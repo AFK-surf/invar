@@ -522,6 +522,11 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const H = host();
       return H && H.reduceTransparency && H.reduceTransparency() ? 1 : 0;
     },
+    mb_web_increase_contrast() {
+      const H = host();
+      if (H && H.increaseContrast) return H.increaseContrast() ? 1 : 0;
+      return typeof matchMedia === "function" && matchMedia("(prefers-contrast: more)").matches ? 1 : 0;
+    },
     mb_web_keys_platform() {
       if (typeof navigator === "undefined") return -1;
       const p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";

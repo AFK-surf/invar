@@ -4113,6 +4113,20 @@
   H.exit = (code) => { window.__done = code; document.title = 'DONE ' + code; };
   H.eventTime = () => evT;
   H.reduceTransparency = () => !!(window.matchMedia && matchMedia('(prefers-reduced-transparency: reduce)').matches);
+  H.increaseContrast = () => !!(window.matchMedia && matchMedia('(prefers-contrast: more)').matches);
+  if (typeof window !== 'undefined' && window.matchMedia) {
+    const onPrefChange = () => H.requestFrame();
+    for (const q of [
+      '(prefers-color-scheme: dark)',
+      '(prefers-reduced-transparency: reduce)',
+      '(prefers-contrast: more)',
+      '(prefers-reduced-motion: reduce)',
+    ]) {
+      const mq = matchMedia(q);
+      if (mq && mq.addEventListener) mq.addEventListener('change', onPrefChange);
+      else if (mq && mq.addListener) mq.addListener(onPrefChange);
+    }
+  }
   H.gpuMs = () => -1;
   H.memBytes = () => (performance.memory ? performance.memory.usedJSHeapSize : 0);
 
