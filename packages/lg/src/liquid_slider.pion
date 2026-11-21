@@ -33,6 +33,11 @@ fn slider_thumb_x(w : Double, progress : Double) -> Double {
   }
 }
 
+/// A slider of `least`..`most`. The thumb follows the hand itself, by how far the hand has gone since it took hold
+/// (so past an end and back it meets the hand again where it left), whatever the caller does with what it is told.
+/// `change` hears the value as it goes (each `step` it reaches, `step` 0: every move); `committed` hears it once the hand
+/// lets go, or at once for a tap on the track or a key's step: what must not happen on every move (a device written to)
+/// goes there. While held, a `value` coming back from the caller does not move the thumb.
 pub fn liquid_slider_node(
   parent : view::View,
   value : () -> Double,
@@ -40,10 +45,11 @@ pub fn liquid_slider_node(
   label : () -> String,
   least~ : Double = 0.0,
   most~ : Double = 100.0,
+  step~ : Double = 0.0,
+  committed~ : (Double) -> Unit = fn(_v : Double) -> Unit { () },
   threshold~ : Double = 0.01,
   disabled~ : () -> Bool = fn() { false },
   drag? : DampedDrag,
-  held~ : (Bool) -> Unit = fn(_h : Bool) -> Unit { () },
   loc~ : String = "",
 ) -> view::View {
   let dd = match drag {
@@ -51,9 +57,31 @@ pub fn liquid_slider_node(
     None => DampedDrag::new(signals::untracked(value), lo=least, hi=most, threshold=threshold, held_scale=thumb_held_scale)
   }
   let span = most - least
+  let snapped = fn(v : Double) -> Double { headless::slider_snap(v, least, most, step) }
   let on_thumb = ui::ref_new(false)
-  let did_drag = ui::ref_new(false)
-  let last_x = fref(0.0)
+  let start_x = fref(0.0)
+  let start_v = fref(0.0)
+  let told = fref(0.0)
+  // (the value as the hand has it, told on only as it reaches another step)
+  let follow = fn(raw : Double) -> Unit {
+    dd.update_value(raw)
+    let s = snapped(raw)
+    if s != told.v {
+      told.v = s
+      change(s)
+    }
+  }
+  let let_go = fn() -> Unit {
+    on_thumb.v = false
+    let s = snapped(dd.target())
+    dd.update_value(s)
+    dd.release()
+    if s != told.v {
+      told.v = s
+      change(s)
+    }
+    committed(s)
+  }
   let hand = fn(d : view::Drag) -> Unit {
     if disabled() || d.w <= 0.0 {
       return
@@ -63,41 +91,28 @@ pub fn liquid_slider_node(
         let tx = slider_thumb_x(d.w, (dd.target() - least) / span)
         let hit_thumb = d.x >= tx && d.x <= tx + thumb_w
         on_thumb.v = true
-        did_drag.v = false
-        last_x.v = d.wx
+        told.v = snapped(dd.target())
         dd.press()
-        held(true)
         if !hit_thumb {
-          let to = clamp(least + span * (d.x / d.w), least, most)
-          dd.update_value(to)
-          change(to)
+          follow(clamp(least + span * (d.x / d.w), least, most))
         }
+        start_x.v = d.wx
+        start_v.v = dd.target()
       }
       Moved =>
         if on_thumb.v {
-          let dx = d.wx - last_x.v
-          last_x.v = d.wx
-          if dx != 0.0 {
-            did_drag.v = true
-          }
-          change(clamp(dd.target() + span * (dx / d.w), least, most))
+          follow(clamp(start_v.v + span * ((d.wx - start_x.v) / d.w), least, most))
         }
-      Up =>
-        if on_thumb.v {
-          if did_drag.v {
-            change(dd.target())
-          }
-          on_thumb.v = false
-          dd.release()
-          held(false)
-        }
-      Off =>
-        if on_thumb.v {
-          on_thumb.v = false
-          dd.release()
-          held(false)
-        }
+      Up => if on_thumb.v { let_go() }
+      Off => if on_thumb.v { let_go() }
     }
+  }
+  // (a key's step or an assistive set: told and committed at once)
+  let keyed = fn(v : Double) -> Unit {
+    let s = snapped(v)
+    told.v = s
+    change(s)
+    committed(s)
   }
   headless::slider(
     loc=loc,
@@ -106,14 +121,14 @@ pub fn liquid_slider_node(
     value,
     min=least,
     max=most,
-    step=0.0,
-    change,
+    step=step,
+    keyed,
     disabled=disabled,
     drag=hand,
     fn(s : view::View, sl : headless::Slider) -> Unit {
       dd.attach(s)
       let _ = s.height(view::Live::Is(Some(thumb_h))).alpha(view::Live::By(fn() { if sl.disabled() { 0.5 } else { 1.0 } }))
-      s.reacts(at_start=false, value, fn(v : Double) -> Unit { if dd.target() != v { dd.update_value(v) } })
+      s.reacts(at_start=false, value, fn(v : Double) -> Unit { if !on_thumb.v && dd.target() != v { dd.update_value(v) } })
       let _ = s.by_room(fn(inner : view::View, room : view::Room) -> Unit {
         let w = fn() -> Double { room.width() }
         let _ = inner.box(fn(track : view::View) -> Unit {
