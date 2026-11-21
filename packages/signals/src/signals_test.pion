@@ -1,0 +1,267 @@
+test "diamond dependency and glitch-free computed propagation" {
+  let a = signal(1)
+  let b = computed(fn(_p : Option[Int]) -> Int { a.get() * 2 })
+  let c = computed(fn(_p : Option[Int]) -> Int { a.get() * 10 })
+  let mut sum_runs = 0
+  let sum = computed(fn(_p : Option[Int]) -> Int {
+    sum_runs += 1
+    b.get() + c.get()
+  })
+  let seen : Array[Int] = []
+  let stop = effect(fn() -> Unit {
+    seen.push(sum.get())
+  })
+  debug_assert(seen.length() == 1 && seen[0] == 12, "initial diamond value")
+  debug_assert(sum_runs == 1, "initial sum runs")
+  a.set(2)
+  debug_assert(seen.length() == 2 && seen[1] == 24, "glitch-free update")
+  debug_assert(sum_runs == 2, "sum ran exactly once on diamond update")
+  // Same value is a no-op
+  a.set(2)
+  debug_assert(seen.length() == 2 && sum_runs == 2, "same value no-op")
+  stop()
+  a.set(3)
+  debug_assert(seen.length() == 2, "stopped effect not triggered")
+}
+
+test "batch coalescing and nested batches" {
+  let x = signal(1)
+  let y = signal(10)
+  let mut runs = 0
+  let mut last = 0
+  let stop = effect(fn() -> Unit {
+    runs += 1
+    last = x.get() + y.get()
+  })
+  debug_assert(runs == 1 && last == 11, "initial")
+  start_batch()
+  x.set(2)
+  start_batch()
+  y.set(20)
+  debug_assert(runs == 1, "still inside batch")
+  end_batch()
+  debug_assert(runs == 1, "still inside outer batch")
+  x.set(3)
+  end_batch()
+  debug_assert(runs == 2 && last == 23, "flushed once after outer batch")
+  stop()
+}
+
+test "dynamic dependency switching and unwatched cleanup" {
+  let cond = signal(true)
+  let a = signal(10)
+  let b = signal(20)
+  let mut a_unwatched = 0
+  a.on_unwatched(fn() -> Unit { a_unwatched += 1 })
+  let mut runs = 0
+  let mut cur = 0
+  let stop = effect(fn() -> Unit {
+    runs += 1
+    cur = if cond.get() { a.get() } else { b.get() }
+  })
+  debug_assert(cur == 10 && runs == 1 && a.watched() && !b.watched(), "branch A")
+  cond.set(false)
+  debug_assert(cur == 20 && runs == 2 && !a.watched() && b.watched(), "branch B")
+  debug_assert(a_unwatched == 1, "a unwatched callback fired")
+  a.set(99)
+  debug_assert(runs == 2, "changing inactive dep does not re-run")
+  stop()
+  debug_assert(!b.watched() && !cond.watched(), "all unwatched after stop")
+}
+
+test "effect_cleanup and nested effect_scope disposal" {
+  let s = signal(1)
+  let log : Array[String] = []
+  let stop_outer = effect_scope(fn() -> Unit {
+    let _ = effect_scope(fn() -> Unit {
+      let _ = effect_cleanup(fn() -> () -> Unit {
+        let v = s.get()
+        log.push("run:" + v.to_string())
+        fn() -> Unit { log.push("clean:" + v.to_string()) }
+      })
+    })
+  })
+  debug_assert(log.length() == 1 && log[0] == "run:1", "initial run")
+  s.set(2)
+  debug_assert(log.length() == 3 && log[1] == "clean:1" && log[2] == "run:2", "cleanup before rerun")
+  stop_outer()
+  debug_assert(log.length() == 4 && log[3] == "clean:2", "cleanup on outer scope stop")
+  s.set(3)
+  debug_assert(log.length() == 4, "no run after scope stop")
+}
+
+test "watch, rest hibernation and wake re-subscription" {
+  let s = signal(1)
+  let mut notified = 0
+  let mut w_opt : Option[Watch] = None
+  let mut scope_node : Option[ReactiveNode] = None
+  let stop_scope = effect_scope(fn() -> Unit {
+    scope_node = active_sub()
+    let w = watch(fn() -> Unit { notified += 1 })
+    w_opt = Some(w)
+  })
+  let w = match w_opt {
+    Some(x) => x
+    None => panic("missing watch")
+  }
+  let snode = match scope_node {
+    Some(x) => x
+    None => panic("missing scope")
+  }
+  debug_assert(w.is_stale(), "watch starts stale")
+  let v1 = w.read(fn() -> Int { s.get() })
+  debug_assert(v1 == 1 && !w.is_stale() && notified == 0, "fresh after read")
+  s.set(2)
+  debug_assert(w.is_stale() && notified == 1, "notified on change")
+  let v2 = w.read(fn() -> Int { s.get() })
+  debug_assert(v2 == 2 && !w.is_stale(), "fresh again")
+
+  // Put scope to rest: changes while resting do NOT notify until wake
+  let wake = rest(snode)
+  debug_assert(w.resting(), "watch is resting")
+  s.set(3)
+  debug_assert(notified == 1 && w.is_stale(), "resting watch marks stale without notifying")
+  wake()
+  debug_assert(!w.resting() && notified == 2, "waking stale watch notifies once")
+  stop_scope()
+  debug_assert(w.gone(), "watch gone after scope stop")
+}
+
+test "untracked read and strict untracked detector" {
+  let s = signal(42)
+  let mut untracked_hits = 0
+  set_on_untracked_read(Some(fn(_n : ReactiveNode) -> Unit { untracked_hits += 1 }))
+  let v1 = s.get()
+  debug_assert(v1 == 42 && untracked_hits == 1, "bare read detected")
+  let v2 = s.untracked()
+  debug_assert(v2 == 42 && untracked_hits == 1, "explicit untracked ignored")
+  let v3 = untracked(fn() -> Int { s.get() })
+  debug_assert(v3 == 42 && untracked_hits == 1, "untracked block ignored")
+  set_on_untracked_read(None)
+}
+
+test "DerivedSignal and Optimistic" {
+  let base = signal(10)
+  let d = derived_signal(fn(_p : Option[Int]) -> Int { base.get() * 2 })
+  debug_assert(d.get() == 20, "derived initial")
+  d.set(99)
+  debug_assert(d.get() == 99, "derived local override")
+  base.set(15)
+  debug_assert(d.get() == 30, "upstream change resets derived override")
+
+  let auth = signal(100)
+  let opt = optimistic(fn() -> Int { auth.get() })
+  debug_assert(opt.get() == 100 && !opt.is_pending(), "opt initial")
+  let undo1 = opt.push(fn(x : Int) -> Int { x + 5 })
+  let undo2 = opt.push(fn(x : Int) -> Int { x * 2 })
+  debug_assert(opt.is_pending() && opt.get() == 210, "opt stacked edits")
+  undo1()
+  debug_assert(opt.is_pending() && opt.get() == 200, "opt after undo1")
+  undo1() // idempotent
+  debug_assert(opt.get() == 200, "undo1 idempotent")
+  undo2()
+  debug_assert(!opt.is_pending() && opt.get() == 100, "opt back to authority")
+}
+
+test "Keyed and KeyedList per-key granularity" {
+  let k = keyed()
+  let mut a_runs = 0
+  let mut b_runs = 0
+  let stop_a = effect(fn() -> Unit { let _ = k.has("a"); a_runs += 1 })
+  let stop_b = effect(fn() -> Unit { let _ = k.has("b"); b_runs += 1 })
+  debug_assert(a_runs == 1 && b_runs == 1, "initial")
+  k.add("a")
+  debug_assert(a_runs == 2 && b_runs == 1, "only a notified")
+  k.set(["b"])
+  debug_assert(a_runs == 3 && b_runs == 2, "a left, b came")
+  stop_a()
+  stop_b()
+
+  let kl : KeyedList[Int] = keyed_list(fn(a : Int, b : Int) -> Bool { a == b })
+  let mut order_runs = 0
+  let mut x_runs = 0
+  let mut y_runs = 0
+  let stop_o = effect(fn() -> Unit { let _ = kl.keys(); order_runs += 1 })
+  let stop_x = effect(fn() -> Unit { let _ = kl.get("x"); x_runs += 1 })
+  let stop_y = effect(fn() -> Unit { let _ = kl.get("y"); y_runs += 1 })
+  kl.put("x", 1, None)
+  kl.put("y", 2, None)
+  debug_assert(order_runs == 3 && x_runs == 2 && y_runs == 2, "put x, y")
+  kl.put("x", 10, None)
+  debug_assert(order_runs == 3 && x_runs == 3 && y_runs == 2, "patch x only notifies x")
+  kl.drop("x")
+  debug_assert(order_runs == 4 && x_runs == 4 && y_runs == 2 && kl.count() == 1, "drop x")
+  stop_o()
+  stop_x()
+  stop_y()
+}
+
+test "after_flush, after_computing, trigger, memo and inner write" {
+  let s = signal(1)
+  let order : Array[String] = []
+  let stop = effect(fn() -> Unit {
+    let v = s.get()
+    order.push("eff:" + v.to_string())
+    after_flush(fn() -> Unit { order.push("after:" + v.to_string()) })
+  })
+  order.clear()
+  s.set(2)
+  debug_assert(order.length() == 2 && order[0] == "eff:2" && order[1] == "after:2", "after_flush order")
+
+  let mut m_runs = 0
+  let m = memo(fn() -> Int { s.get() % 2 }, fn(parity : Int) -> Int {
+    m_runs += 1
+    parity * 100
+  })
+  debug_assert(m.get() == 0 && m_runs == 1, "memo initial")
+  s.set(4) // same parity 0
+  debug_assert(m.get() == 0 && m_runs == 1, "memo skipped on same input")
+  s.set(5) // parity 1
+  debug_assert(m.get() == 100 && m_runs == 2, "memo recomputed")
+  stop()
+
+  // Inner write inside effect
+  let a = signal(0)
+  let b = signal(0)
+  let mut b_seen = 0
+  let s1 = effect(fn() -> Unit {
+    let v = a.get()
+    if v > 0 {
+      b.set(v * 10)
+    }
+  })
+  let s2 = effect(fn() -> Unit {
+    b_seen = b.get()
+  })
+  a.set(3)
+  debug_assert(b_seen == 30, "inner write propagated")
+  s1()
+  s2()
+}
+
+test "stress create and destroy 2000 scopes/effects/watches with zero leaked links or nodes" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let root = signal(0)
+  let c1 = computed(fn(_p : Option[Int]) -> Int { root.get() + 1 })
+  let mut acc = 0
+  for i in 0..<2000 {
+    let stop = effect_scope(fn() -> Unit {
+      let _ = effect(fn() -> Unit {
+        acc += c1.get()
+      })
+      let w = watch(fn() -> Unit { acc += 1 })
+      let _ = w.read(fn() -> Int { c1.get() })
+    })
+    if i % 100 == 0 {
+      root.set(i)
+    }
+    stop()
+  }
+  c1.dispose()
+  debug_assert(acc > 0, "stress ran")
+  // All temporary effects, scopes, watches, and links must be recycled
+  debug_assert(live_link_count() == base_links, "zero leaked links")
+  // Only root signal + c1 computed remain (+2)
+  debug_assert(live_node_count() == base_nodes + 2, "zero leaked nodes")
+}

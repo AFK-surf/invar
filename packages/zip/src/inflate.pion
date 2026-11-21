@@ -1,0 +1,435 @@
+// Raw Deflate (RFC 1951), Gzip (RFC 1952), Zlib (RFC 1950), CRC-32, Adler-32.
+// Ported from libs/mbui/src/zip/inflate.mbt.
+
+struct Bits {
+  data : Bytes
+  mut at : Int
+  mut buf : Int
+  mut n : Int
+  mut over : Int
+}
+
+fn Bits::need(self : Bits, k : Int) -> Unit {
+  while self.n < k {
+    let byte = if self.at < self.data.length() {
+      self.data[self.at].to_int()
+    } else {
+      self.over += 1
+      0
+    }
+    self.at += 1
+    self.buf = self.buf | (byte << self.n)
+    self.n += 8
+  }
+}
+
+fn Bits::take(self : Bits, k : Int) -> Int {
+  if k == 0 {
+    return 0
+  }
+  self.need(k)
+  let v = self.buf & ((1 << k) - 1)
+  self.buf = (self.buf >> k) & ((1 << (30 - k)) - 1)
+  self.n -= k
+  v
+}
+
+fn Bits::past_end(self : Bits) -> Bool {
+  self.over * 8 > self.n
+}
+
+struct Huff {
+  table : Array[Int]
+  bits : Int
+}
+
+fn make_int_arr(n : Int, v : Int) -> Array[Int] {
+  let a : Array[Int] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+fn huff(lens : Array[Int], from : Int, count : Int) -> Option[Huff] {
+  let per_len = make_int_arr(16, 0)
+  let mut most = 0
+  for i in 0..<count {
+    let l = lens[from + i]
+    per_len[l] += 1
+    if l > most {
+      most = l
+    }
+  }
+  per_len[0] = 0
+  let mut left = 1
+  for l in 1..<16 {
+    left = (left << 1) - per_len[l]
+    if left < 0 {
+      return None
+    }
+  }
+  let bits = if most == 0 { 1 } else { most }
+  let table = make_int_arr(1 << bits, 0)
+  let next = make_int_arr(16, 0)
+  let mut code = 0
+  for l in 1..<16 {
+    code = (code + per_len[l - 1]) << 1
+    next[l] = code
+  }
+  for i in 0..<count {
+    let l = lens[from + i]
+    if l == 0 {
+      continue
+    }
+    let c = next[l]
+    next[l] = c + 1
+    let mut rev = 0
+    for k in 0..<l {
+      rev = rev | (((c >> k) & 1) << (l - 1 - k))
+    }
+    let entry = (i << 4) | l
+    let mut j = rev
+    while j < table.length() {
+      table[j] = entry
+      j += 1 << l
+    }
+  }
+  Some(Huff::{ table, bits })
+}
+
+fn Bits::decode(self : Bits, h : Huff) -> Int {
+  self.need(h.bits)
+  let e = h.table[self.buf & ((1 << h.bits) - 1)]
+  if e == 0 {
+    return -1
+  }
+  let l = e & 15
+  self.buf = (self.buf >> l) & ((1 << (30 - l)) - 1)
+  self.n -= l
+  e >> 4
+}
+
+fn fixed_codes() -> (Huff, Huff) {
+  let lens = make_int_arr(288 + 30, 5)
+  for i in 0..<288 {
+    lens[i] = if i < 144 { 8 } else if i < 256 { 9 } else if i < 280 { 7 } else { 8 }
+  }
+  let l = match huff(lens, 0, 288) {
+    Some(h) => h
+    None => panic("fixed lencode")
+  }
+  let d = match huff(lens, 288, 30) {
+    Some(h) => h
+    None => panic("fixed distcode")
+  }
+  (l, d)
+}
+
+fn dynamic_codes(b : Bits) -> Option[(Huff, Huff)] {
+  let clen_order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+  let nlen = b.take(5) + 257
+  let ndist = b.take(5) + 1
+  let ncode = b.take(4) + 4
+  if nlen > 286 || ndist > 30 {
+    return None
+  }
+  let clens = make_int_arr(19, 0)
+  for i in 0..<ncode {
+    clens[clen_order[i]] = b.take(3)
+  }
+  let lencode = match huff(clens, 0, 19) {
+    Some(h) => h
+    None => return None
+  }
+  let lens = make_int_arr(nlen + ndist, 0)
+  let mut i = 0
+  while i < nlen + ndist {
+    let sym = b.decode(lencode)
+    if sym < 0 {
+      return None
+    }
+    if sym < 16 {
+      lens[i] = sym
+      i += 1
+    } else {
+      let (value, times) = if sym == 16 {
+        if i == 0 {
+          return None
+        }
+        (lens[i - 1], 3 + b.take(2))
+      } else if sym == 17 {
+        (0, 3 + b.take(3))
+      } else {
+        (0, 11 + b.take(7))
+      }
+      if i + times > nlen + ndist {
+        return None
+      }
+      for _ in 0..<times {
+        lens[i] = value
+        i += 1
+      }
+    }
+  }
+  if lens[256] == 0 {
+    return None
+  }
+  match (huff(lens, 0, nlen), huff(lens, nlen, ndist)) {
+    (Some(l), Some(d)) => Some((l, d))
+    _ => None
+  }
+}
+
+fn decode_codes(b : Bits, out : Array[Int], lencode : Huff, distcode : Huff) -> Bool {
+  let len_base = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99,
+    115, 131, 163, 195, 227, 258,
+  ]
+  let len_extra = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+  ]
+  let dist_base = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025,
+    1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+  ]
+  let dist_extra = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12,
+    12, 13, 13,
+  ]
+  while true {
+    let sym = b.decode(lencode)
+    if sym < 0 || b.past_end() {
+      return false
+    }
+    if sym < 256 {
+      out.push(sym)
+    } else if sym == 256 {
+      return true
+    } else {
+      let s = sym - 257
+      if s >= 29 {
+        return false
+      }
+      let len = len_base[s] + b.take(len_extra[s])
+      let d = b.decode(distcode)
+      if d < 0 || d >= 30 {
+        return false
+      }
+      let dist = dist_base[d] + b.take(dist_extra[d])
+      if dist > out.length() {
+        return false
+      }
+      for _ in 0..<len {
+        let v = out[out.length() - dist]
+        out.push(v)
+      }
+    }
+  }
+  false
+}
+
+fn ints_to_bytes(arr : Array[Int]) -> Bytes {
+  let sb = StringBuilder::new()
+  for x in arr {
+    sb.write_byte(x as Byte)
+  }
+  sb.to_string().to_bytes()
+}
+
+/// Raw deflate decompression starting at `start` (size hint ignored).
+pub fn inflate(data : Bytes, start : Int, size : Int) -> Option[Bytes] {
+  match inflate_at(data, start, size) {
+    Some((out, _)) => Some(out)
+    None => None
+  }
+}
+
+pub fn inflate_raw(data : Bytes) -> Option[Bytes] {
+  inflate(data, 0, 0)
+}
+
+fn inflate_at(data : Bytes, start : Int, _size : Int) -> Option[(Bytes, Int)] {
+  let b = Bits::{ data, at: start, buf: 0, n: 0, over: 0 }
+  let out : Array[Int] = []
+  while true {
+    let last = b.take(1)
+    let kind = b.take(2)
+    if kind == 0 {
+      let _ = b.take(b.n % 8)
+      let len = b.take(16)
+      let nlen = b.take(16)
+      if (len ^ nlen) != 0xFFFF {
+        return None
+      }
+      for _ in 0..<len {
+        out.push(b.take(8))
+      }
+      if b.past_end() {
+        return None
+      }
+    } else if kind == 1 {
+      let (l, d) = fixed_codes()
+      if !decode_codes(b, out, l, d) {
+        return None
+      }
+    } else if kind == 2 {
+      match dynamic_codes(b) {
+        Some((l, d)) => {
+          if !decode_codes(b, out, l, d) {
+            return None
+          }
+        }
+        None => return None
+      }
+    } else {
+      return None
+    }
+    if last == 1 {
+      break
+    }
+  }
+  if b.past_end() {
+    return None
+  }
+  Some((ints_to_bytes(out), b.at - b.n / 8))
+}
+
+fn u32_mask() -> Int64 {
+  (1.to_int64() << 32) - 1.to_int64()
+}
+
+fn le32_u(data : Bytes, at : Int) -> Int64 {
+  data[at].to_int().to_int64() |
+  (data[at + 1].to_int().to_int64() << 8) |
+  (data[at + 2].to_int().to_int64() << 16) |
+  (data[at + 3].to_int().to_int64() << 24)
+}
+
+fn be32_u(data : Bytes, at : Int) -> Int64 {
+  (data[at].to_int().to_int64() << 24) |
+  (data[at + 1].to_int().to_int64() << 16) |
+  (data[at + 2].to_int().to_int64() << 8) |
+  data[at + 3].to_int().to_int64()
+}
+
+/// RFC 1952 gzip decompression with CRC-32 and ISIZE verification.
+pub fn gunzip(data : Bytes) -> Option[Bytes] {
+  let n = data.length()
+  if n < 18 || data[0].to_int() != 0x1F || data[1].to_int() != 0x8B || data[2].to_int() != 0x08 {
+    return None
+  }
+  let flags = data[3].to_int()
+  let mut at = 10
+  if (flags & 4) != 0 {
+    if at + 2 > n {
+      return None
+    }
+    at += 2 + (data[at].to_int() | (data[at + 1].to_int() << 8))
+  }
+  if (flags & 8) != 0 {
+    while at < n && data[at].to_int() != 0 {
+      at += 1
+    }
+    at += 1
+  }
+  if (flags & 16) != 0 {
+    while at < n && data[at].to_int() != 0 {
+      at += 1
+    }
+    at += 1
+  }
+  if (flags & 2) != 0 {
+    at += 2
+  }
+  if at >= n {
+    return None
+  }
+  let said = le32_u(data, n - 4).to_int()
+  match inflate_at(data, at, said) {
+    Some((out, end)) => {
+      if end + 8 > n {
+        return None
+      }
+      if le32_u(data, end + 4) != (out.length().to_int64() & u32_mask()) {
+        return None
+      }
+      if crc32(out) != le32_u(data, end) {
+        return None
+      }
+      Some(out)
+    }
+    None => None
+  }
+}
+
+/// RFC 1950 zlib decompression with Adler-32 verification.
+pub fn zlib_inflate(data : Bytes) -> Option[Bytes] {
+  let n = data.length()
+  if n < 6 {
+    return None
+  }
+  let cmf = data[0].to_int()
+  let flg = data[1].to_int()
+  if (cmf & 0x0F) != 8 || (cmf >> 4) > 7 {
+    return None
+  }
+  if ((cmf * 256 + flg) % 31) != 0 {
+    return None
+  }
+  let mut start = 2
+  if (flg & 0x20) != 0 {
+    if n < 10 {
+      return None
+    }
+    start = 6
+  }
+  match inflate_at(data, start, 0) {
+    Some((out, end)) => {
+      if end + 4 > n {
+        return None
+      }
+      if adler32(out) != be32_u(data, end) {
+        return None
+      }
+      Some(out)
+    }
+    None => None
+  }
+}
+
+/// Adler-32 checksum (unsigned 32-bit in Int64).
+pub fn adler32(data : Bytes) -> Int64 {
+  let mut s1 : Int64 = 1.to_int64()
+  let mut s2 : Int64 = 0.to_int64()
+  let mod_base : Int64 = 65521.to_int64()
+  for i in 0..<data.length() {
+    s1 = (s1 + data[i].to_int().to_int64()) % mod_base
+    s2 = (s2 + s1) % mod_base
+  }
+  (s2 << 16) | s1
+}
+
+/// Unsigned 32-bit CRC-32 (IEEE 802.3 / gzip / zlib), returned as Int64 in [0, 0xFFFFFFFF].
+pub fn crc32(data : Bytes) -> Int64 {
+  let poly : Int64 = (0x76DC4190.to_int64() << 1) // 0xEDB88320
+  let mask = u32_mask()
+  let table : Array[Int64] = []
+  for i in 0..<256 {
+    let mut c : Int64 = i.to_int64()
+    for _ in 0..<8 {
+      if (c & 1.to_int64()) != 0.to_int64() {
+        c = poly ^ ((c >> 1) & 0x7FFFFFFF.to_int64())
+      } else {
+        c = (c >> 1) & 0x7FFFFFFF.to_int64()
+      }
+    }
+    table.push(c)
+  }
+  let mut c = mask
+  for i in 0..<data.length() {
+    let idx = ((c ^ data[i].to_int().to_int64()) & 0xFF.to_int64()).to_int()
+    c = table[idx] ^ ((c >> 8) & 0x00FFFFFF.to_int64())
+  }
+  (c ^ mask) & mask
+}

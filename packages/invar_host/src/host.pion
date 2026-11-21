@@ -1,0 +1,495 @@
+// Pure Pion native host bindings + 60-double MB_INST SceneBuilder + CoreText glyph atlas
+// for unmodified upstream libs/mbui/src/host/apple_{render,text,image,film}.m.
+
+extern "C" fn c_init_offscreen(w : Double, h : Double, scale : Double) -> Unit = "pion_mb_init_offscreen"
+extern "C" fn c_render_frame(inst : Ptr, count : Int, r : Double, g : Double, b : Double) -> Int = "pion_mb_render_frame"
+extern "C" fn c_snapshot_utf8(path : Ptr, path_len : Int64) -> Int = "pion_mb_snapshot_utf8"
+extern "C" fn c_shape_utf8(
+  text : Ptr,
+  text_len : Int64,
+  size : Double,
+  weight : Int,
+  style : Int,
+  out : Ptr,
+  out_doubles : Int,
+) -> Int = "pion_mb_shape_utf8"
+extern "C" fn c_font_metrics(size : Double, weight : Int, style : Int, out : Ptr) -> Unit = "pion_mb_font_metrics"
+extern "C" fn c_glyph(key : Int, out : Ptr) -> Unit = "pion_mb_glyph"
+extern "C" fn c_glyph_put(key : Int, x : Int, y : Int) -> Unit = "pion_mb_glyph_put"
+extern "C" fn c_atlas_size(colour : Int) -> Int = "pion_mb_atlas_size"
+extern "C" fn c_invoke_frame_cb(cb : Ptr, w : Double, h : Double, scale : Double) -> Int = "pion_mb_invoke_frame_cb"
+
+pub let inst_stride : Int = 60
+pub let atlas_color_u : Int = 16384
+
+pub struct Rgba {
+  pub r : Double
+  pub g : Double
+  pub b : Double
+  pub a : Double
+}
+
+pub fn rgba(r : Double, g : Double, b : Double, a : Double) -> Rgba {
+  Rgba::{ r, g, b, a }
+}
+
+pub fn rgb_hex(hex : Int, a : Double) -> Rgba {
+  let r = (((hex >> 16) & 255) as Double) / 255.0
+  let g = (((hex >> 8) & 255) as Double) / 255.0
+  let b = ((hex & 255) as Double) / 255.0
+  Rgba::{ r, g, b, a }
+}
+
+struct GlyphEntry {
+  u : Double
+  v : Double
+  gw : Double
+  gh : Double
+  ox : Double
+  oy : Double
+  is_color : Bool
+}
+
+struct ShelfPacker {
+  side : Int
+  mut cur_x : Int
+  mut cur_y : Int
+  mut row_h : Int
+}
+
+fn ShelfPacker::new(side : Int) -> ShelfPacker {
+  ShelfPacker::{ side, cur_x: 1, cur_y: 1, row_h: 0 }
+}
+
+fn ShelfPacker::alloc(self : ShelfPacker, w : Int, h : Int) -> (Int, Int) {
+  if w <= 0 || h <= 0 {
+    return (-1, -1)
+  }
+  if self.cur_x + w + 1 > self.side {
+    self.cur_x = 1
+    self.cur_y = self.cur_y + self.row_h + 1
+    self.row_h = 0
+  }
+  if self.cur_y + h + 1 > self.side {
+    return (-1, -1)
+  }
+  let x = self.cur_x
+  let y = self.cur_y
+  self.cur_x = self.cur_x + w + 1
+  if h > self.row_h {
+    self.row_h = h
+  }
+  (x, y)
+}
+
+pub struct Scene {
+  pub width : Double
+  pub height : Double
+  pub scale : Double
+  pub inst : Array[Double]
+  pub mut count : Int
+  mut glass_run : Int
+  alpha_atlas : ShelfPacker
+  color_atlas : ShelfPacker
+  glyph_cache : Map[String, GlyphEntry]
+  shape_buf : Array[Double]
+  metrics_buf : Array[Double]
+  glyph_buf : Array[Double]
+}
+
+fn make_zero_doubles(n : Int) -> Array[Double] {
+  let a : Array[Double] = []
+  let mut i = 0
+  while i < n {
+    a.push(0.0)
+    i = i + 1
+  }
+  a
+}
+
+pub fn init_offscreen(w : Double, h : Double, scale : Double) -> Scene {
+  c_init_offscreen(w, h, scale)
+  let alpha_side = c_atlas_size(0)
+  let color_side = c_atlas_size(1)
+  Scene::{
+    width: w,
+    height: h,
+    scale,
+    inst: [],
+    count: 0,
+    glass_run: 0,
+    alpha_atlas: ShelfPacker::new(alpha_side),
+    color_atlas: ShelfPacker::new(color_side),
+    glyph_cache: Map::new(),
+    shape_buf: make_zero_doubles(2048),
+    metrics_buf: make_zero_doubles(8),
+    glyph_buf: make_zero_doubles(8),
+  }
+}
+
+pub fn invoke_frame_cb(cb : Ptr, w : Double, h : Double, scale : Double) -> Int {
+  c_invoke_frame_cb(cb, w, h, scale)
+}
+
+fn Scene::push_raw(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  kind : Double,
+  p6 : Double,
+  p7 : Double,
+  col : Rgba,
+  c2a : Double,
+  c2b : Double,
+  c2c : Double,
+  c2d : Double,
+  tex_id : Double,
+  pad1 : Double,
+  pad2 : Double,
+  pad3 : Double,
+) -> Unit {
+  let a = self.inst
+  // 0..3 rect
+  a.push(x)
+  a.push(y)
+  a.push(w)
+  a.push(h)
+  // 4..7 radius, kind, bw/saturation, blur
+  a.push(radius)
+  a.push(kind)
+  a.push(p6)
+  a.push(p7)
+  // 8..11 color rgba
+  a.push(col.r)
+  a.push(col.g)
+  a.push(col.b)
+  a.push(col.a)
+  // 12..15 c2
+  a.push(c2a)
+  a.push(c2b)
+  a.push(c2c)
+  a.push(c2d)
+  // 16..19 clip (full canvas)
+  a.push(0.0)
+  a.push(0.0)
+  a.push(1000000000.0)
+  a.push(1000000000.0)
+  // 20..23 image/glass capture id + pad (refraction, chroma, merge / adaptive ink)
+  a.push(tex_id)
+  a.push(pad1)
+  a.push(pad2)
+  a.push(pad3)
+  // 24..31 clip rounded corners (none)
+  let mut i = 0
+  while i < 8 {
+    a.push(0.0)
+    i = i + 1
+  }
+  // 32..35 rotation (none)
+  a.push(0.0)
+  a.push(0.0)
+  a.push(0.0)
+  a.push(0.0)
+  // 36..39 per-corner radii (tl, tr, br, bl)
+  a.push(radius)
+  a.push(radius)
+  a.push(radius)
+  a.push(radius)
+  // 40..59 outer clip & fade (none)
+  let mut j = 0
+  while j < 20 {
+    a.push(0.0)
+    j = j + 1
+  }
+  self.count = self.count + 1
+}
+
+pub fn Scene::add_rect(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  fill : Rgba,
+) -> Unit {
+  self.push_raw(
+    x, y, w, h, radius, 0.0, 0.0, 0.0,
+    fill, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+  )
+}
+
+pub fn Scene::add_bordered_rect(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  fill : Rgba,
+  border_w : Double,
+  border : Rgba,
+) -> Unit {
+  self.push_raw(
+    x, y, w, h, radius, 0.0, border_w, 0.0,
+    fill, border.r, border.g, border.b, border.a,
+    0.0, 0.0, 0.0, 0.0,
+  )
+}
+
+pub fn Scene::add_shadow(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  blur : Double,
+  dy : Double,
+  col : Rgba,
+  outside_only : Bool,
+) -> Unit {
+  let out_flag = if outside_only { 1.0 } else { 0.0 }
+  self.push_raw(
+    x, y + dy, w, h, radius, 2.0, 0.0, blur,
+    col, out_flag, dy, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+  )
+}
+
+pub fn Scene::add_frosted_glass(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  blur : Double,
+  saturation : Double,
+  tint : Rgba,
+  rim_edge : Double,
+  rim_lit : Double,
+  rim_back : Double,
+  opacity : Double,
+) -> Unit {
+  self.glass_run = self.glass_run + 1
+  let cap_id = -(self.glass_run as Double)
+  self.push_raw(
+    x, y, w, h, radius, 5.0, saturation, blur,
+    tint, rim_edge, rim_lit, rim_back, opacity,
+    cap_id, 0.0, 0.0, 0.0,
+  )
+}
+
+pub fn Scene::add_liquid_glass(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  blur : Double,
+  saturation : Double,
+  tint : Rgba,
+  rim : Double,
+  bezel : Double,
+  refraction : Double,
+  chroma : Double,
+  opacity : Double,
+) -> Unit {
+  self.glass_run = self.glass_run + 1
+  let cap_id = -(self.glass_run as Double)
+  self.push_raw(
+    x, y, w, h, radius, 6.0, saturation, blur,
+    tint, rim, bezel, 0.0, opacity,
+    cap_id, refraction, chroma, 0.0,
+  )
+}
+
+pub fn Scene::add_line(
+  self : Scene,
+  x0 : Double,
+  y0 : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  col : Rgba,
+) -> Unit {
+  let rx = if x0 < x1 { x0 } else { x1 }
+  let ry = if y0 < y1 { y0 } else { y1 }
+  let rw = math_abs(x1 - x0)
+  let rh = math_abs(y1 - y0)
+  let bw = if rw < 1.0 { 1.0 } else { rw }
+  let bh = if rh < 1.0 { 1.0 } else { rh }
+  let sx0 = (x0 - rx) / bw
+  let sy0 = (y0 - ry) / bh
+  let sx1 = (x1 - rx) / bw
+  let sy1 = (y1 - ry) / bh
+  self.push_raw(
+    rx, ry, bw, bh, width * 0.5, 10.0, 0.0, 0.0,
+    col, sx0, sy0, sx1, sy1,
+    0.0, 0.0, 0.0, 0.0,
+  )
+}
+
+fn Scene::ensure_glyph(self : Scene, key : Int) -> GlyphEntry {
+  let sk = key.to_string()
+  match self.glyph_cache.get(sk) {
+    Some(g) => return g
+    None => ()
+  }
+  c_glyph(key, array_data_ptr(self.glyph_buf))
+  let gw = self.glyph_buf[2]
+  let gh = self.glyph_buf[3]
+  let ox = self.glyph_buf[4]
+  let oy = self.glyph_buf[5]
+  let is_color = self.glyph_buf[6] > 0.5
+  let pw = math_round(gw * self.scale).to_int()
+  let ph = math_round(gh * self.scale).to_int()
+  if pw <= 0 || ph <= 0 {
+    let empty = GlyphEntry::{ u: 0.0, v: 0.0, gw: 0.0, gh: 0.0, ox: 0.0, oy: 0.0, is_color: false }
+    self.glyph_cache.set(sk, empty)
+    return empty
+  }
+  let (ax, ay) = if is_color {
+    self.color_atlas.alloc(pw, ph)
+  } else {
+    self.alpha_atlas.alloc(pw, ph)
+  }
+  if ax < 0 || ay < 0 {
+    let empty = GlyphEntry::{ u: 0.0, v: 0.0, gw: 0.0, gh: 0.0, ox: 0.0, oy: 0.0, is_color: false }
+    return empty
+  }
+  let u_off = if is_color { atlas_color_u } else { 0 }
+  c_glyph_put(key, ax + u_off, ay)
+  let entry = GlyphEntry::{
+    u: (ax + u_off) as Double,
+    v: ay as Double,
+    gw,
+    gh,
+    ox,
+    oy,
+    is_color,
+  }
+  self.glyph_cache.set(sk, entry)
+  entry
+}
+
+pub fn Scene::measure_text(
+  self : Scene,
+  text : String,
+  size : Double,
+  weight : Int,
+  style : Int,
+) -> Double {
+  let k = c_shape_utf8(
+    str_data_ptr(text),
+    text.length().to_int64(),
+    size,
+    weight,
+    style,
+    array_data_ptr(self.shape_buf),
+    self.shape_buf.length(),
+  )
+  let mut total = 0.0
+  let mut i = 0
+  while i < k {
+    total = total + self.shape_buf[i * 4 + 2]
+    i = i + 1
+  }
+  total
+}
+
+pub fn Scene::draw_text(
+  self : Scene,
+  text : String,
+  x : Double,
+  y : Double,
+  size : Double,
+  weight : Int,
+  style : Int,
+  col : Rgba,
+) -> Double {
+  c_font_metrics(size, weight, style, array_data_ptr(self.metrics_buf))
+  let lat_asc = self.metrics_buf[0]
+  let han_asc = self.metrics_buf[3]
+  let asc = if han_asc > lat_asc { han_asc } else { lat_asc }
+  let base_y = math_round((y + asc) * self.scale) / self.scale
+
+  let k = c_shape_utf8(
+    str_data_ptr(text),
+    text.length().to_int64(),
+    size,
+    weight,
+    style,
+    array_data_ptr(self.shape_buf),
+    self.shape_buf.length(),
+  )
+  let mut pen_x = x
+  let mut i = 0
+  while i < k {
+    let adv = self.shape_buf[i * 4 + 2]
+    let key = self.shape_buf[i * 4 + 3].to_int()
+    if key >= 0 {
+      let g = self.ensure_glyph(key)
+      if g.gw > 0.0 && g.gh > 0.0 {
+        let gx = math_round((pen_x + g.ox) * self.scale) / self.scale
+        let gy = math_round((base_y + g.oy) * self.scale) / self.scale
+        let kind = if g.is_color { 3.0 } else { 1.0 }
+        let gcol = if g.is_color { rgba(1.0, 1.0, 1.0, col.a) } else { col }
+        self.push_raw(
+          gx, gy, g.gw, g.gh, 0.0, kind, 0.0, 0.0,
+          gcol, g.u, g.v, g.gw * self.scale, g.gh * self.scale,
+          0.0, 0.0, 0.0, 0.0,
+        )
+      }
+    }
+    pen_x = pen_x + adv
+    i = i + 1
+  }
+  pen_x - x
+}
+
+pub fn Scene::draw_text_centered(
+  self : Scene,
+  text : String,
+  box_x : Double,
+  box_y : Double,
+  box_w : Double,
+  box_h : Double,
+  size : Double,
+  weight : Int,
+  style : Int,
+  col : Rgba,
+) -> Unit {
+  c_font_metrics(size, weight, style, array_data_ptr(self.metrics_buf))
+  let lat_asc = self.metrics_buf[0]
+  let lat_desc = self.metrics_buf[1]
+  let han_asc = self.metrics_buf[3]
+  let han_desc = self.metrics_buf[4]
+  let asc = if han_asc > lat_asc { han_asc } else { lat_asc }
+  let desc = if han_desc > lat_desc { han_desc } else { lat_desc }
+  let tw = self.measure_text(text, size, weight, style)
+  let tx = box_x + (box_w - tw) * 0.5
+  let ty = box_y + (box_h - (asc + desc)) * 0.5
+  let _ = self.draw_text(text, tx, ty, size, weight, style, col)
+}
+
+pub fn Scene::render_and_snapshot(
+  self : Scene,
+  bg_r : Double,
+  bg_g : Double,
+  bg_b : Double,
+  out_path : String,
+) -> Bool {
+  let ok_r = c_render_frame(array_data_ptr(self.inst), self.count, bg_r, bg_g, bg_b)
+  if ok_r == 0 {
+    return false
+  }
+  let ok_s = c_snapshot_utf8(str_data_ptr(out_path), out_path.length().to_int64())
+  ok_s != 0
+}

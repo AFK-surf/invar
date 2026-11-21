@@ -1,0 +1,1566 @@
+// Dirty-rect tracking and frame diffing for incremental rendering.
+// Ported from libs/mbui/src/damage/damage.mbt.
+
+import "halt"
+
+/// The numbers of an instance (src/ui/scene.mbt).
+let inst_size : Int = 60
+
+/// What an instance's image (slot 20) is from here on, below `view_tex_base`: a stream's picture
+/// which changes while its numbers stay.
+pub let stream_tex_base : Double = 4194304.0
+
+/// From here on a native view's: a hole it shows through.
+pub let view_tex_base : Double = 8388608.0
+
+/// How far past what an instance says it covers its pixels may reach.
+let reach_pad : Double = 2.0
+
+/// A part of the window larger than this share of it is drawn whole.
+let whole_share : Double = 0.5
+
+/// The most edits match_between looks for: more apart than this, the run is drawn again whole.
+let most_edits : Int = 512
+
+/// The most parts a frame is drawn again in: more are merged, the pair that grows least first.
+let most_parts : Int = 4
+
+/// Parts nearer than this (points) are one.
+let part_gap : Double = 16.0
+
+/// A rect, x0 y0 x1 y1 (empty where x1 <= x0 or y1 <= y0).
+struct Rect {
+  mut x0 : Double
+  mut y0 : Double
+  mut x1 : Double
+  mut y1 : Double
+}
+
+fn Rect::none() -> Rect {
+  Rect::{ x0: 1.0e18, y0: 1.0e18, x1: -1.0e18, y1: -1.0e18 }
+}
+
+fn Rect::clear(self : Rect) -> Unit {
+  self.x0 = 1.0e18
+  self.y0 = 1.0e18
+  self.x1 = -1.0e18
+  self.y1 = -1.0e18
+}
+
+fn Rect::cut_to(self : Rect, w : Rect) -> Unit {
+  self.x0 = dmax(self.x0, w.x0)
+  self.y0 = dmax(self.y0, w.y0)
+  self.x1 = dmin(self.x1, w.x1)
+  self.y1 = dmin(self.y1, w.y1)
+}
+
+fn Rect::empty(self : Rect) -> Bool {
+  self.x1 <= self.x0 || self.y1 <= self.y0
+}
+
+fn Rect::add(self : Rect, x0 : Double, y0 : Double, x1 : Double, y1 : Double) -> Unit {
+  if x1 <= x0 || y1 <= y0 {
+    return
+  }
+  if x0 < self.x0 {
+    self.x0 = x0
+  }
+  if y0 < self.y0 {
+    self.y0 = y0
+  }
+  if x1 > self.x1 {
+    self.x1 = x1
+  }
+  if y1 > self.y1 {
+    self.y1 = y1
+  }
+}
+
+fn Rect::meets(self : Rect, o : Rect) -> Bool {
+  !self.empty() && !o.empty() && self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
+}
+
+fn Rect::near(self : Rect, o : Rect) -> Bool {
+  self.x0 < o.x1 + part_gap && o.x0 < self.x1 + part_gap && self.y0 < o.y1 + part_gap && o.y0 < self.y1 + part_gap
+}
+
+fn Rect::area(self : Rect) -> Double {
+  if self.empty() {
+    0.0
+  } else {
+    (self.x1 - self.x0) * (self.y1 - self.y0)
+  }
+}
+
+fn Rect::within(self : Rect, w : Rect) -> Rect {
+  Rect::{ x0: dmax(self.x0, w.x0), y0: dmax(self.y0, w.y0), x1: dmin(self.x1, w.x1), y1: dmin(self.y1, w.y1) }
+}
+
+fn Rect::holds(self : Rect, o : Rect) -> Bool {
+  o.x0 >= self.x0 && o.y0 >= self.y0 && o.x1 <= self.x1 && o.y1 <= self.y1
+}
+
+// Lightweight array helpers (FixedArray substitute until P27-C2)
+fn make_doubles(n : Int, v : Double) -> Array[Double] {
+  let a : Array[Double] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+fn make_ints(n : Int, v : Int) -> Array[Int] {
+  let a : Array[Int] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+fn make_bools(n : Int, v : Bool) -> Array[Bool] {
+  let a : Array[Bool] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+fn make_i64s(n : Int, v : Int64) -> Array[Int64] {
+  let a : Array[Int64] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+fn blit_doubles(src : Array[Double], src_offset : Int, dst : Array[Double], dst_offset : Int, len : Int) -> Unit {
+  for i in 0..<len {
+    dst[dst_offset + i] = src[src_offset + i]
+  }
+}
+
+fn copy_ints(a : Array[Int]) -> Array[Int] {
+  let out : Array[Int] = []
+  for i in 0..<a.length() {
+    out.push(a[i])
+  }
+  out
+}
+
+fn copy_i64s(a : Array[Int64]) -> Array[Int64] {
+  let out : Array[Int64] = []
+  for i in 0..<a.length() {
+    out.push(a[i])
+  }
+  out
+}
+
+fn sort_i64s(a : Array[Int64]) -> Unit {
+  let n = a.length()
+  if n <= 1 {
+    return
+  }
+  // Shell sort: O(n log^2 n) worst case, zero recursion/alloc
+  let mut gap = n / 2
+  while gap > 0 {
+    for i in gap..<n {
+      let key = a[i]
+      let mut j = i
+      while j >= gap && a[j - gap] > key {
+        a[j] = a[j - gap]
+        j -= gap
+      }
+      a[j] = key
+    }
+    gap = gap / 2
+  }
+}
+
+fn remove_rect_at(a : Array[Rect], idx : Int) -> Rect {
+  let r = a[idx]
+  let last = a.length() - 1
+  for i in idx..<last {
+    a[i] = a[i + 1]
+  }
+  let _ = a.pop()
+  r
+}
+
+// Lightweight associative tables for group maps (Int -> Rect, Int -> (Bool, Array[Int]))
+fn groups_get(m : Array[(Int, Rect)], id : Int) -> Option[Rect] {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      return Some(m[i].1)
+    }
+  }
+  None
+}
+
+fn groups_contains(m : Array[(Int, Rect)], id : Int) -> Bool {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      return true
+    }
+  }
+  false
+}
+
+fn groups_set(m : Array[(Int, Rect)], id : Int, r : Rect) -> Unit {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      m[i] = (id, r)
+      return
+    }
+  }
+  m.push((id, r))
+}
+
+fn groups_remove(m : Array[(Int, Rect)], id : Int) -> Unit {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      let last = m.length() - 1
+      m[i] = m[last]
+      let _ = m.pop()
+      return
+    }
+  }
+}
+
+fn reads_get(m : Array[(Int, (Bool, Array[Int]))], id : Int) -> Option[(Bool, Array[Int])] {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      return Some(m[i].1)
+    }
+  }
+  None
+}
+
+fn reads_set(m : Array[(Int, (Bool, Array[Int]))], id : Int, v : (Bool, Array[Int])) -> Unit {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      m[i] = (id, v)
+      return
+    }
+  }
+  m.push((id, v))
+}
+
+fn reads_remove(m : Array[(Int, (Bool, Array[Int]))], id : Int) -> Unit {
+  for i in 0..<m.length() {
+    if m[i].0 == id {
+      let last = m.length() - 1
+      m[i] = m[last]
+      let _ = m.pop()
+      return
+    }
+  }
+}
+
+/// The frame presented last, as the next is compared with it.
+pub struct Damage {
+  mut prev : Array[Double]
+  mut n : Int
+  mut w : Double
+  mut h : Double
+  mut scale : Double
+  mut r : Double
+  mut g : Double
+  mut b : Double
+  mut has : Bool
+  mut why : Int
+  mut seen : Array[String]
+  mut telling : Bool
+  mut groups : Array[(Int, Rect)]
+  mut group_reads : Array[(Int, (Bool, Array[Int]))]
+  mut covers : Array[Double]
+  mut unit_at : Array[Int]
+  mut hidden : Array[Bool]
+  mut shown : Array[Double]
+  mut occ_ok : Bool
+  mut occ_count : Int
+  mut occ_w : Double
+  mut occ_h : Double
+  mut occ_units : Int
+  mut occ_pieces : Int
+  mut occ_last : Int
+  mut occ_hid : Int
+  mut cover_unit : Int
+  mut cover_log : Array[Double]
+  mut replay : Array[Double]
+  mut shown_at : Array[Int]
+  mut occ_shown : Int
+  mut units : Array[Double]
+  mut prev_hash : Array[Int64]
+  mut prev_at : Array[Int]
+  mut cur_hash : Array[Int64]
+  mut cur_at : Array[Int]
+  mut stamp : Int
+  mut prev_stamp : Int
+  mut given_n : Int
+  mut heads_at : Array[(Int, Int)]
+  mut kept_read : Bool
+  mut kept_streams : Bool
+  mut kept_glass : Array[Rect]
+  mut kept_seg : Int
+  mut seg_now : Int
+  mut step_far : Double
+  mut step_ink : Double
+  mut step_known : Bool
+}
+
+/// Nothing presented yet: the next frame is drawn whole.
+pub fn Damage::new() -> Damage {
+  Damage::{
+    prev: [],
+    n: 0,
+    w: 0.0,
+    h: 0.0,
+    scale: 0.0,
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    has: false,
+    why: 0,
+    seen: [],
+    telling: false,
+    groups: [],
+    group_reads: [],
+    covers: make_doubles(cover_most * 4, 0.0),
+    unit_at: [],
+    hidden: [],
+    shown: [],
+    occ_ok: false,
+    occ_count: 0,
+    occ_w: 0.0,
+    occ_h: 0.0,
+    occ_units: 0,
+    occ_pieces: 0,
+    occ_last: -1,
+    occ_hid: 0,
+    cover_unit: -1,
+    cover_log: [],
+    replay: make_doubles(cover_most * 4, 0.0),
+    shown_at: [],
+    occ_shown: 0,
+    units: [],
+    prev_hash: [],
+    prev_at: [],
+    cur_hash: [],
+    cur_at: [],
+    stamp: 0,
+    prev_stamp: -1,
+    given_n: -1,
+    heads_at: [],
+    kept_read: false,
+    kept_streams: false,
+    kept_glass: [],
+    kept_seg: -1,
+    seg_now: -1,
+    step_far: 0.0,
+    step_ink: 0.0,
+    step_known: false,
+  }
+}
+
+/// The next frame drawn whole, whatever it is.
+pub fn Damage::forget(self : Damage) -> Unit {
+  self.has = false
+}
+
+/// The parts of the frame `inst` (`count` instances, a window `w` x `h` points at `scale`,
+/// its ground `r`, `g`, `b`) that differ from the frame given before it, in points.
+pub fn Damage::next(
+  self : Damage,
+  inst : Array[Double],
+  count : Int,
+  w : Double,
+  h : Double,
+  scale : Double,
+  r : Double,
+  g : Double,
+  b : Double,
+  groups~ : Bool = false,
+  known? : Array[(Double, Double, Double, Double)],
+) -> Array[(Double, Double, Double, Double)] {
+  let known_arr : Array[(Double, Double, Double, Double)] = match known {
+    Some(a) => a
+    None => []
+  }
+  let given = count
+  self.heads_at = []
+  let (inst, count) = if groups { self.units_of(inst, count) } else { (inst, count) }
+  self.given_n = given
+  self.stamp += 1
+  let same_frame = self.has &&
+    w == self.w &&
+    h == self.h &&
+    scale == self.scale &&
+    r == self.r &&
+    g == self.g &&
+    b == self.b
+  self.why = if !self.has {
+    1
+  } else if !same_frame {
+    3
+  } else {
+    0
+  }
+  self.seg_now = -1
+  self.step_far = 0.0
+  self.step_ink = 0.0
+  self.step_known = same_frame && known_arr.length() == 0
+  let out = if same_frame {
+    self.changed(inst, count, w, h, known_arr)
+  } else {
+    [(0.0, 0.0, -1.0, -1.0)]
+  }
+  if !(same_frame && out.length() == 0 && count == self.n) {
+    self.keep(inst, count, w, h, scale, r, g, b)
+  }
+  out
+}
+
+/// Group `id` of a host's (`n` instances in `inst`) kept, as far as it reaches wherever it is moved.
+pub fn Damage::group_set(self : Damage, id : Int, inst : Array[Double], n : Int) -> Unit {
+  let r = Rect::none()
+  let mut glass = false
+  let heads : Array[Int] = []
+  for k in 0..<n {
+    if kind_at(inst, k) == 13 {
+      self.reach_of(inst, k, r)
+      heads.push(inst[k * inst_size + 12].to_int())
+    } else {
+      reach(inst, k, r, cut=false)
+      glass = glass || is_glass(kind_at(inst, k))
+    }
+  }
+  groups_set(self.groups, id, r)
+  reads_set(self.group_reads, id, (glass, heads))
+  self.occ_ok = false
+}
+
+/// Group `id` let go.
+pub fn Damage::group_drop(self : Damage, id : Int) -> Unit {
+  groups_remove(self.groups, id)
+  reads_remove(self.group_reads, id)
+  self.occ_ok = false
+}
+
+/// The frame `inst` (`count` instances, headers among them) as its units.
+fn Damage::units_of(self : Damage, inst : Array[Double], count : Int) -> (Array[Double], Int) {
+  if self.units.length() < count * inst_size {
+    self.units = make_doubles(count * inst_size * 2, 0.0)
+  }
+  let u = self.units
+  let mut k = 0
+  let mut n = 0
+  while k < count {
+    let mut e = k
+    while e < count && kind_at(inst, e) != 13 {
+      e += 1
+    }
+    let run = if e < count { e - k + 1 } else { e - k }
+    blit_doubles(inst, k * inst_size, u, n * inst_size, run * inst_size)
+    n += run
+    if e < count {
+      self.heads_at.push((e, n - 1))
+      k = e + inst[e * inst_size + 14].to_int()
+    } else {
+      k = e
+    }
+  }
+  (u, n)
+}
+
+/// Fast path when only headers at `moved` changed.
+pub fn Damage::moved(
+  self : Damage,
+  inst : Array[Double],
+  count : Int,
+  w : Double,
+  h : Double,
+  scale : Double,
+  r : Double,
+  g : Double,
+  b : Double,
+  moved : Array[Int],
+  known? : Array[(Double, Double, Double, Double)],
+) -> Option[Array[(Double, Double, Double, Double)]] {
+  let known_arr : Array[(Double, Double, Double, Double)] = match known {
+    Some(a) => a
+    None => []
+  }
+  guard self.has &&
+    count == self.given_n &&
+    w == self.w &&
+    h == self.h &&
+    scale == self.scale &&
+    r == self.r &&
+    g == self.g &&
+    b == self.b else {
+    return None
+  }
+  let units : Array[Int] = []
+  for k in moved {
+    let mut u = -1
+    for p in self.heads_at {
+      if p.0 == k {
+        u = p.1
+        break
+      }
+    }
+    guard u >= 0 && u < self.n && kind_at(inst, k) == 13 else { return None }
+    units.push(u)
+  }
+  let prev = self.prev
+  if !self.kept_read {
+    if self.kept_seg < 0 {
+      self.kept_seg = pieces_from(prev, self.n)
+    }
+    self.kept_streams = false
+    for k in 0..<self.kept_seg {
+      let t = prev[k * inst_size + 20]
+      if t >= stream_tex_base && t < view_tex_base {
+        self.kept_streams = true
+        break
+      }
+    }
+    self.kept_glass = glass_groups(prev, self.kept_seg)
+    self.kept_read = true
+  }
+  if self.kept_streams {
+    return None
+  }
+  self.stamp += 1
+  self.why = 0
+  self.seen = []
+  self.step_far = 0.0
+  self.step_ink = 0.0
+  self.step_known = known_arr.length() == 0
+  let window = Rect::{ x0: 0.0, y0: 0.0, x1: w, y1: h }
+  let parts : Array[Rect] = []
+  let most_area = whole_share * w * h
+  for kr in known_arr {
+    let (x0, y0, x1, y1) = kr
+    let p = Rect::{ x0, y0, x1, y1 }
+    p.cut_to(window)
+    let _ = add_part(parts, p)
+  }
+  let was = Rect::none()
+  let now = Rect::none()
+  for i, k in moved {
+    let u = units[i]
+    if same_pair(prev, u, inst, k) {
+      continue
+    }
+    self.pair_step(prev, u, inst, k)
+    was.clear()
+    now.clear()
+    self.reach_of(prev, u, was)
+    was.cut_to(window)
+    blit_doubles(inst, k * inst_size, prev, u * inst_size, inst_size)
+    if u < self.prev_at.length() {
+      self.prev_at[u] = -1
+    }
+    self.reach_of(prev, u, now)
+    now.cut_to(window)
+    if !was.empty() && !now.empty() && was.near(now) {
+      was.add(now.x0, now.y0, now.x1, now.y1)
+      let _ = add_part(parts, was)
+    } else {
+      let _ = add_part(parts, was)
+      let _ = add_part(parts, now)
+    }
+  }
+  if parts.length() == 0 {
+    return Some([])
+  }
+  let groups = self.kept_glass
+  let mut grew = true
+  while grew {
+    grew = false
+    for gr in groups {
+      for p in parts {
+        if p.meets(gr) && !p.holds(gr.within(window)) {
+          let g = gr.within(window)
+          p.add(g.x0, g.y0, g.x1, g.y1)
+          grew = true
+        }
+      }
+      if grew {
+        settle(parts)
+        break
+      }
+    }
+  }
+  if parts_area(parts) > most_area {
+    self.why = 5
+    self.step_known = false
+    return Some([(0.0, 0.0, -1.0, -1.0)])
+  }
+  let res : Array[(Double, Double, Double, Double)] = []
+  for p in parts {
+    res.push((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0))
+  }
+  Some(res)
+}
+
+/// As far as any pixel of unit `k` of `a` reaches.
+fn Damage::reach_of(self : Damage, a : Array[Double], k : Int, into : Rect) -> Unit {
+  let o = k * inst_size
+  if kind_at(a, k) != 13 {
+    reach(a, k, into)
+    return
+  }
+  match groups_get(self.groups, a[o + 12].to_int()) {
+    Some(g) => {
+      if !g.empty() {
+        if !(a[o + 16] == 0.0 && a[o + 17] == 0.0 && a[o + 18] == 0.0 && a[o + 19] == 0.0) {
+          let x0 = dmax(g.x0 + a[o], a[o + 16] - reach_pad)
+          let y0 = dmax(g.y0 + a[o + 1], a[o + 17] - reach_pad)
+          let x1 = dmin(g.x1 + a[o], a[o + 18] + reach_pad)
+          let y1 = dmin(g.y1 + a[o + 1], a[o + 19] + reach_pad)
+          if x0 < x1 && y0 < y1 {
+            into.add(x0, y0, x1, y1)
+          }
+        } else {
+          into.add(g.x0 + a[o], g.y0 + a[o + 1], g.x1 + a[o], g.y1 + a[o + 1])
+        }
+      }
+    }
+    None => into.add(-1.0e9, -1.0e9, 1.0e9, 1.0e9)
+  }
+}
+
+/// Why the last frame was drawn whole: 0 no, 1 none before it, 3 frame changed, 5 > half window.
+pub fn Damage::why(self : Damage) -> Int {
+  self.why
+}
+
+/// Whether what changed is said (Damage::told).
+pub fn Damage::tell(self : Damage, on : Bool) -> Unit {
+  self.telling = on
+}
+
+/// Whether what changed is said.
+pub fn Damage::telling(self : Damage) -> Bool {
+  self.telling
+}
+
+/// While told to: the first instances that changed in the last frame compared.
+pub fn Damage::told(self : Damage) -> String {
+  let n = self.seen.length()
+  let lim = if n > 6 { 6 } else { n }
+  let mut s = n.to_string() + " changed; the first: "
+  for i in 0..<lim {
+    if i > 0 {
+      s = s + "; "
+    }
+    s = s + self.seen[i]
+  }
+  s
+}
+
+fn Damage::keep(
+  self : Damage,
+  inst : Array[Double],
+  count : Int,
+  w : Double,
+  h : Double,
+  scale : Double,
+  r : Double,
+  g : Double,
+  b : Double,
+) -> Unit {
+  let len = count * inst_size
+  if self.prev.length() < len {
+    self.prev = make_doubles(len * 2, 0.0)
+  }
+  blit_doubles(inst, 0, self.prev, 0, len)
+  let was_hash = self.prev_hash
+  let was_at = self.prev_at
+  self.prev_hash = self.cur_hash
+  self.prev_at = self.cur_at
+  self.cur_hash = was_hash
+  self.cur_at = was_at
+  self.prev_stamp = self.stamp
+  self.kept_read = false
+  self.kept_seg = self.seg_now
+  self.n = count
+  self.w = w
+  self.h = h
+  self.scale = scale
+  self.r = r
+  self.g = g
+  self.b = b
+  self.has = true
+}
+
+/// What the frame compared last moved by.
+pub fn Damage::step(self : Damage) -> Option[(Double, Double)] {
+  if self.step_known {
+    Some((self.step_far, self.step_ink))
+  } else {
+    None
+  }
+}
+
+fn slot_is(kind : Int, j : Int) -> Int {
+  if j < 4 || j == 32 {
+    2
+  } else if j == 5 || j == 20 || j == 35 {
+    3
+  } else if j == 6 && kind == 11 {
+    3
+  } else if j < 8 {
+    0
+  } else if j < 12 {
+    1
+  } else if j < 16 {
+    if kind == 0 {
+      1
+    } else if kind == 2 {
+      0
+    } else if kind == 10 {
+      2
+    } else {
+      3
+    }
+  } else if j < 20 {
+    0
+  } else if j < 24 {
+    if kind == 0 || kind == 5 || kind == 6 {
+      0
+    } else if kind == 4 {
+      if j == 22 { 3 } else { 1 }
+    } else {
+      3
+    }
+  } else if (j >= 28 && j < 32) || (j >= 48 && j < 52) {
+    1
+  } else {
+    0
+  }
+}
+
+fn Damage::pair_step(self : Damage, a : Array[Double], ka : Int, b : Array[Double], kb : Int) -> Unit {
+  let oa = ka * inst_size
+  let ob = kb * inst_size
+  let kind = kind_at(b, kb)
+  if kind_at(a, ka) != kind || kind == 12 || kind == 13 {
+    self.step_known = false
+    return
+  }
+  let mut far = 0.0
+  let mut ink = 0.0
+  let mut any = false
+  for j in 0..<inst_size {
+    let u = a[oa + j]
+    let v = b[ob + j]
+    if u == v {
+      continue
+    }
+    any = true
+    let sl = slot_is(kind, j)
+    if sl == 0 {
+      if u.abs() > 1.0e6 || v.abs() > 1.0e6 {
+        self.step_known = false
+        return
+      }
+      far = dmax(far, (v - u).abs())
+    } else if sl == 1 {
+      ink = dmax(ink, (v - u).abs())
+    } else if sl == 2 {
+      ()
+    } else {
+      self.step_known = false
+      return
+    }
+  }
+  if !any {
+    self.step_known = false
+    return
+  }
+  let x0 = (b[ob] - a[oa]).abs()
+  let y0 = (b[ob + 1] - a[oa + 1]).abs()
+  let x1 = (b[ob] + b[ob + 2] - a[oa] - a[oa + 2]).abs()
+  let y1 = (b[ob + 1] + b[ob + 3] - a[oa + 1] - a[oa + 3]).abs()
+  far = dmax(far, dmax(dmax(x0, y0), dmax(x1, y1)))
+  let (w, h) = (b[ob + 2], b[ob + 3])
+  let mut reach = 0.0
+  if kind == 10 {
+    for e in 0..<2 {
+      let sx = b[ob + 12 + 2 * e]
+      let sy = b[ob + 13 + 2 * e]
+      far = dmax(
+        far,
+        dmax(((sx - a[oa + 12 + 2 * e]) * w).abs(), ((sy - a[oa + 13 + 2 * e]) * h).abs()),
+      )
+      let dx = b[ob] + sx * w - b[ob + 33]
+      let dy = b[ob + 1] + sy * h - b[ob + 34]
+      reach = dmax(reach, (dx * dx + dy * dy).sqrt() + b[ob + 4])
+    }
+  } else {
+    let dx = dmax((b[ob] - b[ob + 33]).abs(), (b[ob] + w - b[ob + 33]).abs())
+    let dy = dmax((b[ob + 1] - b[ob + 34]).abs(), (b[ob + 1] + h - b[ob + 34]).abs())
+    reach = (dx * dx + dy * dy).sqrt()
+  }
+  let round = 2.0 * 3.141592653589793
+  let turn = (b[ob + 32] - a[oa + 32]).abs()
+  if turn > 0.0 {
+    let t = turn - (turn / round).floor() * round
+    far = dmax(far, dmin(t, round - t) * reach)
+  }
+  self.step_far = dmax(self.step_far, far)
+  self.step_ink = dmax(self.step_ink, ink)
+}
+
+fn same_pair(a : Array[Double], ka : Int, b : Array[Double], kb : Int) -> Bool {
+  let oa = ka * inst_size
+  let ob = kb * inst_size
+  for j in 0..<inst_size {
+    if a[oa + j] != b[ob + j] {
+      return false
+    }
+  }
+  true
+}
+
+fn seg_slot_at(i : Int) -> Int {
+  if i == 0 { 0 }
+  else if i == 1 { 2 }
+  else if i == 2 { 3 }
+  else if i == 3 { 4 }
+  else if i == 4 { 6 }
+  else { 7 }
+}
+
+fn same_pieces(
+  a : Array[Double],
+  seg_a : Int,
+  count_a : Int,
+  b : Array[Double],
+  seg_b : Int,
+  count_b : Int,
+  first : Int,
+  n : Int,
+) -> Bool {
+  for i in first..<(first + n) {
+    let ia = seg_a + i / 6
+    let ib = seg_b + i / 6
+    if ia >= count_a || ib >= count_b {
+      return false
+    }
+    let oa = ia * inst_size + seg_slot_at(i % 6) * 4
+    let ob = ib * inst_size + seg_slot_at(i % 6) * 4
+    for j in 0..<4 {
+      if a[oa + j] != b[ob + j] {
+        return false
+      }
+    }
+  }
+  true
+}
+
+fn fnv_offset_basis() -> Int64 {
+  (0xCBF2.to_int64() << 48) | (0x9CE4.to_int64() << 32) | (0x8422.to_int64() << 16) | 0x2325.to_int64()
+}
+
+fn fnv_prime() -> Int64 {
+  (0x0100.to_int64() << 32) | 0x01B3.to_int64()
+}
+
+fn inst_hash(a : Array[Double], k : Int) -> Int64 {
+  let mut h = fnv_offset_basis()
+  let prime = fnv_prime()
+  let o = k * inst_size
+  guard o + inst_size <= a.length() else {
+    halt::saying("damage: an instance past its frame", "damage.pion:inst_hash")
+  }
+  for j in 0..<inst_size {
+    h = (h ^ a[o + j].to_bits()) * prime
+  }
+  h
+}
+
+fn Damage::hash_at(self : Damage, prev : Bool, inst : Array[Double], k : Int) -> Int64 {
+  let stamp = if prev { self.prev_stamp } else { self.stamp }
+  if prev {
+    if k >= self.prev_at.length() {
+      self.prev_at = grown_at(self.prev_at, k)
+      self.prev_hash = grown_hash(self.prev_hash, k)
+    }
+  } else if k >= self.cur_at.length() {
+    self.cur_at = grown_at(self.cur_at, k)
+    self.cur_hash = grown_hash(self.cur_hash, k)
+  }
+  let at = if prev { self.prev_at } else { self.cur_at }
+  let hs = if prev { self.prev_hash } else { self.cur_hash }
+  if at[k] == stamp {
+    return hs[k]
+  }
+  let h = inst_hash(inst, k)
+  hs[k] = h
+  at[k] = stamp
+  h
+}
+
+fn grown_at(a : Array[Int], k : Int) -> Array[Int] {
+  let b = make_ints((k + 1) * 2, -1)
+  for i in 0..<a.length() {
+    b[i] = a[i]
+  }
+  b
+}
+
+fn grown_hash(a : Array[Int64], k : Int) -> Array[Int64] {
+  let b = make_i64s((k + 1) * 2, 0.to_int64())
+  for i in 0..<a.length() {
+    b[i] = a[i]
+  }
+  b
+}
+
+fn unmatched(ha : Array[Int64], hb : Array[Int64]) -> Int {
+  let sa = copy_i64s(ha)
+  let sb = copy_i64s(hb)
+  sort_i64s(sa)
+  sort_i64s(sb)
+  let mut i = 0
+  let mut j = 0
+  let mut same = 0
+  while i < sa.length() && j < sb.length() {
+    if sa[i] == sb[j] {
+      same += 1
+      i += 1
+      j += 1
+    } else if sa[i] < sb[j] {
+      i += 1
+    } else {
+      j += 1
+    }
+  }
+  sa.length() + sb.length() - 2 * same
+}
+
+fn having(h : Array[Int64], sorted : Array[Int64]) -> Array[Int] {
+  let out : Array[Int] = []
+  for i, x in h {
+    let mut lo = 0
+    let mut hi = sorted.length()
+    while lo < hi {
+      let mid = (lo + hi) / 2
+      if sorted[mid] < x {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if lo < sorted.length() && sorted[lo] == x {
+      out.push(i)
+    }
+  }
+  out
+}
+
+fn match_between(ha : Array[Int64], hb : Array[Int64]) -> Option[Array[(Int, Int)]] {
+  let n = ha.length()
+  let m = hb.length()
+  if unmatched(ha, hb) > most_edits {
+    return None
+  }
+  let most = if n + m < most_edits { n + m } else { most_edits }
+  let off = most + 1
+  let v = make_ints(2 * off + 1, 0)
+  let trace : Array[Array[Int]] = []
+  let mut found = -1
+  for d in 0..=most {
+    trace.push(copy_ints(v))
+    let mut k = -d
+    while k <= d {
+      let mut x = if k == -d || (k != d && v[off + k - 1] < v[off + k + 1]) {
+        v[off + k + 1]
+      } else {
+        v[off + k - 1] + 1
+      }
+      let mut y = x - k
+      while x < n && y < m && ha[x] == hb[y] {
+        x += 1
+        y += 1
+      }
+      v[off + k] = x
+      if x >= n && y >= m {
+        found = d
+        break
+      }
+      k += 2
+    }
+    if found >= 0 {
+      break
+    }
+  }
+  if found < 0 {
+    return None
+  }
+  let out : Array[(Int, Int)] = []
+  let mut x = n
+  let mut y = m
+  let mut d = found
+  while d >= 0 {
+    let tv = trace[d]
+    let k = x - y
+    let pk = if k == -d || (k != d && tv[off + k - 1] < tv[off + k + 1]) { k + 1 } else { k - 1 }
+    let px = if d == 0 { 0 } else { tv[off + pk] }
+    let py = if d == 0 { 0 } else { px - pk }
+    while x > px && y > py {
+      out.push((x - 1, y - 1))
+      x -= 1
+      y -= 1
+    }
+    if d > 0 {
+      if x == px {
+        out.push((-1, py))
+      } else {
+        out.push((px, -1))
+      }
+    }
+    x = px
+    y = py
+    d -= 1
+  }
+  Some(out)
+}
+
+fn kind_at(a : Array[Double], k : Int) -> Int {
+  (a[k * inst_size + 5] + 0.5).to_int()
+}
+
+fn is_glass(kind : Int) -> Bool {
+  kind == 5 || kind == 6 || kind == 7
+}
+
+fn glass_rim(a : Array[Double], o : Int) -> Double {
+  dmax(a[o + 23], 0.0)
+}
+
+fn glass_margin(a : Array[Double], k : Int) -> Double {
+  let o = k * inst_size
+  let liquid = kind_at(a, k) == 6
+  if a[o + 7] < 0.0 {
+    return 2.0 + reach_pad
+  }
+  3.0 * a[o + 7] +
+  (if liquid { a[o + 21] * (1.0 + a[o + 22]) + glass_rim(a, o) } else { 0.0 }) +
+  2.0 +
+  reach_pad
+}
+
+fn glass_box(a : Array[Double], k : Int, into : Rect) -> Unit {
+  let o = k * inst_size
+  if kind_at(a, k) == 6 {
+    let e = glass_rim(a, o)
+    into.add(a[o] - e, a[o + 1] - e, a[o] + a[o + 2] + e, a[o + 1] + a[o + 3] + e)
+  } else {
+    into.add(
+      dmax(a[o], a[o + 16]),
+      dmax(a[o + 1], a[o + 17]),
+      dmin(a[o] + a[o + 2], a[o + 18]),
+      dmin(a[o + 1] + a[o + 3], a[o + 19]),
+    )
+  }
+}
+
+fn reach(a : Array[Double], k : Int, into : Rect, cut~ : Bool = true) -> Unit {
+  let o = k * inst_size
+  let kind = kind_at(a, k)
+  if kind == 12 {
+    return
+  }
+  if is_glass(kind) {
+    let m = glass_margin(a, k)
+    let g = Rect::none()
+    glass_box(a, k, g)
+    if !g.empty() {
+      into.add(g.x0 - m, g.y0 - m, g.x1 + m, g.y1 + m)
+    }
+    return
+  }
+  let grow = reach_pad + (if kind == 2 { 3.0 * a[o + 7] + 2.0 } else { 0.0 })
+  let mut x0 = a[o] - grow
+  let mut y0 = a[o + 1] - grow
+  let mut x1 = a[o] + a[o + 2] + grow
+  let mut y1 = a[o + 1] + a[o + 3] + grow
+  let turned = a[o + 32] != 0.0
+  if turned {
+    let px = a[o + 33]
+    let py = a[o + 34]
+    let dx = dmax((x0 - px).abs(), (x1 - px).abs())
+    let dy = dmax((y0 - py).abs(), (y1 - py).abs())
+    let rr = (dx * dx + dy * dy).sqrt()
+    x0 = px - rr
+    y0 = py - rr
+    x1 = px + rr
+    y1 = py + rr
+  }
+  if cut && (!turned || a[o + 35] > 0.5) {
+    x0 = dmax(x0, a[o + 16] - reach_pad)
+    y0 = dmax(y0, a[o + 17] - reach_pad)
+    x1 = dmin(x1, a[o + 18] + reach_pad)
+    y1 = dmin(y1, a[o + 19] + reach_pad)
+  }
+  into.add(x0, y0, x1, y1)
+}
+
+fn pieces_from(a : Array[Double], count : Int) -> Int {
+  let mut d = count
+  while d > 0 && kind_at(a, d - 1) == 12 {
+    d -= 1
+  }
+  d
+}
+
+fn Damage::changed(
+  self : Damage,
+  inst : Array[Double],
+  count : Int,
+  w : Double,
+  h : Double,
+  known : Array[(Double, Double, Double, Double)],
+) -> Array[(Double, Double, Double, Double)] {
+  let prev = self.prev
+  let n_old = self.n
+  self.seen = []
+  let window = Rect::{ x0: 0.0, y0: 0.0, x1: w, y1: h }
+  let parts : Array[Rect] = []
+  let most_area = whole_share * w * h
+  for r in known {
+    let (x0, y0, x1, y1) = r
+    let p = Rect::{ x0, y0, x1, y1 }
+    p.cut_to(window)
+    if add_part(parts, p) && parts_area(parts) > most_area {
+      self.why = 5
+      self.step_known = false
+      return [(0.0, 0.0, -1.0, -1.0)]
+    }
+  }
+  let seg = pieces_from(inst, count)
+  self.seg_now = seg
+  let seg_old = if self.kept_seg >= 0 { self.kept_seg } else { pieces_from(prev, n_old) }
+  let mut whole = false
+  let same = fn(k_old : Int, k : Int) -> Bool {
+    let o = k * inst_size
+    if inst[o + 20] >= stream_tex_base && inst[o + 20] < view_tex_base {
+      return false
+    }
+    if !same_pair(prev, k_old, inst, k) {
+      return false
+    }
+    kind_at(inst, k) != 11 ||
+    inst[o + 13] <= 0.0 ||
+    same_pieces(prev, seg_old, n_old, inst, seg, count, inst[o + 12].to_int(), inst[o + 13].to_int())
+  }
+  let was = Rect::none()
+  let now = Rect::none()
+  let changed = fn(k_old : Int, k : Int) -> Unit {
+    if self.telling && self.seen.length() < 400 && k >= 0 {
+      self.seen.push(
+        "#" + k.to_string() + " kind " + inst[k * inst_size + 5].to_string() +
+        " at " + inst[k * inst_size].to_string() + "," + inst[k * inst_size + 1].to_string(),
+      )
+    }
+    if k_old < 0 || k < 0 {
+      self.step_known = false
+    } else if self.step_known {
+      self.pair_step(prev, k_old, inst, k)
+    }
+    was.clear()
+    now.clear()
+    if k_old >= 0 {
+      self.reach_of(prev, k_old, was)
+      was.cut_to(window)
+    }
+    if k >= 0 {
+      self.reach_of(inst, k, now)
+      now.cut_to(window)
+    }
+    let grew = if !was.empty() && !now.empty() && was.near(now) {
+      was.add(now.x0, now.y0, now.x1, now.y1)
+      add_part(parts, was)
+    } else {
+      let a = add_part(parts, was)
+      add_part(parts, now) || a
+    }
+    if grew && parts_area(parts) > most_area {
+      whole = true
+    }
+  }
+  if seg == seg_old {
+    for k in 0..<seg {
+      if whole {
+        break
+      }
+      if !same(k, k) {
+        changed(k, k)
+      }
+    }
+  } else {
+    let least = if seg < seg_old { seg } else { seg_old }
+    let mut head = 0
+    while head < least && same(head, head) {
+      head += 1
+    }
+    let mut tail = 0
+    while tail < least - head && same(seg_old - 1 - tail, seg - 1 - tail) {
+      tail += 1
+    }
+    let n_a = seg_old - tail - head
+    let n_b = seg - tail - head
+    let ha : Array[Int64] = []
+    for i in 0..<n_a {
+      ha.push(self.hash_at(true, prev, head + i))
+    }
+    let hb : Array[Int64] = []
+    for i in 0..<n_b {
+      hb.push(self.hash_at(false, inst, head + i))
+    }
+    let sa = copy_i64s(ha)
+    let sb = copy_i64s(hb)
+    sort_i64s(sa)
+    sort_i64s(sb)
+    let in_a = having(ha, sb)
+    let in_b = having(hb, sa)
+    let mut x = 0
+    for i in 0..<n_a {
+      if whole {
+        break
+      }
+      if x < in_a.length() && in_a[x] == i {
+        x += 1
+      } else {
+        changed(head + i, -1)
+      }
+    }
+    let mut y = 0
+    for j in 0..<n_b {
+      if whole {
+        break
+      }
+      if y < in_b.length() && in_b[y] == j {
+        y += 1
+      } else {
+        changed(-1, head + j)
+      }
+    }
+    if !whole {
+      let ra : Array[Int64] = []
+      for i in 0..<in_a.length() {
+        ra.push(ha[in_a[i]])
+      }
+      let rb : Array[Int64] = []
+      for j in 0..<in_b.length() {
+        rb.push(hb[in_b[j]])
+      }
+      match match_between(ra, rb) {
+        Some(ps) => {
+          for p in ps {
+            if whole {
+              break
+            }
+            let ko = if p.0 < 0 { -1 } else { head + in_a[p.0] }
+            let kn = if p.1 < 0 { -1 } else { head + in_b[p.1] }
+            if ko < 0 || kn < 0 || !same(ko, kn) {
+              changed(ko, kn)
+            }
+          }
+        }
+        None => {
+          for i in in_a {
+            if whole {
+              break
+            }
+            changed(head + i, -1)
+          }
+          for j in in_b {
+            if whole {
+              break
+            }
+            changed(-1, head + j)
+          }
+        }
+      }
+    }
+  }
+  if whole {
+    self.why = 5
+    self.step_known = false
+    return [(0.0, 0.0, -1.0, -1.0)]
+  }
+  if parts.length() == 0 {
+    return []
+  }
+  let groups = glass_groups(inst, seg)
+  let mut grew = true
+  while grew {
+    grew = false
+    for gr in groups {
+      for p in parts {
+        if p.meets(gr) && !p.holds(gr.within(window)) {
+          if self.telling {
+            self.seen.push(
+              "glass " + gr.x0.to_string() + "," + gr.y0.to_string() +
+              " to " + gr.x1.to_string() + "," + gr.y1.to_string(),
+            )
+          }
+          let g = gr.within(window)
+          p.add(g.x0, g.y0, g.x1, g.y1)
+          grew = true
+        }
+      }
+      if grew {
+        settle(parts)
+        break
+      }
+    }
+  }
+  if parts_area(parts) > most_area {
+    self.why = 5
+    self.step_known = false
+    return [(0.0, 0.0, -1.0, -1.0)]
+  }
+  let res : Array[(Double, Double, Double, Double)] = []
+  for p in parts {
+    res.push((p.x0, p.y0, p.x1 - p.x0, p.y1 - p.y0))
+  }
+  res
+}
+
+fn parts_area(parts : Array[Rect]) -> Double {
+  let mut area = 0.0
+  for p in parts {
+    area += (p.x1 - p.x0) * (p.y1 - p.y0)
+  }
+  area
+}
+
+fn add_part(parts : Array[Rect], r : Rect) -> Bool {
+  if r.empty() {
+    return false
+  }
+  for p in parts {
+    if p.holds(r) {
+      return false
+    }
+  }
+  parts.push(Rect::{ x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 })
+  settle(parts)
+  true
+}
+
+fn settle(parts : Array[Rect]) -> Unit {
+  merge_near(parts)
+  if parts.length() > most_parts {
+    fewer(parts)
+    merge_near(parts)
+  }
+}
+
+fn merge_near(parts : Array[Rect]) -> Unit {
+  let mut merged = true
+  while merged {
+    merged = false
+    for i in 0..<parts.length() {
+      for j in (i + 1)..<parts.length() {
+        if parts[i].near(parts[j]) {
+          let b = remove_rect_at(parts, j)
+          parts[i].add(b.x0, b.y0, b.x1, b.y1)
+          merged = true
+          break
+        }
+      }
+      if merged {
+        break
+      }
+    }
+  }
+}
+
+fn fewer(parts : Array[Rect]) -> Unit {
+  while parts.length() > most_parts {
+    let mut bi = 0
+    let mut bj = 1
+    let mut best = 1.0e300
+    for i in 0..<parts.length() {
+      for j in (i + 1)..<parts.length() {
+        let a = parts[i]
+        let b = parts[j]
+        let u = (dmax(a.x1, b.x1) - dmin(a.x0, b.x0)) * (dmax(a.y1, b.y1) - dmin(a.y0, b.y0))
+        let grows = u - a.area() - b.area()
+        if grows < best {
+          best = grows
+          bi = i
+          bj = j
+        }
+      }
+    }
+    let b = remove_rect_at(parts, bj)
+    parts[bi].add(b.x0, b.y0, b.x1, b.y1)
+  }
+}
+
+fn glass_groups(a : Array[Double], seg : Int) -> Array[Rect] {
+  let ids : Array[Double] = []
+  let boxes : Array[Rect] = []
+  let margins : Array[Double] = []
+  for k in 0..<seg {
+    let id = a[k * inst_size + 20]
+    if id >= 0.0 || !is_glass(kind_at(a, k)) {
+      continue
+    }
+    let mut at = -1
+    for j, x in ids {
+      if x == id {
+        at = j
+        break
+      }
+    }
+    if at < 0 {
+      ids.push(id)
+      boxes.push(Rect::none())
+      margins.push(0.0)
+      at = ids.length() - 1
+    }
+    glass_box(a, k, boxes[at])
+    margins[at] = dmax(margins[at], glass_margin(a, k))
+  }
+  let out : Array[Rect] = []
+  for j, bx in boxes {
+    if !bx.empty() {
+      let m = margins[j]
+      out.push(Rect::{ x0: bx.x0 - m, y0: bx.y0 - m, x1: bx.x1 + m, y1: bx.y1 + m })
+    }
+  }
+  out
+}
+
+fn dmax(a : Double, b : Double) -> Double {
+  if a > b { a } else { b }
+}
+
+fn dmin(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+fn Damage::clone_state(self : Damage) -> Damage {
+  Damage::{
+    prev: self.prev,
+    n: self.n,
+    w: self.w,
+    h: self.h,
+    scale: self.scale,
+    r: self.r,
+    g: self.g,
+    b: self.b,
+    has: self.has,
+    why: self.why,
+    seen: self.seen,
+    telling: self.telling,
+    groups: self.groups,
+    group_reads: self.group_reads,
+    covers: self.covers,
+    unit_at: self.unit_at,
+    hidden: self.hidden,
+    shown: self.shown,
+    occ_ok: self.occ_ok,
+    occ_count: self.occ_count,
+    occ_w: self.occ_w,
+    occ_h: self.occ_h,
+    occ_units: self.occ_units,
+    occ_pieces: self.occ_pieces,
+    occ_last: self.occ_last,
+    occ_hid: self.occ_hid,
+    cover_unit: self.cover_unit,
+    cover_log: self.cover_log,
+    replay: self.replay,
+    shown_at: self.shown_at,
+    occ_shown: self.occ_shown,
+    units: self.units,
+    prev_hash: self.prev_hash,
+    prev_at: self.prev_at,
+    cur_hash: self.cur_hash,
+    cur_at: self.cur_at,
+    stamp: self.stamp,
+    prev_stamp: self.prev_stamp,
+    given_n: self.given_n,
+    heads_at: self.heads_at,
+    kept_read: self.kept_read,
+    kept_streams: self.kept_streams,
+    kept_glass: self.kept_glass,
+    kept_seg: self.kept_seg,
+    seg_now: self.seg_now,
+    step_far: self.step_far,
+    step_ink: self.step_ink,
+    step_known: self.step_known,
+  }
+}
+
+/// What it compares with put aside (a window's, as another window of the same run is drawn).
+pub fn Damage::window_take(self : Damage) -> () -> Unit {
+  let held = self.clone_state()
+  fn() -> Unit { self.window_put(held) }
+}
+
+/// As it is made (a window made anew): nothing presented yet.
+pub fn Damage::window_fresh(self : Damage) -> Unit {
+  self.window_put(Damage::new())
+}
+
+fn Damage::window_put(self : Damage, o : Damage) -> Unit {
+  self.prev = o.prev
+  self.n = o.n
+  self.w = o.w
+  self.h = o.h
+  self.scale = o.scale
+  self.r = o.r
+  self.g = o.g
+  self.b = o.b
+  self.has = o.has
+  self.why = o.why
+  self.seen = o.seen
+  self.telling = o.telling
+  self.groups = o.groups
+  self.group_reads = o.group_reads
+  self.covers = o.covers
+  self.unit_at = o.unit_at
+  self.hidden = o.hidden
+  self.shown = o.shown
+  self.occ_ok = o.occ_ok
+  self.occ_count = o.occ_count
+  self.occ_w = o.occ_w
+  self.occ_h = o.occ_h
+  self.occ_units = o.occ_units
+  self.occ_pieces = o.occ_pieces
+  self.occ_last = o.occ_last
+  self.occ_hid = o.occ_hid
+  self.cover_unit = o.cover_unit
+  self.cover_log = o.cover_log
+  self.replay = o.replay
+  self.shown_at = o.shown_at
+  self.occ_shown = o.occ_shown
+  self.units = o.units
+  self.prev_hash = o.prev_hash
+  self.prev_at = o.prev_at
+  self.cur_hash = o.cur_hash
+  self.cur_at = o.cur_at
+  self.stamp = o.stamp
+  self.prev_stamp = o.prev_stamp
+  self.given_n = o.given_n
+  self.heads_at = o.heads_at
+  self.kept_read = o.kept_read
+  self.kept_streams = o.kept_streams
+  self.kept_glass = o.kept_glass
+  self.kept_seg = o.kept_seg
+  self.seg_now = o.seg_now
+  self.step_far = o.step_far
+  self.step_ink = o.step_ink
+  self.step_known = o.step_known
+}

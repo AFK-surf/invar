@@ -1,0 +1,142 @@
+fn bytes_eq(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  for i in 0..<a.length() {
+    if a[i].to_int() != b[i].to_int() {
+      return false
+    }
+  }
+  true
+}
+
+fn bytes_of(xs : Array[Int]) -> Bytes {
+  let sb = StringBuilder::new()
+  for x in xs {
+    sb.write_byte(x as Byte)
+  }
+  sb.to_string().to_bytes()
+}
+
+test "base64 written and read back, both alphabets" {
+  debug_assert(base64("".to_bytes()) == "", "empty")
+  debug_assert(base64("f".to_bytes()) == "Zg==", "f")
+  debug_assert(base64("fo".to_bytes()) == "Zm8=", "fo")
+  debug_assert(base64("foo".to_bytes()) == "Zm9v", "foo")
+  debug_assert(base64("foobar".to_bytes()) == "Zm9vYmFy", "foobar")
+  debug_assert(bytes_eq(from_base64("Zm9vYmFy"), "foobar".to_bytes()), "decode foobar")
+  debug_assert(bytes_eq(from_base64("Zm9v\nYmFy=="), "foobar".to_bytes()), "decode with newline")
+  let fbff = bytes_of([0xFB, 0xFF])
+  debug_assert(base64(fbff) == "+/8=", "encode +/8=")
+  debug_assert(bytes_eq(from_base64("-_8"), fbff), "decode url-safe")
+  debug_assert(bytes_eq(from_base64("+/8="), fbff), "decode std")
+}
+
+test "base64 read exactly" {
+  match from_base64_exact("Zm9v\r\nYmFy") {
+    Some(b) => debug_assert(bytes_eq(b, "foobar".to_bytes()), "exact foobar")
+    None => debug_assert(false, "expected Some")
+  }
+  match from_base64_exact("Zm8=") {
+    Some(b) => debug_assert(bytes_eq(b, "fo".to_bytes()), "exact fo")
+    None => debug_assert(false, "expected Some")
+  }
+  debug_assert(from_base64_exact("-_8").is_none(), "url-safe refused")
+  debug_assert(from_base64_exact("Zm9v!").is_none(), "invalid char refused")
+}
+
+test "hex and binary varint" {
+  let raw = bytes_of([0x00, 0x9F, 0xFF])
+  debug_assert(hex(raw) == "009fff", "hex encode")
+  debug_assert(bytes_eq(from_hex("009fFF"), raw), "hex decode")
+  debug_assert(bytes_eq(from_hex("abc"), bytes_of([0xAB])), "hex odd len")
+
+  let enc = encode_uleb128(624485.to_int64())
+  debug_assert(bytes_eq(enc, bytes_of([0xE5, 0x8E, 0x26])), "uleb128 encode")
+  match decode_uleb128(enc, 0) {
+    Some((v, next)) => {
+      debug_assert(v == 624485.to_int64() && next == 3, "uleb128 decode")
+    }
+    None => debug_assert(false, "expected Some")
+  }
+  let u32b = bytes_of([0x78, 0x56, 0x34, 0x12])
+  debug_assert(read_u32_le(u32b, 0) == 0x12345678.to_int64(), "u32 le")
+  debug_assert(read_u32_be(u32b, 0) == 0x78563412.to_int64(), "u32 be")
+}
+
+test "URI encodeURIComponent and decodeURIComponent" {
+  debug_assert(
+    encode_uri_component("a b/会?x=1&y=(2)") == "a%20b%2F%E4%BC%9A%3Fx%3D1%26y%3D(2)",
+    "encode_uri_component",
+  )
+  match decode_uri_component("a%20b%2F%E4%BC%9A") {
+    Some(s) => debug_assert(s == "a b/会", "decode_uri_component")
+    None => debug_assert(false, "expected Some")
+  }
+  debug_assert(decode_uri_component("100%").is_none(), "trailing %")
+  debug_assert(decode_uri_component("%zz").is_none(), "bad hex")
+  debug_assert(decode_uri_component("%E4%BC").is_none(), "incomplete utf8")
+  debug_assert(percent_decoded("50%25 off %zz") == "50% off %zz", "lenient 1")
+  debug_assert(percent_decoded("%E4%BC") == "%E4%BC", "lenient 2")
+  debug_assert(percent_decoded("plain") == "plain", "lenient 3")
+}
+
+test "text bytes UTF-8 and UTF-16" {
+  debug_assert(looks_like_text("纯文本 plain".to_bytes()), "utf8 looks like text")
+  debug_assert(!looks_like_text(bytes_of([0x00, 0x01, 0x02])), "nul not text")
+  debug_assert(!looks_like_text(bytes_of([0xFF, 0xFE])), "invalid utf8 not text")
+  debug_assert(utf8_text("会议".to_bytes(), 100) == "会议", "utf8 whole")
+  debug_assert(utf8_text("会议".to_bytes(), 4) == "会\xEF\xBF\xBD", "utf8 split")
+  debug_assert(utf8_text(bytes_of([0x61, 0xFF, 0x62]), 100) == "a\xEF\xBF\xBDb", "utf8 invalid byte")
+  let half = "ab会".to_bytes()
+  debug_assert(utf8_end(half, 0, 4, true) == 2, "utf8_end drop tail")
+  debug_assert(utf8_end(half, 0, 4, false) == 4, "utf8_end keep")
+  debug_assert(utf8_end(half, 0, 5, true) == 5, "utf8_end whole")
+  debug_assert(utf16_text(bytes_of([0xFF, 0xFE, 0x61, 0x00, 0x1A, 0x4F]), 2, true) == "a会", "utf16 le")
+  debug_assert(utf16_text(bytes_of([0x00, 0x61, 0x4F, 0x1A, 0xD8, 0x00]), 0, false) == "a会\xEF\xBF\xBD", "utf16 be lone surrogate")
+}
+
+test "CSV, TSV and pretty JSON" {
+  let rows = parse_csv("a,\"b,c\",\"d \"\"e\"\"\"\r\n1,2\n\n3", 44, 10)
+  debug_assert(rows.length() == 4, "csv row count")
+  debug_assert(rows[0][0] == "a" && rows[0][1] == "b,c" && rows[0][2] == "d \"e\"", "csv row 0")
+  debug_assert(rows[1][0] == "1" && rows[1][1] == "2", "csv row 1")
+  debug_assert(rows[2].length() == 1 && rows[2][0] == "", "csv row 2")
+  debug_assert(rows[3][0] == "3", "csv row 3")
+
+  let tsv = parse_csv("x\ty\n1\t2\n3\t4", 9, 2)
+  debug_assert(tsv.length() == 2 && tsv[0][1] == "y" && tsv[1][1] == "2", "tsv limit 2")
+
+  let v = JObject([
+    ("a", JInt(1)),
+    ("b", JArray([JBool(true), JNull])),
+    ("c", JObject([])),
+    ("d", JArray([])),
+  ])
+  debug_assert(
+    pretty_json(v) == "{\n  \"a\": 1,\n  \"b\": [\n    true,\n    null\n  ],\n  \"c\": {},\n  \"d\": []\n}",
+    "pretty_json",
+  )
+}
+
+test "subtitles SubRip, WebVTT, ASS" {
+  let srt = "1\n00:00:01,500 --> 00:00:03,000\n<i>第一句</i>\n第二行\n\n2\n00:01:02,000 --> 00:01:04,250\n{\\an8}上面 &amp; 下面\n"
+  let cues = parse_timed(srt)
+  debug_assert(cues.length() == 2, "srt count")
+  debug_assert(cues[0].from == 1500.0 && cues[0].to == 3000.0 && cues[0].text == "第一句\n第二行", "srt 0")
+  debug_assert(cues[1].from == 62000.0 && cues[1].to == 64250.0 && cues[1].text == "上面 & 下面", "srt 1")
+  debug_assert(cues_at(cues, 2000.0) == "第一句\n第二行", "cues_at hit")
+  debug_assert(cues_at(cues, 4000.0) == "", "cues_at miss")
+
+  let vtt = "WEBVTT\n\nNOTE 说明\n\n00:01.000 --> 00:02.500 align:start\n<c.yellow>一</c>\n\n01:00:00.000 --> 01:00:01.000\n二\n"
+  let vcues = parse_subtitles("a.vtt", vtt.to_bytes())
+  debug_assert(vcues.length() == 2 && vcues[0].from == 1000.0 && vcues[0].text == "一" && vcues[1].from == 3600000.0 && vcues[1].text == "二", "vtt")
+
+  let ass = "[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:03.00,0:00:05.50,Default,,0,0,0,,{\\b1}你好，世界, 再见\\N第二行\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,先说\n"
+  let acues = parse_subtitles("a.ass", ass.to_bytes())
+  debug_assert(acues.length() == 2 && acues[0].from == 1000.0 && acues[0].text == "先说", "ass sorted 0")
+  debug_assert(acues[1].from == 3000.0 && acues[1].to == 5500.0 && acues[1].text == "你好，世界, 再见\n第二行", "ass sorted 1")
+  debug_assert(subtitle_time("0:00:03.25").unwrap_or(-1.0) == 3250.0, "ass time")
+  debug_assert(subtitle_time("12:34").unwrap_or(-1.0) == 754000.0, "mm:ss")
+  debug_assert(subtitle_time("x").is_none(), "invalid time")
+}

@@ -1,0 +1,1685 @@
+// Core Flexbox layout engine (CSS Flexbox + Yoga defaults & rounding + reuse cache + come_* + pixel grid).
+// Ported from libs/mbui/src/flex/layout.mbt (part 1: core state, box, compute, size_node, layout_flex).
+
+import "dmath"
+
+pub let cut_kept_ems : Double = 4.0
+
+fn undef() -> Double {
+  dmath::nan()
+}
+
+fn known(x : Double) -> Bool {
+  x == x
+}
+
+fn or_else(x : Double, y : Double) -> Double {
+  if known(x) { x } else { y }
+}
+
+fn fmax(a : Double, b : Double) -> Double {
+  if a > b { a } else { b }
+}
+
+fn fmin(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+fn pct(p : Double, base : Double) -> Double {
+  if known(base) { base * p / 100.0 } else { undef() }
+}
+
+fn edge_pct(p : Double, base : Double) -> Double {
+  let v = pct(p, base)
+  if known(v) { v } else { 0.0 }
+}
+
+fn resolve_of(k : Int, v : Double, base : Double) -> Double {
+  if k == LEN_PT {
+    v
+  } else if k == LEN_PCT {
+    pct(v, base)
+  } else if k == LEN_WITHIN {
+    if known(base) && base < v { base } else { v }
+  } else {
+    undef()
+  }
+}
+
+fn edge_of(k : Int, v : Double, base : Double) -> Double {
+  if k == LEN_PT {
+    if known(v) { v } else { 0.0 }
+  } else if k == LEN_PCT {
+    edge_pct(v, base)
+  } else {
+    0.0
+  }
+}
+
+fn clamp_size(v : Double, lo : Double, hi : Double) -> Double {
+  let mut r = v
+  if known(hi) && r > hi { r = hi }
+  if known(lo) && r < lo { r = lo }
+  r
+}
+
+fn is_row(d : FlexDirection) -> Bool {
+  dir_eq(d, FlexDirection::Row) || dir_eq(d, FlexDirection::RowReverse)
+}
+
+fn is_reverse(d : FlexDirection) -> Bool {
+  dir_eq(d, FlexDirection::RowReverse) || dir_eq(d, FlexDirection::ColumnReverse)
+}
+
+fn make_doubles(n : Int, v : Double) -> Array[Double] {
+  let a : Array[Double] = []
+  for _ in 0..<n { a.push(v) }
+  a
+}
+
+fn make_ints(n : Int, v : Int) -> Array[Int] {
+  let a : Array[Int] = []
+  for _ in 0..<n { a.push(v) }
+  a
+}
+
+fn make_bools(n : Int, v : Bool) -> Array[Bool] {
+  let a : Array[Bool] = []
+  for _ in 0..<n { a.push(v) }
+  a
+}
+
+fn make_aligns(n : Int, v : Align) -> Array[Align] {
+  let a : Array[Align] = []
+  for _ in 0..<n { a.push(v) }
+  a
+}
+
+struct FlexState {
+  mut next_id : Int
+  mut generation : Int
+  mut out_h : Double
+  mut out_b : Double
+  mut reusing : Bool
+  mut placing_grid : Double
+  mut absolute_seen : Bool
+  mut performing_now : Bool
+  mut depth : Int
+  pools : Array[Pool]
+  mut first_told_base : Double
+  mut first_told_mid : Double
+  mut first_asked : Int
+  mut first_out : Double
+}
+
+let flx : FlexState = FlexState::{
+  next_id: 1,
+  generation: 0,
+  out_h: 0.0,
+  out_b: 0.0,
+  reusing: false,
+  placing_grid: 0.0,
+  absolute_seen: false,
+  performing_now: false,
+  depth: 0,
+  pools: [],
+  first_told_base: 0.0,
+  first_told_mid: 0.0,
+  first_asked: 0,
+  first_out: 0.0,
+}
+
+pub let counters : Array[Int] = [0, 0, 0]
+
+fn next_node_id() -> Int {
+  let id = flx.next_id
+  flx.next_id += 1
+  id
+}
+
+fn get_generation() -> Int {
+  flx.generation
+}
+
+pub fn computes() -> Int {
+  flx.generation
+}
+
+pub fn performing() -> Bool {
+  flx.performing_now
+}
+
+pub fn first_line_told(baseline : Double, middle : Double) -> Unit {
+  flx.first_told_base = baseline
+  flx.first_told_mid = middle
+}
+
+struct Box {
+  mut pad_l : Double
+  mut pad_t : Double
+  mut pad_r : Double
+  mut pad_b : Double
+  mut bor_l : Double
+  mut bor_t : Double
+  mut bor_r : Double
+  mut bor_b : Double
+  mut mar_l : Double
+  mut mar_t : Double
+  mut mar_r : Double
+  mut mar_b : Double
+  mut w : Double
+  mut h : Double
+  mut min_w : Double
+  mut min_h : Double
+  mut max_w : Double
+  mut max_h : Double
+  mut of_cb_w : Bool
+  mut of_cb_h : Bool
+  mut laid_grid : Double
+}
+
+fn Box::pbw(self : Box) -> Double {
+  self.pad_l + self.pad_r + self.bor_l + self.bor_r
+}
+
+fn Box::pbh(self : Box) -> Double {
+  self.pad_t + self.pad_b + self.bor_t + self.bor_b
+}
+
+fn box_of(s : Style, cb_w : Double, cb_h : Double, into : Option[Box]) -> Box {
+  let pad_l = edge_of(s.padding_left_k, s.padding_left_v, cb_w)
+  let pad_r = edge_of(s.padding_right_k, s.padding_right_v, cb_w)
+  let pad_t = edge_of(s.padding_top_k, s.padding_top_v, cb_w)
+  let pad_b = edge_of(s.padding_bottom_k, s.padding_bottom_v, cb_w)
+  let bor_l = edge_of(s.border_left_k, s.border_left_v, cb_w)
+  let bor_r = edge_of(s.border_right_k, s.border_right_v, cb_w)
+  let bor_t = edge_of(s.border_top_k, s.border_top_v, cb_w)
+  let bor_b = edge_of(s.border_bottom_k, s.border_bottom_v, cb_w)
+  let pbw = pad_l + pad_r + bor_l + bor_r
+  let pbh = pad_t + pad_b + bor_t + bor_b
+  let content_box = sizing_eq(s.box_sizing, BoxSizing::ContentBox)
+  let adj_w = if content_box { pbw } else { 0.0 }
+  let adj_h = if content_box { pbh } else { 0.0 }
+  let mut min_w = resolve_of(s.min_width_k, s.min_width_v, cb_w) + adj_w
+  let mut min_h = resolve_of(s.min_height_k, s.min_height_v, cb_h) + adj_h
+  min_w = if known(min_w) { fmax(min_w, pbw) } else { pbw }
+  min_h = if known(min_h) { fmax(min_h, pbh) } else { pbh }
+  if s.gone_empty {
+    let mh0 = resolve_of(s.min_height_k, s.min_height_v, cb_h) + adj_h
+    min_h = if known(mh0) { fmax(mh0, bor_t + bor_b) } else { bor_t + bor_b }
+  }
+  let mar_l = edge_of(s.margin_left_k, s.margin_left_v, cb_w)
+  let mar_t = edge_of(s.margin_top_k, s.margin_top_v, cb_w)
+  let mar_r = edge_of(s.margin_right_k, s.margin_right_v, cb_w)
+  let mar_b = edge_of(s.margin_bottom_k, s.margin_bottom_v, cb_w)
+  let w = resolve_of(s.width_k, s.width_v, cb_w) + adj_w
+  let h = resolve_of(s.height_k, s.height_v, cb_h) + adj_h
+  let max_w = resolve_of(s.max_width_k, s.max_width_v, cb_w) + adj_w
+  let max_h = resolve_of(s.max_height_k, s.max_height_v, cb_h) + adj_h
+  let of_cb_w = s.padding_left_k == LEN_PCT ||
+    s.padding_right_k == LEN_PCT ||
+    s.padding_top_k == LEN_PCT ||
+    s.padding_bottom_k == LEN_PCT ||
+    s.border_left_k == LEN_PCT ||
+    s.border_right_k == LEN_PCT ||
+    s.border_top_k == LEN_PCT ||
+    s.border_bottom_k == LEN_PCT ||
+    s.margin_left_k == LEN_PCT ||
+    s.margin_right_k == LEN_PCT ||
+    s.margin_top_k == LEN_PCT ||
+    s.margin_bottom_k == LEN_PCT ||
+    s.width_k >= LEN_PCT ||
+    s.min_width_k >= LEN_PCT ||
+    s.max_width_k >= LEN_PCT
+  let of_cb_h = s.height_k >= LEN_PCT ||
+    s.min_height_k >= LEN_PCT ||
+    s.max_height_k >= LEN_PCT
+  match into {
+    Some(o) => {
+      o.pad_l = pad_l
+      o.pad_t = pad_t
+      o.pad_r = pad_r
+      o.pad_b = pad_b
+      o.bor_l = bor_l
+      o.bor_t = bor_t
+      o.bor_r = bor_r
+      o.bor_b = bor_b
+      o.mar_l = mar_l
+      o.mar_t = mar_t
+      o.mar_r = mar_r
+      o.mar_b = mar_b
+      o.w = w
+      o.h = h
+      o.min_w = min_w
+      o.min_h = min_h
+      o.max_w = max_w
+      o.max_h = max_h
+      o.of_cb_w = of_cb_w
+      o.of_cb_h = of_cb_h
+      o
+    }
+    None => Box::{
+      pad_l,
+      pad_t,
+      pad_r,
+      pad_b,
+      bor_l,
+      bor_t,
+      bor_r,
+      bor_b,
+      mar_l,
+      mar_t,
+      mar_r,
+      mar_b,
+      w,
+      h,
+      min_w,
+      min_h,
+      max_w,
+      max_h,
+      of_cb_w,
+      of_cb_h,
+      laid_grid: undef(),
+    }
+  }
+}
+
+fn box_for(node : Node, cb_w : Double, cb_h : Double) -> Box {
+  touch(node)
+  match node.box_memo {
+    Some(b) => {
+      if node.box_ver == node.style.ver &&
+        (!b.of_cb_w || same(node.box_cbw, cb_w)) &&
+        (!b.of_cb_h || same(node.box_cbh, cb_h)) {
+        return b
+      }
+    }
+    None => ()
+  }
+  let b = box_of(node.style, cb_w, cb_h, node.box_memo)
+  node.box_cbw = cb_w
+  node.box_cbh = cb_h
+  node.box_memo = Some(b)
+  node.box_ver = node.style.ver
+  b
+}
+
+fn touch(node : Node) -> Unit {
+  if node.cache_gen != flx.generation {
+    node.cache_gen = flx.generation
+    if !flx.reusing || node.dirty {
+      node.cache_n = 0
+      node.p_ok = false
+      node.dirty = false
+      node.first_baseline = undef()
+      node.first_line_mid = undef()
+    }
+  }
+}
+
+fn on_grid(v : Double) -> Double {
+  let g = flx.placing_grid
+  if g > 0.0 {
+    (v * g + 0.5).floor() / g
+  } else {
+    v
+  }
+}
+
+fn rows_room(v : Double, g : Double) -> Double {
+  if v == 0.0 { v } else { (v * g - 0.000001).ceil() / g }
+}
+
+pub fn rows_on_way(size : Double, from : Double, goal : Double, g : Double) -> Double {
+  if g <= 0.0 {
+    return size
+  }
+  let up = fn(v : Double) -> Double { (v * g - 0.000001).ceil() / g }
+  if !known(from) || !known(goal) || (goal - from).abs() < 0.000001 {
+    return up(size)
+  }
+  let (lf, lg) = (up(from), up(goal))
+  let laid = lf + (lg - lf) * ((size - from) / (goal - from))
+  if goal > from {
+    fmin((laid * g - 0.000001).ceil() / g, lg)
+  } else {
+    fmax((laid * g + 0.000001).floor() / g, lg)
+  }
+}
+
+fn row_on_grid(s : Style, size : Double, g : Double) -> Double {
+  if known(s.come_now) && known(s.come_ends) && known(s.come_goal) && s.come_now < s.come_ends && !s.come_across {
+    rows_on_way(size, s.come_from, s.come_goal, g)
+  } else {
+    rows_on_way(size, undef(), undef(), g)
+  }
+}
+
+fn kept(n : Node) -> Bool {
+  n.skip_gen == flx.generation
+}
+
+pub fn compute(
+  root : Node,
+  width? : Double,
+  height? : Double,
+  round~ : Bool = true,
+  reuse~ : Bool = false,
+  grid~ : Double = 0.0,
+) -> Unit {
+  let w_in = match width { Some(v) => v; None => undef() }
+  let h_in = match height { Some(v) => v; None => undef() }
+  flx.generation += 1
+  let same_grid = match root.box_memo {
+    Some(box) => grid == box.laid_grid
+    None => grid == 0.0
+  }
+  flx.reusing = reuse && !round && same_grid
+  flx.placing_grid = grid
+  flx.absolute_seen = false
+  let b = box_of(root.style, w_in, h_in, None)
+  let w = or_else(b.w, if pos_eq(root.style.position, PositionType::Absolute) { undef() } else { w_in })
+  let h = or_else(b.h, if pos_eq(root.style.position, PositionType::Absolute) { undef() } else { h_in })
+  let aw = if known(w) { w } else if known(b.max_w) { b.max_w } else { w_in }
+  let ah = if known(h) { h } else if known(b.max_h) { b.max_h } else { h_in }
+  let fw = size_node(root, w, h, aw, ah, aw, ah, true)
+  let fh = flx.out_h
+  root.width = fw
+  root.height = fh
+  let s = root.style
+  let is_pos = pos_eq(s.position, PositionType::Relative) || pos_eq(s.position, PositionType::Absolute)
+  let dx = if is_pos {
+    let l = resolve_of(s.inset_left_k, s.inset_left_v, w_in)
+    let r = resolve_of(s.inset_right_k, s.inset_right_v, w_in)
+    if known(l) { l } else if known(r) { -r } else { 0.0 }
+  } else {
+    0.0
+  }
+  let dy = if is_pos {
+    let t = resolve_of(s.inset_top_k, s.inset_top_v, h_in)
+    let bt = resolve_of(s.inset_bottom_k, s.inset_bottom_v, h_in)
+    if known(t) { t } else if known(bt) { -bt } else { 0.0 }
+  } else {
+    0.0
+  }
+  root.left = on_grid(b.mar_l + dx)
+  root.top = on_grid(b.mar_t + dy)
+  if flx.absolute_seen && !(kept(root) && !pos_eq(s.position, PositionType::Static)) {
+    layout_static_absolute(root, root, 0.0, 0.0)
+  }
+  if round {
+    round_layout(root, 0.0, 0.0)
+  }
+  match root.box_memo {
+    Some(box) => { box.laid_grid = if round { undef() } else { grid } }
+    None => ()
+  }
+}
+
+pub fn Node::laid_given(self : Node) -> Bool {
+  self.p_ok && known(self.p_kw) && known(self.p_kh) && self.style.height_kind() == LEN_PT
+}
+
+pub fn relayout(node : Node) -> Unit {
+  flx.generation += 1
+  flx.reusing = true
+  flx.absolute_seen = false
+  let kw = node.p_kw
+  let kh = node.p_kh
+  let _ = size_node(node, kw, kh, kw, kh, node.p_cbw, node.p_cbh, true)
+  if flx.absolute_seen {
+    layout_static_absolute(node, node, 0.0, 0.0)
+  }
+}
+
+pub fn measured_height(node : Node, width : Double) -> Double {
+  let b = box_of(node.style, width, undef(), None)
+  let w = or_else(b.w, width)
+  let _ = size_node(node, w, undef(), w, undef(), w, undef(), false)
+  flx.out_h
+}
+
+pub fn measured_width(node : Node, height : Double) -> Double {
+  let b = box_of(node.style, undef(), height, None)
+  let h = or_else(b.h, height)
+  size_node(node, undef(), h, undef(), h, undef(), h, false)
+}
+
+fn inset_offset(s : Style, cb_w : Double, cb_h : Double, horizontal : Bool) -> Double {
+  if !pos_eq(s.position, PositionType::Relative) {
+    return 0.0
+  }
+  if horizontal {
+    let l = resolve_of(s.inset_left_k, s.inset_left_v, cb_w)
+    if known(l) { return l }
+    let r = resolve_of(s.inset_right_k, s.inset_right_v, cb_w)
+    if known(r) { -r } else { 0.0 }
+  } else {
+    let t = resolve_of(s.inset_top_k, s.inset_top_v, cb_h)
+    if known(t) { return t }
+    let b = resolve_of(s.inset_bottom_k, s.inset_bottom_v, cb_h)
+    if known(b) { -b } else { 0.0 }
+  }
+}
+
+fn same(a : Double, b : Double) -> Bool {
+  a == b || (!known(a) && !known(b))
+}
+
+fn reusable(k : Double, a : Double, old_k : Double, old_a : Double, result : Double) -> Bool {
+  if known(k) {
+    return (known(old_k) && old_k == k) || (result - k).abs() < 0.0001
+  }
+  if known(old_k) {
+    return false
+  }
+  if known(a) {
+    if !known(old_a) {
+      return result <= a + 0.0001
+    }
+    return old_a == a || (old_a > a && result <= a + 0.0001)
+  }
+  !known(old_a)
+}
+
+fn size_node(
+  node : Node,
+  kw : Double,
+  kh : Double,
+  aw : Double,
+  ah : Double,
+  cb_w : Double,
+  cb_h : Double,
+  perform : Bool,
+) -> Double {
+  touch(node)
+  if perform {
+    if flx.reusing &&
+      node.p_ok &&
+      same(node.p_kw, kw) &&
+      same(node.p_kh, kh) &&
+      laid_in_cb(node, kw, kh, cb_w, cb_h) {
+      node.p_cbw = cb_w
+      node.p_cbh = cb_h
+      node.skip_gen = flx.generation
+      counters[1] += 1
+      flx.out_h = node.p_h
+      return node.p_w
+    }
+  } else {
+    let c = node.cache
+    let n = node.cache_n
+    let mut any_w = false
+    let mut any_h = false
+    if n > 0 {
+      let bx = box_for(node, cb_w, cb_h)
+      any_w = !bx.of_cb_w
+      any_h = !bx.of_cb_h
+    }
+    let leaf = node.children.length() == 0 && !node.room
+    let mut k = 0
+    while k < n {
+      let same_cb = same(c[k + 4], cb_w) && same(c[k + 5], cb_h)
+      if (
+          same_cb ||
+          (
+            (any_w || same(c[k + 4], cb_w)) &&
+            (any_h || same(c[k + 5], cb_h)) &&
+            (leaf || (same(c[k], kw) && same(c[k + 1], kh)))
+          )
+        ) &&
+        reusable(kw, aw, c[k], c[k + 2], c[k + 6]) &&
+        reusable(kh, ah, c[k + 1], c[k + 3], c[k + 7]) {
+        counters[1] += 1
+        flx.out_h = c[k + 7]
+        return c[k + 6]
+      }
+      k += 8
+    }
+  }
+  counters[0] += 1
+  let w = size_uncached(node, kw, kh, aw, ah, cb_w, cb_h, perform)
+  let h = flx.out_h
+  if perform {
+    node.p_ok = true
+    node.p_kw = kw
+    node.p_kh = kh
+    node.p_cbw = cb_w
+    node.p_cbh = cb_h
+    node.p_w = w
+    node.p_h = h
+    node.laid_gen = flx.generation
+    if !flx.reusing {
+      flx.out_h = h
+      return w
+    }
+  }
+  let mut n = node.cache_n
+  if n >= 8 * 16 {
+    n = 0
+  }
+  let mut c = node.cache
+  if n + 8 > c.length() {
+    let more = make_doubles(if n == 0 { 16 } else { n * 2 }, 0.0)
+    for i in 0..<n {
+      more[i] = c[i]
+    }
+    node.cache = more
+    c = more
+  }
+  c[n] = kw
+  c[n + 1] = kh
+  c[n + 2] = aw
+  c[n + 3] = ah
+  c[n + 4] = cb_w
+  c[n + 5] = cb_h
+  c[n + 6] = w
+  c[n + 7] = h
+  node.cache_n = n + 8
+  flx.out_h = h
+  w
+}
+
+fn laid_in_cb(node : Node, kw : Double, kh : Double, cb_w : Double, cb_h : Double) -> Bool {
+  let w_same = same(node.p_cbw, cb_w)
+  let h_same = same(node.p_cbh, cb_h)
+  if w_same && h_same { return true }
+  if !known(kw) || !known(kh) { return false }
+  let b = box_for(node, cb_w, cb_h)
+  (w_same || !b.of_cb_w) && (h_same || !b.of_cb_h)
+}
+
+fn box_with_max(b : Box, max_w : Double, max_h : Double) -> Box {
+  Box::{
+    pad_l: b.pad_l,
+    pad_t: b.pad_t,
+    pad_r: b.pad_r,
+    pad_b: b.pad_b,
+    bor_l: b.bor_l,
+    bor_t: b.bor_t,
+    bor_r: b.bor_r,
+    bor_b: b.bor_b,
+    mar_l: b.mar_l,
+    mar_t: b.mar_t,
+    mar_r: b.mar_r,
+    mar_b: b.mar_b,
+    w: b.w,
+    h: b.h,
+    min_w: b.min_w,
+    min_h: b.min_h,
+    max_w,
+    max_h,
+    of_cb_w: b.of_cb_w,
+    of_cb_h: b.of_cb_h,
+    laid_grid: b.laid_grid,
+  }
+}
+
+fn size_uncached(
+  node : Node,
+  kw : Double,
+  kh : Double,
+  aw : Double,
+  ah : Double,
+  cb_w : Double,
+  cb_h : Double,
+  perform : Bool,
+) -> Double {
+  let s = node.style
+  if s.come_foot && perform && known(kh) {
+    s.come_foot = false
+    let now = s.come_now
+    s.come_now = undef()
+    let _ = size_uncached(node, kw, undef(), aw, ah, cb_w, cb_h, false)
+    let natural = flx.out_h
+    let w = size_uncached(node, kw, natural, aw, ah, cb_w, cb_h, perform)
+    s.come_now = now
+    s.come_foot = true
+    come_keep_foot(node, kh - natural)
+    flx.out_h = kh
+    return w
+  }
+  if known(s.come_now) && s.come_across {
+    if !known(kw) {
+      let now = s.come_now
+      s.come_now = undef()
+      let natural = size_uncached(node, kw, kh, aw, ah, cb_w, cb_h, false)
+      s.come_now = now
+      let wide = come_height(s, natural)
+      if known(wide) {
+        let _ = size_uncached(node, natural, kh, aw, ah, cb_w, cb_h, perform)
+        return wide
+      }
+    } else if perform && s.come_k < 1.0 && s.come_whole > kw {
+      let _ = size_uncached(node, s.come_whole, kh, aw, ah, cb_w, cb_h, perform)
+      return kw
+    }
+  } else if known(s.come_now) && !known(kh) {
+    let now = s.come_now
+    s.come_now = undef()
+    let _ = size_uncached(node, kw, kh, aw, ah, cb_w, cb_h, false)
+    s.come_now = now
+    let natural = flx.out_h
+    let tall = come_height(s, natural)
+    if known(tall) {
+      let w = size_uncached(node, kw, natural, aw, ah, cb_w, cb_h, perform)
+      if perform {
+        come_keep_foot(node, tall - natural)
+      }
+      flx.out_h = tall
+      return w
+    }
+  } else if known(s.come_now) && perform && s.come_k < 1.0 {
+    let natural = s.come_whole
+    let fw = if known(kw) {
+      kw
+    } else {
+      let now = s.come_now
+      s.come_now = undef()
+      let w = size_uncached(node, kw, undef(), aw, ah, cb_w, cb_h, false)
+      s.come_now = now
+      w
+    }
+    if natural > kh {
+      let w = size_uncached(node, fw, natural, aw, ah, cb_w, cb_h, perform)
+      flx.out_h = kh
+      return w
+    }
+  } else if !known(s.come_now) {
+    s.come_k = 1.0
+  }
+  let b0 = box_for(node, cb_w, cb_h)
+  let b = if s.stretch_past_max && ((known(kw) && known(b0.max_w)) || (known(kh) && known(b0.max_h))) {
+    box_with_max(b0, if known(kw) { undef() } else { b0.max_w }, if known(kh) { undef() } else { b0.max_h })
+  } else {
+    b0
+  }
+  let mut w = if known(kw) { kw } else { b.w }
+  let mut h = if known(kh) { kh } else { b.h }
+  if !known(w) && known(b.min_w) && b.min_w == b.max_w { w = b.min_w }
+  if !known(h) && known(b.min_h) && b.min_h == b.max_h { h = b.min_h }
+  if s.aspect > 0.0 {
+    if known(w) && !known(h) {
+      h = clamp_size(w, soft_floor(node.style, b.min_w), b.max_w) / s.aspect
+    } else if known(h) && !known(w) {
+      w = clamp_size(h, b.min_h, b.max_h) * s.aspect
+    }
+  }
+  if known(w) { w = clamp_size(w, soft_floor(node.style, b.min_w), b.max_w) }
+  if known(h) { h = clamp_size(h, b.min_h, b.max_h) }
+  let pbw = b.pbw()
+  let pbh = b.pbh()
+  match node.measure {
+    Some(m) => {
+      if !node.room && node.children.length() == 0 {
+        if known(w) && known(h) {
+          flx.out_h = h
+          return w
+        }
+        let iw = if known(w) {
+          w - pbw
+        } else if known(aw) {
+          fmax(clamp_size(aw, b.min_w, b.max_w) - pbw, 0.0)
+        } else {
+          undef()
+        }
+        let ih = if known(h) {
+          h - pbh
+        } else if known(ah) {
+          fmax(clamp_size(ah, b.min_h, b.max_h) - pbh, 0.0)
+        } else {
+          undef()
+        }
+        let wm = if known(w) { MeasureMode::Exactly } else if known(iw) { MeasureMode::AtMost } else { MeasureMode::Undefined }
+        let hm = if known(h) { MeasureMode::Exactly } else if known(ih) { MeasureMode::AtMost } else { MeasureMode::Undefined }
+        counters[2] += 1
+        flx.first_told_base = undef()
+        flx.first_told_mid = undef()
+        let (mw, mh) = m(
+          if known(iw) { iw } else { 0.0 },
+          wm,
+          if known(ih) { ih } else { 0.0 },
+          hm,
+        )
+        first_kept(node, b)
+        let fw = if known(w) { w } else { clamp_size(mw + pbw, b.min_w, b.max_w) }
+        let fh = if known(h) { h } else { clamp_size(mh + pbh, b.min_h, b.max_h) }
+        flx.out_h = fh
+        return fw
+      }
+    }
+    None => {
+      if node.children.length() == 0 {
+        flx.out_h = if known(h) {
+          fmax(h - pbh, 0.0) + pbh
+        } else {
+          clamp_size(pbh, b.min_h, b.max_h)
+        }
+        return if known(w) {
+          fmax(w - pbw, 0.0) + pbw
+        } else {
+          clamp_size(pbw, b.min_w, b.max_w)
+        }
+      }
+    }
+  }
+  if known(s.content_share) && !known(h) {
+    let asked = flx.first_asked
+    flx.first_asked = 0
+    let fw = layout_flex(node, b, w, h, aw, ah, false)
+    flx.first_asked = asked
+    let natural = flx.out_h
+    let share = fmax(fmin(s.content_share, 1.0), 0.0)
+    let sized = clamp_size(pbh + (natural - pbh) * share, b.min_h, b.max_h)
+    return layout_flex(node, b, if known(w) { w } else { fw }, sized, aw, ah, perform)
+  }
+  layout_flex(node, b, w, h, aw, ah, perform)
+}
+
+fn come_keep_foot(node : Node, by : Double) -> Unit {
+  if !node.style.come_foot || by == 0.0 {
+    return
+  }
+  for c in node.children {
+    c.top += by
+  }
+}
+
+let ITEM : Int = 27
+let BASIS : Int = 0
+let HYP : Int = 1
+let MAIN : Int = 2
+let CROSS : Int = 3
+let TARGET : Int = 4
+let MAIN_POS : Int = 5
+let CROSS_POS : Int = 6
+let MIN_MAIN : Int = 7
+let MAX_MAIN : Int = 8
+let MIN_CROSS : Int = 9
+let MAX_CROSS : Int = 10
+let MARGIN_MAIN : Int = 11
+let MARGIN_CROSS : Int = 12
+let ASCENT : Int = 13
+let CLAMPED : Int = 14
+let FACTOR : Int = 15
+let LO_MAIN : Int = 16
+let CROSS_STYLE : Int = 17
+let GROW : Int = 18
+let SHRINK : Int = 19
+let PB_MAIN : Int = 20
+let MAR_MAIN_START : Int = 21
+let MAR_MAIN_END : Int = 22
+let MAR_CROSS_START : Int = 23
+let MAR_CROSS_END : Int = 24
+let SOFT_MIN : Int = 25
+let DECLARED : Int = 26
+
+let AUTO_L : Int = 1
+let AUTO_T : Int = 2
+let AUTO_R : Int = 4
+let AUTO_B : Int = 8
+let FROZEN : Int = 16
+let STRETCH : Int = 32
+let INSET : Int = 64
+let FITS : Int = 128
+let PAST_MAX : Int = 256
+
+struct FlexLine {
+  mut start : Int
+  mut end : Int
+  mut used : Double
+  mut cross : Double
+  mut pos : Double
+  mut ascent : Double
+}
+
+struct Pool {
+  mut count : Int
+  mut at : Array[Int]
+  mut aligns : Array[Align]
+  mut f : Array[Double]
+  mut flags : Array[Int]
+  mut line_of : Array[Int]
+  mut lines : Array[FlexLine]
+  line_store : Array[FlexLine]
+}
+
+fn Pool::add(self : Pool, at : Int, al : Align) -> Int {
+  let k = self.count
+  if k >= self.flags.length() {
+    self.grow()
+  }
+  self.at[k] = at
+  self.aligns[k] = al
+  self.count = k + 1
+  k
+}
+
+fn Pool::grow(self : Pool) -> Unit {
+  let k = self.count
+  let n = if k < 8 { 16 } else { k * 2 }
+  let f = make_doubles(n * ITEM, 0.0)
+  for i in 0..<(k * ITEM) { f[i] = self.f[i] }
+  let flags = make_ints(n, 0)
+  let line_of = make_ints(n, 0)
+  let at = make_ints(n, 0)
+  let aligns = make_aligns(n, Align::Auto)
+  for i in 0..<k {
+    flags[i] = self.flags[i]
+    line_of[i] = self.line_of[i]
+    at[i] = self.at[i]
+    aligns[i] = self.aligns[i]
+  }
+  self.f = f
+  self.flags = flags
+  self.line_of = line_of
+  self.at = at
+  self.aligns = aligns
+}
+
+fn item_box(n : Node) -> Box {
+  match n.box_memo {
+    Some(b) => b
+    None => box_of(Style::new(), undef(), undef(), None)
+  }
+}
+
+fn Pool::line(self : Pool, start : Int, end : Int) -> Unit {
+  let k = self.lines.length()
+  let ln = if k < self.line_store.length() {
+    self.line_store[k]
+  } else {
+    let nl = FlexLine::{ start: 0, end: 0, used: 0.0, cross: 0.0, pos: 0.0, ascent: 0.0 }
+    self.line_store.push(nl)
+    nl
+  }
+  ln.start = start
+  ln.end = end
+  ln.used = 0.0
+  ln.cross = 0.0
+  ln.pos = 0.0
+  ln.ascent = 0.0
+  self.lines.push(ln)
+}
+
+fn item_align(container : Style, s : Style) -> Align {
+  if align_eq(s.align_self, Align::Auto) { container.align_items } else { s.align_self }
+}
+
+fn layout_flex(
+  node : Node,
+  b : Box,
+  w0 : Double,
+  h0 : Double,
+  aw : Double,
+  ah : Double,
+  perform : Bool,
+) -> Double {
+  let asked = flx.first_asked
+  flx.first_asked = 0
+  let s = node.style
+  let row = is_row(s.direction)
+  let pbw = b.pbw()
+  let pbh = b.pbh()
+  let gone_kids = node.holds_gone
+  let inner_w = if known(w0) { fmax(w0 - pbw, 0.0) } else { undef() }
+  let inner_h = if known(h0) { fmax(h0 - pbh, 0.0) } else { undef() }
+  let avail_inner_w = if known(inner_w) {
+    inner_w
+  } else if known(aw) {
+    fmax(clamp_size(aw, b.min_w, b.max_w) - pbw, 0.0)
+  } else {
+    undef()
+  }
+  let avail_inner_h = if known(inner_h) {
+    inner_h
+  } else if known(ah) {
+    fmax(clamp_size(ah, b.min_h, b.max_h) - pbh, 0.0)
+  } else {
+    undef()
+  }
+  let inner_main = if row { inner_w } else { inner_h }
+  let inner_cross = if row { inner_h } else { inner_w }
+  let avail_main = if row { avail_inner_w } else { avail_inner_h }
+  let avail_cross = if row { avail_inner_h } else { avail_inner_w }
+  let held_main = if overflow_eq(s.overflow, Overflow::Scroll) { undef() } else { avail_main }
+  let rows_g = if row { 0.0 } else { s.rows_grid }
+  let gap_main = if row {
+    edge_of(s.gap_col_k, s.gap_col_v, inner_main)
+  } else {
+    let gap = edge_of(s.gap_row_k, s.gap_row_v, inner_main)
+    if rows_g > 0.0 { rows_room(gap, rows_g) } else { gap }
+  }
+  let gap_cross = if row {
+    edge_of(s.gap_row_k, s.gap_row_v, inner_cross)
+  } else {
+    edge_of(s.gap_col_k, s.gap_col_v, inner_cross)
+  }
+  let cb_w = inner_w
+  let cb_h = inner_h
+  match node.measure {
+    Some(m) => {
+      if node.room {
+        let wm = if known(inner_w) { MeasureMode::Exactly } else if known(avail_inner_w) { MeasureMode::AtMost } else { MeasureMode::Undefined }
+        let hm = if known(inner_h) { MeasureMode::Exactly } else if known(avail_inner_h) { MeasureMode::AtMost } else { MeasureMode::Undefined }
+        let was_performing = flx.performing_now
+        flx.performing_now = perform
+        let (changed, _) = m(
+          if known(avail_inner_w) { avail_inner_w } else { 0.0 },
+          wm,
+          if known(avail_inner_h) { avail_inner_h } else { 0.0 },
+          hm,
+        )
+        flx.performing_now = was_performing
+        if changed > 0.0 {
+          node.pre_gen = -1
+          node.cache_n = 0
+          node.p_ok = false
+        }
+      }
+    }
+    None => ()
+  }
+  let d = flx.depth
+  flx.depth = d + 1
+  if d >= flx.pools.length() {
+    flx.pools.push(Pool::{
+      count: 0,
+      at: [],
+      aligns: [],
+      f: [],
+      flags: [],
+      line_of: [],
+      lines: [],
+      line_store: [],
+    })
+  }
+  let pool = flx.pools[d]
+  pool.count = 0
+  pool.lines = []
+  let flow0 = flow_children(node)
+  let all = flow0
+  let flow = if s.one_of && row {
+    first_fit(flow0, if known(avail_main) { avail_main } else { 1.0e9 }, cb_w, cb_h)
+  } else if s.fits && row && known(avail_main) {
+    fit_flow(flow0, avail_main, gap_main, cb_w, cb_h)
+  } else {
+    flow0
+  }
+  let pre = node.pre
+  let fast = perform &&
+    node.pre_gen == flx.generation &&
+    pre.length() >= 3 &&
+    known(w0) &&
+    w0 == pre[0] &&
+    known(h0) &&
+    h0 == pre[2]
+  let mut fh = 0.0
+  let mut gone_cut = 0.0
+  let fw = if fast {
+    for j, c in flow {
+      let cs = c.style
+      if pos_eq(cs.position, PositionType::Absolute) { continue }
+      if c.line < 0 { c.line = 0 }
+      let k = pool.add(j, Align::Auto)
+      let i = k * ITEM
+      let p = 3 + k * 4
+      let f = pool.f
+      f[i + MAIN] = pre[p]
+      f[i + CROSS] = pre[p + 1]
+      f[i + MAIN_POS] = pre[p + 2]
+      f[i + CROSS_POS] = pre[p + 3]
+      pool.flags[k] = if pos_eq(cs.position, PositionType::Relative) &&
+        !(cs.inset_left_k == LEN_AUTO &&
+        cs.inset_right_k == LEN_AUTO &&
+        cs.inset_top_k == LEN_AUTO &&
+        cs.inset_bottom_k == LEN_AUTO) {
+        INSET
+      } else {
+        0
+      }
+    }
+    fh = pre[2]
+    pre[1]
+  } else {
+    let mut any_auto = false
+    let mut any_stretch = false
+    let mut cross_by_height = false
+    let mut any_baseline = false
+    let mut any_fits = false
+    let mut comes_across = false
+    for j, c in flow {
+      let cs = c.style
+      if pos_eq(cs.position, PositionType::Absolute) {
+        flx.absolute_seen = true
+        continue
+      }
+      touch(c)
+      let cb = box_for(c, cb_w, cb_h)
+      let al = item_align(s, cs)
+      let margin_main = if row { cb.mar_l + cb.mar_r } else { cb.mar_t + cb.mar_b }
+      let margin_cross = if row { cb.mar_t + cb.mar_b } else { cb.mar_l + cb.mar_r }
+      let cross_style = if row { cb.h } else { cb.w }
+      let auto_cross_margin = if row {
+        cs.margin_top_k == LEN_AUTO || cs.margin_bottom_k == LEN_AUTO
+      } else {
+        cs.margin_left_k == LEN_AUTO || cs.margin_right_k == LEN_AUTO
+      }
+      let k = pool.add(j, al)
+      let f = pool.f
+      let i = k * ITEM
+      let stretch = align_eq(al, Align::Stretch) && !known(cross_style) && !auto_cross_margin
+      let mut fl = 0
+      if cs.margin_left_k == LEN_AUTO { fl = fl | AUTO_L }
+      if cs.margin_top_k == LEN_AUTO { fl = fl | AUTO_T }
+      if cs.margin_right_k == LEN_AUTO { fl = fl | AUTO_R }
+      if cs.margin_bottom_k == LEN_AUTO { fl = fl | AUTO_B }
+      if fl != 0 { any_auto = true }
+      if stretch {
+        fl = fl | STRETCH
+        any_stretch = true
+        if cs.stretch_past_max { fl = fl | PAST_MAX }
+      }
+      if pos_eq(cs.position, PositionType::Relative) &&
+        !(cs.inset_left_k == LEN_AUTO &&
+        cs.inset_right_k == LEN_AUTO &&
+        cs.inset_top_k == LEN_AUTO &&
+        cs.inset_bottom_k == LEN_AUTO) {
+        fl = fl | INSET
+      }
+      pool.flags[k] = fl
+      pool.line_of[k] = 0
+      if align_eq(al, Align::Baseline) || align_eq(al, Align::FirstLineCenter) {
+        any_baseline = true
+      }
+      if !known(cross_style) || cb.of_cb_h {
+        cross_by_height = true
+      }
+      let min_main0 = if row { row_item_min(c, cb, cb_w, cb_h) } else { cb.min_h }
+      let min_main = if row && !wrap_eq(s.wrap, FlexWrap::NoWrap) && s.wrap_least && cs.shrink != 0.0 {
+        let least = least_held(c, cb_w, cb_h)
+        if known(min_main0) { fmax(min_main0, least) } else if least > 0.0 { least } else { min_main0 }
+      } else {
+        min_main0
+      }
+      let max_main = if row { cb.max_w } else { cb.max_h }
+      f[i + MIN_MAIN] = min_main
+      f[i + SOFT_MIN] = if row && !(s.fits && cs.drop != 0) {
+        if cs.soft_min >= 0.0 {
+          cs.soft_min
+        } else if cs.min_held || cs.soft_min < 0.0 {
+          -1.0
+        } else {
+          undef()
+        }
+      } else {
+        undef()
+      }
+      f[i + MAX_MAIN] = max_main
+      f[i + MIN_CROSS] = if row { cb.min_h } else { cb.min_w }
+      f[i + MAX_CROSS] = if row { cb.max_h } else { cb.max_w }
+      f[i + MARGIN_CROSS] = margin_cross
+      if rows_g > 0.0 && (cb.mar_t != 0.0 || cb.mar_b != 0.0) {
+        let m_start = rows_room(cb.mar_t, rows_g)
+        let m_end = rows_room(cb.mar_b, rows_g)
+        f[i + MARGIN_MAIN] = m_start + m_end
+        f[i + MAR_MAIN_START] = m_start
+        f[i + MAR_MAIN_END] = m_end
+      } else {
+        f[i + MARGIN_MAIN] = margin_main
+        f[i + MAR_MAIN_START] = if row { cb.mar_l } else { cb.mar_t }
+        f[i + MAR_MAIN_END] = if row { cb.mar_r } else { cb.mar_b }
+      }
+      f[i + MAR_CROSS_START] = if row { cb.mar_t } else { cb.mar_l }
+      f[i + MAR_CROSS_END] = if row { cb.mar_b } else { cb.mar_r }
+      f[i + CROSS_STYLE] = cross_style
+      f[i + ASCENT] = 0.0
+      f[i + GROW] = cs.grow
+      f[i + DECLARED] = undef()
+      f[i + SHRINK] = if s.fits && cs.drop != 0 { 0.0 } else { cs.shrink }
+      let basis_style = resolve_of(cs.basis_k, cs.basis_v, inner_main)
+      let grows_in_unknown = cs.grow > 0.0 && !known(inner_main)
+      let mut declared = undef()
+      let mut basis = basis_said(cs, cb, row, inner_main)
+      if grows_in_unknown && known(basis_style) && cs.basis_k != LEN_AUTO {
+        declared = basis
+        basis = undef()
+      }
+      let said_main = known(basis)
+      if !known(basis) {
+        let mut kc = cross_style
+        if !known(kc) && stretch && known(inner_cross) && wrap_eq(s.wrap, FlexWrap::NoWrap) {
+          kc = fmax(inner_cross - margin_cross, 0.0)
+        }
+        let cw = if row {
+          size_node(
+            c,
+            undef(),
+            kc,
+            if known(held_main) { held_main - margin_main } else { undef() },
+            if known(avail_cross) { avail_cross - margin_cross } else { undef() },
+            cb_w,
+            cb_h,
+            false,
+          )
+        } else {
+          size_node(
+            c,
+            kc,
+            undef(),
+            if known(avail_cross) { avail_cross - margin_cross } else { undef() },
+            if known(held_main) { held_main - margin_main } else { undef() },
+            cb_w,
+            cb_h,
+            false,
+          )
+        }
+        let ch = flx.out_h
+        basis = if row { cw } else { ch }
+        if known(declared) {
+          basis = fmax(basis, declared)
+        } else if row && cs.fits && is_row(cs.direction) {
+          pool.flags[k] = pool.flags[k] | FITS
+          any_fits = true
+        }
+      }
+      let pb_main = if row { cb.pbw() } else { cb.pbh() }
+      f[i + PB_MAIN] = pb_main
+      if gone_kids && !row && cs.gone_empty && !known(cs.come_now) && cs.come_k < 1.0 {
+        f[i + MIN_MAIN] = undef()
+        f[i + PB_MAIN] = 0.0
+        let ck = cs.come_k
+        if rows_g > 0.0 {
+          let m_start = rows_room(cb.mar_t * ck, rows_g)
+          let m_end = rows_room(cb.mar_b * ck, rows_g)
+          f[i + MARGIN_MAIN] = m_start + m_end
+          f[i + MAR_MAIN_START] = m_start
+          f[i + MAR_MAIN_END] = m_end
+        } else {
+          f[i + MARGIN_MAIN] = margin_main * ck
+          f[i + MAR_MAIN_START] = cb.mar_t * ck
+          f[i + MAR_MAIN_END] = cb.mar_b * ck
+        }
+      } else if !(row && cs.come_across && known(cs.come_now)) {
+        basis = fmax(basis, pb_main)
+      }
+      if known(cs.come_now) && cs.come_across == row {
+        if row {
+          comes_across = true
+          f[i + SOFT_MIN] = undef()
+        }
+        if said_main {
+          let tall = come_height(cs, basis)
+          if known(tall) { basis = tall }
+        }
+        if cs.come_k < 1.0 {
+          f[i + MIN_MAIN] = undef()
+          f[i + PB_MAIN] = 0.0
+        }
+      }
+      f[i + BASIS] = basis
+      f[i + HYP] = clamp_size(basis, f[i + MIN_MAIN], max_main)
+      f[i + DECLARED] = if known(declared) && !known(cs.come_now) { fmax(declared, pb_main) } else { undef() }
+    }
+    let f = pool.f
+    let flags = pool.flags
+    let count = pool.count
+    let at = pool.at
+    let aligns = pool.aligns
+    let mut comes = false
+    if !row {
+      for k in 0..<count {
+        let cs = flow[at[k]].style
+        if cs.come_k < 1.0 && (cs.come_fill || !known(cs.come_now)) {
+          comes = true
+          break
+        }
+      }
+    } else if comes_across {
+      for k in 0..<count {
+        let cs = flow[at[k]].style
+        if cs.come_across && known(cs.come_now) && cs.come_k < 1.0 && cs.come_fill {
+          comes = true
+          break
+        }
+      }
+    }
+    let gap_before = if comes { make_doubles(count, gap_main) } else { [] }
+    let wrap = !wrap_eq(s.wrap, FlexWrap::NoWrap)
+    let line_limit = if known(inner_main) { inner_main } else { avail_main }
+    let mut start = 0
+    let mut sum = 0.0
+    if wrap {
+      for k in 0..<count {
+        let size = if row && s.wrap_least && f[k * ITEM + SHRINK] != 0.0 {
+          fmax(or_else(f[k * ITEM + MIN_MAIN], 0.0), f[k * ITEM + PB_MAIN])
+        } else {
+          f[k * ITEM + HYP]
+        }
+        let outer = size + f[k * ITEM + MARGIN_MAIN]
+        if k > start && known(line_limit) && sum + gap_main + outer > line_limit + 0.0001 {
+          pool.line(start, k)
+          start = k
+          sum = outer
+        } else {
+          sum = if k == start { outer } else { sum + gap_main + outer }
+        }
+      }
+    }
+    if count > 0 || pool.lines.length() == 0 {
+      pool.line(start, count)
+    }
+    let lines = pool.lines
+    let mut max_line_main = 0.0
+    for ln in lines {
+      let n = ln.end - ln.start
+      let gaps = if comes {
+        let mut seen = 0.0
+        let mut all_g = 0.0
+        for k in ln.start..<ln.end {
+          let cs = flow[at[k]].style
+          let here = if cs.come_k < 1.0 && known(cs.come_now) && !cs.come_fill { 1.0 } else { cs.come_k }
+          let g = if k == ln.start {
+            0.0
+          } else if rows_g > 0.0 {
+            rows_room(gap_main * fmin(here, seen), rows_g)
+          } else {
+            gap_main * fmin(here, seen)
+          }
+          gap_before[k] = g
+          all_g += g
+          seen = fmax(seen, here)
+        }
+        all_g
+      } else if n > 1 {
+        gap_main * (n - 1).to_double()
+      } else {
+        0.0
+      }
+      let mut sum_hyp = gaps
+      let mut items_hyp = 0.0
+      for k in ln.start..<ln.end {
+        let hyp = if rows_g > 0.0 {
+          let h = row_on_grid(flow[at[k]].style, f[k * ITEM + HYP], rows_g)
+          f[k * ITEM + HYP] = h
+          h
+        } else {
+          f[k * ITEM + HYP]
+        }
+        let margin = f[k * ITEM + MARGIN_MAIN]
+        sum_hyp += hyp + margin
+        items_hyp += hyp + margin
+      }
+      let mut space = inner_main
+      if !known(space) {
+        let lo = if row { b.min_w - pbw } else { b.min_h - pbh }
+        let hi = if row { b.max_w - pbw } else { b.max_h - pbh }
+        if known(avail_main) && sum_hyp > avail_main {
+          space = avail_main
+        } else if known(hi) && sum_hyp > hi {
+          space = hi
+        } else if known(lo) && sum_hyp < lo {
+          space = lo
+        }
+      }
+      if row && !known(inner_main) && known(space) {
+        for k in ln.start..<ln.end {
+          let i = k * ITEM
+          let dec = f[i + DECLARED]
+          if known(dec) {
+            let back = clamp_size(dec, f[i + MIN_MAIN], f[i + MAX_MAIN])
+            let hyp = f[i + HYP]
+            sum_hyp = sum_hyp - hyp + back
+            items_hyp = items_hyp - hyp + back
+            f[i + BASIS] = dec
+            f[i + HYP] = back
+          }
+        }
+      }
+      if any_fits && !wrap && known(space) && sum_hyp > space + 0.01 {
+        let was = items_hyp
+        items_hyp = fit_line(pool, flow, ln.start, ln.end, space - gaps, cb_w, cb_h)
+        sum_hyp = sum_hyp + items_hyp - was
+      }
+      if known(space) {
+        resolve_flexible(pool, ln.start, ln.end, items_hyp, space - gaps)
+        if row && !overflow_eq(s.overflow, Overflow::Scroll) {
+          last_resort(pool, flow, ln.start, ln.end, space - gaps, cb_w, cb_h)
+        }
+      } else {
+        for k in ln.start..<ln.end {
+          f[k * ITEM + MAIN] = f[k * ITEM + HYP]
+        }
+      }
+      if rows_g > 0.0 {
+        for k in ln.start..<ln.end {
+          let m = f[k * ITEM + MAIN]
+          if m != f[k * ITEM + HYP] {
+            f[k * ITEM + MAIN] = row_on_grid(flow[at[k]].style, m, rows_g)
+          }
+        }
+      }
+      let mut used = gaps
+      for k in ln.start..<ln.end {
+        used += f[k * ITEM + MAIN] + f[k * ITEM + MARGIN_MAIN]
+      }
+      ln.used = used
+      max_line_main = fmax(max_line_main, used)
+    }
+    let main_size = if known(inner_main) {
+      inner_main
+    } else if wrap && known(avail_main) && lines.length() > 1 {
+      avail_main
+    } else {
+      let pb = if row { pbw } else { pbh }
+      let lo = if row { b.min_w } else { b.min_h }
+      let hi = if row { b.max_w } else { b.max_h }
+      clamp_size(max_line_main + pb, lo, hi) - pb
+    }
+    for k in 0..<count {
+      let i = k * ITEM
+      let cross_style = f[i + CROSS_STYLE]
+      if known(cross_style) {
+        f[i + CROSS] = clamp_size(cross_style, f[i + MIN_CROSS], f[i + MAX_CROSS])
+      } else {
+        let kc = if (flags[k] & STRETCH) != 0 && known(inner_cross) && !wrap {
+          fmax(inner_cross - f[i + MARGIN_CROSS], 0.0)
+        } else {
+          undef()
+        }
+        if known(kc) {
+          let hi = if (flags[k] & PAST_MAX) != 0 { undef() } else { f[i + MAX_CROSS] }
+          f[i + CROSS] = clamp_size(kc, f[i + MIN_CROSS], hi)
+          continue
+        }
+        let ac = if known(avail_cross) { avail_cross - f[i + MARGIN_CROSS] } else { undef() }
+        let main = f[i + MAIN]
+        let cw = if row {
+          size_node(flow[at[k]], main, kc, main, ac, cb_w, cb_h, false)
+        } else {
+          size_node(flow[at[k]], kc, main, ac, main, cb_w, cb_h, false)
+        }
+        let ch = flx.out_h
+        f[i + CROSS] = clamp_size(if row { ch } else { cw }, f[i + MIN_CROSS], f[i + MAX_CROSS])
+      }
+    }
+    let one_known_line = !wrap && known(inner_cross) && lines.length() == 1
+    for li, ln in lines {
+      if one_known_line && !(any_baseline && row) {
+        break
+      }
+      let mut c = 0.0
+      let mut asc = 0.0
+      let mut desc = 0.0
+      for k in ln.start..<ln.end {
+        let i = k * ITEM
+        pool.line_of[k] = li
+        let al = aligns[k]
+        if (align_eq(al, Align::Baseline) || align_eq(al, Align::FirstLineCenter)) && row {
+          let iw = f[i + MAIN]
+          let ih = f[i + CROSS]
+          let n = flow[at[k]]
+          let ascent = first_line_at(n, iw, ih, cb_w, cb_h, align_eq(al, Align::FirstLineCenter)) + f[i + MAR_CROSS_START]
+          f[i + ASCENT] = ascent
+          asc = fmax(asc, ascent)
+          desc = fmax(desc, f[i + CROSS] + f[i + MARGIN_CROSS] - ascent)
+        } else {
+          c = fmax(c, f[i + CROSS] + f[i + MARGIN_CROSS])
+        }
+      }
+      ln.ascent = asc
+      ln.cross = fmax(c, asc + desc)
+    }
+    if one_known_line {
+      lines[0].cross = inner_cross
+    }
+    let nl = lines.length()
+    let mut lines_cross = if nl > 1 { gap_cross * (nl - 1).to_double() } else { 0.0 }
+    for ln in lines { lines_cross += ln.cross }
+    let cross_size = if known(inner_cross) {
+      inner_cross
+    } else {
+      let pb = if row { pbh } else { pbw }
+      let lo = if row { b.min_h } else { b.min_w }
+      let hi = if row { b.max_h } else { b.max_w }
+      clamp_size(lines_cross + pb, lo, hi) - pb
+    }
+    if wrap {
+      let free = cross_size - lines_cross
+      if align_eq(s.align_content, Align::Stretch) && free > 0.0 && nl > 0 {
+        let extra = free / nl.to_double()
+        for ln in lines { ln.cross += extra }
+      }
+    } else if nl == 1 {
+      lines[0].cross = cross_size
+    }
+    for ln in lines {
+      if !any_stretch { break }
+      for k in ln.start..<ln.end {
+        if (flags[k] & STRETCH) != 0 {
+          let i = k * ITEM
+          let hi = if (flags[k] & PAST_MAX) != 0 { undef() } else { f[i + MAX_CROSS] }
+          f[i + CROSS] = clamp_size(fmax(ln.cross - f[i + MARGIN_CROSS], 0.0), f[i + MIN_CROSS], hi)
+        }
+      }
+    }
+    let mut total_cross = if nl > 1 { gap_cross * (nl - 1).to_double() } else { 0.0 }
+    for ln in lines { total_cross += ln.cross }
+    let free_cross = cross_size - total_cross
+    let lead = distribute(if wrap { s.align_content } else { Align::FlexStart }, free_cross, nl, true)
+    let between = flx.out_b
+    let mut cp = lead
+    for ln in lines {
+      ln.pos = cp
+      cp += ln.cross + gap_cross + between
+    }
+    let reverse = is_reverse(s.direction)
+    let wrap_reverse = wrap_eq(s.wrap, FlexWrap::WrapReverse)
+    let a_start_bit = if row { AUTO_L } else { AUTO_T }
+    let a_end_bit = if row { AUTO_R } else { AUTO_B }
+    let ca_start_bit = if row { AUTO_T } else { AUTO_L }
+    let ca_end_bit = if row { AUTO_B } else { AUTO_R }
+    for ln in lines {
+      let n = ln.end - ln.start
+      let used = ln.used
+      let mut auto_margins = 0
+      for k in ln.start..<ln.end {
+        if !any_auto { break }
+        if (flags[k] & a_start_bit) != 0 { auto_margins += 1 }
+        if (flags[k] & a_end_bit) != 0 { auto_margins += 1 }
+      }
+      let free = main_size - used
+      let per_auto = if auto_margins > 0 && free > 0.0 { free / auto_margins.to_double() } else { 0.0 }
+      let lead_m = if auto_margins > 0 {
+        flx.out_b = 0.0
+        0.0
+      } else {
+        distribute(s.justify, free, n, false)
+      }
+      let between_m = if rows_g > 0.0 { rows_room(flx.out_b, rows_g) } else { flx.out_b }
+      let mut p = if rows_g > 0.0 { rows_room(lead_m, rows_g) } else { lead_m }
+      for k in ln.start..<ln.end {
+        let i = k * ITEM
+        if comes && k > ln.start {
+          p = p - gap_main + gap_before[k]
+        }
+        let fl = flags[k]
+        let m_start = f[i + MAR_MAIN_START]
+        let m_end = f[i + MAR_MAIN_END]
+        let ms = m_start + (if (fl & a_start_bit) != 0 { per_auto } else { 0.0 })
+        let me = m_end + (if (fl & a_end_bit) != 0 { per_auto } else { 0.0 })
+        let main = f[i + MAIN]
+        if reverse {
+          f[i + MAIN_POS] = main_size - (p + ms) - main
+        } else {
+          f[i + MAIN_POS] = p + ms
+        }
+        p += ms + main + me + gap_main + between_m
+        let c_start = f[i + MAR_CROSS_START]
+        let c_end = f[i + MAR_CROSS_END]
+        let ca_start = (fl & ca_start_bit) != 0
+        let ca_end = (fl & ca_end_bit) != 0
+        let cross = f[i + CROSS]
+        let free_c = ln.cross - cross - c_start - c_end
+        let al = aligns[k]
+        let off = if ca_start && ca_end {
+          fmax(free_c, 0.0) / 2.0
+        } else if ca_start {
+          fmax(free_c, 0.0)
+        } else if ca_end {
+          0.0
+        } else {
+          match al {
+            Align::FlexEnd => free_c
+            Align::Center => free_c / 2.0
+            _ => 0.0
+          }
+        }
+        let mut cross_pos = ln.pos + c_start + off
+        if (align_eq(al, Align::Baseline) || align_eq(al, Align::FirstLineCenter)) && row && !(ca_start || ca_end) {
+          cross_pos = ln.pos + ln.ascent - f[i + ASCENT] + c_start
+        }
+        if wrap_reverse {
+          cross_pos = cross_size - cross_pos - cross
+        }
+        f[i + CROSS_POS] = cross_pos
+        if perform {
+          flow[at[k]].line = pool.line_of[k]
+        }
+      }
+    }
+    let fw_calc = if row { main_size + pbw } else { cross_size + pbw }
+    fh = if row { cross_size + pbh } else { main_size + pbh }
+    if s.gone_empty && !row {
+      gone_cut = 1.0 - gone_there(flow, pool)
+      if gone_cut > 0.0 {
+        fh = if known(h0) { h0 } else { fmax(fh - gone_cut * (b.pad_t + b.pad_b), 0.0) }
+      }
+      if !known(s.come_now) {
+        s.come_k = 1.0 - gone_cut
+      }
+    }
+    if !perform &&
+      row &&
+      wrap_eq(s.wrap, FlexWrap::NoWrap) &&
+      known(w0) &&
+      !known(h0) &&
+      !cross_by_height &&
+      !any_baseline &&
+      !b.of_cb_w &&
+      !b.of_cb_h &&
+      fmax(fh - pbh, 0.0) == cross_size {
+      let pre_arr = if pre.length() >= 3 + count * 4 {
+        pre
+      } else {
+        let a = make_doubles(3 + count * 4, 0.0)
+        node.pre = a
+        a
+      }
+      pre_arr[0] = w0
+      pre_arr[1] = fw_calc
+      pre_arr[2] = fh
+      for k in 0..<count {
+        let i = k * ITEM
+        let j = 3 + k * 4
+        pre_arr[j] = f[i + MAIN]
+        pre_arr[j + 1] = f[i + CROSS]
+        pre_arr[j + 2] = f[i + MAIN_POS]
+        pre_arr[j + 3] = f[i + CROSS_POS]
+      }
+      node.pre_gen = flx.generation
+    } else if !perform {
+      node.pre_gen = -1
+    }
+    fw_calc
+  }
+  if perform {
+    let count = pool.count
+    let at = pool.at
+    let f = pool.f
+    let flags = pool.flags
+    let ox = b.bor_l + b.pad_l
+    let oy0 = b.bor_t + b.pad_t
+    let oy1 = if gone_cut > 0.0 { oy0 - b.pad_t * gone_cut } else { oy0 }
+    let oy = if rows_g > 0.0 { rows_room(oy1, rows_g) } else { oy1 }
+    for k in 0..<count {
+      let i = k * ITEM
+      let n = flow[at[k]]
+      let iw = if row { f[i + MAIN] } else { f[i + CROSS] }
+      let ih = if row { f[i + CROSS] } else { f[i + MAIN] }
+      if !flx.reusing &&
+        n.children.length() == 0 &&
+        n.measure is None &&
+        known(iw) &&
+        known(ih) {
+        let ib = item_box(n)
+        let w = clamp_size(iw, soft_floor(n.style, ib.min_w), ib.max_w)
+        let h = clamp_size(ih, ib.min_h, ib.max_h)
+        let ipbw = ib.pbw()
+        let ipbh = ib.pbh()
+        let rw = fmax(w - ipbw, 0.0) + ipbw
+        let rh = fmax(h - ipbh, 0.0) + ipbh
+        counters[0] += 1
+        n.p_ok = true
+        n.p_kw = iw
+        n.p_kh = ih
+        n.p_cbw = cb_w
+        n.p_cbh = cb_h
+        n.p_w = rw
+        n.p_h = rh
+        n.laid_gen = flx.generation
+        n.width = rw
+        n.height = rh
+      } else {
+        let rw = size_node(n, iw, ih, iw, ih, cb_w, cb_h, true)
+        let rh = flx.out_h
+        n.width = rw
+        n.height = rh
+      }
+      let x = if row { f[i + MAIN_POS] } else { f[i + CROSS_POS] }
+      let y = if row { f[i + CROSS_POS] } else { f[i + MAIN_POS] }
+      let inset = (flags[k] & INSET) != 0
+      let dx = if inset { inset_offset(n.style, fw - pbw, fh - pbh, true) } else { 0.0 }
+      let dy = if inset { inset_offset(n.style, fw - pbw, fh - pbh, false) } else { 0.0 }
+      n.left = on_grid(ox + x + dx)
+      n.top = on_grid(if rows_g > 0.0 { ((oy + y + dy) * rows_g + 0.5).floor() / rows_g } else { oy + y + dy })
+    }
+    for c in node.children {
+      if disp_eq(c.style.display, Display::DisplayNone) {
+        if !(c.hidden_gen >= 0 && c.hidden_gen == c.laid_gen) {
+          left_out(c)
+          zero(c)
+          c.hidden_gen = c.laid_gen
+        }
+      } else if c.line < 0 && pos_eq(c.style.position, PositionType::Absolute) {
+        c.line = 0
+      }
+    }
+    if gone_kids {
+      for c in node.children {
+        if disp_eq(c.style.display, Display::Flex) && c.style.gone_empty && holds_none(c) {
+          left_out(c)
+          zero(c)
+        }
+      }
+    }
+    if s.fits {
+      let mut j = 0
+      for c in all {
+        if j < flow.length() && flow[j].id == c.id {
+          j += 1
+          if c.line < 0 { c.line = 0 }
+        } else {
+          left_out(c)
+        }
+      }
+    }
+  }
+  if asked > 0 {
+    flx.first_out = first_in_pool(node, b, flow, pool, row, fw, fh, gone_cut, rows_g, cb_w, cb_h, asked == 2)
+  }
+  pool.count = 0
+  flx.depth = d
+  flx.out_h = fh
+  fw
+}

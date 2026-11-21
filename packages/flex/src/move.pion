@@ -1,0 +1,663 @@
+// Move spring & come_* motion geometry for flex layout.
+// Ported from libs/mbui/src/flex/move.mbt.
+
+import "dmath"
+
+pub let move_k : Double = 7.4
+pub let move_end : Double = 0.9948653810514772
+pub let move_whole_frames_ms : Double = 50.0
+pub let move_least_ms : Double = 200.0
+pub let move_most_ms : Double = 500.0
+pub let turn_judged_from : Double = 0.05
+
+let move_start_gain : Double = 1.005161119327524
+let come_turn_rounds : Int = 12
+let come_back_k_halvings : Int = 64
+
+pub fn move_ms(points : Double) -> Double {
+  let d = if points > 0.0 { points } else { 0.0 }
+  let ms = ((200.0 + 7.5 * d.sqrt()) / move_whole_frames_ms).round() * move_whole_frames_ms
+  if ms < move_least_ms {
+    move_least_ms
+  } else if ms > move_most_ms || dmath::is_nan(ms) {
+    move_most_ms
+  } else {
+    ms
+  }
+}
+
+pub fn move_at(t : Double) -> Double {
+  if t <= 0.0 {
+    0.0
+  } else if t >= 1.0 {
+    1.0
+  } else {
+    let x = move_k * t
+    (1.0 - (1.0 + x) * dmath::exp(-x)) / move_end
+  }
+}
+
+pub fn move_path(d : Double, v : Double, t : Double, dur : Double) -> (Double, Double) {
+  if dur <= 0.0 || t >= time_gone(dur, 0.0) {
+    return (0.0, 0.0)
+  }
+  if t <= 0.0 {
+    return (d, v)
+  }
+  let w = move_k / dur
+  let b = v + w * d
+  let at = fn(tt : Double) -> (Double, Double) {
+    let e = dmath::exp(-w * tt)
+    ((d + b * tt) * e, (b - w * (d + b * tt)) * e)
+  }
+  let (x, xv) = at(t)
+  let (xt, _) = at(dur)
+  let s = move_k * t / dur
+  let m = (1.0 - (1.0 + s) * dmath::exp(-s)) / move_end
+  let mv = s * dmath::exp(-s) * move_k / dur / move_end
+  (x - xt * m, xv - xt * mv)
+}
+
+pub fn move_stop_points(v : Double) -> Double {
+  let speed = v.abs()
+  if speed <= 0.0 {
+    return 0.0
+  }
+  let mut d = speed * 200.0
+  for _ in 0..<8 {
+    d = speed * move_ms(d) / move_k
+  }
+  d
+}
+
+fn come_turn_w(v : Double) -> Double {
+  let x = v / turn_judged_from
+  let x2 = x * x
+  1.0 / (1.0 + x2 * x2 * x2)
+}
+
+pub struct ComeTurn {
+  pub v : Double
+  pub far : Double
+  pub ends : Double
+  pub t1 : Double
+  pub s : Double
+  pub a : Double
+  pub dur : Double
+  pub w : Double
+}
+
+pub struct ComeWith {
+  pub start : Double
+  pub ends : Double
+}
+
+fn come_turned(v : Double, far : Double, along : Option[ComeWith]) -> ComeTurn {
+  let speed = v.abs()
+  let w = come_turn_w(v)
+  let stop = move_stop_points(v)
+  let a_stop = speed * speed / (2.0 * stop)
+  let mut s = 0.0
+  let mut a = a_stop
+  let mut t1 = 0.0
+  let mut dur = 0.0
+  for _ in 0..<come_turn_rounds {
+    let d = far.abs() + s
+    t1 = speed / a
+    dur = come_move_ms(d, t1, along)
+    let om = if dur > 0.0 { move_k / dur } else { 0.0 }
+    let a_move = om * om * d * move_start_gain
+    if a_move <= 0.0 {
+      break
+    }
+    let was = a
+    a = dmath::exp(w * dmath::ln(a_move) + (1.0 - w) * dmath::ln(a_stop))
+    s = speed * speed / (2.0 * a)
+    if (a - was).abs() <= 1.0e-12 * a {
+      break
+    }
+  }
+  t1 = speed / a
+  dur = come_move_ms(far.abs() + s, t1, along)
+  let ends = match along {
+    Some(cw) => cw.ends
+    None => dmath::nan()
+  }
+  ComeTurn::{ v, far, ends, t1, s: if v > 0.0 { s } else { -s }, a, dur, w }
+}
+
+fn come_back_k_of(k : Double) -> Double {
+  let left = (1.0 + k) * dmath::exp(-k)
+  let mut lo = k
+  let mut hi = 4.0 * k
+  for _ in 0..<come_back_k_halvings {
+    let mid = (lo + hi) / 2.0
+    if (1.0 + mid + mid * mid / 2.0) * dmath::exp(-mid) > left {
+      lo = mid
+    } else {
+      hi = mid
+    }
+  }
+  (lo + hi) / 2.0
+}
+
+pub fn come_back_path(d : Double, a : Double, w : Double, t : Double, dur : Double) -> (Double, Double) {
+  if dur <= 0.0 || t >= time_gone(dur, 0.0) {
+    return (0.0, 0.0)
+  }
+  if t <= 0.0 {
+    return (d, 0.0)
+  }
+  let cbk = come_back_k_of(move_k)
+  let wm = w * w * (w * w)
+  let k = wm * move_k + (1.0 - wm) * cbk
+  let om = k / dur
+  let c1 = om * d
+  let x = k * t / dur
+  let e = dmath::exp(-x)
+  let end2 = 1.0 - (1.0 + k) * dmath::exp(-k)
+  let end3 = 1.0 - (1.0 + k + k * k / 2.0) * dmath::exp(-k)
+  let m = wm * (1.0 - (1.0 + x) * e) / end2 + (1.0 - wm) * (1.0 - (1.0 + x + x * x / 2.0) * e) / end3
+  let mv = wm * x * e * k / dur / end2 + (1.0 - wm) * x * x / 2.0 * e * k / dur / end3
+  let left = dmath::exp(-k)
+  let mm = wm * om * om / end2
+  let a_to = if d >= 0.0 { a } else { -a }
+  let c2 = (om * om * d - a_to + (d + c1 * dur) * left * mm) / (2.0 - dur * dur * left * mm)
+  let at = fn(tt : Double) -> (Double, Double) {
+    let ee = dmath::exp(-om * tt)
+    let p = d + c1 * tt + c2 * tt * tt
+    (p * ee, (c1 + 2.0 * c2 * tt - om * p) * ee)
+  }
+  let (y, yv) = at(t)
+  let (yt, _) = at(dur)
+  (y - yt * m, yv - yt * mv)
+}
+
+fn come_toward(from : Double, v : Double, goal : Double) -> Bool {
+  v * (goal - from) > 0.0
+}
+
+fn come_move_ms(far : Double, t0 : Double, along : Option[ComeWith]) -> Double {
+  match along {
+    Some(w) => fmax(w.ends - w.start - t0, 0.0)
+    None => if far.abs() < 0.5 { 0.0 } else { move_ms(far.abs()) }
+  }
+}
+
+fn come_on_ms(far : Double, along : Option[ComeWith]) -> Double {
+  match along {
+    Some(w) => fmax(w.ends - w.start, 0.0)
+    None => move_ms(far.abs())
+  }
+}
+
+pub struct ComeKept {
+  mut turn : Option[ComeTurn]
+}
+
+pub fn ComeKept::new() -> ComeKept {
+  ComeKept::{ turn: None }
+}
+
+pub fn come_way_ms(
+  from : Double,
+  v : Double,
+  goal : Double,
+  along? : ComeWith,
+  kept? : ComeKept,
+) -> Double {
+  if come_toward(from, v, goal) {
+    return come_on_ms(goal - from, along)
+  }
+  if v == 0.0 {
+    return come_move_ms(goal - from, 0.0, along)
+  }
+  let tr = come_turned_kept(v, goal - from, along, kept, None)
+  tr.t1 + tr.dur
+}
+
+fn come_turn_along(tr : ComeTurn, along : Option[ComeWith]) -> Bool {
+  match along {
+    Some(w) => tr.ends == w.ends
+    None => dmath::is_nan(tr.ends)
+  }
+}
+
+fn come_style_turn(s : Style, plan : Double, along : Option[ComeWith]) -> Option[ComeTurn] {
+  let v = s.come_v
+  if v == 0.0 || come_toward(s.come_from, v, plan) {
+    return None
+  }
+  let far = plan - s.come_from
+  match s.come_turn {
+    Some(tr) => {
+      if tr.v == v && tr.far == far && come_turn_along(tr, along) {
+        return Some(tr)
+      }
+      let nt = come_turned(v, far, along)
+      s.come_turn = Some(nt)
+      Some(nt)
+    }
+    None => {
+      let nt = come_turned(v, far, along)
+      s.come_turn = Some(nt)
+      Some(nt)
+    }
+  }
+}
+
+fn come_turned_kept(
+  v : Double,
+  far : Double,
+  along : Option[ComeWith],
+  kept : Option[ComeKept],
+  turn : Option[ComeTurn],
+) -> ComeTurn {
+  match turn {
+    Some(tr) => {
+      if tr.v == v && tr.far == far && come_turn_along(tr, along) {
+        return tr
+      }
+    }
+    None => ()
+  }
+  match (kept, along) {
+    (Some(k), None) => {
+      match k.turn {
+        Some(tr) => {
+          if tr.v == v && tr.far == far {
+            return tr
+          }
+          let nt = come_turned(v, far, None)
+          k.turn = Some(nt)
+          nt
+        }
+        None => {
+          let nt = come_turned(v, far, None)
+          k.turn = Some(nt)
+          nt
+        }
+      }
+    }
+    _ => come_turned(v, far, along)
+  }
+}
+
+pub fn come_way(from : Double, v : Double, goal : Double, t : Double, along? : ComeWith) -> (Double, Double) {
+  come_way_by_opt(from, v, goal, goal, t, along, None, None)
+}
+
+pub fn come_way_by(
+  from : Double,
+  v : Double,
+  goal : Double,
+  plan : Double,
+  t : Double,
+  along? : ComeWith,
+  kept? : ComeKept,
+  turn? : ComeTurn,
+) -> (Double, Double) {
+  come_way_by_opt(from, v, goal, plan, t, along, kept, turn)
+}
+
+fn come_way_by_opt(
+  from : Double,
+  v : Double,
+  goal : Double,
+  plan : Double,
+  t : Double,
+  along : Option[ComeWith],
+  kept : Option[ComeKept],
+  turn : Option[ComeTurn],
+) -> (Double, Double) {
+  if come_toward(from, v, plan) {
+    let (off, ov) = move_path(from - goal, v, t, come_on_ms(plan - from, along))
+    return (goal + off, ov)
+  }
+  if v == 0.0 {
+    let far = goal - from
+    if t <= 0.0 {
+      return (from, 0.0)
+    }
+    let dur = come_move_ms(plan - from, 0.0, along)
+    if dur <= 0.0 || t >= time_gone(dur, 0.0) {
+      return (from + far, 0.0)
+    }
+    let (off, ov) = move_path(-far, 0.0, t, dur)
+    return (from + far + off, ov)
+  }
+  let tr = come_turned_kept(v, plan - from, along, kept, turn)
+  if t >= tr.t1 + tr.dur {
+    return (goal, 0.0)
+  }
+  if t <= tr.t1 {
+    let g = if v > 0.0 { -tr.a } else { tr.a }
+    return (from + v * t + g * t * t / 2.0, v + g * t)
+  }
+  let (off, ov) = come_back_path(from + tr.s - goal, tr.a, tr.w, t - tr.t1, tr.dur)
+  (goal + off, ov)
+}
+
+pub struct ComeGroup {
+  pub at : Double
+  pub members : Array[Style]
+  pub mut set : Bool
+  pub mut v : Double
+  pub mut d : Double
+  pub mut s : Double
+  pub mut t1 : Double
+  pub mut a : Double
+  pub mut w : Double
+  pub mut dur : Double
+  pub mut spec : Option[(Double, (Double) -> Double)]
+}
+
+pub fn ComeGroup::new(at : Double) -> ComeGroup {
+  ComeGroup::{ at, members: [], set: false, v: 0.0, d: 0.0, s: 0.0, t1: 0.0, a: 0.0, w: 0.0, dur: 0.0, spec: None }
+}
+
+pub fn come_group_set(g : ComeGroup) -> Unit {
+  if g.members.length() < 2 {
+    for m in g.members {
+      m.come_group = None
+    }
+    return
+  }
+  let mut v = 0.0
+  for m in g.members {
+    let d = m.come_goal - m.come_from
+    v += if d >= 0.0 { m.come_v } else { -m.come_v }
+  }
+  g.v = v
+  match g.spec {
+    Some((ms, _)) => {
+      if ms > 0.0 {
+        g.v = 0.0
+        g.dur = ms
+        g.d = 0.0
+        for m in g.members {
+          g.d += (m.come_goal - m.come_from).abs()
+        }
+        for m in g.members {
+          m.come_group = Some(g)
+          m.come_ends = g.at + ms
+          m.come_plan = m.come_goal
+        }
+        g.set = true
+        return
+      }
+    }
+    None => ()
+  }
+  let speed = -v
+  let w = if v < 0.0 { come_turn_w(v) } else { 0.0 }
+  let a_stop = if v < 0.0 { speed * speed / (2.0 * move_stop_points(v)) } else { 0.0 }
+  let mut s = 0.0
+  let mut a = a_stop
+  let mut t1 = 0.0
+  let measure = fn(ss : Double) -> (Double, Double) {
+    let mut far = 0.0
+    let mut dd = 0.0
+    for m in g.members {
+      let start = if v < 0.0 { m.come_from + m.come_v * ss / v } else { m.come_from }
+      let d = (m.come_goal - start).abs()
+      far = fmax(far, d)
+      dd += d
+    }
+    (far, dd)
+  }
+  if v < 0.0 {
+    for _ in 0..<come_turn_rounds {
+      let (f, d) = measure(s)
+      t1 = speed / a
+      let du = come_move_ms(f, t1, None)
+      let om = if du > 0.0 { move_k / du } else { 0.0 }
+      let a_move = om * om * d * move_start_gain
+      if a_move <= 0.0 {
+        break
+      }
+      let was = a
+      a = 1.0 / ((1.0 - w) / a_stop + w / a_move)
+      s = -(speed * speed / (2.0 * a))
+      if (a - was).abs() <= 1.0e-12 * a {
+        break
+      }
+    }
+    t1 = speed / a
+  }
+  let (far, dd) = measure(s)
+  let dur = if v < 0.0 { come_move_ms(far, t1, None) } else if far < 0.5 { 0.0 } else { move_ms(far) }
+  g.s = s
+  g.t1 = t1
+  g.a = a
+  g.w = w
+  g.d = dd
+  g.dur = dur
+  let ends = g.at + (if v < 0.0 { t1 + g.dur } else { g.dur })
+  for m in g.members {
+    m.come_group = Some(g)
+    m.come_ends = ends
+    m.come_plan = m.come_goal
+  }
+  g.set = true
+}
+
+fn come_group_way(g : ComeGroup, s : Style, goal : Double, t : Double) -> (Double, Double) {
+  match g.spec {
+    Some(spec) => {
+      if spec.0 > 0.0 {
+        return come_spec_way(s, spec, goal, t)
+      }
+    }
+    None => ()
+  }
+  if g.v < 0.0 {
+    let k = s.come_v / g.v
+    if t <= g.t1 {
+      let x = g.v * t + g.a * t * t / 2.0
+      return (s.come_from + k * x, k * (g.v + g.a * t))
+    }
+    let start = s.come_from + k * g.s
+    let (y, yv) = if g.d > 0.0 { come_back_path(1.0, g.a / g.d, g.w, t - g.t1, g.dur) } else { (0.0, 0.0) }
+    (start + (goal - start) * (1.0 - y), -(goal - start) * yv)
+  } else {
+    let (p, pv) = if g.d <= 0.0 || g.dur <= 0.0 || t >= time_gone(g.dur, 0.0) {
+      (1.0, 0.0)
+    } else {
+      let v = fmin(g.v, move_k / g.dur * g.d)
+      let (off, ov) = move_path(-g.d, v, t, g.dur)
+      (1.0 + off / g.d, ov / g.d)
+    }
+    (s.come_from + (goal - s.come_from) * p, (goal - s.come_from) * pv)
+  }
+}
+
+fn plan_of(s : Style, goal : Double) -> Double {
+  if known(s.come_plan) { s.come_plan } else { goal }
+}
+
+fn group_is_set(g : Option[ComeGroup]) -> Bool {
+  match g {
+    Some(cg) => cg.set
+    None => false
+  }
+}
+
+fn come_height(s : Style, natural : Double) -> Double {
+  let goal = s.come_to * natural
+  s.come_goal = goal
+  s.come_whole = natural
+  if !known(s.come_ends) {
+    let dur0 = match s.come_spec {
+      Some((ms, _)) => {
+        if !group_is_set(s.come_group) {
+          ms
+        } else {
+          match come_style_turn(s, goal, None) {
+            Some(tr) => tr.t1 + tr.dur
+            None => come_way_ms(s.come_from, s.come_v, goal)
+          }
+        }
+      }
+      None => {
+        match come_style_turn(s, goal, None) {
+          Some(tr) => tr.t1 + tr.dur
+          None => come_way_ms(s.come_from, s.come_v, goal)
+        }
+      }
+    }
+    s.come_ends = s.come_at + dur0
+    s.come_plan = goal
+  }
+  let dur = s.come_ends - s.come_at
+  let t = time_gone(s.come_now, s.come_at)
+  if dur <= 0.0 || t >= time_gone(dur, 0.0) {
+    s.come_k = fmax(fmin(s.come_to, 1.0), 0.0)
+    return if s.come_to >= 1.0 { dmath::nan() } else { goal }
+  }
+  let tall = come_tall_on(s, goal, t)
+  s.come_k = if natural > 0.0 {
+    fmax(fmin(tall / natural, 1.0), 0.0)
+  } else if s.come_to <= 0.0 && s.come_from > 0.0 {
+    fmax(fmin(tall / s.come_from, 1.0), 0.0)
+  } else {
+    s.come_to
+  }
+  tall
+}
+
+fn come_tall_on(s : Style, goal : Double, t : Double) -> Double {
+  let said = match s.come_group {
+    Some(g) => {
+      if g.set {
+        g.spec is Some(_)
+      } else {
+        s.come_spec is Some(_)
+      }
+    }
+    None => s.come_spec is Some(_)
+  }
+  let (tall0, _) = match s.come_group {
+    Some(g) => {
+      if g.set {
+        come_group_way(g, s, goal, t)
+      } else {
+        match s.come_spec {
+          Some(spec) => come_spec_way(s, spec, goal, t)
+          None => {
+            let plan = plan_of(s, goal)
+            come_way_by_opt(s.come_from, s.come_v, goal, plan, t, None, None, come_style_turn(s, plan, None))
+          }
+        }
+      }
+    }
+    None => {
+      match s.come_spec {
+        Some(spec) => come_spec_way(s, spec, goal, t)
+        None => {
+          let plan = plan_of(s, goal)
+          come_way_by_opt(s.come_from, s.come_v, goal, plan, t, None, None, come_style_turn(s, plan, None))
+        }
+      }
+    }
+  }
+  let tall = fmax(tall0, 0.0)
+  let g = s.come_grid
+  if g <= 0.0 || !known(goal) {
+    tall
+  } else if goal < s.come_from {
+    fmax((tall * g + 0.000001).floor() / g, goal)
+  } else if said {
+    fmin((tall * g - 0.000001).ceil() / g, (goal * g - 0.000001).ceil() / g)
+  } else {
+    fmin((tall * g - 0.000001).ceil() / g, goal)
+  }
+}
+
+fn come_spec_way(s : Style, spec : (Double, (Double) -> Double), goal : Double, t : Double) -> (Double, Double) {
+  let (ms, curve) = spec
+  if ms <= 0.0 || t >= ms {
+    return (goal, 0.0)
+  }
+  let x = fmax(t / ms, 0.0)
+  let dx = 1.0e-4
+  let p = curve(x)
+  let slope = (curve(fmin(x + dx, 1.0)) - p) / (fmin(x + dx, 1.0) - x) / ms
+  (s.come_from + (goal - s.come_from) * p, (goal - s.come_from) * slope)
+}
+
+pub fn come_tall_at(s : Style, natural : Double, at : Double) -> Double {
+  if !known(s.come_at) || !known(s.come_to) {
+    return natural
+  }
+  let goal = s.come_to * natural
+  let ends = if known(s.come_ends) {
+    s.come_ends
+  } else {
+    let dur0 = match s.come_spec {
+      Some((ms, _)) => {
+        if !group_is_set(s.come_group) {
+          ms
+        } else {
+          match come_style_turn(s, goal, None) {
+            Some(tr) => tr.t1 + tr.dur
+            None => come_way_ms(s.come_from, s.come_v, goal)
+          }
+        }
+      }
+      None => {
+        match come_style_turn(s, goal, None) {
+          Some(tr) => tr.t1 + tr.dur
+          None => come_way_ms(s.come_from, s.come_v, goal)
+        }
+      }
+    }
+    s.come_at + dur0
+  }
+  let dur = ends - s.come_at
+  let t = time_gone(at, s.come_at)
+  if dur <= 0.0 || t >= time_gone(dur, 0.0) {
+    return if s.come_to >= 1.0 { natural } else { goal }
+  }
+  come_tall_on(s, goal, t)
+}
+
+pub fn come_state(s : Style, at : Double) -> Option[(Double, Double)] {
+  if !known(s.come_now) || !known(s.come_at) || !known(s.come_ends) || !known(s.come_goal) {
+    return None
+  }
+  let dur = s.come_ends - s.come_at
+  let t = time_gone(at, s.come_at)
+  if dur <= 0.0 || t >= time_gone(dur, 0.0) {
+    return Some((s.come_goal, 0.0))
+  }
+  let (tall, v) = match s.come_group {
+    Some(g) => {
+      if g.set {
+        come_group_way(g, s, s.come_goal, t)
+      } else {
+        match s.come_spec {
+          Some(spec) => come_spec_way(s, spec, s.come_goal, t)
+          None => {
+            let plan = plan_of(s, s.come_goal)
+            come_way_by_opt(s.come_from, s.come_v, s.come_goal, plan, t, None, None, come_style_turn(s, plan, None))
+          }
+        }
+      }
+    }
+    None => {
+      match s.come_spec {
+        Some(spec) => come_spec_way(s, spec, s.come_goal, t)
+        None => {
+          let plan = plan_of(s, s.come_goal)
+          come_way_by_opt(s.come_from, s.come_v, s.come_goal, plan, t, None, None, come_style_turn(s, plan, None))
+        }
+      }
+    }
+  }
+  Some((fmax(tall, 0.0), v))
+}
+
+pub fn time_gone(now : Double, start : Double) -> Double {
+  ((now - start) / 1.0e-6).round() * 1.0e-6
+}

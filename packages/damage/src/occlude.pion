@@ -1,0 +1,441 @@
+// Occlusion culling for frame instances before host rendering.
+// Ported from libs/mbui/src/damage/occlude.mbt.
+
+/// How many covers are kept at once.
+let cover_most : Int = 16
+
+/// The least share of the window an opaque fill is a cover from.
+let cover_least : Double = 0.125
+
+/// The frame `inst` (`count` instances, a window `w` x `h` points) without what of it cannot be seen.
+pub fn Damage::occlude(
+  self : Damage,
+  inst : Array[Double],
+  count : Int,
+  w : Double,
+  h : Double,
+) -> (Array[Double], Int) {
+  if self.unit_at.length() < count {
+    self.unit_at = make_ints(count * 2, 0)
+    self.hidden = make_bools(count * 2, false)
+    self.shown_at = make_ints(count * 2, -1)
+  }
+  self.occ_ok = false
+  self.occ_count = count
+  self.occ_w = w
+  self.occ_h = h
+  self.occ_hid = 0
+  self.occ_last = -1
+  self.cover_log = []
+  let least = w * h * cover_least
+  let mut units = 0
+  let mut last = -1
+  let mut k = 0
+  while k < count && kind_at(inst, k) != 12 {
+    self.unit_at[units] = k
+    self.hidden[units] = false
+    let o = k * inst_size
+    let kind = kind_at(inst, k)
+    if kind == 0 && inst[o + 11] == 1.0 && inst[o + 2] * inst[o + 3] >= least {
+      last = units
+    }
+    units += 1
+    k += if kind == 13 { dmax(inst[o + 14], 1.0).to_int() } else { 1 }
+  }
+  let pieces = if k < count { k } else { count }
+  self.occ_units = units
+  self.occ_pieces = pieces
+  if last <= 0 {
+    self.occ_ok = true
+    return (inst, count)
+  }
+  self.occ_last = last
+  let mut covers = 0
+  let mut hid = 0
+  let all = Rect::none()
+  let r = Rect::none()
+  let mut u = last
+  while u >= 0 {
+    let k = self.unit_at[u]
+    let o = k * inst_size
+    let kind = kind_at(inst, k)
+    self.cover_unit = u
+    if covers > 0 &&
+      (
+        kind == 13 ||
+        (inst[o] >= all.x0 &&
+        inst[o + 1] >= all.y0 &&
+        inst[o] + inst[o + 2] <= all.x1 &&
+        inst[o + 1] + inst[o + 3] <= all.y1)
+      ) &&
+      self.hideable(inst, k, kind) {
+      r.clear()
+      self.reach_of(inst, k, r)
+      r.x0 = dmax(r.x0, 0.0)
+      r.y0 = dmax(r.y0, 0.0)
+      r.x1 = dmin(r.x1, w)
+      r.y1 = dmin(r.y1, h)
+      if !r.empty() && self.covered(covers, r) {
+        self.hidden[u] = true
+        hid += 1
+        u -= 1
+        continue
+      }
+    }
+    if is_glass(kind) || (kind == 13 && self.reads_under(inst[o + 12].to_int(), 0)) {
+      if covers > 0 {
+        covers = 0
+        all.clear()
+        self.cover_logged(-1, Rect::none())
+      }
+    } else if kind == 0 {
+      let was = self.cover_log.length()
+      covers = self.cover_add(inst, k, w, h, covers)
+      if self.cover_log.length() != was {
+        all.clear()
+        for j in 0..<covers {
+          let c = j * 4
+          all.add(self.covers[c], self.covers[c + 1], self.covers[c + 2], self.covers[c + 3])
+        }
+      }
+    }
+    u -= 1
+  }
+  self.occ_hid = hid
+  self.occ_ok = true
+  if hid == 0 {
+    return (inst, count)
+  }
+  self.shown_put(inst)
+}
+
+/// Fast path when only headers at `moved` changed since last `occlude`.
+pub fn Damage::occlude_moved(
+  self : Damage,
+  inst : Array[Double],
+  count : Int,
+  w : Double,
+  h : Double,
+  moved : Array[Int],
+) -> Option[(Array[Double], Int)] {
+  guard self.occ_ok && count == self.occ_count && w == self.occ_w && h == self.occ_h else {
+    return None
+  }
+  let mut flipped = false
+  let r = Rect::none()
+  for k in moved {
+    guard k >= 0 && k < count && kind_at(inst, k) == 13 else { return None }
+    let u = match self.unit_at_k(k) {
+      Some(v) => v
+      None => return None
+    }
+    let mut hide = false
+    if u <= self.occ_last && self.hideable(inst, k, 13) {
+      let n = self.covers_at(u)
+      if n > 0 {
+        r.clear()
+        self.reach_of(inst, k, r)
+        r.x0 = dmax(r.x0, 0.0)
+        r.y0 = dmax(r.y0, 0.0)
+        r.x1 = dmin(r.x1, w)
+        r.y1 = dmin(r.y1, h)
+        if !r.empty() && covered_in(self.replay, n, r) {
+          hide = true
+        }
+      }
+    }
+    if hide != self.hidden[u] {
+      if self.reads_under(inst[k * inst_size + 12].to_int(), 0) {
+        return None
+      }
+      self.hidden[u] = hide
+      self.occ_hid += if hide { 1 } else { -1 }
+      flipped = true
+    }
+  }
+  if self.occ_hid == 0 {
+    return Some((inst, count))
+  }
+  if flipped {
+    return Some(self.shown_put(inst))
+  }
+  for k in moved {
+    match self.unit_at_k(k) {
+      Some(u) => {
+        if !self.hidden[u] {
+          blit_doubles(inst, k * inst_size, self.shown, self.shown_at[u] * inst_size, inst_size)
+        }
+      }
+      None => ()
+    }
+  }
+  Some((self.shown, self.occ_shown))
+}
+
+fn Damage::unit_at_k(self : Damage, k : Int) -> Option[Int] {
+  let mut lo = 0
+  let mut hi = self.occ_units
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    let at = self.unit_at[mid]
+    if at == k {
+      return Some(mid)
+    } else if at < k {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  None
+}
+
+fn Damage::cover_logged(self : Damage, j : Int, c : Rect) -> Unit {
+  self.cover_log.push(self.cover_unit.to_double())
+  self.cover_log.push(j.to_double())
+  self.cover_log.push(c.x0)
+  self.cover_log.push(c.y0)
+  self.cover_log.push(c.x1)
+  self.cover_log.push(c.y1)
+}
+
+fn Damage::covers_at(self : Damage, u : Int) -> Int {
+  let log = self.cover_log
+  let mut n = 0
+  let mut e = 0
+  while e < log.length() && log[e].to_int() > u {
+    let j = log[e + 1].to_int()
+    if j < 0 {
+      n = 0
+    } else {
+      for q in 0..<4 {
+        self.replay[j * 4 + q] = log[e + 2 + q]
+      }
+      if j + 1 > n {
+        n = j + 1
+      }
+    }
+    e += 6
+  }
+  n
+}
+
+fn covered_in(c : Array[Double], n : Int, r : Rect) -> Bool {
+  for j in 0..<n {
+    let o = j * 4
+    if r.x0 >= c[o] && r.y0 >= c[o + 1] && r.x1 <= c[o + 2] && r.y1 <= c[o + 3] {
+      return true
+    }
+  }
+  false
+}
+
+fn Damage::shown_put(self : Damage, inst : Array[Double]) -> (Array[Double], Int) {
+  let count = self.occ_count
+  let units = self.occ_units
+  let pieces = self.occ_pieces
+  if self.shown.length() < count * inst_size {
+    self.shown = make_doubles(count * inst_size * 2, 0.0)
+  }
+  let mut n = 0
+  for v in 0..<units {
+    if self.hidden[v] {
+      continue
+    }
+    let at = self.unit_at[v]
+    let end = if v + 1 < units { self.unit_at[v + 1] } else { pieces }
+    self.shown_at[v] = n
+    blit_doubles(inst, at * inst_size, self.shown, n * inst_size, (end - at) * inst_size)
+    n += end - at
+  }
+  blit_doubles(inst, pieces * inst_size, self.shown, n * inst_size, (count - pieces) * inst_size)
+  self.occ_shown = n + count - pieces
+  (self.shown, self.occ_shown)
+}
+
+fn Damage::hideable(self : Damage, a : Array[Double], k : Int, kind : Int) -> Bool {
+  if is_glass(kind) || kind == 9 || kind == 12 {
+    return false
+  }
+  if kind == 13 {
+    return groups_contains(self.groups, a[k * inst_size + 12].to_int())
+  }
+  !(kind == 4 && a[k * inst_size + 20] >= stream_tex_base)
+}
+
+fn Damage::reads_under(self : Damage, id : Int, depth : Int) -> Bool {
+  match reads_get(self.group_reads, id) {
+    Some((glass, heads)) => {
+      if glass || depth > 8 {
+        return true
+      }
+      for g in heads {
+        if self.reads_under(g, depth + 1) {
+          return true
+        }
+      }
+      false
+    }
+    None => true
+  }
+}
+
+fn Damage::covered(self : Damage, n : Int, r : Rect) -> Bool {
+  let c = self.covers
+  for j in 0..<n {
+    let o = j * 4
+    if r.x0 >= c[o] && r.y0 >= c[o + 1] && r.x1 <= c[o + 2] && r.y1 <= c[o + 3] {
+      return true
+    }
+  }
+  false
+}
+
+fn Damage::cover_add(self : Damage, a : Array[Double], k : Int, w : Double, h : Double, n : Int) -> Int {
+  let o = k * inst_size
+  let solid = a[o + 11] == 1.0 &&
+    a[o + 7] == 0.0 &&
+    a[o + 32] == 0.0 &&
+    a[o + 21] == 0.0 &&
+    a[o + 22] == 0.0 &&
+    a[o + 23] == 0.0 &&
+    a[o + 53] == 0.0 &&
+    a[o + 55] == 0.0 &&
+    a[o + 57] == 0.0 &&
+    a[o + 59] == 0.0
+  if !solid || a[o + 2] * a[o + 3] < w * h * cover_least {
+    return n
+  }
+  let border = if a[o + 6] > 0.0 && a[o + 15] != 1.0 { a[o + 6] } else { 0.0 }
+  let box = cross(
+    a[o] + border,
+    a[o + 1] + border,
+    a[o] + a[o + 2] - border,
+    a[o + 1] + a[o + 3] - border,
+    a[o + 36],
+    a[o + 37],
+    a[o + 38],
+    a[o + 39],
+    reach_pad,
+    w,
+    h,
+  )
+  let rounded = a[o + 24] > 0.0 || a[o + 25] > 0.0 || a[o + 26] > 0.0 || a[o + 27] > 0.0
+  let clip = cross(
+    a[o + 16],
+    a[o + 17],
+    a[o + 18],
+    a[o + 19],
+    a[o + 24],
+    a[o + 25],
+    a[o + 26],
+    a[o + 27],
+    if rounded { reach_pad } else { 0.0 },
+    w,
+    h,
+  )
+  let mut cores = meet(box, clip)
+  if a[o + 44] > 0.0 || a[o + 45] > 0.0 || a[o + 46] > 0.0 || a[o + 47] > 0.0 {
+    let outer = cross(
+      a[o + 40],
+      a[o + 41],
+      a[o + 42],
+      a[o + 43],
+      a[o + 44],
+      a[o + 45],
+      a[o + 46],
+      a[o + 47],
+      reach_pad,
+      w,
+      h,
+    )
+    cores = meet(cores, outer)
+  }
+  let mut n = n
+  let pair = [cores.0, cores.1]
+  for c in pair {
+    if c.empty() {
+      continue
+    }
+    if n < cover_most {
+      self.cover_put(n, c)
+      n += 1
+    } else {
+      let mut least = 0
+      let mut least_area = 1.0e300
+      for j in 0..<n {
+        let p = j * 4
+        let area = (self.covers[p + 2] - self.covers[p]) * (self.covers[p + 3] - self.covers[p + 1])
+        if area < least_area {
+          least_area = area
+          least = j
+        }
+      }
+      if c.area() > least_area {
+        self.cover_put(least, c)
+      }
+    }
+  }
+  n
+}
+
+fn Damage::cover_put(self : Damage, j : Int, c : Rect) -> Unit {
+  self.cover_logged(j, c)
+  self.covers[j * 4] = c.x0
+  self.covers[j * 4 + 1] = c.y0
+  self.covers[j * 4 + 2] = c.x1
+  self.covers[j * 4 + 3] = c.y1
+}
+
+fn cross(
+  x0 : Double,
+  y0 : Double,
+  x1 : Double,
+  y1 : Double,
+  tl : Double,
+  tr : Double,
+  br : Double,
+  bl : Double,
+  pad : Double,
+  w : Double,
+  h : Double,
+) -> (Rect, Rect) {
+  let left = if x0 <= 0.0 { -1.0e18 } else { x0 + pad }
+  let top = if y0 <= 0.0 { -1.0e18 } else { y0 + pad }
+  let right = if x1 >= w { 1.0e18 } else { x1 - pad }
+  let foot = if y1 >= h { 1.0e18 } else { y1 - pad }
+  let across = Rect::{
+    x0: left,
+    y0: dmax(top, y0 + 2.0 * dmax(tl, tr) + pad),
+    x1: right,
+    y1: dmin(foot, y1 - 2.0 * dmax(bl, br) - pad),
+  }
+  let up = Rect::{
+    x0: dmax(left, x0 + 2.0 * dmax(tl, bl) + pad),
+    y0: top,
+    x1: dmin(right, x1 - 2.0 * dmax(tr, br) - pad),
+    y1: foot,
+  }
+  if tl <= 0.0 && tr <= 0.0 && br <= 0.0 && bl <= 0.0 {
+    across.x0 = left
+    across.y0 = top
+    across.x1 = right
+    across.y1 = foot
+    up.clear()
+  }
+  (across, up)
+}
+
+fn meet(a : (Rect, Rect), b : (Rect, Rect)) -> (Rect, Rect) {
+  let all = [a.0.within(b.0), a.0.within(b.1), a.1.within(b.0), a.1.within(b.1)]
+  // Sort 4 elements descending by area
+  for i in 0..<4 {
+    for j in (i + 1)..<4 {
+      if all[j].area() > all[i].area() {
+        let tmp = all[i]
+        all[i] = all[j]
+        all[j] = tmp
+      }
+    }
+  }
+  (all[0], all[1])
+}

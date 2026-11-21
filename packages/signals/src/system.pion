@@ -1,0 +1,543 @@
+// Index-based alien-signals 3.2.1 reactive graph (zero RC cycles!).
+// Ported from libs/mbui/src/signals/system.mbt.
+
+import "halt"
+
+pub let flag_none : Int = 0
+pub let flag_mutable : Int = 1
+pub let flag_watching : Int = 2
+pub let flag_recursed_check : Int = 4
+pub let flag_recursed : Int = 8
+pub let flag_dirty : Int = 16
+pub let flag_pending : Int = 32
+let flag_has_child_effect : Int = 64
+let flag_unwatch_after_update : Int = 128
+let flag_dispose_after_update : Int = 256
+
+let kind_signal : Int = 0
+let kind_computed : Int = 1
+let kind_effect : Int = 2
+let kind_scope : Int = 3
+let kind_trigger : Int = 4
+let kind_watch : Int = 5
+
+/// Opaque handle to a node in the index-based reactive graph (zero RC cycles).
+pub struct ReactiveNode {
+  pub id : Int
+  pub gen : Int
+}
+
+struct LinkSlot {
+  mut version : Int
+  mut dep : Int
+  mut sub : Int
+  mut prev_sub : Int
+  mut next_sub : Int
+  mut prev_dep : Int
+  mut next_dep : Int
+  mut alive : Bool
+}
+
+struct NodeSlot {
+  mut gen : Int
+  mut deps : Int
+  mut deps_tail : Int
+  mut subs : Int
+  mut subs_tail : Int
+  mut flags : Int
+  mut kind : Int
+  mut effect_fn : Option[() -> Option[() -> Unit]]
+  mut watch_id : Int
+  mut update_fn : Option[(Int) -> Bool]
+  mut cleanup : Option[() -> Unit]
+  mut holds : Bool
+  mut alive : Bool
+}
+
+struct WatchSlot {
+  mut changed : Option[() -> Unit]
+  mut marked : Option[() -> Unit]
+  mut stale : Bool
+  mut gone : Bool
+  mut marked_by : String
+  mut set_by : Array[String]
+  mut resting : Bool
+}
+
+struct GraphState {
+  nodes : Array[NodeSlot]
+  links : Array[LinkSlot]
+  watches : Array[WatchSlot]
+  free_nodes : Array[Int]
+  free_links : Array[Int]
+  check_frames : Array[Int]
+  propagate_frames : Array[Int]
+  inner_recursed : Array[Int]
+  computed_extra_reads : Array[Int]
+  mut cycle : Int
+  mut run_depth : Int
+  mut batch_depth : Int
+  mut notify_index : Int
+  mut queued_length : Int
+  mut active_sub : Int
+  mut untracked_depth : Int
+  mut owner : Int
+  queued : Array[Int]
+  mut flushing : Int
+  afters : Array[Option[() -> Unit]]
+  mut draining : Bool
+  mut computing : Int
+  computed_afters : Array[Option[() -> Unit]]
+  mut held_at : Int
+  mut watch_read_depth : Int
+  watch_read_sets : Array[String]
+  mut set_at : String
+  mut setting : String
+  mut has_setting : Bool
+  mut sets_count : Int
+  mut fanout_limit : Int
+  mut on_fanout : Option[(String, Int) -> Unit]
+  mut on_untracked_read : Option[(ReactiveNode) -> Unit]
+  mut effect_in_watch : Option[(String) -> Unit]
+  mut effect_in_computed : Option[(String) -> Unit]
+  mut first_told_by : Option[(() -> Unit) -> Unit]
+  mut live_nodes : Int
+  mut live_links : Int
+}
+
+let g : GraphState = GraphState::{
+  nodes: [],
+  links: [],
+  watches: [],
+  free_nodes: [],
+  free_links: [],
+  check_frames: [],
+  propagate_frames: [],
+  inner_recursed: [],
+  computed_extra_reads: [],
+  cycle: 0,
+  run_depth: 0,
+  batch_depth: 0,
+  notify_index: 0,
+  queued_length: 0,
+  active_sub: -1,
+  untracked_depth: 0,
+  owner: -1,
+  queued: [],
+  flushing: 0,
+  afters: [],
+  draining: false,
+  computing: 0,
+  computed_afters: [],
+  held_at: 0,
+  watch_read_depth: 0,
+  watch_read_sets: [],
+  set_at: "",
+  setting: "",
+  has_setting: false,
+  sets_count: 0,
+  fanout_limit: 0,
+  on_fanout: None,
+  on_untracked_read: None,
+  effect_in_watch: None,
+  effect_in_computed: None,
+  first_told_by: None,
+  live_nodes: 0,
+  live_links: 0,
+}
+
+fn bit_not(x : Int) -> Int {
+  x ^ (-1)
+}
+
+pub fn live_node_count() -> Int {
+  g.live_nodes
+}
+
+pub fn live_link_count() -> Int {
+  g.live_links
+}
+
+fn alloc_node(
+  flags : Int,
+  kind : Int,
+  effect_fn : Option[() -> Option[() -> Unit]],
+  watch_id : Int,
+  update_fn : Option[(Int) -> Bool],
+) -> Int {
+  g.live_nodes += 1
+  match g.free_nodes.pop() {
+    Some(id) => {
+      let s = g.nodes[id]
+      s.gen += 1
+      s.deps = -1
+      s.deps_tail = -1
+      s.subs = -1
+      s.subs_tail = -1
+      s.flags = flags
+      s.kind = kind
+      s.effect_fn = effect_fn
+      s.watch_id = watch_id
+      s.update_fn = update_fn
+      s.cleanup = None
+      s.holds = false
+      s.alive = true
+      id
+    }
+    None => {
+      let id = g.nodes.length()
+      g.nodes.push(NodeSlot::{
+        gen: 1,
+        deps: -1,
+        deps_tail: -1,
+        subs: -1,
+        subs_tail: -1,
+        flags,
+        kind,
+        effect_fn,
+        watch_id,
+        update_fn,
+        cleanup: None,
+        holds: false,
+        alive: true,
+      })
+      id
+    }
+  }
+}
+
+fn free_node(id : Int) -> Unit {
+  let s = g.nodes[id]
+  if !s.alive {
+    return
+  }
+  s.alive = false
+  s.flags = flag_none
+  s.deps = -1
+  s.deps_tail = -1
+  s.subs = -1
+  s.subs_tail = -1
+  s.effect_fn = None
+  s.update_fn = None
+  s.cleanup = None
+  s.holds = false
+  g.live_nodes -= 1
+  g.free_nodes.push(id)
+}
+
+fn alloc_link(
+  version : Int,
+  dep : Int,
+  sub : Int,
+  prev_dep : Int,
+  next_dep : Int,
+  prev_sub : Int,
+) -> Int {
+  g.live_links += 1
+  match g.free_links.pop() {
+    Some(id) => {
+      let l = g.links[id]
+      l.version = version
+      l.dep = dep
+      l.sub = sub
+      l.prev_dep = prev_dep
+      l.next_dep = next_dep
+      l.prev_sub = prev_sub
+      l.next_sub = -1
+      l.alive = true
+      id
+    }
+    None => {
+      let id = g.links.length()
+      g.links.push(LinkSlot::{
+        version,
+        dep,
+        sub,
+        prev_sub,
+        next_sub: -1,
+        prev_dep,
+        next_dep,
+        alive: true,
+      })
+      id
+    }
+  }
+}
+
+fn free_link(id : Int) -> Unit {
+  let l = g.links[id]
+  if !l.alive {
+    return
+  }
+  l.alive = false
+  l.dep = -1
+  l.sub = -1
+  l.prev_dep = -1
+  l.next_dep = -1
+  l.prev_sub = -1
+  l.next_sub = -1
+  g.live_links -= 1
+  g.free_links.push(id)
+}
+
+fn node_handle(id : Int) -> ReactiveNode {
+  ReactiveNode::{ id, gen: g.nodes[id].gen }
+}
+
+fn link_nodes(dep : Int, sub : Int, version : Int) -> Unit {
+  let dep_slot = g.nodes[dep]
+  let sub_slot = g.nodes[sub]
+  if dep_slot.holds && !sub_slot.holds {
+    holds_up(sub)
+  }
+  let prev_dep = sub_slot.deps_tail
+  if prev_dep >= 0 && g.links[prev_dep].dep == dep {
+    return
+  }
+  let next_dep = if prev_dep >= 0 { g.links[prev_dep].next_dep } else { sub_slot.deps }
+  if next_dep >= 0 && g.links[next_dep].dep == dep {
+    g.links[next_dep].version = version
+    sub_slot.deps_tail = next_dep
+    return
+  }
+  let prev_sub = dep_slot.subs_tail
+  if prev_sub >= 0 && g.links[prev_sub].version == version && g.links[prev_sub].sub == sub {
+    return
+  }
+  let new_link = alloc_link(version, dep, sub, prev_dep, next_dep, prev_sub)
+  sub_slot.deps_tail = new_link
+  dep_slot.subs_tail = new_link
+  if next_dep >= 0 {
+    g.links[next_dep].prev_dep = new_link
+  }
+  if prev_dep >= 0 {
+    g.links[prev_dep].next_dep = new_link
+  } else {
+    sub_slot.deps = new_link
+  }
+  if prev_sub >= 0 {
+    g.links[prev_sub].next_sub = new_link
+  } else {
+    dep_slot.subs = new_link
+  }
+}
+
+fn holds_up(node_id : Int) -> Unit {
+  let slot = g.nodes[node_id]
+  slot.holds = true
+  let mut l = slot.subs
+  while l >= 0 {
+    let sub_id = g.links[l].sub
+    if !g.nodes[sub_id].holds {
+      holds_up(sub_id)
+    }
+    l = g.links[l].next_sub
+  }
+}
+
+fn unlink_edge(link_id : Int, sub : Int) -> Int {
+  let l = g.links[link_id]
+  let dep = l.dep
+  let prev_dep = l.prev_dep
+  let next_dep = l.next_dep
+  let next_sub = l.next_sub
+  let prev_sub = l.prev_sub
+  free_link(link_id)
+
+  let sub_slot = g.nodes[sub]
+  if next_dep >= 0 {
+    g.links[next_dep].prev_dep = prev_dep
+  } else {
+    sub_slot.deps_tail = prev_dep
+  }
+  if prev_dep >= 0 {
+    g.links[prev_dep].next_dep = next_dep
+  } else {
+    sub_slot.deps = next_dep
+  }
+
+  let dep_slot = g.nodes[dep]
+  if next_sub >= 0 {
+    g.links[next_sub].prev_sub = prev_sub
+  } else {
+    dep_slot.subs_tail = prev_sub
+  }
+  if prev_sub >= 0 {
+    g.links[prev_sub].next_sub = next_sub
+  } else {
+    dep_slot.subs = next_sub
+    if next_sub < 0 {
+      unwatched_node(dep)
+    }
+  }
+  next_dep
+}
+
+fn propagate(start : Int, inner_write : Bool) -> Unit {
+  let first_inserted = g.queued_length
+  let mut link_id = start
+  let mut next = g.links[link_id].next_sub
+  let base = g.propagate_frames.length()
+  let rec_base = g.inner_recursed.length()
+  while true {
+    let sub = g.links[link_id].sub
+    let sub_slot = g.nodes[sub]
+    let mut flags = sub_slot.flags
+    if (flags & (flag_recursed_check | flag_recursed | flag_dirty | flag_pending)) == 0 {
+      sub_slot.flags = flags | flag_pending
+      if inner_write && (flags & flag_mutable) != 0 {
+        g.inner_recursed.push(sub)
+      }
+    } else if (flags & (flag_recursed_check | flag_recursed)) == 0 {
+      flags = flag_none
+    } else if (flags & flag_recursed_check) == 0 {
+      sub_slot.flags = (flags & bit_not(flag_recursed)) | flag_pending
+      if inner_write && (flags & flag_mutable) != 0 {
+        g.inner_recursed.push(sub)
+      }
+    } else if (flags & (flag_dirty | flag_pending)) == 0 && is_valid_link(link_id, sub) {
+      sub_slot.flags = flags | (flag_recursed | flag_pending)
+      flags = flags & flag_mutable
+    } else {
+      flags = flag_none
+    }
+    if (flags & flag_watching) != 0 {
+      notify_node(sub)
+    }
+    if (flags & flag_mutable) != 0 {
+      let sub_subs = sub_slot.subs
+      if sub_subs >= 0 {
+        link_id = sub_subs
+        let next_sub = g.links[sub_subs].next_sub
+        if next_sub >= 0 {
+          if next >= 0 {
+            g.propagate_frames.push(next)
+          }
+          next = next_sub
+        }
+        continue
+      }
+    }
+    if next >= 0 {
+      link_id = next
+      next = g.links[next].next_sub
+      continue
+    }
+    if g.propagate_frames.length() > base {
+      let popped = g.propagate_frames.pop().unwrap_or(-1)
+      link_id = popped
+      next = g.links[popped].next_sub
+      continue
+    }
+    break
+  }
+  while g.inner_recursed.length() > rec_base {
+    let n = g.inner_recursed.pop().unwrap_or(-1)
+    let ns = g.nodes[n]
+    if (ns.flags & (flag_pending | flag_dirty)) != 0 {
+      ns.flags = ns.flags | flag_recursed
+    }
+  }
+  if g.fanout_limit > 0 {
+    let woken = g.queued_length - first_inserted
+    if woken >= g.fanout_limit {
+      match g.on_fanout {
+        Some(tell) => tell(g.setting, woken)
+        None => ()
+      }
+    }
+  }
+}
+
+fn check_dirty(start : Int, start_sub : Int) -> Bool {
+  let mut link_id = start
+  let mut sub = start_sub
+  let mut check_depth = 0
+  let mut dirty = false
+  while true {
+    let dep = g.links[link_id].dep
+    let flags = g.nodes[dep].flags
+    if (g.nodes[sub].flags & flag_dirty) != 0 {
+      dirty = true
+    } else if (flags & (flag_mutable | flag_dirty)) == (flag_mutable | flag_dirty) {
+      let subs = g.nodes[dep].subs
+      if update_node(dep) {
+        if subs >= 0 && g.links[subs].next_sub >= 0 {
+          shallow_propagate(subs)
+        }
+        dirty = true
+      }
+    } else if (flags & (flag_mutable | flag_pending)) == (flag_mutable | flag_pending) {
+      g.check_frames.push(link_id)
+      link_id = g.nodes[dep].deps
+      sub = dep
+      check_depth += 1
+      continue
+    }
+    if !dirty {
+      let nd = g.links[link_id].next_dep
+      if nd >= 0 {
+        link_id = nd
+        continue
+      }
+    }
+    let mut to_top = false
+    while check_depth > 0 {
+      check_depth -= 1
+      link_id = g.check_frames.pop().unwrap_or(-1)
+      if dirty {
+        let subs = g.nodes[sub].subs
+        if subs < 0 {
+          dirty = false
+        } else if update_node(sub) {
+          if subs >= 0 && g.links[subs].next_sub >= 0 {
+            shallow_propagate(subs)
+          }
+          sub = g.links[link_id].sub
+          continue
+        }
+        dirty = false
+      } else {
+        g.nodes[sub].flags = g.nodes[sub].flags & bit_not(flag_pending)
+      }
+      sub = g.links[link_id].sub
+      let nd = g.links[link_id].next_dep
+      if nd >= 0 {
+        link_id = nd
+        to_top = true
+        break
+      }
+    }
+    if to_top {
+      continue
+    }
+    return dirty && g.nodes[sub].flags != 0
+  }
+  false
+}
+
+fn shallow_propagate(start : Int) -> Unit {
+  let mut link_id = start
+  while link_id >= 0 {
+    let sub = g.links[link_id].sub
+    let flags = g.nodes[sub].flags
+    if (flags & (flag_pending | flag_dirty)) == flag_pending {
+      g.nodes[sub].flags = flags | flag_dirty
+      if (flags & (flag_watching | flag_recursed_check)) == flag_watching {
+        notify_node(sub)
+      }
+    }
+    link_id = g.links[link_id].next_sub
+  }
+}
+
+fn is_valid_link(check : Int, sub : Int) -> Bool {
+  let mut link_id = g.nodes[sub].deps_tail
+  while link_id >= 0 {
+    if link_id == check {
+      return true
+    }
+    link_id = g.links[link_id].prev_dep
+  }
+  false
+}

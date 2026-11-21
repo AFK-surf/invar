@@ -1,0 +1,713 @@
+// Bidirectional text (UAX #9): embedding levels, L1, L2 visual order, L4 mirroring.
+// Offsets are UTF-8 byte offsets.
+// Ported from libs/mbui/src/text/bidi.mbt.
+
+fn bidi_class(c : Int) -> Int {
+  get_bidi_table().get(c)
+}
+
+fn bracket_of(c : Int) -> (Int, Int) {
+  let n = bidi_brackets.length() / 3
+  let mut lo = 0
+  let mut hi = n - 1
+  while lo <= hi {
+    let mid = (lo + hi) / 2
+    let v = bidi_brackets[mid * 3]
+    if v == c {
+      return (bidi_brackets[mid * 3 + 1], bidi_brackets[mid * 3 + 2])
+    } else if v < c {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  (0, 0)
+}
+
+/// L4: Bidi_Mirroring_Glyph of `c`, or `c`.
+pub fn mirror(c : Int) -> Int {
+  let n = bidi_mirrors.length() / 2
+  let mut lo = 0
+  let mut hi = n - 1
+  while lo <= hi {
+    let mid = (lo + hi) / 2
+    let v = bidi_mirrors[mid * 2]
+    if v == c {
+      return bidi_mirrors[mid * 2 + 1]
+    } else if v < c {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  c
+}
+
+fn bracket_norm(c : Int) -> Int {
+  if c == 0x2329 { 0x3008 } else if c == 0x232A { 0x3009 } else { c }
+}
+
+fn is_isolate_initiator(t : Int) -> Bool {
+  t == b_lri || t == b_rli || t == b_fsi
+}
+
+fn is_removed_class(t : Int) -> Bool {
+  t == b_lre || t == b_lro || t == b_rle || t == b_rlo || t == b_pdf || t == b_bn
+}
+
+pub struct Bidi {
+  pub levels : Array[Int]
+  pub classes : Array[Int]
+  pub para : Array[Int]
+  pub mixed : Bool
+}
+
+fn strong_dir(t : Int) -> Int {
+  if t == b_l {
+    0
+  } else if t == b_r || t == b_al || t == b_en || t == b_an {
+    1
+  } else {
+    -1
+  }
+}
+
+fn first_strong(cls : Array[Int], a : Int, b : Int) -> Int {
+  let mut depth = 0
+  for k in a..<b {
+    let t = cls[k]
+    if is_isolate_initiator(t) {
+      depth += 1
+    } else if t == b_pdi {
+      if depth > 0 { depth -= 1 }
+    } else if depth == 0 {
+      if t == b_l { return 0 }
+      if t == b_r || t == b_al { return 1 }
+    }
+  }
+  -1
+}
+
+fn complex_class(t : Int) -> Bool {
+  t == b_r || t == b_al || t == b_an || (t >= b_lre && t <= b_pdf) || t == b_lri || t == b_rli || t == b_fsi
+}
+
+fn make_zeros(n : Int, v : Int) -> Array[Int] {
+  let a : Array[Int] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+fn make_bools(n : Int, v : Bool) -> Array[Bool] {
+  let a : Array[Bool] = []
+  for _ in 0..<n {
+    a.push(v)
+  }
+  a
+}
+
+pub fn bidi_new(s : String, dir : Int) -> Bidi {
+  let n = s.length()
+  let cps : Array[Int] = []
+  let at : Array[Int] = []
+  let lens : Array[Int] = []
+  let mut i = 0
+  let mut complex = dir == 1
+  while i < n {
+    let c = code_point_at(s, i)
+    let clen = cp_byte_len_at(s, i)
+    cps.push(c)
+    at.push(i)
+    lens.push(clen)
+    i += clen
+  }
+  let m = cps.length()
+  let cls = make_zeros(m, 0)
+  for k in 0..<m {
+    let t = bidi_class(cps[k])
+    cls[k] = t
+    if complex_class(t) {
+      complex = true
+    }
+  }
+  let levels = make_zeros(n, 0)
+  let classes = make_zeros(n, 0)
+  let para = make_zeros(n, 0)
+  for k in 0..<m {
+    let o = at[k]
+    for b in 0..<lens[k] {
+      classes[o + b] = cls[k]
+    }
+  }
+  if !complex {
+    return Bidi::{ levels, classes, para, mixed: false }
+  }
+  let lv = make_zeros(m, 0)
+  let pl = make_zeros(m, 0)
+  let mut a = 0
+  while a < m {
+    let mut b = a
+    while b < m && cls[b] != b_b {
+      b += 1
+    }
+    if b < m {
+      b += 1
+    }
+    resolve_paragraph(cps, cls, a, b, dir, lv, pl)
+    a = b
+  }
+  let mut mixed = false
+  for k in 0..<m {
+    let o = at[k]
+    for b in 0..<lens[k] {
+      levels[o + b] = lv[k]
+      para[o + b] = pl[k]
+    }
+    if lv[k] > 0 {
+      mixed = true
+    }
+  }
+  Bidi::{ levels, classes, para, mixed }
+}
+
+fn next_odd(l : Int) -> Int {
+  (l + 1) | 1
+}
+
+fn next_even(l : Int) -> Int {
+  (l + 2) & (-2)
+}
+
+fn resolve_paragraph(
+  cps : Array[Int],
+  cls : Array[Int],
+  a : Int,
+  b : Int,
+  dir : Int,
+  lv : Array[Int],
+  pl : Array[Int],
+) -> Unit {
+  let len = b - a
+  let match_pdi = make_zeros(len, b)
+  let pdi_of = make_zeros(len, -1)
+  let open : Array[Int] = []
+  for k in a..<b {
+    let t = cls[k]
+    if is_isolate_initiator(t) {
+      open.push(k)
+    } else if t == b_pdi && open.length() > 0 {
+      let o = open.pop().unwrap_or(0)
+      match_pdi[o - a] = k
+      pdi_of[k - a] = o
+    }
+  }
+  let para_level = if dir == 0 {
+    0
+  } else if dir == 1 {
+    1
+  } else if first_strong(cls, a, b) == 1 {
+    1
+  } else {
+    0
+  }
+  for k in a..<b {
+    pl[k] = para_level
+  }
+  let types = make_zeros(len, 0)
+  let removed = make_bools(len, false)
+  let st_level : Array[Int] = [para_level]
+  let st_override : Array[Int] = [0]
+  let st_isolate : Array[Bool] = [false]
+  let mut overflow_isolate = 0
+  let mut overflow_embedding = 0
+  let mut valid_isolate = 0
+
+  for k in a..<b {
+    let t = cls[k]
+    let j = k - a
+    let top_i = st_level.length() - 1
+    if t == b_rle || t == b_lre || t == b_rlo || t == b_lro {
+      let cur = st_level[top_i]
+      let nl = if t == b_rle || t == b_rlo { next_odd(cur) } else { next_even(cur) }
+      lv[k] = cur
+      if nl <= 125 && overflow_isolate == 0 && overflow_embedding == 0 {
+        st_level.push(nl)
+        st_override.push(if t == b_rlo { 2 } else if t == b_lro { 1 } else { 0 })
+        st_isolate.push(false)
+      } else if overflow_isolate == 0 {
+        overflow_embedding += 1
+      }
+      removed[j] = true
+      types[j] = t
+    } else if is_isolate_initiator(t) {
+      let cur = st_level[top_i]
+      lv[k] = cur
+      let o = st_override[top_i]
+      types[j] = if o == 1 { b_l } else if o == 2 { b_r } else { t }
+      let rtl = t == b_rli || (t == b_fsi && first_strong(cls, k + 1, match_pdi[j]) == 1)
+      let nl = if rtl { next_odd(cur) } else { next_even(cur) }
+      if nl <= 125 && overflow_isolate == 0 && overflow_embedding == 0 {
+        valid_isolate += 1
+        st_level.push(nl)
+        st_override.push(0)
+        st_isolate.push(true)
+      } else {
+        overflow_isolate += 1
+      }
+    } else if t == b_pdi {
+      if overflow_isolate > 0 {
+        overflow_isolate -= 1
+      } else if valid_isolate > 0 {
+        overflow_embedding = 0
+        while !st_isolate[st_level.length() - 1] {
+          let _ = st_level.pop()
+          let _ = st_override.pop()
+          let _ = st_isolate.pop()
+        }
+        let _ = st_level.pop()
+        let _ = st_override.pop()
+        let _ = st_isolate.pop()
+        valid_isolate -= 1
+      }
+      let ti = st_level.length() - 1
+      lv[k] = st_level[ti]
+      let o = st_override[ti]
+      types[j] = if o == 1 { b_l } else if o == 2 { b_r } else { t }
+    } else if t == b_pdf {
+      if overflow_isolate > 0 {
+        ()
+      } else if overflow_embedding > 0 {
+        overflow_embedding -= 1
+      } else if !st_isolate[top_i] && st_level.length() >= 2 {
+        let _ = st_level.pop()
+        let _ = st_override.pop()
+        let _ = st_isolate.pop()
+      }
+      lv[k] = st_level[st_level.length() - 1]
+      removed[j] = true
+      types[j] = t
+    } else if t == b_b {
+      lv[k] = para_level
+      types[j] = t
+    } else if t == b_bn {
+      lv[k] = st_level[top_i]
+      removed[j] = true
+      types[j] = t
+    } else {
+      lv[k] = st_level[top_i]
+      let o = st_override[top_i]
+      types[j] = if o == 1 { b_l } else if o == 2 { b_r } else { t }
+    }
+  }
+
+  let seqs : Array[Array[Int]] = []
+  let seq_of_initiator = make_zeros(len, -1)
+  let run : Array[Int] = []
+  for k in a..<b {
+    if removed[k - a] {
+      continue
+    }
+    if run.length() > 0 && lv[run[run.length() - 1]] != lv[k] {
+      close_bidi_run(cls, a, b, pdi_of, match_pdi, seqs, seq_of_initiator, run)
+    }
+    run.push(k)
+  }
+  close_bidi_run(cls, a, b, pdi_of, match_pdi, seqs, seq_of_initiator, run)
+
+  let emb = make_zeros(len, 0)
+  for k in a..<b {
+    emb[k - a] = lv[k]
+  }
+  for seq in seqs {
+    resolve_sequence(cps, cls, types, removed, emb, lv, a, b, para_level, match_pdi, seq)
+  }
+  for k in a..<b {
+    if removed[k - a] {
+      let mut p = k - 1
+      while p >= a && removed[p - a] {
+        p -= 1
+      }
+      if p >= a {
+        lv[k] = lv[p]
+      } else {
+        let mut q = k + 1
+        while q < b && removed[q - a] {
+          q += 1
+        }
+        lv[k] = if q < b { lv[q] } else { para_level }
+      }
+    }
+  }
+}
+
+fn close_bidi_run(
+  cls : Array[Int],
+  a : Int,
+  b : Int,
+  pdi_of : Array[Int],
+  match_pdi : Array[Int],
+  seqs : Array[Array[Int]],
+  seq_of_initiator : Array[Int],
+  run : Array[Int],
+) -> Unit {
+  if run.length() == 0 {
+    return
+  }
+  let first = run[0]
+  let o = pdi_of[first - a]
+  let id = if cls[first] == b_pdi && o >= 0 && seq_of_initiator[o - a] >= 0 {
+    let s = seq_of_initiator[o - a]
+    for x in run {
+      seqs[s].push(x)
+    }
+    s
+  } else {
+    seqs.push(run.copy())
+    seqs.length() - 1
+  }
+  let last = run[run.length() - 1]
+  if is_isolate_initiator(cls[last]) && match_pdi[last - a] < b {
+    seq_of_initiator[last - a] = id
+  }
+  run.clear()
+}
+
+fn is_neutral(x : Int) -> Bool {
+  x == b_b || x == b_s || x == b_ws || x == b_on || is_isolate_initiator(x) || x == b_pdi
+}
+
+fn resolve_sequence(
+  cps : Array[Int],
+  cls : Array[Int],
+  types : Array[Int],
+  removed : Array[Bool],
+  emb : Array[Int],
+  lv : Array[Int],
+  a : Int,
+  b : Int,
+  para_level : Int,
+  match_pdi : Array[Int],
+  seq : Array[Int],
+) -> Unit {
+  let n = seq.length()
+  let level = emb[seq[0] - a]
+  let mut p = seq[0] - 1
+  while p >= a && removed[p - a] {
+    p -= 1
+  }
+  let before = if p >= a { emb[p - a] } else { para_level }
+  let last = seq[n - 1]
+  let after = if is_isolate_initiator(cls[last]) && match_pdi[last - a] >= b {
+    para_level
+  } else {
+    let mut q = last + 1
+    while q < b && removed[q - a] {
+      q += 1
+    }
+    if q < b && !is_isolate_initiator(cls[last]) {
+      emb[q - a]
+    } else {
+      para_level
+    }
+  }
+  let sos = if (if before > level { before } else { level }) % 2 == 1 { b_r } else { b_l }
+  let eos = if (if after > level { after } else { level }) % 2 == 1 { b_r } else { b_l }
+  let t = make_zeros(n, 0)
+  for j in 0..<n {
+    t[j] = types[seq[j] - a]
+  }
+  for j in 0..<n {
+    if t[j] == b_nsm {
+      t[j] = if j == 0 {
+        sos
+      } else if is_isolate_initiator(t[j - 1]) || t[j - 1] == b_pdi {
+        b_on
+      } else {
+        t[j - 1]
+      }
+    }
+  }
+  let mut strong = sos
+  for j in 0..<n {
+    let x = t[j]
+    if x == b_l || x == b_r || x == b_al {
+      strong = x
+    } else if x == b_en && strong == b_al {
+      t[j] = b_an
+    }
+  }
+  for j in 0..<n {
+    if t[j] == b_al {
+      t[j] = b_r
+    }
+  }
+  if n >= 3 {
+    for j in 1..<(n - 1) {
+      let x = t[j]
+      if x == b_es && t[j - 1] == b_en && t[j + 1] == b_en {
+        t[j] = b_en
+      } else if x == b_cs && t[j - 1] == b_en && t[j + 1] == b_en {
+        t[j] = b_en
+      } else if x == b_cs && t[j - 1] == b_an && t[j + 1] == b_an {
+        t[j] = b_an
+      }
+    }
+  }
+  let mut j = 0
+  while j < n {
+    if t[j] != b_et {
+      j += 1
+      continue
+    }
+    let s = j
+    while j < n && t[j] == b_et {
+      j += 1
+    }
+    if (s > 0 && t[s - 1] == b_en) || (j < n && t[j] == b_en) {
+      for k in s..<j {
+        t[k] = b_en
+      }
+    }
+  }
+  for k in 0..<n {
+    let x = t[k]
+    if x == b_es || x == b_et || x == b_cs {
+      t[k] = b_on
+    }
+  }
+  strong = sos
+  for k in 0..<n {
+    let x = t[k]
+    if x == b_l || x == b_r {
+      strong = x
+    } else if x == b_en && strong == b_l {
+      t[k] = b_l
+    }
+  }
+  let e = if level % 2 == 1 { b_r } else { b_l }
+  let e_dir = if e == b_r { 1 } else { 0 }
+  let pairs : Array[(Int, Int)] = []
+  let stack_pair : Array[Int] = []
+  let stack_at : Array[Int] = []
+  let mut overflow = false
+  for k in 0..<n {
+    if overflow || t[k] != b_on {
+      continue
+    }
+    let c = cps[seq[k]]
+    let (pair, kind) = bracket_of(c)
+    if kind == 1 {
+      if stack_pair.length() == 63 {
+        overflow = true
+        continue
+      }
+      stack_pair.push(bracket_norm(pair))
+      stack_at.push(k)
+    } else if kind == 2 {
+      let want = bracket_norm(c)
+      let mut d = stack_pair.length() - 1
+      while d >= 0 && stack_pair[d] != want {
+        d -= 1
+      }
+      if d >= 0 {
+        pairs.push((stack_at[d], k))
+        while stack_pair.length() > d {
+          let _ = stack_pair.pop()
+          let _ = stack_at.pop()
+        }
+      }
+    }
+  }
+  // Sort pairs by opening bracket position
+  for ii in 1..<pairs.length() {
+    let key = pairs[ii]
+    let mut jj = ii - 1
+    while jj >= 0 && pairs[jj].0 > key.0 {
+      pairs[jj + 1] = pairs[jj]
+      jj -= 1
+    }
+    pairs[jj + 1] = key
+  }
+  for pr in pairs {
+    let (o, c) = pr
+    let mut found_e = false
+    let mut found_other = false
+    for k in (o + 1)..<c {
+      let d = strong_dir(t[k])
+      if d == e_dir {
+        found_e = true
+      } else if d >= 0 {
+        found_other = true
+      }
+    }
+    let to = if found_e {
+      e
+    } else if found_other {
+      let mut ctx = if sos == b_r { 1 } else { 0 }
+      let mut k = o - 1
+      while k >= 0 {
+        let d = strong_dir(t[k])
+        if d >= 0 {
+          ctx = d
+          break
+        }
+        k -= 1
+      }
+      if ctx != e_dir {
+        if ctx == 1 { b_r } else { b_l }
+      } else {
+        e
+      }
+    } else {
+      -1
+    }
+    if to >= 0 {
+      t[o] = to
+      t[c] = to
+      let bks = [o, c]
+      for bk in bks {
+        let mut k = bk + 1
+        while k < n && cls[seq[k]] == b_nsm {
+          t[k] = to
+          k += 1
+        }
+      }
+    }
+  }
+  j = 0
+  while j < n {
+    if !is_neutral(t[j]) {
+      j += 1
+      continue
+    }
+    let s = j
+    while j < n && is_neutral(t[j]) {
+      j += 1
+    }
+    let lead = if s == 0 { strong_dir(sos) } else { strong_dir(t[s - 1]) }
+    let trail = if j >= n { strong_dir(eos) } else { strong_dir(t[j]) }
+    let to = if lead == trail && lead >= 0 {
+      if lead == 1 { b_r } else { b_l }
+    } else {
+      e
+    }
+    for k in s..<j {
+      t[k] = to
+    }
+  }
+  for k in 0..<n {
+    let x = t[k]
+    let l = level
+    lv[seq[k]] = if l % 2 == 0 {
+      if x == b_r { l + 1 } else if x == b_an || x == b_en { l + 2 } else { l }
+    } else if x == b_l || x == b_en || x == b_an {
+      l + 1
+    } else {
+      l
+    }
+  }
+}
+
+pub fn Bidi::line_levels(self : Bidi, start : Int, end : Int) -> Array[Int] {
+  let n = end - start
+  let out = make_zeros(n, 0)
+  if !self.mixed {
+    return out
+  }
+  for k in 0..<n {
+    out[k] = self.levels[start + k]
+  }
+  let mut trailing = true
+  let mut k = n - 1
+  while k >= 0 {
+    let t = self.classes[start + k]
+    if t == b_s || t == b_b {
+      out[k] = self.para[start + k]
+      trailing = true
+    } else if trailing && (t == b_ws || is_isolate_initiator(t) || t == b_pdi || is_removed_class(t)) {
+      out[k] = self.para[start + k]
+    } else {
+      trailing = false
+    }
+    k -= 1
+  }
+  out
+}
+
+pub fn Bidi::is_mixed(self : Bidi) -> Bool {
+  self.mixed
+}
+
+pub fn Bidi::paragraph_level(self : Bidi, i : Int) -> Int {
+  if i < self.para.length() { self.para[i] } else { 0 }
+}
+
+fn may_be_bidi_cp(c : Int) -> Bool {
+  if c < 0x0590 {
+    return false
+  }
+  c <= 0x08FF ||
+  c == 0x200F ||
+  (c >= 0x202A && c <= 0x202E) ||
+  (c >= 0x2066 && c <= 0x2068) ||
+  (c >= 0xFB1D && c <= 0xFDFF) ||
+  (c >= 0xFE70 && c <= 0xFEFF) ||
+  (c >= 0x10800 && c <= 0x10FFF) ||
+  (c >= 0x1E800 && c <= 0x1EFFF)
+}
+
+pub fn bidi_mixed(s : String) -> Option[Bidi] {
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let c = code_point_at(s, i)
+    if may_be_bidi_cp(c) {
+      let bd = bidi_new(s, -1)
+      return if bd.mixed { Some(bd) } else { None }
+    }
+    i += cp_byte_len_at(s, i)
+  }
+  None
+}
+
+/// L2: visual order of runs given their embedding levels.
+pub fn visual_order(levels : Array[Int]) -> Array[Int] {
+  let n = levels.length()
+  let order : Array[Int] = []
+  for i in 0..<n {
+    order.push(i)
+  }
+  let mut hi = 0
+  let mut lo_odd = 1000
+  for l in levels {
+    if l > hi { hi = l }
+    if l % 2 == 1 && l < lo_odd { lo_odd = l }
+  }
+  let mut l = hi
+  while l >= lo_odd && l > 0 {
+    let mut i = 0
+    while i < n {
+      if levels[order[i]] < l {
+        i += 1
+        continue
+      }
+      let s = i
+      while i < n && levels[order[i]] >= l {
+        i += 1
+      }
+      let mut x = s
+      let mut y = i - 1
+      while x < y {
+        let tmp = order[x]
+        order[x] = order[y]
+        order[y] = tmp
+        x += 1
+        y -= 1
+      }
+    }
+    l -= 1
+  }
+  order
+}

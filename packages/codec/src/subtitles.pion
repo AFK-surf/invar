@@ -1,0 +1,284 @@
+// SubRip, WebVTT and ASS/SSA subtitle parser.
+// Ported from libs/mbui/src/codec/subtitles.mbt.
+
+pub struct Cue {
+  pub from : Double
+  pub to : Double
+  pub text : String
+}
+
+fn ascii_to_lower(s : String) -> String {
+  let sb = StringBuilder::new()
+  for i in 0..<s.length() {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_byte((c + 32) as Byte)
+    } else {
+      sb.write_byte(c as Byte)
+    }
+  }
+  sb.to_string()
+}
+
+fn rev_find_byte(s : String, target : Int) -> Option[Int] {
+  let mut i = s.length() - 1
+  while i >= 0 {
+    if s.code_unit_at(i) == target {
+      return Some(i)
+    }
+    i -= 1
+  }
+  None
+}
+
+fn parse_uint_str(s : String) -> Option[Int] {
+  if s.length() == 0 {
+    return None
+  }
+  let mut v = 0
+  for i in 0..<s.length() {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    v = v * 10 + (c - 48)
+  }
+  Some(v)
+}
+
+fn strip_utf8_bom(b : Bytes) -> Bytes {
+  if b.length() >= 3 && b[0].to_int() == 0xEF && b[1].to_int() == 0xBB && b[2].to_int() == 0xBF {
+    b.slice(3, b.length())
+  } else {
+    b
+  }
+}
+
+pub fn parse_subtitles(name : String, bytes : Bytes) -> Array[Cue] {
+  let clean = strip_utf8_bom(bytes)
+  let raw = utf8_text(clean, clean.length())
+  let text = raw.replace("\r\n", "\n").replace("\r", "\n")
+  let ext = match rev_find_byte(name, 46) {
+    Some(i) => ascii_to_lower(name.slice(i + 1, name.length()))
+    None => ""
+  }
+  if ext == "ass" || ext == "ssa" {
+    parse_ass(text)
+  } else {
+    parse_timed(text)
+  }
+}
+
+pub fn parse_timed(text : String) -> Array[Cue] {
+  let out : Array[Cue] = []
+  let lines = text.split("\n")
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    let at = line.index_of("-->")
+    if at >= 0 {
+      let a = line.slice(0, at).trim()
+      let rest = line.slice(at + 3, line.length()).trim()
+      let sp = rest.index_of(" ")
+      let b = if sp >= 0 { rest.slice(0, sp) } else { rest }
+      i += 1
+      let words : Array[String] = []
+      while i < lines.length() && lines[i].trim() != "" {
+        words.push(strip_tags(lines[i]))
+        i += 1
+      }
+      match (subtitle_time(a), subtitle_time(b)) {
+        (Some(f), Some(t)) => {
+          if words.length() > 0 {
+            out.push(Cue::{ from: f, to: t, text: words.join("\n") })
+          }
+        }
+        _ => ()
+      }
+    } else {
+      i += 1
+    }
+  }
+  out
+}
+
+pub fn parse_ass(text : String) -> Array[Cue] {
+  let out : Array[Cue] = []
+  let mut events = false
+  let mut fields : Array[String] = ["layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"]
+  let lines = text.split("\n")
+  for raw in lines {
+    let line = raw.trim()
+    if line.starts_with("[") {
+      events = ascii_to_lower(line) == "[events]"
+      continue
+    }
+    if !events {
+      continue
+    }
+    let low = ascii_to_lower(line)
+    if low.starts_with("format:") {
+      let fs = line.slice(7, line.length()).split(",")
+      let next : Array[String] = []
+      for f in fs {
+        next.push(ascii_to_lower(f.trim()))
+      }
+      fields = next
+      continue
+    }
+    if !low.starts_with("dialogue:") {
+      continue
+    }
+    let body = line.slice(9, line.length())
+    let n = fields.length()
+    let parts : Array[String] = []
+    let mut from = 0
+    for k in 0..<body.length() {
+      if body.code_unit_at(k) == 44 && parts.length() < n - 1 {
+        parts.push(body.slice(from, k).trim())
+        from = k + 1
+      }
+    }
+    parts.push(body.slice(from, body.length()))
+    let mut start_s = ""
+    let mut end_s = ""
+    let mut text_s = ""
+    for k in 0..<fields.length() {
+      if k < parts.length() {
+        if fields[k] == "start" {
+          start_s = parts[k]
+        } else if fields[k] == "end" {
+          end_s = parts[k]
+        } else if fields[k] == "text" {
+          text_s = parts[k]
+        }
+      }
+    }
+    let words = ass_words(text_s)
+    match (subtitle_time(start_s), subtitle_time(end_s)) {
+      (Some(f), Some(t)) => {
+        if words != "" {
+          out.push(Cue::{ from: f, to: t, text: words })
+        }
+      }
+      _ => ()
+    }
+  }
+  // Insertion sort by Cue.from (stable)
+  for i in 1..<out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && out[j].from > key.from {
+      out[j + 1] = out[j]
+      j -= 1
+    }
+    out[j + 1] = key
+  }
+  out
+}
+
+fn ass_words(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let ch = s.code_unit_at(i)
+    if ch == 123 { // '{'
+      while i < n && s.code_unit_at(i) != 125 {
+        i += 1
+      }
+      i += 1
+      continue
+    }
+    if ch == 92 && i + 1 < n { // '\\'
+      let nx = s.code_unit_at(i + 1)
+      if nx == 78 || nx == 110 { // 'N' or 'n'
+        sb.write_byte(10 as Byte)
+        i += 2
+        continue
+      } else if nx == 104 { // 'h'
+        sb.write_byte(32 as Byte)
+        i += 2
+        continue
+      }
+    }
+    sb.write_byte(ch as Byte)
+    i += 1
+  }
+  sb.to_string().trim()
+}
+
+fn strip_tags(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let ch = s.code_unit_at(i)
+    if ch == 60 || (ch == 123 && i + 1 < n && s.code_unit_at(i + 1) == 92) {
+      let close = if ch == 60 { 62 } else { 125 }
+      let mut k = i + 1
+      while k < n && s.code_unit_at(k) != close {
+        k += 1
+      }
+      if k < n {
+        i = k + 1
+        continue
+      }
+    }
+    sb.write_byte(ch as Byte)
+    i += 1
+  }
+  sb.to_string()
+    .replace("&amp;", "&")
+    .replace("&lt;", "<")
+    .replace("&gt;", ">")
+    .replace("&nbsp;", " ")
+}
+
+pub fn subtitle_time(s : String) -> Option[Double] {
+  let s = s.trim().replace(",", ".")
+  if s == "" {
+    return None
+  }
+  let dot = s.index_of(".")
+  let (whole, frac) = if dot >= 0 {
+    (s.slice(0, dot), s.slice(dot + 1, s.length()))
+  } else {
+    (s, "")
+  }
+  let parts = whole.split(":")
+  if parts.length() < 2 || parts.length() > 3 {
+    return None
+  }
+  let mut secs = 0.0
+  for p in parts {
+    match parse_uint_str(p) {
+      Some(n) => { secs = secs * 60.0 + n.to_double() }
+      None => return None
+    }
+  }
+  let mut ms = secs * 1000.0
+  if frac != "" {
+    match parse_uint_str(frac) {
+      Some(n) => {
+        let mut scale = 1.0
+        for _ in 0..<frac.length() {
+          scale *= 10.0
+        }
+        ms += n.to_double() / scale * 1000.0
+      }
+      None => return None
+    }
+  }
+  Some(ms)
+}
+
+pub fn cues_at(cues : Array[Cue], ms : Double) -> String {
+  let said : Array[String] = []
+  for q in cues {
+    if q.from <= ms && ms < q.to {
+      said.push(q.text)
+    }
+  }
+  said.join("\n")
+}

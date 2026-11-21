@@ -1,0 +1,241 @@
+// Line break opportunities (UAX #14, rules LB1-LB31).
+// Offsets are UTF-8 byte offsets.
+// Ported from libs/mbui/src/text/linebreak.mbt.
+
+let cs_hard : Int = 1
+let cs_no_base : Int = 2
+let cs_lb13 : Int = 4
+let cs_lb15a_before : Int = 8
+let cs_lb15b_after : Int = 16
+let cs_lb20a_before : Int = 32
+let cs_lb21 : Int = 64
+let cs_al_hl : Int = 128
+let cs_al_hl_nu : Int = 256
+let cs_hy_hh : Int = 512
+let cs_cl_cp : Int = 1024
+let cs_pr_po : Int = 2048
+let cs_sy_is : Int = 4096
+let cs_id_eb_em : Int = 8192
+let cs_jamo : Int = 16384
+
+fn make_class_sets() -> Array[Int] {
+  let m : Array[Int] = []
+  for _ in 0..<64 {
+    m.push(0)
+  }
+  let sets : Array[(Int, Array[Int])] = [
+    (cs_hard, [lb_bk, lb_cr, lb_lf, lb_nl]),
+    (cs_no_base, [lb_bk, lb_cr, lb_lf, lb_nl, lb_sp, lb_zw]),
+    (cs_lb13, [lb_cl, lb_cp, lb_ex, lb_sy]),
+    (cs_lb15a_before, [lb_bk, lb_cr, lb_lf, lb_nl, lb_op, lb_qu, lb_gl, lb_sp, lb_zw]),
+    (cs_lb15b_after, [lb_sp, lb_gl, lb_wj, lb_cl, lb_qu, lb_cp, lb_ex, lb_is, lb_sy, lb_bk, lb_cr, lb_lf, lb_nl, lb_zw]),
+    (cs_lb20a_before, [lb_bk, lb_cr, lb_lf, lb_nl, lb_sp, lb_zw, lb_cb, lb_gl]),
+    (cs_lb21, [lb_ba, lb_hh, lb_hy, lb_ns]),
+    (cs_al_hl, [lb_al, lb_hl]),
+    (cs_al_hl_nu, [lb_al, lb_hl, lb_nu]),
+    (cs_hy_hh, [lb_hy, lb_hh]),
+    (cs_cl_cp, [lb_cl, lb_cp]),
+    (cs_pr_po, [lb_pr, lb_po]),
+    (cs_sy_is, [lb_sy, lb_is]),
+    (cs_id_eb_em, [lb_id, lb_eb, lb_em]),
+    (cs_jamo, [lb_jl, lb_jv, lb_jt, lb_h2, lb_h3]),
+  ]
+  for e in sets {
+    let (bit, ks) = e
+    for k in ks {
+      m[k] = m[k] | bit
+    }
+  }
+  m
+}
+
+fn get_class_sets() -> Array[Int] {
+  match text_tables.class_sets {
+    Some(cs) => cs
+    None => {
+      let cs = make_class_sets()
+      text_tables.class_sets = Some(cs)
+      cs
+    }
+  }
+}
+
+fn has_set(set : Int, k : Int) -> Bool {
+  let cs = get_class_sets()
+  k >= 0 && (cs[k] & set) != 0
+}
+
+let u_ea : Int = 1
+let u_xpcn : Int = 2
+let u_pi : Int = 4
+let u_pf : Int = 8
+let u_dotted : Int = 16
+let u_zwj_end : Int = 32
+
+struct Units {
+  start : Array[Int]
+  cls : Array[Int]
+  flags : Array[Int]
+  ri_run : Array[Int]
+}
+
+fn make_units(s : String) -> Units {
+  let n = s.length()
+  let u = Units::{ start: [], cls: [], flags: [], ri_run: [] }
+  let lt = get_line_table()
+  let mut i = 0
+  while i < n {
+    let c = code_point_at(s, i)
+    let p = lt.get(c)
+    let k = p & 63
+    let m = u.cls.length()
+    if (k == lb_cm || k == lb_zwj) && m > 0 && !has_set(cs_no_base, u.cls[m - 1]) {
+      let f = (u.flags[m - 1] | u_zwj_end) ^ u_zwj_end
+      u.flags[m - 1] = if k == lb_zwj { f | u_zwj_end } else { f }
+    } else {
+      let (cls, flags) = if k == lb_cm || k == lb_zwj {
+        (lb_al, 0)
+      } else {
+        (k, (p >> 6) | (if c == 0x25CC { u_dotted } else { 0 }))
+      }
+      u.start.push(i)
+      u.cls.push(cls)
+      u.flags.push(if k == lb_zwj { flags | u_zwj_end } else { flags })
+      u.ri_run.push(
+        if cls != lb_ri {
+          0
+        } else if m > 0 {
+          u.ri_run[m - 1] + 1
+        } else {
+          1
+        },
+      )
+    }
+    i += cp_byte_len_at(s, i)
+  }
+  u
+}
+
+fn Units::flag(self : Units, k : Int, f : Int) -> Bool {
+  k >= 0 && k < self.flags.length() && (self.flags[k] & f) != 0
+}
+
+fn Units::at(self : Units, k : Int) -> Int {
+  if k >= 0 && k < self.cls.length() { self.cls[k] } else { -1 }
+}
+
+fn Units::skip_sp(self : Units, k : Int) -> Int {
+  let mut j = k
+  while j >= 0 && self.cls[j] == lb_sp {
+    j -= 1
+  }
+  j
+}
+
+fn Units::brahmic(self : Units, k : Int) -> Bool {
+  let c = self.at(k)
+  c == lb_ak || c == lb_as || self.flag(k, u_dotted)
+}
+
+fn Units::decide(self : Units, u : Int) -> Int {
+  let a = self.cls[u - 1]
+  let b = self.cls[u]
+  let nb = self.at(u + 1)
+  if a == lb_bk { return 2 }
+  if a == lb_cr && b == lb_lf { return 0 }
+  if a == lb_cr || a == lb_lf || a == lb_nl { return 2 }
+  if has_set(cs_hard, b) || b == lb_sp || b == lb_zw { return 0 }
+  if self.at(self.skip_sp(u - 1)) == lb_zw { return 1 }
+  if self.flag(u - 1, u_zwj_end) { return 0 }
+  if a == lb_wj || b == lb_wj || a == lb_gl { return 0 }
+  if b == lb_gl && a != lb_sp && !has_set(cs_hy_hh, a) { return 0 }
+  if has_set(cs_lb13, b) { return 0 }
+  let before_sp = self.skip_sp(u - 1)
+  let bs = self.at(before_sp)
+  if bs == lb_op { return 0 }
+  if bs == lb_qu && self.flag(before_sp, u_pi) {
+    let k = self.at(before_sp - 1)
+    if k < 0 || has_set(cs_lb15a_before, k) { return 0 }
+  }
+  if b == lb_qu && self.flag(u, u_pf) && (nb < 0 || has_set(cs_lb15b_after, nb)) { return 0 }
+  if a == lb_sp && b == lb_is && nb == lb_nu { return 1 }
+  if b == lb_is { return 0 }
+  if has_set(cs_cl_cp, bs) && b == lb_ns { return 0 }
+  if bs == lb_b2 && b == lb_b2 { return 0 }
+  if a == lb_sp { return 1 }
+  if b == lb_qu && !self.flag(u, u_pi) { return 0 }
+  if a == lb_qu && !self.flag(u - 1, u_pf) { return 0 }
+  if b == lb_qu && (!self.flag(u - 1, u_ea) || nb < 0 || !self.flag(u + 1, u_ea)) { return 0 }
+  if a == lb_qu && (!self.flag(u, u_ea) || u < 2 || !self.flag(u - 2, u_ea)) { return 0 }
+  if a == lb_cb || b == lb_cb { return 1 }
+  if has_set(cs_hy_hh, a) && has_set(cs_al_hl, b) {
+    let k = self.at(u - 2)
+    if k < 0 || has_set(cs_lb20a_before, k) { return 0 }
+  }
+  if has_set(cs_lb21, b) || a == lb_bb { return 0 }
+  if has_set(cs_hy_hh, a) && self.at(u - 2) == lb_hl && b != lb_hl { return 0 }
+  if (a == lb_sy && b == lb_hl) || b == lb_in { return 0 }
+  if (has_set(cs_al_hl, a) && b == lb_nu) || (a == lb_nu && has_set(cs_al_hl, b)) { return 0 }
+  if (a == lb_pr && has_set(cs_id_eb_em, b)) || (has_set(cs_id_eb_em, a) && b == lb_po) { return 0 }
+  if (has_set(cs_pr_po, a) && has_set(cs_al_hl, b)) || (has_set(cs_al_hl, a) && has_set(cs_pr_po, b)) { return 0 }
+  if has_set(cs_pr_po, b) {
+    let mut j = u - 1
+    if has_set(cs_cl_cp, self.cls[j]) { j -= 1 }
+    while j >= 0 && has_set(cs_sy_is, self.cls[j]) { j -= 1 }
+    if self.at(j) == lb_nu { return 0 }
+  }
+  if has_set(cs_pr_po, a) && (b == lb_nu || (b == lb_op && (nb == lb_nu || (nb == lb_is && self.at(u + 2) == lb_nu)))) {
+    return 0
+  }
+  if (a == lb_hy || a == lb_is) && b == lb_nu { return 0 }
+  if b == lb_nu {
+    let mut j = u - 1
+    while j >= 0 && has_set(cs_sy_is, self.cls[j]) { j -= 1 }
+    if self.at(j) == lb_nu { return 0 }
+  }
+  if a == lb_jl && (b == lb_jl || b == lb_jv || b == lb_h2 || b == lb_h3) { return 0 }
+  if (a == lb_jv || a == lb_h2) && (b == lb_jv || b == lb_jt) { return 0 }
+  if (a == lb_jt || a == lb_h3) && b == lb_jt { return 0 }
+  if (has_set(cs_jamo, a) && b == lb_po) || (a == lb_pr && has_set(cs_jamo, b)) { return 0 }
+  if has_set(cs_al_hl, a) && has_set(cs_al_hl, b) { return 0 }
+  if a == lb_ap && self.brahmic(u) { return 0 }
+  if self.brahmic(u - 1) && (b == lb_vf || b == lb_vi) { return 0 }
+  if a == lb_vi && self.brahmic(u - 2) && (b == lb_ak || self.flag(u, u_dotted)) { return 0 }
+  if self.brahmic(u - 1) && self.brahmic(u) && nb == lb_vf { return 0 }
+  if a == lb_is && has_set(cs_al_hl, b) { return 0 }
+  if has_set(cs_al_hl_nu, a) && b == lb_op && !self.flag(u, u_ea) { return 0 }
+  if a == lb_cp && !self.flag(u - 1, u_ea) && has_set(cs_al_hl_nu, b) { return 0 }
+  if a == lb_ri && b == lb_ri && self.ri_run[u - 1] % 2 == 1 { return 0 }
+  if b == lb_em && (a == lb_eb || self.flag(u - 1, u_xpcn)) { return 0 }
+  1
+}
+
+/// Line breaks before each UTF-8 byte offset of `s` (length + 1 entries).
+pub fn line_breaks(s : String) -> Array[Int] {
+  let n = s.length()
+  let out : Array[Int] = []
+  for _ in 0..=n {
+    out.push(0)
+  }
+  if n == 0 {
+    return out
+  }
+  let u = make_units(s)
+  for k in 1..<u.cls.length() {
+    out[u.start[k]] = u.decide(k)
+  }
+  out[n] = 2
+  out
+}
+
+/// Line break opportunities of `s`: (byte_offset, mandatory).
+pub fn break_opportunities(s : String) -> Array[(Int, Bool)] {
+  let b = line_breaks(s)
+  let out : Array[(Int, Bool)] = []
+  for i in 1..<b.length() {
+    if b[i] != 0 {
+      out.push((i, b[i] == 2))
+    }
+  }
+  out
+}

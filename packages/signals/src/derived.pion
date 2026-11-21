@@ -1,0 +1,474 @@
+// DerivedSignal, Optimistic, first_told, Keyed, KeyedList.
+// Ported from libs/mbui/src/signals/{derived_signal,optimistic,first_told,keyed,keyed_list}.mbt.
+
+pub fn first_told_with(by : (() -> Unit) -> Unit) -> Unit {
+  g.first_told_by = Some(by)
+}
+
+pub fn first_told(f : () -> Unit) -> Unit {
+  match g.first_told_by {
+    Some(by) => by(f)
+    None => f()
+  }
+}
+
+// ── DerivedSignal ────────────────────────────────────────────────────────────
+
+struct WrittenCell[T] {
+  mut item : Option[(Int64, T)]
+}
+
+pub struct DerivedSignal[T] {
+  upstream : Computed[(Int64, T)]
+  value : Computed[T]
+  written : WrittenCell[T]
+}
+
+pub fn derived_signal[T : Eq](getter : (Option[T]) -> T) -> DerivedSignal[T] {
+  derived_signal_by(getter, fn(a : T, b : T) -> Bool { a.eq(b) })
+}
+
+pub fn derived_signal_ref[T](getter : (Option[T]) -> T) -> DerivedSignal[T] {
+  derived_signal_by(getter, fn(_a : T, _b : T) -> Bool { false })
+}
+
+pub fn derived_signal_by[T](getter : (Option[T]) -> T, same : (T, T) -> Bool) -> DerivedSignal[T] {
+  let written = WrittenCell::{ item: None }
+  let upstream = computed_by(
+    fn(last : Option[(Int64, T)]) -> (Int64, T) {
+      match last {
+        None => (0.to_int64(), getter(None))
+        Some((up_rev, before)) => {
+          let next = getter(Some(before))
+          if same(before, next) {
+            (up_rev, next)
+          } else {
+            written.item = None
+            (up_rev + 1.to_int64(), next)
+          }
+        }
+      }
+    },
+    fn(a : (Int64, T), b : (Int64, T)) -> Bool { a.0 == b.0 },
+  )
+  let value = computed_by(
+    fn(_last : Option[T]) -> T {
+      let base = upstream.get()
+      derived_value(base, written.item)
+    },
+    same,
+  )
+  DerivedSignal::{ upstream, value, written }
+}
+
+fn derived_value[T](base : (Int64, T), written : Option[(Int64, T)]) -> T {
+  match written {
+    Some((rev, local_val)) => if rev == base.0 { local_val } else { base.1 }
+    None => base.1
+  }
+}
+
+pub fn DerivedSignal::get[T](self : DerivedSignal[T]) -> T {
+  self.value.get_releasing()
+}
+
+pub fn DerivedSignal::untracked[T](self : DerivedSignal[T]) -> T {
+  self.value.untracked_releasing()
+}
+
+pub fn DerivedSignal::peek[T](self : DerivedSignal[T]) -> Option[T] {
+  match self.written.item {
+    Some((_, v)) => Some(v)
+    None => self.value.peek()
+  }
+}
+
+pub fn DerivedSignal::set[T](self : DerivedSignal[T], value : T) -> Unit {
+  let base = self.upstream.untracked_releasing()
+  let node_id = self.value.node_id
+  release_unwatched_resource(node_id)
+  let before = derived_value(base, self.written.item)
+  if !(self.value.state.same)(before, value) {
+    self.written.item = Some((base.0, value))
+    g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dirty
+    tell_set(node_id, "")
+  }
+}
+
+pub fn DerivedSignal::watched[T](self : DerivedSignal[T]) -> Bool {
+  self.value.watched()
+}
+
+pub fn DerivedSignal::dispose[T](self : DerivedSignal[T]) -> Unit {
+  self.value.dispose()
+  if !self.upstream.watched() {
+    self.upstream.dispose()
+  }
+}
+
+// ── Optimistic ───────────────────────────────────────────────────────────────
+
+struct EditEntry[T] {
+  id : Int
+  mut apply : Option[(T) -> T]
+}
+
+pub struct Optimistic[T] {
+  edits : Array[EditEntry[T]]
+  mut next_id : Int
+  revision : Signal[Int64]
+  value : Computed[T]
+  pending : Computed[Bool]
+}
+
+pub fn optimistic[T : Eq](authority : () -> T) -> Optimistic[T] {
+  optimistic_by(authority, fn(a : T, b : T) -> Bool { a.eq(b) })
+}
+
+pub fn optimistic_ref[T](authority : () -> T) -> Optimistic[T] {
+  optimistic_by(authority, fn(_a : T, _b : T) -> Bool { false })
+}
+
+pub fn optimistic_by[T](authority : () -> T, same : (T, T) -> Bool) -> Optimistic[T] {
+  let edits : Array[EditEntry[T]] = []
+  let revision = signal(0.to_int64())
+  let value = computed_by(
+    fn(_last : Option[T]) -> T {
+      let _ = revision.get()
+      let mut projected = authority()
+      for entry in edits {
+        match entry.apply {
+          Some(f) => { projected = f(projected) }
+          None => ()
+        }
+      }
+      projected
+    },
+    same,
+  )
+  let pending = computed(
+    fn(_last : Option[Bool]) -> Bool {
+      let _ = revision.get()
+      let mut any = false
+      for entry in edits {
+        if entry.apply.is_some() {
+          any = true
+          break
+        }
+      }
+      any
+    },
+  )
+  Optimistic::{ edits, next_id: 1, revision, value, pending }
+}
+
+pub fn Optimistic::get[T](self : Optimistic[T]) -> T {
+  self.value.get_releasing()
+}
+
+pub fn Optimistic::untracked[T](self : Optimistic[T]) -> T {
+  self.value.untracked_releasing()
+}
+
+pub fn Optimistic::is_pending[T](self : Optimistic[T]) -> Bool {
+  self.pending.get()
+}
+
+fn Optimistic::bump[T](self : Optimistic[T]) -> Unit {
+  self.revision.set(self.revision.state.pending + 1.to_int64())
+}
+
+pub fn Optimistic::push[T](self : Optimistic[T], apply : (T) -> T) -> () -> Unit {
+  let id = self.next_id
+  self.next_id += 1
+  let entry = EditEntry::{ id, apply: Some(apply) }
+  self.edits.push(entry)
+  self.bump()
+  fn() -> Unit {
+    if entry.apply.is_some() {
+      entry.apply = None
+      // Compact removed entries
+      let kept : Array[EditEntry[T]] = []
+      for e in self.edits {
+        if e.apply.is_some() {
+          kept.push(e)
+        }
+      }
+      self.edits.clear()
+      for e in kept {
+        self.edits.push(e)
+      }
+      self.bump()
+    }
+  }
+}
+
+pub fn Optimistic::set_value[T](self : Optimistic[T], value : T) -> () -> Unit {
+  self.push(fn(_prev : T) -> T { value })
+}
+
+pub fn Optimistic::clear[T](self : Optimistic[T]) -> Unit {
+  if self.edits.length() == 0 {
+    return
+  }
+  for entry in self.edits {
+    entry.apply = None
+  }
+  self.edits.clear()
+  self.bump()
+}
+
+// ── Keyed (String-keyed per-member selector) ─────────────────────────────────
+
+pub struct Keyed {
+  members : Map[String, Bool]
+  said : Map[String, Signal[Bool]]
+  mut said_kept : Int
+}
+
+pub fn keyed() -> Keyed {
+  Keyed::{ members: Map::new(), said: Map::new(), said_kept: 0 }
+}
+
+pub fn Keyed::has(self : Keyed, k : String) -> Bool {
+  let s = match self.said.get(k) {
+    Some(sig) => sig
+    None => {
+      if self.said.length() >= 64 && self.said.length() >= 2 * self.said_kept {
+        self.unread_gone()
+      }
+      let sig = signal(self.members.contains(k))
+      self.said.set(k, sig)
+      sig
+    }
+  }
+  s.get()
+}
+
+fn Keyed::unread_gone(self : Keyed) -> Unit {
+  let ks = self.said.keys()
+  for k in ks {
+    match self.said.get(k) {
+      Some(s) => {
+        if !s.watched() && !self.members.contains(k) {
+          self.said.remove(k)
+        }
+      }
+      None => ()
+    }
+  }
+  self.said_kept = self.said.length()
+}
+
+pub fn Keyed::peek(self : Keyed, k : String) -> Bool {
+  self.members.contains(k)
+}
+
+pub fn Keyed::set(self : Keyed, ks : Array[String]) -> Unit {
+  let now : Map[String, Bool] = Map::new()
+  for k in ks {
+    now.set(k, true)
+  }
+  let left : Array[String] = []
+  for k in self.members.keys() {
+    if !now.contains(k) {
+      left.push(k)
+    }
+  }
+  let came : Array[String] = []
+  for k in now.keys() {
+    if !self.members.contains(k) {
+      came.push(k)
+    }
+  }
+  if left.length() == 0 && came.length() == 0 {
+    return
+  }
+  start_batch()
+  for k in left {
+    self.members.remove(k)
+    match self.said.get(k) {
+      Some(s) => {
+        if s.watched() {
+          s.set(false)
+        } else {
+          self.said.remove(k)
+        }
+      }
+      None => ()
+    }
+  }
+  for k in came {
+    self.members.set(k, true)
+    match self.said.get(k) {
+      Some(s) => s.set(true)
+      None => ()
+    }
+  }
+  end_batch()
+  if self.said.length() > 64 && self.said.length() > 4 * (self.members.length() + 1) {
+    self.unread_gone()
+  }
+}
+
+pub fn Keyed::add(self : Keyed, k : String) -> Unit {
+  if self.members.contains(k) {
+    return
+  }
+  self.members.set(k, true)
+  match self.said.get(k) {
+    Some(s) => s.set(true)
+    None => ()
+  }
+}
+
+pub fn Keyed::remove(self : Keyed, k : String) -> Unit {
+  if !self.members.contains(k) {
+    return
+  }
+  self.members.remove(k)
+  match self.said.get(k) {
+    Some(s) => s.set(false)
+    None => ()
+  }
+}
+
+pub fn Keyed::count(self : Keyed) -> Int {
+  self.members.length()
+}
+
+// ── KeyedList (String-keyed ordered reactive store) ──────────────────────────
+
+pub struct KeyedList[V] {
+  mut order : Array[String]
+  vals : Map[String, V]
+  order_said : Signal[Int]
+  said : Map[String, Signal[Int]]
+  same : (V, V) -> Bool
+}
+
+pub fn keyed_list[V](same : (V, V) -> Bool) -> KeyedList[V] {
+  KeyedList::{
+    order: [],
+    vals: Map::new(),
+    order_said: signal(0),
+    said: Map::new(),
+    same,
+  }
+}
+
+pub fn KeyedList::keys[V](self : KeyedList[V]) -> Array[String] {
+  let _ = self.order_said.get()
+  self.order
+}
+
+pub fn KeyedList::peek_keys[V](self : KeyedList[V]) -> Array[String] {
+  self.order
+}
+
+pub fn KeyedList::get[V](self : KeyedList[V], k : String) -> Option[V] {
+  let s = match self.said.get(k) {
+    Some(sig) => sig
+    None => {
+      let sig = signal(0)
+      self.said.set(k, sig)
+      sig
+    }
+  }
+  let _ = s.get()
+  self.vals.get(k)
+}
+
+pub fn KeyedList::peek[V](self : KeyedList[V], k : String) -> Option[V] {
+  self.vals.get(k)
+}
+
+pub fn KeyedList::count[V](self : KeyedList[V]) -> Int {
+  self.order.length()
+}
+
+fn KeyedList::tell[V](self : KeyedList[V], k : String) -> Unit {
+  match self.said.get(k) {
+    Some(s) => s.set(s.untracked() + 1)
+    None => ()
+  }
+}
+
+fn KeyedList::ordered[V](self : KeyedList[V], order : Array[String]) -> Unit {
+  self.order = order
+  self.order_said.set(self.order_said.untracked() + 1)
+}
+
+fn KeyedList::index_of[V](self : KeyedList[V], k : String) -> Int {
+  let mut i = self.order.length() - 1
+  while i >= 0 {
+    if self.order[i] == k {
+      return i
+    }
+    i -= 1
+  }
+  -1
+}
+
+pub fn KeyedList::put[V](self : KeyedList[V], k : String, v : V, before : Option[String]) -> Unit {
+  match self.vals.get(k) {
+    Some(was) => {
+      if (self.same)(was, v) {
+        return
+      }
+      self.vals.set(k, v)
+      self.tell(k)
+    }
+    None => {
+      start_batch()
+      self.vals.set(k, v)
+      let at = match before {
+        Some(b) => self.index_of(b)
+        None => -1
+      }
+      let next_order : Array[String] = []
+      if at < 0 {
+        for x in self.order {
+          next_order.push(x)
+        }
+        next_order.push(k)
+      } else {
+        for i in 0..<self.order.length() {
+          if i == at {
+            next_order.push(k)
+          }
+          next_order.push(self.order[i])
+        }
+      }
+      self.ordered(next_order)
+      self.tell(k)
+      end_batch()
+    }
+  }
+}
+
+pub fn KeyedList::drop[V](self : KeyedList[V], k : String) -> Unit {
+  if !self.vals.contains(k) {
+    return
+  }
+  start_batch()
+  self.vals.remove(k)
+  let next_order : Array[String] = []
+  for x in self.order {
+    if x != k {
+      next_order.push(x)
+    }
+  }
+  self.ordered(next_order)
+  match self.said.get(k) {
+    Some(s) => {
+      if s.watched() {
+        s.set(s.untracked() + 1)
+      } else {
+        self.said.remove(k)
+      }
+    }
+    None => ()
+  }
+  end_batch()
+}
