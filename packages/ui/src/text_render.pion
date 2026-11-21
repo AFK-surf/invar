@@ -1,0 +1,359 @@
+// Real CoreText/hostapi glyph shaping, atlas packing, and kind=1.0/3.0 instance emission
+// for d.words and d.runs. Aligned with packages/host/native/apple_text.m and apple_render.m.
+
+import "dmath"
+import "hostapi"
+import "text"
+import "view"
+
+struct GlyphSlot {
+  u : Double
+  v : Double
+  gw : Double
+  gh : Double
+  ox : Double
+  oy : Double
+  color : Bool
+  plot : Int
+  in_colour : Bool
+  scale : Double
+}
+
+struct GlyphAtlasState {
+  mut mono : hostapi::Atlas
+  mut colour : hostapi::Atlas
+  mut gen : Int
+  mut scale : Double
+  mut initialized : Bool
+  glyphs : Map[Int, GlyphSlot]
+}
+
+let glyph_state : GlyphAtlasState = GlyphAtlasState::{
+  mono: hostapi::Atlas::new(0),
+  colour: hostapi::Atlas::new(0),
+  gen: -1,
+  scale: 0.0,
+  initialized: false,
+  glyphs: Map::new(),
+}
+
+/// Reset glyph atlas caches (called on view_forget or host switch).
+pub fn reset_glyph_atlas() -> Unit {
+  glyph_state.mono.clear()
+  glyph_state.colour.clear()
+  glyph_state.glyphs.clear()
+  glyph_state.gen = -1
+  glyph_state.scale = 0.0
+  glyph_state.initialized = false
+}
+
+fn ensure_glyph_atlas(scale : Double) -> Unit {
+  let gen = hostapi::atlas_generation()
+  let mono_side = hostapi::atlas_size(false)
+  let col_side = hostapi::atlas_size(true)
+  let need_reset = !glyph_state.initialized ||
+    glyph_state.gen != gen ||
+    (glyph_state.scale - scale).abs() > 0.001 ||
+    (mono_side > 0 && !glyph_state.mono.sized())
+  if need_reset {
+    glyph_state.mono = hostapi::Atlas::new(if mono_side > 0 { mono_side } else { 1024 })
+    glyph_state.colour = hostapi::Atlas::new(if col_side > 0 { col_side } else { 512 })
+    glyph_state.glyphs.clear()
+    glyph_state.gen = gen
+    glyph_state.scale = scale
+    glyph_state.initialized = true
+  }
+}
+
+fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
+  if key < 0 {
+    return None
+  }
+  ensure_glyph_atlas(scale)
+  match glyph_state.glyphs.get(key) {
+    Some(slot) => {
+      if slot.plot >= 0 {
+        if slot.in_colour {
+          glyph_state.colour.drawn(slot.plot)
+        } else {
+          glyph_state.mono.drawn(slot.plot)
+        }
+      }
+      Some(slot)
+    }
+    None => {
+      let gbuf : Array[Double] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      hostapi::glyph(key, gbuf)
+      let gw = gbuf[2]
+      let gh = gbuf[3]
+      let ox = gbuf[4]
+      let oy = gbuf[5]
+      let is_color = gbuf[6] > 0.5
+      if gw <= 0.0 || gh <= 0.0 {
+        return None
+      }
+      let pw = dmath::round(gw * scale).to_int()
+      let ph = dmath::round(gh * scale).to_int()
+      if pw <= 0 || ph <= 0 {
+        return None
+      }
+      let use_col = is_color && glyph_state.colour.sized()
+      let atlas = if use_col { glyph_state.colour } else { glyph_state.mono }
+      let across = if use_col { hostapi::colour_atlas_u } else { 0 }
+      if !atlas.holds(pw, ph) {
+        return None
+      }
+      match atlas.place(key, pw, ph, fn(evicted : Int) { glyph_state.glyphs.remove(evicted) }) {
+        Some((plot, ax, ay)) => {
+          hostapi::glyph_put(key, ax + across, ay)
+          let slot = GlyphSlot::{
+            u: (ax + across).to_double(),
+            v: ay.to_double(),
+            gw,
+            gh,
+            ox,
+            oy,
+            color: is_color,
+            plot,
+            in_colour: use_col,
+            scale,
+          }
+          glyph_state.glyphs[key] = slot
+          Some(slot)
+        }
+        None => None
+      }
+    }
+  }
+}
+
+fn split_lines(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let cu = s.code_unit_at(i)
+    if cu == 10 {
+      out.push(sb.to_string())
+      sb.reset()
+    } else if cu != 13 {
+      sb.write_byte(cu as Byte)
+    }
+    i += 1
+  }
+  out.push(sb.to_string())
+  out
+}
+
+fn font_style_bits(italic : Bool, mono : Bool, serif : Bool) -> Int {
+  let mut bits = 0
+  if italic { bits = bits | 1 }
+  if mono { bits = bits | 2 }
+  if serif { bits = bits | 4 }
+  bits
+}
+
+fn measure_metrics(size : Double, weight : Int, style : Int) -> (Double, Double) {
+  let mbuf : Array[Double] = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  hostapi::font_metrics(size, weight, style, mbuf)
+  let asc = if mbuf[0] > 0.0 { mbuf[0] } else { size * 0.8 }
+  let desc = if mbuf[1] > 0.0 { mbuf[1] } else { size * 0.2 }
+  (asc, desc)
+}
+
+fn emit_glyph_quad(
+  scene : Scene,
+  pen_x : Double,
+  baseline_y : Double,
+  slot : GlyphSlot,
+  ink : Int64,
+  alpha_mul : Double,
+  scale : Double,
+  clip_x : Double,
+  clip_y : Double,
+  clip_x1 : Double,
+  clip_y1 : Double,
+) -> Unit {
+  let kind = if slot.color { 3.0 } else { 1.0 }
+  // apple_text.m:697: e->oy = -(b.origin.y + b.size.height) (negative above baseline)
+  let gx = pen_x + slot.ox
+  let gy = baseline_y + slot.oy
+  let _ = scene.push_inst(
+    gx,
+    gy,
+    slot.gw,
+    slot.gh,
+    0.0,
+    kind,
+    0.0,
+    0.0,
+    ink,
+    alpha_mul,
+    slot.u,
+    slot.v,
+    slot.gw * scale,
+    slot.gh * scale,
+    clip_x=clip_x,
+    clip_y=clip_y,
+    clip_x1=clip_x1,
+    clip_y1=clip_y1,
+  )
+}
+
+/// Shape and emit real glyph quads (kind=1.0 mono / 3.0 color) for `d.words`.
+fn encode_words(
+  scene : Scene,
+  d : view::Drawn,
+  scale : Double,
+  clip_x : Double,
+  clip_y : Double,
+  clip_x1 : Double,
+  clip_y1 : Double,
+) -> Unit {
+  if d.words.length() == 0 || (d.ink & 0xFFL) == 0L {
+    return
+  }
+  let sz = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
+  let weight = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
+  let style_bits = 0
+  let (asc, desc) = measure_metrics(sz, weight, style_bits)
+  let line_h = if d.words_look.line > 0.0 { d.words_look.line } else { asc + desc }
+  let lead = (line_h - (asc + desc)) * 0.5
+  let optical_shift = if d.words_optical { (asc - desc) * 0.04 } else { 0.0 }
+  let base_off = lead + asc + optical_shift
+
+  let raw_lines = split_lines(d.words)
+  let max_lines = d.words_look.max_lines
+  let wrap = d.words_look.wrap && d.w > 0.0
+  let mut line_idx = 0
+
+  for raw in raw_lines {
+    if max_lines > 0 && line_idx >= max_lines {
+      break
+    }
+    if raw.length() == 0 {
+      line_idx += 1
+      continue
+    }
+    let cap = (raw.length() + 4) * 4
+    let sbuf = Array::make(cap, 0.0)
+    let n = hostapi::shape(raw, sz, weight, style_bits, sbuf)
+    if n <= 0 {
+      line_idx += 1
+      continue
+    }
+    // Partition shaped clusters into visual lines (wrapping by d.w if wrap=true)
+    let mut start = 0
+    while start < n {
+      if max_lines > 0 && line_idx >= max_lines {
+        break
+      }
+      let mut end = start
+      let mut line_w = 0.0
+      while end < n {
+        let adv = sbuf[end * 4 + 2]
+        if wrap && end > start && line_w + adv > d.w {
+          break
+        }
+        line_w = line_w + adv
+        end += 1
+      }
+      if end == start {
+        end = start + 1
+      }
+      let start_x = if d.words_center && d.w > line_w {
+        d.x + (d.w - line_w) * 0.5
+      } else {
+        d.x
+      }
+      let baseline_y = d.y + line_idx.to_double() * line_h + base_off
+      let mut pen_x = start_x
+      let mut k = start
+      while k < end {
+        let adv = sbuf[k * 4 + 2]
+        let gkey = sbuf[k * 4 + 3].to_int()
+        match resolve_glyph(gkey, scale) {
+          Some(slot) => emit_glyph_quad(scene, pen_x, baseline_y, slot, d.ink, d.alpha, scale, clip_x, clip_y, clip_x1, clip_y1)
+          None => ()
+        }
+        pen_x = pen_x + adv
+        k += 1
+      }
+      line_idx += 1
+      start = end
+    }
+  }
+}
+
+/// Shape and emit real glyph quads (and inline run backgrounds) for `d.runs`.
+fn encode_runs(
+  scene : Scene,
+  d : view::Drawn,
+  scale : Double,
+  clip_x : Double,
+  clip_y : Double,
+  clip_x1 : Double,
+  clip_y1 : Double,
+) -> Unit {
+  if d.runs.length() == 0 {
+    return
+  }
+  let base_sz = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
+  let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
+  let (base_asc, base_desc) = measure_metrics(base_sz, base_w, 0)
+  let line_h = if d.words_look.line > 0.0 { d.words_look.line } else { base_asc + base_desc }
+  let base_off = (line_h - (base_asc + base_desc)) * 0.5 + base_asc
+  let wrap = d.words_look.wrap && d.w > 0.0
+
+  let mut line_idx = 0
+  let mut pen_x = d.x
+  for run in d.runs {
+    if run.text.length() == 0 {
+      continue
+    }
+    let rsz = if run.scale > 0.0 { base_sz * run.scale } else { base_sz }
+    let rweight = if run.weight > 0 { run.weight } else { base_w }
+    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif)
+    let rink = if (run.color & 0xFFL) != 0L { run.color } else { d.ink }
+    let sub_lines = split_lines(run.text)
+    let mut si = 0
+    while si < sub_lines.length() {
+      if si > 0 {
+        line_idx += 1
+        pen_x = d.x
+      }
+      let seg = sub_lines[si]
+      if seg.length() > 0 {
+        let cap = (seg.length() + 4) * 4
+        let sbuf = Array::make(cap, 0.0)
+        let n = hostapi::shape(seg, rsz, rweight, rstyle, sbuf)
+        let mut k = 0
+        while k < n {
+          let adv = sbuf[k * 4 + 2]
+          if wrap && pen_x > d.x && (pen_x - d.x) + adv > d.w {
+            line_idx += 1
+            pen_x = d.x
+          }
+          let baseline_y = d.y + line_idx.to_double() * line_h + base_off
+          if (run.bg & 0xFFL) != 0L && adv > 0.0 {
+            let _ = scene.push_inst(
+              pen_x, d.y + line_idx.to_double() * line_h, adv, line_h,
+              0.0, 0.0, 0.0, 0.0, run.bg, d.alpha, 0.0, 0.0, 0.0, 0.0,
+              clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+            )
+          }
+          let gkey = sbuf[k * 4 + 3].to_int()
+          if (rink & 0xFFL) != 0L {
+            match resolve_glyph(gkey, scale) {
+              Some(slot) => emit_glyph_quad(scene, pen_x, baseline_y, slot, rink, d.alpha, scale, clip_x, clip_y, clip_x1, clip_y1)
+              None => ()
+            }
+          }
+          pen_x = pen_x + adv
+          k += 1
+        }
+      }
+      si += 1
+    }
+  }
+}

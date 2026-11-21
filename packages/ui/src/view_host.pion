@@ -1,5 +1,6 @@
-// Pure-tree window host runtime: Scene encoding (28 doubles/instance), damage tracking,
-// view_tree, set_view_app, run, run_tree, and event routing (pointer, wheel, key, text, IME).
+// Pure-tree window host runtime: 60-Double Scene encoding aligned 100% with apple_render.m,
+// damage tracking, view_tree, set_view_app, run, run_tree, encode_tree_scene, and full event
+// routing (pointer down/move/up/cancel, drag/gesture, right-click menu, wheel, Keymap/stroke/on_key/IME).
 // Ported from libs/mbui/src/ui/view_host.mbt, app.mbt, scene.mbt.
 
 import "damage"
@@ -8,10 +9,10 @@ import "paint"
 import "signals"
 import "view"
 
-/// Instance stride in the flat Double scene buffer sent to hostapi::present and damage::Damage (matches damage.pion).
+/// Instance stride in the flat Double scene buffer sent to hostapi::present and damage::Damage (60 doubles = 15 float4).
 pub let inst_size : Int = 60
 
-/// Encoded GPU scene for a single frame (28 doubles per instance).
+/// Encoded GPU scene for a single frame (60 doubles per instance matching apple_render.m struct Inst).
 pub struct Scene {
   pub inst : Array[Double]
   pub mut ninst : Int
@@ -43,6 +44,18 @@ pub fn Scene::clear(self : Scene, w : Double, h : Double, scale : Double) -> Uni
   self.dirty_count = 0
 }
 
+/// Push a 60-Double instance aligned with apple_render.m:259 `struct Inst`:
+///   0..3   rect (x, y, w, h)
+///   4..7   p (radius, kind, p6/bw/sat, p7/blur)
+///   8..11  color (r, g, b, a)
+///   12..15 c2 (border RGBA / glyph uv+wh / shadow flags / glass params)
+///   16..19 clip (x0, y0, x1, y1) — defaults to (0, 0, 1e9, 1e9) so unclipped quads are never discarded
+///   20..23 pad (tex_id, extra0, extra1, extra2)
+///   24..27 rc (rounded clip corners)
+///   28..31 rs (clip corner smoothness)
+///   32..35 rot (angle, ox, oy, outer_clip_flag)
+///   36..39 rr (box per-corner radii tl, tr, br, bl)
+///   40..59 oclip, orc, ors, fade, fadex
 pub fn Scene::push_inst(
   self : Scene,
   x : Double,
@@ -61,8 +74,8 @@ pub fn Scene::push_inst(
   p15 : Double,
   clip_x~ : Double = 0.0,
   clip_y~ : Double = 0.0,
-  clip_w~ : Double = 0.0,
-  clip_h~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
   tex_id~ : Double = 0.0,
 ) -> Int {
   let idx = self.ninst
@@ -75,38 +88,44 @@ pub fn Scene::push_inst(
   self.inst.push(y)
   self.inst.push(w)
   self.inst.push(h)
-  // 4..7: radius, kind, p6, p7
+  // 4..7: p (radius, kind, p6, p7)
   self.inst.push(radius)
   self.inst.push(kind)
   self.inst.push(p6)
   self.inst.push(p7)
-  // 8..11: rgba
+  // 8..11: color rgba
   self.inst.push(r)
   self.inst.push(g)
   self.inst.push(b)
   self.inst.push(a)
-  // 12..15: extra params
+  // 12..15: c2
   self.inst.push(p12)
   self.inst.push(p13)
   self.inst.push(p14)
   self.inst.push(p15)
-  // 16..19: clip rect
+  // 16..19: clip (x0, y0, x1, y1)
   self.inst.push(clip_x)
   self.inst.push(clip_y)
-  self.inst.push(clip_w)
-  self.inst.push(clip_h)
-  // 20..23: tex_id, extra0, extra1, extra2
+  self.inst.push(clip_x1)
+  self.inst.push(clip_y1)
+  // 20..23: pad (tex_id, extra0, extra1, extra2)
   self.inst.push(tex_id)
   self.inst.push(0.0)
   self.inst.push(0.0)
   self.inst.push(0.0)
-  // 24..27: per-corner radii
+  // 24..35: rc (24..27), rs (28..31), rot (32..35)
+  let mut z = 24
+  while z < 36 {
+    self.inst.push(0.0)
+    z += 1
+  }
+  // 36..39: rr (box per-corner radii tl, tr, br, bl)
   self.inst.push(radius)
   self.inst.push(radius)
   self.inst.push(radius)
   self.inst.push(radius)
-  // 28..59: extended band/clip/SDF slots (60 doubles total per instance)
-  let mut pad = 28
+  // 40..59: oclip, orc, ors, fade, fadex
+  let mut pad = 40
   while pad < inst_size {
     self.inst.push(0.0)
     pad += 1
@@ -115,7 +134,19 @@ pub fn Scene::push_inst(
   idx
 }
 
+/// Set per-corner box radii `rr` in slots 36..39 (tl, tr, br, bl).
 pub fn Scene::set_corners(self : Scene, idx : Int, c0 : Double, c1 : Double, c2 : Double, c3 : Double) -> Unit {
+  let base = idx * inst_size
+  if base + 39 < self.inst.length() {
+    self.inst[base + 36] = c0
+    self.inst[base + 37] = c1
+    self.inst[base + 38] = c2
+    self.inst[base + 39] = c3
+  }
+}
+
+/// Set rounded clip corner radii `rc` in slots 24..27 (tl, tr, br, bl).
+pub fn Scene::set_clip_corners(self : Scene, idx : Int, c0 : Double, c1 : Double, c2 : Double, c3 : Double) -> Unit {
   let base = idx * inst_size
   if base + 27 < self.inst.length() {
     self.inst[base + 24] = c0
@@ -160,6 +191,7 @@ struct ViewAppState {
   mut press_y : Double
   mut press_down : Bool
   mut pressed_node : Option[view::NodeId]
+  mut dragging_node : Option[view::NodeId]
   mut last_present_hash : Int64
 }
 
@@ -179,6 +211,7 @@ let view_app : ViewAppState = ViewAppState::{
   press_y: 0.0,
   press_down: false,
   pressed_node: None,
+  dragging_node: None,
   last_present_hash: 0L,
 }
 
@@ -207,9 +240,11 @@ fn view_forget() -> Unit {
   view_app.last_scale = 1.0
   view_app.press_down = false
   view_app.pressed_node = None
+  view_app.dragging_node = None
   view_app.last_present_hash = 0L
   fields_reset()
   streams_and_natives_reset()
+  reset_glyph_atlas()
 }
 
 /// Register the pure-tree root builder and optional reactive theme provider.
@@ -229,13 +264,47 @@ pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
   view_app.tree = Some(tree)
 }
 
-fn encode_glass(scene : Scene, d : view::Drawn, gl : paint::Glass) -> Unit {
-  if glass_solid() {
-    let idx = scene.push_inst(d.x, d.y, d.w, d.h, d.radius, 0.0, 0.0, 0.0, gl.solid, d.alpha, 0.0, 0.0, 0.0, 1.0)
+fn color_rgba_tuple(c : Int64, alpha_mul : Double) -> (Double, Double, Double, Double) {
+  let r = ((c >> 24) & 0xFFL).to_double() / 255.0
+  let g = ((c >> 16) & 0xFFL).to_double() / 255.0
+  let b = ((c >> 8) & 0xFFL).to_double() / 255.0
+  let a = ((c & 0xFFL).to_double() / 255.0) * dclamp(alpha_mul, 0.0, 1.0)
+  (r, g, b, a)
+}
+
+fn apply_node_corners(scene : Scene, idx : Int, d : view::Drawn) -> Unit {
+  match d.corners {
+    Some((c0, c1, c2, c3)) => scene.set_corners(idx, c0, c1, c2, c3)
+    None => ()
+  }
+}
+
+fn apply_self_clip(scene : Scene, idx : Int, d : view::Drawn) -> Unit {
+  if d.clips_self {
     match d.corners {
-      Some((c0, c1, c2, c3)) => scene.set_corners(idx, c0, c1, c2, c3)
-      None => ()
+      Some((c0, c1, c2, c3)) => scene.set_clip_corners(idx, c0, c1, c2, c3)
+      None => if d.radius > 0.0 { scene.set_clip_corners(idx, d.radius, d.radius, d.radius, d.radius) }
     }
+  }
+}
+
+fn encode_glass(
+  scene : Scene,
+  d : view::Drawn,
+  gl : paint::Glass,
+  clip_x : Double,
+  clip_y : Double,
+  clip_x1 : Double,
+  clip_y1 : Double,
+) -> Unit {
+  if glass_solid() {
+    let idx = scene.push_inst(
+      d.x, d.y, d.w, d.h, d.radius, 0.0, 0.0, 0.0, gl.solid, d.alpha,
+      0.0, 0.0, 0.0, 0.0,
+      clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+    apply_node_corners(scene, idx, d)
+    apply_self_clip(scene, idx, d)
     return
   }
   let kind = if gl.liquid { 6.0 } else { 5.0 }
@@ -246,6 +315,7 @@ fn encode_glass(scene : Scene, d : view::Drawn, gl : paint::Glass) -> Unit {
     if gl.liquid { gl.bezel } else { gl.rim_lit },
     if gl.liquid { 0.0 } else { gl.rim_back },
     d.alpha,
+    clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
   )
   let base = idx * inst_size
   if base + 23 < scene.inst.length() {
@@ -253,66 +323,98 @@ fn encode_glass(scene : Scene, d : view::Drawn, gl : paint::Glass) -> Unit {
     scene.inst[base + 22] = gl.chroma
     scene.inst[base + 23] = gl.merge
   }
-  match d.corners {
-    Some((c0, c1, c2, c3)) => scene.set_corners(idx, c0, c1, c2, c3)
-    None => ()
-  }
+  apply_node_corners(scene, idx, d)
+  apply_self_clip(scene, idx, d)
 }
 
-fn encode_drawn_node(scene : Scene, d : view::Drawn, frame_no : Int, now : Double) -> Unit {
+fn encode_drawn_node(scene : Scene, d : view::Drawn, frame_no : Int, now : Double, scale : Double) -> Unit {
   if d.alpha <= 0.0 || d.w <= 0.0 || d.h <= 0.0 {
     return
   }
-  // 1. Shadow (kind 2)
+  let clip_x = if d.clips_self { d.x } else { 0.0 }
+  let clip_y = if d.clips_self { d.y } else { 0.0 }
+  let clip_x1 = if d.clips_self { d.x + d.w } else { 1.0e9 }
+  let clip_y1 = if d.clips_self { d.y + d.h } else { 1.0e9 }
+
+  // 1. Shadow (kind = 2.0, blur in p7 = I.p.w per apple_render.m:596; glass outside-box flag in p12/p13)
   let (sblur, sy, scol) = d.shadow
   if sblur > 0.0 && (scol & 0xFFL) != 0L {
-    let _ = scene.push_inst(d.x, d.y + sy, d.w, d.h, d.radius, 2.0, sblur, 0.0, scol, d.alpha, 0.0, 0.0, 0.0, 1.0)
+    let is_glass = d.glass.is_some()
+    let sidx = scene.push_inst(
+      d.x, d.y + sy, d.w, d.h, d.radius, 2.0, 0.0, sblur, scol, d.alpha,
+      if is_glass { 1.0 } else { 0.0 },
+      if is_glass { sy } else { 0.0 },
+      0.0, 0.0,
+      clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+    apply_node_corners(scene, sidx, d)
   }
+
   // 2. Glass (kind 5 frosted / 6 liquid)
   match d.glass {
-    Some(gl) => encode_glass(scene, d, gl)
+    Some(gl) => encode_glass(scene, d, gl, clip_x, clip_y, clip_x1, clip_y1)
     None => ()
   }
-  // 3. Ground fill (kind 0)
-  if (d.ground & 0xFFL) != 0L {
-    let idx = scene.push_inst(d.x, d.y, d.w, d.h, d.radius, 0.0, 0.0, 0.0, d.ground, d.alpha, 0.0, 0.0, 0.0, 1.0)
-    match d.corners {
-      Some((c0, c1, c2, c3)) => scene.set_corners(idx, c0, c1, c2, c3)
-      None => ()
-    }
+
+  // 3. Ground fill + Border/edge merged into a single kind=0.0 instance (apple_render.m:629-634: bw=p6, bc=c2)
+  let (ew, ecol) = d.edge
+  let has_ground = (d.ground & 0xFFL) != 0L
+  let has_edge = ew > 0.0 && (ecol & 0xFFL) != 0L
+  if has_ground || has_edge {
+    let (br, bg_c, bb, ba) = if has_edge { color_rgba_tuple(ecol, d.alpha) } else { (0.0, 0.0, 0.0, 0.0) }
+    let idx = scene.push_inst(
+      d.x, d.y, d.w, d.h, d.radius, 0.0,
+      if has_edge { ew } else { 0.0 },
+      0.0,
+      if has_ground { d.ground } else { 0L },
+      d.alpha,
+      br, bg_c, bb, ba,
+      clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+    apply_node_corners(scene, idx, d)
+    apply_self_clip(scene, idx, d)
   }
+
   // 4. Image (kind 4)
   match d.image {
     Some((src, _ph, max_px)) => {
       let px = if max_px > 0 { max_px } else { dmax(d.w, d.h).round().to_int() }
       match image_resolve(src, px, frame_no, now) {
         Some((hid, _iw, _ih)) => {
-          let _ = scene.push_inst(
+          let idx = scene.push_inst(
             d.x, d.y, d.w, d.h, d.radius, 4.0, 0.0, 0.0, c64(0xFFFF, 0xFFFF), d.alpha,
-            0.0, 0.0, 1.0, 1.0, tex_id=hid.to_double(),
+            0.0, 0.0, 1.0, 1.0,
+            clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+            tex_id=hid.to_double(),
           )
+          apply_node_corners(scene, idx, d)
         }
         None => ()
       }
     }
     None => ()
   }
+
   // 5. Tree stream node (kind 4 with stream_tex_base + stream.id)
   match find_tree_stream(d.id) {
     Some(ts) => {
       ts.drawn_this_frame = true
       match ts.stream.size {
         Some((pw, ph)) if !ts.stream.closed && ts.stream.id > 0 && pw > 0 && ph > 0 => {
-          let _ = scene.push_inst(
+          let idx = scene.push_inst(
             d.x, d.y, d.w, d.h, d.radius, 4.0, 0.0, 0.0, c64(0xFFFF, 0xFFFF), d.alpha,
-            0.0, 0.0, 1.0, 1.0, tex_id=(hostapi::stream_tex_base + ts.stream.id).to_double(),
+            0.0, 0.0, 1.0, 1.0,
+            clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+            tex_id=(hostapi::stream_tex_base + ts.stream.id).to_double(),
           )
+          apply_node_corners(scene, idx, d)
         }
         _ => ()
       }
     }
     None => ()
   }
+
   // 6. Tree native view node
   match find_tree_native(d.id) {
     Some(tn) => {
@@ -327,46 +429,93 @@ fn encode_drawn_node(scene : Scene, d : view::Drawn, frame_no : Int, now : Doubl
     }
     None => ()
   }
-  // 7. Border/edge (kind 1)
-  let (ew, ecol) = d.edge
-  if ew > 0.0 && (ecol & 0xFFL) != 0L {
-    let _ = scene.push_inst(d.x, d.y, d.w, d.h, d.radius, 1.0, ew, 0.0, ecol, d.alpha, 0.0, 0.0, 0.0, 1.0)
-  }
-  // 8. Child rects
+
+  // 7. Child rects (kind 0)
   for r in d.rects {
-    let ridx = scene.push_inst(d.x + r.x, d.y + r.y, r.w, r.h, r.corners.0, 0.0, 0.0, 0.0, r.color, d.alpha, 0.0, 0.0, 0.0, 1.0)
+    let ridx = scene.push_inst(
+      d.x + r.x, d.y + r.y, r.w, r.h, r.corners.0, 0.0, 0.0, 0.0, r.color, d.alpha,
+      0.0, 0.0, 0.0, 0.0,
+      clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
     scene.set_corners(ridx, r.corners.0, r.corners.1, r.corners.2, r.corners.3)
   }
-  // 9. Text glyphs / words (kind 3)
-  let words_str = d.words
-  if words_str.length() > 0 && (d.ink & 0xFFL) != 0L {
-    let sz = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
-    let adv = sz * 0.6
-    let _ = scene.push_inst(
-      d.x, d.y, dmin(d.w, words_str.length().to_double() * adv), dmin(d.h, sz * 1.4),
-      0.0, 3.0, sz, words_str.length().to_double(), d.ink, d.alpha, 0.0, 0.0, 1.0, 1.0,
-    )
+
+  // 8. Polylines (kind = 10.0 per apple_render.m:540-545: p.x = half_width, c2 = normalized x0,y0,x1,y1)
+  for ln in d.lines {
+    if ln.width > 0.0 && (ln.color & 0xFFL) != 0L && ln.points.length() >= 2 {
+      let half_w = ln.width * 0.5
+      let mut pi = 0
+      while pi + 1 < ln.points.length() {
+        let (ax, ay) = ln.points[pi]
+        let (bx, by) = ln.points[pi + 1]
+        let rx0 = dmin(ax, bx) - half_w - 1.0
+        let ry0 = dmin(ay, by) - half_w - 1.0
+        let rx1 = dmax(ax, bx) + half_w + 1.0
+        let ry1 = dmax(ay, by) + half_w + 1.0
+        let rw = dmax(rx1 - rx0, 1.0)
+        let rh = dmax(ry1 - ry0, 1.0)
+        let nx0 = (ax - rx0) / rw
+        let ny0 = (ay - ry0) / rh
+        let nx1 = (bx - rx0) / rw
+        let ny1 = (by - ry0) / rh
+        let _ = scene.push_inst(
+          d.x + rx0, d.y + ry0, rw, rh, half_w, 10.0, 0.0, 0.0, ln.color, d.alpha,
+          nx0, ny0, nx1, ny1,
+          clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+        )
+        pi += 1
+      }
+    }
   }
+
+  // 9. Text glyphs via real CoreText/hostapi shaping + atlas (kind=1.0 mono / 3.0 color)
+  if d.runs.length() > 0 {
+    encode_runs(scene, d, scale, clip_x, clip_y, clip_x1, clip_y1)
+  } else if d.words.length() > 0 {
+    encode_words(scene, d, scale, clip_x, clip_y, clip_x1, clip_y1)
+  }
+
   // 10. Focused field caret indicator
   match find_tree_field(d.id) {
     Some(tf) if tf.field.focused_sig.untracked() => {
       let sz = (tf.font_size)()
       let caret = tf.field.caret_sig.untracked()
       let cx = d.x + caret.to_double() * sz * 0.6
-      let _ = scene.push_inst(cx, d.y + 2.0, 1.5, dmax(sz, 14.0), 0.75, 0.0, 0.0, 0.0, tf.field.caret_color, d.alpha, 0.0, 0.0, 0.0, 1.0)
+      let _ = scene.push_inst(
+        cx, d.y + 2.0, 1.5, dmax(sz, 14.0), 0.75, 0.0, 0.0, 0.0, tf.field.caret_color, d.alpha,
+        0.0, 0.0, 0.0, 0.0,
+        clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+      )
       hostapi::set_ime(true, cx, d.y, 1.5, dmax(sz, 14.0), tf.field.text_sig.untracked(), caret, caret)
     }
     _ => ()
   }
-  // 11. Outer ring (kind 1)
+
+  // 11. Outer focus ring (kind = 0.0 transparent fill + p6=rw + c2=rcol RGBA; never kind=1.0!)
   let (rw, rgap, rcol) = d.ring
   if rw > 0.0 && (rcol & 0xFFL) != 0L {
     let pad = rgap + rw
+    let (rr_r, rr_g, rr_b, rr_a) = color_rgba_tuple(rcol, d.alpha)
     let _ = scene.push_inst(
       d.x - pad, d.y - pad, d.w + pad * 2.0, d.h + pad * 2.0,
-      concentric_out(d.radius, pad), 1.0, rw, 0.0, rcol, d.alpha, 0.0, 0.0, 0.0, 1.0,
+      concentric_out(d.radius, pad), 0.0, rw, 0.0, 0L, d.alpha,
+      rr_r, rr_g, rr_b, rr_a,
     )
   }
+}
+
+/// Encode `tree.drawn()` into a standalone 60-Double `Scene` using the currently active `hostapi`
+/// (uploads glyphs to the active host's atlas so Apple Metal can present it directly).
+pub fn encode_tree_scene(tree : view::Tree, w : Double, h : Double, scale : Double, now : Double) -> Scene {
+  let _ = tree.frame(w, h, now=now)
+  let sc = Scene::new()
+  sc.clear(w, h, scale)
+  let drawn = tree.drawn()
+  for d in drawn {
+    encode_drawn_node(sc, d, 1, now, scale)
+  }
+  sc.perf.instances = sc.ninst
+  sc
 }
 
 fn scene_hash(scene : Scene) -> Int64 {
@@ -401,7 +550,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   view_app.scene.clear(w, h, scale)
   let drawn = tree.drawn()
   for d in drawn {
-    encode_drawn_node(view_app.scene, d, view_app.frame_no, now)
+    encode_drawn_node(view_app.scene, d, view_app.frame_no, now, scale)
   }
   let t2 = work_clock_now()
   let bg = tree_theme().bg
@@ -410,7 +559,8 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   let bg_b = ((bg >> 8) & 0xFFL).to_double() / 255.0
   let dirty = view_app.dmg.next(view_app.scene.inst, view_app.scene.ninst, w, h, scale, bg_r, bg_g, bg_b)
   view_app.scene.dirty_count = dirty.length()
-  hostapi::present(view_app.scene.inst, view_app.scene.ninst, w, h, scale)
+  // hostapi::present(buf, count, bg_r, bg_g, bg_b) — clear color RGB, NOT (w, h, scale)!
+  hostapi::present(view_app.scene.inst, view_app.scene.ninst, bg_r, bg_g, bg_b)
   let t3 = work_clock_now()
   view_app.scene.perf.layout_ms = dmax(0.0, t1 - t0)
   view_app.scene.perf.paint_ms = dmax(0.0, t2 - t1)
@@ -430,8 +580,19 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   changed
 }
 
-/// Route a pointer event (kind: 0 move, 1 down, 2 up) into the active view::Tree.
-pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double) -> Unit {
+fn blur_focused_field() -> Unit {
+  match focused_field_ref.v {
+    Some(f) => f.let_go()
+    None => ()
+  }
+}
+
+/// Route a pointer event into the active view::Tree:
+///   kind: 0 = move, 1 = down, 2 = up, 3 = cancel
+///   button: 1 = primary (left), 2 = secondary (right / Ctrl-click)
+/// Note: `mac_app.m` sends `0=down, 1=move, 2=up, 3=cancel` with `btn=0` primary / `btn=2` secondary;
+/// `ui::run` translates `mac_app.m`'s `(kind, btn)` into this convention before calling `view_pointer`.
+pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : Int = 1) -> Unit {
   view_app.pointer_x = x
   view_app.pointer_y = y
   let tree = match view_app.tree {
@@ -439,38 +600,66 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double) -> Unit {
     None => return
   }
   if kind == 0 {
+    // Move
+    match view_app.dragging_node {
+      Some(nid) => {
+        let _ = tree.drag_at(nid, view::DragIs::Moved, x, y, now, finger=0)
+      }
+      None => ()
+    }
     tree.point_at(x, y)
   } else if kind == 1 {
+    // Down
+    tree.went_down(now, x=x, y=y)
+    tree.point_at(x, y)
+    if button == 2 {
+      if tree.menu_at(x, y, now) {
+        return
+      }
+      return
+    }
     view_app.press_down = true
     view_app.press_x = x
     view_app.press_y = y
-    tree.point_at(x, y)
-    let hit = hit_test_drawn(tree, x, y)
-    view_app.pressed_node = hit
-    match hit {
-      Some(nid) => tree.hold_press(nid)
-      None => ()
+    view_app.pressed_node = None
+    view_app.dragging_node = None
+    match tree.target_at(x, y) {
+      view::Target::Dragged(nid) => {
+        blur_focused_field()
+        view_app.dragging_node = Some(nid)
+        let _ = tree.drag_at(nid, view::DragIs::Down, x, y, now, finger=0)
+      }
+      view::Target::Pressed(nid) => {
+        view_app.pressed_node = Some(nid)
+        tree.hold_press(nid)
+        match find_tree_field(nid) {
+          Some(tf) => tf.field.focus()
+          None => blur_focused_field()
+        }
+      }
+      view::Target::Hosted(_) => ()
+      view::Target::TopRow(_) => blur_focused_field()
+      view::Target::Nothing => blur_focused_field()
     }
-  } else if kind == 2 {
+  } else if kind == 2 || kind == 3 {
+    // Up (2) or Cancel (3)
+    let is_cancel = kind == 3
+    tree.went_up(now)
     let was_down = view_app.press_down
     view_app.press_down = false
+    match view_app.dragging_node {
+      Some(nid) => {
+        let drag_end = if is_cancel { view::DragIs::Off } else { view::DragIs::Up }
+        let _ = tree.drag_at(nid, drag_end, x, y, now, finger=0)
+        view_app.dragging_node = None
+      }
+      None => ()
+    }
     let slop = touch_slop()
     let within_slop = (x - view_app.press_x).abs() <= slop && (y - view_app.press_y).abs() <= slop
-    if was_down && within_slop {
-      let target = match view_app.pressed_node {
-        Some(nid) => Some(nid)
-        None => hit_test_drawn(tree, x, y)
-      }
-      match target {
+    if !is_cancel && was_down && within_slop {
+      match view_app.pressed_node {
         Some(nid) => {
-          // If clicking a non-field node, blur active field
-          match find_tree_field(nid) {
-            Some(tf) => tf.field.focus()
-            None => match focused_field_ref.v {
-              Some(f) => f.let_go()
-              None => ()
-            }
-          }
           let _ = tree.run_press_at(nid, now)
         }
         None => ()
@@ -478,21 +667,6 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double) -> Unit {
     }
     view_app.pressed_node = None
   }
-}
-
-fn hit_test_drawn(tree : view::Tree, x : Double, y : Double) -> Option[view::NodeId] {
-  let drawn = tree.drawn()
-  let mut i = drawn.length() - 1
-  while i >= 0 {
-    let d = drawn[i]
-    if x >= d.x && x <= d.x + d.w && y >= d.y && y <= d.y + d.h {
-      if tree.acts_on(d.id) || tree.presses_do(d.id) || find_tree_field(d.id).is_some() {
-        return Some(d.id)
-      }
-    }
-    i -= 1
-  }
-  None
 }
 
 /// Route a wheel scroll event into the active view::Tree.
@@ -533,38 +707,84 @@ fn tree_focus_step(tree : view::Tree, delta : Int) -> Bool {
   tree.focus_to(Some(order[next_idx].id), visible=true)
 }
 
-/// Route a keyboard key press into focused Field or active view::Tree (Tab/Shift+Tab/Enter/Space/Arrows).
+/// Route a keyboard key press into focused Field or active view::Tree
+/// (Keymap stroke -> Field -> focused Enter/Space -> node on_key -> Keymap stroke -> default press).
 pub fn view_key(code : Int, mods : Int, now : Double) -> Bool {
-  match focused_field_ref.v {
-    Some(f) if f.focused_sig.untracked() => {
-      if f.handle_key(code, mods) {
-        return true
-      }
-    }
-    _ => ()
-  }
   let tree = match view_app.tree {
     Some(t) => t
-    None => return false
+    None => {
+      match focused_field_ref.v {
+        Some(f) if f.focused_sig.untracked() => return f.handle_key(code, mods)
+        _ => return false
+      }
+    }
   }
+  let (held, _) = tree.focused_now()
+  let facts : Array[String] = []
+  let field_active = match focused_field_ref.v {
+    Some(f) if f.focused_sig.untracked() => {
+      facts.push("Field")
+      if f.text_sig.untracked().length() == 0 {
+        facts.push("FieldEmpty")
+      }
+      true
+    }
+    _ => false
+  }
+
+  // 1. Tab / Shift+Tab: try keymap stroke first, then focus traversal
   if code == key_tab {
+    if tree.stroke(code, mods, now, from=held, facts=facts) {
+      return true
+    }
     let backward = (mods & mod_shift_key) != 0
     return tree_focus_step(tree, if backward { -1 } else { 1 })
   }
-  if mods == 0 && (code == key_enter || code == key_space) {
-    let (focused_opt, _) = tree.focused_now()
-    match focused_opt {
-      Some(nid) => {
-        let _ = tree.run_press_at(nid, now)
-        return true
-      }
-      None => {
-        if code == key_enter {
-          return tree.press_default_at(now, from=None)
-        }
-        return false
-      }
+
+  // 2. Focused Field: Cmd/Ctrl shortcuts try Keymap stroke first, else Field::handle_key
+  if field_active {
+    let has_cmd_or_ctrl = (mods & (mod_cmd | mod_ctrl)) != 0
+    if has_cmd_or_ctrl && tree.stroke(code, mods, now, from=held, facts=facts) {
+      return true
     }
+    match focused_field_ref.v {
+      Some(f) => {
+        if f.handle_key(code, mods) {
+          return true
+        }
+      }
+      None => ()
+    }
+  }
+
+  // 3. Focused node Enter / Space press
+  if mods == 0 && (code == key_enter || code == key_space) {
+    match held {
+      Some(nid) => {
+        let mask = if code == key_enter { view::focus_enter } else { view::focus_space }
+        if (tree.focus_keys_of(nid) & mask) != 0 {
+          if tree.press_focused_at(nid, now) {
+            return true
+          }
+        }
+      }
+      None => ()
+    }
+  }
+
+  // 4. Node View::on_key handlers
+  if tree.key_at(code, mods, now) {
+    return true
+  }
+
+  // 5. Keymap bindings (View::keymap + View::on_action)
+  if tree.stroke(code, mods, now, from=held, facts=facts) {
+    return true
+  }
+
+  // 6. Layer default press on Enter
+  if mods == 0 && code == key_enter {
+    return tree.press_default_at(now, from=held)
   }
   false
 }
@@ -607,7 +827,18 @@ pub fn run(
   hostapi::run(
     title,
     fn(w, h, scale, now) { let _ = view_frame(w, h, scale, now) },
-    fn(kind, x, y, _btn) { view_pointer(kind, x, y, hostapi::now()) },
+    // mac_app.m sends kind: 0=down, 1=move, 2=up, 3=cancel; btn: 0=left, 2=right
+    fn(host_kind, x, y, btn) {
+      let vp_kind = if host_kind == 0 {
+        1
+      } else if host_kind == 1 {
+        0
+      } else {
+        host_kind
+      }
+      let vp_btn = if btn == 2 { 2 } else { 1 }
+      view_pointer(vp_kind, x, y, hostapi::now(), button=vp_btn)
+    },
     fn(x, y, dx, dy, _phase) { view_wheel(x, y, dx, dy, hostapi::now()) },
     fn(code, mods) { let _ = view_key(code, mods, hostapi::now()) },
     fn(kind, s, _a, _b) { view_text(kind, s) },
