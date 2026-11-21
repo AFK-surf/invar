@@ -1175,3 +1175,94 @@ test "46 image req_px clamps max_px=8192 to physical drawn size (18x18 @ 2x -> 3
   images_reset()
   t.dispose()
 }
+
+test "47 resolve_ligatures merges gkey==-2 clusters via text_key, splits advance, and does not break inside fi" {
+  let lig_calls : Array[String] = []
+  let look = view::WordsLook::{ ..view::words_plain, size: 16.0, line: 20.0, wrap: true }
+  let t = Tester::tree(fn(root : view::View) {
+    let h = hostapi::host()
+    // Simulate CoreText ligature for "fi" in "efficient" ('f' gkey=10 adv=14.0, 'i' gkey=-2 adv=0.0)
+    h.shape = fn(s : String, _sz : Double, _w : Int, _st : Int, out : Array[Double]) {
+      let n = s.length()
+      let mut i = 0
+      while i < n && (i + 1) * 4 <= out.length() {
+        let ch = s.code_unit_at(i)
+        out[i * 4] = i.to_double()
+        out[i * 4 + 1] = 1.0
+        if ch == 102 && i + 1 < n && s.code_unit_at(i + 1) == 105 {
+          out[i * 4 + 2] = 14.0
+          out[i * 4 + 3] = 10.0
+        } else if ch == 105 && i > 0 && s.code_unit_at(i - 1) == 102 {
+          out[i * 4 + 2] = 0.0
+          out[i * 4 + 3] = -2.0
+        } else if ch == 32 {
+          out[i * 4 + 2] = 6.0
+          out[i * 4 + 3] = -1.0
+        } else {
+          out[i * 4 + 2] = 10.0
+          out[i * 4 + 3] = ch.to_double()
+        }
+        i += 1
+      }
+      n
+    }
+    h.text_key = fn(s : String, _sz : Double, _w : Int, _st : Int) {
+      lig_calls.push(s)
+      if s == "fi" { 9001 } else { 9002 }
+    }
+    reset_glyph_atlas()
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(90.0)))
+        .words(view::Live::Is("abc efficient"), ink=0xFFFFFFFFL, look=look)
+    })
+  }, width=400.0, height=200.0, scale=2.0)
+
+  // 1. Verify resolve_ligatures called text_key("fi") and uploaded glyph key 9001 to atlas
+  let mut saw_fi_call = false
+  for s in lig_calls {
+    if s == "fi" {
+      saw_fi_call = true
+    }
+  }
+  debug_assert(saw_fi_call, "resolve_ligatures called text_key(\"fi\")")
+  let mut saw_lig_key = false
+  for gp in t.fake.glyphs_put {
+    if gp.0 == 9001 {
+      saw_lig_key = true
+    }
+  }
+  debug_assert(saw_lig_key, "ligature glyph key 9001 was uploaded to atlas")
+
+  // 2. Direct draw_text_run & measure_text_carets on "efficient": 8 quads, total width 84.0, advance split 7.0 + 7.0
+  let sc = Scene::new()
+  let total_w = sc.draw_text_run(0.0, 0.0, "efficient", 16.0, scale=2.0)
+  debug_assert(sc.ninst == 8, "8 glyph quads emitted for 9-char efficient with fi ligature")
+  debug_assert((total_w - 84.0).abs() < 0.01, "total advance preserved as 84.0")
+  let carets = measure_text_carets("efficient", 16.0)
+  debug_assert(carets.length() == 10 && (carets[3] - 27.0).abs() < 0.01 && (carets[4] - 34.0).abs() < 0.01, "ligature advance evenly split 7+7")
+
+  // 3. Wrapping must NOT treat gkey==-1 (second cluster of "fi") as a space break opportunity!
+  // "abc efficient": "abc "=36, "efficient"=84 (total 120). At max_w=90, wraps at ' ' -> 2 lines, widest=84..85.
+  let (mw, mh) = host_words_measure("abc efficient", look, 90.0, 1.0)
+  debug_assert((mh - 40.0).abs() < 0.5 && mw >= 84.0 && mw <= 86.0, "wraps at space before 'efficient' (2 lines, widest=84), never splits 'fi'")
+
+  // Verify the rendered tree scene has "abc" (3 quads) on line 1 and "efficient" (8 quads) all on line 2
+  let tree_sc = t.scene()
+  let ys : Array[Double] = []
+  let mut i = 0
+  while i < tree_sc.ninst {
+    let b = i * 60
+    if (tree_sc.inst[b + 5] - 1.0).abs() < 0.01 {
+      ys.push(tree_sc.inst[b + 1])
+    }
+    i += 1
+  }
+  debug_assert(ys.length() == 11, "abc + efficient emits 11 glyph quads")
+  debug_assert(ys[3] > ys[0] + 10.0, "'efficient' moved to line 2")
+  let mut k = 4
+  while k < 11 {
+    debug_assert((ys[k] - ys[3]).abs() < 0.5, "all glyphs of 'efficient' stay on line 2 without breaking inside fi")
+    k += 1
+  }
+  t.dispose()
+}

@@ -24,6 +24,109 @@ fn view_spacing(scale : Double, look : view::WordsLook) -> Double {
   }
 }
 
+/// Slice a UTF-8 String by UTF-16 code-unit range `[u16_start, u16_end)` (CoreText cluster ranges).
+fn utf16_slice(s : String, u16_start : Int, u16_end : Int) -> String {
+  if u16_end <= u16_start || s.length() == 0 {
+    return ""
+  }
+  let n = s.length()
+  let mut i = 0
+  let mut u16 = 0
+  let mut b_start = -1
+  let mut b_end = n
+  while i < n {
+    if b_start < 0 && u16 >= u16_start {
+      b_start = i
+    }
+    if u16 >= u16_end {
+      b_end = i
+      break
+    }
+    let b0 = s.code_unit_at(i)
+    if b0 < 0x80 {
+      i += 1
+      u16 += 1
+    } else if (b0 & 0xE0) == 0xC0 {
+      i += 2
+      u16 += 1
+    } else if (b0 & 0xF0) == 0xE0 {
+      i += 3
+      u16 += 1
+    } else if (b0 & 0xF8) == 0xF0 {
+      i += 4
+      u16 += 2
+    } else {
+      i += 1
+      u16 += 1
+    }
+  }
+  if b_start < 0 {
+    return ""
+  }
+  if b_end > n {
+    b_end = n
+  }
+  if b_end <= b_start {
+    ""
+  } else {
+    s.slice(b_start, b_end)
+  }
+}
+
+/// Post-process CoreText/hostapi ligature clusters (`gkey == -2`), aligned with upstream `text.mbt:1089-1119`.
+fn resolve_ligatures(
+  text : String,
+  n : Int,
+  sbuf : Array[Double],
+  size : Double,
+  weight : Int,
+  style : Int,
+) -> Unit {
+  let mut c = 0
+  while c < n {
+    if sbuf[c * 4 + 3].to_int() != -2 {
+      c += 1
+      continue
+    }
+    let u = c - 1
+    let mut e = c
+    while e < n && sbuf[e * 4 + 3].to_int() == -2 {
+      e += 1
+    }
+    if u < 0 || sbuf[u * 4 + 3].to_int() < 0 {
+      let mut k = c
+      while k < e {
+        let st = sbuf[k * 4].to_int()
+        let ln = sbuf[k * 4 + 1].to_int()
+        let sub = utf16_slice(text, st, st + ln)
+        sbuf[k * 4 + 3] = hostapi::text_key(sub, size, weight, style).to_double()
+        k += 1
+      }
+    } else {
+      let st_u = sbuf[u * 4].to_int()
+      let end_e = sbuf[(e - 1) * 4].to_int() + sbuf[(e - 1) * 4 + 1].to_int()
+      let lig = utf16_slice(text, st_u, end_e)
+      sbuf[u * 4 + 3] = hostapi::text_key(lig, size, weight, style).to_double()
+      let mut a = 0.0
+      let mut k = u
+      while k < e {
+        a = a + sbuf[k * 4 + 2]
+        k += 1
+      }
+      let share = a / (e - u).to_double()
+      k = u
+      while k < e {
+        sbuf[k * 4 + 2] = share
+        if k > u {
+          sbuf[k * 4 + 3] = -1.0
+        }
+        k += 1
+      }
+    }
+    c = e
+  }
+}
+
 struct GlyphSlot {
   u : Double
   v : Double
@@ -262,6 +365,7 @@ fn encode_words(
       line_idx += 1
       continue
     }
+    resolve_ligatures(raw, n, sbuf, sz, weight, style_bits)
     // Partition shaped clusters into visual lines (word-boundary wrapping by d.w if wrap=true)
     let mut start = 0
     while start < n {
@@ -276,9 +380,8 @@ fn encode_words(
       while end < n {
         let adv = sbuf[end * 4 + 2] + spacing
         let loc = sbuf[end * 4].to_int()
-        let gkey = sbuf[end * 4 + 3].to_int()
         let cu = if loc >= 0 && loc < raw.length() { raw.code_unit_at(loc) } else { 0 }
-        let is_space = gkey < 0 || cu == 32 || cu == 9
+        let is_space = cu == 32 || cu == 9
         if wrap && end > start && line_w + adv > d.w {
           if !is_space && last_break_end > start {
             end = last_break_end
@@ -386,6 +489,9 @@ fn encode_runs(
         let cap = (seg.length() + 4) * 4
         let sbuf = ensure_shape_buf(cap)
         let n = hostapi::shape(seg, rsz, rweight, rstyle, sbuf)
+        if n > 0 {
+          resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
+        }
         let mut k = 0
         while k < n {
           let adv = sbuf[k * 4 + 2] + spacing
@@ -468,6 +574,7 @@ pub fn host_words_measure(
       continue
     }
     shaped_any = true
+    resolve_ligatures(raw, n, sbuf, sz, weight, style_bits)
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
@@ -481,9 +588,8 @@ pub fn host_words_measure(
       while end < n {
         let adv = sbuf[end * 4 + 2] + spacing
         let loc = sbuf[end * 4].to_int()
-        let gkey = sbuf[end * 4 + 3].to_int()
         let cu = if loc >= 0 && loc < raw.length() { raw.code_unit_at(loc) } else { 0 }
-        let is_space = gkey < 0 || cu == 32 || cu == 9
+        let is_space = cu == 32 || cu == 9
         if wrap && end > start && line_w + adv > max_w {
           if !is_space && last_break_end > start {
             end = last_break_end
@@ -602,6 +708,7 @@ pub fn host_runs_measure(
         }
         if n > 0 {
           shaped_any = true
+          resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
         }
         let mut k = 0
         while k < n {
@@ -732,6 +839,9 @@ pub fn Scene::draw_text_run(
   let cap = (text.length() + 4) * 4
   let sbuf = ensure_shape_buf(cap)
   let n = hostapi::shape(text, size, weight, eff_style, sbuf)
+  if n > 0 {
+    resolve_ligatures(text, n, sbuf, size, weight, eff_style)
+  }
   let mut pen_x = 0.0
   let mut k = 0
   while k < n {
@@ -801,6 +911,9 @@ pub fn measure_text_carets(
   let cap = (text.length() + 4) * 4
   let sbuf = ensure_shape_buf(cap)
   let n = hostapi::shape(text, size, weight, eff_style, sbuf)
+  if n > 0 {
+    resolve_ligatures(text, n, sbuf, size, weight, eff_style)
+  }
   let mut acc = 0.0
   let mut k = 0
   while k < n {

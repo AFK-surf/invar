@@ -1,7 +1,7 @@
 // Browser WebGL2 / WebAssembly host implementation for `hostapi::Host`.
 // Bridges `hostapi::Host` calls to `web/pion_host_bridge.mjs` (`pion_rt.mb_web_*`) and `web/host.js` (`globalThis.__mbhost`),
-// and exports C-ABI callbacks (`web_frame`, `web_pointer`, `web_wheel`, `web_key`, `web_text`, `web_outside`, `web_back`, `web_app_state`)
-// so `host.js` drives every animation frame and input event directly into Wasm.
+// and exports C-ABI callbacks (`web_frame`, `web_pointer`, `web_wheel`, `web_key`, `web_key_up`, `web_text`, `web_outside`, `web_back`, `web_app_state`)
+// so `host.js` and `pion_host_bridge.mjs` drive every frame and desktop input event directly into Wasm.
 
 import "hostapi"
 
@@ -10,6 +10,7 @@ struct WebCbSlots {
   mut pointer : (Int, Double, Double, Int) -> Unit
   mut wheel : (Double, Double, Double, Double, Int) -> Unit
   mut key : (Int, Int) -> Unit
+  mut key_up : (Int, Int) -> Unit
   mut text : (Int, String, Int, Int) -> Unit
   mut outside : (Int, Int, Int) -> Unit
   mut back : (Int, Double, Double, Int) -> Unit
@@ -21,10 +22,21 @@ let cb_slots : WebCbSlots = WebCbSlots::{
   pointer: fn(_k : Int, _x : Double, _y : Double, _b : Int) -> Unit { () },
   wheel: fn(_x : Double, _y : Double, _dx : Double, _dy : Double, _p : Int) -> Unit { () },
   key: fn(_k : Int, _m : Int) -> Unit { () },
+  key_up: fn(_k : Int, _m : Int) -> Unit { () },
   text: fn(_k : Int, _s : String, _a : Int, _b : Int) -> Unit { () },
   outside: fn(_k : Int, _id : Int, _st : Int) -> Unit { () },
   back: fn(_k : Int, _x : Double, _p : Double, _e : Int) -> Unit { () },
   app_state: fn(_st : Int) -> Unit { () },
+}
+
+/// Register a callback invoked on browser `keyup` events (`code`, `mods`).
+pub fn set_key_up_handler(f : (Int, Int) -> Unit) -> Unit {
+  cb_slots.key_up = f
+}
+
+/// Returns the live browser keyboard modifier bitmask (Shift=1, Ctrl=2, Alt=4, Meta=8).
+pub fn web_mods_held() -> Int {
+  mb_web_mods_held()
 }
 
 // ---- Exported Wasm callbacks invoked by `web/pion_host_bridge.mjs` ----
@@ -45,6 +57,10 @@ extern "C" fn web_cb_key(code : Int, mods : Int) -> Unit = "web_key" {
   (cb_slots.key)(code, mods)
 }
 
+extern "C" fn web_cb_key_up(code : Int, mods : Int) -> Unit = "web_key_up" {
+  (cb_slots.key_up)(code, mods)
+}
+
 extern "C" fn web_cb_text(kind : Int, cstr : Ptr, a : Int, b : Int) -> Unit = "web_text" {
   (cb_slots.text)(kind, cstr_to_str(cstr), a, b)
 }
@@ -63,6 +79,8 @@ extern "C" fn web_cb_app_state(st : Int) -> Unit = "web_app_state" {
 
 // ---- Imported browser host bridge functions (`pion_rt.mb_web_*`) ----
 
+extern "C" fn mb_web_last_bytes_len() -> Int = "mb_web_last_bytes_len"
+
 extern "C" fn mb_web_run(title : Ptr, title_len : Int64) -> Unit = "mb_web_run"
 extern "C" fn mb_web_now() -> Double = "mb_web_now"
 extern "C" fn mb_web_wall_ms() -> Double = "mb_web_wall_ms"
@@ -72,6 +90,8 @@ extern "C" fn mb_web_request_frame() -> Unit = "mb_web_request_frame"
 extern "C" fn mb_web_frames_paced(hz : Double) -> Unit = "mb_web_frames_paced"
 extern "C" fn mb_web_wake_after(ms : Double) -> Unit = "mb_web_wake_after"
 extern "C" fn mb_web_own_clock() -> Int = "mb_web_own_clock"
+extern "C" fn mb_web_wheel_kept(kept : Int) -> Unit = "mb_web_wheel_kept"
+extern "C" fn mb_web_mods_held() -> Int = "mb_web_mods_held"
 
 extern "C" fn mb_web_font_metrics(size : Double, weight : Int, style : Int, out : Ptr) -> Unit = "mb_web_font_metrics"
 extern "C" fn mb_web_shape(
@@ -113,8 +133,12 @@ extern "C" fn mb_web_set_ime(
   sel_start : Int,
   sel_end : Int,
 ) -> Unit = "mb_web_set_ime"
+extern "C" fn mb_web_text_menu(shown : Int, x : Double, y : Double, w : Double, h : Double, can : Int) -> Unit = "mb_web_text_menu"
+extern "C" fn mb_web_text_menu_own(words : Ptr, words_len : Int64) -> Unit = "mb_web_text_menu_own"
 extern "C" fn mb_web_clipboard_set(s : Ptr, s_len : Int64) -> Unit = "mb_web_clipboard_set"
 extern "C" fn mb_web_log(s : Ptr, s_len : Int64) -> Unit = "mb_web_log"
+extern "C" fn mb_web_bench_mode() -> Int = "mb_web_bench_mode"
+extern "C" fn mb_web_exit(code : Int) -> Unit = "mb_web_exit"
 extern "C" fn mb_web_set_cursor(kind : Int) -> Unit = "mb_web_set_cursor"
 extern "C" fn mb_web_env(name : Ptr, name_len : Int64) -> Ptr = "mb_web_env"
 extern "C" fn mb_web_system_dark() -> Int = "mb_web_system_dark"
@@ -124,8 +148,74 @@ extern "C" fn mb_web_keys_platform() -> Int = "mb_web_keys_platform"
 extern "C" fn mb_web_native_pointing() -> Int = "mb_web_native_pointing"
 extern "C" fn mb_web_frame_awaiting(n : Int, what : Ptr, what_len : Int64) -> Unit = "mb_web_frame_awaiting"
 extern "C" fn mb_web_set_outside() -> Int = "mb_web_set_outside"
+extern "C" fn mb_web_set_back() -> Unit = "mb_web_set_back"
+extern "C" fn mb_web_back_enabled(on : Int) -> Unit = "mb_web_back_enabled"
 extern "C" fn mb_web_set_app_state() -> Unit = "mb_web_set_app_state"
 
+// Window management & title
+extern "C" fn mb_web_windows(op : Int, wid : Int, what : Ptr, what_len : Int64) -> Int = "mb_web_windows"
+extern "C" fn mb_web_window_set_title(wid : Int, title : Ptr, title_len : Int64) -> Unit = "mb_web_window_set_title"
+
+// Async clipboard (text, PNG bytes, file list)
+extern "C" fn mb_web_cl_read() -> Int = "mb_web_cl_read"
+extern "C" fn mb_web_cl_state(id : Int) -> Int = "mb_web_cl_state"
+extern "C" fn mb_web_cl_picture(id : Int) -> Int = "mb_web_cl_picture"
+extern "C" fn mb_web_cl_text(id : Int) -> Ptr = "mb_web_cl_text"
+extern "C" fn mb_web_cl_png(id : Int) -> Ptr = "mb_web_cl_png"
+extern "C" fn mb_web_cl_files(id : Int) -> Int = "mb_web_cl_files"
+extern "C" fn mb_web_cl_file_name(id : Int, i : Int) -> Ptr = "mb_web_cl_file_name"
+extern "C" fn mb_web_cl_file(id : Int, i : Int) -> Ptr = "mb_web_cl_file"
+extern "C" fn mb_web_cl_end(id : Int) -> Unit = "mb_web_cl_end"
+extern "C" fn mb_web_cl_set(
+  text : Ptr,
+  text_len : Int64,
+  png : Ptr,
+  png_len : Int64,
+  label : Ptr,
+  label_len : Int64,
+) -> Unit = "mb_web_cl_set"
+
+// File picker
+extern "C" fn mb_web_pk_start(kind : Int) -> Int = "mb_web_pk_start"
+extern "C" fn mb_web_pk_state(id : Int) -> Int = "mb_web_pk_state"
+extern "C" fn mb_web_pk_count(id : Int) -> Int = "mb_web_pk_count"
+extern "C" fn mb_web_pk_name(id : Int, i : Int) -> Ptr = "mb_web_pk_name"
+extern "C" fn mb_web_pk_bytes(id : Int, i : Int) -> Ptr = "mb_web_pk_bytes"
+extern "C" fn mb_web_pk_info(id : Int, i : Int) -> Ptr = "mb_web_pk_info"
+extern "C" fn mb_web_pk_end(id : Int) -> Unit = "mb_web_pk_end"
+
+// Keep / download
+extern "C" fn mb_web_kp_begin(name : Ptr, name_len : Int64, mime : Ptr, mime_len : Int64, way : Int) -> Int = "mb_web_kp_begin"
+extern "C" fn mb_web_kp_append(id : Int, data : Ptr, data_len : Int64) -> Int = "mb_web_kp_append"
+extern "C" fn mb_web_kp_finish(id : Int) -> Unit = "mb_web_kp_finish"
+extern "C" fn mb_web_kp_state(id : Int) -> Int = "mb_web_kp_state"
+extern "C" fn mb_web_kp_where(id : Int) -> Ptr = "mb_web_kp_where"
+extern "C" fn mb_web_kp_end(id : Int) -> Unit = "mb_web_kp_end"
+
+// External posts (including drag-and-drop file imports)
+extern "C" fn mb_web_post_take() -> Int = "mb_web_post_take"
+extern "C" fn mb_web_post_next() -> Ptr = "mb_web_post_next"
+extern "C" fn mb_web_post_json() -> Ptr = "mb_web_post_json"
+extern "C" fn mb_web_post_bytes() -> Ptr = "mb_web_post_bytes"
+
+// Device & notifications
+extern "C" fn mb_web_keep_awake(on : Int) -> Unit = "mb_web_keep_awake"
+extern "C" fn mb_web_key_catch(on : Int) -> Unit = "mb_web_key_catch"
+extern "C" fn mb_web_ime_inset() -> Double = "mb_web_ime_inset"
+extern "C" fn mb_web_ime_action(k : Int) -> Unit = "mb_web_ime_action"
+extern "C" fn mb_web_haptic(k : Int) -> Unit = "mb_web_haptic"
+extern "C" fn mb_web_nt_show(
+  ch : Ptr, ch_len : Int64,
+  tag : Ptr, tag_len : Int64,
+  title : Ptr, title_len : Int64,
+  body : Ptr, body_len : Int64,
+  opens : Ptr, opens_len : Int64,
+) -> Unit = "mb_web_nt_show"
+extern "C" fn mb_web_nt_cancel(tag : Ptr, tag_len : Int64) -> Unit = "mb_web_nt_cancel"
+extern "C" fn mb_web_nt_state(what : Int) -> Int = "mb_web_nt_state"
+extern "C" fn mb_web_nt_text(what : Int) -> Ptr = "mb_web_nt_text"
+
+// Images, URLs, perf
 extern "C" fn mb_web_image_load(src : Ptr, src_len : Int64, max_px : Int) -> Int = "mb_web_image_load"
 extern "C" fn mb_web_image_load_bytes(data : Ptr, data_len : Int64, max_px : Int) -> Int = "mb_web_image_load_bytes"
 extern "C" fn mb_web_image_info(id : Int, out : Ptr) -> Int = "mb_web_image_info"
@@ -140,6 +230,16 @@ fn take_c_str(p : Ptr) -> String {
   s
 }
 
+fn take_raw_bytes(p : Ptr) -> Bytes {
+  let n = mb_web_last_bytes_len()
+  if n <= 0 {
+    return "".to_bytes()
+  }
+  let b = bytes_from_ptr(p, n)
+  ptr_free(p)
+  b
+}
+
 /// Builds a `hostapi::Host` backed by the browser WebGL2 `host.js` + `pion_host_bridge.mjs`.
 pub fn web_host() -> hostapi::Host {
   let h = hostapi::Host::noop()
@@ -148,6 +248,19 @@ pub fn web_host() -> hostapi::Host {
   h.native_pointing = fn() -> Int { mb_web_native_pointing() }
   h.keyboard = fn() -> Int { -1 }
   h.rows_on_pixels = fn() -> Bool { false }
+  h.wheel_kept = fn(kept : Bool) -> Unit { mb_web_wheel_kept(if kept { 1 } else { 0 }) }
+  h.mods_held = fn() -> Int { mb_web_mods_held() }
+
+  // Multi-window & title
+  h.windows_in_process = fn() -> Bool { mb_web_windows(0, 0, str_data_ptr(""), 0L) != 0 }
+  h.window_open_id = fn(what : String) -> Int { mb_web_windows(1, 0, str_data_ptr(what), what.length().to_int64()) }
+  h.window_front_id = fn(wid : Int) -> Bool { mb_web_windows(2, wid, str_data_ptr(""), 0L) != 0 }
+  h.window_close_id = fn(wid : Int) -> Unit { let _ = mb_web_windows(3, wid, str_data_ptr(""), 0L) }
+  h.window_current = fn() -> Int { mb_web_windows(4, 0, str_data_ptr(""), 0L) }
+  h.window_set_title = fn(wid : Int, title : String) -> Unit {
+    mb_web_window_set_title(wid, str_data_ptr(title), title.length().to_int64())
+  }
+
   h.run = fn(
     title : String,
     frame : (Double, Double, Double, Double) -> Unit,
@@ -172,6 +285,7 @@ pub fn web_host() -> hostapi::Host {
   h.wake_after = fn(ms : Double) -> Unit { mb_web_wake_after(ms) }
   h.own_clock = fn() -> Bool { mb_web_own_clock() != 0 }
 
+  // Text shaping & glyph atlas
   h.font_metrics = fn(size : Double, weight : Int, style : Int, out : Array[Double]) -> Unit {
     mb_web_font_metrics(size, weight, style, array_data_ptr(out))
   }
@@ -207,6 +321,7 @@ pub fn web_host() -> hostapi::Host {
   }
   h.face_clear = fn(face : Int) -> Unit { mb_web_face_clear(face) }
 
+  // Presentation & WebGL2 glass
   h.present = fn(buf : Array[Double], count : Int, r : Double, g : Double, b : Double) -> Unit {
     mb_web_present(array_data_ptr(buf), count, r, g, b)
   }
@@ -217,6 +332,7 @@ pub fn web_host() -> hostapi::Host {
     mb_web_glass_light_angle(rad)
   }
 
+  // IME, text menu & clipboard
   h.set_ime = fn(
     active : Bool,
     x : Double,
@@ -239,12 +355,97 @@ pub fn web_host() -> hostapi::Host {
       sel_end,
     )
   }
+  h.text_menu = fn(shown : Bool, x : Double, y : Double, w : Double, h_px : Double, can : Int) -> Unit {
+    mb_web_text_menu(if shown { 1 } else { 0 }, x, y, w, h_px, can)
+  }
+  h.text_menu_own = fn(words : String) -> Unit {
+    mb_web_text_menu_own(str_data_ptr(words), words.length().to_int64())
+  }
   h.clipboard_set = fn(s : String) -> Unit {
     mb_web_clipboard_set(str_data_ptr(s), s.length().to_int64())
   }
+  h.clipboard_set_secret = fn(s : String, _clear_ms : Double) -> Unit {
+    mb_web_clipboard_set(str_data_ptr(s), s.length().to_int64())
+  }
+  h.clipboard_set_image = fn(data : Bytes) -> Unit {
+    mb_web_cl_set(str_data_ptr(""), 0L, bytes_data_ptr(data), data.length().to_int64(), str_data_ptr(""), 0L)
+  }
+  h.cl_read = fn() -> Int { mb_web_cl_read() }
+  h.cl_state = fn(id : Int) -> Int { mb_web_cl_state(id) }
+  h.cl_picture = fn(id : Int) -> Int { mb_web_cl_picture(id) }
+  h.cl_text = fn(id : Int) -> String { take_c_str(mb_web_cl_text(id)) }
+  h.cl_png = fn(id : Int) -> Bytes { take_raw_bytes(mb_web_cl_png(id)) }
+  h.cl_files = fn(id : Int) -> Int { mb_web_cl_files(id) }
+  h.cl_file_name = fn(id : Int, i : Int) -> String { take_c_str(mb_web_cl_file_name(id, i)) }
+  h.cl_file = fn(id : Int, i : Int) -> Bytes { take_raw_bytes(mb_web_cl_file(id, i)) }
+  h.cl_end = fn(id : Int) -> Unit { mb_web_cl_end(id) }
+  h.cl_set = fn(text : String, png : Bytes, label : String) -> Unit {
+    mb_web_cl_set(
+      str_data_ptr(text),
+      text.length().to_int64(),
+      bytes_data_ptr(png),
+      png.length().to_int64(),
+      str_data_ptr(label),
+      label.length().to_int64(),
+    )
+  }
+
+  // File picker & download keep
+  h.pk_start = fn(kind : Int) -> Int { mb_web_pk_start(kind) }
+  h.pk_state = fn(id : Int) -> Int { mb_web_pk_state(id) }
+  h.pk_count = fn(id : Int) -> Int { mb_web_pk_count(id) }
+  h.pk_name = fn(id : Int, i : Int) -> String { take_c_str(mb_web_pk_name(id, i)) }
+  h.pk_bytes = fn(id : Int, i : Int) -> Bytes { take_raw_bytes(mb_web_pk_bytes(id, i)) }
+  h.pk_info = fn(id : Int, i : Int) -> String { take_c_str(mb_web_pk_info(id, i)) }
+  h.pk_end = fn(id : Int) -> Unit { mb_web_pk_end(id) }
+
+  h.kp_begin = fn(name : String, mime : String, way : Int) -> Int {
+    mb_web_kp_begin(str_data_ptr(name), name.length().to_int64(), str_data_ptr(mime), mime.length().to_int64(), way)
+  }
+  h.kp_append = fn(id : Int, data : Bytes) -> Int {
+    mb_web_kp_append(id, bytes_data_ptr(data), data.length().to_int64())
+  }
+  h.kp_finish = fn(id : Int) -> Unit { mb_web_kp_finish(id) }
+  h.kp_state = fn(id : Int) -> Int { mb_web_kp_state(id) }
+  h.kp_where = fn(id : Int) -> String { take_c_str(mb_web_kp_where(id)) }
+  h.kp_end = fn(id : Int) -> Unit { mb_web_kp_end(id) }
+
+  // External posts (drag-and-drop, system events)
+  h.post_take = fn() -> Int { mb_web_post_take() }
+  h.post_next = fn() -> Option[(String, String, Bytes)] {
+    let ch = take_c_str(mb_web_post_next())
+    if ch.length() == 0 {
+      return None
+    }
+    let json = take_c_str(mb_web_post_json())
+    let bs = take_raw_bytes(mb_web_post_bytes())
+    Some((ch, json, bs))
+  }
+
+  // Device, notifications, navigation
+  h.dv_keep_awake = fn(on : Int) -> Unit { mb_web_keep_awake(on) }
+  h.dv_key_catch = fn(on : Int) -> Unit { mb_web_key_catch(on) }
+  h.dv_ime_inset = fn() -> Double { mb_web_ime_inset() }
+  h.dv_ime_action = fn(k : Int) -> Unit { mb_web_ime_action(k) }
+  h.dv_haptic = fn(k : Int) -> Unit { mb_web_haptic(k) }
+  h.nt_show = fn(ch : String, tag : String, title : String, body : String, opens : String) -> Unit {
+    mb_web_nt_show(
+      str_data_ptr(ch), ch.length().to_int64(),
+      str_data_ptr(tag), tag.length().to_int64(),
+      str_data_ptr(title), title.length().to_int64(),
+      str_data_ptr(body), body.length().to_int64(),
+      str_data_ptr(opens), opens.length().to_int64(),
+    )
+  }
+  h.nt_cancel = fn(tag : String) -> Unit { mb_web_nt_cancel(str_data_ptr(tag), tag.length().to_int64()) }
+  h.nt_state = fn(what : Int) -> Int { mb_web_nt_state(what) }
+  h.nt_text = fn(what : Int) -> String { take_c_str(mb_web_nt_text(what)) }
+
   h.log = fn(s : String) -> Unit {
     mb_web_log(str_data_ptr(s), s.length().to_int64())
   }
+  h.bench_mode = fn() -> Int { mb_web_bench_mode() }
+  h.exit = fn(code : Int) -> Unit { mb_web_exit(code) }
   h.set_cursor = fn(kind : Int) -> Unit { mb_web_set_cursor(kind) }
   h.env = fn(name : String) -> String {
     take_c_str(mb_web_env(str_data_ptr(name), name.length().to_int64()))
@@ -259,6 +460,11 @@ pub fn web_host() -> hostapi::Host {
     cb_slots.outside = f
     mb_web_set_outside() != 0
   }
+  h.set_back = fn(f : (Int, Double, Double, Int) -> Unit) -> Unit {
+    cb_slots.back = f
+    mb_web_set_back()
+  }
+  h.back_enabled = fn(on : Bool) -> Unit { mb_web_back_enabled(if on { 1 } else { 0 }) }
   h.set_app_state = fn(f : (Int) -> Unit) -> Unit {
     cb_slots.app_state = f
     mb_web_set_app_state()
@@ -275,6 +481,9 @@ pub fn web_host() -> hostapi::Host {
   }
   h.image_free = fn(id : Int) -> Unit { mb_web_image_free(id) }
   h.open_url = fn(url : String) -> Bool {
+    mb_web_open_url(str_data_ptr(url), url.length().to_int64()) != 0
+  }
+  h.open_tab = fn(url : String) -> Bool {
     mb_web_open_url(str_data_ptr(url), url.length().to_int64()) != 0
   }
   h.gpu_ms = fn() -> Double { mb_web_gpu_ms() }
