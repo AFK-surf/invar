@@ -1,0 +1,356 @@
+// Core unit tests for packages/view (declarative tree, layout, reactivity, show/pick/each,
+// scroll, virtualized list_window, block reuse, focus, keymap, text wrapping, beside, said,
+// bounded_hold, velocity tracker, answering/transition).
+
+import "signals"
+import "text"
+
+test "declarative tree construction, flex layout and reactive props" {
+  let w_sig = signals::signal(120.0)
+  let bg_sig = signals::signal(0x112233FF.to_int64())
+  let box_id : Ref[Option[NodeId]] = ref_new(None)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.row(Is(true)).gap(Is(10.0)).padding(Is((12.0, 8.0, 12.0, 8.0)))
+    let a = root.box(fn(v : View) {
+      let _ = v.width(By(fn() { Some(w_sig.get()) })).height(Is(Some(40.0))).ground(By(fn() { bg_sig.get() }))
+    })
+    box_id.v = Some(a.id())
+    let _ = root.box(fn(v : View) {
+      let _ = v.grow(Is(1.0)).height(Is(Some(40.0))).ground(Is(0x445566FF.to_int64()))
+    })
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  let drawn = tree.drawn()
+  debug_assert(drawn.length() >= 2, "expected at least 2 drawn nodes")
+  let aid = match box_id.v {
+    Some(id) => id
+    None => { debug_assert(false, "box_id must be set"); NodeId::{ at: 0, gen: 0 } }
+  }
+  match tree.drawn_of(aid) {
+    Some(d) => {
+      debug_assert((d.x - 12.0).abs() < 0.01, "x should equal left padding 12")
+      debug_assert((d.y - 8.0).abs() < 0.01, "y should equal top padding 8")
+      debug_assert((d.w - 120.0).abs() < 0.01, "initial width 120")
+      debug_assert((d.h - 40.0).abs() < 0.01, "height 40")
+      debug_assert(d.ground == 0x112233FF.to_int64(), "initial ground")
+    }
+    None => debug_assert(false, "box should be drawn")
+  }
+  w_sig.set(200.0)
+  bg_sig.set(0xAABBCCFF.to_int64())
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+  match tree.drawn_of(aid) {
+    Some(d) => {
+      debug_assert((d.w - 200.0).abs() < 0.01, "updated width 200")
+      debug_assert(d.ground == 0xAABBCCFF.to_int64(), "updated ground")
+    }
+    None => debug_assert(false, "box should still be drawn after update")
+  }
+  tree.dispose()
+}
+
+test "show combinator mounts and disposes child cleanly" {
+  let visible = signals::signal(false)
+  let child_ref : Ref[Option[View]] = ref_new(None)
+  let disposed = ref_new(0)
+  let tree = Tree::new(fn(root : View) {
+    root.show(fn() { visible.get() }, fn(v : View) {
+      let _ = v.width(Is(Some(80.0))).height(Is(Some(30.0))).ground(Is(0xFF0000FF.to_int64()))
+      let _ = v.owns(fn() { disposed.v = disposed.v + 1 })
+      child_ref.v = Some(v)
+    }, at_once=true)
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  debug_assert(child_ref.v.is_none(), "not mounted when false")
+  visible.set(true)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  match child_ref.v {
+    Some(v) => debug_assert(v.alive(), "mounted and alive when true")
+    None => debug_assert(false, "child should be mounted")
+  }
+  visible.set(false)
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  match child_ref.v {
+    Some(v) => debug_assert(!v.alive(), "disposed when hidden")
+    None => ()
+  }
+  debug_assert(disposed.v == 1, "owns cleanup called once")
+  tree.dispose()
+}
+
+test "pick combinator switches branches by key" {
+  let tab = signals::signal(1)
+  let built : Array[Int] = []
+  let tree = Tree::new(fn(root : View) {
+    root.pick(fn() { tab.get() }, fn(v : View, k : Int) {
+      built.push(k)
+      let _ = v.width(Is(Some(100.0))).height(Is(Some(20.0 * k.to_double()))).ground(Is(0x223344FF.to_int64()))
+    }, at_once=true)
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  debug_assert(built.length() == 1 && built[0] == 1, "built initial branch 1")
+  tab.set(2)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  debug_assert(built.length() == 2 && built[1] == 2, "switched to branch 2")
+  // Setting same key does not rebuild
+  tab.set(2)
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  debug_assert(built.length() == 2, "same key does not rebuild")
+  tree.dispose()
+}
+
+test "each keyed list preserves identity across reorder and removal" {
+  let items = signals::signal_by([1, 2, 3], array_eq_int)
+  let created : Array[Int] = []
+  let row_views : Map[Int, View] = Map::new()
+  let tree = Tree::new(fn(root : View) {
+    root.each(fn() { items.get() }, fn(k : Int) { k }, fn(v : View, item : signals::Signal[Int]) {
+      let k = item.untracked()
+      created.push(k)
+      row_views[k] = v
+      let _ = v.height(Is(Some(24.0))).ground(Is(0x334455FF.to_int64()))
+    }, at_once=true)
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  debug_assert(created.length() == 3, "created 3 initial rows")
+  let id2 = row_views[2].id()
+  // Reorder and add 4, remove 1
+  items.set([3, 2, 4])
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  debug_assert(created.length() == 4 && created[3] == 4, "only new key 4 created")
+  debug_assert(!row_views[1].alive(), "removed key 1 disposed")
+  debug_assert(row_views[2].alive() && row_views[2].id() == id2, "key 2 preserved identity")
+  debug_assert(row_views[4].alive(), "key 4 alive")
+  tree.dispose()
+}
+
+test "text wrapping and words_measure" {
+  let (w1, h1) = words_measure("hello", words_plain, -1.0, 1.0)
+  debug_assert((w1 - 35.0).abs() < 0.01 && (h1 - 18.0).abs() < 0.01, "single line 5 chars * 7 = 35, 18 high")
+  let (_, h2) = words_measure("hello world foo bar", words_plain, 50.0, 1.0)
+  debug_assert(h2 > 18.0, "wrapped text should be taller than one line")
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(100.0)))
+    let _ = root.box(fn(v : View) {
+      let _ = v.words(Is("hello world"), look=words_plain)
+    })
+  })
+  let _ = tree.frame(100.0, 100.0, now=0.0)
+  let drawn = tree.drawn()
+  debug_assert(drawn.length() >= 1, "words node drawn")
+  tree.dispose()
+}
+
+test "scroll container wheel and clamping" {
+  let sc = Scroll::new()
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(200.0))).height(Is(Some(100.0)))
+    let _ = root.scrolls(sc, fn(inner : View) {
+      for i in 0..<10 {
+        let _ = inner.box(fn(v : View) {
+          let _ = v.height(Is(Some(40.0))).ground(Is((0x101010FF + i * 0x05050500).to_int64()))
+        })
+      }
+    })
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  debug_assert(sc.at(tree) == 0.0, "starts at top 0")
+  debug_assert((sc.most() - 300.0).abs() < 1.0, "content 400 - viewport 100 = 300")
+  sc.put(150.0)
+  let _ = tree.frame(200.0, 100.0, now=16.0)
+  debug_assert((sc.at(tree) - 150.0).abs() < 1.0, "scrolled to 150")
+  sc.put(999.0)
+  let _ = tree.frame(200.0, 100.0, now=32.0)
+  debug_assert((sc.at(tree) - 300.0).abs() < 1.0, "clamped to max 300")
+  tree.dispose()
+}
+
+test "virtualized scrolls_window materializes only visible window of 1000 items" {
+  let sc = Scroll::list()
+  let place : ListPlace[Int] = ListPlace::new()
+  let all_keys : Array[Int] = []
+  for i in 0..<1000 {
+    all_keys.push(i)
+  }
+  let keys_sig = signals::signal_by(all_keys, array_eq_int)
+  let made_count = ref_new(0)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(300.0))).height(Is(Some(200.0)))
+    let _ = root.scrolls_window(
+      sc,
+      fn() { keys_sig.get() },
+      fn(v : View, k : Int) {
+        made_count.v = made_count.v + 1
+        let _ = v.height(Is(Some(40.0))).ground(Is(0x222222FF.to_int64()))
+        let _ = v.words(Is("row " + k.to_string()))
+      },
+      est=40.0,
+      at_once=true,
+      place=place,
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  debug_assert(made_count.v > 0 && made_count.v < 60, "virtualized: far fewer than 1000 rows materialized")
+  match place.sight_now() {
+    Some(sg) => {
+      debug_assert(sg.first == 0, "first visible key is 0")
+      debug_assert(sg.last >= 4, "at least 5 rows visible in 200px viewport of 40px rows")
+    }
+    None => debug_assert(false, "sight_now should be Some after layout")
+  }
+  place.to_end(glide=false)
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  match place.sight_now() {
+    Some(sg) => {
+      debug_assert(sg.last == 999, "to_end brings last key 999 into sight")
+      debug_assert(sg.at_foot, "at_foot should be true after to_end")
+    }
+    None => debug_assert(false, "sight_now should be Some after to_end")
+  }
+  tree.dispose()
+}
+
+test "scrolls_reused recycles slots across scroll" {
+  let sc = Scroll::list()
+  let place : ListPlace[Int] = ListPlace::new()
+  let all_keys : Array[Int] = []
+  for i in 0..<200 {
+    all_keys.push(i)
+  }
+  let keys_sig = signals::signal_by(all_keys, array_eq_int)
+  let built_slots = ref_new(0)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(300.0))).height(Is(Some(200.0)))
+    let _ = root.scrolls_reused(
+      sc,
+      fn() { keys_sig.get() },
+      fn(v : View, key : () -> Int) {
+        built_slots.v = built_slots.v + 1
+        let _ = v.height(Is(Some(40.0))).words(By(fn() { "item " + key().to_string() }))
+      },
+      est=40.0,
+      at_once=true,
+      place=place,
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let initial_slots = built_slots.v
+  debug_assert(initial_slots > 0 && initial_slots < 40, "small initial recycled slot pool")
+  place.bring(100, glide=false)
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  debug_assert(built_slots.v <= initial_slots + 20, "slots recycled rather than creating 100 new ones")
+  tree.dispose()
+}
+
+test "focus order and keymap when-predicate parsing and dispatch" {
+  let parsed = key_when_parse("editor && !readonly || modal")
+  match parsed {
+    Some(w) => {
+      debug_assert(key_when_holds(w, fn(c) { c == "editor" }), "editor && !readonly holds")
+      debug_assert(!key_when_holds(w, fn(c) { c == "editor" || c == "readonly" }), "editor && readonly does not hold")
+      debug_assert(key_when_holds(w, fn(c) { c == "modal" }), "modal holds via ||")
+    }
+    None => debug_assert(false, "key_when_parse should succeed")
+  }
+  let fired = ref_new(0)
+  let target_id : Ref[Option[NodeId]] = ref_new(None)
+  let tree = Tree::new(fn(root : View) {
+    let km = Keymap::{
+      bindings: [
+        Binding::{
+          keys: [Stroke::{ code: 65, mods: 0 }],
+          action: "act.test",
+          when: KeyWhen::In("panel"),
+        },
+      ],
+      pending_ms: None,
+    }
+    let _ = root.keymap(Is(km))
+    let b = root.box(fn(v : View) {
+      let _ = v.width(Is(Some(80.0))).height(Is(Some(30.0)))
+      let _ = v.focusable(Is(true)).key_context("panel")
+      let _ = v.on_action("act.test", fn(_) { fired.v = fired.v + 1; true })
+    })
+    target_id.v = Some(b.id())
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  let order = tree.focus_order()
+  debug_assert(order.length() == 1, "one focusable node in order")
+  let ok = tree.stroke(65, 0, 10.0, from=target_id.v)
+  debug_assert(ok && fired.v == 1, "action dispatched via keymap")
+  tree.dispose()
+}
+
+test "place_beside flips side when viewport lacks room" {
+  // Anchor near bottom edge (y=280, h=15) in 300x300 viewport; tooltip 80x40 below won't fit -> flips to Top
+  let (x, y, side) = place_beside((100.0, 280.0, 60.0, 15.0), 80.0, 40.0, 300.0, 300.0, side=Bottom, offset=4.0, padding=8.0)
+  debug_assert(side == Top, "should flip from Bottom to Top near bottom edge")
+  debug_assert(y < 280.0, "tooltip placed above anchor")
+  debug_assert(x >= 8.0 && x + 80.0 <= 292.0, "tooltip clamped horizontally within padding")
+}
+
+test "said accessibility tree and words_within" {
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.box(fn(v : View) {
+      let _ = v.width(Is(Some(100.0))).height(Is(Some(30.0)))
+      let _ = v.says(Is(Some(Said::{
+        role: Button,
+        label: "Submit",
+        description: "",
+        value: "",
+        range: None,
+        check: None,
+        expanded: None,
+        selected: None,
+        pressed: None,
+        actions: [],
+      })))
+    })
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  let said = tree.said_order()
+  debug_assert(said.length() == 1, "one accessible node")
+  match said[0].said {
+    Some(s) => debug_assert(s.label == "Submit" && s.role == Button, "accessible role and label match")
+    None => debug_assert(false, "said entry must have Said")
+  }
+  tree.dispose()
+}
+
+test "bounded_hold gate waits until ready or deadline" {
+  let ready = signals::signal(false)
+  let went = ref_new(0)
+  let gate = HoldGate::new(acknowledged=true)
+  let tree = Tree::new(fn(root : View) {
+    gate.collect(fn() {
+      hold_note(fn() { ready.get() })
+    })
+    gate.seal(root)
+    gate.go(root, most=100.0, fn() { went.v = went.v + 1 })
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  debug_assert(gate.is_pending() && went.v == 0, "gate pending before ready")
+  ready.set(true)
+  let _ = tree.frame(200.0, 100.0, now=20.0)
+  debug_assert(!gate.is_pending() && went.v == 1, "gate fired once ready")
+  tree.dispose()
+}
+
+test "velocity tracker computes drag velocity" {
+  let vt = Tracker::new()
+  vt.add(0.0, 0.0)
+  vt.add(16.0, 32.0)
+  vt.add(32.0, 64.0)
+  let vy = vt.velocity_at(32.0)
+  debug_assert((vy - 2.0).abs() < 0.2, "vertical velocity ~2.0 pt/ms")
+}
+
+test "answering flag toggles during callback" {
+  debug_assert(!answering_now(), "not answering initially")
+  let inside = ref_new(false)
+  answering(fn() {
+    inside.v = answering_now()
+  })
+  debug_assert(inside.v, "answering_now true inside answering()")
+  debug_assert(!answering_now(), "restored after answering()")
+}
