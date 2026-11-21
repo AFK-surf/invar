@@ -1,0 +1,315 @@
+// Real native macOS (Apple Metal / CoreText / ImageIO / AppKit) tests for packages/host.
+
+import "hostapi"
+
+fn assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn push_inst(
+  a : Array[Double],
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  kind : Double,
+  p6 : Double,
+  p7 : Double,
+  r : Double,
+  g : Double,
+  b : Double,
+  al : Double,
+  c2a : Double,
+  c2b : Double,
+  c2c : Double,
+  c2d : Double,
+  tex_id : Double,
+  pad1 : Double,
+  pad2 : Double,
+  pad3 : Double,
+) -> Unit {
+  // 0..3 rect
+  a.push(x)
+  a.push(y)
+  a.push(w)
+  a.push(h)
+  // 4..7 radius, kind, bw/saturation, blur
+  a.push(radius)
+  a.push(kind)
+  a.push(p6)
+  a.push(p7)
+  // 8..11 color rgba
+  a.push(r)
+  a.push(g)
+  a.push(b)
+  a.push(al)
+  // 12..15 c2
+  a.push(c2a)
+  a.push(c2b)
+  a.push(c2c)
+  a.push(c2d)
+  // 16..19 clip (full canvas)
+  a.push(0.0)
+  a.push(0.0)
+  a.push(1000000000.0)
+  a.push(1000000000.0)
+  // 20..23 tex/glass capture id + pad
+  a.push(tex_id)
+  a.push(pad1)
+  a.push(pad2)
+  a.push(pad3)
+  // 24..31 clip rounded corners
+  let mut i = 0
+  while i < 8 {
+    a.push(0.0)
+    i = i + 1
+  }
+  // 32..35 rotation
+  a.push(0.0)
+  a.push(0.0)
+  a.push(0.0)
+  a.push(0.0)
+  // 36..39 per-corner radii
+  a.push(radius)
+  a.push(radius)
+  a.push(radius)
+  a.push(radius)
+  // 40..59 outer clip & fade
+  let mut j = 0
+  while j < 20 {
+    a.push(0.0)
+    j = j + 1
+  }
+}
+
+test "native_host_install_and_system_probes" {
+  install()
+  // macOS platform == 0
+  assert(hostapi::platform() == 0, "macOS platform must be 0")
+  assert(hostapi::now() > 0.0, "monotonic clock must be positive")
+  assert(hostapi::wall_ms() > 1577836800000.0, "wall_ms must be after 2020")
+  assert(hostapi::atlas_size(false) == 4096, "alpha glyph atlas must be 4096")
+  assert(hostapi::atlas_size(true) == 1024, "colour glyph atlas must be 1024")
+  assert(hostapi::rows_on_pixels(), "native host draws rows on pixels")
+  assert(hostapi::groups_here(), "apple_render supports groups")
+  assert(hostapi::h264_here(), "VideoToolbox H.264 must be available on macOS")
+  let (ws, we) = hostapi::word_at("hello world", 1)
+  assert(ws == 0 && we == 5, "CoreFoundation word_at must find 'hello'")
+  match hostapi::decode_charset("hello".to_bytes(), "GB18030") {
+    Some(s) => assert(s == "hello", "GB18030 ASCII decode must match 'hello'")
+    None => assert(false, "GB18030 charset must be known on macOS")
+  }
+}
+
+test "coretext_real_font_metrics_shaping_and_families" {
+  install()
+  init_offscreen(160.0, 100.0, 2.0)
+
+  // 1. CoreText font metrics
+  let metrics = Array::make(6, 0.0)
+  hostapi::font_metrics(16.0, 400, 0, metrics)
+  let ascent = metrics[0]
+  let descent = metrics[1]
+  let line_h = metrics[2]
+  let han_asc = metrics[3]
+  assert(ascent > 8.0 && ascent < 30.0, "CoreText 16pt ascent must be realistic positive")
+  assert(descent > 1.0 && descent < 15.0, "CoreText 16pt descent must be realistic positive")
+  assert(line_h >= ascent + descent - 1.0, "line height must cover ascent + descent")
+  assert(han_asc > 0.0, "Han fallback ascent must be positive")
+
+  // 2. CoreText shaping (ASCII + CJK)
+  let shaped = Array::make(256, 0.0)
+  let count = hostapi::shape("Hello 世界 2026", 16.0, 400, 0, shaped)
+  assert(count >= 10, "shaped cluster count must be >= 10")
+  let mut total_adv = 0.0
+  let mut first_key = -1
+  let mut i = 0
+  while i < count {
+    let adv = shaped[i * 4 + 2]
+    let key = shaped[i * 4 + 3].to_int()
+    total_adv = total_adv + adv
+    if first_key < 0 && key >= 0 {
+      first_key = key
+    }
+    i = i + 1
+  }
+  assert(total_adv > 60.0, "total advance must be > 60pt")
+  assert(first_key >= 0, "must produce at least one valid glyph key")
+
+  // 3. Glyph bbox + atlas upload
+  let gbuf = Array::make(8, 0.0)
+  hostapi::glyph(first_key, gbuf)
+  assert(gbuf[2] > 0.0 && gbuf[3] > 0.0, "rasterized glyph width and height must be positive")
+  hostapi::glyph_put(first_key, 1, 1)
+
+  // 4. Local installed macOS font families
+  let families = hostapi::local_font_families()
+  assert(families.length() > 20, "macOS must report local font families")
+}
+
+test "apple_metal_offscreen_render_and_pixel_readback" {
+  install()
+  let w_pt = 160.0
+  let h_pt = 100.0
+  let scale = 2.0
+  let pw = 320
+  let ph = 200
+  init_offscreen(w_pt, h_pt, scale)
+
+  let inst : Array[Double] = []
+  let mut count = 0
+
+  // 1. Rounded rectangle (kind 0): vibrant coral-red at (16, 16, 70, 68), radius 12
+  push_inst(
+    inst,
+    16.0, 16.0, 70.0, 68.0,
+    12.0, 0.0, 0.0, 0.0,
+    0.92, 0.22, 0.18, 1.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+  )
+  count = count + 1
+
+  // 2. Liquid glass panel (kind 6) overlapping the right half of the red rect
+  push_inst(
+    inst,
+    56.0, 24.0, 88.0, 52.0,
+    14.0, 6.0, 1.4, 12.0,
+    0.95, 0.97, 1.0, 0.18,
+    0.55, 10.0, 0.0, 1.0,
+    -1.0, 0.35, 0.15, 0.0,
+  )
+  count = count + 1
+
+  // 3. Real CoreText glyphs (kind 1) rendered in white inside the glass panel
+  let shaped = Array::make(128, 0.0)
+  let gbuf = Array::make(8, 0.0)
+  let n_clusters = hostapi::shape("Invar", 18.0, 600, 0, shaped)
+  assert(n_clusters >= 5, "expected at least 5 glyphs for 'Invar'")
+  let mut pen_x = 68.0
+  let base_y = 56.0
+  let mut atlas_x = 4
+  let mut ci = 0
+  while ci < n_clusters {
+    let adv = shaped[ci * 4 + 2]
+    let key = shaped[ci * 4 + 3].to_int()
+    if key >= 0 {
+      hostapi::glyph(key, gbuf)
+      let gw = gbuf[2]
+      let gh = gbuf[3]
+      let ox = gbuf[4]
+      let oy = gbuf[5]
+      if gw > 0.0 && gh > 0.0 {
+        let gpw = math_round(gw * scale).to_int()
+        hostapi::glyph_put(key, atlas_x, 4)
+        push_inst(
+          inst,
+          pen_x + ox, base_y + oy, gw, gh,
+          0.0, 1.0, 0.0, 0.0,
+          1.0, 1.0, 1.0, 1.0,
+          atlas_x as Double, 4.0, gw * scale, gh * scale,
+          0.0, 0.0, 0.0, 0.0,
+        )
+        count = count + 1
+        atlas_x = atlas_x + gpw + 2
+      }
+    }
+    pen_x = pen_x + adv
+    ci = ci + 1
+  }
+
+  // Present via hostapi::present and read back via hostapi::drawn_pixels
+  let bg_r = 0.08
+  let bg_g = 0.12
+  let bg_b = 0.22
+  hostapi::present(inst, count, bg_r, bg_g, bg_b)
+
+  let rgba = Array::make(pw * ph * 4, 0 as Byte)
+  let ok = hostapi::drawn_pixels(0, 0, pw, ph, rgba)
+  assert(ok, "hostapi::drawn_pixels must succeed after offscreen present")
+
+  // Check top-left background pixel (4, 4): ~ (20, 31, 56, 255)
+  let bg_idx = (4 * pw + 4) * 4
+  let bgr = rgba[bg_idx].to_int()
+  let bgg = rgba[bg_idx + 1].to_int()
+  let bgb = rgba[bg_idx + 2].to_int()
+  let bga = rgba[bg_idx + 3].to_int()
+  assert(bgr >= 10 && bgr <= 35, "bg red channel matches 0.08")
+  assert(bgg >= 20 && bgg <= 45, "bg green channel matches 0.12")
+  assert(bgb >= 42 && bgb <= 72, "bg blue channel matches 0.22")
+  assert(bga == 255, "bg alpha must be opaque 255")
+
+  // Check red rounded rect interior pixel at (30pt, 50pt) => (60px, 100px): ~ (235, 56, 46, 255)
+  let red_idx = (100 * pw + 60) * 4
+  let rr = rgba[red_idx].to_int()
+  let rg = rgba[red_idx + 1].to_int()
+  let rb = rgba[red_idx + 2].to_int()
+  assert(rr > 200, "red rect R channel must be > 200")
+  assert(rg < 90, "red rect G channel must be < 90")
+  assert(rb < 80, "red rect B channel must be < 80")
+
+  // Check glass-over-background pixel at (130pt, 50pt) => (260px, 100px): lighter than pure bg
+  let gl_idx = (100 * pw + 260) * 4
+  let glr = rgba[gl_idx].to_int()
+  let glg = rgba[gl_idx + 1].to_int()
+  let glb = rgba[gl_idx + 2].to_int()
+  assert(glr > bgr + 10 || glg > bgg + 10 || glb > bgb + 10, "liquid glass tint must brighten background")
+
+  // Also test hostapi::drawn_pixels_of standalone offscreen draw
+  let rgba2 = Array::make(80 * 60 * 4, 0 as Byte)
+  let ok2 = hostapi::drawn_pixels_of(inst, 1, 0.10, 0.70, 0.25, 1.0, 80, 60, rgba2)
+  assert(ok2, "hostapi::drawn_pixels_of must succeed")
+  let g_idx = (2 * 80 + 2) * 4
+  assert(rgba2[g_idx + 1].to_int() > 150, "drawn_pixels_of green background must be > 150")
+}
+
+test "imageio_png_snapshot_and_decode_roundtrip" {
+  install()
+  init_offscreen(64.0, 48.0, 1.0)
+
+  // Render a solid teal rect on dark background and snapshot to PNG via Apple ImageIO
+  let inst : Array[Double] = []
+  push_inst(
+    inst,
+    8.0, 8.0, 48.0, 32.0,
+    4.0, 0.0, 0.0, 0.0,
+    0.10, 0.80, 0.75, 1.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+  )
+  hostapi::present(inst, 1, 0.05, 0.05, 0.10)
+
+  let png_path = "/tmp/invar_host_test_probe.png"
+  assert(snapshot(png_path), "Apple Metal + ImageIO PNG snapshot must succeed")
+
+  // Decode the PNG back through hostapi::image_load -> image_info -> image_pixels
+  let img_id = hostapi::image_load(png_path, 256)
+  assert(img_id > 0, "image_load must return a positive id")
+
+  let info = Array::make(4, 0.0)
+  let mut state = hostapi::image_info(img_id, info)
+  let mut tries = 0
+  while state == 0 && tries < 100 {
+    pump_main_loop(10.0)
+    state = hostapi::image_info(img_id, info)
+    tries = tries + 1
+  }
+  assert(state == 1, "ImageIO decode must reach ready state (1)")
+  assert(info[0].to_int() == 64 && info[1].to_int() == 48, "decoded PNG dimensions must be 64x48")
+  assert(info[2].to_int() == 64 && info[3].to_int() == 48, "original PNG dimensions must be 64x48")
+
+  let px = Array::make(64 * 48 * 4, 0 as Byte)
+  assert(hostapi::image_pixels(img_id, px), "image_pixels must read back RGBA pixels")
+
+  // Verify center pixel (32, 24) is teal (R~25, G~204, B~191, A=255)
+  let c_idx = (24 * 64 + 32) * 4
+  assert(px[c_idx].to_int() < 60, "decoded teal R < 60")
+  assert(px[c_idx + 1].to_int() > 170, "decoded teal G > 170")
+  assert(px[c_idx + 2].to_int() > 160, "decoded teal B > 160")
+  assert(px[c_idx + 3].to_int() == 255, "decoded teal A == 255")
+
+  hostapi::image_free(img_id)
+}
