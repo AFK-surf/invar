@@ -31,6 +31,7 @@ COMMON_FLAGS=(
 )
 
 C_SOURCES=(
+  "packages/hostapi/native/wake_bridge.c"
   "packages/host/compat/pion_mb_compat.c"
 )
 
@@ -78,6 +79,10 @@ REQUIRED_SYMS=(
   _mb_host_present
   _mb_host_shape
   _mb_host_glass_light_angle
+  _mb_host_wake_now
+  _mb_host_wake_now_ptr
+  _invar_hostapi_set_native_wake
+  _invar_hostapi_call_native_wake
   _pion_host_run
   _pion_host_present
   _pion_host_shape

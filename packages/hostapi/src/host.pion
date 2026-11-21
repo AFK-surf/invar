@@ -644,6 +644,8 @@ pub fn Host::noop() -> Host {
 }
 
 extern "C" fn pion_cur_tid() -> Int64 = "pion_cur_tid"
+extern "C" fn c_set_native_wake(fn_ptr : Ptr) -> Unit = "invar_hostapi_set_native_wake"
+extern "C" fn c_call_native_wake() -> Unit = "invar_hostapi_call_native_wake"
 
 struct HostBox {
   mut h : Host
@@ -662,8 +664,16 @@ let wake_owner_tid : AtomicInt = AtomicInt::new(0)
 let sideways_now : signals::Signal[Bool] = signals::signal(false)
 let turnable_now : signals::Signal[Bool] = signals::signal(false)
 
-/// Installs the active host (resets sideways/turnable signals and nav bar cache).
+/// Installs a lock-free C function pointer `void (*)(void)` invoked by `wake_now()`
+/// from any OS thread without touching Pion closures or biased RC.
+/// Pass `ptr_null()` to clear.
+pub fn set_native_wake(fn_ptr : Ptr) -> Unit {
+  c_set_native_wake(fn_ptr)
+}
+
+/// Installs the active host (resets native wake callback, sideways/turnable signals and nav bar cache).
 pub fn set_host(h : Host) -> Unit {
+  c_set_native_wake(ptr_null())
   current_host.h = h
   let wf = h.wake_now
   wake_owner_tid.store(pion_cur_tid().to_int())
@@ -686,11 +696,13 @@ pub fn reset_wake_count() -> Unit {
 }
 
 /// Thread-safe frame wake-up callable from any background OS thread.
-/// Atomically increments `wake_seq` on all threads, and only invokes the host closure
-/// `wake_slot.f` on the owning thread that called `set_host` (avoiding cross-thread
-/// biased-RC UAF on non-`Send` host closures).
+/// Atomically increments `wake_seq`, invokes the registered native C wake callback
+/// (zero Pion closures, zero RC, lock-free across all OS threads), and invokes the
+/// host closure `wake_slot.f` only on the owning thread that called `set_host`
+/// (covering `FakeHost` unit tests and single-threaded `wasm32` `host_web`).
 pub fn wake_now() -> Unit {
   let _ = wake_seq.fetch_add(1)
+  c_call_native_wake()
   if pion_cur_tid().to_int() == wake_owner_tid.load() {
     wake_lock.with_lock(fn(_v : Int) -> Unit {
       (wake_slot.f)()

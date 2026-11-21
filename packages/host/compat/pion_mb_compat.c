@@ -220,6 +220,11 @@ extern int32_t mb_render_pixels_of(const double *inst, int32_t count, double r, 
 extern void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointer,
                         mb_wheel_fn wheel, mb_key_fn key, mb_text_fn text);
 extern void mb_host_present(double *buf, int32_t count, double r, double g, double b);
+extern void mb_host_wake_now(void);
+
+void *mb_host_wake_now_ptr(void) {
+  return (void *)(uintptr_t)mb_host_wake_now;
+}
 
 extern int32_t mb_host_shape(moonbit_string_t text, double size, int32_t weight, int32_t style, double *out);
 extern int32_t mb_host_text_key(moonbit_string_t text, double size, int32_t weight, int32_t style);
