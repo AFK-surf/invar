@@ -1,0 +1,93 @@
+// Real OS-thread 500-roundtrip String-enum regression stress test for `ui::Worker` / `ui::EventQueue`.
+// Exercises cross-package generic Channel[Cmd] + Mutex[Array[Ev]] deep-freeze, `hostapi::wake_now()`,
+// strict per-item String payload integrity, and clean `scope` exit after `worker.close()`.
+
+import "hostapi"
+import "ui"
+
+pub enum Cmd {
+  Compute(Int, String)
+}
+
+pub enum Ev {
+  Done(Int, String)
+}
+
+fn handle_cmd(cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+  match cmd {
+    Cmd::Compute(id, payload) => {
+      let result = "job#" + id.to_string() + ":" + payload + ":ok"
+      emit(Ev::Done(id, result))
+    }
+  }
+}
+
+pub fn main(world : World) -> Int {
+  let rounds = 500
+  hostapi::reset_wake_count()
+  hostapi::set_host(hostapi::Host::noop())
+
+  let (worker, ctx) : (ui::Worker[Cmd, Ev], ui::WorkerCtx[Cmd, Ev]) = ui::Worker::pair()
+
+  let received = AtomicInt::new(0)
+  let mismatches = AtomicInt::new(0)
+  let failed_send = AtomicInt::new(0)
+
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      ctx.run_loop(fn(cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+        handle_cmd(cmd, emit)
+      })
+    })
+
+    let mut sent = 0
+    while sent < rounds {
+      let payload = "req-" + sent.to_string() + "-alpha-beta-gamma"
+      if !worker.send(Cmd::Compute(sent, payload)) {
+        let _ = failed_send.fetch_add(1)
+      }
+      sent += 1
+    }
+
+    while received.load() < rounds {
+      let _ = worker.drain(fn(ev : Ev) -> Unit {
+        let idx = received.load()
+        match ev {
+          Ev::Done(id, got) => {
+            let expected_payload = "req-" + idx.to_string() + "-alpha-beta-gamma"
+            let expected = "job#" + idx.to_string() + ":" + expected_payload + ":ok"
+            if id != idx || got != expected {
+              let _ = mismatches.fetch_add(1)
+              io_println(
+                world,
+                "MISMATCH idx=" + idx.to_string() + " id=" + id.to_string() + " got=" + got + " expected=" + expected,
+              )
+            }
+            let _ = received.fetch_add(1)
+          }
+        }
+      })
+    }
+
+    worker.close()
+  })
+
+  let got_received = received.load()
+  let got_mismatches = mismatches.load()
+  let got_failed_send = failed_send.load()
+  let wake_count = hostapi::wake_count()
+
+  if got_failed_send != 0 || got_received != rounds || got_mismatches != 0 || wake_count < rounds {
+    io_println(
+      world,
+      "FAIL rounds=" + rounds.to_string() + " received=" + got_received.to_string() + " mismatches=" + got_mismatches.to_string() + " failed_send=" + got_failed_send.to_string() + " wakes=" + wake_count.to_string(),
+    )
+    return 1
+  }
+
+  io_println(
+    world,
+    "OK rounds=" + rounds.to_string() + " received=" + got_received.to_string() + " mismatches=0 wakes=" + wake_count.to_string(),
+  )
+  0
+}
