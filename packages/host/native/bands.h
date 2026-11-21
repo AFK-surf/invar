@@ -241,7 +241,10 @@ static int mb_bands(const float *f, int32_t i, int32_t count, float scale, MBStr
   } else if (kind == 0) {
     if (a[22] > 0) return -1;
     // a ground of one colour: in pieces, its middle flat (mb_pieces)
-    if (a[11] > 0 && a[6] <= 0) return mb_pieces(a, scale, to, out);
+    if (a[11] > 0 && a[6] <= 0) {
+      if ((double)fabsf(a[2]) * (double)fabsf(a[3]) * (double)scale * (double)scale < (double)MB_PIECE_COST) return -1;
+      return mb_pieces(a, scale, to, out);
+    }
     // only its border: nothing between its edges (fill 0, its border's cover whole)
     if (a[11] != 0 || a[6] <= 0) return -1;
     if (!mb_inside(a, 0, a[6], scale, &hole)) return -1;

@@ -1240,17 +1240,33 @@ static void glass_forget(void) {
 }
 
 // Whether instance i (its run of glass starting at `run`) draws anything in g (x0, y0, x1, y1, points): its quad as
-// the vertex shader makes it (vmain: grown round its rect, liquid glass over its group's bounds), turned ones always.
+// the vertex shader makes it (vmain: grown round its rect, liquid glass over its group's bounds, rotated when turned).
 static int reaches(const float *f, int32_t i, int32_t run, const float g[4]) {
   const float *b = f + (size_t)i * MB_INST;
-  if (b[32] != 0.0f) return 1;
   int kind = (int)(b[5] + 0.5f);
   float e = kind == 2 ? fabsf(b[7]) * 3.0f + 2.0f : 1.0f;
   // (liquid: its group's bounds, each shape and the first's reach round it, 2 more: grab_of)
   if (kind == 6) e = fmaxf(fmaxf(b[23], f[(size_t)run * MB_INST + 23]), 0.0f) + 2.0f;
   e += 1.0f;
-  float x0 = fminf(b[0], b[0] + b[2]) - e, x1 = fmaxf(b[0], b[0] + b[2]) + e;
-  float y0 = fminf(b[1], b[1] + b[3]) - e, y1 = fmaxf(b[1], b[1] + b[3]) + e;
+  float rx0 = fminf(b[0], b[0] + b[2]) - e, rx1 = fmaxf(b[0], b[0] + b[2]) + e;
+  float ry0 = fminf(b[1], b[1] + b[3]) - e, ry1 = fmaxf(b[1], b[1] + b[3]) + e;
+  float x0 = rx0, x1 = rx1, y0 = ry0, y1 = ry1;
+  if (b[32] != 0.0f) {
+    float c = cosf(b[32]), s = sinf(b[32]);
+    float ox = b[33], oy = b[34];
+    float px[4] = {rx0, rx1, rx0, rx1};
+    float py[4] = {ry0, ry0, ry1, ry1};
+    x0 = x1 = ox + c * (px[0] - ox) - s * (py[0] - oy);
+    y0 = y1 = oy + s * (px[0] - ox) + c * (py[0] - oy);
+    for (int k = 1; k < 4; k++) {
+      float ax = ox + c * (px[k] - ox) - s * (py[k] - oy);
+      float ay = oy + s * (px[k] - ox) + c * (py[k] - oy);
+      if (ax < x0) x0 = ax;
+      if (ax > x1) x1 = ax;
+      if (ay < y0) y0 = ay;
+      if (ay > y1) y1 = ay;
+    }
+  }
   return x1 > g[0] && x0 < g[2] && y1 > g[1] && y0 < g[3];
 }
 

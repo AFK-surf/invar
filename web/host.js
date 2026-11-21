@@ -1658,15 +1658,29 @@
 
   function reaches(i, run, g) {
     const b = i * INST;
-    if (f32[b + 32] !== 0) return true;
     const kind = Math.round(f32[b + 5]);
     let e = kind === 2 ? Math.abs(f32[b + 7]) * 3 + 2 : 1;
     if (kind === 6) e = Math.max(f32[b + 23], f32[run * INST + 23], 0) + 2;
     e += 1;
-    const x0 = Math.min(f32[b], f32[b] + f32[b + 2]) - e;
-    const x1 = Math.max(f32[b], f32[b] + f32[b + 2]) + e;
-    const y0 = Math.min(f32[b + 1], f32[b + 1] + f32[b + 3]) - e;
-    const y1 = Math.max(f32[b + 1], f32[b + 1] + f32[b + 3]) + e;
+    const rx0 = Math.min(f32[b], f32[b] + f32[b + 2]) - e;
+    const rx1 = Math.max(f32[b], f32[b] + f32[b + 2]) + e;
+    const ry0 = Math.min(f32[b + 1], f32[b + 1] + f32[b + 3]) - e;
+    const ry1 = Math.max(f32[b + 1], f32[b + 1] + f32[b + 3]) + e;
+    let x0 = rx0, x1 = rx1, y0 = ry0, y1 = ry1;
+    const angle = f32[b + 32];
+    if (angle !== 0) {
+      const c = Math.cos(angle), s = Math.sin(angle);
+      const ox = f32[b + 33], oy = f32[b + 34];
+      const dx0 = rx0 - ox, dx1 = rx1 - ox, dy0 = ry0 - oy, dy1 = ry1 - oy;
+      const ax0 = ox + c * dx0 - s * dy0, ay0 = oy + s * dx0 + c * dy0;
+      const ax1 = ox + c * dx1 - s * dy0, ay1 = oy + s * dx1 + c * dy0;
+      const ax2 = ox + c * dx0 - s * dy1, ay2 = oy + s * dx0 + c * dy1;
+      const ax3 = ox + c * dx1 - s * dy1, ay3 = oy + s * dx1 + c * dy1;
+      x0 = Math.min(ax0, ax1, ax2, ax3);
+      x1 = Math.max(ax0, ax1, ax2, ax3);
+      y0 = Math.min(ay0, ay1, ay2, ay3);
+      y1 = Math.max(ay0, ay1, ay2, ay3);
+    }
     return x1 > g[0] && x0 < g[2] && y1 > g[1] && y0 < g[3];
   }
 
@@ -2047,7 +2061,10 @@
       }
     } else if (kind === 0) {
       if (f32[a + 22] > 0) return -1;
-      if (f32[a + 11] > 0 && f32[a + 6] <= 0) return mbPieces(a, scale, toX0, toY0, toX1, toY1, out);
+      if (f32[a + 11] > 0 && f32[a + 6] <= 0) {
+        if (Math.abs(f32[a + 2]) * Math.abs(f32[a + 3]) * scale * scale < MB_PIECE_COST) return -1;
+        return mbPieces(a, scale, toX0, toY0, toX1, toY1, out);
+      }
       if (f32[a + 11] !== 0 || f32[a + 6] <= 0) return -1;
       if (!mbInside(a, 0, f32[a + 6], scale, bandHole)) return -1;
     } else {
