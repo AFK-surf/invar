@@ -658,6 +658,8 @@ static const char *edge_src =
 // programs that share a folder share what is the same. A file says how long its bytecode is and its hash before it:
 // one cut short or damaged is deleted and compiled again, never handed to the device. One that cannot be read or
 // written is compiled as before.
+#include "win_shaders_baked.h"
+
 struct ShaderKept {
   char magic[4];  // "MBSH"
   UINT32 size;
@@ -767,6 +769,15 @@ static ID3DBlob *compile(const char *entry, const char *target, const char *src 
   }
   UINT32 made_by[2] = {D3D_COMPILER_VERSION, D3DCOMPILE_OPTIMIZATION_LEVEL3};
   key = shader_fnv(made_by, sizeof made_by, key);
+  // (baked into the program: compiled when it was built, tools/bake_win_shaders.c)
+  for (int i = 0; baked_shaders[i].code; i++) {
+    if (baked_shaders[i].key != key) continue;
+    ID3DBlob *blob = NULL;
+    if (SUCCEEDED(D3DCreateBlob(baked_shaders[i].size, &blob))) {
+      memcpy(blob->GetBufferPointer(), baked_shaders[i].code, baked_shaders[i].size);
+      return blob;
+    }
+  }
   wchar_t path[MAX_PATH * 2 + 32];
   bool kept = shader_path(path, MAX_PATH * 2, key);
   if (kept) {
