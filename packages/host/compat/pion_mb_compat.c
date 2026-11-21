@@ -1,6 +1,6 @@
 // MoonBit C runtime shim + zero-copy Pion FFI bridges for mbui native multi-platform hosts
-// (macOS, iOS, Linux). Lets unmodified upstream libs/mbui/src/host/{apple_*.m,mac_app.m,ios_app.m,linux_*.c,*.h}
-// link directly into Pion with zero MoonBit runtime dependency.
+// (macOS, iOS, Linux, Windows). Lets unmodified upstream libs/mbui/src/host/{apple_*.m,mac_app.m,ios_app.m,linux_*.c,
+// win_*.{c,cpp},*.h} link directly into Pion with zero MoonBit runtime dependency.
 #if defined(__linux__) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -10,6 +10,8 @@
 #elif defined(__linux__)
 #include <time.h>
 extern void mb_images_upload(void);
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -405,6 +407,19 @@ void pion_host_pump_main_loop(double ms) {
   }
   if (pion_offscreen_active) {
     mb_images_upload();
+  }
+#elif defined(_WIN32)
+  // Deliver what is waiting on this thread's queue (decodes and other posted callbacks), then wait up to `ms` for more.
+  DWORD until = GetTickCount() + (DWORD)(ms > 0.0 ? ms : 1.0);
+  for (;;) {
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    DWORD now = GetTickCount();
+    if ((int32_t)(until - now) <= 0) break;
+    MsgWaitForMultipleObjects(0, NULL, FALSE, until - now, QS_ALLINPUT);
   }
 #else
   (void)ms;
