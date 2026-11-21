@@ -46,18 +46,22 @@ enum { WM_MB_TRAY = WM_APP + 1, WM_MB_NETWORK = WM_APP + 2, WM_MB_STATE = WM_APP
 // RCDATA "MBUI_ENV"'s NAME=VALUE lines as UTF-16, each line's '=' and end made a NUL: names and values in turn
 static WCHAR *own_env;
 static int own_env_n;  // how many WCHARs
-static void own_env_read(void) {
-  static int read;
-  if (read) return;
-  read = 1;
+// (read once, whichever thread asks first: the renderer's start's may as the window's does, win_render.cpp warm_make)
+static INIT_ONCE own_env_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK own_env_load(PINIT_ONCE, PVOID, PVOID *);
+static void own_env_read(void) { InitOnceExecuteOnce(&own_env_once, own_env_load, NULL, NULL); }
+static BOOL CALLBACK own_env_load(PINIT_ONCE once, PVOID arg, PVOID *ctx_out) {
+  (void)once;
+  (void)arg;
+  (void)ctx_out;
   HRSRC r = FindResourceW(NULL, L"MBUI_ENV", MAKEINTRESOURCEW(10));  // RT_RCDATA
   HGLOBAL g = r ? LoadResource(NULL, r) : NULL;
   const char *p = g ? (const char *)LockResource(g) : NULL;
   int n = r ? (int)SizeofResource(NULL, r) : 0;
-  if (!p || n <= 0) return;
+  if (!p || n <= 0) return TRUE;
   int w = MultiByteToWideChar(CP_UTF8, 0, p, n, NULL, 0);
   own_env = (WCHAR *)calloc((size_t)w + 1, sizeof(WCHAR));
-  if (!own_env) return;
+  if (!own_env) return TRUE;
   MultiByteToWideChar(CP_UTF8, 0, p, n, own_env, w);
   for (int i = 0; i < w; i++)
     if (own_env[i] == L'\n' || own_env[i] == L'\r') own_env[i] = 0;
@@ -70,6 +74,7 @@ static void own_env_read(void) {
     i = j + 1;
   }
   own_env_n = w;
+  return TRUE;
 }
 
 // NAME as the process's environment has it, else as the program's own does; NULL where neither says it

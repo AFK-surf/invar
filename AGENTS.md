@@ -85,6 +85,14 @@ pub fn main(world : World) -> Int {
 ### 1.6 Clean branches & merge discipline
 - Never push directly to `main`; commit on feature branches and verify all gates before merge.
 
+### 1.7 Desktop apps: what a window needs (learned shipping one on Windows, 2026-11-22)
+- **Hooks go inside the maker.** `ui::run` forgets every `ui::on_before_frame` hook (and `worker.bind`) made before it: register them inside the `fn(root)` passed to `ui::run`, as `examples/worker_app` does.
+- **The tree's clock is the host's.** `ui::run`'s tree starts at `hostapi::now()` (on Windows, ms since boot). Schedule with `View::at_moment(v.cause_at() + ms, ...)`; never with a moment of your own counted from 0. A device or service to watch is a `ui::Worker` (or an `EventQueue` fed by a thread that blocks on it) that emits on change, not a timer polling it.
+- **Windows draws only when asked.** `ui::run` asks for the frames; any other loop must turn `tree.on_due` into `hostapi::request_frame`.
+- **Shaders.** The startup shaders are baked into the program (`win_shaders_baked.h`, `packages/host/tools/bake_win_shaders.c`: rebake when `win_render.cpp`'s shaders change). Others are compiled at first use and kept on disk only where the program is an app (`MBUI_APP_ID`) or says where (`MBUI_SHADERS`): set them in an `MBUI_ENV` RCDATA resource (`NAME=VALUE` lines) in the program's `.rc`, or each run compiles them again.
+- **No jump, no system title bar.** `hostapi::window_setup(min_w, min_h, w, h, true)` gives the page the whole window (give its top row `.moves_window(...)`, and minimize/close via `hostapi::window_act`); `hostapi::window_hold()` before `ui::run` keeps it out of sight until `hostapi::window_show()`, so it is placed before it is seen.
+- **Measure starts with marks, not guesses.** Time stamps at each stage (process start → main → tree built → window → renderer → first frame → shown) find where a start goes; a profiler that suspends the window's thread from inside the process can deadlock it, sample from another process.
+
 ---
 
 ## 2. Quick Checks, Host Verification & Benchmarks
