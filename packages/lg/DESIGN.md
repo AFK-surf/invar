@@ -47,14 +47,14 @@ Every nested rounded surface obeys exact concentric geometry:
 R_inner = R_outer - pad
 ```
 
-- Examples: `Menu` (`r=22, pad=6 -> item r=16`), `List` (`r=24, pad=6 -> row r=18`), `Disclosure` (`r=22, pad=6 -> header r=16`), `ActionSheet` (`r=28, pad=8 -> item r=20`), `Sheet` (`r=36, inset=20 -> close r=16`), `SegmentedControl` (`r=h/2, pad=3 -> thumb r=h/2-3`).
+- Examples: `Menu` (`r=18, pad=6 -> item r=12`), `List` (`r=24, pad=6 -> row r=18`), `Disclosure` (`r=22, pad=6 -> header r=16`), `ActionSheet` (`r=22, pad=6 -> item r=16`), `Sheet` (`r=28, inset=12 -> close r=16`), `Dialog` (`r=28, inset=10 -> 36pt button r=18`), `Toolbar` (`h=42 r=21, pad=5 -> 32pt button r=16`), `Toast` (`r=20, pad=6 -> 28pt action/close r=14`), `SegmentedControl` (`h=36 r=18, pad=3 -> thumb h=30 r=15`), `BottomTabs` (`h=50 r=25, pad=4 -> lens h=42 r=21`).
 - **Enforcement**: Invar `ui::Tester::audit()` / `unasked_faults()` must report **0 faults** across light and dark themes.
 
 ---
 
 ## Law 4 — Optical Restraint & Contrast
 
-- **Neutral dark density ladder**: Regular floating controls use `0x20202067L` (matching the neutral dark regular baseline); dense panels and dialogs (`ovl_panel_glass`, `liquid_dialog_node`) use `0x202020BFL` (75% veil); detached sheets (`ovl_sheet_glass`) use `0x202020CCL` (80% veil) so white foreground ink stays legible even over saturated or bright backdrops.
+- **Symmetric light/dark density ladder**: Regular floating controls and capsules use `0x20202067L` (dark) / `0xFDFCFD67L` (light); dense panels and dialogs (`ovl_panel_glass`, `liquid_dialog_node`) use `0x202020BFL` (dark) / `0xFDFCFDBFL` (light, 75% veil); detached sheets (`ovl_sheet_glass`) use `0x202020CCL` (dark) / `0xFDFCFDCCL` (light, 80% veil) so foreground ink stays legible even over saturated or bright backdrops.
 - **Contrast**: All foreground text and icons maintain **WCAG >= 4.5:1** contrast against both the glass `solid` fallback and Content Layer surfaces in Light and Dark modes (verified by `ui::Tester` audits).
 - **Zero hidden glass instances at rest**: Controls that reveal a clear refraction loupe only while pressed/dragged (`liquid_segmented_node`, `liquid_bottom_tabs_node`, `liquid_toggle_node`, `liquid_slider_node`) must return `None` from `.glass(...)` whenever `p <= 0.001`, submitting `Some(...)` only during active interaction. Never submit `alpha == 0` glass passes to the GPU.
 - **No `outside=false` shadows under glass**: Shadows beneath `paint::Glass::liquid` render outside the SDF contour (`shadow_outside(view::Live::Is(true))`) so they never darken the refracted interior.
