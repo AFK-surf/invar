@@ -1,0 +1,291 @@
+// The popover and the hover card: what floats beside what opened it.
+// Ported 1:1 from libs/mbui/src/headless/popover.mbt.
+
+import "signals"
+import "view"
+
+/// A popover's trigger and content.
+pub struct Popover {
+  now : () -> Bool
+  set : (Bool) -> Unit
+  esc : Bool
+  outside : Bool
+  opener : view::Ref[Option[view::View]]
+}
+
+pub fn Popover::new(
+  open : () -> Bool,
+  set_open : (Bool) -> Unit,
+  close_on_escape~ : Bool = true,
+  close_on_outside~ : Bool = true,
+) -> Popover {
+  Popover::{ now: open, set: set_open, esc: close_on_escape, outside: close_on_outside, opener: view::ref_new(None) }
+}
+
+pub fn Popover::open(self : Popover) -> Bool {
+  (self.now)()
+}
+
+pub fn Popover::close(self : Popover) -> Unit {
+  if signals::untracked(self.now) {
+    (self.set)(false)
+  }
+}
+
+pub fn Popover::opener(self : Popover) -> Option[view::View] {
+  self.opener.v
+}
+
+pub fn Popover::trigger(
+  self : Popover,
+  parent : view::View,
+  label : () -> String,
+  look : (view::View, Disclosure) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  disclosure(
+    parent,
+    label,
+    self.now,
+    fn(_v : view::View) { (self.set)(!signals::untracked(self.now)) },
+    fn(v : view::View, d : Disclosure) {
+      self.opener.v = Some(v)
+      let _ = v.owns(fn() {
+        match self.opener.v {
+          Some(o) => if o.id() == v.id() { self.opener.v = None }
+          None => ()
+        }
+      })
+      look(v, d)
+    },
+    disabled=disabled,
+    made_for=resolve_made_for(made_for, loc),
+    loc=loc,
+  )
+}
+
+pub fn Popover::content(
+  self : Popover,
+  parent : view::View,
+  label : () -> String,
+  look : (view::View) -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(fn(v : view::View) {
+    look(v)
+    let _ = v.focus_opens_first()
+    match self.opener.v {
+      Some(o) => { let _ = v.opened_by(view::Opener::ByNode(o.id())) }
+      None => ()
+    }
+    let on_trigger = fn() -> Bool {
+      match self.opener.v {
+        Some(o) => o.focused()
+        None => false
+      }
+    }
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Dialog, label=label())) }))
+      .hides(view::Live::By(fn() -> Bool { !(self.now)() }))
+      .presses(view::Live::By(self.now))
+      .focusable(view::Live::By(self.now), keys=0, tab=false)
+      .on_drag(fn(_d : view::Drag) { () })
+      .on_key(fn(k : view::Key) -> Bool {
+        if k.code == menu_key_escape &&
+          k.mods == 0 &&
+          self.esc &&
+          (self.now)() &&
+          (focus_in(v, true) || on_trigger()) {
+          (self.set)(false)
+          true
+        } else {
+          false
+        }
+      })
+    if self.outside {
+      window_downs_while(v, self.now, fn(x : Double, y : Double) {
+        let on_opener = match self.opener.v {
+          Some(o) => press_on(o, x, y)
+          None => false
+        }
+        if !press_on(v, x, y) && !on_opener {
+          (self.set)(false)
+        }
+      })
+    }
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+pub fn Popover::layer(
+  self : Popover,
+  host : view::View,
+  label : () -> String,
+  look : (view::View, Option[view::View]) -> Unit,
+  leave~ : Double = 0.0,
+  at_once~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> Unit {
+  let place = resolve_made_for(made_for, loc)
+  host.show(
+    self.now,
+    fn(s : view::View) {
+      let _ = self.content(s, label, fn(v : view::View) { look(v, self.opener.v) }, made_for=place, loc=loc)
+    },
+    leave=leave,
+    at_once=at_once,
+    loc=loc,
+  )
+}
+
+/// A hover card's trigger and card.
+pub struct HoverCard {
+  now : () -> Bool
+  set : (Bool) -> Unit
+  open_delay_ms : Double
+  close_delay_ms : Double
+  waiting : view::Ref[() -> Unit]
+  opener : signals::Signal[Option[view::View]]
+  shown : signals::Signal[Option[view::View]]
+}
+
+pub fn HoverCard::new(
+  open : () -> Bool,
+  set_open : (Bool) -> Unit,
+  open_delay_ms~ : Double = 300.0,
+  close_delay_ms~ : Double = 150.0,
+) -> HoverCard {
+  HoverCard::{
+    now: open,
+    set: set_open,
+    open_delay_ms,
+    close_delay_ms,
+    waiting: view::ref_new(fn() { () }),
+    opener: signals::signal_by(None, same_node),
+    shown: signals::signal_by(None, same_node),
+  }
+}
+
+pub fn HoverCard::open(self : HoverCard) -> Bool {
+  (self.now)()
+}
+
+pub fn HoverCard::opener(self : HoverCard) -> Option[view::View] {
+  self.opener.get()
+}
+
+fn HoverCard::call_off(self : HoverCard) -> Unit {
+  (self.waiting.v)()
+  self.waiting.v = fn() { () }
+}
+
+fn HoverCard::now_to(self : HoverCard, on : Bool) -> Unit {
+  self.call_off()
+  if signals::untracked(self.now) != on {
+    (self.set)(on)
+  }
+}
+
+fn HoverCard::later_to(self : HoverCard, node : view::View, on : Bool, ms : Double) -> Unit {
+  self.call_off()
+  if signals::untracked(self.now) == on {
+    return
+  }
+  if ms <= 0.0 {
+    (self.set)(on)
+    return
+  }
+  self.waiting.v = node.at_moment(node.cause_at() + ms, fn() {
+    self.waiting.v = fn() { () }
+    if signals::untracked(self.now) != on {
+      (self.set)(on)
+    }
+  })
+}
+
+fn HoverCard::hovered(self : HoverCard) -> Bool {
+  let on = fn(v : Option[view::View]) -> Bool {
+    match v {
+      Some(n) => n.pointed_in()
+      None => false
+    }
+  }
+  on(self.opener.get()) || on(self.shown.get())
+}
+
+fn HoverCard::focus_held(self : HoverCard) -> Bool {
+  let held = fn(v : Option[view::View]) -> Bool {
+    match v {
+      Some(n) => view_holds_focused(n)
+      None => false
+    }
+  }
+  held(self.opener.untracked()) || held(self.shown.untracked())
+}
+
+pub fn HoverCard::trigger(self : HoverCard, node : view::View, disabled~ : () -> Bool = fn() { false }) -> Unit {
+  self.opener.set(Some(node))
+  node.reacts(fn() -> Bool { self.hovered() }, fn(over : Bool) {
+    if over {
+      if !disabled() {
+        self.later_to(node, true, self.open_delay_ms)
+      }
+    } else if !self.focus_held() {
+      self.later_to(node, false, self.close_delay_ms)
+    }
+  }, at_start=false)
+  node.reacts(fn() -> Bool { node.focus_shown() }, fn(on : Bool) {
+    if on && !disabled() {
+      self.now_to(true)
+    }
+  }, at_start=false)
+  node.reacts(fn() -> Bool { node.focused() }, fn(on : Bool) {
+    if !on && !self.focus_held() && !signals::untracked(fn() -> Bool { self.hovered() }) && signals::untracked(self.now) {
+      self.now_to(false)
+    }
+  }, at_start=false)
+  node.reacts(disabled, fn(off : Bool) { if off { self.now_to(false) } }, at_start=false)
+  let _ = node.owns(fn() {
+    self.call_off()
+    if same_node(self.opener.untracked(), Some(node)) {
+      self.opener.set(None)
+    }
+    if signals::untracked(self.now) {
+      (self.set)(false)
+    }
+  })
+}
+
+pub fn HoverCard::card(
+  self : HoverCard,
+  parent : view::View,
+  label : () -> String,
+  look : (view::View) -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(fn(v : view::View) {
+    look(v)
+    self.shown.set(Some(v))
+    let _ = v.owns(fn() { if same_node(self.shown.untracked(), Some(v)) { self.shown.set(None) } })
+    match self.opener.untracked() {
+      Some(o) => { let _ = v.opened_by(view::Opener::ByNode(o.id())) }
+      None => ()
+    }
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Group, label=label())) }))
+      .hides(view::Live::By(fn() -> Bool { !(self.now)() }))
+      .presses(view::Live::By(self.now))
+      .on_key(fn(k : view::Key) -> Bool {
+        if k.code == menu_key_escape && k.mods == 0 && (self.now)() {
+          self.now_to(false)
+          true
+        } else {
+          false
+        }
+      })
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}

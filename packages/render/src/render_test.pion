@@ -1,0 +1,136 @@
+// Real Apple Metal / CoreText / ImageIO offscreen tests for packages/render.
+
+import "damage"
+import "hostapi"
+
+fn assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn rect_dl_line(
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  r : Double,
+  g : Double,
+  b : Double,
+  a : Double,
+) -> String {
+  // 60-field mbui-dl 9 instance line
+  let sb = StringBuilder::new()
+  sb.write_string("i ")
+  sb.write_string(x.to_string() + " " + y.to_string() + " " + w.to_string() + " " + h.to_string() + " ")
+  sb.write_string(radius.to_string() + " 0 0 0 ")
+  sb.write_string(r.to_string() + " " + g.to_string() + " " + b.to_string() + " " + a.to_string() + " ")
+  // 12..15 c2
+  sb.write_string("0 0 0 0 ")
+  // 16..19 clip
+  sb.write_string("0 0 1000000 1000000 ")
+  // 20..35 tex/clip-corners/rot
+  sb.write_string("0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ")
+  // 36..39 per-corner radii
+  sb.write_string(radius.to_string() + " " + radius.to_string() + " " + radius.to_string() + " " + radius.to_string() + " ")
+  // 40..59 outer clip + fade
+  sb.write_string("0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0")
+  sb.to_string()
+}
+
+test "parse_dl, drawable validation, and glyph_col_sub" {
+  let dl_text = "mbui-dl 9\nwindow 120 80 2\nclear 0.1 0.2 0.3\n" +
+    rect_dl_line(10.0, 10.0, 40.0, 30.0, 4.0, 0.9, 0.2, 0.1, 1.0) + "\n"
+  let dl = parse_dl(dl_text)
+  assert(dl.version == 9, "version 9")
+  assert(dl.w == 120.0 && dl.h == 80.0 && dl.scale == 2.0, "window parsed")
+  assert(dl.inst.length() == 1, "1 instance parsed")
+  assert(drawable(dl, "test.dl"), "dl is drawable")
+
+  let bad = parse_dl("mbui-dl 2\nwindow 100 100 1\n")
+  assert(!drawable(bad, "bad.dl"), "version 2 not drawable")
+
+  let (col0, sub0) = glyph_col_sub(10.0)
+  assert(col0 == 10.0 && sub0 == 0, "exact pixel column phase 0")
+  let (col1, sub1) = glyph_col_sub(10.25)
+  assert(col1 == 10.0 && sub1 == 1, "quarter pixel phase 1")
+}
+
+test "offscreen Metal render_dl_to_png produces verified RGBA and PNG" {
+  let dl_text = "mbui-dl 9\nwindow 96 64 1\nclear 0.05 0.10 0.20\n" +
+    rect_dl_line(16.0, 12.0, 64.0, 40.0, 4.0, 0.90, 0.25, 0.15, 1.0) + "\n"
+  let out_png = "/tmp/invar_render_test_offscreen.png"
+  let (ok, summary) = render_dl_to_png(dl_text, out_png, path="rect.dl")
+  assert(ok, "render_dl_to_png must succeed")
+  assert(summary != "", "summary must be non-empty")
+
+  // Verify non-empty PNG file bytes with PNG magic signature (0x89 P N G)
+  let png_bytes = read_bytes(out_png)
+  assert(png_bytes.length() > 64, "PNG file must be non-empty")
+  assert(png_bytes[0].to_int() == 0x89 && png_bytes[1].to_int() == 0x50 && png_bytes[2].to_int() == 0x4E && png_bytes[3].to_int() == 0x47, "valid PNG header")
+
+  // Verify live offscreen RGBA readback via hostapi::drawn_pixels
+  let rgba = Array::make(96 * 64 * 4, 0 as Byte)
+  assert(hostapi::drawn_pixels(0, 0, 96, 64, rgba), "drawn_pixels must succeed")
+
+  // Background corner (2, 2): dark blue ~ (13, 26, 51, 255)
+  let bg = (2 * 96 + 2) * 4
+  assert(rgba[bg].to_int() < 30 && rgba[bg + 2].to_int() > 35 && rgba[bg + 3].to_int() == 255, "bg pixel matches clear color")
+
+  // Rect interior (48, 32): coral red ~ (230, 64, 38, 255)
+  let fg = (32 * 96 + 48) * 4
+  assert(rgba[fg].to_int() > 200 && rgba[fg + 1].to_int() < 90 && rgba[fg + 2].to_int() < 70 && rgba[fg + 3].to_int() == 255, "rect interior pixel matches coral red")
+}
+
+test "incremental damage partial redraw matches full offscreen frame" {
+  let dl1_text = "mbui-dl 9\nwindow 80 60 1\nclear 0.10 0.10 0.10\n" +
+    rect_dl_line(8.0, 8.0, 24.0, 24.0, 0.0, 0.20, 0.80, 0.30, 1.0) + "\n"
+  let dl2_text = "mbui-dl 9\nwindow 80 60 1\nclear 0.10 0.10 0.10\n" +
+    rect_dl_line(8.0, 8.0, 24.0, 24.0, 0.0, 0.20, 0.80, 0.30, 1.0) + "\n" +
+    rect_dl_line(44.0, 16.0, 24.0, 24.0, 0.0, 0.15, 0.45, 0.95, 1.0) + "\n"
+
+  let dl1 = parse_dl(dl1_text)
+  let dl2 = parse_dl(dl2_text)
+  init_offscreen(80.0, 60.0, 1.0)
+  let atlas = hostapi::Atlas::new(hostapi::atlas_size(false))
+  let colour_atlas = hostapi::Atlas::new(hostapi::atlas_size(true))
+  let (i1, n1, _) = build_instances(dl1, "f1.dl", atlas, colour_atlas)
+  let (i2, n2, _) = build_instances(dl2, "f2.dl", atlas, colour_atlas)
+
+  let dmg = damage::Damage::new()
+  tell_parts(dmg.next(i1, n1, 80.0, 60.0, 1.0, 0.10, 0.10, 0.10))
+  draw(i1, n1, 0.10, 0.10, 0.10)
+
+  let parts = dmg.next(i2, n2, 80.0, 60.0, 1.0, 0.10, 0.10, 0.10)
+  assert(parts.length() >= 1, "damage must report dirty rect for added blue square")
+  tell_parts(parts)
+  draw(i2, n2, 0.10, 0.10, 0.10)
+
+  let out_part = "/tmp/invar_render_test_partial.png"
+  assert(snapshot_drawn(out_part), "snapshot_drawn must write partial redraw PNG")
+  assert(read_bytes(out_part).length() > 64, "partial redraw PNG non-empty")
+
+  let rgba = Array::make(80 * 60 * 4, 0 as Byte)
+  assert(hostapi::drawn_pixels(0, 0, 80, 60, rgba), "readback after partial redraw")
+  // Green square center (20, 20)
+  let g_idx = (20 * 80 + 20) * 4
+  assert(rgba[g_idx + 1].to_int() > 170, "green rect preserved")
+  // Blue square center (56, 28)
+  let b_idx = (28 * 80 + 56) * 4
+  assert(rgba[b_idx + 2].to_int() > 200, "blue rect drawn in dirty region")
+}
+
+test "occlusion culling drops completely covered instances" {
+  // Back rect (0,0,60,60) completely covered by opaque front rect (0,0,60,60)
+  let dl_text = "mbui-dl 9\nwindow 60 60 1\nclear 0.0 0.0 0.0\n" +
+    rect_dl_line(0.0, 0.0, 60.0, 60.0, 0.0, 1.0, 0.0, 0.0, 1.0) + "\n" +
+    rect_dl_line(0.0, 0.0, 60.0, 60.0, 0.0, 0.0, 0.0, 1.0, 1.0) + "\n"
+  let dl = parse_dl(dl_text)
+  init_offscreen(60.0, 60.0, 1.0)
+  let atlas = hostapi::Atlas::new(hostapi::atlas_size(false))
+  let colour_atlas = hostapi::Atlas::new(hostapi::atlas_size(true))
+  let (inst, n, _) = build_instances(dl, "occ.dl", atlas, colour_atlas)
+  let (_, sn) = seen_instances(inst, n, dl)
+  assert(n == 2 && sn == 1, "covered back rect must be occluded")
+}

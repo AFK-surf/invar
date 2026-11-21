@@ -1,0 +1,218 @@
+// The tooltip: a few words about what is pointed at, with warmup/skip delay and glide tracking.
+// Ported 1:1 from libs/mbui/src/headless/tooltip.mbt.
+
+import "signals"
+import "view"
+
+pub let tooltip_close : String = "tooltip.close"
+
+pub let tooltip_keys : Array[view::Binding] = [
+  view::Binding::{ keys: [view::Stroke::{ code: 17, mods: 0 }], action: tooltip_close, when: view::KeyWhen::Always },
+]
+
+/// A group of triggers whose tips show one at a time, warm for a while after one closed.
+pub struct TooltipGroup[K] {
+  shown : () -> Option[K]
+  show : (Option[K]) -> Unit
+  open_delay_ms : Double
+  warmup_ms : Double
+  closed_at : view::Ref[Option[Double]]
+  last : view::Ref[Option[view::NodeId]]
+  glided : view::Ref[Option[(view::NodeId, Double)]]
+}
+
+pub fn TooltipGroup::new[K](
+  shown : () -> Option[K],
+  show : (Option[K]) -> Unit,
+  open_delay_ms~ : Double = 400.0,
+  warmup_ms~ : Double = 300.0,
+) -> TooltipGroup[K] {
+  TooltipGroup::{
+    shown,
+    show,
+    open_delay_ms,
+    warmup_ms,
+    closed_at: view::ref_new(None),
+    last: view::ref_new(None),
+    glided: view::ref_new(None),
+  }
+}
+
+pub fn TooltipGroup::shown[K](self : TooltipGroup[K]) -> Option[K] {
+  (self.shown)()
+}
+
+pub fn TooltipGroup::is_open[K : view::ViewEq](self : TooltipGroup[K], key : K) -> Bool {
+  match (self.shown)() {
+    Some(k) => k.eq(key)
+    None => false
+  }
+}
+
+pub fn TooltipGroup::glided_from[K](self : TooltipGroup[K]) -> Option[(view::NodeId, Double)] {
+  match (self.shown)() {
+    Some(_) => self.glided.v
+    None => None
+  }
+}
+
+fn TooltipGroup::open[K](self : TooltipGroup[K], node : view::View, key : K, now : Double, warm : Bool) -> Unit {
+  let id = node.id()
+  self.glided.v = match self.last.v {
+    Some(from) => if warm && from != id { Some((from, now)) } else { None }
+    None => None
+  }
+  self.last.v = Some(id)
+  (self.show)(Some(key))
+}
+
+fn TooltipGroup::warm[K](self : TooltipGroup[K], now : Double) -> Bool {
+  if (self.shown)() is Some(_) {
+    return true
+  }
+  match self.closed_at.v {
+    Some(at) => now - at <= self.warmup_ms
+    None => false
+  }
+}
+
+fn TooltipGroup::close[K : view::ViewEq](self : TooltipGroup[K], key : K, now : Double) -> Unit {
+  if self.is_open(key) {
+    self.closed_at.v = Some(now)
+    (self.show)(None)
+  }
+}
+
+/// `node` made a trigger of the group, its tip `key`'s.
+pub fn TooltipGroup::trigger[K : view::ViewEq](
+  self : TooltipGroup[K],
+  node : view::View,
+  key : K,
+  disabled~ : () -> Bool = fn() { false },
+) -> Unit {
+  let waiting : view::Ref[() -> Unit] = view::ref_new(fn() { () })
+  let call_off = fn() {
+    (waiting.v)()
+    waiting.v = fn() { () }
+  }
+  let close = fn() {
+    call_off()
+    self.close(key, node.cause_at())
+  }
+  let open_now = fn() {
+    call_off()
+    if !disabled() {
+      let now = node.cause_at()
+      self.open(node, key, now, self.warm(now))
+    }
+  }
+  node.reacts(fn() -> Bool { node.pointed() }, fn(over : Bool) {
+    if !over {
+      close()
+    } else if !disabled() {
+      let now = node.cause_at()
+      if self.warm(now) {
+        open_now()
+      } else {
+        call_off()
+        waiting.v = node.at_moment(now + self.open_delay_ms, fn() {
+          waiting.v = fn() { () }
+          if !disabled() {
+            self.open(node, key, now + self.open_delay_ms, false)
+          }
+        })
+      }
+    }
+  }, at_start=false)
+  node.reacts(fn() -> Bool { node.pressed() }, fn(down : Bool) { if down { close() } }, at_start=false)
+  node.reacts(fn() -> Bool { node.focus_shown() }, fn(on : Bool) {
+    if on {
+      open_now()
+    } else {
+      close()
+    }
+  }, at_start=false)
+  node.reacts(disabled, fn(off : Bool) { if off { close() } }, at_start=false)
+  let _ = node
+    .on_action(
+      tooltip_close,
+      fn(_a : view::ActionAt) -> Bool {
+        close()
+        true
+      },
+      can=fn() -> Bool { self.is_open(key) },
+    )
+    .owns(fn() {
+      call_off()
+      self.close(key, node.cause_at())
+      match self.last.v {
+        Some(lid) => if lid == node.id() { self.last.v = None }
+        None => ()
+      }
+    })
+}
+
+/// A tip's node in `parent`, read out a `Tooltip` called `label`, taking no press.
+pub fn tooltip_bubble(
+  parent : view::View,
+  label : () -> String,
+  look : (view::View) -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(fn(v : view::View) {
+    look(v)
+    let _ = v.presses(view::Live::Is(false)).says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Tooltip, label=label()))
+    }))
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+pub let tooltip_delay_ms : Double = 700.0
+pub let tooltip_skip_ms : Double = 300.0
+pub let tooltip_lifted_ms : Double = 1500.0
+
+/// A tooltip owner in the window's shared visible slot.
+#derive(Eq)
+pub enum TipOwner {
+  Built(Int)
+  Node(Int)
+}
+
+fn same_tip_owner_opt(a : Option[TipOwner], b : Option[TipOwner]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+struct TipSlot {
+  owner : signals::Signal[Option[TipOwner]]
+  mut next : Int
+}
+
+fn TipSlot::new() -> TipSlot {
+  TipSlot::{ owner: signals::signal_by(None, same_tip_owner_opt), next: 0 }
+}
+
+let tip_slot : view::Ref[TipSlot] = view::ref_new(TipSlot::new())
+
+pub fn tip_slot_reset() -> Unit {
+  tip_slot.v = TipSlot::new()
+}
+
+pub fn tip_node_owner() -> TipOwner {
+  tip_slot.v.next = tip_slot.v.next + 1
+  TipOwner::Node(tip_slot.v.next)
+}
+
+pub fn tip_claim(owner : TipOwner) -> Unit {
+  if !same_tip_owner_opt(tip_slot.v.owner.untracked(), Some(owner)) {
+    tip_slot.v.owner.set(Some(owner))
+  }
+}
+
+pub fn tip_owns(owner : TipOwner) -> Bool {
+  same_tip_owner_opt(tip_slot.v.owner.get(), Some(owner))
+}

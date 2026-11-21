@@ -1,0 +1,375 @@
+// The menu: a list of things to do, with item, check_item, radio_item, roving focus, and typeahead.
+// Ported 1:1 from libs/mbui/src/headless/menu.mbt.
+
+import "signals"
+import "view"
+
+struct MenuEntry {
+  node : view::View
+  off : () -> Bool
+  text : () -> String
+}
+
+struct MenuStop {
+  last : signals::Signal[Option[view::NodeId]]
+  made : signals::Signal[Int]
+}
+
+/// A menu as its look reads it and makes its items by (`Menu::item`, `Menu::check_item`, `Menu::radio_item`).
+pub struct Menu {
+  node : view::View
+  off : () -> Bool
+  items : Array[MenuEntry]
+  stop : Option[MenuStop]
+  typed : view::Ref[(String, Double)]
+}
+
+pub fn Menu::node(self : Menu) -> view::View {
+  self.node
+}
+
+pub fn Menu::disabled(self : Menu) -> Bool {
+  (self.off)()
+}
+
+fn Menu::live(self : Menu) -> Array[MenuEntry] {
+  if (self.off)() {
+    let empty : Array[MenuEntry] = []
+    return empty
+  }
+  view::array_filter(self.items, fn(e : MenuEntry) -> Bool { e.node.takes_input() && !(e.off)() })
+}
+
+fn Menu::stop_at(self : Menu) -> Option[view::NodeId] {
+  let st = match self.stop {
+    Some(s) => s
+    None => return None
+  }
+  let _ = st.made.get()
+  let live = view::array_filter(self.items, fn(e : MenuEntry) -> Bool { e.node.takes_input() && !(e.off)() })
+  match st.last.get() {
+    Some(id) => {
+      if view::array_any(live, fn(e : MenuEntry) -> Bool { e.node.id() == id }) {
+        return Some(id)
+      }
+    }
+    None => ()
+  }
+  if live.length() > 0 {
+    Some(live[0].node.id())
+  } else {
+    None
+  }
+}
+
+pub fn Menu::focus_first(self : Menu, visible~ : Bool = true) -> Bool {
+  let live = self.live()
+  if live.length() > 0 {
+    live[0].node.ask_focus(visible=visible)
+  } else {
+    false
+  }
+}
+
+pub fn Menu::focus_last(self : Menu, visible~ : Bool = true) -> Bool {
+  let live = self.live()
+  let n = live.length()
+  if n > 0 {
+    live[n - 1].node.ask_focus(visible=visible)
+  } else {
+    false
+  }
+}
+
+/// An item of a `Menu` as its look reads it.
+pub struct MenuItem {
+  node : view::View
+  on : () -> Bool
+  off : () -> Bool
+  open : () -> Bool
+}
+
+pub fn MenuItem::open(self : MenuItem) -> Bool {
+  (self.open)()
+}
+
+pub fn MenuItem::disabled(self : MenuItem) -> Bool {
+  (self.off)()
+}
+
+pub fn MenuItem::checked(self : MenuItem) -> Bool {
+  (self.on)()
+}
+
+pub fn MenuItem::hovered(self : MenuItem) -> Bool {
+  self.node.pointed()
+}
+
+pub fn MenuItem::pressed(self : MenuItem) -> Bool {
+  self.node.pressed()
+}
+
+pub fn MenuItem::focused(self : MenuItem) -> Bool {
+  self.node.focused()
+}
+
+pub fn MenuItem::focus_shown(self : MenuItem) -> Bool {
+  self.node.focus_shown()
+}
+
+pub fn MenuItem::press(self : MenuItem) -> Unit {
+  let _ = self.node.press()
+}
+
+let menu_key_up : Int = 5
+let menu_key_down : Int = 6
+let menu_key_home : Int = 8
+let menu_key_end : Int = 9
+let menu_key_escape : Int = 17
+
+/// How long letters typed one after another find an entry together.
+pub let typeahead_ms : Double = 1000.0
+
+/// A menu in `parent` (`parent` itself where `in_node`).
+pub fn menu(
+  parent : view::View,
+  look : (view::View, Menu) -> Unit,
+  label? : () -> String,
+  on_close? : () -> Unit,
+  close_key? : Int,
+  wraps~ : Bool = true,
+  disabled~ : () -> Bool = fn() { false },
+  takes_focus~ : Bool = false,
+  roving~ : Bool = false,
+  typeahead~ : Bool = true,
+  typeahead_ms~ : Double = 500.0,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let stop : Option[MenuStop] = if roving {
+      Some(MenuStop::{ last: signals::signal_by(None, same_node_id_opt), made: signals::signal(0) })
+    } else {
+      None
+    }
+    let m = Menu::{ node: v, off: disabled, items: [], stop, typed: view::ref_new(("", 0.0)) }
+    look(v, m)
+    if takes_focus {
+      let _ = v.focusable(view::Live::Is(true), keys=0)
+    }
+    let said_live : view::Live[Option[view::Said]] = match label {
+      Some(f) => view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Menu, label=f())) })
+      None => view::Live::Is(Some(view::said(view::Role::Menu)))
+    }
+    let _ = v
+      .says(said_live)
+      .on_key(fn(k : view::Key) -> Bool {
+        if disabled() {
+          return false
+        }
+        if typeahead &&
+          k.code > listbox_key_char &&
+          k.code != listbox_key_space &&
+          (k.mods == 0 || k.mods == shift_mod) {
+          let ours = if v.focused() || view::array_any(m.items, fn(e : MenuEntry) -> Bool { e.node.focused() }) {
+            true
+          } else if !takes_focus {
+            !view_holds_focused(view_root(v))
+          } else {
+            false
+          }
+          if !ours {
+            return false
+          }
+          let live = m.live()
+          let c = (k.code - listbox_key_char).unsafe_to_char()
+          let nodes : Array[view::View] = view::array_map(live, fn(e : MenuEntry) -> view::View { e.node })
+          return type_ahead(m.typed, c, k.at, typeahead_ms, nodes, fn(i : Int) -> String { (live[i].text)() })
+        }
+        if k.mods != 0 {
+          return false
+        }
+        let closing = k.code == menu_key_escape || match close_key {
+          Some(ck) => ck == k.code
+          None => false
+        }
+        if closing {
+          match on_close {
+            Some(f) => {
+              if focus_in(v, k.code == menu_key_escape) {
+                f()
+                return true
+              }
+              return false
+            }
+            None => return false
+          }
+        }
+        if !focus_in(v, !takes_focus) {
+          return false
+        }
+        let live = m.live()
+        let n = live.length()
+        if n == 0 {
+          return false
+        }
+        let at = view::array_search_by(live, fn(e : MenuEntry) -> Bool { e.node.focused() })
+        let to : Option[Int] = if k.code == menu_key_down {
+          match at {
+            None => Some(0)
+            Some(i) => if i + 1 < n { Some(i + 1) } else if wraps { Some(0) } else { Some(n - 1) }
+          }
+        } else if k.code == menu_key_up {
+          match at {
+            None => Some(n - 1)
+            Some(i) => if i > 0 { Some(i - 1) } else if wraps { Some(n - 1) } else { Some(0) }
+          }
+        } else if k.code == menu_key_home {
+          Some(0)
+        } else if k.code == menu_key_end {
+          Some(n - 1)
+        } else {
+          None
+        }
+        match to {
+          Some(j) => {
+            let _ = live[j].node.ask_focus(visible=true)
+            true
+          }
+          None => false
+        }
+      })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+fn Menu::part(
+  self : Menu,
+  parent : view::View,
+  role : view::Role,
+  label : () -> String,
+  check : Option[(() -> Bool)],
+  expanded : Option[(() -> Bool)],
+  act : (view::View) -> Unit,
+  look : (view::View, MenuItem) -> Unit,
+  disabled : () -> Bool,
+  in_node : Bool,
+  made_for : Option[String],
+  loc : String,
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let on : () -> Bool = match check {
+      Some(f) => f
+      None => fn() -> Bool { false }
+    }
+    let open_fn : () -> Bool = match expanded {
+      Some(e) => e
+      None => fn() -> Bool { false }
+    }
+    self.items.push(MenuEntry::{ node: v, off, text: label })
+    let made = fn() {
+      match self.stop {
+        Some(st) => st.made.set(st.made.untracked() + 1)
+        None => ()
+      }
+    }
+    made()
+    let _ = v.owns(fn() {
+      view::array_retain(self.items, fn(e : MenuEntry) -> Bool { e.node.id() != v.id() })
+      made()
+    })
+    look(v, MenuItem::{ node: v, on, off, open: open_fn })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space, tab=false)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        match (check, expanded) {
+          (Some(f), _) => {
+            let chk = if f() { view::Check::On } else { view::Check::Off }
+            Some(view::said(role, label=label(), check=chk))
+          }
+          (None, Some(e)) => Some(view::said(role, label=label(), expanded=e()))
+          _ => Some(view::said(role, label=label()))
+        }
+      }))
+      .on_press(fn() {
+        if !off() {
+          act(v)
+        }
+      })
+    match self.stop {
+      Some(st) => {
+        let _ = v.tab_stop(view::Live::By(fn() -> Bool {
+          match self.stop_at() {
+            Some(id) => id == v.id()
+            None => false
+          }
+        }))
+        v.reacts(fn() -> Bool { v.focused() }, fn(f : Bool) {
+          if f {
+            st.last.set(Some(v.id()))
+          }
+        })
+      }
+      None => ()
+    }
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+pub fn Menu::item(
+  self : Menu,
+  parent : view::View,
+  label : () -> String,
+  act : (view::View) -> Unit,
+  look : (view::View, MenuItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  self.part(parent, view::Role::MenuItem, label, None, None, act, look, disabled, in_node, made_for, loc)
+}
+
+pub fn Menu::check_item(
+  self : Menu,
+  parent : view::View,
+  label : () -> String,
+  checked : () -> Bool,
+  act : (view::View) -> Unit,
+  look : (view::View, MenuItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  self.part(parent, view::Role::MenuItemCheckbox, label, Some(checked), None, act, look, disabled, in_node, made_for, loc)
+}
+
+pub fn Menu::radio_item(
+  self : Menu,
+  parent : view::View,
+  label : () -> String,
+  checked : () -> Bool,
+  act : (view::View) -> Unit,
+  look : (view::View, MenuItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  self.part(parent, view::Role::MenuItemRadio, label, Some(checked), None, act, look, disabled, in_node, made_for, loc)
+}

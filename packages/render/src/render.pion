@@ -1,0 +1,775 @@
+// mbui-render: a draw list (.dl) drawn by this host's renderer offscreen, into a PNG.
+// Ported 1:1 from libs/mbui/src/render/main.mbt.
+
+import "codec"
+import "damage"
+import "dmath"
+import "hostapi"
+
+pub let inst_size : Int = 60
+
+pub struct Dl {
+  pub mut w : Double
+  pub mut h : Double
+  pub mut scale : Double
+  pub mut clear : (Double, Double, Double)
+  pub glyphs : Map[Int, (Double, Int, Int, Int, String)]
+  pub images : Map[Int, (Int, String, Int)]
+  pub carried : Map[Int, String]
+  pub inst : Array[Array[String]]
+  pub mut version : Int
+}
+
+fn str_slice(s : String, start : Int, end : Int) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let lo = if start < 0 { 0 } else { start }
+  let hi = if end > n { n } else { end }
+  let mut i = lo
+  while i < hi {
+    sb.write_char(s.code_unit_at(i).unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn str_split(s : String, sep : Int) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == sep {
+      out.push(str_slice(s, start, i))
+      start = i + 1
+    }
+    i += 1
+  }
+  out.push(str_slice(s, start, n))
+  out
+}
+
+fn str_find_char(s : String, ch : Int) -> Option[Int] {
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i) == ch {
+      return Some(i)
+    }
+    i += 1
+  }
+  None
+}
+
+fn str_rev_find_char(s : String, ch : Int) -> Option[Int] {
+  let mut i = s.length() - 1
+  while i >= 0 {
+    if s.code_unit_at(i) == ch {
+      return Some(i)
+    }
+    i -= 1
+  }
+  None
+}
+
+fn str_has_suffix(s : String, suf : String) -> Bool {
+  let sl = s.length()
+  let sufl = suf.length()
+  if sufl > sl {
+    return false
+  }
+  let mut i = 0
+  while i < sufl {
+    if s.code_unit_at(sl - sufl + i) != suf.code_unit_at(i) {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+/// Parse a decimal/scientific floating-point number (matching JSON number format).
+pub fn parse_num(s : String) -> Double {
+  let n = s.length()
+  if n == 0 {
+    return 0.0
+  }
+  let mut i = 0
+  while i < n && (s.code_unit_at(i) == 32 || s.code_unit_at(i) == 9 || s.code_unit_at(i) == 13) {
+    i += 1
+  }
+  if i >= n {
+    return 0.0
+  }
+  let mut neg = false
+  if s.code_unit_at(i) == 45 { // '-'
+    neg = true
+    i += 1
+  } else if s.code_unit_at(i) == 43 { // '+'
+    i += 1
+  }
+  let mut num = 0.0
+  let mut any = false
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      num = num * 10.0 + (c - 48).to_double()
+      any = true
+      i += 1
+    } else {
+      break
+    }
+  }
+  if i < n && s.code_unit_at(i) == 46 { // '.'
+    i += 1
+    let mut frac = 0.1
+    while i < n {
+      let c = s.code_unit_at(i)
+      if c >= 48 && c <= 57 {
+        num = num + (c - 48).to_double() * frac
+        frac = frac * 0.1
+        any = true
+        i += 1
+      } else {
+        break
+      }
+    }
+  }
+  if !any {
+    return 0.0
+  }
+  if i < n && (s.code_unit_at(i) == 101 || s.code_unit_at(i) == 69) { // 'e' | 'E'
+    i += 1
+    let mut eneg = false
+    if i < n && s.code_unit_at(i) == 45 {
+      eneg = true
+      i += 1
+    } else if i < n && s.code_unit_at(i) == 43 {
+      i += 1
+    }
+    let mut exp = 0
+    while i < n {
+      let c = s.code_unit_at(i)
+      if c >= 48 && c <= 57 {
+        exp = exp * 10 + (c - 48)
+        i += 1
+      } else {
+        break
+      }
+    }
+    let factor = dmath::pow(10.0, (if eneg { -exp } else { exp }).to_double())
+    num = num * factor
+  }
+  if neg { -num } else { num }
+}
+
+fn hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 65 && c <= 70 {
+    c - 65 + 10
+  } else if c >= 97 && c <= 102 {
+    c - 97 + 10
+  } else {
+    0
+  }
+}
+
+/// Parse the JSON-quoted string starting at the first `"` in `line`.
+fn quoted(line : String) -> String {
+  let k = match str_find_char(line, 34) {
+    Some(idx) => idx
+    None => return ""
+  }
+  let sb = StringBuilder::new()
+  let n = line.length()
+  let mut i = k + 1
+  while i < n {
+    let c = line.code_unit_at(i)
+    if c == 34 { // '"'
+      break
+    } else if c == 92 && i + 1 < n { // '\\'
+      i += 1
+      let esc = line.code_unit_at(i)
+      if esc == 34 { sb.write_char('"') }
+      else if esc == 92 { sb.write_char('\\') }
+      else if esc == 47 { sb.write_char('/') }
+      else if esc == 110 { sb.write_char('\n') }
+      else if esc == 114 { sb.write_char('\r') }
+      else if esc == 116 { sb.write_char('\t') }
+      else if esc == 98 { sb.write_char(8.unsafe_to_char()) }
+      else if esc == 102 { sb.write_char(12.unsafe_to_char()) }
+      else if esc == 117 && i + 4 < n {
+        let code = (hex_val(line.code_unit_at(i + 1)) << 12) |
+          (hex_val(line.code_unit_at(i + 2)) << 8) |
+          (hex_val(line.code_unit_at(i + 3)) << 4) |
+          hex_val(line.code_unit_at(i + 4))
+        sb.write_char(code.unsafe_to_char())
+        i += 4
+      } else {
+        sb.write_char(esc.unsafe_to_char())
+      }
+      i += 1
+    } else {
+      sb.write_char(c.unsafe_to_char())
+      i += 1
+    }
+  }
+  sb.to_string()
+}
+
+/// Parse a `.dl` draw list text into a `Dl`.
+pub fn parse_dl(text : String) -> Dl {
+  let dl = Dl::{
+    w: 0.0,
+    h: 0.0,
+    scale: 1.0,
+    clear: (1.0, 1.0, 1.0),
+    glyphs: Map::new(),
+    images: Map::new(),
+    carried: Map::new(),
+    inst: [],
+    version: 0,
+  }
+  for raw_line in str_split(text, 10) {
+    let line = if raw_line.length() > 0 && raw_line.code_unit_at(raw_line.length() - 1) == 13 {
+      str_slice(raw_line, 0, raw_line.length() - 1)
+    } else {
+      raw_line
+    }
+    let t = str_split(line, 32)
+    if t.length() == 0 {
+      continue
+    }
+    let head = t[0]
+    if head == "window" && t.length() >= 4 {
+      dl.w = parse_num(t[1])
+      dl.h = parse_num(t[2])
+      dl.scale = parse_num(t[3])
+    } else if head == "clear" && t.length() >= 4 {
+      dl.clear = (parse_num(t[1]), parse_num(t[2]), parse_num(t[3]))
+    } else if head == "glyph" && t.length() >= 7 {
+      dl.glyphs.set(parse_num(t[1]).to_int(), (
+        parse_num(t[2]),
+        parse_num(t[3]).to_int(),
+        parse_num(t[4]).to_int(),
+        parse_num(t[5]).to_int(),
+        quoted(line),
+      ))
+    } else if head == "image" && t.length() >= 4 {
+      let last = t[t.length() - 1]
+      let bytes = if str_has_suffix(last, "\"") { -1 } else { parse_num(last).to_int() }
+      let src = match (str_find_char(line, 34), str_rev_find_char(line, 34)) {
+        (Some(k), Some(e)) => if e > k { quoted(str_slice(line, 0, e + 1)) } else { "" }
+        _ => ""
+      }
+      dl.images.set(parse_num(t[1]).to_int(), (parse_num(t[2]).to_int(), src, bytes))
+    } else if head == "bytes" && t.length() >= 3 {
+      dl.carried.set(parse_num(t[1]).to_int(), t[2])
+    } else if head == "mbui-dl" && t.length() >= 2 {
+      dl.version = parse_num(t[1]).to_int()
+    } else if head == "i" && (
+      t.length() == inst_size + 1 ||
+      t.length() == 57 ||
+      t.length() == 53 ||
+      t.length() == 41 ||
+      t.length() == 37 ||
+      t.length() == 33 ||
+      t.length() == 29
+    ) {
+      dl.inst.push(t)
+    }
+  }
+  dl
+}
+
+pub fn drawable(dl : Dl, path : String) -> Bool {
+  if dl.version < 3 || dl.version > 9 {
+    say("mbui-render: " + path + ": mbui-dl " + dl.version.to_string() + ", not 3 to 9")
+    return false
+  }
+  if dl.w <= 0.0 || dl.inst.length() == 0 {
+    say("mbui-render: " + path + ": no window or nothing drawn")
+    return false
+  }
+  true
+}
+
+pub fn faces_given() -> Unit {
+  let env_faces = arg("MBUI_FACES")
+  if env_faces == "" {
+    return
+  }
+  for item in str_split(env_faces, 59) { // ';'
+    let parts = str_split(item, 58) // ':'
+    if parts.length() < 2 {
+      continue
+    }
+    let face = parse_num(parts[0]).to_int()
+    let ok = if parts[1] == "local" && parts.length() > 2 {
+      hostapi::face_add_family(face, parts[2])
+    } else {
+      let path = StringBuilder::new()
+      let mut i = 1
+      while i < parts.length() {
+        if i > 1 {
+          path.write_string(":")
+        }
+        path.write_string(parts[i])
+        i += 1
+      }
+      hostapi::face_add(face, path.to_string(), 0)
+    }
+    if !ok {
+      say("mbui-render: face " + face.to_string() + " not given: " + item)
+    }
+  }
+}
+
+/// The whole pixel column and quarter-pixel phase of a glyph's pen at `tx` device pixels.
+pub fn glyph_col_sub(tx : Double) -> (Double, Int) {
+  let qf = dmath::floor(tx * 4.0 + 0.5)
+  let col = dmath::floor((qf + 2.0) * 0.25)
+  let sub = match (qf - col * 4.0).to_int() {
+    1 => 1
+    -2 => 2
+    -1 => 3
+    _ => 0
+  }
+  (col, sub)
+}
+
+let placed : Map[Int, (Double, Double, Double, Double, Double)] = Map::new()
+let sub_placed : Map[Int, (Double, Double, Double, Double, Double, Double)] = Map::new()
+
+pub fn reset_glyph_cache() -> Unit {
+  placed.clear()
+  sub_placed.clear()
+}
+
+pub fn tell_parts(parts : Array[(Double, Double, Double, Double)]) -> Unit {
+  for p in parts {
+    let (x, y, w, h) = p
+    hostapi::render_dirty(x, y, w, h)
+  }
+  if parts.length() == 0 {
+    hostapi::render_dirty(0.0, 0.0, 0.0, 0.0)
+  }
+}
+
+pub fn build_instances(
+  dl : Dl,
+  path : String,
+  atlas : hostapi::Atlas,
+  colour_atlas : hostapi::Atlas,
+) -> (Array[Double], Int, String) {
+  let shaped = Array::make(4096, 0.0)
+  let g = Array::make(8, 0.0)
+  let places : Map[Int, (Double, Double, Double, Double, Double)] = Map::new()
+  let glyph_info : Map[Int, (Int, Double, Double, Double)] = Map::new()
+  let mut unknown = 0
+  let pens = !colour_atlas.sized() || arg("MBUI_DL_PEN") == "1"
+
+  let phase_place = fn(base_key : Int, sub : Int) -> Option[(Double, Double, Double, Double, Double, Double)] {
+    let sub_key = (base_key & 0x03FFFFFF) | (sub << 26)
+    match sub_placed.get(sub_key) {
+      Some(p) => Some(p)
+      None => {
+        hostapi::glyph(sub_key, g)
+        let sgw = g[2] * dl.scale
+        let sgh = g[3] * dl.scale
+        let (a, across) = if g[6] > 0.5 && colour_atlas.sized() {
+          (colour_atlas, hostapi::colour_atlas_u)
+        } else {
+          (atlas, 0)
+        }
+        match a.place(sub_key, dmath::round(sgw).to_int(), dmath::round(sgh).to_int(), fn(_k : Int) { () }) {
+          Some((_, sx, sy)) => {
+            hostapi::glyph_put(sub_key, sx + across, sy)
+            let p = ((sx + across).to_double(), sy.to_double(), sgw, sgh, g[5], g[4])
+            sub_placed.set(sub_key, p)
+            Some(p)
+          }
+          None => None
+        }
+      }
+    }
+  }
+
+  for no in dl.glyphs.keys() {
+    match dl.glyphs.get(no) {
+      Some(gl) => {
+        let (size, weight, style, cluster, text) = gl
+        if size <= 0.0 || text == "" {
+          unknown += 1
+          continue
+        }
+        let sadv = if pens && hostapi::shape(" ", size, weight, style, shaped) > 0 {
+          shaped[2]
+        } else {
+          0.0
+        }
+        let (key, gadv) = if cluster < 0 {
+          let adv = if pens && hostapi::shape(text, size, weight, style, shaped) > 0 {
+            shaped[2]
+          } else {
+            0.0
+          }
+          (hostapi::text_key(text, size, weight, style), adv)
+        } else {
+          let n = hostapi::shape(text, size, weight, style, shaped)
+          if cluster < n {
+            (shaped[cluster * 4 + 3].to_int(), shaped[cluster * 4 + 2])
+          } else {
+            (-1, 0.0)
+          }
+        }
+        if key < 0 {
+          unknown += 1
+        } else {
+          hostapi::glyph(key, g)
+          glyph_info.set(no, (key, gadv, sadv, g[4]))
+          let gw = g[2] * dl.scale
+          let gh = g[3] * dl.scale
+          let (a, across) = if g[6] > 0.5 && colour_atlas.sized() {
+            (colour_atlas, hostapi::colour_atlas_u)
+          } else {
+            (atlas, 0)
+          }
+          match placed.get(key) {
+            Some(p) => places.set(no, p)
+            None =>
+              match a.place(key, dmath::round(gw).to_int(), dmath::round(gh).to_int(), fn(_k : Int) { () }) {
+                Some((_, x, y)) => {
+                  hostapi::glyph_put(key, x + across, y)
+                  let p = ((x + across).to_double(), y.to_double(), gw, gh, g[5])
+                  places.set(no, p)
+                  placed.set(key, p)
+                }
+                None => if gw > 0.0 && gh > 0.0 { unknown += 1 }
+              }
+          }
+        }
+      }
+      None => ()
+    }
+  }
+
+  let ids : Map[Int, Int] = Map::new()
+  let info = Array::make(4, 0.0)
+  for no in dl.images.keys() {
+    match dl.images.get(no) {
+      Some(im) => {
+        let (px, src, bytes) = im
+        let mine = if bytes >= 0 {
+          let data = match dl.carried.get(no) {
+            Some(b64) => codec::from_base64(b64)
+            None => read_bytes(path + ".img" + no.to_string())
+          }
+          hostapi::image_load_bytes(data, px)
+        } else {
+          hostapi::image_load(src, px)
+        }
+        let mut tries = 0
+        while hostapi::image_info(mine, info) == 0 && tries < 3000 {
+          spin(1.0)
+          tries += 1
+        }
+        ids.set(no, mine)
+      }
+      None => ()
+    }
+  }
+
+  let n = dl.inst.length()
+  let inst = Array::make(n * inst_size, 0.0)
+  let mut resized = 0
+  let mut line_base = -1.0e9
+  let mut prev_x = 1.0e9
+  let mut prev_gadv = 0.0
+  let mut prev_sadv = 0.0
+  let mut pen = 0.0
+  let mut k = 0
+  while k < n {
+    let t = dl.inst[k]
+    let mut j = 0
+    while j < t.length() - 1 {
+      inst[k * inst_size + j] = parse_num(t[j + 1])
+      j += 1
+    }
+    if t.length() - 1 < 40 {
+      let mut cj = 36
+      while cj < 40 {
+        inst[k * inst_size + cj] = inst[k * inst_size + 4]
+        cj += 1
+      }
+    }
+    let kind = inst[k * inst_size + 5]
+    if kind == 1.0 || kind == 3.0 || kind == 7.0 {
+      let no = inst[k * inst_size + 12].to_int()
+      match places.get(no) {
+        Some((u0, v0, gw0, gh0, goy0)) => {
+          let mut u = u0
+          let mut v = v0
+          let mut gw = gw0
+          let mut gh = gh0
+          let mut goy = goy0
+          if pens {
+            let (base_key, gadv, sadv, gox0) = match glyph_info.get(no) {
+              Some(gi) => gi
+              None => (-1, 0.0, 0.0, 0.0)
+            }
+            let x = inst[k * inst_size]
+            let y = inst[k * inst_size + 1]
+            let b = y - goy
+            if x < prev_x || dmath::abs(b - line_base) > 2.0 || x - prev_x > prev_gadv + 6.0 {
+              line_base = dmath::round(b * dl.scale) / dl.scale
+              pen = if gox0 < 0.0 { x - gox0 } else { x }
+            } else if x - prev_x > prev_gadv + 2.7 {
+              pen = pen + prev_gadv + prev_sadv
+            } else {
+              pen = pen + prev_gadv
+            }
+            prev_x = x
+            prev_gadv = gadv
+            prev_sadv = sadv
+            let (col, sub) = glyph_col_sub(pen * dl.scale)
+            let mut gox = gox0
+            if sub != 0 && base_key >= 0 {
+              match phase_place(base_key, sub) {
+                Some((su, sv, sgw, sgh, sgoy, sgox)) => {
+                  u = su
+                  v = sv
+                  gw = sgw
+                  gh = sgh
+                  goy = sgoy
+                  gox = sgox
+                }
+                None => ()
+              }
+            }
+            inst[k * inst_size] = col / dl.scale + gox
+            inst[k * inst_size + 1] = line_base + goy
+          } else {
+            let sub = inst[k * inst_size + 13].to_int()
+            let base_key = match glyph_info.get(no) {
+              Some((bk, _, _, _)) => bk
+              None => -1
+            }
+            if sub > 0 && sub < 4 && base_key >= 0 {
+              match phase_place(base_key, sub) {
+                Some((su, sv, sgw, sgh, _, _)) => {
+                  u = su
+                  v = sv
+                  gw = sgw
+                  gh = sgh
+                }
+                None => ()
+              }
+            }
+          }
+          if gw != inst[k * inst_size + 14] || gh != inst[k * inst_size + 15] {
+            resized += 1
+            if pens {
+              inst[k * inst_size + 2] = gw / dl.scale
+              inst[k * inst_size + 3] = gh / dl.scale
+            }
+          }
+          inst[k * inst_size + 12] = u
+          inst[k * inst_size + 13] = v
+          inst[k * inst_size + 14] = gw
+          inst[k * inst_size + 15] = gh
+        }
+        None => unknown += 1
+      }
+    } else {
+      prev_x = 1.0e9
+      if kind == 4.0 {
+        match ids.get(inst[k * inst_size + 20].to_int()) {
+          Some(mine) => inst[k * inst_size + 20] = mine.to_double()
+          None => ()
+        }
+      }
+    }
+    k += 1
+  }
+  (
+    inst,
+    n,
+    n.to_string() +
+      " instances, " +
+      dl.glyphs.length().to_string() +
+      " glyphs (" +
+      unknown.to_string() +
+      " not known here, " +
+      resized.to_string() +
+      " another size here), " +
+      dl.images.length().to_string() +
+      " images",
+  )
+}
+
+let unseen : damage::Damage = damage::Damage::new()
+
+pub fn seen_instances(inst : Array[Double], n : Int, dl : Dl) -> (Array[Double], Int) {
+  if arg("MBUI_DL_ALL") == "1" {
+    return (inst, n)
+  }
+  unseen.occlude(inst, n, dl.w, dl.h)
+}
+
+/// Render a draw list text offscreen on the native Apple Metal host and write a PNG to `out_png`.
+pub fn render_dl_to_png(dl_text : String, out_png : String, path~ : String = "<memory>") -> (Bool, String) {
+  let dl = parse_dl(dl_text)
+  if !drawable(dl, path) {
+    return (false, "not drawable")
+  }
+  init_offscreen(dl.w, dl.h, dl.scale)
+  faces_given()
+  reset_glyph_cache()
+  let atlas = hostapi::Atlas::new(hostapi::atlas_size(false))
+  let colour_atlas = hostapi::Atlas::new(hostapi::atlas_size(true))
+  let (r, gg, b) = dl.clear
+  let (inst, n, made) = build_instances(dl, path, atlas, colour_atlas)
+  let (si, sn) = seen_instances(inst, n, dl)
+  draw(si, sn, r, gg, b)
+  let ok = snapshot(out_png)
+  (ok, made)
+}
+
+fn sort_doubles(a : Array[Double]) -> Unit {
+  let n = a.length()
+  let mut i = 1
+  while i < n {
+    let key = a[i]
+    let mut j = i - 1
+    while j >= 0 && a[j] > key {
+      a[j + 1] = a[j]
+      j -= 1
+    }
+    a[j + 1] = key
+    i += 1
+  }
+}
+
+/// Full CLI driver matching upstream `mbui-render` (`MBUI_DL`, `MBUI_DL_FROM`, `MBUI_DL_BENCH`, `MBUI_DL_PNG`).
+pub fn render_from_env() -> Unit {
+  if !supported {
+    return
+  }
+  let path = arg("MBUI_DL")
+  let out = arg("MBUI_DL_PNG")
+  if path == "" || out == "" {
+    say("mbui-render: MBUI_DL=<list.dl> MBUI_DL_PNG=<out.png>")
+    return
+  }
+  let dl = parse_dl(read_text(path))
+  if !drawable(dl, path) {
+    return
+  }
+  let from_path = arg("MBUI_DL_FROM")
+  let from : Option[Dl] = if from_path == "" { None } else { Some(parse_dl(read_text(from_path))) }
+  match from {
+    Some(a) => {
+      if !drawable(a, from_path) {
+        return
+      }
+      if a.w != dl.w || a.h != dl.h || a.scale != dl.scale {
+        say("mbui-render: " + from_path + ": another window than " + path + "'s")
+        return
+      }
+    }
+    None => ()
+  }
+  init_offscreen(dl.w, dl.h, dl.scale)
+  faces_given()
+  let atlas = hostapi::Atlas::new(hostapi::atlas_size(false))
+  let colour_atlas = hostapi::Atlas::new(hostapi::atlas_size(true))
+  let (r, gg, b) = dl.clear
+  match from {
+    None => {
+      let (inst, n, made) = build_instances(dl, path, atlas, colour_atlas)
+      let (si, sn) = seen_instances(inst, n, dl)
+      draw(si, sn, r, gg, b)
+      if !snapshot(out) {
+        say("mbui-render: " + out + ": not written")
+        return
+      }
+      say("mbui-render: " + out + ": " + made)
+    }
+    Some(a) => {
+      let (ia, na, made_a) = build_instances(a, from_path, atlas, colour_atlas)
+      let (inst, n, made) = build_instances(dl, path, atlas, colour_atlas)
+      say("mbui-render: " + from_path + ": " + made_a)
+      say("mbui-render: " + path + ": " + made)
+      let dmg = damage::Damage::new()
+      let (ar, ag, ab) = a.clear
+      tell_parts(dmg.next(ia, na, a.w, a.h, a.scale, ar, ag, ab))
+      let (sia, sna) = seen_instances(ia, na, a)
+      draw(sia, sna, ar, ag, ab)
+      let parts = dmg.next(inst, n, dl.w, dl.h, dl.scale, r, gg, b)
+      let bench = arg("MBUI_DL_BENCH")
+      if bench != "" {
+        let times = parse_num(bench).to_int()
+        let time = fn(partial : Bool, all : Bool) -> Double {
+          let d = damage::Damage::new()
+          let hid = damage::Damage::new()
+          let gpus : Array[Double] = []
+          let mut k = 0
+          while k < 2 * times {
+            let (fi, fn_) = if k % 2 == 0 { (ia, na) } else { (inst, n) }
+            let ps = d.next(fi, fn_, dl.w, dl.h, dl.scale, r, gg, b)
+            if partial {
+              tell_parts(ps)
+            } else {
+              hostapi::render_dirty(0.0, 0.0, -1.0, -1.0)
+            }
+            let (si, sn) = if all { (fi, fn_) } else { hid.occlude(fi, fn_, dl.w, dl.h) }
+            let ms = draw_gpu(si, sn, r, gg, b)
+            if k >= 4 {
+              gpus.push(ms)
+            }
+            k += 1
+          }
+          sort_doubles(gpus)
+          if gpus.length() > 0 { gpus[gpus.length() / 2] } else { -1.0 }
+        }
+        let whole_ms = time(false, false)
+        let part_ms = time(true, false)
+        let whole_all = time(false, true)
+        let part_all = time(true, true)
+        say(
+          "BENCH " +
+            path +
+            ": whole " +
+            whole_ms.to_string() +
+            " ms, in parts " +
+            part_ms.to_string() +
+            " ms; all: whole " +
+            whole_all.to_string() +
+            " ms, in parts " +
+            part_all.to_string() +
+            " ms",
+        )
+        return
+      }
+      tell_parts(parts)
+      let (si1, sn1) = seen_instances(inst, n, dl)
+      draw(si1, sn1, r, gg, b)
+      tell_parts(dmg.next(inst, n, dl.w, dl.h, dl.scale, r, gg, b))
+      let (si2, sn2) = seen_instances(inst, n, dl)
+      draw(si2, sn2, r, gg, b)
+      let whole = (if str_has_suffix(out, ".png") { str_slice(out, 0, out.length() - 4) } else { out }) + ".whole.png"
+      if !snapshot_drawn(out) {
+        say("mbui-render: " + out + ": not written")
+        return
+      }
+      hostapi::render_dirty(0.0, 0.0, -1.0, -1.0)
+      draw(inst, n, r, gg, b)
+      if !snapshot_drawn(whole) {
+        say("mbui-render: " + whole + ": not written")
+        return
+      }
+      say("mbui-render: " + out + ": drawn in parts, and whole beside it")
+    }
+  }
+}

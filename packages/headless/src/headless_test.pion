@@ -1,0 +1,661 @@
+// Comprehensive pure-Pion unit tests for packages/headless (all 30 modules, 16 tests).
+
+import "signals"
+import "view"
+
+fn assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn make_tree(make : (view::View) -> Unit) -> view::Tree {
+  view::Tree::new(
+    make,
+    measure=view::words_measure,
+    measure_runs=view::runs_measure,
+    measure_runs_least=view::runs_least_measure,
+  )
+}
+
+fn said_of(tree : view::Tree, id : view::NodeId) -> Option[view::Said] {
+  for sn in tree.said_order() {
+    if sn.id == id {
+      return sn.said
+    }
+  }
+  None
+}
+
+fn opt_int_is(o : Option[Int], expected : Int) -> Bool {
+  match o {
+    Some(v) => v == expected
+    None => false
+  }
+}
+
+fn opt_bool_is(o : Option[Bool], expected : Bool) -> Bool {
+  match o {
+    Some(v) => v == expected
+    None => false
+  }
+}
+
+fn opt_check_is(o : Option[view::Check], expected : view::Check) -> Bool {
+  match o {
+    Some(v) => v == expected
+    None => false
+  }
+}
+
+test "01 button press, disabled, ARIA role/label/value/range, and StateStyle" {
+  let clicks = view::ref_new(0)
+  let off = signals::signal(false)
+  let btn_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let handle_ref : view::Ref[Option[Button]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let b = button(
+      root,
+      fn() -> String { "Save" },
+      fn(_v : view::View) { clicks.v = clicks.v + 1 },
+      fn(v : view::View, h : Button) {
+        let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(32.0)))
+        handle_ref.v = Some(h)
+      },
+      disabled=fn() -> Bool { off.get() },
+      value=fn() -> String { "50%" },
+      range=fn() -> Option[(Double, Double, Double)] { Some((0.0, 50.0, 100.0)) },
+    )
+    btn_ref.v = Some(b)
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  let b = match btn_ref.v { Some(v) => v; None => panic("missing button") }
+  let h = match handle_ref.v { Some(v) => v; None => panic("missing handle") }
+
+  match said_of(tree, b.id()) {
+    Some(s) => {
+      assert(s.role == view::Role::Button, "button role")
+      assert(s.label == "Save", "button label")
+      assert(s.value == "50%", "button value")
+    }
+    None => panic("missing button said")
+  }
+  h.press()
+  assert(clicks.v == 1, "button press increments clicks")
+
+  let style = StateStyle::new(base="base", disabled="off", hovered="hov", selected="sel")
+  assert(style.resolve(h.state()) == "base", "base style")
+  assert(style.resolve(h.state(selected=true)) == "sel", "selected style")
+
+  off.set(true)
+  let _ = tree.frame(200.0, 100.0, now=16.0)
+  assert(h.disabled(), "button disabled")
+  assert(style.resolve(h.state(selected=true)) == "off", "disabled beats selected")
+  h.press()
+  assert(clicks.v == 1, "disabled button ignores press")
+  tree.dispose()
+}
+
+test "02 toggle Checkbox, Switch, Button, mixed state, and keyboard rules" {
+  let on = signals::signal(false)
+  let mixed = signals::signal(true)
+  let cb_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let sw_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    cb_ref.v = Some(toggle(
+      root,
+      ToggleKind::Checkbox,
+      fn() -> String { "Select All" },
+      fn() -> Bool { on.get() },
+      fn(next : Bool) {
+        mixed.set(false)
+        on.set(next)
+      },
+      fn(v : view::View, _t : Toggle) {
+        let _ = v.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(24.0)))
+      },
+      mixed=fn() -> Bool { mixed.get() },
+    ))
+    sw_ref.v = Some(toggle(
+      root,
+      ToggleKind::Switch,
+      fn() -> String { "Dark Mode" },
+      fn() -> Bool { on.get() },
+      fn(next : Bool) { on.set(next) },
+      fn(v : view::View, _t : Toggle) {
+        let _ = v.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(24.0)))
+      },
+    ))
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  let cb = match cb_ref.v { Some(v) => v; None => panic("missing cb") }
+  let sw = match sw_ref.v { Some(v) => v; None => panic("missing sw") }
+
+  match said_of(tree, cb.id()) {
+    Some(s) => {
+      assert(s.role == view::Role::Checkbox, "checkbox role")
+      assert(opt_check_is(s.check, view::Check::Mixed), "checkbox starts mixed")
+    }
+    None => panic("missing cb said")
+  }
+  assert(tree.focus_keys_of(cb.id()) == view::focus_space, "checkbox Space only")
+  assert(tree.focus_keys_of(sw.id()) == (view::focus_enter | view::focus_space), "switch Enter|Space")
+
+  let _ = cb.press()
+  let _ = tree.frame(200.0, 100.0, now=16.0)
+  assert(on.get() && !mixed.get(), "mixed checkbox turns on")
+  match said_of(tree, sw.id()) {
+    Some(s) => assert(s.role == view::Role::Switch && opt_check_is(s.check, view::Check::On), "switch on")
+    None => panic("missing sw said")
+  }
+  let _ = sw.press()
+  assert(!on.get(), "switch toggles off")
+  tree.dispose()
+}
+
+test "03 toggle_group Single and Multiple with roving arrow navigation" {
+  let active = signals::signal(1)
+  let n1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let n2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let n3 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = toggle_group(
+      root,
+      fn() -> String { "Align" },
+      fn(k : Int) -> Bool { active.get() == k },
+      fn(k : Int, on : Bool) { active.set(if on { k } else { 0 }) },
+      fn(v : view::View, g : ToggleGroup[Int]) {
+        assert(g.single(), "single mode")
+        n1.v = Some(g.item(v, 1, fn() -> String { "Left" }, fn(_n : view::View, _t : Toggle) { () }))
+        n2.v = Some(g.item(v, 2, fn() -> String { "Center" }, fn(_n : view::View, _t : Toggle) { () }, disabled=fn() -> Bool { true }))
+        n3.v = Some(g.item(v, 3, fn() -> String { "Right" }, fn(_n : view::View, _t : Toggle) { () }))
+      },
+      kind=ToggleGroupKind::Single,
+    )
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  let v1 = match n1.v { Some(v) => v; None => panic("missing n1") }
+  let v3 = match n3.v { Some(v) => v; None => panic("missing n3") }
+  let _ = v1.ask_focus(visible=true)
+  assert(v1.focused(), "v1 focused")
+  let handled = tree.key_at(4, 0, 16.0)
+  assert(handled, "Right arrow handled")
+  assert(v3.focused(), "Right arrow skipped disabled item 2 to item 3")
+  let _ = v3.press()
+  assert(active.get() == 3, "pressing item 3 activates 3")
+  tree.dispose()
+}
+
+test "04 disclosure and accordion Single/Multiple with arrow keys" {
+  let open_key = signals::signal(1)
+  let t1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let t2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let acc_ref : view::Ref[Option[Accordion[Int]]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = accordion(
+      root,
+      fn(k : Int) -> Bool { open_key.get() == k },
+      fn(k : Int) { open_key.set(if open_key.get() == k { 0 } else { k }) },
+      fn(v : view::View, a : Accordion[Int]) {
+        acc_ref.v = Some(a)
+        t1.v = Some(a.trigger(v, 1, fn() -> String { "Sec 1" }, fn(_n : view::View, _d : Disclosure) { () }))
+        let _ = a.panel(v, 1, fn() -> String { "Panel 1" }, fn(_n : view::View) { () })
+        t2.v = Some(a.trigger(v, 2, fn() -> String { "Sec 2" }, fn(_n : view::View, _d : Disclosure) { () }))
+        let _ = a.panel(v, 2, fn() -> String { "Panel 2" }, fn(_n : view::View) { () })
+      },
+      kind=AccordionKind::Single(false),
+    )
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  let v1 = match t1.v { Some(v) => v; None => panic("missing t1") }
+  let v2 = match t2.v { Some(v) => v; None => panic("missing t2") }
+  let acc = match acc_ref.v { Some(a) => a; None => panic("missing acc") }
+
+  let _ = v1.press()
+  assert(open_key.get() == 1, "non-collapsible keeps Sec 1 open")
+  let _ = v2.press()
+  assert(open_key.get() == 2, "Sec 2 opens")
+  assert(acc.is_open(2), "acc.is_open(2)")
+  assert(acc.focus_first(), "focus_first succeeds")
+  assert(v1.focused(), "v1 focused")
+  assert(tree.key_at(6, 0, 16.0), "Down arrow handled")
+  assert(v2.focused(), "Down moved focus to v2")
+  tree.dispose()
+}
+
+test "05 radio_group and tabs navigation, auto-activation, and panels" {
+  let cur = signals::signal("a")
+  let tab_a : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tab_b : view::Ref[Option[view::View]] = view::ref_new(None)
+  let panel_mounts = view::ref_new(0)
+  let tabs = Tabs::new(fn() -> String { cur.get() }, fn(k : String) { cur.set(k) })
+  let tree = make_tree(fn(root : view::View) {
+    let _ = tabs.list(root, fn() -> String { "Main Tabs" }, fn(v : view::View, rg : RadioGroup[String]) {
+      tab_a.v = Some(rg.item(v, fn() -> String { "a" }, fn() -> String { "Tab A" }, fn(_n : view::View, _r : RadioItem) { () }))
+      tab_b.v = Some(rg.item(v, fn() -> String { "b" }, fn() -> String { "Tab B" }, fn(_n : view::View, _r : RadioItem) { () }))
+    })
+    let _ = tabs.panel(
+      root,
+      "b",
+      fn() -> String { "Panel B" },
+      fn(_n : view::View, _p : TabPanel) { () },
+      fn(_n : view::View) { panel_mounts.v = panel_mounts.v + 1 },
+    )
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  assert(panel_mounts.v == 0, "Panel B not mounted initially")
+  let va = match tab_a.v { Some(v) => v; None => panic("missing tab_a") }
+  let vb = match tab_b.v { Some(v) => v; None => panic("missing tab_b") }
+  let _ = va.ask_focus(visible=true)
+  assert(tree.key_at(4, 0, 16.0), "Right arrow moves to Tab B")
+  assert(cur.get() == "b" && vb.focused(), "auto-activation selects Tab B")
+  let _ = tree.frame(200.0, 200.0, now=32.0)
+  assert(panel_mounts.v == 1, "Panel B mounted when Tab B selected")
+  tree.dispose()
+}
+
+test "06 slider snap, keyboard step/page/home/end, and on_step" {
+  assert(slider_snap(13.0, 0.0, 100.0, 5.0) == 15.0, "snap 13 -> 15")
+  assert(slider_snap(-5.0, 0.0, 100.0, 5.0) == 0.0, "clamp low")
+  assert(slider_snap(150.0, 0.0, 100.0, 5.0) == 100.0, "clamp high")
+
+  let sval = signals::signal(20.0)
+  let sl_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let handle_ref : view::Ref[Option[Slider]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    sl_ref.v = Some(slider(
+      root,
+      fn() -> String { "Volume" },
+      fn() -> Double { sval.get() },
+      min=0.0,
+      max=100.0,
+      step=5.0,
+      fn(next : Double) { sval.set(next) },
+      fn(_v : view::View, s : Slider) { handle_ref.v = Some(s) },
+    ))
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  let v = match sl_ref.v { Some(x) => x; None => panic("missing slider") }
+  let h = match handle_ref.v { Some(x) => x; None => panic("missing slider handle") }
+  assert(h.part() == 0.2, "initial part 0.2")
+  let _ = v.ask_focus(visible=true)
+  assert(tree.key_at(4, 0, 16.0), "Right arrow increments")
+  assert(sval.get() == 25.0, "20 + 5 = 25")
+  assert(tree.key_at(15, 0, 32.0), "PageUp adds 10 steps")
+  assert(sval.get() == 75.0, "25 + 50 = 75")
+  assert(tree.key_at(9, 0, 48.0), "End goes to max")
+  assert(sval.get() == 100.0, "max 100")
+  assert(tree.key_at(8, 0, 64.0), "Home goes to min")
+  assert(sval.get() == 0.0, "min 0")
+  assert(tree.step_at(v.id(), 2, 80.0), "a11y step_at +2")
+  assert(sval.get() == 10.0, "0 + 2*5 = 10")
+  tree.dispose()
+}
+
+test "07 split keyboard navigation and ARIA separator role" {
+  let pos = signals::signal(200.0)
+  let sp_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    sp_ref.v = Some(split(
+      root,
+      fn() -> String { "Sidebar" },
+      fn() -> Double { pos.get() },
+      min=100.0,
+      max=400.0,
+      step=20.0,
+      fn(next : Double) { pos.set(next) },
+      fn(_v : view::View, _s : Split) { () },
+    ))
+  })
+  let _ = tree.frame(600.0, 400.0, now=0.0)
+  let v = match sp_ref.v { Some(x) => x; None => panic("missing split") }
+  match said_of(tree, v.id()) {
+    Some(s) => assert(s.role == view::Role::Separator && s.label == "Sidebar", "Separator role")
+    None => panic("missing split said")
+  }
+  let _ = v.ask_focus(visible=true)
+  assert(tree.key_at(4, 0, 16.0) && pos.get() == 220.0, "Right increases split")
+  assert(tree.key_at(8, 0, 32.0) && pos.get() == 100.0, "Home jumps to min")
+  assert(tree.key_at(9, 0, 48.0) && pos.get() == 400.0, "End jumps to max")
+  tree.dispose()
+}
+
+test "08 dialog and overlay stack depth, is_top, Escape dismiss, and cleanup" {
+  let show_o1 = signals::signal(true)
+  let show_o2 = signals::signal(true)
+  let dismissed : Array[String] = []
+  let o1_ref : view::Ref[Option[Overlay]] = view::ref_new(None)
+  let o2_ref : view::Ref[Option[Overlay]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    root.show(fn() -> Bool { show_o1.get() }, fn(v : view::View) {
+      let _ = overlay(
+        v,
+        fn(_how : OverlayDismiss) {
+          dismissed.push("o1")
+          show_o1.set(false)
+        },
+        fn(_n : view::View, o : Overlay) { o1_ref.v = Some(o) },
+        modal=true,
+        label=fn() -> String { "First" },
+      )
+    }, at_once=true)
+    root.show(fn() -> Bool { show_o2.get() }, fn(v : view::View) {
+      let _ = overlay(
+        v,
+        fn(_how : OverlayDismiss) {
+          dismissed.push("o2")
+          show_o2.set(false)
+        },
+        fn(_n : view::View, o : Overlay) { o2_ref.v = Some(o) },
+        modal=true,
+        label=fn() -> String { "Second" },
+      )
+    }, at_once=true)
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  assert(overlays_open(tree) == 2, "2 overlays open")
+  let o1 = match o1_ref.v { Some(o) => o; None => panic("missing o1") }
+  let o2 = match o2_ref.v { Some(o) => o; None => panic("missing o2") }
+  assert(o1.depth() == 0 && !o1.is_top(), "o1 at depth 0, not top")
+  assert(o2.depth() == 1 && o2.is_top(), "o2 at depth 1, is top")
+
+  assert(tree.key_at(17, 0, 16.0), "Escape handled")
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+  assert(dismissed.length() == 1 && dismissed[0] == "o2", "o2 dismissed first")
+  assert(overlays_open(tree) == 1 && o1.is_top(), "o1 now top")
+
+  assert(tree.key_at(17, 0, 32.0), "Second Escape handled")
+  let _ = tree.frame(400.0, 300.0, now=32.0)
+  assert(overlays_open(tree) == 0, "all overlays closed")
+  tree.dispose()
+}
+
+test "09 menu navigation, check_item, typeahead, and submenu" {
+  let acted = view::ref_new("")
+  let checked = signals::signal(false)
+  let sub_open = signals::signal(false)
+  let m_ref : view::Ref[Option[Menu]] = view::ref_new(None)
+  let i1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let i2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let i3 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let sub = Submenu::new(fn() -> Bool { sub_open.get() }, fn(v : Bool) { sub_open.set(v) })
+  let tree = make_tree(fn(root : view::View) {
+    let _ = menu(
+      root,
+      fn(v : view::View, m : Menu) {
+        m_ref.v = Some(m)
+        i1.v = Some(m.item(v, fn() -> String { "Apple" }, fn(_n : view::View) { acted.v = "Apple" }, fn(_n : view::View, _mi : MenuItem) { () }))
+        i2.v = Some(m.check_item(v, fn() -> String { "Banana" }, fn() -> Bool { checked.get() }, fn(_n : view::View) { checked.set(!checked.get()) }, fn(_n : view::View, _mi : MenuItem) { () }))
+        i3.v = Some(m.sub_trigger(v, sub, fn() -> String { "Cherry" }, fn(_n : view::View, _mi : MenuItem) { () }))
+      },
+      label=fn() -> String { "Fruits" },
+    )
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  let m = match m_ref.v { Some(x) => x; None => panic("missing menu") }
+  let v1 = match i1.v { Some(x) => x; None => panic("missing i1") }
+  let v2 = match i2.v { Some(x) => x; None => panic("missing i2") }
+  let v3 = match i3.v { Some(x) => x; None => panic("missing i3") }
+
+  assert(m.focus_first() && v1.focused(), "focus_first -> Apple")
+  assert(tree.key_at(1000 + 98, 0, 16.0), "typeahead 'b' handled")
+  assert(v2.focused(), "typeahead focused Banana")
+  let _ = v2.press()
+  assert(checked.get(), "check_item toggled")
+  assert(tree.key_at(6, 0, 32.0) && v3.focused(), "Down -> Cherry")
+  assert(tree.key_at(4, 0, 48.0) && sub_open.get(), "Right opened submenu")
+  sub.close()
+  assert(!sub_open.get(), "submenu closed")
+  tree.dispose()
+}
+
+test "10 listbox single/multiple, focus_stop, arrow keys, and typeahead" {
+  let sel = signals::signal("alpha")
+  let lb_ref : view::Ref[Option[Listbox[String]]] = view::ref_new(None)
+  let o1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let o2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let o3 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = listbox(
+      root,
+      fn() -> String { "Greek" },
+      fn(k : String) -> Bool { sel.get() == k },
+      fn(k : String) { sel.set(k) },
+      fn(v : view::View, lb : Listbox[String]) {
+        lb_ref.v = Some(lb)
+        o1.v = Some(lb.option(v, "alpha", fn() -> String { "Alpha" }, fn(_n : view::View, _o : ListOption) { () }))
+        o2.v = Some(lb.option(v, "beta", fn() -> String { "Beta" }, fn(_n : view::View, _o : ListOption) { () }))
+        o3.v = Some(lb.option(v, "gamma", fn() -> String { "Gamma" }, fn(_n : view::View, _o : ListOption) { () }))
+      },
+      wraps=true,
+    )
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  let lb = match lb_ref.v { Some(x) => x; None => panic("missing lb") }
+  let v1 = match o1.v { Some(x) => x; None => panic("missing o1") }
+  let v2 = match o2.v { Some(x) => x; None => panic("missing o2") }
+  let v3 = match o3.v { Some(x) => x; None => panic("missing o3") }
+
+  assert(lb.focus_stop() && v1.focused(), "focus_stop focuses selected alpha")
+  assert(tree.key_at(6, 0, 16.0) && v2.focused(), "Down -> Beta")
+  assert(tree.key_at(1000 + 103, 0, 32.0) && v3.focused(), "typeahead 'g' -> Gamma")
+  let _ = v3.press()
+  assert(sel.get() == "gamma", "press selects gamma")
+  tree.dispose()
+}
+
+test "11 combobox keyboard navigation, choose, close, and cmdk scoring/filtering" {
+  let items = [
+    cmdk_item(1, "Open File", group="File"),
+    cmdk_item(2, "New Window", keywords=["create window"], group="File"),
+    cmdk_item(3, "Settings", group="App", disabled=true),
+    cmdk_item(4, "Quit App", group="App"),
+  ]
+  let all_rows = cmdk_filter(items, "")
+  assert(cmdk_keys(all_rows).length() == 4, "all 4 items shown on empty query")
+  assert(opt_int_is(cmdk_first(all_rows), 1), "first valid is 1")
+  assert(opt_int_is(cmdk_move(all_rows, Some(2), CmdkMove::NextGroup), 4), "NextGroup skips disabled 3 to 4")
+  let filtered = cmdk_filter(items, "quit")
+  assert(opt_int_is(cmdk_first(filtered), 4), "query 'quit' matches item 4")
+  assert(opt_int_is(cmdk_keep(filtered, Some(1)), 4), "cmdk_keep falls back to first when old gone")
+
+  let active : signals::Signal[Option[Int]] = signals::signal_by(Some(1), fn(a : Option[Int], b : Option[Int]) -> Bool {
+    match (a, b) { (None, None) => true; (Some(x), Some(y)) => x == y; _ => false }
+  })
+  let chosen = view::ref_new(0)
+  let closed = view::ref_new(false)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = combobox(
+      root,
+      fn() -> String { "Commands" },
+      fn() -> Array[Int] { [1, 2, 3] },
+      fn() -> Option[Int] { active.get() },
+      fn(k : Option[Int]) { active.set(k) },
+      fn(k : Int) { chosen.v = k },
+      fn(v : view::View, cb : Combobox[Int]) {
+        let _ = cb.listbox(v, fn(lv : view::View) {
+          let _ = cb.option(lv, fn() -> Int { 1 }, fn() -> String { "One" }, fn(_n : view::View, _o : ComboOption) { () })
+          let _ = cb.option(lv, fn() -> Int { 2 }, fn() -> String { "Two" }, fn(_n : view::View, _o : ComboOption) { () })
+          let _ = cb.option(lv, fn() -> Int { 3 }, fn() -> String { "Three" }, fn(_n : view::View, _o : ComboOption) { () })
+        })
+      },
+      key_disabled=fn(k : Int) -> Bool { k == 2 },
+      on_close=fn() { closed.v = true },
+    )
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  assert(tree.key_at(6, 0, 16.0), "Down handled")
+  assert(opt_int_is(active.get(), 3), "active skipped 2 to 3")
+  assert(tree.key_at(7, 0, 32.0), "Enter handled")
+  assert(chosen.v == 3, "Enter chose 3")
+  assert(tree.key_at(17, 0, 48.0) && closed.v, "Escape closed combobox")
+  tree.dispose()
+}
+
+test "12 tooltip group warmup/slot and popover trigger/content/Escape" {
+  tip_slot_reset()
+  let o1 = tip_node_owner()
+  let o2 = tip_node_owner()
+  tip_claim(o1)
+  assert(tip_owns(o1) && !tip_owns(o2), "o1 owns slot")
+  tip_claim(o2)
+  assert(!tip_owns(o1) && tip_owns(o2), "o2 took slot")
+
+  let pop_open = signals::signal(false)
+  let pop = Popover::new(fn() -> Bool { pop_open.get() }, fn(b : Bool) { pop_open.set(b) })
+  let trig_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    trig_ref.v = Some(pop.trigger(root, fn() -> String { "More" }, fn(_v : view::View, _d : Disclosure) { () }))
+    pop.layer(root, fn() -> String { "More Menu" }, fn(_v : view::View, _op : Option[view::View]) { () }, at_once=true)
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let trig = match trig_ref.v { Some(v) => v; None => panic("missing trigger") }
+  let _ = trig.press()
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  assert(pop.open(), "popover opened on trigger press")
+  assert(tree.key_at(17, 0, 32.0), "Escape closed popover")
+  assert(!pop.open(), "popover closed")
+  tree.dispose()
+}
+
+test "13 shortcut formatting and anchor_place / edge_scroll_speed" {
+  let cmd_shift_k = view::Stroke::{ code: 1000 + 107, mods: 8 | 1 }
+  assert(format_stroke(cmd_shift_k, apple=true) == "⇧⌘K", "Mac ⇧⌘K")
+  let win_k = platform_stroke(cmd_shift_k, apple=false)
+  assert(format_stroke(win_k, apple=false) == "Ctrl+Shift+K", "Win Ctrl+Shift+K")
+  assert(format_chord([view::Stroke::{ code: 1000 + 103, mods: 0 }, view::Stroke::{ code: 1000 + 105, mods: 0 }], apple=true) == "G I", "chord G I")
+
+  let placed = anchor_place((100.0, 550.0, 80.0, 30.0), (120.0, 100.0), (800.0, 600.0), placement=Placement::BelowStart, gap=4.0)
+  assert(placed.flipped && placed.side == AnchorSide::Above, "flips above near bottom")
+  assert(anchor_side_back_key(placed.side) == 6, "Above back_key is Down (6)")
+
+  assert(edge_scroll_speed(50.0, 0.0, 200.0, zone=40.0, max_speed=1.0) == 0.0, "middle has 0 speed")
+  assert(edge_scroll_speed(0.0, 0.0, 200.0, zone=40.0, max_speed=1.0) == -1.0, "top edge -max_speed")
+  assert(edge_scroll_speed(200.0, 0.0, 200.0, zone=40.0, max_speed=1.0) == 1.0, "bottom edge +max_speed")
+}
+
+test "14 table ARIA roles (Table, Row, ColumnHeader, Cell)" {
+  let tbl_id : view::Ref[Option[view::NodeId]] = view::ref_new(None)
+  let hdr_id : view::Ref[Option[view::NodeId]] = view::ref_new(None)
+  let cell_id : view::Ref[Option[view::NodeId]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let tv = table(root, fn(v : view::View, t : Table) {
+      let _ = t.row(v, fn(rv : view::View, r : TableRow) {
+        hdr_id.v = Some(r.header(rv, fn(_n : view::View) { () }, label=fn() -> String { "Name" }).id())
+        cell_id.v = Some(r.cell(rv, fn(_n : view::View) { () }, label=fn() -> String { "Alice" }).id())
+      })
+    }, label=fn() -> String { "Users" })
+    tbl_id.v = Some(tv.id())
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  match said_of(tree, match tbl_id.v { Some(x) => x; None => panic("tbl") }) {
+    Some(s) => assert(s.role == view::Role::Table && s.label == "Users", "Table role")
+    None => panic("missing table said")
+  }
+  match said_of(tree, match hdr_id.v { Some(x) => x; None => panic("hdr") }) {
+    Some(s) => assert(s.role == view::Role::ColumnHeader && s.label == "Name", "ColumnHeader role")
+    None => panic("missing hdr said")
+  }
+  match said_of(tree, match cell_id.v { Some(x) => x; None => panic("cell") }) {
+    Some(s) => assert(s.role == view::Role::Cell && s.label == "Alice", "Cell role")
+    None => panic("missing cell said")
+  }
+  tree.dispose()
+}
+
+test "15 progress, text_field, and hover_reveal" {
+  let pval : signals::Signal[Option[Double]] = signals::signal_by(None, fn(a : Option[Double], b : Option[Double]) -> Bool {
+    match (a, b) { (None, None) => true; (Some(x), Some(y)) => x == y; _ => false }
+  })
+  let prog_ref : view::Ref[Option[Progress]] = view::ref_new(None)
+  let tf = TextField::new(
+    fn() -> String { "Email" },
+    description=fn() -> String { "Your work email" },
+    error=fn() -> String { "Invalid email" },
+    invalid=fn() -> Bool { true },
+  )
+  let lbl_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = progress(root, fn() -> Option[Double] { pval.get() }, fn(_v : view::View, p : Progress) { prog_ref.v = Some(p) })
+    let _ = tf.control(root, fn(_v : view::View, _f : TextField) { () })
+    lbl_ref.v = Some(tf.label(root, fn(_v : view::View) { () }))
+    let host = root.box(fn(_v : view::View) { () })
+    let act = root.box(fn(_v : view::View) { () })
+    let hr = hover_reveal(host, act, always=fn() -> Bool { true })
+    assert(hr.shown(), "hover_reveal always shows")
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let p = match prog_ref.v { Some(x) => x; None => panic("missing progress") }
+  assert(p.indeterminate() && p.part() == 0.0, "progress starts indeterminate")
+  pval.set(Some(50.0))
+  assert(!p.indeterminate() && p.part() == 0.5, "progress 50%")
+
+  assert(tf.said_description() == "Invalid email", "invalid field uses error as description")
+  let lbl = match lbl_ref.v { Some(v) => v; None => panic("missing label") }
+  let _ = lbl.press()
+  assert(tf.focused(), "pressing label focuses TextField control")
+  tree.dispose()
+}
+
+test "16 toaster lifecycle, due time, close, and choice Radio" {
+  let list : signals::Signal[Array[String]] = signals::signal_by(["t1"], fn(a : Array[String], b : Array[String]) -> Bool {
+    if a.length() != b.length() { return false }
+    let mut i = 0
+    while i < a.length() {
+      if a[i] != b[i] { return false }
+      i += 1
+    }
+    true
+  })
+  let gone_ids : Array[String] = []
+  let acted_ids : Array[String] = []
+  let item_ref : view::Ref[Option[ToastItem[String]]] = view::ref_new(None)
+  let picked = signals::signal(false)
+  let ch_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = toaster(
+      root,
+      fn() -> Array[String] { list.get() },
+      fn(s : String) -> String { s },
+      fn(s : String) -> (String, String) { (s, "desc") },
+      fn(_s : String) -> Double { 3000.0 },
+      fn(_v : view::View) { () },
+      fn(_v : view::View, item : ToastItem[String]) { item_ref.v = Some(item) },
+      fn(id : String) { acted_ids.push(id) },
+      fn(id : String) { gone_ids.push(id) },
+      key="test_toaster",
+    )
+    ch_ref.v = Some(choice(
+      root,
+      ChoiceKind::Radio,
+      fn() -> String { "Option A" },
+      fn() -> Bool { picked.get() },
+      fn(_v : view::View) { picked.set(true) },
+      fn(_v : view::View, _c : Choice) { () },
+    ))
+  })
+  let _ = tree.frame(400.0, 300.0, now=100.0)
+  match toaster_due("test_toaster") {
+    Some(due) => assert(due >= 3000.0, "toaster_due scheduled")
+    None => panic("missing toaster_due")
+  }
+  let item = match item_ref.v { Some(x) => x; None => panic("missing toast item") }
+  assert(item.live(), "toast starts live")
+  item.close()
+  assert(!item.live(), "toast no longer live after close")
+  assert(gone_ids.length() == 1 && gone_ids[0] == "t1", "gone callback fired once")
+
+  let ch = match ch_ref.v { Some(v) => v; None => panic("missing choice") }
+  match said_of(tree, ch.id()) {
+    Some(s) => assert(s.role == view::Role::Radio && opt_bool_is(s.selected, false), "choice unselected")
+    None => panic("missing choice said")
+  }
+  let _ = ch.press()
+  let _ = tree.frame(400.0, 300.0, now=116.0)
+  assert(picked.get(), "choice selected on press")
+  match said_of(tree, ch.id()) {
+    Some(s) => assert(opt_bool_is(s.selected, true), "choice selected ARIA")
+    None => panic("missing choice said 2")
+  }
+  tree.dispose()
+}

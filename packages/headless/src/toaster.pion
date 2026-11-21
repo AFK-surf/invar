@@ -1,0 +1,307 @@
+// The toaster: short notices that go by themselves, pause on hover/focus, and swipe away.
+// Ported 1:1 from libs/mbui/src/headless/toaster.mbt.
+
+import "signals"
+import "view"
+
+/// One toast of a toaster as its look reads it.
+pub struct ToastItem[T] {
+  item : signals::Signal[T]
+  row : view::View
+  dx : signals::Signal[Double]
+  live : signals::Signal[Bool]
+  focus_in : signals::Signal[Int]
+  leave : ((String) -> Unit) -> Unit
+  acted : (String) -> Unit
+  gone : (String) -> Unit
+  rest : view::Ref[(Double) -> Double]
+}
+
+pub fn ToastItem::toast[T](self : ToastItem[T]) -> T {
+  self.item.get()
+}
+
+pub fn ToastItem::row[T](self : ToastItem[T]) -> view::View {
+  self.row
+}
+
+pub fn ToastItem::live[T](self : ToastItem[T]) -> Bool {
+  self.live.get()
+}
+
+pub fn ToastItem::dx[T](self : ToastItem[T]) -> Double {
+  self.dx.get()
+}
+
+pub fn ToastItem::action[T](self : ToastItem[T], a : view::View, label : () -> String) -> view::View {
+  let s = self
+  let _ = a
+    .presses(view::Live::Is(true))
+    .focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
+    .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Button, label=label())) }))
+    .on_press(fn() { (s.leave)(s.acted) })
+  s.holds_focus(a)
+  a
+}
+
+pub fn ToastItem::holds_focus[T](self : ToastItem[T], n : view::View) -> Unit {
+  hold_while(n, self.focus_in, fn() -> Bool { n.focused() })
+}
+
+pub fn ToastItem::close[T](self : ToastItem[T]) -> Unit {
+  (self.leave)(self.gone)
+}
+
+pub fn ToastItem::moves[T](self : ToastItem[T], rest : (Double) -> Double) -> Unit {
+  self.rest.v = rest
+}
+
+fn hold_while(n : view::View, held : signals::Signal[Int], on : () -> Bool) -> Unit {
+  let had = view::ref_new(false)
+  n.reacts(on, fn(h : Bool) {
+    if h != had.v {
+      had.v = h
+      held.set(held.untracked() + (if h { 1 } else { -1 }))
+    }
+  })
+  let _ = n.owns(fn() {
+    if had.v {
+      had.v = false
+      held.set(held.untracked() - 1)
+    }
+  })
+}
+
+struct ToasterTimes {
+  phys_id : Int
+  rows : Map[String, (() -> Double, () -> Double)]
+}
+
+let toasters : Map[String, ToasterTimes] = Map::new()
+
+/// When the next of toaster `key`'s toasts goes by itself (its time out), -1 where none is counting.
+pub fn toaster_due(key : String) -> Option[Double] {
+  let t = match toasters.get(key) {
+    Some(v) => v
+    None => return None
+  }
+  let mut due = -1.0
+  for k in t.rows.keys() {
+    match t.rows.get(k) {
+      Some(r) => {
+        let d = (r.0)()
+        if d >= 0.0 && (due < 0.0 || d < due) {
+          due = d
+        }
+      }
+      None => ()
+    }
+  }
+  Some(due)
+}
+
+/// When toaster `key`'s toasts are done moving, -1 where none moves.
+pub fn toaster_rest(key : String) -> Option[Double] {
+  let t = match toasters.get(key) {
+    Some(v) => v
+    None => return None
+  }
+  let mut rest = -1.0
+  for k in t.rows.keys() {
+    match t.rows.get(k) {
+      Some(r) => {
+        let e = (r.1)()
+        if e > rest {
+          rest = e
+        }
+      }
+      None => ()
+    }
+  }
+  Some(rest)
+}
+
+/// The toasts `toasts` gives as a region in `parent` called `label`.
+pub fn toaster[T : view::ViewEq](
+  parent : view::View,
+  toasts : () -> Array[T],
+  id : (T) -> String,
+  said : (T) -> (String, String),
+  duration : (T) -> Double,
+  region : (view::View) -> Unit,
+  look : (view::View, ToastItem[T]) -> Unit,
+  acted : (String) -> Unit,
+  gone : (String) -> Unit,
+  key~ : String = "toast",
+  label~ : String = "通知",
+  leave~ : Double = 0.0,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let held = signals::signal(0)
+  let times = ToasterTimes::{ phys_id: view::next_phys_id(), rows: Map::new() }
+  toasters.set(key, times)
+  parent.box(fn(v : view::View) {
+    let _ = v.owns(fn() {
+      match toasters.get(key) {
+        Some(t) => if t.phys_id == times.phys_id { toasters.remove(key) }
+        None => ()
+      }
+    })
+    region(v)
+    let _ = v.says(view::Live::Is(Some(view::said(view::Role::Region, label=label))))
+    v.each(
+      toasts,
+      id,
+      fn(row : view::View, item : signals::Signal[T]) {
+        toast_lives(row, item, id, said, duration, held, times, look, acted, gone, loc)
+      },
+      leave=leave,
+    )
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+fn toast_lives[T](
+  row : view::View,
+  item : signals::Signal[T],
+  id_of : (T) -> String,
+  said : (T) -> (String, String),
+  duration : (T) -> Double,
+  held : signals::Signal[Int],
+  times : ToasterTimes,
+  look : (view::View, ToastItem[T]) -> Unit,
+  acted : (String) -> Unit,
+  gone : (String) -> Unit,
+  loc : String,
+) -> Unit {
+  let id = signals::untracked(fn() -> String { id_of(item.get()) })
+  let live = signals::signal(true)
+  let dx = signals::signal(0.0)
+  let focus_in = signals::signal(0)
+  let stays = view::ref_new(signals::untracked(fn() -> Double { duration(item.get()) }))
+  let left = view::ref_new(stays.v)
+  let ends : view::Ref[Option[Double]] = view::ref_new(None)
+  let due : view::Ref[() -> Unit] = view::ref_new(fn() { () })
+  let stop = fn(at : Double) {
+    (due.v)()
+    due.v = fn() { () }
+    match ends.v {
+      Some(e) => {
+        left.v = e - at
+        ends.v = None
+      }
+      None => ()
+    }
+  }
+  let leave = fn(f : (String) -> Unit) {
+    if live.untracked() {
+      live.set(false)
+      dx.set(0.0)
+      stop(row.cause_at())
+      f(id)
+    }
+  }
+  row.reacts_by(
+    fn() -> (Bool, Double) { (held.get() > 0 || !live.get(), duration(item.get())) },
+    fn(a : (Bool, Double), b : (Bool, Double)) -> Bool { a.0 == b.0 && a.1 == b.1 },
+    fn(now : (Bool, Double)) {
+      let (stopped, d) = now
+      let at = row.cause_at()
+      let more = d - stays.v
+      stays.v = d
+      let count = fn(e : Double) {
+        (due.v)()
+        ends.v = Some(e)
+        due.v = row.at_moment(e, fn() { leave(gone) }, later=true)
+      }
+      match (stopped, ends.v) {
+        (true, _) => {
+          stop(at)
+          left.v = left.v + more
+        }
+        (false, Some(e)) => if more != 0.0 { count(e + more) }
+        _ => {
+          left.v = left.v + more
+          count(at + left.v)
+        }
+      }
+    },
+  )
+  let was_leaving = view::ref_new(false)
+  row.reacts(fn() -> Bool { row.leaving() }, fn(l : Bool) {
+    if l && !was_leaving.v {
+      live.set(false)
+      dx.set(0.0)
+    } else if !l && was_leaving.v {
+      live.set(true)
+    }
+    was_leaving.v = l
+  })
+  let rest : view::Ref[(Double) -> Double] = view::ref_new(fn(_t : Double) -> Double { -1.0 })
+  times.rows.set(id, (
+    fn() -> Double {
+      match ends.v {
+        Some(e) => e
+        None => -1.0
+      }
+    },
+    fn() -> Double {
+      let now = row.logic_at()
+      let way = (rest.v)(now)
+      let let_go = row.leaves_at()
+      if let_go > now && let_go > way {
+        let_go
+      } else {
+        way
+      }
+    },
+  ))
+  let _ = row.owns(fn() {
+    (due.v)()
+    if times.rows.get(id) is Some(_) {
+      times.rows.remove(id)
+    }
+  })
+  let s = ToastItem::{ item, row, dx, live, focus_in, leave, acted, gone, rest }
+  let _ = row.box(fn(b : view::View) {
+    look(b, s)
+    let _ = b
+      .presses(view::Live::Is(true))
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        let (title, description) = said(item.get())
+        Some(view::said(view::Role::Status, label=title, description=description))
+      }))
+    hold_while(b, held, fn() -> Bool { b.pointed_in() || focus_in.get() > 0 })
+    let x0 = view::ref_new(0.0)
+    let last = view::ref_new((0.0, 0.0))
+    let quick = view::ref_new(0.0)
+    let _ = b.on_drag(fn(d : view::Drag) {
+      match d.kind {
+        Down => {
+          x0.v = d.x
+          last.v = (d.x, d.at)
+          quick.v = 0.0
+        }
+        Moved => {
+          dx.set(if d.x - x0.v > 0.0 { d.x - x0.v } else { 0.0 })
+          let (lx, lt) = last.v
+          if d.at > lt {
+            quick.v = (d.x - lx) / (d.at - lt)
+          }
+          last.v = (d.x, d.at)
+        }
+        Up =>
+          if toast_put_away(d.x - x0.v, d.w, quick.v) {
+            leave(gone)
+          } else {
+            dx.set(0.0)
+          }
+        Off => dx.set(0.0)
+      }
+    })
+  }, made_for=loc)
+}
+
+fn toast_put_away(dx : Double, w : Double, quick : Double) -> Bool {
+  view::lands_past(dx, quick, w / 3.0) || quick > view::flung_away
+}

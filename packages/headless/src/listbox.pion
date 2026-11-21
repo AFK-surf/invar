@@ -1,0 +1,211 @@
+// The list box: a list of options to choose one (or multiple) of, with typeahead.
+// Ported 1:1 from libs/mbui/src/headless/listbox.mbt.
+
+import "signals"
+import "view"
+
+struct ListboxEntry {
+  node : view::View
+  text : () -> String
+}
+
+/// A list box handed to its look to make its options by (`Listbox::option`).
+pub struct Listbox[K] {
+  is_selected : (K) -> Bool
+  pick : (K) -> Unit
+  multiple : Bool
+  off : () -> Bool
+  options : Rove
+  entries : Array[ListboxEntry]
+  typed : view::Ref[(String, Double)]
+}
+
+pub fn Listbox::disabled[K](self : Listbox[K]) -> Bool {
+  (self.off)()
+}
+
+pub fn Listbox::multiple[K](self : Listbox[K]) -> Bool {
+  self.multiple
+}
+
+pub fn Listbox::focus_stop[K](self : Listbox[K], visible~ : Bool = true) -> Bool {
+  match signals::untracked(fn() -> Option[view::NodeId] { self.options.stop_at() }) {
+    Some(id) =>
+      match view::array_find_first(self.options.items, fn(e : RoveEntry) -> Bool { e.node.id() == id }) {
+        Some(e) => e.node.ask_focus(visible=visible)
+        None => false
+      }
+    None => false
+  }
+}
+
+/// An option of a list box as its look reads it.
+pub struct ListOption {
+  node : view::View
+  on : () -> Bool
+  off : () -> Bool
+}
+
+pub fn ListOption::selected(self : ListOption) -> Bool {
+  (self.on)()
+}
+
+pub fn ListOption::disabled(self : ListOption) -> Bool {
+  (self.off)()
+}
+
+pub fn ListOption::focused(self : ListOption) -> Bool {
+  self.node.focused()
+}
+
+pub fn ListOption::focus_shown(self : ListOption) -> Bool {
+  self.node.focus_shown()
+}
+
+pub fn ListOption::hovered(self : ListOption) -> Bool {
+  self.node.pointed()
+}
+
+pub fn ListOption::pressed(self : ListOption) -> Bool {
+  self.node.pressed()
+}
+
+let listbox_key_char : Int = 1000
+let listbox_key_space : Int = 1032
+let shift_mod : Int = 1
+
+fn type_ahead(
+  typed : view::Ref[(String, Double)],
+  c : Char,
+  at : Double,
+  window_ms : Double,
+  live : Array[view::View],
+  words : (Int) -> String,
+) -> Bool {
+  let small = ascii_lower(c.to_string())
+  let (was, last) = typed.v
+  let now = if was != "" && at - last <= window_ms { was + small } else { small }
+  typed.v = (now, at)
+  let n = live.length()
+  if n == 0 {
+    return false
+  }
+  let first_code = if small.length() > 0 { small.code_unit_at(0) } else { 32 }
+  let (find, from_next) = if str_all_code(now, first_code) { (small, true) } else { (now, false) }
+  let start = match view::array_search_by(live, fn(v : view::View) -> Bool { v.focused() }) {
+    Some(i) => if from_next { i + 1 } else { i }
+    None => 0
+  }
+  let mut d = 0
+  while d < n {
+    let i = (start + d) % n
+    if str_has_prefix(ascii_lower(words(i)), find) {
+      let _ = live[i].ask_focus(visible=true)
+      return true
+    }
+    d += 1
+  }
+  false
+}
+
+fn Listbox::typeahead[K](self : Listbox[K], c : Char, at : Double, window_ms : Double) -> Bool {
+  let live = self.options.live()
+  let nodes : Array[view::View] = view::array_map(live, fn(e : RoveEntry) -> view::View { e.node })
+  type_ahead(self.typed, c, at, window_ms, nodes, fn(i : Int) -> String {
+    let id = live[i].node.id()
+    match view::array_find_first(self.entries, fn(x : ListboxEntry) -> Bool { x.node.id() == id }) {
+      Some(x) => (x.text)()
+      None => ""
+    }
+  })
+}
+
+/// A list box in `parent`, called `label`.
+pub fn listbox[K](
+  parent : view::View,
+  label : () -> String,
+  is_selected : (K) -> Bool,
+  pick : (K) -> Unit,
+  look : (view::View, Listbox[K]) -> Unit,
+  multiple~ : Bool = false,
+  wraps~ : Bool = false,
+  typeahead_ms~ : Double = 500.0,
+  disabled~ : () -> Bool = fn() { false },
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let lb : Listbox[K] = Listbox::{
+    is_selected,
+    pick,
+    multiple,
+    off: disabled,
+    options: Rove::new(true),
+    entries: [],
+    typed: view::ref_new(("", 0.0)),
+  }
+  parent.box(fn(v : view::View) {
+    look(v, lb)
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Listbox, label=label())) }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if disabled() || !focus_in(v, false) {
+          return false
+        }
+        if k.mods == 0 && lb.options.step(k.code, [group_key_up], [group_key_down], wraps) is Some(_) {
+          return true
+        }
+        if k.code > listbox_key_char && k.code != listbox_key_space && (k.mods == 0 || k.mods == shift_mod) {
+          let c = (k.code - listbox_key_char).unsafe_to_char()
+          return lb.typeahead(c, k.at, typeahead_ms)
+        }
+        false
+      })
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// An option of `key` in `parent`.
+pub fn Listbox::option[K](
+  self : Listbox[K],
+  parent : view::View,
+  key : K,
+  label : () -> String,
+  look : (view::View, ListOption) -> Unit,
+  text? : () -> String,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let on = fn() -> Bool { (self.is_selected)(key) }
+    let text_fn : () -> String = match text {
+      Some(t) => t
+      None => label
+    }
+    self.entries.push(ListboxEntry::{ node: v, text: text_fn })
+    let _ = v.owns(fn() {
+      view::array_retain(self.entries, fn(e : ListboxEntry) -> Bool { e.node.id() != v.id() })
+    })
+    look(v, ListOption::{ node: v, on, off })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space, tab=false)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Option, label=label(), selected=on()))
+      }))
+      .on_press(fn() {
+        if !off() && (self.multiple || !on()) {
+          (self.pick)(key)
+        }
+      })
+    self.options.add(v, off, on)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

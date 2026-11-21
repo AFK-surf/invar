@@ -1,0 +1,416 @@
+// The radio group and the tab list: a control of several parts, one among them chosen at a time.
+// Ported 1:1 from libs/mbui/src/headless/radio_group.mbt.
+
+import "dmath"
+import "signals"
+import "view"
+
+/// What the group and its items are to a screen reader: Radio or Tab.
+#derive(Eq)
+pub enum GroupKind {
+  Radio
+  Tab
+}
+
+/// Which arrow keys step along the group: Horizontal, Vertical, or Both.
+#derive(Eq)
+pub enum GroupAxis {
+  Horizontal
+  Vertical
+  Both
+}
+
+struct GroupEntry[K] {
+  node : view::View
+  key : () -> K
+  off : () -> Bool
+}
+
+/// A radio group or tab list handed to its look to register its items with `RadioGroup::item`.
+pub struct RadioGroup[K] {
+  kind : GroupKind
+  selected : Bool
+  now : () -> K
+  choose : (K) -> Unit
+  off : () -> Bool
+  items : Array[GroupEntry[K]]
+  building : view::Ref[Bool]
+  stops : Array[(view::View, () -> Unit)]
+  refocus : view::Ref[Option[(view::View, K)]]
+}
+
+pub fn RadioGroup::disabled[K](self : RadioGroup[K]) -> Bool {
+  (self.off)()
+}
+
+/// One item of a `RadioGroup[K]` as its look reads it.
+pub struct RadioItem {
+  node : view::View
+  now : () -> Bool
+  off : () -> Bool
+  close_ : () -> Unit
+}
+
+pub fn RadioItem::close(self : RadioItem) -> Unit {
+  (self.close_)()
+}
+
+pub fn RadioItem::chosen(self : RadioItem) -> Bool {
+  (self.now)()
+}
+
+pub fn RadioItem::disabled(self : RadioItem) -> Bool {
+  (self.off)()
+}
+
+pub fn RadioItem::pressed(self : RadioItem) -> Bool {
+  self.node.pressed()
+}
+
+pub fn RadioItem::hovered(self : RadioItem) -> Bool {
+  self.node.pointed()
+}
+
+pub fn RadioItem::focus_shown(self : RadioItem) -> Bool {
+  self.node.focus_shown()
+}
+
+pub fn RadioItem::press(self : RadioItem) -> Unit {
+  let _ = self.node.press()
+}
+
+let group_key_left : Int = 3
+let group_key_right : Int = 4
+let group_key_up : Int = 5
+let group_key_down : Int = 6
+let group_key_home : Int = 8
+let group_key_end : Int = 9
+let group_key_backspace : Int = 1
+let group_key_delete : Int = 2
+
+/// A radio group or tab list in `parent`.
+pub fn radio_group[K : view::ViewEq](
+  parent : view::View,
+  label : () -> String,
+  chosen : () -> K,
+  choose : (K) -> Unit,
+  look : (view::View, RadioGroup[K]) -> Unit,
+  kind~ : GroupKind = GroupKind::Radio,
+  axis~ : GroupAxis = GroupAxis::Horizontal,
+  shown~ : () -> Bool = fn() { true },
+  selected~ : Bool = false,
+  in_node~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  manual~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let items : Array[GroupEntry[K]] = []
+    let building = view::ref_new(true)
+    let stops : Array[(view::View, () -> Unit)] = []
+    let refocus : view::Ref[Option[(view::View, K)]] = view::ref_new(None)
+    let rg = RadioGroup::{ kind, selected, now: chosen, choose, off: disabled, items, building, stops, refocus }
+    look(v, rg)
+    if kind == GroupKind::Tab {
+      v.reacts(chosen, fn(_k : K) { rg.hand_on() }, at_start=false)
+    }
+    building.v = false
+    for s in stops {
+      if s.0.alive() {
+        (s.1)()
+      }
+    }
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        if !shown() {
+          None
+        } else {
+          Some(
+            match kind {
+              Radio => view::said(view::Role::RadioGroup, label=label())
+              Tab => view::said(view::Role::TabList, label=label())
+            },
+          )
+        }
+      }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if disabled() || k.mods != 0 {
+          return false
+        }
+        let live = view::array_filter(items, fn(e : GroupEntry[K]) -> Bool { e.node.alive() && !(e.off)() })
+        let n = live.length()
+        if n == 0 {
+          return false
+        }
+        let i = match view::array_search_by(live, fn(e : GroupEntry[K]) -> Bool { e.node.focused() }) {
+          Some(idx) => idx
+          None => return false
+        }
+        let prev = match axis {
+          Horizontal => k.code == group_key_left
+          Vertical => k.code == group_key_up
+          Both => k.code == group_key_left || k.code == group_key_up
+        }
+        let next = match axis {
+          Horizontal => k.code == group_key_right
+          Vertical => k.code == group_key_down
+          Both => k.code == group_key_right || k.code == group_key_down
+        }
+        let to : Option[Int] = if prev {
+          Some((i + n - 1) % n)
+        } else if next {
+          Some((i + 1) % n)
+        } else if k.code == group_key_home {
+          Some(0)
+        } else if k.code == group_key_end {
+          Some(n - 1)
+        } else {
+          None
+        }
+        match to {
+          Some(j) => {
+            let target = live[j]
+            let next_key = (target.key)()
+            if !manual && !next_key.eq(chosen()) {
+              choose(next_key)
+            }
+            let _ = target.node.ask_focus(visible=true)
+            true
+          }
+          None => false
+        }
+      })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+fn RadioGroup::hand_on[K : view::ViewEq](self : RadioGroup[K]) -> Unit {
+  let (gone, gone_key) = match self.refocus.v {
+    Some(pair) => pair
+    None => return
+  }
+  let cur = signals::untracked(self.now)
+  let live = view::array_filter(self.items, fn(e : GroupEntry[K]) -> Bool {
+    e.node.alive() && e.node.id() != gone.id() && !signals::untracked(e.off)
+  })
+  let to : Option[GroupEntry[K]] = match view::array_find_first(live, fn(e : GroupEntry[K]) -> Bool {
+    signals::untracked(e.key).eq(cur)
+  }) {
+    Some(e) => Some(e)
+    None => if !cur.eq(gone_key) { view::array_get(live, 0) } else { None }
+  }
+  match to {
+    Some(e) => {
+      self.refocus.v = None
+      let _ = e.node.ask_focus(visible=true)
+    }
+    None => ()
+  }
+}
+
+/// An item of `self` in `parent`.
+pub fn RadioGroup::item[K : view::ViewEq](
+  self : RadioGroup[K],
+  parent : view::View,
+  key : () -> K,
+  label : () -> String,
+  look : (view::View, RadioItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  space_only~ : Bool = false,
+  slop? : Double,
+  slide? : (Double, (Option[view::Drag]) -> Option[K]),
+  on_close? : () -> Unit,
+  closes~ : () -> Bool = fn() { true },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let on = fn() -> Bool { (self.now)().eq(key()) }
+    self.items.push(GroupEntry::{ node: v, key, off: disabled })
+    let _ = v.owns(fn() {
+      view::array_retain(self.items, fn(e : GroupEntry[K]) -> Bool { e.node.id() != v.id() })
+      view::array_retain(self.stops, fn(s : (view::View, () -> Unit)) -> Bool { s.0.id() != v.id() })
+    })
+    let close : () -> Unit = match on_close {
+      Some(f) =>
+        if self.kind == GroupKind::Tab {
+          fn() {
+            if !off() && closes() {
+              if v.focused() {
+                self.refocus.v = Some((v, key()))
+              }
+              f()
+              self.hand_on()
+            }
+          }
+        } else {
+          fn() { () }
+        }
+      None => fn() { () }
+    }
+    look(v, RadioItem::{ node: v, now: on, off, close_: close })
+    if on_close is Some(_) && self.kind == GroupKind::Tab {
+      let _ = v.on_key(fn(e : view::Key) -> Bool {
+        if e.mods == 0 && (e.code == group_key_delete || e.code == group_key_backspace) && v.focused() && !off() && closes() {
+          close()
+          true
+        } else {
+          false
+        }
+      })
+    }
+    match slop {
+      Some(s) => {
+        let on_it = fn(d : view::Drag) -> Bool { v.finger_target(d.wx, d.wy) }
+        match slide {
+          None => {
+            let _ = v.gesture(
+              s,
+              tap=fn(d : view::Drag) { if on_it(d) { let _ = v.press() } },
+              drag=fn(d : view::Drag) { if d.kind == view::DragIs::Up && on_it(d) { let _ = v.press() } },
+            )
+          }
+          Some((hold_ms, preview)) => {
+            let horizontal : view::Ref[Option[Bool]] = view::ref_new(None)
+            let across = fn(d : view::Drag) -> Bool { dmath::abs(d.x - d.ox) > dmath::abs(d.y - d.oy) }
+            let tap = fn(d : view::Drag) {
+              if on_it(d) {
+                let _ = v.press()
+              }
+              let _ = preview(None)
+            }
+            let _ = v.gesture(
+              s,
+              press=fn(_d : view::Drag) { horizontal.v = None },
+              tap=tap,
+              hold=(hold_ms, fn(d : view::Drag) { let _ = preview(Some(d)) }),
+              hold_yields=true,
+              drag=fn(d : view::Drag) {
+                match d.kind {
+                  Down | Moved => {
+                    if d.kind == view::DragIs::Down {
+                      horizontal.v = Some(across(d))
+                    }
+                    let is_h = match horizontal.v {
+                      Some(b) => b
+                      None => false
+                    }
+                    let _ = preview(if is_h { Some(d) } else { None })
+                  }
+                  Up => {
+                    let is_h = match horizontal.v {
+                      Some(b) => b
+                      None => across(d)
+                    }
+                    if is_h {
+                      match preview(Some(d)) {
+                        Some(k) =>
+                          match view::array_find_first(self.items, fn(item : GroupEntry[K]) -> Bool {
+                            item.node.alive() && !(item.off)() && (item.key)().eq(k)
+                          }) {
+                            Some(item) => { let _ = item.node.press() }
+                            None => ()
+                          }
+                        None => if on_it(d) { let _ = v.press() }
+                      }
+                      let _ = preview(None)
+                    } else {
+                      tap(d)
+                    }
+                  }
+                  Off => { let _ = preview(None) }
+                }
+              },
+            )
+          }
+        }
+      }
+      None => ()
+    }
+    let stop = fn() -> Bool {
+      let cur = (self.now)()
+      let mut any_on = false
+      let mut first_id : Option[view::NodeId] = None
+      for e in self.items {
+        if e.node.alive() {
+          let e_off = (e.off)()
+          let e_key = (e.key)()
+          if !e_off {
+            if first_id is None {
+              first_id = Some(e.node.id())
+            }
+            if e_key.eq(cur) {
+              any_on = true
+            }
+          }
+        }
+      }
+      if off() {
+        false
+      } else if on() {
+        true
+      } else if any_on {
+        false
+      } else {
+        match first_id {
+          Some(fid) => fid == v.id()
+          None => false
+        }
+      }
+    }
+    let keys = if space_only { view::focus_space } else { view::focus_enter | view::focus_space }
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=keys)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        let now = on()
+        Some(
+          match self.kind {
+            Radio =>
+              if self.selected {
+                view::said(view::Role::Radio, label=label(), selected=now)
+              } else {
+                let chk = if now { view::Check::On } else { view::Check::Off }
+                view::said(view::Role::Radio, label=label(), check=chk)
+              }
+            Tab => view::said(view::Role::Tab, label=label(), selected=now)
+          },
+        )
+      }))
+      .on_press(fn() {
+        if !off() {
+          let k = key()
+          if !(self.now)().eq(k) {
+            (self.choose)(k)
+          }
+        }
+      })
+    let bind_stop = fn() { let _ = v.tab_stop(view::Live::By(stop)) }
+    self.stops.push((v, bind_stop))
+    if !self.building.v {
+      for s in self.stops {
+        if s.0.alive() {
+          (s.1)()
+        }
+      }
+    }
+    if self.refocus.v is Some(_) && !self.building.v {
+      self.hand_on()
+    }
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

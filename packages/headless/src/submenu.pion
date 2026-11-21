@@ -1,0 +1,221 @@
+// The submenu: an item of a menu (`Menu::sub_trigger`) that opens a submenu (`Submenu::menu`).
+// Ported 1:1 from libs/mbui/src/headless/submenu.mbt.
+
+import "signals"
+import "view"
+
+/// A submenu's trigger and menu.
+pub struct Submenu {
+  now : () -> Bool
+  set : (Bool) -> Unit
+  open_delay_ms : Double
+  close_delay_ms : Double
+  waiting : view::Ref[() -> Unit]
+  opener : signals::Signal[Option[view::View]]
+  shown : signals::Signal[Option[view::View]]
+  inner : view::Ref[Option[Menu]]
+  enter : view::Ref[Bool]
+}
+
+pub fn Submenu::new(
+  open : () -> Bool,
+  set_open : (Bool) -> Unit,
+  open_delay_ms~ : Double = 180.0,
+  close_delay_ms~ : Double = 150.0,
+) -> Submenu {
+  Submenu::{
+    now: open,
+    set: set_open,
+    open_delay_ms,
+    close_delay_ms,
+    waiting: view::ref_new(fn() { () }),
+    opener: signals::signal_by(None, same_node),
+    shown: signals::signal_by(None, same_node),
+    inner: view::ref_new(None),
+    enter: view::ref_new(false),
+  }
+}
+
+pub fn Submenu::open(self : Submenu) -> Bool {
+  (self.now)()
+}
+
+pub fn Submenu::close(self : Submenu) -> Unit {
+  self.now_to(false)
+}
+
+fn Submenu::call_off(self : Submenu) -> Unit {
+  (self.waiting.v)()
+  self.waiting.v = fn() { () }
+}
+
+fn Submenu::now_to(self : Submenu, on : Bool) -> Unit {
+  self.call_off()
+  if !on {
+    self.enter.v = false
+  }
+  if signals::untracked(self.now) != on {
+    (self.set)(on)
+  }
+}
+
+fn Submenu::later_to(self : Submenu, node : view::View, on : Bool, ms : Double) -> Unit {
+  self.call_off()
+  if signals::untracked(self.now) == on {
+    return
+  }
+  self.waiting.v = node.at_moment(node.cause_at() + ms, fn() {
+    self.waiting.v = fn() { () }
+    if signals::untracked(self.now) != on {
+      (self.set)(on)
+    }
+  })
+}
+
+fn Submenu::open_now(self : Submenu, keys : Bool) -> Unit {
+  self.now_to(true)
+  if !keys {
+    return
+  }
+  match self.inner.v {
+    Some(m) => {
+      if m.node.alive() {
+        self.enter.v = false
+        let _ = m.focus_first()
+      } else {
+        self.enter.v = true
+      }
+    }
+    None => self.enter.v = true
+  }
+}
+
+fn Submenu::hovered(self : Submenu) -> Bool {
+  let on = fn(v : Option[view::View]) -> Bool {
+    match v {
+      Some(n) => n.pointed_in()
+      None => false
+    }
+  }
+  on(self.opener.get()) || on(self.shown.get())
+}
+
+fn Submenu::focus_inside(self : Submenu) -> Bool {
+  match self.shown.untracked() {
+    Some(n) => view_holds_focused(n)
+    None => false
+  }
+}
+
+/// An item of `self` in `parent` that opens `sub`.
+pub fn Menu::sub_trigger(
+  self : Menu,
+  parent : view::View,
+  sub : Submenu,
+  label : () -> String,
+  look : (view::View, MenuItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  open_key~ : Int = group_key_right,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let off = fn() -> Bool { (self.off)() || disabled() }
+  let node = self.part(
+    parent,
+    view::Role::MenuItem,
+    label,
+    None,
+    Some(sub.now),
+    fn(v : view::View) { sub.open_now(v.focus_shown()) },
+    look,
+    disabled,
+    in_node,
+    made_for,
+    loc,
+  )
+  sub.opener.set(Some(node))
+  let _ = node.on_key(fn(k : view::Key) -> Bool {
+    if k.mods == 0 && k.code == open_key && !off() && node.focused() {
+      sub.open_now(true)
+      true
+    } else {
+      false
+    }
+  })
+  node.reacts(fn() -> Bool { sub.hovered() }, fn(over : Bool) {
+    if over {
+      if !off() {
+        sub.later_to(node, true, sub.open_delay_ms)
+      }
+    } else if !sub.focus_inside() {
+      sub.later_to(node, false, sub.close_delay_ms)
+    }
+  }, at_start=false)
+  node.reacts(fn() -> Bool { node.focused() }, fn(on : Bool) {
+    if !on && !sub.focus_inside() && !signals::untracked(fn() -> Bool { sub.hovered() }) && signals::untracked(sub.now) {
+      sub.now_to(false)
+    }
+  }, at_start=false)
+  node.reacts(off, fn(o : Bool) { if o { sub.now_to(false) } }, at_start=false)
+  let _ = node.owns(fn() {
+    sub.call_off()
+    if same_node(sub.opener.untracked(), Some(node)) {
+      sub.opener.set(None)
+    }
+  })
+  node
+}
+
+/// Its menu in `parent`.
+pub fn Submenu::menu(
+  self : Submenu,
+  parent : view::View,
+  look : (view::View, Menu) -> Unit,
+  label? : () -> String,
+  close_key~ : Int = group_key_left,
+  wraps~ : Bool = true,
+  typeahead~ : Bool = true,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let v = menu(
+    parent,
+    fn(v : view::View, m : Menu) {
+      self.inner.v = Some(m)
+      self.shown.set(Some(v))
+      let _ = v.owns(fn() {
+        if same_node(self.shown.untracked(), Some(v)) {
+          self.shown.set(None)
+          self.inner.v = None
+        }
+      })
+      look(v, m)
+    },
+    label?=label,
+    on_close=fn() {
+      self.now_to(false)
+      match self.opener.untracked() {
+        Some(o) => { let _ = o.ask_focus(visible=true) }
+        None => ()
+      }
+    },
+    close_key=close_key,
+    wraps=wraps,
+    typeahead=typeahead,
+    made_for=resolve_made_for(made_for, loc),
+    loc=loc,
+  )
+  if self.enter.v {
+    let _ = v.at_moment(v.cause_at(), fn() {
+      if self.enter.v {
+        self.enter.v = false
+        match self.inner.v {
+          Some(m) => { let _ = m.focus_first() }
+          None => ()
+        }
+      }
+    })
+  }
+  v
+}
