@@ -71,21 +71,51 @@ pub fn main(world : World) -> Int {
 ### 1.3 Upstream missing primitives to `AFK-surf/invar` first
 - If `packages/lg` lacks a desktop size, variant, or reusable glass primitive, **add it to `AFK-surf/invar` (`packages/lg`) first** with full unit tests and offscreen verification. Never degrade or hand-roll a one-off glass surface in downstream business code.
 
-### 1.4 Keep all 4 GPU renderers in lockstep
+### 1.4 Scrolling & Flex Container Rules
+- Default to `ui::scroll_box(parent, fn(body) { ... })` (vertical) or `ui::scroll_row(parent, fn(body) { ... })` (horizontal) — or `kit::scroll_area` — to create a dedicated child scroller with `.fill()`, `ui::tree_scroll_bar()`, and `ui::touch_slop()` drag-claim takeover wired automatically.
+- **Every flex ancestor from `root` down to a scroller must bound its main-axis size** via `.fill()` (i.e. `.grow(Is(1.0)).shrink(Is(1.0)).basis(Is(Some(0.0))).min_width(Is(Some(0.0))).min_height(Is(Some(0.0)))`) or an explicit `.height(Is(Some(h)))` / `.width(Is(Some(w)))`.
+- Golden "header + scrollable body + footer" skeleton (copy-paste ready):
+
+```pion
+pub fn build_page(root : view::View) -> Unit {
+  let _ = root.box(fn(header : view::View) {
+    let _ = header.height(view::Live::Is(Some(48.0))).rigid()
+    let _ = header.words(view::Live::Is("Title"), look=view::words_plain)
+  })
+  let _ = ui::scroll_box(root, fn(body : view::View) {
+    // Long content here — automatically fills remaining space, clips, scrolls, and shows a scrollbar.
+    let _ = body.box(fn(content : view::View) {
+      let _ = content.height(view::Live::Is(Some(1200.0)))
+    })
+  })
+  let _ = root.box(fn(footer : view::View) {
+    let _ = footer.height(view::Live::Is(Some(44.0))).rigid()
+  })
+}
+```
+
+- **Four anti-patterns to avoid**:
+  1. **Unbounded flex ancestor**: wrapping a scroller in `parent.box(...)` without `.fill()` or `.min_height(Is(Some(0.0)))` lets the ancestor expand to full content height, leaving `reach == 0` (silent non-scrolling).
+  2. **Calling `.scrolls(...)` on a container that already has sibling children**: mutating `parent` into a scroller after adding headers/footers breaks layout and clipping; always wrap the scrollable region in its own child box (`ui::scroll_box` / `View::scroll_box`).
+  3. **Using `clips(true)` alone**: clipping does not scroll; use `ui::scroll_box` / `kit::scroll_area` / `View::scrolls`.
+  4. **Omitting `bar` / `slop` on raw `View::scrolls`**: manual `View::scrolls` calls without `bar=ui::tree_scroll_bar(), slop=ui::touch_slop()` drop scrollbars and touch-slop ergonomics; prefer `ui::scroll_box`.
+- **Mandatory test gate**: every UI test suite with scrollable views must assert `t.scroll_faults().length() == 0` (or call `t.assert_scrollable(label="...")`).
+
+### 1.5 Keep all 4 GPU renderers in lockstep
 - Any shader, optical transfer model, or instance-layout change in the GPU renderer **MUST** be updated simultaneously across all 4 backends:
   - `packages/host/native/apple_render.m` (macOS / iOS Metal)
   - `packages/host/native/gles_render.h` (Linux EGL / GLES3)
   - `packages/host/native/win_render.cpp` (Windows D3D11)
   - `web/host.js` (Web WebGL2)
 
-### 1.5 Offscreen GPU evidence for every UI change
+### 1.6 Offscreen GPU evidence for every UI change
 - Any visible UI, optical, or motion change must be verified with same-size, same-data **before/after** offscreen renders via Invar's native Metal (`film::picture` / `film::film` on macOS) or Linux GLES3 offscreen pipeline.
 - Never use browser or simulator screenshots/screen-recordings as UI verification evidence.
 
-### 1.6 Clean branches & merge discipline
+### 1.7 Clean branches & merge discipline
 - Never push directly to `main`; commit on feature branches and verify all gates before merge.
 
-### 1.7 Desktop apps: what a window needs (learned shipping one on Windows, 2026-11-22)
+### 1.8 Desktop apps: what a window needs (learned shipping one on Windows, 2026-11-22)
 - **Hooks go inside the maker.** `ui::run` forgets every `ui::on_before_frame` hook (and `worker.bind`) made before it: register them inside the `fn(root)` passed to `ui::run`, as `examples/worker_app` does.
 - **The tree's clock is the host's.** `ui::run`'s tree starts at `hostapi::now()` (on Windows, ms since boot). Schedule with `View::at_moment(v.cause_at() + ms, ...)`; never with a moment of your own counted from 0. A device or service to watch is a `ui::Worker` (or an `EventQueue` fed by a thread that blocks on it) that emits on change, not a timer polling it.
 - **Windows draws only when asked.** `ui::run` asks for the frames; any other loop must turn `tree.on_due` into `hostapi::request_frame`.

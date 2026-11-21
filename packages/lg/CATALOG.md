@@ -26,6 +26,7 @@
 | 轻提示 / 徽标 / 进度条 / 进度环 | `lg::liquid_toast_node` / `lg::liquid_badge_node` / `lg::liquid_count_badge_node` / `lg::liquid_progress_bar_node` / `lg::liquid_progress_ring_node` | 严禁手写状态色与进度动画 |
 | 毛细融合 / 放大镜 / 自适应亮度 / 渐进模糊 | `lg::liquid_merge_node` / `lg::liquid_magnifier_node` / `lg::liquid_adaptive_surface_node` / `lg::liquid_progressive_blur_node` | 严禁手调 shader 参数 |
 | 单测零玻璃嵌套门禁 | `lg::audit_glass` / `lg::assert_no_nested_glass` / `lg::count_liquid_glass` | 严禁肉眼检查代替自动门禁 |
+| 纵向/横向可滚动区域 | `ui::scroll_box` / `ui::scroll_row` / `kit::scroll_area` | 严禁在已有兄弟节点的容器上直接 `.scrolls(...)` 或遗漏 Flex 祖先 `.fill()` / `min_height(0)` |
 
 ---
 

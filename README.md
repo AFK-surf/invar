@@ -11,6 +11,7 @@ If you are an AI coding agent (Claude Code, Codex, Cursor, etc.) working with In
 1. **Read [`AGENTS.md`](AGENTS.md) first** before writing or modifying any code.
 2. **Never run blocking IO on the render thread**: isolate all network, filesystem, process, and heavy compute work on a background thread using `ui::Worker::pair()` + `ui::WorkerCtx::run_loop()` + `worker.bind()` + `ui::wake_now()` + `#render_thread` (use `ui::Worker::inline()` for `wasm32` and `ui::Tester` tests; see [`examples/worker_app/`](examples/worker_app/)).
 3. **Build all Liquid Glass UI with `packages/lg` (never hand-roll `paint::Glass::liquid`)**: pick components from [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md), follow [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md), and verify with `lg::assert_no_nested_glass` and native offscreen rendering (`film::picture` / `film::film`).
+4. **Scrolling & Flex Layout**: default to `ui::scroll_box(parent, fn(body) { ... })` / `ui::scroll_row(...)` (or `kit::scroll_area`) to create a dedicated scrollable child container with `.fill()`, scrollbar (`ui::tree_scroll_bar()`), and drag-claim takeover wired automatically. Every flex ancestor from `root` down to a scroller **must bound its height** (`.fill()`, `.grow(Is(1.0)).basis(Is(Some(0.0))).min_height(Is(Some(0.0)))`, or fixed `.height(Is(Some(h)))`); never call `.scrolls(...)` directly on a container that already has sibling children; always assert `t.scroll_faults().length() == 0` (or `t.assert_scrollable()`) in UI unit tests.
 
 ---
 
