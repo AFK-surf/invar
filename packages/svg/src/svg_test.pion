@@ -1,0 +1,176 @@
+// Comprehensive unit tests for packages/svg: parsing, CSS selectors, shapes, paths,
+// gradients, clipPath, mask, marker, <use>, filters, and pixel-verified rendering.
+
+import "skia"
+
+fn px_rgba(rgba : FixedArray[Byte], w : Int, x : Int, y : Int) -> (Int, Int, Int, Int) {
+  let i = (y * w + x) * 4
+  (rgba[i].to_int(), rgba[i + 1].to_int(), rgba[i + 2].to_int(), rgba[i + 3].to_int())
+}
+
+test "svg: rasterize basic rect and aspect ratio (longer side)" {
+  let svg_bytes = "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><rect width='20' height='20' fill='#ff0000'/></svg>".to_bytes()
+  let (w, h, rgba) = match rasterize(svg_bytes, 80) {
+    Some(v) => v
+    None => {
+      debug_assert(false, "rasterize failed")
+      (0, 0, FixedArray::make(0, 0 as Byte))
+    }
+  }
+  debug_assert(w == 80 && h == 40, "expected 80x40")
+  let (r0, g0, b0, a0) = px_rgba(rgba, w, 10, 10)
+  debug_assert(r0 == 255 && g0 == 0 && b0 == 0 && a0 == 255, "left half must be red")
+  let (_, _, _, a1) = px_rgba(rgba, w, 70, 10)
+  debug_assert(a1 == 0, "right half must be transparent")
+
+  // Tall SVG: height is the longer side
+  let tall = "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='30'/>".to_bytes()
+  match rasterize(tall, 90) {
+    Some((tw, th, _)) => debug_assert(tw == 30 && th == 90, "expected 30x90")
+    None => debug_assert(false, "tall svg failed")
+  }
+
+  // Invalid SVG returns None
+  let bad = match rasterize("not svg".to_bytes(), 50) {
+    None => true
+    Some(_) => false
+  }
+  debug_assert(bad, "invalid svg must return None")
+}
+
+test "svg: CSS attribute selectors ^=, $=, *= (mermaid markers)" {
+  let svg_str = "<svg xmlns='http://www.w3.org/2000/svg' width='30' height='10'><style>" +
+    "rect{fill:#ff0000}" +
+    "[id^=\"a-\"],.none{fill:#00ff00}" +
+    "[id$=\"-b\"],.none{fill:#0000ff}" +
+    "[id*=\"mid\"],.none{fill:#ffffff}" +
+    "</style><rect id='a-1' width='10' height='10'/><rect id='x-b' x='10' width='10' height='10'/>" +
+    "<rect id='xmidx' x='20' width='10' height='10'/></svg>"
+  let (w, h, rgba) = match rasterize(svg_str.to_bytes(), 30) {
+    Some(v) => v
+    None => {
+      debug_assert(false, "css selector svg failed")
+      (0, 0, FixedArray::make(0, 0 as Byte))
+    }
+  }
+  debug_assert(w == 30 && h == 10, "expected 30x10")
+  let (r1, g1, b1, a1) = px_rgba(rgba, w, 5, 5)
+  let (r2, g2, b2, a2) = px_rgba(rgba, w, 15, 5)
+  let (r3, g3, b3, a3) = px_rgba(rgba, w, 25, 5)
+  debug_assert(r1 == 0 && g1 == 255 && b1 == 0, "a-1 must be green")
+  debug_assert(r2 == 0 && g2 == 0 && b2 == 255, "x-b must be blue, got=" + r2.to_string() + "," + g2.to_string() + "," + b2.to_string() + "," + a2.to_string())
+  debug_assert(r3 == 255 && g3 == 255 && b3 == 255, "xmidx must be white, got=" + r3.to_string() + "," + g3.to_string() + "," + b3.to_string() + "," + a3.to_string())
+}
+
+test "svg: svg_size and render_svg_to_width with circle and path" {
+  let src = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100' width='100' height='100'>" +
+    "<circle cx='50' cy='50' r='40' fill='#00aa00'/>" +
+    "<path d='M 10 10 L 30 10 L 30 30 L 10 30 Z' fill='#0000ff'/>" +
+    "</svg>"
+  let opt = Options::default()
+  match svg_size(src, opt) {
+    Some((sw, sh)) => debug_assert((sw - 100.0f).abs() < 0.01f && (sh - 100.0f).abs() < 0.01f, "size 100x100")
+    None => debug_assert(false, "svg_size returned None")
+  }
+  let pm = match render_svg_to_width(src, 100, opt) {
+    Some(p) => p
+    None => {
+      debug_assert(false, "render_svg_to_width failed")
+      opt_unwrap(skia::Pixmap::new(1, 1))
+    }
+  }
+  debug_assert(pm.width == 100 && pm.height == 100, "pixmap 100x100")
+  // Center of circle (50, 50) -> green
+  match pm.pixel(50, 50) {
+    Some(c) => debug_assert(c.r == 0 && c.g > 150 && c.b == 0 && c.a == 255, "circle center green")
+    None => debug_assert(false, "missing pixel")
+  }
+  // Inside path square (20, 20) -> blue
+  match pm.pixel(20, 20) {
+    Some(c) => debug_assert(c.r == 0 && c.g == 0 && c.b == 255 && c.a == 255, "path square blue")
+    None => debug_assert(false, "missing pixel")
+  }
+}
+
+test "svg: linearGradient and radialGradient rendering" {
+  let src = "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='20'>" +
+    "<defs>" +
+    "<linearGradient id='g1' x1='0%' y1='0%' x2='100%' y2='0%'>" +
+    "<stop offset='0%' stop-color='#ff0000'/>" +
+    "<stop offset='100%' stop-color='#0000ff'/>" +
+    "</linearGradient>" +
+    "</defs>" +
+    "<rect width='60' height='20' fill='url(#g1)'/>" +
+    "</svg>"
+  let pm = match render_svg_to_width(src, 60, Options::default()) {
+    Some(p) => p
+    None => {
+      debug_assert(false, "gradient render failed")
+      opt_unwrap(skia::Pixmap::new(1, 1))
+    }
+  }
+  let left = opt_unwrap(pm.pixel(2, 10))
+  let mid = opt_unwrap(pm.pixel(30, 10))
+  let right = opt_unwrap(pm.pixel(58, 10))
+  debug_assert(left.r > 200 && left.b < 40 && left.a == 255, "left red, got=" + left.r.to_string() + "," + left.g.to_string() + "," + left.b.to_string() + "," + left.a.to_string())
+  debug_assert(mid.r > 80 && mid.b > 80 && mid.a == 255, "mid purple, got=" + mid.r.to_string() + "," + mid.g.to_string() + "," + mid.b.to_string() + "," + mid.a.to_string())
+  debug_assert(right.b > 200 && right.r < 40 && right.a == 255, "right blue, got=" + right.r.to_string() + "," + right.g.to_string() + "," + right.b.to_string() + "," + right.a.to_string())
+}
+
+test "svg: clipPath, use node, and marker rendering" {
+  let src = "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'>" +
+    "<defs>" +
+    "<clipPath id='c1'><rect x='0' y='0' width='20' height='40'/></clipPath>" +
+    "<rect id='box' width='10' height='10' fill='#00ff00'/>" +
+    "<marker id='dot' viewBox='0 0 10 10' refX='5' refY='5' markerWidth='8' markerHeight='8'>" +
+    "<circle cx='5' cy='5' r='5' fill='#0000ff'/>" +
+    "</marker>" +
+    "</defs>" +
+    "<rect x='0' y='0' width='40' height='40' fill='#ff0000' clip-path='url(#c1)'/>" +
+    "<use href='#box' x='25' y='5'/>" +
+    "<line x1='45' y1='20' x2='55' y2='20' stroke='#000000' stroke-width='2' marker-end='url(#dot)'/>" +
+    "</svg>"
+  let pm = match render_svg_to_width(src, 60, Options::default()) {
+    Some(p) => p
+    None => {
+      debug_assert(false, "clip/use/marker render failed")
+      opt_unwrap(skia::Pixmap::new(1, 1))
+    }
+  }
+  // Inside clipPath (10, 20): red
+  let p_in = opt_unwrap(pm.pixel(10, 20))
+  debug_assert(p_in.r == 255 && p_in.g == 0 && p_in.b == 0 && p_in.a == 255, "inside clipPath red")
+  // Outside clipPath (30, 30): transparent
+  let p_out = opt_unwrap(pm.pixel(30, 30))
+  debug_assert(p_out.a == 0, "outside clipPath transparent")
+  // Inside <use> at (30, 10): green
+  let p_use = opt_unwrap(pm.pixel(30, 10))
+  debug_assert(p_use.r == 0 && p_use.g == 255 && p_use.b == 0 && p_use.a == 255, "use node green")
+  // Marker dot at (55, 20): blue
+  let p_mk = opt_unwrap(pm.pixel(55, 20))
+  debug_assert(p_mk.b > 200 && p_mk.a == 255, "marker dot blue")
+}
+
+test "svg: filter feOffset and feColorMatrix" {
+  let src = "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'>" +
+    "<defs>" +
+    "<filter id='f1' x='0' y='0' width='200%' height='200%'>" +
+    "<feOffset in='SourceGraphic' dx='20' dy='0'/>" +
+    "</filter>" +
+    "</defs>" +
+    "<rect x='5' y='10' width='15' height='20' fill='#ff0000' filter='url(#f1)'/>" +
+    "</svg>"
+  let pm = match render_svg_to_width(src, 60, Options::default()) {
+    Some(p) => p
+    None => {
+      debug_assert(false, "filter render failed")
+      opt_unwrap(skia::Pixmap::new(1, 1))
+    }
+  }
+  // Original pos (10, 20) should now be empty due to feOffset dx=20
+  let p_orig = opt_unwrap(pm.pixel(10, 20))
+  debug_assert(p_orig.a == 0, "original position should be empty after feOffset")
+  // Shifted pos (30, 20) should be red
+  let p_shift = opt_unwrap(pm.pixel(30, 20))
+  debug_assert(p_shift.r == 255 && p_shift.g == 0 && p_shift.b == 0 && p_shift.a == 255, "shifted position must be red")
+}

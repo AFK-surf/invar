@@ -1,0 +1,1313 @@
+import "dmath"
+import "skia"
+import "font"
+import "shape"
+import "text"
+import "zip"
+
+// usvg's text layout (text/mod.rs): fonts resolved with the font database, each
+// chunk shaped run by run in bidi order, glyphs gathered into clusters, spacing, anchors, baselines, text paths and
+// decorations applied, then every glyph's outline placed as paths of its span's paint.
+
+struct ResolvedFont {
+  id : Int
+  face : font::Face
+  shaper : shape::ShapeFont
+  units_per_em : Int
+  ascent : Int
+  descent : Int
+  x_height : Int
+  underline_position : Int
+  underline_thickness : Int
+  line_through_position : Int
+  subscript_offset : Int
+  superscript_offset : Int
+}
+
+fn ResolvedFont::scale(self : ResolvedFont, size : Float) -> Float {
+  size / fi(self.units_per_em)
+}
+
+fn ResolvedFont::ascent_at(self : ResolvedFont, s : Float) -> Float {
+  fi(self.ascent) * self.scale(s)
+}
+
+fn ResolvedFont::descent_at(self : ResolvedFont, s : Float) -> Float {
+  fi(self.descent) * self.scale(s)
+}
+
+fn ResolvedFont::height_at(self : ResolvedFont, s : Float) -> Float {
+  self.ascent_at(s) - self.descent_at(s)
+}
+
+fn ResolvedFont::alignment_shift(self : ResolvedFont, a : String, s : Float) -> Float {
+  match a {
+    "before-edge" | "text-before-edge" => self.ascent_at(s)
+    "middle" => fi(self.x_height) * self.scale(s) * 0.5f
+    "central" => self.ascent_at(s) - self.height_at(s) * 0.5f
+    "after-edge" | "text-after-edge" => self.descent_at(s)
+    "ideographic" => self.descent_at(s)
+    "hanging" => self.ascent_at(s) * 0.8f
+    "mathematical" => self.ascent_at(s) * 0.5f
+    _ => 0.0f
+  }
+}
+
+fn ResolvedFont::dominant_shift(self : ResolvedFont, d : String, s : Float) -> Float {
+  match d {
+    "auto" | "use-script" | "no-change" | "reset-size" => 0.0f
+    _ => self.alignment_shift(d, s)
+  }
+}
+
+fn f2i16(x : Float) -> Int {
+  let v = f2i(fround(x))
+  if v > 32767 {
+    32767
+  } else if v < -32768 {
+    -32768
+  } else {
+    v
+  }
+}
+
+fn load_resolved_font(db : font::FontDb, id : Int, variations : Array[(String, Float)]) -> Option[ResolvedFont] {
+  let face = match db.face(id) {
+    Some(f) => f
+    None => return None
+  }
+  // metrics vary with the location (MVAR)
+  let coords = face.coords(variations)
+  let m = face.metrics(coords~)
+  let upem = m.units_per_em
+  if upem < 16 || upem > 16384 {
+    return None
+  }
+  let ascent = m.ascent
+  let descent = m.descent
+  let x_height = match m.x_height {
+    Some(x) =>
+      if x > 0.0f {
+        let v = f2i(fround(x))
+        if v > 0 && v <= 65535 { v } else { 0 }
+      } else {
+        0
+      }
+    None => 0
+  }
+  let x_height = if x_height > 0 {
+    x_height
+  } else {
+    let v = f2i(fround((ascent - descent) * 0.45f))
+    if v > 0 && v <= 65535 {
+      v
+    } else {
+      return None
+    }
+  }
+  let line_through_position = match m.strikeout {
+    Some((offset, _)) => f2i16(offset)
+    None => x_height / 2
+  }
+  let (underline_position, underline_thickness) = match m.underline {
+    Some((offset, thickness)) => {
+      let t = f2i(fround(thickness))
+      (f2i16(offset), if t > 0 && t <= 65535 { t } else { upem / 12 })
+    }
+    None => (-upem / 9, upem / 12)
+  }
+  let (sub, sup) = match face.script_offsets() {
+    Some((a, b)) => (a, b)
+    None => (f2i16(fi(upem) / 0.2f), f2i16(fi(upem) / 0.4f))
+  }
+  let (sub, sup) = if coords.length() > 0 && face.has_table("MVAR") {
+    (
+      i16_wrap(sub + f2i16(face.metric_delta("sbyo", coords))),
+      i16_wrap(sup + f2i16(face.metric_delta("spyo", coords))),
+    )
+  } else {
+    (sub, sup)
+  }
+  Some(ResolvedFont::{
+    id,
+    face,
+    shaper: shape::ShapeFont::new(face),
+    units_per_em: upem,
+    ascent: f2i16(ascent),
+    descent: f2i16(descent),
+    x_height,
+    underline_position,
+    underline_thickness,
+    line_through_position,
+    subscript_offset: sub,
+    superscript_offset: sup,
+  })
+}
+
+fn select_font(db : font::FontDb, font : SFont) -> Option[Int] {
+  let names : Array[font::Family] = arr_map(font.families, fn(f : FontFamily) -> font::Family {
+    match f {
+      FontFamily::FSerif => font::Family::Serif
+      FontFamily::FSansSerif => font::Family::SansSerif
+      FontFamily::FCursive => font::Family::Cursive
+      FontFamily::FFantasy => font::Family::Fantasy
+      FontFamily::FMonospace => font::Family::Monospace
+      FontFamily::FNamed(s) => font::Family::Named(s)
+    }
+  })
+  names.push(font::Family::Serif)
+  db.query(names, font.weight, font.stretch, font.style)
+}
+
+fn select_fallback(db : font::FontDb, c : Int, used : Array[Int]) -> Option[Int] {
+  let base = db.faces()[used[0]]
+  for face in db.faces() {
+    if arr_contains_int(used, face.id) {
+      continue
+    }
+    if base.style != face.style && base.weight != face.weight && base.stretch != face.stretch {
+      continue
+    }
+    match db.face(face.id) {
+      Some(f) => if f.glyph_index(c) == 0 { continue }
+      None => continue
+    }
+    return Some(face.id)
+  }
+  None
+}
+
+struct TGlyph {
+  id : Int
+  byte_idx : Int
+  cluster_len : Int
+  dx : Int
+  dy : Int
+  width : Int
+  font : ResolvedFont
+}
+
+struct PosGlyph {
+  glyph_ts : skia::Transform
+  cluster_ts : skia::Transform
+  span_ts : skia::Transform
+  units_per_em : Int
+  font_size : Float
+  id : Int
+  face : font::Face
+}
+
+fn PosGlyph::transform(self : PosGlyph) -> skia::Transform {
+  let sx = self.font_size / fi(self.units_per_em)
+  self.span_ts.pre_concat(self.cluster_ts).pre_concat(skia::Transform::from_scale(sx, sx)).pre_concat(self.glyph_ts)
+}
+
+struct Cluster {
+  byte_idx : Int
+  codepoint : Int
+  mut width : Float
+  mut advance : Float
+  mut text_length_spacing : Float
+  mut ascent : Float
+  mut descent : Float
+  mut has_relative_shift : Bool
+  mut glyphs : Array[PosGlyph]
+  mut transform : skia::Transform
+  mut path_transform : skia::Transform
+  mut visible : Bool
+}
+
+fn Cluster::full_transform(self : Cluster) -> skia::Transform {
+  self.path_transform.post_concat(self.transform)
+}
+
+fn span_contains(span : TextSpan, b : Int) -> Bool {
+  b >= span.start && b < span.end
+}
+
+fn chunk_span_at(chunk : TextChunk, b : Int) -> Option[TextSpan] {
+  for s in chunk.spans {
+    if span_contains(s, b) {
+      return Some(s)
+    }
+  }
+  None
+}
+
+struct LSpan {
+  fill : Option[Fill]
+  stroke : Option[SStroke]
+  paint_order : PaintOrder
+  font_size : Float
+  variations : Array[(String, Float)]
+  optical_auto : Bool
+  visible : Bool
+  glyphs : Array[PosGlyph]
+  underline : Option[SPath]
+  overline : Option[SPath]
+  line_through : Option[SPath]
+}
+
+fn layout_and_flatten(text : ParsedText, opt : Options) -> Option[SText] {
+  let db = opt.fonts
+  let fonts : Map[String, ResolvedFont] = Map::new()
+  for chunk in text.chunks {
+    for span in chunk.spans {
+      let key = span.font.key()
+      if !fonts.contains(key) {
+        match select_font(db, span.font) {
+          Some(id) =>
+            match load_resolved_font(db, id, span.font.variations) {
+              Some(f) => fonts[key] = f
+              None => ()
+            }
+          None => ()
+        }
+      }
+    }
+  }
+  let spans : Array[LSpan] = []
+  let mut char_offset = 0
+  let mut last_x : Float = 0.0f
+  let mut last_y : Float = 0.0f
+  let mut bbox = BBox::default()
+  for chunk in text.chunks {
+    let (x, y) = match chunk.flow {
+      TextFlow::Linear => (chunk.x.unwrap_or(last_x), chunk.y.unwrap_or(last_y))
+      TextFlow::OnPath(_, _) => (0.0f, 0.0f)
+    }
+    let clusters = process_chunk(chunk, fonts, db)
+    if clusters.length() == 0 {
+      char_offset += chunk.chars.length()
+      continue
+    }
+    apply_writing_mode(text.vertical, clusters)
+    apply_letter_spacing(chunk, clusters)
+    apply_word_spacing(chunk, clusters)
+    apply_length_adjust(chunk, clusters)
+    let mut curr = resolve_clusters_positions(text, chunk, char_offset, fonts, clusters)
+    let mut text_ts = skia::Transform::default()
+    if text.vertical && (match chunk.flow { TextFlow::Linear => true, _ => false }) {
+      text_ts = text_ts.pre_rotate_at(90.0f, x, y)
+    }
+    for span in chunk.spans {
+      let font = match fonts.get(span.font.key()) {
+        Some(f) => f
+        None => continue
+      }
+      let deco_spans = collect_decoration_spans(span, clusters)
+      let mut span_ts = text_ts.pre_translate(x, y)
+      if (match chunk.flow { TextFlow::Linear => true, _ => false }) {
+        span_ts = span_ts.pre_translate(0.0f, resolve_baseline(span, font, text.vertical))
+      }
+      let s = span.font_size
+      let mut underline : Option[SPath] = None
+      let mut overline : Option[SPath] = None
+      let mut line_through : Option[SPath] = None
+      match span.underline {
+        Some(d) => {
+          let offset = if text.vertical {
+            font.height_at(s) / 2.0f
+          } else {
+            -(fi(font.underline_position) * font.scale(s))
+          }
+          match convert_decoration(offset, span, font, d, deco_spans, span_ts) {
+            Some(p) => {
+              bbox = bbox.expand_rect(p.data.bounds())
+              underline = Some(p)
+            }
+            None => ()
+          }
+        }
+        None => ()
+      }
+      match span.overline {
+        Some(d) => {
+          let offset = if text.vertical { -font.height_at(s) / 2.0f } else { -font.ascent_at(s) }
+          match convert_decoration(offset, span, font, d, deco_spans, span_ts) {
+            Some(p) => {
+              bbox = bbox.expand_rect(p.data.bounds())
+              overline = Some(p)
+            }
+            None => ()
+          }
+        }
+        None => ()
+      }
+      match span.line_through {
+        Some(d) => {
+          let offset : Float = if text.vertical { 0.0f } else { -(fi(font.line_through_position) * font.scale(s)) }
+          match convert_decoration(offset, span, font, d, deco_spans, span_ts) {
+            Some(p) => {
+              bbox = bbox.expand_rect(p.data.bounds())
+              line_through = Some(p)
+            }
+            None => ()
+          }
+        }
+        None => ()
+      }
+      let fill = opt_map(span.fill, fn(f : Fill) -> Fill { Fill::{ paint: f.paint, opacity: f.opacity, rule: skia::FillRule::Winding, context: f.context } })
+      match convert_span(span, clusters, span_ts) {
+        Some((span_clusters, sb)) => {
+          bbox = bbox.expand(sb.left, sb.top, sb.right, sb.bottom)
+          let glyphs : Array[PosGlyph] = []
+          for c in span_clusters {
+            let cts = c.full_transform()
+            for g in c.glyphs {
+              glyphs.push(PosGlyph::{ glyph_ts: g.glyph_ts, cluster_ts: cts, span_ts: span_ts, units_per_em: g.units_per_em, font_size: g.font_size, id: g.id, face: g.face })
+            }
+          }
+          spans.push(LSpan::{
+            fill,
+            stroke: span.stroke,
+            paint_order: span.paint_order,
+            font_size: span.font_size,
+            variations: span.font.variations,
+            optical_auto: span.optical_auto,
+            visible: span.visible,
+            glyphs,
+            underline,
+            overline,
+            line_through,
+          })
+        }
+        None => ()
+      }
+    }
+    char_offset += chunk.chars.length()
+    if text.vertical && (match chunk.flow { TextFlow::Linear => true, _ => false }) {
+      curr = (curr.1, curr.0)
+    }
+    last_x = x + curr.0
+    last_y = y + curr.1
+  }
+  let bbox = match bbox.to_non_zero_rect() {
+    Some(b) => b
+    None => return None
+  }
+  // flatten
+  let rendering : ShapeRendering = match text.rendering {
+    TextRendering::TrOptimizeSpeed => ShapeRendering::CrispEdges
+    _ => ShapeRendering::GeometricPrecision
+  }
+  let group = Group::empty()
+  group.id = text.id
+  for span in spans {
+    match span.overline {
+      Some(p) => group.children.push(Node::NPath(SPath::{ id: p.id, visible: p.visible, fill: p.fill, stroke: p.stroke, paint_order: p.paint_order, rendering: rendering, data: p.data, abs_transform: p.abs_transform }))
+      None => ()
+    }
+    match span.underline {
+      Some(p) => group.children.push(Node::NPath(SPath::{ id: p.id, visible: p.visible, fill: p.fill, stroke: p.stroke, paint_order: p.paint_order, rendering: rendering, data: p.data, abs_transform: p.abs_transform }))
+      None => ()
+    }
+    let builder = skia::PathBuilder::new()
+    // the outlines gathered so far, as one path of the span's paint (push_outline_paths)
+    let flush = fn() -> Unit {
+      match builder.finish() {
+        Some(data) =>
+          group.children.push(
+            Node::NPath(SPath::{
+              id: "",
+              visible: span.visible,
+              fill: span.fill,
+              stroke: span.stroke,
+              paint_order: span.paint_order,
+              rendering,
+              data,
+              abs_transform: text.abs_transform,
+            }),
+          )
+        None => ()
+      }
+      builder.clear()
+    }
+    for g in span.glyphs {
+      match colr_glyph(g.face, g.id) {
+        Some(tree) => {
+          let glyph_group = Group::empty()
+          glyph_group.transform = g.transform().pre_concat(skia::Transform::from_scale(1.0f, -1.0f))
+          glyph_group.children.push(Node::NGroup(tree.root))
+          group.children.push(Node::NGroup(glyph_group))
+          continue
+        }
+        None => ()
+      }
+      match svg_glyph(g.face, g.id) {
+        Some(node) => {
+          flush()
+          let glyph_group = Group::empty()
+          glyph_group.transform = g.transform()
+          glyph_group.children.push(node)
+          group.children.push(Node::NGroup(glyph_group))
+          continue
+        }
+        None => ()
+      }
+      match raster_glyph(g) {
+        Some((image, transform)) => {
+          flush()
+          let glyph_group = Group::empty()
+          glyph_group.transform = transform
+          glyph_group.children.push(Node::NImage(image))
+          group.children.push(Node::NGroup(glyph_group))
+          continue
+        }
+        None => ()
+      }
+      match g.face.outline(g.id, coords=g.face.coords(effective_variations(g.face, span.variations, span.font_size, span.optical_auto))) {
+        Some(cmds) => {
+          let gb = skia::PathBuilder::new()
+          for c in cmds {
+            match c {
+              MoveTo(x, y) => gb.move_to(x, y)
+              LineTo(x, y) => gb.line_to(x, y)
+              QuadTo(x1, y1, x, y) => gb.quad_to(x1, y1, x, y)
+              CubicTo(x1, y1, x2, y2, x, y) => gb.cubic_to(x1, y1, x2, y2, x, y)
+              Close => gb.close()
+            }
+          }
+          match gb.finish() {
+            Some(p) =>
+              match p.transform(g.transform().pre_concat(skia::Transform::from_scale(1.0f, -1.0f))) {
+                Some(t) => builder.push_path(t)
+                None => ()
+              }
+            None => ()
+          }
+        }
+        None => ()
+      }
+    }
+    flush()
+    match span.line_through {
+      Some(p) => group.children.push(Node::NPath(SPath::{ id: p.id, visible: p.visible, fill: p.fill, stroke: p.stroke, paint_order: p.paint_order, rendering: rendering, data: p.data, abs_transform: p.abs_transform }))
+      None => ()
+    }
+  }
+  let stroke_bbox = match group.stroke_bounding_box() {
+    Some(r) =>
+      match r.to_non_zero_rect() {
+        Some(n) => n
+        None => return None
+      }
+    None => return None
+  }
+  let bounding_box = bbox.to_rect()
+  let abs_bounding_box = match bbox.transform(text.abs_transform) {
+    Some(b) => b.to_rect()
+    None => return None
+  }
+  let abs_stroke = match stroke_bbox.transform(text.abs_transform) {
+    Some(b) => b.to_rect()
+    None => return None
+  }
+  Some({
+    id: text.id,
+    bounding_box,
+    abs_bounding_box,
+    stroke_bounding_box: stroke_bbox.to_rect(),
+    abs_stroke_bounding_box: abs_stroke,
+    flattened: group,
+  })
+}
+
+fn convert_span(span : TextSpan, clusters : Array[Cluster], ts : skia::Transform) -> Option[(Array[Cluster], skia::Rect)] {
+  let out : Array[Cluster] = []
+  let b = skia::PathBuilder::new()
+  for c in clusters {
+    if !c.visible {
+      continue
+    }
+    if span_contains(span, c.byte_idx) {
+      out.push(c)
+    }
+    let mut advance = c.advance
+    if advance <= 0.0f {
+      advance = 1.0f
+    }
+    match skia::NonZeroRect::from_xywh(0.0f, -c.ascent, advance, c.ascent - c.descent) {
+      Some(r) =>
+        match r.transform(c.full_transform()) {
+          Some(r) => b.push_rect(r.to_rect())
+          None => ()
+        }
+      None => ()
+    }
+  }
+  let p = match b.finish() {
+    Some(v) => v
+    None => { return None }
+  }
+  let p = match p.transform(ts) {
+    Some(v) => v
+    None => { return None }
+  }
+  let r = match p.compute_tight_bounds() {
+    Some(v) => v
+    None => { return None }
+  }
+  let r = match r.to_non_zero_rect() {
+    Some(v) => v
+    None => { return None }
+  }
+  Some((out, r.to_rect()))
+}
+
+fn collect_decoration_spans(span : TextSpan, clusters : Array[Cluster]) -> Array[(Float, skia::Transform)] {
+  let out : Array[(Float, skia::Transform)] = []
+  let mut started = false
+  let mut width : Float = 0.0f
+  let mut ts = skia::Transform::default()
+  for c in clusters {
+    if span_contains(span, c.byte_idx) {
+      if started && c.has_relative_shift {
+        started = false
+        out.push((width, ts))
+      }
+      if !started {
+        width = c.advance
+        started = true
+        ts = c.transform
+      } else {
+        width = width + c.advance
+      }
+    } else if started {
+      out.push((width, ts))
+      started = false
+    }
+  }
+  if started {
+    out.push((width, ts))
+  }
+  out
+}
+
+fn convert_decoration(
+  dy : Float,
+  span : TextSpan,
+  font : ResolvedFont,
+  deco : TDeco,
+  spans : Array[(Float, skia::Transform)],
+  ts : skia::Transform,
+) -> Option[SPath] {
+  let thickness = fi(font.underline_thickness) * font.scale(span.font_size)
+  let b = skia::PathBuilder::new()
+  for d in spans {
+    let rect = match skia::NonZeroRect::from_xywh(0.0f, -thickness / 2.0f, d.0, thickness) {
+      Some(r) => r
+      None => continue
+    }
+    match skia::PathBuilder::from_rect(rect.to_rect()).transform(d.1.pre_translate(0.0f, dy)) {
+      Some(p) => b.push_path(p)
+      None => ()
+    }
+  }
+  let p = match b.finish() {
+    Some(v) => v
+    None => { return None }
+  }
+  let p = match p.transform(ts) {
+    Some(v) => v
+    None => { return None }
+  }
+  Some(SPath::{
+    id: "",
+    visible: span.visible,
+    fill: deco.fill,
+    stroke: deco.stroke,
+    paint_order: PaintOrder::FillAndStroke,
+    rendering: ShapeRendering::GeometricPrecision,
+    data: p,
+    abs_transform: skia::Transform::default(),
+  })
+}
+
+fn resolve_baseline(span : TextSpan, font : ResolvedFont, vertical : Bool) -> Float {
+  let s = span.font_size
+  let mut shift : Float = 0.0f
+  let mut i = span.baseline_shift.length() - 1
+  while i >= 0 {
+    match span.baseline_shift[i] {
+      BShift::BsBaseline => ()
+      BShift::BsSub => shift = shift - fi(font.subscript_offset) * font.scale(s)
+      BShift::BsSuper => shift = shift + fi(font.superscript_offset) * font.scale(s)
+      BShift::BsNumber(n) => shift = shift + n
+    }
+    i -= 1
+  }
+  let mut out = -shift
+  if !vertical {
+    if span.alignment_baseline == "auto" || span.alignment_baseline == "baseline" {
+      out = out + font.dominant_shift(span.dominant_baseline, s)
+    } else {
+      out = out + font.alignment_shift(span.alignment_baseline, s)
+    }
+  }
+  out
+}
+
+fn process_anchor(a : Int, w : Float) -> Float {
+  match a {
+    1 => -w / 2.0f
+    2 => -w
+    _ => 0.0f
+  }
+}
+
+fn resolve_relative_shifts(text : ParsedText, chunk : TextChunk, offset : Int, clusters : Array[Cluster]) -> (Array[(Float, Float)], Array[Int]) {
+  let order : Array[Int] = arr_makei(clusters.length(), fn(i : Int) -> Int { i })
+  // a stable sort by byte offset
+  for i in 1..<order.length() {
+    let v = order[i]
+    let mut j = i
+    while j > 0 && clusters[order[j - 1]].byte_idx > clusters[v].byte_idx {
+      order[j] = order[j - 1]
+      j -= 1
+    }
+    order[j] = v
+  }
+  let shifts = Array::make(clusters.length(), (0.0f, 0.0f))
+  let mut sx : Float = 0.0f
+  let mut sy : Float = 0.0f
+  for i in order {
+    let cp = offset + chunk.char_at_byte(clusters[i].byte_idx)
+    sx = sx + opt_unwrap_or(arr_get(text.dx, cp), 0.0f)
+    sy = sy + opt_unwrap_or(arr_get(text.dy, cp), 0.0f)
+    shifts[i] = (sx, sy)
+  }
+  (shifts, order)
+}
+
+fn resolve_clusters_positions(
+  text : ParsedText,
+  chunk : TextChunk,
+  offset : Int,
+  fonts : Map[String, ResolvedFont],
+  clusters : Array[Cluster],
+) -> (Float, Float) {
+  match chunk.flow {
+    TextFlow::Linear => {
+      let (shifts, order) = resolve_relative_shifts(text, chunk, offset, clusters)
+      let first = order[0]
+      let last = order[order.length() - 1]
+      if text.vertical {
+        for i in 0..<shifts.length() {
+          shifts[i] = (shifts[i].1, -shifts[i].0)
+        }
+      }
+      for i in 1..<clusters.length() {
+        if shifts[i].0 != shifts[i - 1].0 || shifts[i].1 != shifts[i - 1].1 {
+          clusters[i].has_relative_shift = true
+        }
+      }
+      let mut left : Float = f32_from_double(d_pos_inf())
+      let mut right : Float = f32_from_double(d_neg_inf())
+      let mut advance : Float = 0.0f
+      for i, c in clusters {
+        let start = advance + shifts[i].0
+        let end = start + c.advance - c.text_length_spacing
+        left = fmin(fmin(left, start), end)
+        right = fmax(fmax(right, start), end)
+        advance = advance + c.advance
+      }
+      let mut x = shifts[first].0 - left + process_anchor(chunk.anchor, right - left)
+      for i, c in clusters {
+        let cp = offset + chunk.char_at_byte(c.byte_idx)
+        c.transform = c.transform.pre_translate(x + shifts[i].0, shifts[i].1)
+        match arr_get(text.rotate, cp) {
+          Some(angle) =>
+            if !approx_zero(angle) {
+              c.transform = c.transform.pre_rotate(angle)
+              c.has_relative_shift = true
+            }
+          None => ()
+        }
+        x = x + c.advance
+      }
+      (x + shifts[last].0, shifts[last].1)
+    }
+    TextFlow::OnPath(start_offset, path) => {
+      let mut last_x : Float = 0.0f
+      let mut last_y : Float = 0.0f
+      let (shifts, _) = resolve_relative_shifts(text, chunk, offset, clusters)
+      let chunk_offset = if text.vertical { chunk.y.unwrap_or(0.0f) } else { chunk.x.unwrap_or(0.0f) }
+      let mut total : Float = 0.0f
+      for c in clusters {
+        total = total + c.advance
+      }
+      let start = chunk_offset + start_offset + process_anchor(chunk.anchor, total)
+      let normals = collect_normals(text, clusters, shifts, path, start)
+      for i, c in clusters {
+        let (x, y, angle) = match normals[i] {
+          Some(n) => n
+          None => {
+            c.visible = false
+            continue
+          }
+        }
+        c.has_relative_shift = true
+        let orig = c.transform
+        let half = c.width / 2.0f
+        c.transform = skia::Transform::default().pre_translate(x - half, y).pre_rotate_at(angle, half, 0.0f)
+        let cp = offset + chunk.char_at_byte(c.byte_idx)
+        let baseline_shift = match chunk_span_at(chunk, c.byte_idx) {
+          Some(span) =>
+            match fonts.get(span.font.key()) {
+              Some(f) => -resolve_baseline(span, f, text.vertical)
+              None => 0.0f
+            }
+          None => 0.0f
+        }
+        let dy = shifts[i].1
+        if !approx_zero(dy) || !approx_zero(baseline_shift) {
+          c.transform = c.transform.pre_translate(0.0f, fd((dy - baseline_shift).to_double()))
+        }
+        match arr_get(text.rotate, cp) {
+          Some(a) => if !approx_zero(a) { c.transform = c.transform.pre_rotate(a) }
+          None => ()
+        }
+        c.transform = c.transform.pre_concat(orig)
+        last_x = x + c.advance
+        last_y = y
+      }
+      (last_x, last_y)
+    }
+  }
+}
+
+fn collect_normals(
+  text : ParsedText,
+  clusters : Array[Cluster],
+  shifts : Array[(Float, Float)],
+  path : skia::Path,
+  offset : Float,
+) -> Array[Option[(Float, Float, Float)]] {
+  let offsets : Array[Double] = []
+  let normals : Array[Option[(Float, Float, Float)]] = []
+  let mut advance = offset
+  for i, c in clusters {
+    let o = advance + shifts[i].0 + c.width / 2.0f
+    if o < 0.0f {
+      normals.push(None)
+    }
+    offsets.push(o.to_double())
+    advance = advance + c.advance
+  }
+  let (sx, sy) = text.abs_transform.get_scale()
+  let acc_f : Float = 0.5f / fmax((sx * sy).sqrt(), 1.0f)
+  let accuracy = acc_f.to_double()
+  let mut length = 0.0
+  for curve in path_cubics(path) {
+    let len = curve.arclen(accuracy)
+    let mut k = normals.length()
+    while k < offsets.length() {
+      let o = offsets[k]
+      if o >= length && o <= length + len {
+        let mut t = curve.inv_arclen(o - length, accuracy)
+        t = if t < 0.0 { 0.0 } else if t > 1.0 { 1.0 } else { t }
+        let (px, py) = curve.eval(t)
+        let (dx, dy) = curve.deriv_eval(t)
+        // the tangent turned a quarter
+        let angle = dmath::atan2(dx, -dy) * (180.0 / 3.141592653589793) - 90.0
+        normals.push(Some((fd(px), fd(py), fd(angle))))
+        if normals.length() == offsets.length() {
+          break
+        }
+      }
+      k += 1
+    }
+    length = length + len
+  }
+  while normals.length() < offsets.length() {
+    normals.push(None)
+  }
+  normals
+}
+
+fn process_chunk(chunk : TextChunk, fonts : Map[String, ResolvedFont], db : font::FontDb) -> Array[Cluster] {
+  let mut positions : Map[Int, Bool] = Map::new()
+  let mut glyphs : Array[TGlyph] = []
+  for span in chunk.spans {
+    let font = match fonts.get(span.font.key()) {
+      Some(f) => f
+      None => continue
+    }
+    let tmp = shape_text(chunk, font, span.small_caps, span.apply_kerning, db, span.font.variations, span.font_size, span.optical_auto)
+    if glyphs.length() == 0 {
+      glyphs = tmp
+      continue
+    }
+    positions = Map::new()
+    let mut k = 0
+    while k < tmp.length() {
+      let g = tmp[k]
+      k += 1
+      if !span_contains(span, g.byte_idx) {
+        continue
+      }
+      let mut idx = -1
+      for i, old in glyphs {
+        if old.byte_idx == g.byte_idx {
+          idx = i
+          break
+        }
+      }
+      if idx < 0 || (match positions.get(idx) { Some(_) => true, None => false }) {
+        continue
+      }
+      positions.set(idx, true)
+      let prev_len = glyphs[idx].cluster_len
+      if prev_len < g.cluster_len {
+        for _ in 1..<g.cluster_len {
+          if idx + 1 < glyphs.length() {
+            ignore(arr_remove(glyphs, idx + 1))
+          }
+        }
+      } else if prev_len > g.cluster_len {
+        for j in 1..<prev_len {
+          if k < tmp.length() {
+            arr_insert(glyphs, idx + j, tmp[k])
+            k += 1
+          }
+        }
+      }
+      glyphs[idx] = g
+    }
+  }
+  let clusters : Array[Cluster] = []
+  let mut i = 0
+  while i < glyphs.length() {
+    let start = i
+    let b = glyphs[i].byte_idx
+    while i < glyphs.length() && glyphs[i].byte_idx == b {
+      i += 1
+    }
+    match chunk_span_at(chunk, b) {
+      Some(span) => clusters.push(form_cluster(glyphs, start, i, chunk, span.font_size))
+      None => ()
+    }
+  }
+  clusters
+}
+
+fn form_cluster(glyphs : Array[TGlyph], from : Int, to : Int, chunk : TextChunk, size : Float) -> Cluster {
+  let mut x : Float = 0.0f
+  let mut width : Float = 0.0f
+  let mut advance : Float = 0.0f
+  let pg : Array[PosGlyph] = []
+  for k in from..<to {
+    let g = glyphs[k]
+    let sx = g.font.scale(size)
+    pg.push(PosGlyph::{
+      glyph_ts: skia::Transform::from_translate(x + fi(g.dx), -fi(g.dy)),
+      cluster_ts: skia::Transform::default(),
+      span_ts: skia::Transform::default(),
+      units_per_em: g.font.units_per_em,
+      font_size: size,
+      id: g.id,
+      face: g.font.face,
+    })
+    x = x + fi(g.width)
+    let gw = fi(g.width) * sx
+    advance = advance + gw
+    if gw > width {
+      width = gw
+    }
+  }
+  let b = glyphs[from].byte_idx
+  let font = glyphs[from].font
+  Cluster::{
+    byte_idx: b,
+    codepoint: chunk.chars[chunk.char_at_byte(b)].to_int(),
+    width,
+    advance,
+    text_length_spacing: 0.0f,
+    ascent: font.ascent_at(size),
+    descent: font.descent_at(size),
+    has_relative_shift: false,
+    glyphs: pg,
+    transform: skia::Transform::default(),
+    path_transform: skia::Transform::default(),
+    visible: true,
+  }
+}
+
+fn apply_length_adjust(chunk : TextChunk, clusters : Array[Cluster]) -> Unit {
+  let horizontal = match chunk.flow { TextFlow::Linear => true, _ => false }
+  for span in chunk.spans {
+    let target = match span.text_length {
+      Some(v) => v
+      None => continue
+    }
+    let idx : Array[Int] = []
+    for b in span.start..<span.end {
+      for i, c in clusters {
+        if c.byte_idx == b {
+          if !arr_contains_int(idx, i) {
+            idx.push(i)
+          }
+          break
+        }
+      }
+    }
+    idx.sort()
+    if idx.length() == 0 {
+      continue
+    }
+    let mut width : Float = 0.0f
+    for i in idx {
+      width = width + clusters[i].width
+    }
+    if !span.length_adjust_glyphs {
+      let factor : Float = if idx.length() > 1 { (target - width) / fi(idx.length() - 1) } else { 0.0f }
+      for i in idx {
+        clusters[i].advance = clusters[i].width + factor
+        clusters[i].text_length_spacing = factor
+      }
+    } else {
+      let factor = target / width
+      if factor < 0.001f {
+        continue
+      }
+      for i in idx {
+        clusters[i].transform = clusters[i].transform.pre_scale(factor, 1.0f)
+        if !horizontal {
+          clusters[i].advance = clusters[i].advance * factor
+          clusters[i].width = clusters[i].width * factor
+        }
+      }
+    }
+  }
+}
+
+fn apply_writing_mode(vertical : Bool, clusters : Array[Cluster]) -> Unit {
+  if !vertical {
+    return
+  }
+  for c in clusters {
+    if is_upright(c.codepoint) {
+      let ts = skia::Transform::default()
+        .pre_translate(0.0f, (c.ascent + c.descent) / 2.0f)
+        .pre_rotate_at(-90.0f, c.width / 2.0f, -(c.ascent + c.descent) / 2.0f)
+      c.path_transform = ts
+      c.ascent = c.width / 2.0f
+      c.descent = -c.width / 2.0f
+    } else {
+      c.transform = c.transform.pre_translate(0.0f, (c.ascent + c.descent) / 2.0f)
+    }
+  }
+}
+
+fn apply_letter_spacing(chunk : TextChunk, clusters : Array[Cluster]) -> Unit {
+  if !arr_any(chunk.spans, fn(s : TextSpan) -> Bool { !approx_zero(s.letter_spacing) }) {
+    return
+  }
+  let n = clusters.length()
+  for i, c in clusters {
+    if script_supports_letter_spacing(c.codepoint) {
+      match chunk_span_at(chunk, c.byte_idx) {
+        Some(span) => {
+          if i != n - 1 {
+            c.advance = c.advance + span.letter_spacing
+          }
+          if !is_valid_length(c.advance) {
+            c.width = 0.0
+            c.advance = 0.0
+            c.glyphs = []
+          }
+        }
+        None => ()
+      }
+    }
+  }
+}
+
+/// Scripts whose letters join (Arabic, Syriac, N'Ko, Mongolian, the Indic ones…) are not letter-spaced.
+fn script_supports_letter_spacing(c : Int) -> Bool {
+  !(
+    (c >= 0x0600 && c <= 0x08FF) ||
+    (c >= 0x0700 && c <= 0x074F) ||
+    (c >= 0x07C0 && c <= 0x07FF) ||
+    (c >= 0x0800 && c <= 0x085F) ||
+    (c >= 0x0900 && c <= 0x0DFF) ||
+    (c >= 0x1800 && c <= 0x18AF) ||
+    (c >= 0xA840 && c <= 0xA87F) ||
+    (c >= 0xFB50 && c <= 0xFDFF) ||
+    (c >= 0xFE70 && c <= 0xFEFF)
+  )
+}
+
+fn apply_word_spacing(chunk : TextChunk, clusters : Array[Cluster]) -> Unit {
+  if !arr_any(chunk.spans, fn(s : TextSpan) -> Bool { !approx_zero(s.word_spacing) }) {
+    return
+  }
+  for c in clusters {
+    match c.codepoint {
+      0x20 | 0xA0 | 0x1361 | 0x10100 | 0x10101 | 0x1039F | 0x1091F =>
+        match chunk_span_at(chunk, c.byte_idx) {
+          Some(span) => c.advance = c.advance + span.word_spacing
+          None => ()
+        }
+      _ => ()
+    }
+  }
+}
+
+// ── shaping ───────────────────────────────────────────────────────────
+
+fn shape_text(
+  chunk : TextChunk,
+  font : ResolvedFont,
+  small_caps : Bool,
+  kerning : Bool,
+  db : font::FontDb,
+  variations : Array[(String, Float)],
+  font_size : Float,
+  optical_auto : Bool,
+) -> Array[TGlyph] {
+  let shape = fn(f : ResolvedFont) -> Array[TGlyph] { shape_with_font(chunk, f, small_caps, kerning, variations, font_size, optical_auto) }
+  let mut glyphs = shape(font)
+  let used = [font.id]
+  while true {
+    let mut missing = -1
+    for g in glyphs {
+      if g.id == 0 {
+        missing = chunk.chars[chunk.char_at_byte(g.byte_idx)].to_int()
+        break
+      }
+    }
+    if missing < 0 {
+      break
+    }
+    let fallback = match select_fallback(db, missing, used) {
+      Some(id) =>
+        match load_resolved_font(db, id, variations) {
+          Some(f) => f
+          None => break
+        }
+      None => break
+    }
+    let fb = shape(fallback)
+    let mut all_ok = true
+    for g in fb {
+      if g.id == 0 {
+        all_ok = false
+        break
+      }
+    }
+    if all_ok {
+      glyphs = fb
+      break
+    }
+    if glyphs.length() != fb.length() {
+      break
+    }
+    for i in 0..<glyphs.length() {
+      if glyphs[i].id == 0 && fb[i].id != 0 {
+        glyphs[i] = fb[i]
+      }
+    }
+    used.push(fallback.id)
+  }
+  glyphs
+}
+
+/// A chunk's runs in visual order: (first char, end char, right to left), by the bidi algorithm on a left-to-right
+/// paragraph (unicode_bidi's visual_runs).
+fn visual_runs(chunk : TextChunk) -> Array[(Int, Int, Bool)] {
+  let sb = StringBuilder::new()
+  for c in chunk.chars {
+    sb_write_cp(sb, c)
+  }
+  let s = sb.to_string()
+  let bidi = text::bidi_new(s, 0)
+  let n = chunk.chars.length()
+  if !bidi.is_mixed() {
+    return [(0, n, false)]
+  }
+  let unit_levels = bidi.line_levels(0, s.length())
+  // a level per character (its first code unit's)
+  let levels = []
+  let mut u = 0
+  for c in chunk.chars {
+    levels.push(unit_levels[u])
+    u += if c.to_int() > 0xFFFF { 2 } else { 1 }
+  }
+  let runs : Array[(Int, Int, Int)] = []
+  let mut i = 0
+  while i < n {
+    let start = i
+    let l = levels[i]
+    while i < n && levels[i] == l {
+      i += 1
+    }
+    runs.push((start, i, l))
+  }
+  let order = text::visual_order(arr_map(runs, fn(r : (Int, Int, Int)) -> Int { r.2 }))
+  arr_map(order, fn(k : Int) -> (Int, Int, Bool) { (runs[k].0, runs[k].1, runs[k].2 % 2 == 1) })
+}
+
+fn shape_with_font(
+  chunk : TextChunk,
+  font : ResolvedFont,
+  small_caps : Bool,
+  kerning : Bool,
+  variations : Array[(String, Float)],
+  font_size : Float,
+  optical_auto : Bool,
+) -> Array[TGlyph] {
+  let out : Array[TGlyph] = []
+  // an instance at the variations' location, with opsz following the font size when sizing is automatic
+  let shaper = if variations.length() == 0 && !(optical_auto && font.face.has_axis("opsz")) {
+    font.shaper
+  } else {
+    shape::ShapeFont::new(font.face, coords=font.face.coords(effective_variations(font.face, variations, font_size, optical_auto)))
+  }
+  for run in visual_runs(chunk) {
+    let (a, b, rtl) = run
+    if a >= b {
+      continue
+    }
+    let run_start = chunk.bytes[a]
+    let run_end = if b < chunk.chars.length() { chunk.bytes[b] } else { chunk.byte_len }
+    let shaped = shape_run(shaper, chunk, a, b, rtl, kerning, small_caps)
+    for i, g in shaped {
+      let start = g.cluster
+      let next = if rtl { i - 1 } else { i + 1 }
+      let end = if next >= 0 && next < shaped.length() { shaped[next].cluster } else { run_end - run_start }
+      out.push(TGlyph::{
+        id: g.glyph,
+        byte_idx: run_start + start,
+        cluster_len: if end >= start { end - start } else { 0 },
+        dx: g.x_offset,
+        dy: g.y_offset,
+        width: g.x_advance,
+        font,
+      })
+    }
+  }
+  out
+}
+
+/// A glyph's SVG document from the font's `SVG ` table, or the part of it for this glyph (`glyph<id>`).
+fn svg_glyph(face : font::Face, glyph : Int) -> Option[Node] {
+  let (data, start, end) = match face.svg_document(glyph) {
+    Some(v) => v
+    None => { return None }
+  }
+  let data = if data.length() >= 2 && data[0] == (0x1F as Byte) && data[1] == (0x8B as Byte) {
+    match zip::gunzip(data) {
+      Some(d) => d
+      None => return None
+    }
+  } else {
+    data
+  }
+  let text = match utf8_decode(data) {
+    Some(t) => t
+    None => return None
+  }
+  let tree = match tree_from_str(text, Options::default()) {
+    Some(v) => v
+    None => { return None }
+  }
+  if start == end {
+    Some(Node::NGroup(tree.root))
+  } else {
+    node_by_id(tree.root, ("glyph" + (glyph).to_string()))
+  }
+}
+
+fn node_by_id(parent : Group, id : String) -> Option[Node] {
+  for child in parent.children {
+    let child_id = match child {
+      Node::NGroup(g) => g.id
+      Node::NPath(p) => p.id
+      Node::NImage(i) => i.id
+      Node::NText(t) => t.id
+    }
+    if child_id == id {
+      return Some(child)
+    }
+    match child {
+      Node::NGroup(g) =>
+        match node_by_id(g, id) {
+          Some(n) => return Some(n)
+          None => ()
+        }
+      _ => ()
+    }
+  }
+  None
+}
+
+/// A glyph's embedded PNG picture (sbix or CBDT) as an image, with where it goes.
+fn raster_glyph(g : PosGlyph) -> Option[(SImage, skia::Transform)] {
+  let bg = match g.face.bitmap_glyph(g.id) {
+    Some(v) => v
+    None => { return None }
+  }
+  if bg.png.length() == 0 {
+    return None
+  }
+  let w = fi(bg.width)
+  let h = fi(bg.height)
+  let size = match skia::Size::from_wh(w, h) {
+    Some(v) => v
+    None => { return None }
+  }
+  let abs_bbox = match skia::NonZeroRect::from_xywh(0.0f, 0.0f, w, h) {
+    Some(v) => v
+    None => { return None }
+  }
+  let image : SImage = SImage::{
+    id: "",
+    visible: true,
+    size,
+    rendering: ImageRendering::OptimizeQuality,
+    kind: ImageData::Encoded("png", bg.png),
+    abs_bbox,
+  }
+  let upem = fi(g.units_per_em)
+  let x = fi(f2i(bg.inner_bearing_x))
+  let y = fi(f2i(bg.inner_bearing_y))
+  let ppem = fi(f2i(bg.ppem_x))
+  let ts = if bg.is_sbix {
+    let (x_min, y_min) = match g.face.glyph_bbox(g.id) {
+      Some((x0, y0, _, _)) => (fi(x0), fi(y0))
+      None => (0.0f, 0.0f)
+    }
+    let y_shift : Float = if approx_eq_ulps(y_min, 0.0f, 4) { 0.128f * upem } else { -y_min }
+    g.transform()
+    .pre_concat(skia::Transform::from_translate(-x_min, y_shift))
+    .pre_concat(skia::Transform::from_scale(upem / ppem, upem / ppem))
+    .pre_translate(x, -h - y)
+  } else {
+    g.transform().pre_concat(skia::Transform::from_scale(upem / ppem, upem / ppem)).pre_translate(x, -y)
+  }
+  Some((image, ts))
+}
+
+/// The span's variations, plus opsz at the font size where sizing is automatic and the font has that axis without
+/// it being set (usvg's effective_variations).
+fn effective_variations(face : font::Face, variations : Array[(String, Float)], font_size : Float, optical_auto : Bool) -> Array[(String, Float)] {
+  if optical_auto && !arr_any(variations, fn(v : (String, Float)) -> Bool { v.0 == "opsz" }) && face.has_axis("opsz") {
+    let out = variations.copy()
+    out.push(("opsz", font_size))
+    out
+  } else {
+    variations
+  }
+}
+
+/// Rust's i16 wrapping addition result as an Int.
+fn i16_wrap(v : Int) -> Int {
+  let w = v & 0xFFFF
+  if w >= 0x8000 {
+    w - 0x10000
+  } else {
+    w
+  }
+}

@@ -1,0 +1,549 @@
+import "skia"
+
+// usvg's render tree (tree/mod.rs): groups, paths, images and text as resvg draws them, with paint
+// servers, clip paths, masks and filters resolved into user space.
+
+struct Rgb {
+  r : Int
+  g : Int
+  b : Int
+}
+
+let rgb_black : Rgb = Rgb::{ r: 0, g: 0, b: 0 }
+
+struct Stop {
+  offset : Float
+  color : Rgb
+  opacity : Float
+}
+
+struct BaseGradient {
+  units : Units
+  transform : skia::Transform
+  spread : skia::SpreadMode
+  stops : Array[Stop]
+}
+
+struct LinearGradient {
+  base : BaseGradient
+  x1 : Float
+  y1 : Float
+  x2 : Float
+  y2 : Float
+}
+
+struct RadialGradient {
+  base : BaseGradient
+  cx : Float
+  cy : Float
+  r : Float
+  fx : Float
+  fy : Float
+  fr : Float
+}
+
+struct SPattern {
+  units : Units
+  content_units : Units
+  transform : skia::Transform
+  rect : skia::NonZeroRect
+  view_box : Option[SViewBox]
+  root : Group
+}
+
+enum Paint {
+  PColor(Rgb)
+  PLinear(LinearGradient)
+  PRadial(RadialGradient)
+  PPattern(SPattern)
+}
+
+fn paint_units(self : Paint) -> Units {
+  match self {
+    Paint::PColor(_) => Units::UserSpaceOnUse
+    Paint::PLinear(g) => g.base.units
+    Paint::PRadial(g) => g.base.units
+    Paint::PPattern(p) => p.units
+  }
+}
+
+fn paint_content_units(self : Paint) -> Units {
+  match self {
+    Paint::PPattern(p) => p.content_units
+    _ => Units::UserSpaceOnUse
+  }
+}
+
+#derive(Eq)
+enum ContextElement {
+  UseNode
+  PathNode
+}
+
+struct Fill {
+  paint : Paint
+  opacity : Float
+  rule : skia::FillRule
+  context : Option[ContextElement]
+}
+
+fn Fill::default() -> Fill {
+  Fill::{ paint: Paint::PColor(rgb_black), opacity: 1.0f, rule: skia::FillRule::Winding, context: None }
+}
+
+struct SStroke {
+  paint : Paint
+  dasharray : Option[Array[Float]]
+  dashoffset : Float
+  miterlimit : Float
+  opacity : Float
+  width : Float
+  linecap : skia::LineCap
+  linejoin : skia::LineJoin
+  context : Option[ContextElement]
+}
+
+fn SStroke::to_skia(self : SStroke) -> skia::Stroke {
+  let s = skia::Stroke::default()
+  s.width = self.width
+  s.miter_limit = self.miterlimit
+  s.line_cap = self.linecap
+  s.line_join = self.linejoin
+  match self.dasharray {
+    Some(list) => s.dash = skia::StrokeDash::new(list.copy(), self.dashoffset)
+    None => ()
+  }
+  s
+}
+
+struct ClipPath {
+  transform : skia::Transform
+  clip_path : Option[ClipPath]
+  root : Group
+}
+
+enum MaskType {
+  Luminance
+  Alpha
+}
+
+struct Mask {
+  rect : skia::NonZeroRect
+  kind : MaskType
+  mask : Option[Mask]
+  root : Group
+}
+
+#derive(Eq)
+enum PaintOrder {
+  FillAndStroke
+  StrokeAndFill
+}
+
+struct SPath {
+  id : String
+  visible : Bool
+  mut fill : Option[Fill]
+  mut stroke : Option[SStroke]
+  paint_order : PaintOrder
+  rendering : ShapeRendering
+  data : skia::Path
+  abs_transform : skia::Transform
+}
+
+fn SPath::copy(self : SPath) -> SPath {
+  SPath::{ id: self.id, visible: self.visible, fill: self.fill, stroke: self.stroke, paint_order: self.paint_order, rendering: self.rendering, data: self.data, abs_transform: self.abs_transform }
+}
+
+struct Group {
+  mut id : String
+  mut transform : skia::Transform
+  mut abs_transform : skia::Transform
+  opacity : Float
+  blend_mode : skia::BlendMode
+  isolate : Bool
+  mut clip_path : Option[ClipPath]
+  mut is_context_element : Bool
+  mut mask : Option[Mask]
+  mut filters : Array[Filter]
+  children : Array[Node]
+  /// bounding boxes set where they are not the children's (an image's slice: its viewport)
+  mut fixed_bbox : Option[skia::Rect]
+  mut fixed_abs_bbox : Option[skia::Rect]
+}
+
+fn Group::empty() -> Group {
+  Group::{
+    id: "",
+    transform: skia::Transform::default(),
+    abs_transform: skia::Transform::default(),
+    opacity: 1.0f,
+    blend_mode: skia::BlendMode::SourceOver,
+    isolate: false,
+    clip_path: None,
+    is_context_element: false,
+    mask: None,
+    filters: [],
+    children: [],
+    fixed_bbox: None,
+    fixed_abs_bbox: None,
+  }
+}
+
+/// A copy whose children are copies (Group::clone).
+fn Group::deep_copy(self : Group) -> Group {
+  Group::{ id: self.id, transform: self.transform, abs_transform: self.abs_transform, opacity: self.opacity, blend_mode: self.blend_mode, isolate: self.isolate, clip_path: self.clip_path, is_context_element: self.is_context_element, mask: self.mask, filters: self.filters, children: arr_map(self.children, fn(n : Node) -> Node { node_deep_copy(n) }), fixed_bbox: self.fixed_bbox, fixed_abs_bbox: self.fixed_abs_bbox }
+}
+
+enum Node {
+  NGroup(Group)
+  NPath(SPath)
+  NImage(SImage)
+  NText(SText)
+}
+
+fn node_deep_copy(self : Node) -> Node {
+  match self {
+    Node::NGroup(g) => Node::NGroup(g.deep_copy())
+    Node::NPath(p) => Node::NPath(p.copy())
+    Node::NImage(i) => Node::NImage(i)
+    Node::NText(t) => Node::NText(t)
+  }
+}
+
+struct SImage {
+  id : String
+  visible : Bool
+  size : skia::Size
+  rendering : ImageRendering
+  kind : ImageData
+  abs_bbox : skia::NonZeroRect
+}
+
+/// Text, drawn as its outlines (`flattened`); its own bounding boxes as laid out.
+struct SText {
+  id : String
+  bounding_box : skia::Rect
+  abs_bounding_box : skia::Rect
+  stroke_bounding_box : skia::Rect
+  abs_stroke_bounding_box : skia::Rect
+  flattened : Group
+}
+
+struct Tree {
+  mut size : skia::Size
+  root : Group
+}
+
+// ── bounding boxes ────────────────────────────────────────────────────
+
+struct BBox {
+  left : Float
+  top : Float
+  right : Float
+  bottom : Float
+}
+
+fn BBox::default() -> BBox {
+  BBox::{ left: f32_max, top: f32_max, right: -f32_max, bottom: -f32_max }
+}
+
+fn BBox::is_default(self : BBox) -> Bool {
+  self.left == f32_max && self.top == f32_max && self.right == -f32_max && self.bottom == -f32_max
+}
+
+fn BBox::expand(self : BBox, l : Float, t : Float, r : Float, b : Float) -> BBox {
+  BBox::{ left: fmin(self.left, l), top: fmin(self.top, t), right: fmax(self.right, r), bottom: fmax(self.bottom, b) }
+}
+
+fn BBox::expand_rect(self : BBox, r : skia::Rect) -> BBox {
+  self.expand(r.left, r.top, r.right, r.bottom)
+}
+
+fn BBox::to_rect(self : BBox) -> Option[skia::Rect] {
+  if self.is_default() {
+    None
+  } else {
+    skia::Rect::from_ltrb(self.left, self.top, self.right, self.bottom)
+  }
+}
+
+fn BBox::to_non_zero_rect(self : BBox) -> Option[skia::NonZeroRect] {
+  if self.is_default() {
+    None
+  } else {
+    skia::NonZeroRect::from_ltrb(self.left, self.top, self.right, self.bottom)
+  }
+}
+
+fn node_to_parent_coordinates(self : Node, r : skia::Rect) -> skia::Rect {
+  match self {
+    Node::NGroup(g) => r.transform(g.transform).unwrap_or(r)
+    _ => r
+  }
+}
+
+fn node_bounding_box(self : Node) -> Option[skia::Rect] {
+  match self {
+    Node::NGroup(g) => g.bounding_box()
+    Node::NPath(p) => p.bounding_box()
+    Node::NImage(i) => Some(i.bounding_box())
+    Node::NText(t) => Some(t.bounding_box)
+  }
+}
+
+fn node_abs_bounding_box(self : Node) -> Option[skia::Rect] {
+  match self {
+    Node::NGroup(g) => g.abs_bounding_box()
+    Node::NPath(p) => p.abs_bounding_box()
+    Node::NImage(i) => Some(i.abs_bbox.to_rect())
+    Node::NText(t) => Some(t.abs_bounding_box)
+  }
+}
+
+fn node_stroke_bounding_box(self : Node) -> Option[skia::Rect] {
+  match self {
+    Node::NGroup(g) => g.stroke_bounding_box()
+    Node::NPath(p) => p.stroke_bounding_box()
+    Node::NImage(i) => Some(i.bounding_box())
+    Node::NText(t) => Some(t.stroke_bounding_box)
+  }
+}
+
+fn node_abs_stroke_bounding_box(self : Node) -> Option[skia::Rect] {
+  match self {
+    Node::NGroup(g) => g.abs_stroke_bounding_box()
+    Node::NPath(p) => p.abs_stroke_bounding_box()
+    Node::NImage(i) => Some(i.abs_bbox.to_rect())
+    Node::NText(t) => Some(t.abs_stroke_bounding_box)
+  }
+}
+
+fn SImage::bounding_box(self : SImage) -> skia::Rect {
+  opt_unwrap(skia::Rect::from_xywh(0.0f, 0.0f, self.size.width, self.size.height))
+}
+
+fn Group::union_of_children(self : Group, f : (Node) -> Option[skia::Rect]) -> Option[skia::Rect] {
+  let mut bbox = BBox::default()
+  for child in self.children {
+    match f(child) {
+      Some(r) => bbox = bbox.expand_rect(r)
+      None => ()
+    }
+  }
+  bbox.to_rect()
+}
+
+fn Group::bounding_box(self : Group) -> Option[skia::Rect] {
+  if (match self.fixed_bbox { Some(_) => true, None => false }) {
+    return self.fixed_bbox
+  }
+  self.union_of_children(fn(c : Node) -> Option[skia::Rect] {
+    match node_bounding_box(c) {
+      Some(r) => Some(node_to_parent_coordinates(c, r))
+      None => None
+    }
+  })
+}
+
+fn Group::abs_bounding_box(self : Group) -> Option[skia::Rect] {
+  if (match self.fixed_abs_bbox { Some(_) => true, None => false }) {
+    return self.fixed_abs_bbox
+  }
+  self.union_of_children(fn(c : Node) -> Option[skia::Rect] { node_abs_bounding_box(c) })
+}
+
+fn Group::stroke_bounding_box(self : Group) -> Option[skia::Rect] {
+  if (match self.fixed_bbox { Some(_) => true, None => false }) {
+    return self.fixed_bbox
+  }
+  self.union_of_children(fn(c : Node) -> Option[skia::Rect] {
+    match node_stroke_bounding_box(c) {
+      Some(r) => Some(node_to_parent_coordinates(c, r))
+      None => None
+    }
+  })
+}
+
+fn Group::abs_stroke_bounding_box(self : Group) -> Option[skia::Rect] {
+  if (match self.fixed_abs_bbox { Some(_) => true, None => false }) {
+    return self.fixed_abs_bbox
+  }
+  self.union_of_children(fn(c : Node) -> Option[skia::Rect] { node_abs_stroke_bounding_box(c) })
+}
+
+fn Group::filters_bounding_box(self : Group) -> Option[skia::NonZeroRect] {
+  let mut full = BBox::default()
+  for f in self.filters {
+    full = full.expand(f.rect.left, f.rect.top, f.rect.right, f.rect.bottom)
+  }
+  full.to_non_zero_rect()
+}
+
+fn Group::layer_bounding_box(self : Group) -> Option[skia::NonZeroRect] {
+  match self.filters_bounding_box() {
+    Some(r) => return Some(r)
+    None => ()
+  }
+  let layer = match
+    self.union_of_children(fn(c : Node) -> Option[skia::Rect] {
+      match c {
+        Node::NGroup(g) =>
+          match g.layer_bounding_box() {
+            Some(r) =>
+              match r.transform(g.transform) {
+                Some(t) => Some(t.to_rect())
+                None => None
+              }
+            None => None
+          }
+        _ => node_stroke_bounding_box(c)
+      }
+    }) {
+    Some(r) => r
+    None => return None
+  }
+  let layer = match self.clip_path {
+    Some(clip) => {
+      let cb = match clip.root.stroke_bounding_box() {
+        Some(r) =>
+          match r.transform(clip.transform) {
+            Some(t) => t
+            None => return None
+          }
+        None => return None
+      }
+      match layer.intersect(cb) {
+        Some(r) => r
+        None => return None
+      }
+    }
+    None => layer
+  }
+  layer.to_non_zero_rect()
+}
+
+fn Group::should_isolate(self : Group) -> Bool {
+  self.isolate ||
+  self.opacity != 1.0f ||
+  (match self.clip_path { Some(_) => true, None => false }) ||
+  (match self.mask { Some(_) => true, None => false }) ||
+  self.filters.length() > 0 ||
+  self.blend_mode != skia::BlendMode::SourceOver
+}
+
+fn SPath::bounding_box(self : SPath) -> Option[skia::Rect] {
+  self.data.compute_tight_bounds()
+}
+
+fn SPath::abs_bounding_box(self : SPath) -> Option[skia::Rect] {
+  if self.abs_transform.has_skew() {
+    match self.data.transform(self.abs_transform) {
+      Some(p) => p.compute_tight_bounds()
+      None => None
+    }
+  } else {
+    match self.bounding_box() {
+      Some(r) => r.transform(self.abs_transform)
+      None => None
+    }
+  }
+}
+
+fn calculate_stroke_bbox(stroke : Option[SStroke], path : skia::Path) -> Option[skia::Rect] {
+  let s = match stroke {
+    Some(s) => s.to_skia()
+    None => return None
+  }
+  s.dash = None
+  match path.stroke(s, 1.0f) {
+    Some(p) => p.compute_tight_bounds()
+    None => None
+  }
+}
+
+fn SPath::stroke_bounding_box(self : SPath) -> Option[skia::Rect] {
+  match calculate_stroke_bbox(self.stroke, self.data) {
+    Some(r) => Some(r)
+    None => self.bounding_box()
+  }
+}
+
+fn SPath::abs_stroke_bounding_box(self : SPath) -> Option[skia::Rect] {
+  if (match self.stroke { None => true, _ => false }) {
+    self.abs_bounding_box()
+  } else if self.abs_transform.has_skew() {
+    let abs = match self.data.transform(self.abs_transform) {
+      Some(p) => p
+      None => return None
+    }
+    match calculate_stroke_bbox(self.stroke, abs) {
+      Some(r) => Some(r)
+      None => self.abs_bounding_box()
+    }
+  } else {
+    match self.stroke_bounding_box() {
+      Some(r) => r.transform(self.abs_transform)
+      None => None
+    }
+  }
+}
+
+// ── view boxes ─────────────────────────────────────────
+
+struct SViewBox {
+  rect : skia::NonZeroRect
+  aspect : AspectRatio
+}
+
+fn SViewBox::to_transform(self : SViewBox, size : skia::Size) -> skia::Transform {
+  let vr = self.rect
+  let sx0 = size.width / vr.width()
+  let sy0 = size.height / vr.height()
+  let (sx, sy) = if self.aspect.align == Align::AlignNone {
+    (sx0, sy0)
+  } else {
+    let s = if self.aspect.slice {
+      if sx0 < sy0 {
+        sy0
+      } else {
+        sx0
+      }
+    } else if sx0 > sy0 {
+      sy0
+    } else {
+      sx0
+    }
+    (s, s)
+  }
+  let x = -vr.x() * sx
+  let y = -vr.y() * sy
+  let w = size.width - vr.width() * sx
+  let h = size.height - vr.height() * sy
+  let (tx, ty) = aligned_pos(self.aspect.align, x, y, w, h)
+  skia::Transform::from_row(sx, 0.0f, 0.0f, sy, tx, ty)
+}
+
+fn aligned_pos(align : Align, x : Float, y : Float, w : Float, h : Float) -> (Float, Float) {
+  match align {
+    Align::AlignNone | Align::XMinYMin => (x, y)
+    Align::XMidYMin => (x + w / 2.0f, y)
+    Align::XMaxYMin => (x + w, y)
+    Align::XMinYMid => (x, y + h / 2.0f)
+    Align::XMidYMid => (x + w / 2.0f, y + h / 2.0f)
+    Align::XMaxYMid => (x + w, y + h / 2.0f)
+    Align::XMinYMax => (x, y + h)
+    Align::XMidYMax => (x + w / 2.0f, y + h)
+    Align::XMaxYMax => (x + w, y + h)
+  }
+}
+
+fn size_to_non_zero_rect(s : skia::Size, x : Float, y : Float) -> skia::NonZeroRect {
+  opt_unwrap(skia::NonZeroRect::from_xywh(x, y, s.width, s.height))
+}
+
+fn size_to_int_size(s : skia::Size) -> skia::IntSize {
+  let w = f2u(fround(s.width))
+  let h = f2u(fround(s.height))
+  opt_unwrap(skia::IntSize::from_wh(if w < 1 { 1 } else { w }, if h < 1 { 1 } else { h }))
+}

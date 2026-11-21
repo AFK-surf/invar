@@ -1,0 +1,487 @@
+import "skia"
+import "zip"
+
+// resvg: a render tree drawn into a pixmap with the skia port.
+
+struct RContext {
+  max_bbox : skia::IntRect
+}
+
+/// An SVG document drawn into a new pixmap `width` wide (its height by the document's aspect ratio), as
+/// resvg's tests draw one; None where the text is not an SVG document.
+pub fn render_svg_to_width(text : String, width : Int, opt : Options) -> Option[skia::Pixmap] {
+  let tree = match tree_from_str(text, opt) {
+    Some(t) => t
+    None => return None
+  }
+  let size = match size_to_int_size(tree.size).scale_to_width(width) {
+    Some(s) => s
+    None => return None
+  }
+  let pixmap = match skia::Pixmap::new(size.width, size.height) {
+    Some(p) => p
+    None => return None
+  }
+  let ts = skia::Transform::from_scale(fi(size.width) / tree.size.width, fi(size.height) / tree.size.height)
+  render_tree(tree, ts, pixmap)
+  Some(pixmap)
+}
+
+/// The size an SVG document says it is drawn at.
+pub fn svg_size(text : String, opt : Options) -> Option[(Float, Float)] {
+  match tree_from_str(text, opt) {
+    Some(t) => Some((t.size.width, t.size.height))
+    None => None
+  }
+}
+
+/// An SVG document drawn into `pixmap` under `transform` (resvg::render).
+pub fn render_svg(text : String, opt : Options, transform : skia::Transform, pixmap : skia::Pixmap) -> Bool {
+  match tree_from_str(text, opt) {
+    Some(t) => {
+      render_tree(t, transform, pixmap)
+      true
+    }
+    None => false
+  }
+}
+
+fn render_tree(tree : Tree, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  let ctx : RContext = RContext::{ max_bbox: max_filter_bbox(pixmap.width, pixmap.height) }
+  render_nodes(tree.root, ctx, transform, pixmap)
+}
+
+fn max_filter_bbox(width : Int, height : Int) -> skia::IntRect {
+  let x = width.to_int64() * -2L
+  let y = height.to_int64() * -2L
+  let w = width.to_int64() * 5L
+  let h = height.to_int64() * 5L
+  let fits = x >= -2147483648L && y >= -2147483648L && w <= 4294967295L && h <= 4294967295L
+  let r = if fits && w <= 2147483647L && h <= 2147483647L {
+    skia::IntRect::from_xywh(x.to_int(), y.to_int(), w.to_int(), h.to_int())
+  } else {
+    None
+  }
+  match r {
+    Some(r) => r
+    None => opt_unwrap(skia::IntRect::from_ltrb(-2147483648 / 2, -2147483648 / 2, 2147483647 / 2, 2147483647 / 2))
+  }
+}
+
+fn render_nodes(parent : Group, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  for node in parent.children {
+    render_node(node, ctx, transform, pixmap)
+  }
+}
+
+fn render_node(node : Node, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  match node {
+    Node::NGroup(g) => ignore(render_group(g, ctx, transform, pixmap))
+    Node::NPath(p) => render_path(p, skia::BlendMode::SourceOver, ctx, transform, pixmap)
+    Node::NImage(i) => render_image(i, transform, pixmap)
+    Node::NText(t) => ignore(render_group(t.flattened, ctx, transform, pixmap))
+  }
+}
+
+fn render_group(group : Group, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Option[Unit] {
+  let transform = transform.pre_concat(group.transform)
+  if !group.should_isolate() {
+    render_nodes(group, ctx, transform, pixmap)
+    return Some(())
+  }
+  let rest = if group.filters.length() == 0 {
+    skia::Transform::identity()
+  } else {
+    let sx = fhypot(transform.sx, transform.ky)
+    let sy = fhypot(transform.kx, transform.sy)
+    skia::Transform::from_row(transform.sx / sx, transform.ky / sx, transform.kx / sy, transform.sy / sy, 0.0f, 0.0f)
+  }
+  let inv_rest = match rest.invert() {
+    Some(v) => v
+    None => { return None }
+  }
+  let mb = match ctx.max_bbox.to_rect().transform(inv_rest) {
+    Some(v) => v
+    None => { return None }
+  }
+  let max_bbox = match mb.round_out() {
+    Some(v) => v
+    None => { return None }
+  }
+  let (layer, ibbox) = match render_layer(group, RContext::{ max_bbox }, inv_rest.pre_concat(transform)) {
+    Some(v) => v
+    None => {
+    return None
+    }
+  }
+  let paint = skia::Paint::default()
+  paint.shader = skia::Pattern::new(
+    layer,
+    skia::SpreadMode::Pad,
+    skia::FilterQuality::Bilinear,
+    group.opacity,
+    skia::Transform::from_translate(fi(ibbox.x), fi(ibbox.y)),
+  )
+  paint.blend_mode = group.blend_mode
+  paint.anti_alias = true
+  let path = skia::PathBuilder::from_rect(ibbox.to_rect())
+  pixmap.fill_path(path, paint, skia::FillRule::Winding, rest, None)
+  Some(())
+}
+
+fn render_layer(group : Group, ctx : RContext, transform : skia::Transform) -> Option[(skia::Pixmap, skia::IntRect)] {
+  let lb = match group.layer_bounding_box() {
+    Some(v) => v
+    None => { return None }
+  }
+  let bbox = match lb.transform(transform) {
+    Some(v) => v
+    None => { return None }
+  }
+  let mut ibbox = if group.filters.length() == 0 {
+    let x = match checked_sub_i32(f2i(bbox.x().floor()), 2) {
+      Some(v) => v
+      None => { return None }
+    }
+    let y = match checked_sub_i32(f2i(bbox.y().floor()), 2) {
+      Some(v) => v
+      None => { return None }
+    }
+    let w = match checked_add_u32(f2u(bbox.width().ceil()), 4) {
+      Some(v) => v
+      None => { return None }
+    }
+    let h = match checked_add_u32(f2u(bbox.height().ceil()), 4) {
+      Some(v) => v
+      None => { return None }
+    }
+    let r = match skia::IntRect::from_xywh(x, y, w, h) {
+      Some(v) => v
+      None => { return None }
+    }
+    r
+  } else {
+    let b = match skia::IntRect::from_xywh(
+        f2i(f_floor(bbox.x())),
+        f2i(f_floor(bbox.y())),
+        f2u(fmax(f_ceil(bbox.width()), 1.0f)),
+        f2u(fmax(f_ceil(bbox.height()), 1.0f)),
+      ) {
+      Some(v) => v
+      None => return None
+    }
+    let r = match fit_to_rect(b, ctx.max_bbox) {
+      Some(v) => v
+      None => { return None }
+    }
+    r
+  }
+  if group.filters.length() == 0 {
+    let r = match fit_to_rect(ibbox, ctx.max_bbox) {
+      Some(v) => v
+      None => { return None }
+    }
+    ibbox = r
+  }
+  let shift_ts = {
+    let mut dx = bbox.x()
+    let mut dy = bbox.y()
+    dx = dx - (bbox.x() - fi(ibbox.x))
+    dy = dy - (bbox.y() - fi(ibbox.y))
+    skia::Transform::from_translate(-dx, -dy)
+  }
+  let transform = shift_ts.pre_concat(transform)
+  let sub = match skia::Pixmap::new(ibbox.width, ibbox.height) {
+    Some(v) => v
+    None => { return None }
+  }
+  render_nodes(group, ctx, transform, sub)
+  for f in group.filters {
+    apply_filter(f, transform, sub)
+  }
+  match group.clip_path {
+    Some(c) => apply_clip(c, transform, sub)
+    None => ()
+  }
+  match group.mask {
+    Some(m) => apply_mask(m, ctx, transform, sub)
+    None => ()
+  }
+  Some((sub, ibbox))
+}
+
+fn checked_sub_i32(a : Int, b : Int) -> Option[Int] {
+  let r = a.to_int64() - b.to_int64()
+  if r < -2147483648L {
+    None
+  } else {
+    Some(r.to_int())
+  }
+}
+
+/// u32 + u32 checked; the operands are below 2^31 here (f2u saturates there), so is the sum's range check.
+fn checked_add_u32(a : Int, b : Int) -> Option[Int] {
+  let r = a.to_int64() + b.to_int64()
+  if r > 4294967295L {
+    None
+  } else if r > 2147483647L {
+    // (an IntRect's size must fit an i32 anyway)
+    None
+  } else {
+    Some(r.to_int())
+  }
+}
+
+fn fit_to_rect(r : skia::IntRect, bounds : skia::IntRect) -> Option[skia::IntRect] {
+  let left = if r.left() < bounds.left() { bounds.left() } else { r.left() }
+  let top = if r.top() < bounds.top() { bounds.top() } else { r.top() }
+  let right = if r.right() > bounds.right() { bounds.right() } else { r.right() }
+  let bottom = if r.bottom() > bounds.bottom() { bounds.bottom() } else { r.bottom() }
+  skia::IntRect::from_ltrb(left, top, right, bottom)
+}
+
+// ── paths ───────────────────────────────────────────────────
+
+fn render_path(path : SPath, blend : skia::BlendMode, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  if !path.visible {
+    return
+  }
+  if path.paint_order == PaintOrder::FillAndStroke {
+    ignore(fill_path(path, blend, ctx, transform, pixmap))
+    ignore(stroke_path(path, blend, ctx, transform, pixmap))
+  } else {
+    ignore(stroke_path(path, blend, ctx, transform, pixmap))
+    ignore(fill_path(path, blend, ctx, transform, pixmap))
+  }
+}
+
+fn paint_shader(paint : Paint, opacity : Float, ctx : RContext, transform : skia::Transform) -> Option[skia::Shader] {
+  match paint {
+    Paint::PColor(c) => Some(skia::Shader::SolidColor(skia::Color::from_rgba8(c.r, c.g, c.b, opacity_u8(opacity))))
+    Paint::PLinear(lg) => {
+      let (mode, points) = convert_base_gradient(lg.base, opacity)
+      skia::LinearGradient::new(
+        skia::Point::from_xy(lg.x1, lg.y1),
+        skia::Point::from_xy(lg.x2, lg.y2),
+        points,
+        mode,
+        lg.base.transform,
+      )
+    }
+    Paint::PRadial(rg) => {
+      let (mode, points) = convert_base_gradient(rg.base, opacity)
+      skia::RadialGradient::new(
+        skia::Point::from_xy(rg.fx, rg.fy),
+        rg.fr,
+        skia::Point::from_xy(rg.cx, rg.cy),
+        rg.r,
+        points,
+        mode,
+        rg.base.transform,
+      )
+    }
+    Paint::PPattern(p) => {
+      let (pix, ts) = match render_pattern_pixmap(p, ctx, transform) {
+        Some(v) => v
+        None => { return None }
+      }
+      Some(skia::Pattern::new(pix, skia::SpreadMode::Repeat, skia::FilterQuality::Bicubic, opacity, ts))
+    }
+  }
+}
+
+fn fill_path(path : SPath, blend : skia::BlendMode, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Option[Unit] {
+  let fill = match path.fill {
+    Some(v) => v
+    None => { return None }
+  }
+  let b = path.data.bounds()
+  if b.width() == 0.0f || b.height() == 0.0f {
+    return None
+  }
+  let paint = skia::Paint::default()
+  let sh = match paint_shader(fill.paint, fill.opacity, ctx, transform) {
+    Some(v) => v
+    None => { return None }
+  }
+  paint.shader = sh
+  paint.anti_alias = shape_rendering_use_aa(path.rendering)
+  paint.blend_mode = blend
+  pixmap.fill_path(path.data, paint, fill.rule, transform, None)
+  Some(())
+}
+
+fn stroke_path(path : SPath, blend : skia::BlendMode, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Option[Unit] {
+  let stroke = match path.stroke {
+    Some(v) => v
+    None => { return None }
+  }
+  let paint = skia::Paint::default()
+  let sh = match paint_shader(stroke.paint, stroke.opacity, ctx, transform) {
+    Some(v) => v
+    None => { return None }
+  }
+  paint.shader = sh
+  paint.anti_alias = shape_rendering_use_aa(path.rendering)
+  paint.blend_mode = blend
+  pixmap.stroke_path(path.data, paint, stroke.to_skia(), transform, None)
+  Some(())
+}
+
+fn convert_base_gradient(g : BaseGradient, opacity : Float) -> (skia::SpreadMode, Array[skia::GradientStop]) {
+  let points : Array[skia::GradientStop] = []
+  for stop in g.stops {
+    let alpha = opacity_clamped(stop.opacity * opacity)
+    let color = skia::Color::from_rgba8(stop.color.r, stop.color.g, stop.color.b, opacity_u8(alpha))
+    points.push(skia::GradientStop::new(stop.offset, color))
+  }
+  (g.spread, points)
+}
+
+fn render_pattern_pixmap(p : SPattern, ctx : RContext, transform : skia::Transform) -> Option[(skia::Pixmap, skia::Transform)] {
+  let (sx, sy) = transform.pre_concat(p.transform).get_scale()
+  let rect = p.rect
+  let size = match skia::IntSize::from_wh(f2u(fround(rect.width() * sx)), f2u(fround(rect.height() * sy))) {
+    Some(v) => v
+    None => {
+    return None
+    }
+  }
+  let pixmap = match skia::Pixmap::new(size.width, size.height) {
+    Some(v) => v
+    None => { return None }
+  }
+  let sx = fi(size.width) / rect.width()
+  let sy = fi(size.height) / rect.height()
+  render_nodes(p.root, ctx, skia::Transform::from_scale(sx, sy), pixmap)
+  let ts = skia::Transform::default()
+    .pre_concat(p.transform)
+    .pre_translate(rect.x(), rect.y())
+    .pre_scale(1.0f / sx, 1.0f / sy)
+  Some((pixmap, ts))
+}
+
+// ── clip paths ──────────────────────────────────────────────
+
+fn apply_clip(clip : ClipPath, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  let clip_pixmap = opt_unwrap(skia::Pixmap::new(pixmap.width, pixmap.height))
+  clip_pixmap.fill(skia::color_black())
+  clip_draw_children(clip.root, skia::BlendMode::Clear, transform.pre_concat(clip.transform), clip_pixmap)
+  match clip.clip_path {
+    Some(c) => apply_clip(c, transform, pixmap)
+    None => ()
+  }
+  let mask = skia::Mask::from_pixmap(clip_pixmap, skia::MaskType::Alpha)
+  mask.invert()
+  pixmap.apply_mask(mask)
+}
+
+fn clip_draw_children(parent : Group, mode : skia::BlendMode, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  for child in parent.children {
+    match child {
+      Node::NPath(p) => {
+        if !p.visible {
+          continue
+        }
+        let ctx : RContext = RContext::{ max_bbox: opt_unwrap(skia::IntRect::from_xywh(0, 0, 1, 1)) }
+        ignore(fill_path(p, mode, ctx, transform, pixmap))
+      }
+      Node::NText(t) => clip_draw_children(t.flattened, mode, transform, pixmap)
+      Node::NGroup(g) => {
+        let ts = transform.pre_concat(g.transform)
+        match g.clip_path {
+          Some(c) => clip_group(g, c, ts, pixmap)
+          None => clip_draw_children(g, mode, ts, pixmap)
+        }
+      }
+      Node::NImage(_) => ()
+    }
+  }
+}
+
+fn clip_group(children : Group, clip : ClipPath, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  let clip_pixmap = opt_unwrap(skia::Pixmap::new(pixmap.width, pixmap.height))
+  clip_draw_children(children, skia::BlendMode::SourceOver, transform, clip_pixmap)
+  apply_clip(clip, transform, clip_pixmap)
+  let paint = skia::PixmapPaint::default()
+  paint.blend_mode = skia::BlendMode::Xor
+  pixmap.draw_pixmap(0, 0, clip_pixmap, paint, skia::Transform::identity(), None)
+}
+
+// ── masks ───────────────────────────────────────────────────
+
+fn apply_mask(mask : Mask, ctx : RContext, transform : skia::Transform, pixmap : skia::Pixmap) -> Unit {
+  if mask.root.children.length() == 0 {
+    pixmap.fill(skia::color_transparent())
+    return
+  }
+  let mask_pixmap = opt_unwrap(skia::Pixmap::new(pixmap.width, pixmap.height))
+  {
+    let alpha_mask = opt_unwrap(skia::Mask::new(pixmap.width, pixmap.height))
+    alpha_mask.fill_path(skia::PathBuilder::from_rect(mask.rect.to_rect()), skia::FillRule::Winding, true, transform)
+    render_nodes(mask.root, ctx, transform, mask_pixmap)
+    mask_pixmap.apply_mask(alpha_mask)
+  }
+  match mask.mask {
+    Some(m) => apply_mask(m, ctx, transform, pixmap)
+    None => ()
+  }
+  let kind : skia::MaskType = match mask.kind {
+    MaskType::Luminance => skia::MaskType::Luminance
+    MaskType::Alpha => skia::MaskType::Alpha
+  }
+  pixmap.apply_mask(skia::Mask::from_pixmap(mask_pixmap, kind))
+}
+
+/// An SVG document's bytes drawn with its longer side `long_side` pixels: (width, height, straight RGBA). None where
+/// they are not one, or it says no size.
+pub fn rasterize(data : Bytes, long_side : Int, opt~ : Option[Options] = None) -> Option[(Int, Int, FixedArray[Byte])] {
+  let opt = opt_unwrap_or(opt, Options::default())
+  let data = if data.length() >= 2 && data[0] == (0x1F as Byte) && data[1] == (0x8B as Byte) {
+    match zip::gunzip(data) {
+      Some(d) => d
+      None => return None
+    }
+  } else {
+    data
+  }
+  let text = match utf8_decode(data) {
+    Some(t) => t
+    None => return None
+  }
+  let tree = match tree_from_str(text, opt) {
+    Some(v) => v
+    None => { return None }
+  }
+  let (w, h) = (tree.size.width, tree.size.height)
+  if !(w > 0.0f && h > 0.0f) || long_side <= 0 {
+    return None
+  }
+  let width = if w >= h { long_side } else { f2i(fround(fi(long_side) * w / h)) }
+  let width = if width < 1 { 1 } else { width }
+  let size = match size_to_int_size(tree.size).scale_to_width(width) {
+    Some(v) => v
+    None => { return None }
+  }
+  let pixmap = match skia::Pixmap::new(size.width, size.height) {
+    Some(v) => v
+    None => { return None }
+  }
+  let ts = skia::Transform::from_scale(fi(size.width) / w, fi(size.height) / h)
+  render_tree(tree, ts, pixmap)
+  // premultiplied to straight
+  let out = FixedArray::make(size.width * size.height * 4, (0x00 as Byte))
+  for i in 0..<(size.width * size.height) {
+    let a = pixmap.data[i * 4 + 3].to_int()
+    if a == 0 {
+      continue
+    }
+    for k in 0..<3 {
+      let c = pixmap.data[i * 4 + k].to_int()
+      let v = (c * 255 + a / 2) / a
+      out[i * 4 + k] = (if v > 255 { 255 } else { v }).to_byte()
+    }
+    out[i * 4 + 3] = a.to_byte()
+  }
+  Some((size.width, size.height, out))
+}
