@@ -1,0 +1,251 @@
+// Unit tests for packages/lg: button, interactive highlight, toggle, slider, bottom tabs, dialog, damped drag,
+// and glass rendering stability. Ported from libs/liquid-glass/src/lg/parts_wbtest.mbt.
+
+import "signals"
+import "ui"
+import "view"
+
+let springs_out : Double = 1000.0
+let a_frame : Double = ui::input_step_ms
+
+fn lg_case(make : (view::View) -> Unit, dark~ : Bool = false, w~ : Double = 800.0, h~ : Double = 600.0) -> ui::Tester {
+  set_dark(Some(dark))
+  ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(page) {
+        let _ = page
+          .grow(view::Live::Is(1.0))
+          .padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+          .gap(view::Live::Is(24.0))
+          .lines_up(view::Live::Is(Some(view::Along::Start)))
+          .ground(view::Live::By(fn() { if is_dark() { 0x202024FFL } else { 0x8899AAFFL } }))
+        make(page)
+      })
+    },
+    width=w,
+    height=h,
+    theme=ui_theme,
+    platform=0,
+    dark=dark,
+  )
+}
+
+fn require_drawn(t : ui::Tester, name : String, role : view::Role) -> view::Drawn {
+  match t.get(name, role=role) {
+    Some(d) => d
+    None => {
+      debug_assert(false, "expected drawn node \{name}")
+      t.drawn()[0]
+    }
+  }
+}
+
+test "lg_liquid_button_press_and_drag_cancel" {
+  let pressed = ui::ref_new(0)
+  let t = lg_case(fn(p) {
+    let _ = liquid_button_node(p, fn() { "Send" }, fn() { pressed.v = pressed.v + 1 })
+  })
+  let d = require_drawn(t, "Send", view::Role::Button)
+  let x = d.x + d.w / 2.0
+  let y = d.y + d.h / 2.0
+  t.tap(x, y)
+  t.key(ui::key_tab)
+  t.enter()
+  let after_keys = pressed.v
+  t.drag(x, y, x + 400.0, y + 200.0)
+  t.run_shown(springs_out)
+  debug_assert(after_keys == 2, "tap + Tab/Enter must press button twice")
+  debug_assert(pressed.v == 2, "drag released outside button must not press")
+  debug_assert((d.h - button_h).abs() < 0.01, "button height must equal button_h")
+  t.dispose()
+}
+
+test "lg_liquid_button_interactive_highlight" {
+  let light = InteractiveHighlight::new()
+  let t = lg_case(fn(p) {
+    let _ = liquid_button_node(p, fn() { "Send" }, fn() { () }, light=light)
+  })
+  let d = require_drawn(t, "Send", view::Role::Button)
+  t.press_at(d.x + 10.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  let node = match light.node.v {
+    Some(n) => n
+    None => { debug_assert(false, "light node must be attached"); t.dispose(); return }
+  }
+  let held_p = light.pressed(node) > 0.99
+  let held_spot = light.spot(node, d.w, d.h).0 < 20.0
+  t.move_to(d.x + 60.0, d.y + d.h / 2.0)
+  t.frame(ms=a_frame)
+  let (dx, _) = light.offset(node)
+  let (tx, _, sx, sy) = light.stretch(node)
+  t.release(d.x + 60.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  debug_assert(held_p && held_spot, "button light must rise and track finger spot")
+  debug_assert(dx > 0.0 && tx > 0.0 && sx > sy, "horizontal drag must offset and stretch wider than tall")
+  debug_assert(light.pressed(node) < 0.001, "light must settle after release")
+  t.dispose()
+}
+
+test "lg_liquid_toggle_tap_key_and_drag" {
+  let on = signals::signal(false)
+  let t = lg_case(fn(p) {
+    let _ = liquid_toggle_node(p, fn() { on.get() }, fn(v) { on.set(v) }, fn() { "Wi-Fi" })
+  })
+  let d = require_drawn(t, "Wi-Fi", view::Role::Switch)
+  t.tap(d.x + 20.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  let tapped = on.get()
+  t.key(ui::key_tab)
+  t.key(ui::key_space)
+  t.run_shown(springs_out)
+  let spaced = on.get()
+  t.drag(d.x + 22.0, d.y + d.h / 2.0, d.x + 37.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  let dragged_on = on.get()
+  t.drag(d.x + 42.0, d.y + d.h / 2.0, d.x + 33.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  debug_assert(tapped, "tap must turn toggle on")
+  debug_assert(!spaced, "space key must turn toggle off")
+  debug_assert(dragged_on, "drag past half must turn toggle on")
+  debug_assert(on.get(), "short reverse drag under half must keep toggle on")
+  t.dispose()
+}
+
+test "lg_liquid_toggle_thumb_glass_while_held" {
+  let on = signals::signal(false)
+  let drag = DampedDrag::new(0.0, lo=0.0, hi=1.0, held_scale=thumb_held_scale)
+  let t = lg_case(fn(p) {
+    let _ = liquid_toggle_node(p, fn() { on.get() }, fn(v) { on.set(v) }, fn() { "Wi-Fi" }, drag=drag)
+  })
+  let node = match drag.node.v {
+    Some(n) => n
+    None => { debug_assert(false, "drag node must be attached"); t.dispose(); return }
+  }
+  let rest_p = drag.pressed(node)
+  let rest_j = drag.jelly(node, 50.0)
+  let d = require_drawn(t, "Wi-Fi", view::Role::Switch)
+  t.press_at(d.x + 20.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  let held_p = drag.pressed(node) > 0.999
+  let held_s = drag.jelly(node, 50.0).0 > 1.49
+  t.release(d.x + 20.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  debug_assert(rest_p == 0.0 && rest_j.0 == 1.0 && rest_j.1 == 1.0, "thumb at rest must have zero press and 1x scale")
+  debug_assert(held_p && held_s, "held thumb must reach full glass press and ~1.5x scale")
+  debug_assert(drag.pressed(node) < 0.001 && drag.value(node) > 0.999, "released toggle must settle on")
+  t.dispose()
+}
+
+test "lg_liquid_slider_keys_drag_and_track_tap" {
+  let level = signals::signal(50.0)
+  let t = lg_case(fn(p) {
+    let _ = p.box(fn(b) {
+      let _ = b.width(view::Live::Is(Some(400.0)))
+      let _ = liquid_slider_node(b, fn() { level.get() }, fn(v) { level.set(v) }, fn() { "Volume" })
+    })
+  })
+  let d = require_drawn(t, "Volume", view::Role::Slider)
+  t.key(ui::key_tab)
+  t.key(ui::key_code_right)
+  let keyed = level.get()
+  t.key(ui::key_code_home)
+  let home = level.get()
+  t.run_shown(springs_out)
+  t.drag(d.x + 5.0, d.y + d.h / 2.0, d.x + 105.0, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  let dragged = level.get().round()
+  t.tap(d.x + d.w * 0.75, d.y + d.h / 2.0)
+  t.run_shown(springs_out)
+  debug_assert((keyed - 51.0).abs() < 0.01, "Right arrow must step slider to 51")
+  debug_assert((home - 0.0).abs() < 0.01, "Home key must move slider to 0")
+  debug_assert((dragged - 25.0).abs() < 1.5, "100px drag on 400px track must move to ~25")
+  debug_assert((level.get().round() - 75.0).abs() < 1.5, "tap at 75% track must move to ~75")
+  t.dispose()
+}
+
+test "lg_liquid_bottom_tabs_keys_and_lens_drag" {
+  let chosen = signals::signal(0)
+  let t = lg_case(fn(p) {
+    let _ = p.box(fn(b) {
+      let _ = b.width(view::Live::Is(Some(408.0)))
+      let _ = liquid_bottom_tabs_node(b, ["Home", "Search", "Me"], fn() { chosen.get() }, fn(i) { chosen.set(i) }, label="Tabs")
+    })
+  })
+  let me = require_drawn(t, "Me", view::Role::Tab)
+  t.tap(me.x + me.w / 2.0, me.y + me.h / 2.0)
+  t.run_shown(springs_out)
+  let tapped_me = chosen.get()
+  t.key(ui::key_tab)
+  t.key(ui::key_code_left)
+  t.run_shown(springs_out)
+  let keyed = chosen.get()
+  let search = require_drawn(t, "Search", view::Role::Tab)
+  t.drag(search.x + search.w / 2.0, search.y + search.h / 2.0, search.x + search.w / 2.0 - 200.0, search.y + search.h / 2.0)
+  t.run_shown(springs_out)
+  debug_assert(tapped_me == 2, "tapping Me tab must select index 2")
+  debug_assert(keyed == 1, "Left arrow must move selection to Search (1)")
+  debug_assert(chosen.get() == 0, "dragging lens left over Home must select index 0")
+  t.dispose()
+}
+
+test "lg_liquid_dialog_escape_cancel_and_action" {
+  let open = signals::signal(true)
+  let acted = ui::ref_new(0)
+  let t = lg_case(fn(p) {
+    let _ = liquid_dialog_node(
+      p,
+      fn() { open.get() },
+      fn() { open.set(false) },
+      fn() { "Delete?" },
+      fn() { "It cannot be undone." },
+      on_action=fn() {
+        acted.v = acted.v + 1
+        open.set(false)
+      },
+    )
+  })
+  debug_assert(t.get("Delete?", role=view::Role::Dialog).is_some(), "open dialog must be present")
+  t.key(ui::key_escape)
+  t.run_shown(springs_out)
+  debug_assert(!open.get() && t.get("Delete?", role=view::Role::Dialog).is_none(), "Escape must close dialog")
+  open.set(true)
+  t.frame()
+  t.run_shown(springs_out)
+  t.press("Cancel")
+  t.run_shown(springs_out)
+  debug_assert(!open.get(), "Cancel must close dialog")
+  open.set(true)
+  t.frame()
+  t.run_shown(springs_out)
+  t.press("Okay")
+  t.run_shown(springs_out)
+  debug_assert(!open.get() && acted.v == 1, "Okay must invoke on_action and close dialog")
+  t.dispose()
+}
+
+test "lg_damped_drag_springs_and_jelly" {
+  let drag = DampedDrag::new(0.0, lo=0.0, hi=1.0, held_scale=1.5)
+  let n : ui::Ref[Option[view::View]] = ui::ref_new(None)
+  let t = lg_case(fn(p) {
+    let _ = p.box(fn(b) { n.v = Some(b) })
+  })
+  let node = match n.v {
+    Some(v) => v
+    None => { debug_assert(false, "node must exist"); t.dispose(); return }
+  }
+  drag.attach(node)
+  drag.press()
+  drag.update_value(0.5)
+  t.frame(ms=a_frame)
+  drag.update_value(1.0)
+  t.frame(ms=a_frame)
+  let (sx, sy) = drag.jelly(node, 50.0)
+  let going = drag.velocity(node) > 0.0 && sx > drag.scale_x.shown(node) && sy < drag.scale_y.shown(node)
+  drag.release()
+  t.run_shown(springs_out * 2.0)
+  debug_assert(going, "fast rightward drag must stretch wider and flatter")
+  debug_assert((drag.value(node) - 1.0).abs() < 0.001, "value must settle at 1.0")
+  debug_assert(drag.pressed(node).abs() < 0.001, "press must settle at 0.0")
+  debug_assert(drag.velocity(node).abs() < 0.001, "velocity must settle at 0.0")
+  t.dispose()
+}
