@@ -1,8 +1,16 @@
-// MoonBit C runtime shim + zero-copy Pion FFI bridges for mbui native Apple/macOS host.
-// Lets unmodified upstream libs/mbui/src/host/{apple_*.m,mac_app.m,*.h} link directly into Pion
-// with zero MoonBit runtime dependency.
+// MoonBit C runtime shim + zero-copy Pion FFI bridges for mbui native multi-platform hosts
+// (macOS, iOS, Linux). Lets unmodified upstream libs/mbui/src/host/{apple_*.m,mac_app.m,ios_app.m,linux_*.c,*.h}
+// link directly into Pion with zero MoonBit runtime dependency.
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "moonbit.h"
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#elif defined(__linux__)
+#include <time.h>
+extern void mb_images_upload(void);
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -384,8 +392,23 @@ int32_t pion_host_snapshot(const char *path, int64_t path_len) {
 }
 
 void pion_host_pump_main_loop(double ms) {
+#ifdef __APPLE__
   double sec = ms > 0.0 ? ms / 1000.0 : 0.001;
   CFRunLoopRunInMode(kCFRunLoopDefaultMode, sec, true);
+#elif defined(__linux__)
+  if (ms > 0.0) {
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000.0);
+    ts.tv_nsec = (long)((ms - (double)ts.tv_sec * 1000.0) * 1000000.0);
+    if (ts.tv_nsec < 0) ts.tv_nsec = 0;
+    nanosleep(&ts, NULL);
+  }
+  if (pion_offscreen_active) {
+    mb_images_upload();
+  }
+#else
+  (void)ms;
+#endif
 }
 
 // ---- Run callback bridge ----
