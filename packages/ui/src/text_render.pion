@@ -158,6 +158,47 @@ let glyph_state : GlyphAtlasState = GlyphAtlasState::{
   glyphs: Map::new(),
 }
 
+struct ShapedLine {
+  n : Int
+  locs : Array[Int]
+  advs : Array[Double]
+  gkeys : Array[Int]
+}
+
+struct TextRenderCache {
+  mut metrics_valid : Bool
+  mut metrics_size : Double
+  mut metrics_weight : Int
+  mut metrics_style : Int
+  mut metrics_asc : Double
+  mut metrics_desc : Double
+  mut shape_size : Double
+  mut shape_weight : Int
+  mut shape_style : Int
+  shapes : Map[String, ShapedLine]
+}
+
+let text_cache : TextRenderCache = TextRenderCache::{
+  metrics_valid: false,
+  metrics_size: 0.0,
+  metrics_weight: 0,
+  metrics_style: 0,
+  metrics_asc: 0.0,
+  metrics_desc: 0.0,
+  shape_size: -1.0,
+  shape_weight: -1,
+  shape_style: -1,
+  shapes: Map::new(),
+}
+
+fn clear_text_cache() -> Unit {
+  text_cache.metrics_valid = false
+  text_cache.shape_size = -1.0
+  text_cache.shape_weight = -1
+  text_cache.shape_style = -1
+  text_cache.shapes.clear()
+}
+
 /// Reset glyph atlas caches (called on view_forget or host switch).
 pub fn reset_glyph_atlas() -> Unit {
   glyph_state.mono.clear()
@@ -166,6 +207,7 @@ pub fn reset_glyph_atlas() -> Unit {
   glyph_state.gen = -1
   glyph_state.scale = 0.0
   glyph_state.initialized = false
+  clear_text_cache()
 }
 
 fn ensure_glyph_atlas(scale : Double) -> Unit {
@@ -183,6 +225,7 @@ fn ensure_glyph_atlas(scale : Double) -> Unit {
     glyph_state.gen = gen
     glyph_state.scale = scale
     glyph_state.initialized = true
+    clear_text_cache()
   }
 }
 
@@ -190,7 +233,6 @@ fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
   if key < 0 {
     return None
   }
-  ensure_glyph_atlas(scale)
   match glyph_state.glyphs.get(key) {
     Some(slot) => {
       if slot.plot >= 0 {
@@ -249,10 +291,24 @@ fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
 }
 
 fn split_lines(s : String) -> Array[String] {
+  let n = s.length()
+  let mut has_nl = false
+  let mut i = 0
+  while i < n {
+    let cu = s.code_unit_at(i)
+    if cu == 10 || cu == 13 {
+      has_nl = true
+      break
+    }
+    i += 1
+  }
+  if !has_nl {
+    return [s]
+  }
   let out : Array[String] = []
   let sb = StringBuilder::new()
-  let mut i = 0
-  while i < s.length() {
+  i = 0
+  while i < n {
     let cu = s.code_unit_at(i)
     if cu == 10 {
       out.push(sb.to_string())
@@ -274,12 +330,71 @@ fn font_style_bits(italic : Bool, mono : Bool, serif : Bool) -> Int {
   bits
 }
 
+let shared_metrics_buf : Array[Double] = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+
 fn measure_metrics(size : Double, weight : Int, style : Int) -> (Double, Double) {
-  let mbuf : Array[Double] = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
-  hostapi::font_metrics(size, weight, style, mbuf)
-  let asc = if mbuf[0] > 0.0 { mbuf[0] } else { size * 0.8 }
-  let desc = if mbuf[1] > 0.0 { mbuf[1] } else { size * 0.2 }
+  if text_cache.metrics_valid &&
+    text_cache.metrics_size == size &&
+    text_cache.metrics_weight == weight &&
+    text_cache.metrics_style == style {
+    return (text_cache.metrics_asc, text_cache.metrics_desc)
+  }
+  shared_metrics_buf[0] = -1.0
+  shared_metrics_buf[1] = -1.0
+  hostapi::font_metrics(size, weight, style, shared_metrics_buf)
+  let asc = if shared_metrics_buf[0] > 0.0 { shared_metrics_buf[0] } else { size * 0.8 }
+  let desc = if shared_metrics_buf[1] > 0.0 { shared_metrics_buf[1] } else { size * 0.2 }
+  text_cache.metrics_valid = true
+  text_cache.metrics_size = size
+  text_cache.metrics_weight = weight
+  text_cache.metrics_style = style
+  text_cache.metrics_asc = asc
+  text_cache.metrics_desc = desc
   (asc, desc)
+}
+
+fn shape_line_cached(raw : String, sz : Double, weight : Int, style_bits : Int) -> ShapedLine {
+  let can_cache = raw.length() <= 96
+  if can_cache &&
+    text_cache.shape_size == sz &&
+    text_cache.shape_weight == weight &&
+    text_cache.shape_style == style_bits {
+    match text_cache.shapes.get(raw) {
+      Some(sl) => return sl
+      None => ()
+    }
+  }
+  let cap = (raw.length() + 4) * 4
+  let sbuf = ensure_shape_buf(cap)
+  let n = hostapi::shape(raw, sz, weight, style_bits, sbuf)
+  if n <= 0 {
+    return ShapedLine::{ n: 0, locs: [], advs: [], gkeys: [] }
+  }
+  resolve_ligatures(raw, n, sbuf, sz, weight, style_bits)
+  let locs : Array[Int] = []
+  let advs : Array[Double] = []
+  let gkeys : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    locs.push(sbuf[i * 4].to_int())
+    advs.push(sbuf[i * 4 + 2])
+    gkeys.push(sbuf[i * 4 + 3].to_int())
+    i += 1
+  }
+  let sl = ShapedLine::{ n, locs, advs, gkeys }
+  if can_cache {
+    if text_cache.shape_size != sz ||
+      text_cache.shape_weight != weight ||
+      text_cache.shape_style != style_bits ||
+      text_cache.shapes.length() >= 2048 {
+      text_cache.shapes.clear()
+      text_cache.shape_size = sz
+      text_cache.shape_weight = weight
+      text_cache.shape_style = style_bits
+    }
+    text_cache.shapes.set(raw, sl)
+  }
+  sl
 }
 
 fn emit_glyph_quad(
@@ -358,14 +473,15 @@ fn encode_words(
       line_idx += 1
       continue
     }
-    let cap = (raw.length() + 4) * 4
-    let sbuf = ensure_shape_buf(cap)
-    let n = hostapi::shape(raw, sz, weight, style_bits, sbuf)
+    let sl = shape_line_cached(raw, sz, weight, style_bits)
+    let n = sl.n
     if n <= 0 {
       line_idx += 1
       continue
     }
-    resolve_ligatures(raw, n, sbuf, sz, weight, style_bits)
+    let locs = sl.locs
+    let advs = sl.advs
+    let gkeys = sl.gkeys
     // Partition shaped clusters into visual lines (word-boundary wrapping by d.w if wrap=true)
     let mut start = 0
     while start < n {
@@ -378,8 +494,8 @@ fn encode_words(
       let mut break_line_w = 0.0
       let mut wrapped = false
       while end < n {
-        let adv = sbuf[end * 4 + 2] + spacing
-        let loc = sbuf[end * 4].to_int()
+        let adv = advs[end] + spacing
+        let loc = locs[end]
         let cu = if loc >= 0 && loc < raw.length() { raw.code_unit_at(loc) } else { 0 }
         let is_space = cu == 32 || cu == 9
         if wrap && end > start && line_w + adv > d.w {
@@ -402,7 +518,7 @@ fn encode_words(
         }
       }
       if end == start {
-        line_w = sbuf[start * 4 + 2] + spacing
+        line_w = advs[start] + spacing
         end = start + 1
       }
       let start_x = if d.words_center && d.w > line_w {
@@ -411,13 +527,36 @@ fn encode_words(
         d.x
       }
       let baseline_y = d.y + line_idx.to_double() * line_h + base_off
+      let ink_r = ((d.ink >> 24) & 0xFFL).to_double() / 255.0
+      let ink_g = ((d.ink >> 16) & 0xFFL).to_double() / 255.0
+      let ink_b = ((d.ink >> 8) & 0xFFL).to_double() / 255.0
+      let ink_a = ((d.ink & 0xFFL).to_double() / 255.0) * dclamp(d.alpha, 0.0, 1.0)
       let mut pen_x = start_x
       let mut k = start
       while k < end {
-        let adv = sbuf[k * 4 + 2] + spacing
-        let gkey = sbuf[k * 4 + 3].to_int()
+        let adv = advs[k] + spacing
+        let gkey = gkeys[k]
         match resolve_glyph(gkey, scale) {
-          Some(slot) => emit_glyph_quad(scene, pen_x + pad, baseline_y, slot, d.ink, d.alpha, scale, clip_x, clip_y, clip_x1, clip_y1)
+          Some(slot) =>
+            scene.push_glyph_inst(
+              pen_x + pad + slot.ox,
+              baseline_y + slot.oy,
+              slot.gw,
+              slot.gh,
+              if slot.color { 3.0 } else { 1.0 },
+              ink_r,
+              ink_g,
+              ink_b,
+              ink_a,
+              slot.u,
+              slot.v,
+              slot.gw * scale,
+              slot.gh * scale,
+              clip_x,
+              clip_y,
+              clip_x1,
+              clip_y1,
+            )
           None => ()
         }
         pen_x = pen_x + adv
@@ -427,7 +566,7 @@ fn encode_words(
       start = end
       if wrapped {
         while start < n {
-          let sloc = sbuf[start * 4].to_int()
+          let sloc = locs[start]
           let scu = if sloc >= 0 && sloc < raw.length() { raw.code_unit_at(sloc) } else { 0 }
           if scu == 32 || scu == 9 {
             start += 1
@@ -453,6 +592,7 @@ fn encode_runs(
   if d.runs.length() == 0 {
     return
   }
+  ensure_glyph_atlas(scale)
   let base_sz = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
   let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
   let spacing = view_spacing(1.0, d.words_look)
@@ -832,6 +972,7 @@ pub fn Scene::draw_text_run(
   if text.length() == 0 || (color & 0xFFL) == 0L || alpha <= 0.0 || draw_scale <= 0.0 {
     return 0.0
   }
+  ensure_glyph_atlas(scale)
   let eff_style = if tracking != 0.0 { style_bits | hostapi::style_no_ligatures } else { style_bits }
   let pad = tracking * 0.5
   let (asc, _desc) = measure_metrics(size, weight, eff_style)

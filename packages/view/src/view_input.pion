@@ -1537,6 +1537,50 @@ fn View::let_go(self : View) -> Unit {
     Some(n) => n
     _ => { return }
   }
+  if self.tree.gone {
+    if n.kids.length() > 0 {
+      let kids = n.kids.copy()
+      n.kids.clear()
+      for k in kids {
+        self.tree.handle(k).let_go()
+      }
+    }
+    n.live = false
+    match n.stop {
+      Some(stop) => stop()
+      None => ()
+    }
+    n.stop = None
+    n.owner = None
+    if n.takes_units.length() > 0 {
+      self.tree.takes_off(n)
+    }
+    if n.props.length() > 0 {
+      let props = n.props.copy()
+      n.props.clear()
+      for p in props {
+        (p.1)()
+      }
+    }
+    if n.drops.length() > 0 {
+      let drops = n.drops.copy()
+      n.drops.clear()
+      for d in drops {
+        (d.1)()
+      }
+    }
+    if self.at == 0 {
+      n.flex.measure = None
+      n.flex.room = false
+      n.flex.children_cut(0)
+      n.flex.holds_gone = false
+      n.parent = -1
+      n.content = None
+      n.let_go_held()
+    }
+    self.tree.work.let_go = self.tree.work.let_go + 1
+    return
+  }
   // (on a flight's way, or one of an id: that flight over, its id counted no more, shared.mbt)
   self.tree.share_let_go(self.at)
   // (what the pointer is over let go of, it or one it holds: pointed at what holds it that takes the pointer there
@@ -1774,7 +1818,9 @@ fn Tree::boxes(self : Tree, at : Int, into : Array[flex::Node]) -> Unit {
 fn View::box_appended(self : View, child : Int) -> Unit {
   // (telling the host of a new box of the root's can make another of the root's at once, before this one is put)
   if self.at == 0 {
-    self.boxes_again()
+    if !self.tree.nodes[0].boxes_due {
+      self.boxes_again()
+    }
     self.tree.modals_told(within=child)
     return
   }
@@ -1783,12 +1829,16 @@ fn View::box_appended(self : View, child : Int) -> Unit {
     let parent = self.tree.nodes[at].parent
     let siblings = self.tree.nodes[parent].kids
     if parent == 0 || siblings.length() == 0 || siblings[siblings.length() - 1] != at {
+      let holder = self.tree.box_holder(child)
+      if holder >= 0 && self.tree.nodes[holder].boxes_due {
+        self.tree.modals_told(within=child)
+        return
+      }
       // (its box put in where it goes among its holder's, not all of them put again: Tree::box_put_in)
       if !self.tree.box_put_in(child) {
         self.boxes_again()
       }
-      let holder = self.tree.box_holder(child)
-      if holder >= 0 {
+      if holder >= 0 && !self.tree.nodes[holder].boxes_due {
         self.tree.soft_min_applied(holder)
         self.tree.structure_row_sync(holder)
       }
@@ -1799,6 +1849,10 @@ fn View::box_appended(self : View, child : Int) -> Unit {
     at = parent
   }
   // (one due to be put again in order (Tree::holding_boxes) is put whole as that ends: what is pushed now is redone)
+  if self.tree.nodes[at].boxes_due {
+    self.tree.modals_told(within=child)
+    return
+  }
   self.tree.nodes[at].flex.add(self.tree.nodes[child].flex)
   self.tree.soft_min_applied(at)
   self.tree.structure_row_sync(at)
@@ -1865,12 +1919,15 @@ fn Tree::boxes_put(self : Tree, at : Int) -> Unit {
 /// thousands made at once, as a page comes, seconds in the press that opened it).
 fn Tree::holding_boxes(self : Tree, change : () -> Unit) -> Unit {
   self.boxes_held = self.boxes_held + 1
+  self.committing = self.committing + 1
   change()
   self.boxes_held = self.boxes_held - 1
   if self.boxes_held == 0 {
     self.boxes_one_by_one = 0
     self.boxes_flushed()
   }
+  self.committing = self.committing - 1
+  self.modals_settled(withins=false)
 }
 
 ///|
@@ -2648,6 +2705,8 @@ fn each_change[T : ViewEq, K : ViewKey](
     made_now.push(v.at)
     order.push(v.at)
   }
+  let had_rows = !rows.is_empty()
+  let had_gone = !gone_rows.is_empty()
   signals::start_batch()
   for it in all {
     let k = key(it)
@@ -2657,6 +2716,16 @@ fn each_change[T : ViewEq, K : ViewKey](
       continue
     }
     seen.set(k, true)
+    if !had_rows && !had_gone {
+      match each_kept_takes(slot, kept, k, it) {
+        Some(r) => {
+          rows.set(k, r)
+          order.push(r.0.at)
+        }
+        None => fresh(k, it)
+      }
+      continue
+    }
     match rows.get(k) {
       // (moved among them, said to split: closing its way where it was, pressed and read out no more, never come back
       // to; a row made anew for it opening its way where it is now, in the same change)
@@ -2696,40 +2765,44 @@ fn each_change[T : ViewEq, K : ViewKey](
     }
   }
   signals::end_batch()
-  let gone : Array[K] = []
-  for k in rows.keys() {
-    let r = match rows.get(k) {
-      Some(kv_val) => kv_val
-      None => continue
-    }
-    if !seen.contains(k) {
-      gone.push(k)
-      // (said to leave out of the flow: from where it stands, never come back to: pop_leave.mbt)
-      // (but where none stays: what holds it goes as it does (a show said to pop out with it), it in the flow there, so
-      // that it is not put back where it stood twice, once by itself and once with what holds it)
-      if pop_leave && leave > 0.0 && kept.is_none() && (seen.length() > 0) {
-        slot.tree.tell_leaving(r.0.at)
-        slot.pop_leaves(r.0, leave)
-        continue
+  if had_rows {
+    let gone : Array[K] = []
+    for k in rows.keys() {
+      let r = match rows.get(k) {
+        Some(kv_val) => kv_val
+        None => continue
       }
-      if !each_kept_parks(slot, kept, k, r) && slot.goes(r.0, leave, !way(k, r.0, false)) {
-        gone_rows.set(k, r)
+      if !seen.contains(k) {
+        gone.push(k)
+        // (said to leave out of the flow: from where it stands, never come back to: pop_leave.mbt)
+        // (but where none stays: what holds it goes as it does (a show said to pop out with it), it in the flow there, so
+        // that it is not put back where it stood twice, once by itself and once with what holds it)
+        if pop_leave && leave > 0.0 && kept.is_none() && (seen.length() > 0) {
+          slot.tree.tell_leaving(r.0.at)
+          slot.pop_leaves(r.0, leave)
+          continue
+        }
+        if !each_kept_parks(slot, kept, k, r) && slot.goes(r.0, leave, !way(k, r.0, false)) {
+          gone_rows.set(k, r)
+        }
       }
     }
-  }
-  for k in gone {
-    rows.remove(k)
+    for k in gone {
+      rows.remove(k)
+    }
   }
   // (those whose leaving ended, let go: forgotten)
-  let ended : Array[K] = []
-  for k in gone_rows.keys() {
-    match gone_rows.get(k) {
-      Some(r) if !r.0.alive() => ended.push(k)
-      _ => ()
+  if !gone_rows.is_empty() {
+    let ended : Array[K] = []
+    for k in gone_rows.keys() {
+      match gone_rows.get(k) {
+        Some(r) if !r.0.alive() => ended.push(k)
+        _ => ()
+      }
     }
-  }
-  for k in ended {
-    gone_rows.remove(k)
+    for k in ended {
+      gone_rows.remove(k)
+    }
   }
   each_place(slot, sn, order, made=made_now)
   each_kept_settle(slot, kept)
