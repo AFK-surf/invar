@@ -1,0 +1,251 @@
+// Animation specs (Spring, Tween, Moved, Snap, Motion), closed-form spring simulation,
+// and exact duration estimation.
+// Ported from libs/mbui/src/motion/spec.mbt.
+
+import "dmath"
+import "ui"
+
+pub enum Spec {
+  Spring(Double, Double, Double, Double)
+  Tween(Double, ui::Ease, Double)
+  Moved(Double, Double, Double)
+  Snap(Double)
+  Motion(Transition)
+}
+
+pub fn spring(
+  ratio~ : Double = 1.0,
+  stiffness~ : Double = 1500.0,
+  threshold~ : Double = 0.01,
+  delay~ : Double = 0.0,
+) -> Spec {
+  Spec::Spring(ratio, stiffness, threshold, delay)
+}
+
+pub let animate_spring : Spec = spring()
+pub let backdrop_press_spring : Spec = spring(ratio=1.0, stiffness=1000.0, threshold=0.001)
+pub let backdrop_scale_x_spring : Spec = spring(ratio=0.6, stiffness=250.0, threshold=0.001)
+pub let backdrop_scale_y_spring : Spec = spring(ratio=0.7, stiffness=250.0, threshold=0.001)
+
+pub fn tween(ms : Double, ease~ : ui::Ease = ui::Ease::Out, delay~ : Double = 0.0) -> Spec {
+  Spec::Tween(ms, ease, delay)
+}
+
+pub fn moved(points~ : Double = 1.0, over~ : Double = -1.0, delay~ : Double = 0.0) -> Spec {
+  Spec::Moved(points, over, delay)
+}
+
+pub fn spec_over(self : Spec, points : Double) -> Spec {
+  match self {
+    Spec::Moved(per, _, delay) => Spec::Moved(per, points, delay)
+    _ => self
+  }
+}
+
+pub fn spec_way_said(self : Spec) -> Bool {
+  match self {
+    Spec::Moved(_, over, _) => over >= 0.0
+    _ => false
+  }
+}
+
+pub fn spec_per_unit(self : Spec, points : Double) -> Spec {
+  match self {
+    Spec::Moved(_, over, delay) => Spec::Moved(points, over, delay)
+    _ => self
+  }
+}
+
+pub fn spec_delayed(self : Spec, delay : Double) -> Spec {
+  match self {
+    Spec::Spring(a, b, t, _) => Spec::Spring(a, b, t, delay)
+    Spec::Tween(a, b, _) => Spec::Tween(a, b, delay)
+    Spec::Moved(a, b, _) => Spec::Moved(a, b, delay)
+    Spec::Snap(_) => Spec::Snap(delay)
+    Spec::Motion(tr) => Spec::Motion(tr.delayed(delay))
+  }
+}
+
+pub fn spec_delay(self : Spec) -> Double {
+  match self {
+    Spec::Spring(_, _, _, d) => d
+    Spec::Tween(_, _, d) => d
+    Spec::Moved(_, _, d) => d
+    Spec::Snap(d) => d
+    Spec::Motion(tr) => tr.delay
+  }
+}
+
+fn moved_ms(per : Double, over : Double, from : Double, to : Double) -> Double {
+  ui::move_ms(if over >= 0.0 { over } else { (to - from).abs() * per })
+}
+
+pub fn motion_spring(
+  visual : Double,
+  bounce~ : Double = 0.0,
+  threshold~ : Double = 0.01,
+  delay~ : Double = 0.0,
+) -> Spec {
+  let w = two_pi / (1.2 * visual)
+  Spec::Spring(m_clamp(1.0 - bounce, 0.05, 1.0), w * w, threshold, delay)
+}
+
+pub let knob_spring : Spec = motion_spring(0.2, bounce=0.12)
+pub let digit_spring : Spec = motion_spring(0.2)
+
+/// Closed-form damped harmonic oscillator (displacement, velocity/s) at time `t` seconds.
+pub fn spring_at(
+  ratio : Double,
+  stiffness : Double,
+  d : Double,
+  v : Double,
+  t : Double,
+) -> (Double, Double) {
+  let w = stiffness.sqrt()
+  let r = -ratio * w
+  if ratio > 1.0 {
+    let s = w * (ratio * ratio - 1.0).sqrt()
+    let gp = r + s
+    let gm = r - s
+    let b = (gm * d - v) / (gm - gp)
+    let a = d - b
+    let ea = dmath::exp(gm * t)
+    let eb = dmath::exp(gp * t)
+    (a * ea + b * eb, a * gm * ea + b * gp * eb)
+  } else if ratio == 1.0 {
+    let a = d
+    let b = v + w * d
+    let e = dmath::exp(-w * t)
+    let x = (a + b * t) * e
+    (x, x * -w + b * e)
+  } else {
+    let wd = w * (1.0 - ratio * ratio).sqrt()
+    let cs = d
+    let sn = 1.0 / wd * (-r * d + v)
+    let e = dmath::exp(r * t)
+    let x = e * (cs * dmath::cos(wd * t) + sn * dmath::sin(wd * t))
+    (x, x * r + e * (-wd * cs * dmath::sin(wd * t) + wd * sn * dmath::cos(wd * t)))
+  }
+}
+
+/// Settling duration in whole ms until remaining within `threshold` of rest.
+pub fn spring_duration(
+  ratio : Double,
+  stiffness : Double,
+  d : Double,
+  v : Double,
+  threshold : Double,
+) -> Double {
+  if d == 0.0 && v == 0.0 {
+    return 0.0
+  }
+  let p0 = (d / threshold).abs()
+  let v0 = if d < 0.0 { -v / threshold } else { v / threshold }
+  let w = stiffness.sqrt()
+  if ratio < 1.0 {
+    let r = -ratio * w
+    let wd = w * (1.0 - ratio * ratio).sqrt()
+    let c2 = (v0 - r * p0) / wd
+    let c = (p0 * p0 + c2 * c2).sqrt()
+    if c <= 1.0 {
+      return 0.0
+    }
+    let t = dmath::ln(1.0 / c) / r
+    return if t > 0.0 { (t * 1000.0).floor() } else { 0.0 }
+  }
+  let x_at = fn(t : Double) -> (Double, Double) { spring_at(ratio, stiffness, p0, v0, t) }
+  let mut last = -1.0
+  let mut t = 0.0
+  while t < 60.0 {
+    let (x, vel) = x_at(t)
+    if x.abs() >= 1.0 {
+      last = t
+    } else if x.abs() < 0.01 && vel.abs() < 0.01 * w {
+      break
+    }
+    t = t + 0.001
+  }
+  if last < 0.0 {
+    return 0.0
+  }
+  let mut lo = last
+  let mut hi = last + 0.001
+  let mut k = 0
+  while k < 40 {
+    let m = (lo + hi) / 2.0
+    let (x, _) = x_at(m)
+    if x.abs() >= 1.0 {
+      lo = m
+    } else {
+      hi = m
+    }
+    k += 1
+  }
+  (lo * 1000.0).floor()
+}
+
+pub fn spec_duration(self : Spec, from : Double, to : Double, v : Double) -> Double {
+  match self {
+    Spec::Spring(ratio, k, thr, delay) => delay + spring_duration(ratio, k, from - to, v, thr)
+    Spec::Tween(ms, _, delay) => delay + ms
+    Spec::Moved(per, over, delay) => if from == to && v == 0.0 { delay } else { delay + moved_ms(per, over, from, to) }
+    Spec::Snap(delay) => delay
+    Spec::Motion(tr) => tr.delay + generator_duration(tr.generator(from, to, v))
+  }
+}
+
+pub fn spec_value_at(
+  self : Spec,
+  ms : Double,
+  dur : Double,
+  from : Double,
+  to : Double,
+  v : Double,
+) -> (Double, Double) {
+  let t = gone_ms(ms)
+  match self {
+    Spec::Motion(tr) => {
+      if t < tr.delay {
+        return (from, v)
+      }
+      let g = tr.generator(from, to, v)
+      let end = gone_ms(dur)
+      let u = (if t >= end { dur } else { t }) - tr.delay
+      return (g.next(u).value, if t >= end { 0.0 } else { g.velocity(u, initial=v) })
+    }
+    _ => ()
+  }
+  if t >= gone_ms(dur) {
+    return (to, 0.0)
+  }
+  match self {
+    Spec::Spring(ratio, k, _, delay) => {
+      if t < delay {
+        return (from, v)
+      }
+      let (x, vel) = spring_at(ratio, k, from - to, v, (t - delay) / 1000.0)
+      (to + x, vel)
+    }
+    Spec::Tween(len, ease, delay) => {
+      let at = fn(p : Double) -> Double {
+        let q = m_clamp(p - delay, 0.0, len)
+        let f = if len <= 0.0 { 1.0 } else { q / len }
+        from + (to - from) * ui::ease_at(ease, f)
+      }
+      if t < delay {
+        return (from, v)
+      }
+      let x = at(t)
+      (x, (x - at(t - 1.0)) * 1000.0)
+    }
+    Spec::Moved(per, over, delay) => {
+      if t < delay {
+        return (from, v)
+      }
+      let (x, xv) = ui::move_path(from - to, v / 1000.0, t - delay, moved_ms(per, over, from, to))
+      (to + x, xv * 1000.0)
+    }
+    Spec::Snap(_) => (from, v)
+    Spec::Motion(_) => (from, v)
+  }
+}

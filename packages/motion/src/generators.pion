@@ -1,0 +1,613 @@
+// Keyframe generators: spring (physics & duration/visual_duration+bounce), inertia, keyframes.
+// Ported from libs/mbui/src/motion/generators.mbt.
+
+import "dmath"
+
+#derive(Eq)
+pub struct GenState {
+  pub done : Bool
+  pub value : Double
+}
+
+pub struct Generator {
+  next_ : (Double) -> GenState
+  velocity_ : Option[(Double) -> Double]
+  retarget_ : Option[(Double, Double, Double) -> Unit]
+  duration_ : Option[Double]
+  mut calculated : Option[Double]
+}
+
+pub fn Generator::next(self : Generator, t : Double) -> GenState {
+  (self.next_)(t)
+}
+
+pub fn Generator::calculated_duration(self : Generator) -> Option[Double] {
+  self.calculated
+}
+
+pub fn Generator::velocity(self : Generator, t : Double, initial~ : Double = 0.0) -> Double {
+  if t <= 0.0 {
+    return initial
+  }
+  match self.velocity_ {
+    Some(v) => v(t)
+    None => {
+      let prev = if t - 5.0 > 0.0 { t - 5.0 } else { 0.0 }
+      velocity_per_second(self.next(t).value - self.next(prev).value, t - prev)
+    }
+  }
+}
+
+pub fn Generator::can_retarget(self : Generator) -> Bool {
+  match self.retarget_ {
+    Some(_) => true
+    None => false
+  }
+}
+
+pub fn Generator::retarget(self : Generator, from : Double, to : Double, velocity : Double) -> Unit {
+  match self.retarget_ {
+    Some(r) => {
+      self.calculated = self.duration_
+      r(from, to, velocity)
+    }
+    None => ()
+  }
+}
+
+let spring_default_stiffness : Double = 100.0
+let spring_default_damping : Double = 10.0
+let spring_default_mass : Double = 1.0
+let spring_default_duration : Double = 800.0
+let spring_default_bounce : Double = 0.3
+let spring_min_damping : Double = 0.05
+let safe_min : Double = 0.001
+
+pub fn bounce_to_damping_ratio(bounce : Double) -> Double {
+  if bounce < 0.0 {
+    1.0 / m_max(1.0 + bounce, spring_min_damping)
+  } else {
+    m_max(1.0 - bounce, spring_min_damping)
+  }
+}
+
+fn calc_angular_freq(undamped : Double, ratio : Double) -> Double {
+  undamped * (1.0 - ratio * ratio).sqrt()
+}
+
+fn approximate_root(
+  envelope : (Double) -> Double,
+  derivative : (Double) -> Double,
+  guess : Double,
+) -> Double {
+  let mut result = guess
+  let mut i = 1
+  while i < 12 {
+    let d = derivative(result)
+    if d == 0.0 {
+      break
+    }
+    result = result - envelope(result) / d
+    i += 1
+  }
+  result
+}
+
+fn overdamped_freq_scale(ratio : Double, critical_freq_time : Double) -> Double {
+  if !(ratio > 1.0) {
+    return 1.0
+  }
+  let root = (ratio * ratio - 1.0).sqrt()
+  let slow = ratio - root
+  let fast = ratio + root
+  let target = 2.0 * root * dmath::exp(-critical_freq_time) * (1.0 + critical_freq_time)
+  approximate_root(
+    fn(ft : Double) -> Double { fast * dmath::exp(-slow * ft) - slow * dmath::exp(-fast * ft) - target },
+    fn(ft : Double) -> Double { dmath::exp(-fast * ft) - dmath::exp(-slow * ft) },
+    critical_freq_time,
+  ) / critical_freq_time
+}
+
+pub fn find_spring(duration : Double, bounce : Double) -> (Double, Double, Double) {
+  let ratio = bounce_to_damping_ratio(bounce)
+  let dur = clamp(0.01, 10.0, ms_to_seconds(duration))
+  let env_and_deriv : ((Double) -> Double, (Double) -> Double) = if ratio < 1.0 {
+    let envelope = fn(u : Double) -> Double {
+      let decay = u * ratio
+      let delta = decay * dur
+      let b = calc_angular_freq(u, ratio)
+      let c = dmath::exp(-delta)
+      safe_min - decay / b * c
+    }
+    let derivative = fn(u : Double) -> Double {
+      let decay = u * ratio
+      let delta = decay * dur
+      let e = ratio * ratio * u * u * dur
+      let f = dmath::exp(-delta)
+      let g = calc_angular_freq(u * u, ratio)
+      let factor = if -envelope(u) + safe_min > 0.0 { -1.0 } else { 1.0 }
+      factor * -e * f / g
+    }
+    (envelope, derivative)
+  } else {
+    (
+      fn(u : Double) -> Double {
+        let a = dmath::exp(-u * dur)
+        let b = u * dur + 1.0
+        -safe_min + a * b
+      },
+      fn(u : Double) -> Double {
+        let a = dmath::exp(-u * dur)
+        let b = -u * (dur * dur)
+        a * b
+      },
+    )
+  }
+  let critical = approximate_root(env_and_deriv.0, env_and_deriv.1, 5.0 / dur)
+  let undamped = critical * overdamped_freq_scale(ratio, critical * dur)
+  let stiffness = undamped * undamped
+  (stiffness, ratio * 2.0 * stiffness.sqrt(), seconds_to_ms(dur))
+}
+
+fn valid_physics(v : Option[Double], can_be_zero~ : Bool = false) -> Bool {
+  match v {
+    Some(x) => (if can_be_zero { x >= 0.0 } else { x > 0.0 }) && !m_is_inf(x) && !m_is_nan(x)
+    None => false
+  }
+}
+
+fn truthy(v : Option[Double]) -> Bool {
+  match v {
+    Some(x) => x != 0.0 && !m_is_nan(x)
+    None => false
+  }
+}
+
+fn or_else(v : Option[Double], d : Double) -> Double {
+  match v {
+    Some(x) => if x != 0.0 && !m_is_nan(x) { x } else { d }
+    None => d
+  }
+}
+
+struct SpringResolved {
+  stiffness : Double
+  damping : Double
+  mass : Double
+  duration : Option[Double]
+  from_duration : Bool
+  time_defined : Bool
+}
+
+fn resolve_spring(
+  stiffness : Option[Double],
+  damping : Option[Double],
+  mass : Option[Double],
+  duration : Option[Double],
+  bounce : Option[Double],
+  visual_duration : Option[Double],
+) -> SpringResolved {
+  let vs = if valid_physics(stiffness) { stiffness } else { None }
+  let vd = if valid_physics(damping, can_be_zero=true) { damping } else { None }
+  let vm = if valid_physics(mass) { mass } else { None }
+  let mut k = match vs { Some(x) => x; None => spring_default_stiffness }
+  let mut d = match vd { Some(x) => x; None => spring_default_damping }
+  let m = match vm { Some(x) => x; None => spring_default_mass }
+  let mut dur = duration
+  let mut from_duration = false
+  let has_dur_or_bounce = match (duration, bounce) {
+    (Some(_), _) => true
+    (_, Some(_)) => true
+    _ => false
+  }
+  let time_defined = match (vs, vd, vm) {
+    (None, None, None) => has_dur_or_bounce
+    _ => false
+  }
+  if time_defined {
+    if truthy(visual_duration) {
+      let vd_val = match visual_duration { Some(x) => x; None => 0.3 }
+      let ratio = bounce_to_damping_ratio(or_else(bounce, 0.0))
+      let root = two_pi / (vd_val * 1.2) * overdamped_freq_scale(ratio, two_pi / 1.2)
+      k = root * root
+      d = 2.0 * ratio * k.sqrt()
+    } else {
+      let d_in = match duration { Some(x) => x; None => spring_default_duration }
+      let b_in = match bounce { Some(x) => x; None => spring_default_bounce }
+      let (k1, d1, dur1) = find_spring(d_in, b_in)
+      k = k1
+      d = d1
+      dur = Some(dur1)
+      from_duration = true
+    }
+    if !valid_physics(Some(k)) || !valid_physics(Some(d), can_be_zero=true) {
+      k = spring_default_stiffness
+      d = spring_default_damping
+    }
+  }
+  SpringResolved::{ stiffness: k, damping: d, mass: m, duration: dur, from_duration, time_defined }
+}
+
+struct SpringNow {
+  mut target : Double
+  mut delta : Double
+  mut velocity : Double
+  mut rest_speed : Double
+  mut rest_delta : Double
+  mut a : Double
+  mut b : Double
+  mut c : Double
+}
+
+pub fn spring_generator(
+  from : Double,
+  to : Double,
+  stiffness? : Double,
+  damping? : Double,
+  mass? : Double,
+  velocity? : Double,
+  duration? : Double,
+  bounce? : Double,
+  visual_duration? : Double,
+  rest_speed? : Double,
+  rest_delta? : Double,
+) -> Generator {
+  let o = resolve_spring(stiffness, damping, mass, duration, bounce, visual_duration)
+  let carried = fn(v : Double) -> Double { if o.time_defined { 0.0 } else { -ms_to_seconds(v) } }
+  let ratio = o.damping / (2.0 * (o.stiffness * o.mass).sqrt())
+  let undamped = ms_to_seconds((o.stiffness / o.mass).sqrt())
+  let decay = ratio * undamped
+  let v0 = carried(or_else(velocity, 0.0))
+  let s = SpringNow::{
+    target: to,
+    delta: to - from,
+    velocity: if m_is_nan(v0) || v0 == 0.0 { 0.0 } else { v0 },
+    rest_speed: 0.0,
+    rest_delta: 0.0,
+    a: 0.0,
+    b: 0.0,
+    c: 0.0,
+  }
+  let set_rest = fn() -> Unit {
+    let granular = s.delta.abs() < 5.0
+    s.rest_speed = or_else(rest_speed, if granular { 0.01 } else { 2.0 })
+    s.rest_delta = or_else(rest_delta, if granular { 0.005 } else { 0.5 })
+  }
+  set_rest()
+  let funcs : (() -> Unit, (Double) -> Double, (Double) -> Double) = if ratio < 1.0 {
+    let w = calc_angular_freq(undamped, ratio)
+    (
+      fn() -> Unit {
+        s.a = (s.velocity + decay * s.delta) / w
+        s.b = decay * s.a + s.delta * w
+        s.c = decay * s.delta - s.a * w
+      },
+      fn(t : Double) -> Double {
+        let env = dmath::exp(-decay * t)
+        s.target - env * (s.a * dmath::sin(w * t) + s.delta * dmath::cos(w * t))
+      },
+      fn(t : Double) -> Double {
+        let env = dmath::exp(-decay * t)
+        env * (s.b * dmath::sin(w * t) + s.c * dmath::cos(w * t))
+      },
+    )
+  } else if ratio == 1.0 {
+    (
+      fn() -> Unit { s.a = s.velocity + undamped * s.delta },
+      fn(t : Double) -> Double {
+        s.target - dmath::exp(-undamped * t) * (s.delta + (s.velocity + undamped * s.delta) * t)
+      },
+      fn(t : Double) -> Double {
+        dmath::exp(-undamped * t) * (undamped * s.a * t - s.velocity)
+      },
+    )
+  } else {
+    let damped = undamped * (ratio * ratio - 1.0).sqrt()
+    let slow = decay - damped
+    let fast = decay + damped
+    let limit = if o.time_defined { pos_inf } else { 300.0 / damped }
+    let decay_at = fn(rate : Double, t : Double) -> Double {
+      dmath::exp(if t > limit { -rate * limit - decay * (t - limit) } else { -rate * t })
+    }
+    (
+      fn() -> Unit {
+        let p = (s.velocity + decay * s.delta) / damped
+        s.a = (s.delta + p) / 2.0
+        s.b = (s.delta - p) / 2.0
+      },
+      fn(t : Double) -> Double {
+        s.target - s.a * decay_at(slow, t) - s.b * decay_at(fast, t)
+      },
+      fn(t : Double) -> Double {
+        slow * s.a * decay_at(slow, t) + fast * s.b * decay_at(fast, t)
+      },
+    )
+  }
+  let update = funcs.0
+  let at = funcs.1
+  let vel = funcs.2
+  update()
+  let calculated : Option[Double] = if o.from_duration {
+    match o.duration {
+      Some(d_val) => if d_val != 0.0 { Some(d_val) } else { None }
+      None => None
+    }
+  } else {
+    None
+  }
+  let dur_val = match o.duration { Some(x) => x; None => 0.0 }
+  let next = fn(t : Double) -> GenState {
+    let current = at(t)
+    let done = if !o.from_duration {
+      seconds_to_ms(vel(t)).abs() <= s.rest_speed && (s.target - current).abs() <= s.rest_delta
+    } else {
+      t >= dur_val
+    }
+    GenState::{ done, value: if done { s.target } else { current } }
+  }
+  Generator::{
+    next_: next,
+    velocity_: Some(fn(t : Double) -> Double { seconds_to_ms(vel(t)) }),
+    retarget_: Some(fn(new_from : Double, new_to : Double, new_v : Double) -> Unit {
+      s.target = new_to
+      s.delta = new_to - new_from
+      s.velocity = carried(new_v)
+      if !(truthy(rest_speed) && truthy(rest_delta)) {
+        set_rest()
+      }
+      update()
+    }),
+    duration_: calculated,
+    calculated,
+  }
+}
+
+pub fn spring_visual(visual_duration~ : Double = 0.3, bounce~ : Double = 0.3) -> Generator {
+  spring_generator(0.0, 1.0, visual_duration=visual_duration, bounce=bounce)
+}
+
+struct InertiaNow {
+  mut done : Bool
+  mut value : Double
+  mut reached : Option[Double]
+  mut spring : Option[Generator]
+}
+
+pub fn inertia_generator(
+  from : Double,
+  velocity~ : Double = 0.0,
+  power~ : Double = 0.8,
+  time_constant~ : Double = 325.0,
+  bounce_damping~ : Double = 10.0,
+  bounce_stiffness~ : Double = 500.0,
+  modify_target? : (Double) -> Double,
+  min? : Double,
+  max? : Double,
+  rest_delta~ : Double = 0.5,
+  rest_speed? : Double,
+) -> Generator {
+  let state = InertiaNow::{ done: false, value: from, reached: None, spring: None }
+  let out_of_bounds = fn(v : Double) -> Bool {
+    let lo_bad = match min { Some(m) => v < m; None => false }
+    let hi_bad = match max { Some(m) => v > m; None => false }
+    lo_bad || hi_bad
+  }
+  let nearest = fn(v : Double) -> Double {
+    match (min, max) {
+      (None, Some(hi)) => hi
+      (Some(lo), None) => lo
+      (Some(lo), Some(hi)) => if (lo - v).abs() < (hi - v).abs() { lo } else { hi }
+      _ => v
+    }
+  }
+  let mut amplitude = power * velocity
+  let ideal = from + amplitude
+  let target = match modify_target {
+    Some(f) => f(ideal)
+    None => ideal
+  }
+  if target != ideal {
+    amplitude = target - from
+  }
+  let amp = amplitude
+  let calc_delta = fn(t : Double) -> Double { -amp * dmath::exp(-t / time_constant) }
+  let apply_friction = fn(t : Double) -> Unit {
+    let delta = calc_delta(t)
+    state.done = delta.abs() <= rest_delta
+    state.value = if state.done { target } else { target + delta }
+  }
+  let check_catch = fn(t : Double) -> Unit {
+    if !out_of_bounds(state.value) {
+      return
+    }
+    state.reached = Some(t)
+    let vel_at = -calc_delta(t) / time_constant * 1000.0
+    let sp = match rest_speed {
+      Some(rs) => spring_generator(
+        state.value,
+        nearest(state.value),
+        velocity=vel_at,
+        damping=bounce_damping,
+        stiffness=bounce_stiffness,
+        rest_delta=rest_delta,
+        rest_speed=rs,
+      )
+      None => spring_generator(
+        state.value,
+        nearest(state.value),
+        velocity=vel_at,
+        damping=bounce_damping,
+        stiffness=bounce_stiffness,
+        rest_delta=rest_delta,
+      )
+    }
+    state.spring = Some(sp)
+  }
+  check_catch(0.0)
+  let next = fn(t : Double) -> GenState {
+    let mut updated = false
+    let no_sp = match (state.spring, state.reached) {
+      (None, None) => true
+      _ => false
+    }
+    if no_sp {
+      updated = true
+      apply_friction(t)
+      check_catch(t)
+    }
+    match (state.reached, state.spring) {
+      (Some(r), Some(sp)) => {
+        if t >= r {
+          sp.next(t - r)
+        } else {
+          if !updated {
+            apply_friction(t)
+          }
+          GenState::{ done: state.done, value: state.value }
+        }
+      }
+      _ => {
+        if !updated {
+          apply_friction(t)
+        }
+        GenState::{ done: state.done, value: state.value }
+      }
+    }
+  }
+  Generator::{ next_: next, velocity_: None, retarget_: None, duration_: None, calculated: None }
+}
+
+pub fn default_offset(count : Int) -> Array[Double] {
+  let offset : Array[Double] = [0.0]
+  if count > 1 {
+    fill_offset(offset, count - 1)
+  }
+  offset
+}
+
+pub fn fill_offset(offset : Array[Double], remaining : Int) -> Unit {
+  let min_v = offset[offset.length() - 1]
+  let mut i = 1
+  while i <= remaining {
+    offset.push(mix(min_v, 1.0, progress(0.0, remaining.to_double(), i.to_double())))
+    i += 1
+  }
+}
+
+pub fn offsets_to_times(offset : Array[Double], duration : Double) -> Array[Double] {
+  let out : Array[Double] = []
+  for o in offset {
+    out.push(o * duration)
+  }
+  out
+}
+
+pub fn default_easing(count : Int, easing? : (Double) -> Double) -> Array[(Double) -> Double] {
+  let e = match easing { Some(f) => f; None => ease_in_out }
+  let n = if count > 1 { count - 1 } else { 0 }
+  let out : Array[(Double) -> Double] = []
+  let mut i = 0
+  while i < n {
+    out.push(e)
+    i += 1
+  }
+  out
+}
+
+pub fn keyframes_generator(
+  values : Array[Double],
+  duration~ : Double = 300.0,
+  times? : Array[Double],
+  ease? : (Double) -> Double,
+  eases? : Array[(Double) -> Double],
+) -> Generator {
+  let easing = match ease { Some(f) => f; None => ease_in_out }
+  let plain_times = match times {
+    None => true
+    Some(ts) => ts.length() != 2 || (ts[0] == 0.0 && ts[1] == 1.0)
+  }
+  let no_eases = match eases { None => true; Some(_) => false }
+  if values.length() == 2 && no_eases && plain_times {
+    let origin = values[0]
+    let target = values[1]
+    let next = fn(t : Double) -> GenState {
+      let value = if origin == target {
+        target
+      } else {
+        mix(origin, target, easing(if duration > 0.0 { clamp(0.0, 1.0, t / duration) } else { 1.0 }))
+      }
+      GenState::{ done: t >= duration, value }
+    }
+    return Generator::{
+      next_: next,
+      velocity_: None,
+      retarget_: None,
+      duration_: Some(duration),
+      calculated: Some(duration),
+    }
+  }
+  let offsets = match times {
+    Some(ts) => if ts.length() == values.length() { ts } else { default_offset(values.length()) }
+    None => default_offset(values.length())
+  }
+  let es = match eases {
+    Some(arr) => arr
+    None => default_easing(values.length(), easing=easing)
+  }
+  let map = interpolate(offsets_to_times(offsets, duration), values, eases=es)
+  Generator::{
+    next_: fn(t : Double) -> GenState { GenState::{ done: t >= duration, value: map(t) } },
+    velocity_: None,
+    retarget_: None,
+    duration_: Some(duration),
+    calculated: Some(duration),
+  }
+}
+
+pub let max_generator_duration : Double = 20000.0
+
+pub fn calc_generator_duration(
+  g : Generator,
+  time_step~ : Double = 50.0,
+  max_duration~ : Double = max_generator_duration,
+  keyframes? : Array[Double],
+) -> Double {
+  let mut duration = 0.0
+  let mut state = g.next(duration)
+  match keyframes {
+    Some(k) => k.push(state.value)
+    None => ()
+  }
+  while !state.done && duration < max_duration {
+    duration = duration + time_step
+    state = g.next(duration)
+    match keyframes {
+      Some(k) => k.push(state.value)
+      None => ()
+    }
+  }
+  if duration >= max_duration { pos_inf } else { duration }
+}
+
+pub fn pregenerate_keyframes(g : Generator) -> (Array[Double], Double) {
+  let keyframes : Array[Double] = []
+  let d = calc_generator_duration(g, time_step=10.0, max_duration=10000.0, keyframes=keyframes)
+  if keyframes.length() == 1 {
+    keyframes.push(keyframes[0])
+  }
+  (keyframes, ms_to_seconds(m_min(d, 10000.0)))
+}
+
+pub fn generator_easing(
+  make : (Double, Double, Double) -> Generator,
+  from : Double,
+  to : Double,
+  velocity~ : Double = 0.0,
+  scale~ : Double = 100.0,
+) -> ((Double) -> Double, Double) {
+  let delta = to - from
+  let v = if velocity != 0.0 && delta != 0.0 { velocity * scale / delta } else { velocity }
+  let g = make(0.0, scale, v)
+  let duration = m_min(calc_generator_duration(g), max_generator_duration)
+  (fn(p : Double) -> Double { g.next(duration * p).value / scale }, ms_to_seconds(duration))
+}

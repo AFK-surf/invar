@@ -1,0 +1,327 @@
+// High-frequency node-level motion tools: hover_fade, flash_way, breathe_alpha, resident_cycle,
+// indicator_rect, overlay_presence, hover_fade_keyed, cover_indicator, flash_way_keyed.
+// Ported from libs/mbui/src/motion/tools.mbt.
+
+import "signals"
+import "ui"
+import "view"
+
+pub fn hover_fade(
+  v : view::View,
+  active : () -> Bool,
+  duration_ms~ : Double = 140.0,
+  instant_off~ : () -> Bool = fn() -> Bool { false },
+  loc~ : String = "",
+) -> () -> Double {
+  let init = if signals::untracked(active) { 1.0 } else { 0.0 }
+  let way = NodeWay::new(init)
+  v.reacts(active, fn(on : Bool) -> Unit {
+    if on {
+      way.go(v, 1.0, tween(duration_ms, ease=ui::Ease::Out), loc=loc)
+    } else if signals::untracked(instant_off) {
+      way.put(0.0, loc=loc)
+    } else {
+      way.go(v, 0.0, tween(duration_ms, ease=ui::Ease::Out), loc=loc)
+    }
+  }, at_start=false)
+  fn() -> Double { way.shown(v) }
+}
+
+pub fn flash_way(
+  v : view::View,
+  trigger : () -> Int,
+  in_ms~ : Double = 160.0,
+  hold_ms~ : Double = 740.0,
+  out_ms~ : Double = 800.0,
+  loc~ : String = "",
+) -> () -> Double {
+  let _ = loc
+  let has_started = ui::ref_new(false)
+  let start_time = ui::ref_new(0.0)
+  let rev = signals::signal(0)
+  let ended = signals::signal(0)
+  let last = ui::ref_new(signals::untracked(trigger))
+  let due : ui::Ref[Option[() -> Unit]] = ui::ref_new(None)
+  let total = m_max(0.0, in_ms) + m_max(0.0, hold_ms) + m_max(0.0, out_ms)
+  let stop_due = fn() -> Unit {
+    match due.v {
+      Some(f) => {
+        due.v = None
+        f()
+      }
+      None => ()
+    }
+  }
+  v.reacts(trigger, fn(n : Int) -> Unit {
+    let prev = last.v
+    last.v = n
+    if n > prev {
+      stop_due()
+      let start = v.cause_at()
+      has_started.v = true
+      start_time.v = start
+      rev.set(rev.untracked() + 1)
+      if total > 0.0 && v.alive() {
+        let unkeep : ui::Ref[Option[() -> Unit]] = ui::ref_new(None)
+        let drop_unkeep = fn() -> Unit {
+          match unkeep.v {
+            Some(f) => {
+              unkeep.v = None
+              f()
+            }
+            None => ()
+          }
+        }
+        let stop_moment = v.at_moment(start + total, fn() -> Unit {
+          drop_unkeep()
+          due.v = None
+          ended.set(ended.untracked() + 1)
+        })
+        unkeep.v = Some(v.owns_while(fn() -> Unit {
+          unkeep.v = None
+          stop_moment()
+          due.v = None
+        }))
+        due.v = Some(fn() -> Unit {
+          drop_unkeep()
+          stop_moment()
+          due.v = None
+        })
+      }
+    }
+  }, at_start=false)
+  fn() -> Double {
+    let _ = ended.get()
+    let _ = rev.get()
+    if !has_started.v || total <= 0.0 {
+      return 0.0
+    }
+    let start = start_time.v
+    let goes = fn(now : Double) -> Bool { now >= start && now < start + total }
+    if ui::reduced_motion() {
+      if v.goes_now(goes) { 1.0 } else { 0.0 }
+    } else {
+      let at = v.drawn_while(goes)
+      if at == pos_inf || at < start || at >= start + total {
+        return 0.0
+      }
+      let dt = at - start
+      if dt < in_ms {
+        if in_ms <= 0.0 { 1.0 } else { ui::ease_at(ui::Ease::Out, m_clamp(dt / in_ms, 0.0, 1.0)) }
+      } else if dt < in_ms + hold_ms {
+        1.0
+      } else if out_ms <= 0.0 {
+        0.0
+      } else {
+        1.0 - ui::ease_at(ui::Ease::Leave, m_clamp((dt - in_ms - hold_ms) / out_ms, 0.0, 1.0))
+      }
+    }
+  }
+}
+
+pub fn breathe_alpha(
+  v : view::View,
+  period_ms~ : Double = 1400.0,
+  low~ : Double = 0.5,
+  resident~ : Bool = false,
+  still~ : () -> Bool = fn() -> Bool { false },
+) -> () -> Double {
+  fn() -> Double {
+    if still() || ui::reduced_motion() {
+      return 1.0
+    }
+    let p = if resident { v.cycle_resident(period_ms) } else { v.cycle(period_ms) }
+    let half = if p < 0.5 { p * 2.0 } else { (1.0 - p) * 2.0 }
+    let e = ui::ease_at(ui::Ease::InOut, m_clamp(half, 0.0, 1.0))
+    1.0 - (1.0 - low) * e
+  }
+}
+
+pub fn resident_cycle(v : view::View, period_ms : Double) -> Double {
+  v.cycle_resident(period_ms)
+}
+
+pub fn resident_step(v : view::View, period_ms : Double, steps : Int) -> Int {
+  if steps <= 1 || ui::reduced_motion() {
+    return 0
+  }
+  let raw = (v.cycle_resident(period_ms) * steps.to_double()).floor().to_int()
+  if raw < 0 { 0 } else if raw >= steps { steps - 1 } else { raw }
+}
+
+pub fn indicator_rect(
+  v : view::View,
+  target : () -> Option[(Double, Double, Double, Double)],
+  spec~ : Spec = snappy_damped,
+  loc~ : String = "",
+) -> () -> Option[(Double, Double, Double, Double)] {
+  let wx = NodeWay::new(0.0)
+  let wy = NodeWay::new(0.0)
+  let ww = NodeWay::new(0.0)
+  let wh = NodeWay::new(0.0)
+  let placed = ui::ref_new(false)
+  let visible = signals::signal(false)
+  match signals::untracked(target) {
+    Some((x, y, w, h)) => {
+      wx.put(x, loc=loc)
+      wy.put(y, loc=loc)
+      ww.put(w, loc=loc)
+      wh.put(h, loc=loc)
+      placed.v = true
+      visible.set(true)
+    }
+    None => ()
+  }
+  let last_key = ui::ref_new("")
+  let target_sig = fn() -> String {
+    match target() {
+      Some((x, y, w, h)) => "\{x},\{y},\{w},\{h}"
+      None => ""
+    }
+  }
+  v.reacts(target_sig, fn(key : String) -> Unit {
+    if key == last_key.v {
+      return
+    }
+    last_key.v = key
+    match signals::untracked(target) {
+      Some((x, y, w, h)) => {
+        if !placed.v {
+          wx.put(x, loc=loc)
+          wy.put(y, loc=loc)
+          ww.put(w, loc=loc)
+          wh.put(h, loc=loc)
+          placed.v = true
+        } else {
+          wx.go(v, x, spec, loc=loc)
+          wy.go(v, y, spec, loc=loc)
+          ww.go(v, w, spec, loc=loc)
+          wh.go(v, h, spec, loc=loc)
+        }
+        visible.set(true)
+      }
+      None => {
+        placed.v = false
+        visible.set(false)
+      }
+    }
+  }, at_start=false)
+  fn() -> Option[(Double, Double, Double, Double)] {
+    if visible.get() {
+      Some((wx.shown(v), wy.shown(v), ww.shown(v), wh.shown(v)))
+    } else {
+      None
+    }
+  }
+}
+
+pub fn overlay_presence(
+  v : view::View,
+  enter~ : Trans,
+  exit~ : Trans,
+) -> (() -> ui::Look, () -> Bool) {
+  let look = presence_look(v, enter, exit=exit)
+  let modal_live = fn() -> Bool { !v.leaving() }
+  (look, modal_live)
+}
+
+pub fn hover_fade_keyed(
+  v : view::View,
+  key : () -> String,
+  active : () -> Bool,
+  duration_ms~ : Double = 140.0,
+  instant_off~ : () -> Bool = fn() -> Bool { false },
+  loc~ : String = "",
+) -> () -> Double {
+  let init = if signals::untracked(active) { 1.0 } else { 0.0 }
+  let way = NodeWay::new(init)
+  let key_was = ui::ref_new(signals::untracked(key))
+  v.reacts(fn() -> String { "\{key()}|" + if active() { "1" } else { "0" } }, fn(_s : String) -> Unit {
+    let k = signals::untracked(key)
+    let on = signals::untracked(active)
+    if k != key_was.v {
+      key_was.v = k
+      way.put(if on { 1.0 } else { 0.0 }, loc=loc)
+    } else if on {
+      way.go(v, 1.0, tween(duration_ms, ease=ui::Ease::Out), loc=loc)
+    } else if signals::untracked(instant_off) {
+      way.put(0.0, loc=loc)
+    } else {
+      way.go(v, 0.0, tween(duration_ms, ease=ui::Ease::Out), loc=loc)
+    }
+  }, at_start=false)
+  fn() -> Double { way.shown(v) }
+}
+
+pub fn cover_indicator(
+  v : view::View,
+  chosen : () -> Int,
+  rect_of : (Int) -> Option[(Double, Double, Double, Double)],
+  spec~ : Spec = move_damped,
+  loc~ : String = "",
+) -> () -> Option[(Double, Double, Double, Double)] {
+  let first = signals::untracked(chosen)
+  let cover_from : ui::Ref[Array[(Int, Double)]] = ui::ref_new([(first, 1.0)])
+  let cover_to : ui::Ref[Int] = ui::ref_new(first)
+  let cover_rev = signals::signal(0)
+  let way = NodeWay::new(1.0)
+  v.reacts(chosen, fn(k : Int) -> Unit {
+    if k != cover_to.v {
+      let p = way.value_at(v.cause_at())
+      cover_from.v = cover_set_out(cover_from.v, cover_to.v, p)
+      cover_to.v = k
+      cover_rev.set(cover_rev.untracked() + 1)
+      way.go_from(v, 0.0, 1.0, spec, loc=loc)
+    }
+  })
+  fn() -> Option[(Double, Double, Double, Double)] {
+    let _ = cover_rev.get()
+    cover_rect(cover_from.v, cover_to.v, way.shown(v), rect_of)
+  }
+}
+
+pub fn flash_way_keyed(
+  v : view::View,
+  key : () -> String,
+  target : () -> (String, Double),
+  in_ms~ : Double = 160.0,
+  held_ms~ : Double = 900.0,
+  total_ms~ : Double = 1700.0,
+  hold~ : () -> Bool = fn() -> Bool { false },
+  loc~ : String = "",
+) -> Way {
+  let way = Way::new(0.0)
+  let due : ui::Ref[() -> Unit] = ui::ref_new(fn() -> Unit { () })
+  let key_was = ui::ref_new(signals::untracked(key))
+  v.reacts(fn() -> String {
+    let (tk, at) = target()
+    "\{tk}|\{at}|\{key()}"
+  }, fn(_s : String) -> Unit {
+    let (k, at) = signals::untracked(target)
+    let now = signals::untracked(key)
+    if now != key_was.v {
+      key_was.v = now
+      (due.v)()
+      due.v = fn() -> Unit { () }
+      way.put(0.0, loc=loc)
+    }
+    let held = hold()
+    if k != now || at < 0.0 || (!held && v.cause_at() >= at + total_ms) {
+      return
+    }
+    (due.v)()
+    due.v = fn() -> Unit { () }
+    if held {
+      way.put(1.0, loc=loc)
+      return
+    }
+    way.go(1.0, tween(in_ms, ease=ui::Ease::Out), at=at, loc=loc)
+    let out = at + (if ui::reduced_motion() { total_ms } else { held_ms })
+    due.v = v.at_moment(out, fn() -> Unit {
+      due.v = fn() -> Unit { () }
+      way.go(0.0, tween(total_ms - held_ms, ease=ui::Ease::Leave), at=out, loc=loc)
+    })
+  })
+  let _ = v.owns(fn() -> Unit { (due.v)() })
+  way
+}

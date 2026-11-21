@@ -1,0 +1,236 @@
+// Shared ground handoff across a group of nodes (Handoff, HandPart).
+// Ported from libs/mbui/src/motion/handoff.mbt.
+
+import "view"
+
+pub let hand_spring : Spec = motion_spring(0.09, threshold=0.5)
+
+pub struct Handoff {
+  within : Double
+  mut last : Option[HandPart]
+  mut ids : Int
+}
+
+pub fn Handoff::new(within~ : Double = pos_inf) -> Handoff {
+  Handoff::{ within, last: None, ids: 0 }
+}
+
+struct HandFrom {
+  rect : (Double, Double, Double, Double)
+  speed : (Double, Double, Double, Double)
+  at : Double
+  spec : Spec
+}
+
+pub struct HandPart {
+  group : Handoff
+  id : Int
+  tag : Int
+  seen : (Double) -> Double
+  gave : () -> Unit
+  ways : Array[Way]
+  mut node : Option[view::View]
+  mut due : () -> Unit
+  mut pending : Option[HandFrom]
+  mut went : Double
+}
+
+pub fn Handoff::part(
+  self : Handoff,
+  seen : (Double) -> Double,
+  tag~ : Int = 0,
+  gave~ : () -> Unit = fn() -> Unit { () },
+) -> HandPart {
+  self.ids = self.ids + 1
+  let ways : Array[Way] = []
+  let mut i = 0
+  while i < 6 {
+    ways.push(Way::new(0.0))
+    i += 1
+  }
+  HandPart::{
+    group: self,
+    id: self.ids,
+    tag,
+    seen,
+    gave,
+    ways,
+    node: None,
+    due: fn() -> Unit { () },
+    pending: None,
+    went: neg_inf,
+  }
+}
+
+pub fn HandPart::draws(self : HandPart, v : view::View, carries? : view::View) -> Unit {
+  self.node = Some(v)
+  let _ = v.owns(fn() -> Unit {
+    match self.node {
+      Some(n) => if n.id() == v.id() { self.node = None }
+      None => ()
+    }
+  })
+  let _ = v.ground_drawn(view::Live::By(fn() -> view::GroundShape { self.ground(v) }))
+  match carries {
+    Some(c) => {
+      let _ = v.clips(view::Live::By(fn() -> Bool {
+        let g = self.ground(v)
+        g.dx != 0.0 || g.dy != 0.0 || g.dw != 0.0
+      }))
+      let _ = c.drawn_off(view::Live::By(fn() -> (Double, Double) {
+        (self.ways[4].shown_on(c), self.ways[5].shown_on(c))
+      }))
+    }
+    None => ()
+  }
+  self.start(v)
+}
+
+fn HandPart::ground(self : HandPart, v : view::View) -> view::GroundShape {
+  let dx = self.ways[0].shown_on(v)
+  let dy = self.ways[1].shown_on(v)
+  let dw = self.ways[2].shown_on(v)
+  let dh = self.ways[3].shown_on(v)
+  if dx == 0.0 && dy == 0.0 && dw == 0.0 && dh == 0.0 {
+    view::ground_as_laid
+  } else {
+    view::GroundShape::{ dx, dy, dw, dh, corners: None }
+  }
+}
+
+fn HandPart::drawn_at(
+  self : HandPart,
+  at : Double,
+) -> Option[((Double, Double, Double, Double), (Double, Double, Double, Double), Double)] {
+  let s = (self.seen)(at)
+  if s <= 0.0 {
+    return None
+  }
+  match self.node {
+    Some(v) => {
+      if v.alive() && v.was_placed() {
+        let (x, y, w, h) = v.placed_window_now()
+        let (d0, v0) = self.ways[0].at(at)
+        let (d1, v1) = self.ways[1].at(at)
+        let (d2, v2) = self.ways[2].at(at)
+        let (d3, v3) = self.ways[3].at(at)
+        Some(((x + d0, y + d1, w + d2, h + d3), (v0, v1, v2, v3), s))
+      } else {
+        None
+      }
+    }
+    None => None
+  }
+}
+
+pub fn HandPart::other_near(self : HandPart, at : Double) -> Bool {
+  match self.group.last {
+    Some(l) => l.id != self.id && (l.went == pos_inf || at < l.went + self.group.within)
+    None => false
+  }
+}
+
+pub fn HandPart::came(
+  self : HandPart,
+  at : Double,
+  spec : Spec,
+  takes~ : Bool = true,
+) -> Option[Double] {
+  if takes && self.is_last() {
+    self.went = pos_inf
+    return None
+  }
+  let from : Option[(HandPart, ((Double, Double, Double, Double), (Double, Double, Double, Double), Double))] =
+    match self.group.last {
+      Some(l) => {
+        if takes && l.id != self.id && l.tag == self.tag && (l.went == pos_inf || at < l.went + self.group.within) {
+          match l.drawn_at(at) {
+            Some(d) => Some((l, d))
+            None => None
+          }
+        } else {
+          None
+        }
+      }
+      None => None
+    }
+  self.group.last = Some(self)
+  self.went = pos_inf
+  match from {
+    Some((l, (rect, speed, seen))) => {
+      (l.gave)()
+      self.go_from(HandFrom::{ rect, speed, at, spec })
+      Some(seen)
+    }
+    None => {
+      self.still()
+      None
+    }
+  }
+}
+
+pub fn HandPart::left(self : HandPart, at : Double) -> Unit {
+  self.went = at
+}
+
+pub fn HandPart::is_last(self : HandPart) -> Bool {
+  match self.group.last {
+    Some(l) => l.id == self.id
+    None => false
+  }
+}
+
+pub fn HandPart::still(self : HandPart) -> Unit {
+  (self.due)()
+  self.due = fn() -> Unit { () }
+  self.pending = None
+  for w in self.ways {
+    w.put(0.0)
+  }
+}
+
+pub fn HandPart::gone(self : HandPart) -> Unit {
+  self.still()
+  if self.is_last() {
+    self.group.last = None
+  }
+}
+
+fn HandPart::go_from(self : HandPart, from : HandFrom) -> Unit {
+  (self.due)()
+  self.due = fn() -> Unit { () }
+  self.pending = Some(from)
+  match self.node {
+    Some(v) => if v.alive() { self.start(v) }
+    None => ()
+  }
+}
+
+fn HandPart::start(self : HandPart, v : view::View) -> Unit {
+  let f = match self.pending {
+    Some(x) => x
+    None => return
+  }
+  self.due = v.at_moment(f.at, fn() -> Unit {
+    self.due = fn() -> Unit { () }
+    self.pending = None
+    let (tx, ty, tw, th) = v.laid_window_now()
+    let (fx, fy, fw, fh) = f.rect
+    let (vx, vy, vw, vh) = f.speed
+    let off = [
+      fx - tx,
+      fy - ty,
+      fw - tw,
+      fh - th,
+      fx + fw / 2.0 - (tx + tw / 2.0),
+      fy + fh / 2.0 - (ty + th / 2.0),
+    ]
+    let speed = [vx, vy, vw, vh, vx + vw / 2.0, vy + vh / 2.0]
+    let mut i = 0
+    while i < 6 {
+      self.ways[i].put(off[i])
+      self.ways[i].go(0.0, f.spec, at=f.at, velocity=speed[i])
+      i += 1
+    }
+  })
+}

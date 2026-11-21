@@ -1,0 +1,296 @@
+// Interactive image/canvas pan, pinch-zoom, double-tap, inertia fling, and pull-to-dismiss (Zoom).
+// Ported from libs/mbui/src/motion/zoom.mbt.
+
+import "dmath"
+import "signals"
+import "ui"
+
+pub let zoom_pull_least : Double = 0.6
+
+pub struct Zoom {
+  mut nat_w : Double
+  mut nat_h : Double
+  mut box_w : Double
+  mut box_h : Double
+  mut bar_h : Double
+  mut foot_h : Double
+  max_factor : Double
+  min_factor : Double
+  scale_way : Way
+  ox_way : Way
+  oy_way : Way
+  pull_way : Way
+  rev : signals::Signal[Int]
+  mut fling_end : Double
+}
+
+pub fn Zoom::new(
+  max_factor~ : Double = 4.0,
+  min_factor~ : Double = 0.5,
+) -> Zoom {
+  Zoom::{
+    nat_w: 0.0,
+    nat_h: 0.0,
+    box_w: 0.0,
+    box_h: 0.0,
+    bar_h: 0.0,
+    foot_h: 0.0,
+    max_factor,
+    min_factor,
+    scale_way: Way::new(1.0),
+    ox_way: Way::new(0.0),
+    oy_way: Way::new(0.0),
+    pull_way: Way::new(0.0),
+    rev: signals::signal(0),
+    fling_end: -1.0,
+  }
+}
+
+pub fn Zoom::fit(self : Zoom) -> Double {
+  if self.nat_w <= 0.0 || self.nat_h <= 0.0 || self.box_w <= 0.0 || self.box_h <= 0.0 {
+    return 1.0
+  }
+  let avail_h = m_max(1.0, self.box_h - self.bar_h - self.foot_h)
+  m_min(self.box_w / self.nat_w, avail_h / self.nat_h)
+}
+
+pub fn Zoom::min_scale(self : Zoom) -> Double {
+  self.fit() * self.min_factor
+}
+
+pub fn Zoom::max_scale(self : Zoom) -> Double {
+  m_max(self.fit() * self.max_factor, self.fit())
+}
+
+pub fn Zoom::sized(self : Zoom) -> Bool {
+  self.nat_w > 0.0 && self.nat_h > 0.0 && self.box_w > 0.0 && self.box_h > 0.0
+}
+
+pub fn Zoom::told(self : Zoom) -> Unit {
+  let _ = self.rev.get()
+  self.scale_way.said()
+  self.ox_way.said()
+  self.oy_way.said()
+  self.pull_way.said()
+}
+
+pub fn Zoom::natural(self : Zoom, w : Double, h : Double, at~ : Double = 0.0) -> Unit {
+  let _ = at
+  self.nat_w = w
+  self.nat_h = h
+  if self.sized() {
+    self.scale_way.put(self.fit())
+    self.ox_way.put(0.0)
+    self.oy_way.put(0.0)
+  }
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::boxed(self : Zoom, w : Double, h : Double, at~ : Double = 0.0) -> Unit {
+  let _ = at
+  self.box_w = w
+  self.box_h = h
+  if self.sized() && self.scale_way.target() <= 0.0 {
+    self.scale_way.put(self.fit())
+  }
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::under_bars(self : Zoom, bar : Double, foot : Double, at~ : Double = 0.0) -> Unit {
+  let _ = at
+  self.bar_h = bar
+  self.foot_h = foot
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::scale_at(self : Zoom, at : Double) -> Double {
+  self.scale_way.value_at(at)
+}
+
+pub fn Zoom::zoomed_at(self : Zoom, at : Double) -> Bool {
+  self.scale_at(at) > self.fit() * 1.01
+}
+
+pub fn Zoom::rect_at(self : Zoom, at : Double) -> Option[(Double, Double, Double, Double)] {
+  if !self.sized() {
+    return None
+  }
+  let s = self.scale_way.value_at(at)
+  let pw = self.nat_w * s
+  let ph = self.nat_h * s
+  let cx = (self.box_w - pw) / 2.0 + self.ox_way.value_at(at)
+  let cy = self.bar_h + (self.box_h - self.bar_h - self.foot_h - ph) / 2.0 + self.oy_way.value_at(at) + self.pull_way.value_at(at)
+  Some((cx, cy, pw, ph))
+}
+
+fn Zoom::clamp_offset(self : Zoom, s : Double, ox : Double, oy : Double) -> (Double, Double) {
+  let pw = self.nat_w * s
+  let ph = self.nat_h * s
+  let avail_h = m_max(1.0, self.box_h - self.bar_h - self.foot_h)
+  let max_x = m_max(0.0, (pw - self.box_w) / 2.0)
+  let max_y = m_max(0.0, (ph - avail_h) / 2.0)
+  (m_clamp(ox, -max_x, max_x), m_clamp(oy, -max_y, max_y))
+}
+
+pub fn Zoom::pan(self : Zoom, dx : Double, dy : Double, at~ : Double = 0.0) -> Unit {
+  let s = self.scale_way.value_at(at)
+  let ox = self.ox_way.value_at(at) + dx
+  let oy = self.oy_way.value_at(at) + dy
+  let (cx, cy) = self.clamp_offset(s, ox, oy)
+  self.ox_way.put(cx)
+  self.oy_way.put(cy)
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::transform(
+  self : Zoom,
+  scale_delta : Double,
+  dx : Double,
+  dy : Double,
+  ax : Double,
+  ay : Double,
+  at~ : Double = 0.0,
+) -> Unit {
+  let s0 = self.scale_way.value_at(at)
+  let s1 = m_clamp(s0 * scale_delta, self.min_scale(), self.max_scale())
+  let ox0 = self.ox_way.value_at(at)
+  let oy0 = self.oy_way.value_at(at)
+  let ratio = if s0 > 0.0 { s1 / s0 } else { 1.0 }
+  let mid_x = self.box_w / 2.0
+  let mid_y = self.bar_h + (self.box_h - self.bar_h - self.foot_h) / 2.0
+  let ox1 = (ox0 - (ax - mid_x)) * ratio + (ax - mid_x) + dx
+  let oy1 = (oy0 - (ay - mid_y)) * ratio + (ay - mid_y) + dy
+  let (cx, cy) = self.clamp_offset(s1, ox1, oy1)
+  self.scale_way.put(s1)
+  self.ox_way.put(cx)
+  self.oy_way.put(cy)
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::zoom_to(
+  self : Zoom,
+  target : Double,
+  ax : Double,
+  ay : Double,
+  glide : Bool,
+  at~ : Double = 0.0,
+) -> Unit {
+  let s0 = self.scale_way.value_at(at)
+  let s1 = m_clamp(target, self.fit(), self.max_scale())
+  let ox0 = self.ox_way.value_at(at)
+  let oy0 = self.oy_way.value_at(at)
+  let ratio = if s0 > 0.0 { s1 / s0 } else { 1.0 }
+  let mid_x = self.box_w / 2.0
+  let mid_y = self.bar_h + (self.box_h - self.bar_h - self.foot_h) / 2.0
+  let ox1 = (ox0 - (ax - mid_x)) * ratio + (ax - mid_x)
+  let oy1 = (oy0 - (ay - mid_y)) * ratio + (ay - mid_y)
+  let (cx, cy) = self.clamp_offset(s1, ox1, oy1)
+  if glide {
+    self.scale_way.go(s1, move_damped, at=at)
+    self.ox_way.go(cx, move_damped, at=at)
+    self.oy_way.go(cy, move_damped, at=at)
+  } else {
+    self.scale_way.put(s1)
+    self.ox_way.put(cx)
+    self.oy_way.put(cy)
+  }
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::pull(self : Zoom, dx : Double, dy : Double, at~ : Double = 0.0) -> Unit {
+  let _ = dx
+  let cur = self.pull_way.value_at(at)
+  self.pull_way.put(cur + dy)
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::pulled_at(self : Zoom, at : Double) -> Double {
+  self.pull_way.value_at(at)
+}
+
+pub fn Zoom::reset(self : Zoom, at~ : Double = 0.0) -> Unit {
+  self.scale_way.go(self.fit(), move_damped, at=at)
+  self.ox_way.go(0.0, move_damped, at=at)
+  self.oy_way.go(0.0, move_damped, at=at)
+  self.pull_way.go(0.0, move_damped, at=at)
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::fit_now(self : Zoom, at~ : Double = 0.0) -> Unit {
+  let _ = at
+  self.scale_way.put(self.fit())
+  self.ox_way.put(0.0)
+  self.oy_way.put(0.0)
+  self.pull_way.put(0.0)
+  self.fling_end = -1.0
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::stop_glide(self : Zoom, at~ : Double = 0.0) -> Unit {
+  self.scale_way.put(self.scale_way.value_at(at))
+  self.ox_way.put(self.ox_way.value_at(at))
+  self.oy_way.put(self.oy_way.value_at(at))
+  self.pull_way.put(self.pull_way.value_at(at))
+}
+
+pub fn Zoom::stop_fling(self : Zoom, at~ : Double = 0.0) -> Bool {
+  let was = self.fling_end > at
+  self.stop_glide(at=at)
+  self.fling_end = -1.0
+  was
+}
+
+pub fn Zoom::fling(self : Zoom, vx : Double, vy : Double, at~ : Double = 0.0) -> Unit {
+  let s = self.scale_way.value_at(at)
+  let ox0 = self.ox_way.value_at(at)
+  let oy0 = self.oy_way.value_at(at)
+  let tx = ox0 + vx * (zoom_fling_ms / 1000.0)
+  let ty = oy0 + vy * (zoom_fling_ms / 1000.0)
+  let (cx, cy) = self.clamp_offset(s, tx, ty)
+  self.ox_way.go(cx, inertia_to(time_constant=zoom_fling_ms, min=-m_max(0.0, (self.nat_w * s - self.box_w) / 2.0), max=m_max(0.0, (self.nat_w * s - self.box_w) / 2.0)), at=at, velocity=vx)
+  let avail_h = m_max(1.0, self.box_h - self.bar_h - self.foot_h)
+  let max_y = m_max(0.0, (self.nat_h * s - avail_h) / 2.0)
+  self.oy_way.go(cy, inertia_to(time_constant=zoom_fling_ms, min=-max_y, max=max_y), at=at, velocity=vy)
+  self.fling_end = m_max(self.ox_way.ends_at(), self.oy_way.ends_at())
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn Zoom::goes_at(self : Zoom, t : Double) -> Bool {
+  self.scale_way.goes_at(t) || self.ox_way.goes_at(t) || self.oy_way.goes_at(t) || self.pull_way.goes_at(t)
+}
+
+pub fn Zoom::fling_ends(self : Zoom) -> Double {
+  self.fling_end
+}
+
+pub fn Zoom::double_tap(self : Zoom, ax : Double, ay : Double, at~ : Double = 0.0) -> Unit {
+  if self.zoomed_at(at) {
+    self.reset(at=at)
+  } else {
+    self.zoom_to(self.fit() * 2.5, ax, ay, true, at=at)
+  }
+}
+
+pub fn Zoom::keep(self : Zoom, at : (Double, Double), margin : Double, when~ : Double = 0.0) -> Unit {
+  let _ = (at, margin, when)
+  let s = self.scale_way.value_at(when)
+  let (cx, cy) = self.clamp_offset(s, self.ox_way.value_at(when), self.oy_way.value_at(when))
+  self.ox_way.put(cx)
+  self.oy_way.put(cy)
+}
+
+pub fn Zoom::resize_keeping(
+  self : Zoom,
+  w : Double,
+  h : Double,
+  at~ : Double = 0.0,
+) -> Unit {
+  self.box_w = w
+  self.box_h = h
+  let s = m_clamp(self.scale_way.value_at(at), self.fit(), self.max_scale())
+  let (cx, cy) = self.clamp_offset(s, self.ox_way.value_at(at), self.oy_way.value_at(at))
+  self.scale_way.put(s)
+  self.ox_way.put(cx)
+  self.oy_way.put(cy)
+  self.rev.set(self.rev.untracked() + 1)
+}

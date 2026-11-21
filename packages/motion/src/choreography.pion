@@ -1,0 +1,239 @@
+// Multi-track Choreography and staggered SerialQueue.
+// Ported from libs/mbui/src/motion/choreography.mbt.
+
+import "signals"
+import "ui"
+import "view"
+
+pub struct TrackSpec {
+  pub name : String
+  pub forward : Spec
+  pub backward : Spec
+}
+
+pub struct Choreography {
+  specs : Array[TrackSpec]
+  ways : Array[Way]
+  ended : signals::Signal[Int]
+  due : Array[(view::NodeId, () -> Unit)]
+}
+
+pub fn Choreography::new(tracks : Array[TrackSpec]) -> Choreography {
+  let ways : Array[Way] = []
+  for _t in tracks {
+    ways.push(Way::new(0.0))
+  }
+  Choreography::{ specs: tracks.copy(), ways, ended: signals::signal(0), due: [] }
+}
+
+fn Choreography::index_of(self : Choreography, name : String) -> Int {
+  let mut i = 0
+  while i < self.specs.length() {
+    if self.specs[i].name == name {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+pub fn Choreography::start(self : Choreography, at : Double, loc~ : String = "") -> Unit {
+  self.stop()
+  if ui::reduced_motion() {
+    for w in self.ways {
+      w.put(1.0, loc=loc)
+    }
+    return
+  }
+  let mut i = 0
+  while i < self.ways.length() {
+    self.ways[i].put(0.0, loc=loc)
+    self.ways[i].go(1.0, self.specs[i].forward, at=at, loc=loc)
+    i += 1
+  }
+}
+
+pub fn Choreography::reverse(self : Choreography, at : Double, loc~ : String = "") -> Unit {
+  self.stop()
+  if ui::reduced_motion() {
+    for w in self.ways {
+      w.put(0.0, loc=loc)
+    }
+    return
+  }
+  let mut i = 0
+  while i < self.ways.length() {
+    self.ways[i].go(0.0, self.specs[i].backward, at=at, loc=loc)
+    i += 1
+  }
+}
+
+pub fn Choreography::put(self : Choreography, v : Double, loc~ : String = "") -> Unit {
+  self.stop()
+  for w in self.ways {
+    w.put(v, loc=loc)
+  }
+}
+
+pub fn Choreography::arm(self : Choreography, n : view::View) -> Unit {
+  let id = n.id()
+  let mut i = self.due.length() - 1
+  while i >= 0 {
+    if self.due[i].0 == id {
+      let cancel = self.due[i].1
+      ui::array_remove_at(self.due, i)
+      cancel()
+    }
+    i -= 1
+  }
+  let end = self.ends_at()
+  if end < 0.0 || !n.alive() {
+    return
+  }
+  let remove_entry = fn() -> Unit {
+    let mut k = self.due.length() - 1
+    while k >= 0 {
+      if self.due[k].0 == id {
+        ui::array_remove_at(self.due, k)
+      }
+      k -= 1
+    }
+  }
+  let unkeep : ui::Ref[Option[() -> Unit]] = ui::ref_new(None)
+  let drop_unkeep = fn() -> Unit {
+    match unkeep.v {
+      Some(f) => {
+        unkeep.v = None
+        f()
+      }
+      None => ()
+    }
+  }
+  let stop_moment = n.at_moment(end, fn() -> Unit {
+    drop_unkeep()
+    remove_entry()
+    self.ended.set(self.ended.untracked() + 1)
+  })
+  unkeep.v = Some(n.owns_while(fn() -> Unit {
+    unkeep.v = None
+    stop_moment()
+    remove_entry()
+  }))
+  self.due.push((
+    id,
+    fn() -> Unit {
+      drop_unkeep()
+      stop_moment()
+    },
+  ))
+}
+
+pub fn Choreography::progress(self : Choreography, n : view::View, name : String) -> Double {
+  let _ = self.ended.get()
+  let i = self.index_of(name)
+  if i < 0 { 0.0 } else { self.ways[i].shown_on(n) }
+}
+
+pub fn Choreography::value_at(self : Choreography, name : String, t : Double) -> Double {
+  let i = self.index_of(name)
+  if i < 0 { 0.0 } else { self.ways[i].value_at(t) }
+}
+
+pub fn Choreography::active(self : Choreography, n : view::View) -> Bool {
+  let _ = self.ended.get()
+  for w in self.ways {
+    w.said()
+  }
+  n.goes_now(fn(at : Double) -> Bool {
+    for w in self.ways {
+      if w.goes_at(at) {
+        return true
+      }
+    }
+    false
+  })
+}
+
+pub fn Choreography::ends_at(self : Choreography) -> Double {
+  let mut max_end = -1.0
+  for w in self.ways {
+    let e = w.ends_at()
+    if e >= 0.0 && e > max_end {
+      max_end = e
+    }
+  }
+  max_end
+}
+
+pub fn Choreography::duration(self : Choreography) -> Double {
+  let mut min_start = pos_inf
+  let mut max_end = -1.0
+  for w in self.ways {
+    let s = w.starts_at()
+    let e = w.ends_at()
+    if s >= 0.0 && e >= 0.0 {
+      if s < min_start { min_start = s }
+      if e > max_end { max_end = e }
+    }
+  }
+  if max_end >= 0.0 && min_start < pos_inf {
+    max_end - min_start
+  } else {
+    let mut nominal = 0.0
+    for spec in self.specs {
+      let d = spec_duration(spec.forward, 0.0, 1.0, 0.0)
+      if d > nominal { nominal = d }
+    }
+    nominal
+  }
+}
+
+pub fn Choreography::track_delay(self : Choreography, name : String) -> Double {
+  let i = self.index_of(name)
+  if i < 0 { 0.0 } else { spec_delay(self.specs[i].forward) }
+}
+
+pub fn Choreography::stop(self : Choreography) -> Unit {
+  if self.due.length() == 0 {
+    return
+  }
+  let pending = self.due.copy()
+  self.due.clear()
+  for entry in pending {
+    (entry.1)()
+  }
+}
+
+pub struct SerialQueue {
+  mut tail_end : Double
+  mut last_source : String
+}
+
+pub fn SerialQueue::new() -> SerialQueue {
+  SerialQueue::{ tail_end: 0.0, last_source: "" }
+}
+
+pub fn SerialQueue::next_at(
+  self : SerialQueue,
+  source : String,
+  now : Double,
+  lead~ : Double = 0.0,
+) -> Double {
+  if self.last_source != "" && source != self.last_source && self.tail_end - lead > now {
+    self.tail_end - lead
+  } else {
+    now
+  }
+}
+
+pub fn SerialQueue::commit(self : SerialQueue, source : String, end_at : Double) -> Unit {
+  if end_at > self.tail_end {
+    self.tail_end = end_at
+  }
+  self.last_source = source
+}
+
+pub fn SerialQueue::reset(self : SerialQueue) -> Unit {
+  self.tail_end = 0.0
+  self.last_source = ""
+}

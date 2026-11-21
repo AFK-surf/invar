@@ -1,0 +1,212 @@
+// Offscreen Apple Metal rendering tests for packages/film:
+// PNG picture capture, PNG byte header & pixel validation, transparent capture,
+// drive script execution, and H.264 MP4 film recording.
+
+import "host"
+import "hostapi"
+import "ui"
+import "view"
+
+fn is_png_header(b : Bytes) -> Bool {
+  b.length() > 24 &&
+  b[0].to_int() == 0x89 &&
+  b[1].to_int() == 0x50 &&
+  b[2].to_int() == 0x4E &&
+  b[3].to_int() == 0x47 &&
+  b[4].to_int() == 0x0D &&
+  b[5].to_int() == 0x0A &&
+  b[6].to_int() == 0x1A &&
+  b[7].to_int() == 0x0A
+}
+
+fn read_be32(b : Bytes, off : Int) -> Int {
+  (b[off].to_int() << 24) |
+  (b[off + 1].to_int() << 16) |
+  (b[off + 2].to_int() << 8) |
+  b[off + 3].to_int()
+}
+
+test "film_picture_metal_offscreen_png_and_pixel_check" {
+  debug_assert(is_supported(), "Apple macOS host must support offscreen film/picture")
+  let png_path = "/tmp/invar_film_test_card.png"
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(card : view::View) -> Unit {
+        let _ = card
+          .width(view::Live::Is(Some(120.0)))
+          .height(view::Live::Is(Some(80.0)))
+          .padding(view::Live::Is((12.0, 12.0, 12.0, 12.0)))
+          .ground(view::Live::Is(ui::rgba(230, 64, 52, 255)))
+          .corners(view::Live::Is(Some((12.0, 12.0, 12.0, 12.0))))
+          .words(view::Live::Is("Invar Metal"))
+          .ink(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      })
+    },
+    path=png_path,
+    w=160.0,
+    h=120.0,
+    scale=1.0,
+    dark=true,
+  )
+  debug_assert(ok, "film::picture must succeed on Apple Metal offscreen")
+
+  let png_bytes = match read_file_bytes(png_path) {
+    Some(b) => b
+    None => { debug_assert(false, "PNG file must be readable and non-empty"); return }
+  }
+  debug_assert(is_png_header(png_bytes), "output file must have valid PNG magic signature")
+  let ihdr_w = read_be32(png_bytes, 16)
+  let ihdr_h = read_be32(png_bytes, 20)
+  debug_assert(ihdr_w == 160 && ihdr_h == 120, "PNG IHDR dimensions must match 160x120")
+
+  // Decode PNG via native ImageIO and verify pixels are neither all-black nor all-transparent
+  host::install()
+  let img_id = hostapi::image_load(png_path, 256)
+  debug_assert(img_id > 0, "image_load must return positive id")
+  let info = Array::make(4, 0.0)
+  let mut st = hostapi::image_info(img_id, info)
+  let mut tries = 0
+  while st == 0 && tries < 100 {
+    host::pump_main_loop(10.0)
+    st = hostapi::image_info(img_id, info)
+    tries += 1
+  }
+  debug_assert(st == 1, "decoded PNG must reach ready state")
+  let px = Array::make(160 * 120 * 4, 0 as Byte)
+  debug_assert(hostapi::image_pixels(img_id, px), "image_pixels must read back RGBA pixels")
+
+  let mut non_black = 0
+  let mut non_transparent = 0
+  let mut coral_pixels = 0
+  let mut idx = 0
+  while idx < 160 * 120 * 4 {
+    let r = px[idx].to_int()
+    let g = px[idx + 1].to_int()
+    let b = px[idx + 2].to_int()
+    let a = px[idx + 3].to_int()
+    if a > 0 { non_transparent += 1 }
+    if r > 20 || g > 20 || b > 20 { non_black += 1 }
+    if r > 180 && g < 100 && b < 90 && a == 255 { coral_pixels += 1 }
+    idx += 4
+  }
+  hostapi::image_free(img_id)
+  debug_assert(non_transparent > 1000, "rendered PNG must not be all transparent")
+  debug_assert(non_black > 1000, "rendered PNG must not be all black")
+  debug_assert(coral_pixels > 500, "rendered coral card pixels must appear in Metal output")
+}
+
+test "film_picture_bytes_retina_2x" {
+  let bytes_opt = picture_bytes(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(panel : view::View) -> Unit {
+        let _ = panel
+          .width(view::Live::Is(Some(80.0)))
+          .height(view::Live::Is(Some(60.0)))
+          .ground(view::Live::Is(ui::rgba(40, 160, 220, 255)))
+      })
+    },
+    w=100.0,
+    h=80.0,
+    scale=2.0,
+    dark=false,
+  )
+  let b = match bytes_opt {
+    Some(data) => data
+    None => { debug_assert(false, "picture_bytes must return Some(Bytes)"); return }
+  }
+  debug_assert(is_png_header(b), "picture_bytes must return valid PNG bytes")
+  debug_assert(read_be32(b, 16) == 200 && read_be32(b, 20) == 160, "2x scale PNG must be 200x160 pixels")
+}
+
+test "film_picture_transparent_background" {
+  let path = "/tmp/invar_film_test_transparent.png"
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(dot : view::View) -> Unit {
+        let _ = dot
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .ground(view::Live::Is(ui::rgba(80, 220, 120, 255)))
+          .corners(view::Live::Is(Some((20.0, 20.0, 20.0, 20.0))))
+      })
+    },
+    path=path,
+    w=80.0,
+    h=80.0,
+    scale=1.0,
+    transparent=true,
+  )
+  debug_assert(ok, "transparent PNG snapshot must succeed")
+  let b = match read_file_bytes(path) {
+    Some(data) => data
+    None => { debug_assert(false, "transparent PNG must exist"); return }
+  }
+  debug_assert(is_png_header(b), "transparent output must be valid PNG")
+}
+
+test "film_drive_script_and_interactive_capture" {
+  let tapped = ui::ref_new(false)
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(btn : view::View) -> Unit {
+        let _ = btn
+          .width(view::Live::Is(Some(100.0)))
+          .height(view::Live::Is(Some(50.0)))
+          .ground(view::Live::Is(ui::rgba(60, 120, 240, 255)))
+          .on_press(fn() -> Unit { tapped.v = true })
+      })
+    },
+    path="/tmp/invar_film_test_drive.png",
+    w=120.0,
+    h=80.0,
+    scale=1.0,
+    script="wait 50\ntapxy 30 20\nwait 50",
+    at=50.0,
+  )
+  debug_assert(ok, "drive script picture must succeed")
+  debug_assert(tapped.v, "tapxy in drive script must trigger on_press handler")
+}
+
+test "film_mp4_recording_apple_avfoundation" {
+  let mp4_path = "/tmp/invar_film_test_clip.mp4"
+  let ok = film(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(card : view::View) -> Unit {
+        let _ = card
+          .width(view::Live::Is(Some(96.0)))
+          .height(view::Live::Is(Some(64.0)))
+          .ground(view::Live::Is(ui::rgba(240, 150, 40, 255)))
+      })
+    },
+    script="wait 100",
+    out=mp4_path,
+    w=128.0,
+    h=96.0,
+    scale=1.0,
+    fps=30,
+    dark=true,
+  )
+  debug_assert(ok, "film::film MP4 recording must succeed on Apple AVFoundation + Metal")
+  let mp4_bytes = match read_file_bytes(mp4_path) {
+    Some(b) => b
+    None => { debug_assert(false, "MP4 file must be readable and non-empty"); return }
+  }
+  debug_assert(mp4_bytes.length() > 512, "MP4 output must be a non-trivial H.264 file")
+}
+
+test "film_rejects_invalid_dimensions" {
+  let bad = picture(
+    fn(_r : view::View) -> Unit { () },
+    path="/tmp/should_not_exist.png",
+    w=0.0,
+    h=100.0,
+  )
+  debug_assert(!bad, "picture must reject zero width")
+  let bad_path = picture(
+    fn(_r : view::View) -> Unit { () },
+    path="",
+    w=100.0,
+    h=100.0,
+  )
+  debug_assert(!bad_path, "picture must reject empty path")
+}

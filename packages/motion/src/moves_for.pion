@@ -1,0 +1,446 @@
+// Causal FLIP layout and ground-reshape animation for pure-tree nodes (Moves, moves_for).
+// Ported from libs/mbui/src/motion/{reshape_way.mbt,moves_for.mbt}.
+
+import "signals"
+import "ui"
+import "view"
+
+fn corners_in(r : (Double, Double, Double, Double), w : Double, h : Double) -> (Double, Double, Double, Double) {
+  let half = m_min(w, h) / 2.0
+  (m_min(r.0, half), m_min(r.1, half), m_min(r.2, half), m_min(r.3, half))
+}
+
+fn corners_mix(
+  a : (Double, Double, Double, Double),
+  b : (Double, Double, Double, Double),
+  p : Double,
+) -> (Double, Double, Double, Double) {
+  (a.0 + (b.0 - a.0) * p, a.1 + (b.1 - a.1) * p, a.2 + (b.2 - a.2) * p, a.3 + (b.3 - a.3) * p)
+}
+
+fn foot_moved_by(was : (Double, Double, Double, Double), now : (Double, Double, Double, Double)) -> Double {
+  now.1 + now.3 - (was.1 + was.3)
+}
+
+fn shape_held(
+  g : (Double, Double, Double, Double),
+  was : (Double, Double, Double, Double),
+  now : (Double, Double, Double, Double),
+) -> (Double, Double, Double, Double) {
+  (g.0 + (now.0 - was.0), g.1 + (now.1 - was.1), g.2 + (now.2 - was.2), g.3 + (now.3 - was.3))
+}
+
+fn shape_far(g : (Double, Double, Double, Double), to : (Double, Double, Double, Double)) -> Double {
+  m_max(
+    m_max((g.0 - to.0).abs(), (g.1 - to.1).abs()),
+    m_max((g.0 + g.2 - to.0 - to.2).abs(), (g.1 + g.3 - to.1 - to.3).abs()),
+  )
+}
+
+fn way_far(dx : Double, dy : Double, dw : Double, dh : Double, ground : Double) -> Double {
+  m_max(m_max(dx.abs(), dy.abs()), m_max(m_max(dh.abs(), dw.abs()), ground))
+}
+
+fn shape_changed(was : (Double, Double, Double, Double), now : (Double, Double, Double, Double)) -> Bool {
+  (was.0 - now.0).abs() > 0.5 ||
+  (was.1 - now.1).abs() > 0.5 ||
+  (was.2 - now.2).abs() > 0.5 ||
+  (was.3 - now.3).abs() > 0.5
+}
+
+fn carried_y_from(
+  was_carry : Bool,
+  gy : Double,
+  was_y : Double,
+  was_carried_y : Double,
+  p0 : Double,
+) -> Double {
+  if was_carry { gy - was_y } else { was_carried_y * (1.0 - p0) }
+}
+
+fn ground_over_drawn(y : Double, drawn_y : Double, carried_y : Double, p : Double) -> Double {
+  y - drawn_y + carried_y * (1.0 - p)
+}
+
+fn carried_on(
+  drawn : (Double, Double, Double, Double),
+  to : (Double, Double, Double, Double),
+  edges : Int,
+) -> (Double, Double) {
+  let (gx, gy, gw, gh) = drawn
+  (
+    if edges % 2 == 1 { gx + gw - to.0 - to.2 } else { gx - to.0 },
+    if edges >= 2 { gy + gh - to.1 - to.3 } else { gy - to.1 },
+  )
+}
+
+fn carried_edges(inner : (Double, Double, Double, Double), outer : (Double, Double, Double, Double)) -> Int {
+  (if inner.0 + inner.2 / 2.0 > outer.0 + outer.2 / 2.0 { 1 } else { 0 }) +
+  (if inner.1 + inner.3 / 2.0 > outer.1 + outer.3 / 2.0 { 2 } else { 0 })
+}
+
+let next_move_id : ui::Ref[Int] = ui::ref_new(1)
+
+fn alloc_move_id() -> Int {
+  let id = next_move_id.v
+  next_move_id.v = id + 1
+  id
+}
+
+struct Shape {
+  id : Int
+  v : view::View
+  carry : () -> Bool
+  foot : Bool
+  ways : Array[NodeWay]
+  mut to : (Double, Double, Double, Double)
+  round : NodeWay
+  mut from_r : (Double, Double, Double, Double)
+  mut carrying : Bool
+  mut carried_y : Double
+}
+
+struct Part {
+  id : Int
+  v : view::View
+  x : NodeWay
+  y : NodeWay
+  mut ride_shape : Option[Shape]
+  mut ride_edges : Int
+  ride_rev : signals::Signal[Int]
+}
+
+pub struct Moves {
+  owner : view::View
+  shapes : Array[Shape]
+  parts : Array[Part]
+}
+
+pub fn moves_for[T : view::ViewEq](
+  owner : view::View,
+  by : () -> T,
+  spec~ : Spec = moved(),
+  spec_of? : (T, T) -> Spec,
+  carry_of? : (T, T) -> Bool,
+) -> Moves {
+  let m = Moves::{ owner, shapes: [], parts: [] }
+  owner.laid_before_causes()
+  let from : ui::Ref[Option[T]] = ui::ref_new(None)
+  owner.reacts(by, fn(now : T) -> Unit {
+    let (way, carries) = match from.v {
+      Some(was) => (
+        match spec_of { Some(f) => f(was, now); None => spec },
+        match carry_of { Some(f) => f(was, now); None => true },
+      )
+      None => (spec, true)
+    }
+    from.v = Some(now)
+    if owner.transition_gate() {
+      m.set_off(way, carries)
+    }
+  })
+  m
+}
+
+pub fn Moves::reshapes(
+  self : Moves,
+  v : view::View,
+  carry~ : () -> Bool = fn() -> Bool { false },
+  foot~ : Bool = false,
+) -> Unit {
+  let ways : Array[NodeWay] = []
+  let mut i = 0
+  while i < 4 {
+    ways.push(NodeWay::new(0.0))
+    i += 1
+  }
+  let s = Shape::{
+    id: alloc_move_id(),
+    v,
+    carry,
+    foot,
+    ways,
+    to: (0.0, 0.0, 0.0, 0.0),
+    round: NodeWay::new(1.0),
+    from_r: (0.0, 0.0, 0.0, 0.0),
+    carrying: false,
+    carried_y: 0.0,
+  }
+  self.shapes.push(s)
+  let _ = v.owns(fn() -> Unit {
+    for w in s.ways {
+      w.stop()
+    }
+    s.round.stop()
+    let mut k = 0
+    while k < self.shapes.length() {
+      if self.shapes[k].id == s.id {
+        ui::array_remove_at(self.shapes, k)
+        break
+      }
+      k += 1
+    }
+  })
+  let _ = v.ground_drawn(view::Live::By(fn() -> view::GroundShape { s.drawn() }))
+  let _ = v.carries_until(fn() -> Double {
+    let mut m = s.round.ends_at()
+    for w in s.ways {
+      let e = w.ends_at()
+      if e > m { m = e }
+    }
+    m
+  })
+}
+
+pub fn Moves::moves_with(self : Moves, v : view::View) -> Unit {
+  let p = Part::{
+    id: alloc_move_id(),
+    v,
+    x: NodeWay::new(0.0),
+    y: NodeWay::new(0.0),
+    ride_shape: None,
+    ride_edges: 0,
+    ride_rev: signals::signal(0),
+  }
+  self.parts.push(p)
+  let at = self.owner.cause_at()
+  for s in self.shapes {
+    if s.carrying && s.round.goes_at(at) && held_in(v, s.v) {
+      let _ = v.at_moment(at, fn() -> Unit {
+        p.ride_shape = Some(s)
+        p.ride_edges = carried_edges(v.laid_window_now(), s.to)
+        p.ride_rev.set(p.ride_rev.untracked() + 1)
+      })
+      break
+    }
+  }
+  let _ = v.owns(fn() -> Unit {
+    p.x.stop()
+    p.y.stop()
+    let mut k = 0
+    while k < self.parts.length() {
+      if self.parts[k].id == p.id {
+        ui::array_remove_at(self.parts, k)
+        break
+      }
+      k += 1
+    }
+  })
+  let _ = v.drawn_off(view::Live::By(fn() -> (Double, Double) { p.off() }))
+  let _ = v.carries_until(fn() -> Double {
+    let a = p.x.ends_at()
+    let b = p.y.ends_at()
+    if a > b { a } else { b }
+  })
+}
+
+pub fn Moves::ground_over(self : Moves) -> Double {
+  if self.shapes.length() == 0 {
+    return 0.0
+  }
+  let s = self.shapes[0]
+  if s.carrying || !s.goes() {
+    0.0
+  } else {
+    ground_over_drawn(s.to.1, s.ways[1].shown(s.v), s.carried_y, s.round.shown(s.v))
+  }
+}
+
+pub fn Moves::over(self : Moves) -> Bool {
+  for s in self.shapes {
+    if s.goes() {
+      return false
+    }
+  }
+  for p in self.parts {
+    if p.x.goes(p.v) || p.y.goes(p.v) {
+      return false
+    }
+  }
+  true
+}
+
+fn Shape::drawn(self : Shape) -> view::GroundShape {
+  if !self.goes() {
+    return view::ground_as_laid
+  }
+  let to = self.to
+  let (x, y, w, h) = self.shown()
+  let to_r = corners_in(signals::untracked(fn() -> (Double, Double, Double, Double) { self.v.corners_said() }), to.2, to.3)
+  let p = self.round.shown(self.v)
+  view::GroundShape::{
+    dx: x - to.0,
+    dy: y - to.1,
+    dw: w - to.2,
+    dh: h - to.3,
+    corners: Some(corners_mix(self.from_r, to_r, p)),
+  }
+}
+
+fn Shape::goes(self : Shape) -> Bool {
+  let g0 = self.ways[0].goes(self.v)
+  let g1 = self.ways[1].goes(self.v)
+  let g2 = self.ways[2].goes(self.v)
+  let g3 = self.ways[3].goes(self.v)
+  self.round.goes(self.v) || g0 || g1 || g2 || g3
+}
+
+fn Shape::shown(self : Shape) -> (Double, Double, Double, Double) {
+  (self.ways[0].shown(self.v), self.ways[1].shown(self.v), self.ways[2].shown(self.v), self.ways[3].shown(self.v))
+}
+
+fn Shape::goes_at(self : Shape, at : Double) -> Bool {
+  if self.round.goes_at(at) {
+    return true
+  }
+  for w in self.ways {
+    if w.goes_at(at) {
+      return true
+    }
+  }
+  false
+}
+
+fn Shape::at(self : Shape, at : Double) -> (Double, Double, Double, Double) {
+  (self.ways[0].value_at(at), self.ways[1].value_at(at), self.ways[2].value_at(at), self.ways[3].value_at(at))
+}
+
+fn Part::off(self : Part) -> (Double, Double) {
+  let _ = self.ride_rev.get()
+  match self.ride_shape {
+    Some(s) => if s.goes() { return carried_on(s.shown(), s.to, self.ride_edges) }
+    None => ()
+  }
+  (self.x.shown(self.v), self.y.shown(self.v))
+}
+
+fn held_in(v : view::View, of : view::View) -> Bool {
+  let mut at : Option[view::View] = Some(v)
+  while true {
+    match at {
+      Some(n) => {
+        if n.id() == of.id() {
+          return true
+        }
+        at = n.parent()
+      }
+      None => return false
+    }
+  }
+  false
+}
+
+fn Moves::set_off(self : Moves, spec : Spec, carries : Bool) -> Unit {
+  let at = self.owner.cause_at()
+  let shapes : Array[Shape] = []
+  for s in self.shapes {
+    if s.v.alive() && !s.v.leaving_now() && s.v.was_placed() {
+      shapes.push(s)
+    }
+  }
+  let parts : Array[Part] = []
+  for p in self.parts {
+    if p.v.alive() && !p.v.leaving_now() {
+      parts.push(p)
+    }
+  }
+  let shapes_at : Array[((Double, Double, Double, Double), (Double, Double, Double, Double))] = []
+  for s in shapes {
+    shapes_at.push((s.v.placed_window_now(), s.v.laid_window_now()))
+  }
+  let parts_at : Array[Option[((Double, Double, Double, Double), (Double, Double, Double, Double))]] = []
+  for p in parts {
+    if p.v.was_placed() {
+      parts_at.push(Some((p.v.placed_window_now(), p.v.laid_window_now())))
+    } else {
+      parts_at.push(None)
+    }
+  }
+  let mut most = 0.0
+  let mut foot = 0.0
+  let set : Array[(Shape, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
+  let mut i = 0
+  while i < shapes.length() {
+    let s = shapes[i]
+    let (placed, laid) = shapes_at[i]
+    let carry = carries && signals::untracked(s.carry)
+    let p0 = s.round.value_at(at)
+    let (gx, gy, gw, gh) = if s.goes_at(at) { shape_held(s.at(at), s.to, placed) } else { placed }
+    let moved_f = if s.foot && !carry { foot_moved_by(placed, laid) } else { 0.0 }
+    let g = (gx, gy + moved_f, gw, gh)
+    let far = way_far(
+      placed.0 - laid.0,
+      placed.1 - laid.1,
+      laid.2 - placed.2,
+      laid.3 - placed.3,
+      shape_far(g, laid),
+    )
+    if shape_changed(placed, laid) {
+      most = m_max(most, far)
+      if s.foot && !carry {
+        foot = moved_f
+      }
+      let wr = corners_in(signals::untracked(fn() -> (Double, Double, Double, Double) { s.v.corners_drawn() }), placed.2, placed.3)
+      s.from_r = corners_mix(s.from_r, wr, p0)
+      s.carried_y = carried_y_from(s.carrying, gy, placed.1, s.carried_y, p0)
+      s.carrying = carry
+      set.push((s, g, laid))
+    }
+    i += 1
+  }
+  let moving : Array[(Part, Double, Double)] = []
+  let mut j = 0
+  while j < parts.length() {
+    let p = parts[j]
+    match parts_at[j] {
+      None => {
+        let mut ride_s : Option[Shape] = None
+        let mut ride_e = 0
+        for e in set {
+          let (s, _, laid) = e
+          if s.carrying && held_in(p.v, s.v) {
+            ride_s = Some(s)
+            ride_e = carried_edges(p.v.laid_window_now(), laid)
+            break
+          }
+        }
+        p.ride_shape = ride_s
+        p.ride_edges = ride_e
+        p.ride_rev.set(p.ride_rev.untracked() + 1)
+      }
+      Some((placed, laid)) => {
+        p.ride_shape = None
+        p.ride_edges = 0
+        p.ride_rev.set(p.ride_rev.untracked() + 1)
+        let ox = p.x.value_at(at)
+        let oy = p.y.value_at(at)
+        let dx = placed.0 - laid.0
+        let dy = placed.1 - laid.1
+        let far = way_far(ox + dx, oy + dy + foot, laid.2 - placed.2, laid.3 - placed.3, 0.0)
+        if dx.abs() > 0.5 || dy.abs() > 0.5 {
+          most = m_max(most, far)
+          moving.push((p, ox + dx, oy + (dy + foot)))
+        }
+      }
+    }
+    j += 1
+  }
+  let used_spec = if spec_way_said(spec) { spec } else { spec_over(spec, most) }
+  for e in set {
+    let (s, g, laid) = e
+    let from = [g.0, g.1, g.2, g.3]
+    let to = [laid.0, laid.1, laid.2, laid.3]
+    s.to = laid
+    let mut k = 0
+    while k < 4 {
+      s.ways[k].put_at(s.v, from[k], to[k], used_spec, at)
+      k += 1
+    }
+    s.round.go_from(s.v, 0.0, 1.0, used_spec, at=at)
+  }
+  for m in moving {
+    let (p, fx, fy) = m
+    p.x.put_at(p.v, fx, 0.0, used_spec, at)
+    p.y.put_at(p.v, fy, 0.0, used_spec, at)
+  }
+}

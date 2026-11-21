@@ -1,0 +1,365 @@
+// Offscreen PNG snapshot (picture / picture_tree / picture_bytes) and H.264 MP4 recording (film / film_tree)
+// driven by ui::Tester::tree and rendered via Apple Metal (packages/host).
+// Ported from libs/mbui/src/film/{picture.mbt,film.mbt,scene.mbt}.
+
+import "host"
+import "hostapi"
+import "ui"
+import "view"
+
+pub let film_fps : Int = 60
+let inst_size : Int = ui::inst_size
+
+fn is_nan_d(x : Double) -> Bool {
+  x != x
+}
+
+fn is_inf_d(x : Double) -> Bool {
+  let inf = 1.0 / 0.0
+  x == inf || x == -inf
+}
+
+fn clear_rgb_from_theme(dark : Bool) -> (Double, Double, Double) {
+  let bg = ui::tree_theme().bg
+  if (bg & 0xFFL) != 0L {
+    (
+      ((bg >> 24) & 0xFFL).to_double() / 255.0,
+      ((bg >> 16) & 0xFFL).to_double() / 255.0,
+      ((bg >> 8) & 0xFFL).to_double() / 255.0,
+    )
+  } else if dark {
+    (0.08, 0.09, 0.11)
+  } else {
+    (0.98, 0.98, 0.99)
+  }
+}
+
+/// Normalize ui::Scene instances for Apple Metal offscreen rendering:
+/// ensures instances with default zero clip rects use full-canvas clipping `(0, 0, 1e9, 1e9)`.
+pub fn prepare_metal_instances(scene : ui::Scene) -> (Array[Double], Int) {
+  let out = scene.inst.copy()
+  let n = scene.ninst
+  let mut i = 0
+  while i < n {
+    let base = i * inst_size
+    if base + 19 < out.length() {
+      if out[base + 18] <= 0.0 && out[base + 19] <= 0.0 {
+        out[base + 16] = 0.0
+        out[base + 17] = 0.0
+        out[base + 18] = 1.0e9
+        out[base + 19] = 1.0e9
+      }
+    }
+    i += 1
+  }
+  (out, n)
+}
+
+fn render_tester_to_metal(t : ui::Tester, w : Double, h : Double, scale : Double, dark : Bool) -> Bool {
+  let (r, g, b) = clear_rgb_from_theme(dark)
+  let prev = hostapi::host()
+  hostapi::set_host(host::native_host())
+  init_offscreen(w, h, scale)
+  let scene = match ui::view_tree() {
+    Some(tr) => ui::encode_tree_scene(tr, w, h, scale, t.time())
+    None => t.scene()
+  }
+  let (inst, count) = prepare_metal_instances(scene)
+  mark_dirty_full()
+  hostapi::present(inst, count, r, g, b)
+  hostapi::set_host(prev)
+  true
+}
+
+/// Render a pure-tree `view::View` scene offscreen via Apple Metal to a PNG file at `path`.
+pub fn picture(
+  tree : (view::View) -> Unit,
+  path~ : String,
+  w~ : Double,
+  h~ : Double,
+  scale~ : Double = 2.0,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+  inset~ : Bool = false,
+  window_corner~ : Double = 0.0,
+  prepare~ : String = "",
+  script~ : String = "",
+  at~ : Double = 0.0,
+  frame? : Int,
+  fps~ : Int = film_fps,
+  max~ : Int = 3000,
+  transparent~ : Bool = false,
+  corners_held~ : Bool = true,
+  corner_faults_ok~ : (Array[String]) -> Bool = fn(faults : Array[String]) -> Bool { faults.length() == 0 },
+  words_over_held~ : Bool = true,
+  theme? : () -> ui::Theme,
+  transitions_only~ : Bool = true,
+) -> Bool {
+  let _ = (inset, window_corner, corners_held, corner_faults_ok, words_over_held)
+  if !is_supported() || path == "" || w <= 0.0 || h <= 0.0 || scale <= 0.0 ||
+     is_nan_d(w) || is_nan_d(h) || is_nan_d(scale) || is_inf_d(w) || is_inf_d(h) || is_inf_d(scale) ||
+     at < 0.0 || is_nan_d(at) || is_inf_d(at) || fps <= 0 || max <= 0 {
+    say("picture: an output path, positive finite size, non-negative time and a supported host are required")
+    return false
+  }
+  match frame {
+    Some(k) => if k < 0 || at > 0.0 || script == "" {
+      say("picture: invalid frame capture arguments")
+      return false
+    }
+    None => ()
+  }
+  let t = match theme {
+    Some(tf) => ui::Tester::tree(tree, width=w, height=h, scale=scale, theme=tf, transitions_only=transitions_only, platform=platform, dark=dark)
+    None => ui::Tester::tree(tree, width=w, height=h, scale=scale, transitions_only=transitions_only, platform=platform, dark=dark)
+  }
+  t.period_ms = 1000.0 / fps.to_double()
+  let frame_idx = ui::ref_new(0)
+  let noop_cb = fn(_k : Int) -> Bool { true }
+  if prepare != "" {
+    let _ = run_drive_script(t, prepare, max, noop_cb, frame_idx)
+  }
+  if script != "" {
+    match frame {
+      Some(target_k) => {
+        let script_idx = ui::ref_new(0)
+        let stop_at = fn(k : Int) -> Bool { k < target_k }
+        let _ = run_drive_script(t, script, target_k + 1, stop_at, script_idx)
+      }
+      None => {
+        let _ = run_drive_script(t, script, max, noop_cb, frame_idx)
+      }
+    }
+  }
+  if at > 0.0 {
+    t.run_shown(at)
+  }
+  let _ = render_tester_to_metal(t, w, h, scale, dark)
+  let saved = save_snapshot(path, transparent=transparent)
+  t.dispose()
+  if !saved {
+    say("picture: could not write \{path}")
+    return false
+  }
+  true
+}
+
+/// Compatibility alias for `picture`.
+pub fn picture_tree(
+  tree : (view::View) -> Unit,
+  path~ : String,
+  w~ : Double,
+  h~ : Double,
+  scale~ : Double = 2.0,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+  inset~ : Bool = false,
+  window_corner~ : Double = 0.0,
+  prepare~ : String = "",
+  script~ : String = "",
+  at~ : Double = 0.0,
+  frame? : Int,
+  fps~ : Int = film_fps,
+  max~ : Int = 3000,
+  transparent~ : Bool = false,
+  corners_held~ : Bool = true,
+  corner_faults_ok~ : (Array[String]) -> Bool = fn(faults : Array[String]) -> Bool { faults.length() == 0 },
+  words_over_held~ : Bool = true,
+  theme? : () -> ui::Theme,
+  transitions_only~ : Bool = true,
+) -> Bool {
+  picture(
+    tree,
+    path=path,
+    w=w,
+    h=h,
+    scale=scale,
+    platform=platform,
+    dark=dark,
+    inset=inset,
+    window_corner=window_corner,
+    prepare=prepare,
+    script=script,
+    at=at,
+    frame?=frame,
+    fps=fps,
+    max=max,
+    transparent=transparent,
+    corners_held=corners_held,
+    corner_faults_ok=corner_faults_ok,
+    words_over_held=words_over_held,
+    theme?=theme,
+    transitions_only=transitions_only,
+  )
+}
+
+/// Render a pure-tree `view::View` scene offscreen via Apple Metal and return the encoded PNG `Bytes`.
+pub fn picture_bytes(
+  tree : (view::View) -> Unit,
+  w~ : Double,
+  h~ : Double,
+  scale~ : Double = 2.0,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+  prepare~ : String = "",
+  script~ : String = "",
+  at~ : Double = 0.0,
+  fps~ : Int = film_fps,
+  transparent~ : Bool = false,
+  theme? : () -> ui::Theme,
+  transitions_only~ : Bool = true,
+) -> Option[Bytes] {
+  let tmp_path = "/tmp/invar_film_picture_bytes.png"
+  let ok = picture(
+    tree,
+    path=tmp_path,
+    w=w,
+    h=h,
+    scale=scale,
+    platform=platform,
+    dark=dark,
+    prepare=prepare,
+    script=script,
+    at=at,
+    fps=fps,
+    transparent=transparent,
+    theme?=theme,
+    transitions_only=transitions_only,
+  )
+  if !ok {
+    return None
+  }
+  read_file_bytes(tmp_path)
+}
+
+/// Record a scripted pure-tree `view::View` run offscreen via Apple Metal into an H.264 MP4 at `out`.
+pub fn film(
+  tree : (view::View) -> Unit,
+  script~ : String,
+  out~ : String,
+  w~ : Double = 390.0,
+  h~ : Double = 844.0,
+  scale~ : Double = 2.0,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+  inset~ : Bool = false,
+  window_corner~ : Double = 0.0,
+  fps~ : Int = film_fps,
+  prepare~ : String = "",
+  max~ : Int = 3000,
+  last~ : String = "",
+  copied~ : String = "",
+  allow_incomplete~ : Bool = false,
+  corners_held~ : Bool = true,
+  theme? : () -> ui::Theme,
+  transitions_only~ : Bool = true,
+) -> Bool {
+  let _ = (inset, window_corner, copied, allow_incomplete, corners_held)
+  if !is_supported() || out == "" || w <= 0.0 || h <= 0.0 || scale <= 0.0 || fps <= 0 || max <= 0 {
+    say("film: invalid arguments or unsupported host")
+    return false
+  }
+  let pw = (w * scale).round().to_int()
+  let ph = (h * scale).round().to_int()
+  let t = match theme {
+    Some(tf) => ui::Tester::tree(tree, width=w, height=h, scale=scale, theme=tf, transitions_only=transitions_only, platform=platform, dark=dark)
+    None => ui::Tester::tree(tree, width=w, height=h, scale=scale, transitions_only=transitions_only, platform=platform, dark=dark)
+  }
+  t.period_ms = 1000.0 / fps.to_double()
+  let prep_idx = ui::ref_new(0)
+  if prepare != "" {
+    let _ = run_drive_script(t, prepare, max, fn(_k : Int) -> Bool { true }, prep_idx)
+  }
+  let prev = hostapi::host()
+  hostapi::set_host(host::native_host())
+  init_offscreen(w, h, scale)
+  hostapi::set_host(prev)
+  if !film_open(out, pw, ph, fps) {
+    t.dispose()
+    return false
+  }
+  let written = ui::ref_new(0)
+  let emit_frame = fn(k : Int) -> Bool {
+    let (r, g, b) = clear_rgb_from_theme(dark)
+    let prev_h = hostapi::host()
+    hostapi::set_host(host::native_host())
+    let scene = match ui::view_tree() {
+      Some(tr) => ui::encode_tree_scene(tr, w, h, scale, t.time())
+      None => t.scene()
+    }
+    let (inst, count) = prepare_metal_instances(scene)
+    let ok_draw = film_draw(inst, count, r, g, b)
+    hostapi::set_host(prev_h)
+    if !ok_draw {
+      return false
+    }
+    if !film_put_frame(k) {
+      return false
+    }
+    written.v = k + 1
+    true
+  }
+  // Frame 0
+  let ok0 = emit_frame(0)
+  let frame_idx = ui::ref_new(1)
+  let ok_run = if ok0 {
+    run_drive_script(t, script, max, emit_frame, frame_idx)
+  } else {
+    false
+  }
+  let ok_last = if ok_run && last != "" {
+    let _ = render_tester_to_metal(t, w, h, scale, dark)
+    save_snapshot(last)
+  } else {
+    true
+  }
+  let closed = film_close(written.v)
+  let published = film_finish(ok_run && ok_last && closed)
+  t.dispose()
+  ok_run && ok_last && closed && published
+}
+
+/// Compatibility alias for `film`.
+pub fn film_tree(
+  tree : (view::View) -> Unit,
+  script~ : String,
+  out~ : String,
+  w~ : Double = 390.0,
+  h~ : Double = 844.0,
+  scale~ : Double = 2.0,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+  inset~ : Bool = false,
+  window_corner~ : Double = 0.0,
+  fps~ : Int = film_fps,
+  prepare~ : String = "",
+  max~ : Int = 3000,
+  last~ : String = "",
+  copied~ : String = "",
+  allow_incomplete~ : Bool = false,
+  corners_held~ : Bool = true,
+  theme? : () -> ui::Theme,
+  transitions_only~ : Bool = true,
+) -> Bool {
+  film(
+    tree,
+    script=script,
+    out=out,
+    w=w,
+    h=h,
+    scale=scale,
+    platform=platform,
+    dark=dark,
+    inset=inset,
+    window_corner=window_corner,
+    fps=fps,
+    prepare=prepare,
+    max=max,
+    last=last,
+    copied=copied,
+    allow_incomplete=allow_incomplete,
+    corners_held=corners_held,
+    theme?=theme,
+    transitions_only=transitions_only,
+  )
+}

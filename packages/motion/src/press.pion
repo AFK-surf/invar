@@ -1,0 +1,282 @@
+// Control tactile feel under pointer/touch (PressFeel) and hold-to-confirm progress (HoldWay).
+// Ported from libs/mbui/src/motion/press.mbt.
+
+import "signals"
+import "ui"
+import "view"
+
+let press_in : Spec = Spec::Tween(70.0, ui::Ease::Out, 0.0)
+
+pub struct PressFeel {
+  hover : Eased
+  press : Eased
+  mut depth : Double
+  mut told : Option[(Double, Double, Double)]
+  mut late : Bool
+  mut late_due : () -> Unit
+  sink_px : Double
+  sink_most : Double
+  size : Option[(Double, Double)]
+  scale_node : Bool
+  mut scaled : Bool
+  loc : String
+}
+
+pub fn press_feel(
+  v : view::View,
+  live~ : () -> Bool = fn() -> Bool { true },
+  sink_px~ : Double = 1.5,
+  sink_most~ : Double = 0.038,
+  hover_ms~ : Double = 140.0,
+  hovers~ : Bool = true,
+  scale_node~ : Bool = true,
+  size? : (Double, Double),
+  loc~ : String = "",
+) -> PressFeel {
+  let on = fn() -> Bool { live() && (v.focus_shown() || v.pointed()) }
+  let f = PressFeel::{
+    hover: Eased::new(if hovers && signals::untracked(on) { 1.0 } else { 0.0 }),
+    press: Eased::new(0.0),
+    depth: 0.0,
+    told: None,
+    late: false,
+    late_due: fn() -> Unit { () },
+    sink_px,
+    sink_most,
+    size,
+    scale_node,
+    scaled: false,
+    loc,
+  }
+  if hovers {
+    v.reacts(on, fn(now : Bool) -> Unit {
+      f.hover.go(v, if now { 1.0 } else { 0.0 }, hover_ms)
+    }, at_start=false)
+  }
+  let ensure_scaled = fn() -> Unit {
+    if f.scale_node && !f.scaled && !ui::reduced_motion() {
+      f.scaled = true
+      let _ = v.scale(view::Live::By(fn() -> Double { f.scale_on(v) }), loc=f.loc)
+    }
+  }
+  let by_hand = ui::ref_new(false)
+  v.reacts(fn() -> Bool { live() && v.pressed() }, fn(down : Bool) -> Unit {
+    let at = v.cause_at()
+    if down {
+      (f.late_due)()
+      f.late_due = fn() -> Unit { () }
+      f.late = false
+      if !signals::untracked(fn() -> Bool { v.window_held() }) {
+        by_hand.v = false
+        f.told = None
+        return
+      }
+      by_hand.v = true
+      let is_finger = match ui::pointing() {
+        ui::Pointing::Finger => true
+        _ => false
+      }
+      let in_scroll = match v.scroll_holding() {
+        Some(_) => true
+        None => false
+      }
+      if is_finger && in_scroll {
+        let told = f.told
+        f.told = None
+        f.late = true
+        f.late_due = v.at_moment(at + tap_indication_ms, fn() -> Unit {
+          f.late = false
+          f.late_due = fn() -> Unit { () }
+          f.told = told
+          ensure_scaled()
+          f.sink(v)
+        })
+      } else {
+        ensure_scaled()
+        f.sink(v)
+      }
+      return
+    }
+    if !by_hand.v {
+      return
+    }
+    by_hand.v = false
+    if f.late {
+      (f.late_due)()
+      f.late_due = fn() -> Unit { () }
+      f.late = false
+      f.told = None
+    } else {
+      f.told = None
+      f.press.go_by(v, 0.0, tactile_bounce)
+    }
+  }, at_start=false)
+  let _ = v.owns(fn() -> Unit {
+    (f.hover.due)()
+    (f.press.due)()
+    (f.late_due)()
+  })
+  f
+}
+
+pub fn PressFeel::down(self : PressFeel, d : view::Drag) -> Unit {
+  self.told = Some((d.at, d.w, d.h))
+}
+
+fn PressFeel::sink(self : PressFeel, v : view::View) -> Unit {
+  if ui::reduced_motion() {
+    self.told = None
+    return
+  }
+  let (w, h) = match (self.told, self.size) {
+    (Some((_, bw, bh)), _) => (bw, bh)
+    (None, Some(s)) => s
+    _ => (0.0, 0.0)
+  }
+  self.told = None
+  let side = m_max(w, h)
+  self.depth = if side <= 0.0 {
+    self.sink_most * 0.6
+  } else {
+    m_min(self.sink_most, self.sink_px / m_max(side, 1.0))
+  }
+  self.press.go_by(v, 1.0, press_in)
+}
+
+pub fn PressFeel::hovered_on(self : PressFeel, n : view::View) -> Double {
+  self.hover.shown(n)
+}
+
+pub fn PressFeel::pressed_on(self : PressFeel, n : view::View) -> Double {
+  self.press.shown(n)
+}
+
+pub fn PressFeel::scale_on(self : PressFeel, n : view::View) -> Double {
+  let _ = self.press.ended.get()
+  self.press.way.said()
+  let t = n.drawn_while(fn(at : Double) -> Bool { self.press.way.goes_at(at) })
+  let p = if t == pos_inf {
+    self.press.way.target()
+  } else {
+    self.press.way.value_at(t)
+  }
+  if p == 0.0 { 1.0 } else { 1.0 - self.depth * p }
+}
+
+pub struct HoldWay {
+  said : signals::Signal[Int]
+  mut on : Bool
+  mut from : Double
+  mut start : Double
+  mut full_at : Double
+  hold_ms : Double
+  back : Eased
+  mut due : () -> Unit
+  mut done : Bool
+}
+
+pub fn hold_way(
+  v : view::View,
+  hold_ms : Double,
+  on_complete : () -> Unit,
+  live~ : () -> Bool = fn() -> Bool { true },
+  recoil_ms~ : Double = 160.0,
+  loc~ : String = "",
+) -> HoldWay {
+  let _ = loc
+  let hw = HoldWay::{
+    said: signals::signal(0),
+    on: false,
+    from: 0.0,
+    start: 0.0,
+    full_at: 0.0,
+    hold_ms: m_max(hold_ms, 1.0),
+    back: Eased::new(0.0),
+    due: fn() -> Unit { () },
+    done: false,
+  }
+  v.reacts(fn() -> Bool { live() && v.pressed() }, fn(down : Bool) -> Unit {
+    if down {
+      hw.press_at(v, v.cause_at(), on_complete)
+    } else {
+      hw.release_at(v, v.cause_at(), recoil_ms)
+    }
+  }, at_start=false)
+  let _ = v.owns(fn() -> Unit {
+    (hw.due)()
+    (hw.back.due)()
+  })
+  hw
+}
+
+fn HoldWay::press_at(self : HoldWay, v : view::View, at : Double, on_complete : () -> Unit) -> Unit {
+  if self.on {
+    return
+  }
+  let p = m_clamp(self.back.way.value_at(at), 0.0, 1.0)
+  (self.due)()
+  self.back.put(p)
+  self.on = true
+  self.done = false
+  self.from = p
+  self.start = at
+  self.full_at = at + (1.0 - p) * self.hold_ms
+  self.due = v.at_moment(self.full_at, fn() -> Unit {
+    self.due = fn() -> Unit { () }
+    self.done = true
+    self.said.set(self.said.untracked() + 1)
+    on_complete()
+  })
+  self.said.set(self.said.untracked() + 1)
+}
+
+fn HoldWay::release_at(self : HoldWay, v : view::View, at : Double, recoil_ms : Double) -> Unit {
+  if !self.on {
+    return
+  }
+  let p = self.progress_at(at)
+  (self.due)()
+  self.due = fn() -> Unit { () }
+  self.on = false
+  if self.done {
+    self.done = false
+    self.back.put(0.0)
+  } else {
+    self.back.put(p)
+    self.back.go(v, 0.0, recoil_ms)
+  }
+  self.said.set(self.said.untracked() + 1)
+}
+
+fn HoldWay::progress_at(self : HoldWay, t : Double) -> Double {
+  if t >= self.full_at {
+    1.0
+  } else {
+    m_clamp(self.from + (t - self.start) / self.hold_ms, 0.0, 1.0)
+  }
+}
+
+pub fn HoldWay::progress_on(self : HoldWay, n : view::View) -> Double {
+  let _ = self.said.get()
+  if self.on {
+    let t = n.drawn_while(fn(at : Double) -> Bool { at < self.full_at })
+    if t == pos_inf { 1.0 } else { self.progress_at(t) }
+  } else {
+    self.back.shown(n)
+  }
+}
+
+pub fn HoldWay::at(self : HoldWay, t : Double) -> Double {
+  if self.on { self.progress_at(t) } else { self.back.way.value_at(t) }
+}
+
+pub fn HoldWay::end(self : HoldWay) -> Double {
+  let _ = self.said.get()
+  self.back.way.said()
+  if self.on { self.full_at } else { self.back.way.end() }
+}
+
+pub fn HoldWay::holding(self : HoldWay) -> Bool {
+  let _ = self.said.get()
+  self.on
+}
