@@ -1007,3 +1007,117 @@ test "41 host_words_measure uses real hostapi::shape advances and avoids spuriou
   debug_assert(glyph_n == 18, "18 non-space glyphs rendered on 1 line")
   t.dispose()
 }
+
+test "42 set_underlay_painter runs before tree nodes, shares frame-tail kind=12 segs, and set_fast_present works" {
+  let tri_under = [([0.0, 0.0, 20.0, 0.0, 10.0, 16.0], true)]
+  let tri_tree = paint::shape_of([([0.0, 0.0, 16.0, 0.0, 8.0, 12.0], true)], fill=0x00FF00FFL)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(0x223344FFL))
+        .shapes(view::Live::Is([tri_tree]))
+    })
+  })
+  set_underlay_painter(Some(fn(sc : Scene, _w : Double, _h : Double, _scale : Double, _now : Double) {
+    let idx = sc.push_inst(10.0, 10.0, 50.0, 20.0, 4.0, 0.0, 0.0, 0.0, 0xFF0000FFL, 1.0, 0.0, 0.0, 0.0, 0.0)
+    sc.set_rot(idx, 0.5, 35.0, 20.0, outer_clip=false)
+    sc.emit_line(0.0, 0.0, 40.0, 30.0, 2.0, 0x0000FFFFL)
+    sc.emit_vector(5.0, 5.0, tri_under, fill=true, color=0xFFFF00FFL)
+  }))
+  set_fast_present(true)
+  t.fake.frame_requested = true
+  let changed = view_frame(400.0, 300.0, 2.0, t.time() + 16.0)
+  debug_assert(changed, "fast_present view_frame returns true")
+  let sc = t.scene()
+  debug_assert(sc.dirty_count == 0, "fast_present skips damage diff (dirty_count == 0)")
+  // Instance 0 is underlay rotated rect
+  debug_assert((sc.inst[5] - 0.0).abs() < 0.01 && (sc.inst[32] - 0.5).abs() < 0.001 && (sc.inst[35] - 0.0).abs() < 0.01, "underlay inst 0 has set_rot(0.5, outer_clip=false)")
+  // Instance 1 is underlay kind=10 line
+  debug_assert((sc.inst[60 + 5] - 10.0).abs() < 0.01, "underlay inst 1 is kind=10.0 line")
+  // Both underlay and tree kind=11 bands precede frame-tail kind=12 segs
+  let mut k11 = 0
+  let mut k12 = 0
+  let mut saw_k12 = false
+  let mut i = 0
+  while i < sc.ninst {
+    let kind = sc.inst[i * 60 + 5]
+    if (kind - 11.0).abs() < 0.01 {
+      debug_assert(!saw_k12, "all kind=11 bands must precede kind=12 segment packs")
+      k11 += 1
+    } else if (kind - 12.0).abs() < 0.01 {
+      saw_k12 = true
+      k12 += 1
+    }
+    i += 1
+  }
+  debug_assert(k11 >= 2 && k12 >= 1, "underlay + tree vectors both emitted kind=11 and shared tail kind=12")
+  t.dispose()
+}
+
+test "43 Scene::draw_text_run with draw_scale + measure_text_width + measure_text_carets" {
+  let t = Tester::tree(fn(_root : view::View) {  })
+  let w = measure_text_width("ABC", 20.0)
+  let carets = measure_text_carets("ABC", 20.0)
+  // FakeHost advance = 20.0 * 0.6 = 12.0/char -> width = 36.0, carets = [0, 12, 24, 36]
+  debug_assert((w - 36.0).abs() < 0.01, "measure_text_width returns 36.0")
+  debug_assert(carets.length() == 4 && (carets[0] - 0.0).abs() < 0.01 && (carets[3] - 36.0).abs() < 0.01, "measure_text_carets has 4 cumulative offsets")
+  let sc = Scene::new()
+  sc.clear(400.0, 300.0, 2.0)
+  let drawn_w = sc.draw_text_run(10.0, 20.0, "ABC", 20.0, draw_scale=1.5)
+  debug_assert((drawn_w - 54.0).abs() < 0.01, "draw_text_run returns total_adv * draw_scale = 54.0")
+  debug_assert(sc.ninst == 3, "draw_text_run emitted 3 glyph quads")
+  // FakeHost glyph gw=8.0, gh=12.0 -> scaled by 1.5 => 12.0 x 18.0
+  debug_assert((sc.inst[2] - 12.0).abs() < 0.01 && (sc.inst[3] - 18.0).abs() < 0.01, "glyph quad scaled by draw_scale=1.5")
+  t.dispose()
+}
+
+test "44 pointer/wheel/key/text interceptors, middle button=3, wheel phase, and view_key_up" {
+  let tree_pressed : Ref[Bool] = ref_new(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(100.0)))
+        .on_press(fn() { tree_pressed.v = true })
+    })
+  })
+  let ptr_btn : Ref[Int] = ref_new(0)
+  let wheel_ph : Ref[Int] = ref_new(-1)
+  let key_events : Array[(Int, Bool)] = []
+  let text_got : Ref[String] = ref_new("")
+  let text_ab : Ref[(Int, Int)] = ref_new((0, 0))
+
+  set_pointer_interceptor(Some(fn(_k : Int, _x : Double, _y : Double, btn : Int, _mods : Int) -> Bool {
+    ptr_btn.v = btn
+    true
+  }))
+  set_wheel_interceptor(Some(fn(_x : Double, _y : Double, _dx : Double, _dy : Double, ph : Int) -> Bool {
+    wheel_ph.v = ph
+    true
+  }))
+  set_key_interceptor(Some(fn(code : Int, _mods : Int, is_up : Bool) -> Bool {
+    key_events.push((code, is_up))
+    true
+  }))
+  set_text_interceptor(Some(fn(_kind : Int, s : String, a : Int, b : Int) -> Bool {
+    text_got.v = s
+    text_ab.v = (a, b)
+    true
+  }))
+
+  view_pointer(1, 50.0, 50.0, 10.0, button=3)
+  view_pointer(2, 50.0, 50.0, 20.0, button=3)
+  debug_assert(ptr_btn.v == 3, "pointer interceptor received middle button=3")
+  debug_assert(!tree_pressed.v, "pointer interceptor prevented event from reaching tree")
+
+  view_wheel(50.0, 50.0, 0.0, -10.0, 30.0, phase=2)
+  debug_assert(wheel_ph.v == 2 && last_wheel_phase() == 2, "wheel interceptor & last_wheel_phase recorded phase=2")
+
+  debug_assert(view_key(65, 0, 40.0), "view_key intercepted")
+  debug_assert(view_key_up(65, 0, 50.0), "view_key_up intercepted with is_up=true")
+  debug_assert(key_events.length() == 2 && !key_events[0].1 && key_events[1].1, "key interceptor saw down then up")
+
+  view_text(0, "canvas", a=2, b=5)
+  debug_assert(text_got.v == "canvas" && text_ab.v.0 == 2 && text_ab.v.1 == 5, "text interceptor received text and (a, b)")
+  t.dispose()
+}
