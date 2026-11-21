@@ -1,0 +1,279 @@
+// Incremental accessibility semantics tree (SemNode, A11yMirror, A11yTold).
+// Ported from libs/mbui/src/ui/a11y.mbt and semantics.mbt.
+
+import "view"
+import "hostapi"
+
+let a11y_sep : String = "\u{1F}"
+
+/// Accessibility semantics node emitted to screen readers and verified by Tester::set_a11y.
+pub struct SemNode {
+  pub id : Int
+  pub role : String
+  pub flags : String
+  pub x : Double
+  pub y : Double
+  pub w : Double
+  pub h : Double
+  pub label : String
+  pub value : String
+  pub description : String
+  pub actions : String
+  pub widget : Int
+  pub kids : Array[Int]
+}
+
+fn sem_kids_eq(a : Array[Int], b : Array[Int]) -> Bool {
+  if a.length() != b.length() { return false }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] { return false }
+    i += 1
+  }
+  true
+}
+
+fn sem_node_eq(a : SemNode, b : SemNode) -> Bool {
+  a.id == b.id &&
+  a.role == b.role &&
+  a.flags == b.flags &&
+  (a.x - b.x).abs() < 0.001 &&
+  (a.y - b.y).abs() < 0.001 &&
+  (a.w - b.w).abs() < 0.001 &&
+  (a.h - b.h).abs() < 0.001 &&
+  a.label == b.label &&
+  a.value == b.value &&
+  a.description == b.description &&
+  a.actions == b.actions &&
+  a.widget == b.widget &&
+  sem_kids_eq(a.kids, b.kids)
+}
+
+/// Host-side mirror of the incremental accessibility tree.
+pub struct A11yMirror {
+  pub nodes : Map[Int, SemNode]
+  pub holder : Map[Int, Int]
+  pub mut focus : Int
+}
+
+pub fn A11yMirror::new() -> A11yMirror {
+  A11yMirror::{ nodes: Map::new(), holder: Map::new(), focus: 0 }
+}
+
+pub fn A11yMirror::apply(self : A11yMirror, full : Bool, focus : Int, told : Array[SemNode]) -> Array[Int] {
+  let gone : Array[Int] = []
+  if full {
+    for k in self.nodes.keys() {
+      gone.push(k)
+    }
+    self.nodes.clear()
+    self.holder.clear()
+  }
+  self.focus = focus
+  let held : Map[Int, Bool] = Map::new()
+  for n in told {
+    for k in n.kids {
+      held[k] = true
+    }
+  }
+  let let_go : Array[Int] = []
+  for n in told {
+    match self.nodes.get(n.id) {
+      Some(was) => {
+        for k in was.kids {
+          if !n.kids.contains(k) {
+            let_go.push(k)
+          }
+        }
+      }
+      None => ()
+    }
+    self.nodes[n.id] = n
+    for k in n.kids {
+      self.holder[k] = n.id
+    }
+  }
+  let mut i = 0
+  while i < let_go.length() {
+    let k = let_go[i]
+    i += 1
+    if held.contains(k) {
+      continue
+    }
+    match self.nodes.get(k) {
+      Some(n) => {
+        self.nodes.remove(k)
+        self.holder.remove(k)
+        gone.push(k)
+        for c in n.kids {
+          let_go.push(c)
+        }
+      }
+      None => ()
+    }
+  }
+  gone
+}
+
+pub fn A11yMirror::lines(self : A11yMirror) -> String {
+  let sb = StringBuilder::new()
+  let visited : Array[(Int, Int, Double, Double)] = [(0, 0, 0.0, 0.0)]
+  // DFS traversal in child order using an explicit stack
+  while visited.length() > 0 {
+    let top_idx = visited.length() - 1
+    let (k, holder, px, py) = visited[top_idx]
+    array_remove_at(visited, top_idx)
+    match self.nodes.get(k) {
+      Some(n) => {
+        let x = px + n.x
+        let y = py + n.y
+        if k != 0 {
+          let flags = if self.focus == k { n.flags + "f" } else { n.flags }
+          sb.write_string("\{k}\{a11y_sep}\{holder}\{a11y_sep}\{n.widget}\{a11y_sep}\{n.role}\{a11y_sep}\{flags}\{a11y_sep}\{x.round().to_int()}\{a11y_sep}\{y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{n.label}\{a11y_sep}\{n.value}\{a11y_sep}\{n.description}\{a11y_sep}\{n.actions}\n")
+        }
+        let next_holder = if k != 0 { k } else { holder }
+        let mut ci = n.kids.length() - 1
+        while ci >= 0 {
+          visited.push((n.kids[ci], next_holder, x, y))
+          ci -= 1
+        }
+      }
+      None => ()
+    }
+  }
+  sb.to_string()
+}
+
+/// Build full SemNode snapshot from a view::Tree.
+pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
+  let order = tree.said_order()
+  let out : Array[SemNode] = []
+  let root_kids : Array[Int] = []
+  let mut focus_id = 0
+  let (focused_nid, _) = tree.focused_now()
+  for sn in order {
+    let sd = match sn.said {
+      Some(v) => v
+      None => continue
+    }
+    let nid = sn.id.at + 1
+    root_kids.push(nid)
+    match focused_nid {
+      Some(fnid) => if fnid == sn.id { focus_id = nid }
+      None => ()
+    }
+    let rname = role_name(sd.role)
+    let flags_sb = StringBuilder::new()
+    match sd.check {
+      Some(view::Check::Off) => flags_sb.write_string("c")
+      Some(view::Check::On) => flags_sb.write_string("C")
+      Some(view::Check::Mixed) => flags_sb.write_string("M")
+      None => ()
+    }
+    match sd.expanded {
+      Some(false) => flags_sb.write_string("e")
+      Some(true) => flags_sb.write_string("E")
+      None => ()
+    }
+    match sd.selected {
+      Some(true) => flags_sb.write_string("s")
+      _ => ()
+    }
+    if sn.disabled { flags_sb.write_string("d") }
+    let (x, y, w, h) = match tree.drawn_of(sn.id) {
+      Some(d) => (d.x, d.y, d.w, d.h)
+      None => (0.0, 0.0, 0.0, 0.0)
+    }
+    let lbl = if sd.label.length() > 0 { sd.label } else { tree.said_label(sn.id) }
+    out.push(SemNode::{
+      id: nid,
+      role: rname,
+      flags: flags_sb.to_string(),
+      x,
+      y,
+      w,
+      h,
+      label: lbl,
+      value: sd.value,
+      description: sd.description,
+      actions: if tree.acts_on(sn.id) { "a" } else { "" },
+      widget: nid,
+      kids: [],
+    })
+  }
+  let root = SemNode::{
+    id: 0,
+    role: "Region",
+    flags: "",
+    x: 0.0,
+    y: 0.0,
+    w: 0.0,
+    h: 0.0,
+    label: "",
+    value: "",
+    description: "",
+    actions: "",
+    widget: 0,
+    kids: root_kids,
+  }
+  let all : Array[SemNode] = [root]
+  for n in out {
+    all.push(n)
+  }
+  (all, focus_id)
+}
+
+/// Incremental sender state tracking what was last sent to the host.
+pub struct A11yTold {
+  pub mirror : A11yMirror
+  pub mut initialized : Bool
+}
+
+pub fn A11yTold::new() -> A11yTold {
+  A11yTold::{ mirror: A11yMirror::new(), initialized: false }
+}
+
+fn encode_sem_wire(full : Bool, focus : Int, changed : Array[SemNode]) -> String {
+  let sb = StringBuilder::new()
+  let fflag = if full { "1" } else { "0" }
+  sb.write_string("T\{a11y_sep}\{fflag}\{a11y_sep}\{focus}\n")
+  for n in changed {
+    let kids_sb = StringBuilder::new()
+    let mut i = 0
+    while i < n.kids.length() {
+      if i > 0 { kids_sb.write_string(",") }
+      kids_sb.write_string("\{n.kids[i]}")
+      i += 1
+    }
+    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{n.label}\{a11y_sep}\{n.value}\{a11y_sep}\{n.description}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}\n")
+  }
+  sb.to_string()
+}
+
+/// Compute and send incremental a11y update for `tree` against `told`.
+/// Returns (wire_string, changed_nodes_count, full_sent).
+pub fn a11y_sync(tree : view::Tree, told : A11yTold, force_full~ : Bool = false) -> (String, Int, Bool) {
+  let (all, focus) = tree_sem_nodes(tree)
+  let full = force_full || !told.initialized
+  let changed : Array[SemNode] = []
+  if full {
+    for n in all {
+      changed.push(n)
+    }
+  } else {
+    for n in all {
+      match told.mirror.nodes.get(n.id) {
+        Some(prev) => if !sem_node_eq(prev, n) { changed.push(n) }
+        None => changed.push(n)
+      }
+    }
+  }
+  if !full && changed.length() == 0 && told.mirror.focus == focus {
+    return ("", 0, false)
+  }
+  let _ = told.mirror.apply(full, focus, changed)
+  told.initialized = true
+  let wire = encode_sem_wire(full, focus, changed)
+  hostapi::a11y_tree(wire)
+  (wire, changed.length(), full)
+}

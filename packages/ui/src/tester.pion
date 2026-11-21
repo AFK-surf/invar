@@ -1,0 +1,342 @@
+// Pure-tree headless test harness (Tester): frame stepping, idle-time skipping (run_shown),
+// input injection, incremental a11y verification, and unasked_faults checking.
+// Ported from libs/mbui/src/ui/tester.mbt, tester_time.mbt, tester_unasked.mbt.
+
+import "hostapi"
+import "view"
+
+pub let frame_period_default : Double = 1000.0 / 60.0
+pub let input_step_ms : Double = 1000.0 / 60.0
+
+/// Deterministic pure-tree UI test driver backed by FakeHost.
+pub struct Tester {
+  pub fake : FakeHost
+  prev_host : hostapi::Host
+  pub mut period_ms : Double
+  pub mut each_frame_cb : Option[() -> Unit]
+  pub mut unasked_issues : Array[String]
+  pub mut a11y_issues : Array[String]
+  pub mut disposed : Bool
+}
+
+/// Create a pure-tree Tester, install FakeHost, build the tree, and render frame 0.
+/// `transitions_only` defaults to true so changes outside `view::transition` settle immediately.
+pub fn Tester::tree(
+  make : (view::View) -> Unit,
+  width~ : Double = 800.0,
+  height~ : Double = 600.0,
+  scale~ : Double = 2.0,
+  theme? : () -> Theme,
+  transitions_only~ : Bool = true,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+) -> Tester {
+  run_reset_hooks()
+  let fake = FakeHost::new(width=width, height=height, scale=scale, platform=platform, dark=dark)
+  let prev_host = fake.install()
+  let made = if transitions_only {
+    fn(root : view::View) {
+      let _ = root.transitions_only()
+      make(root)
+    }
+  } else {
+    make
+  }
+  match theme {
+    Some(tf) => set_view_app(made, theme=tf)
+    None => set_view_app(made)
+  }
+  let t = Tester::{
+    fake,
+    prev_host,
+    period_ms: frame_period_default,
+    each_frame_cb: None,
+    unasked_issues: [],
+    a11y_issues: [],
+    disposed: false,
+  }
+  t.frame()
+  t
+}
+
+/// Advance the clock by `ms` and render one frame (verifying unasked-frame stability and a11y parity).
+pub fn Tester::frame(self : Tester, ms~ : Double = 0.0) -> Unit {
+  if ms > 0.0 {
+    self.fake.now_ms = self.fake.now_ms + ms
+  }
+  let fired = self.fake.fire_due()
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return
+  }
+  let was_asked = self.fake.frame_requested || fired > 0 || self.fake.frame_count == 0 || tree.clock_read() || tree.wake().is_some()
+  self.fake.frame_requested = false
+  let changed = view_frame(self.fake.width, self.fake.height, self.fake.scale, self.fake.now_ms)
+  if !was_asked && changed && self.fake.frame_count > 1 {
+    self.unasked_issues.push("unasked frame at \{self.fake.now_ms}ms drew changed scene")
+  }
+  if self.fake.a11y_enabled {
+    self.verify_a11y_parity(tree)
+  }
+  match self.each_frame_cb {
+    Some(cb) => cb()
+    None => ()
+  }
+}
+
+fn Tester::verify_a11y_parity(self : Tester, tree : view::Tree) -> Unit {
+  // Compare incremental mirror in view_app.a11y against a freshly built full mirror
+  let (all, focus) = tree_sem_nodes(tree)
+  let fresh = A11yMirror::new()
+  let _ = fresh.apply(true, focus, all)
+  let inc_lines = view_app.a11y.mirror.lines()
+  let full_lines = fresh.lines()
+  if inc_lines != full_lines {
+    self.a11y_issues.push("a11y incremental mismatch at \{self.fake.now_ms}ms")
+  }
+}
+
+/// Advance `ms` skipping idle spans: steps at display cadence only while frames are requested or motion/timers are active.
+pub fn Tester::run_shown(self : Tester, ms : Double) -> Unit {
+  let target = self.fake.now_ms + dmax(0.0, ms)
+  let mut guard_steps = 0
+  while self.fake.now_ms < target && guard_steps < 10000 {
+    guard_steps += 1
+    let tree = match view_tree() {
+      Some(tr) => tr
+      None => break
+    }
+    let next_wake = match (tree.wake(), self.fake.next_due()) {
+      (Some(a), Some(b)) => Some(dmin(a, b))
+      (Some(a), None) => Some(a)
+      (None, Some(b)) => Some(b)
+      _ => None
+    }
+    let active = self.fake.frame_requested || tree.clock_read()
+    if active {
+      let step = dmin(self.period_ms, target - self.fake.now_ms)
+      self.frame(ms=step)
+    } else {
+      match next_wake {
+        Some(w) if w <= target => {
+          let dt = dmax(0.0, w - self.fake.now_ms)
+          self.fake.frame_requested = true
+          self.frame(ms=dt)
+        }
+        _ => {
+          // Jump straight across idle time without stepping empty frames!
+          self.fake.now_ms = target
+          break
+        }
+      }
+    }
+  }
+}
+
+pub fn Tester::each_frame(self : Tester, f : Option[() -> Unit]) -> Unit {
+  self.each_frame_cb = f
+}
+
+pub fn Tester::move_to(self : Tester, x : Double, y : Double) -> Unit {
+  view_pointer(0, x, y, self.fake.now_ms)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::press_at(self : Tester, x : Double, y : Double) -> Unit {
+  view_pointer(1, x, y, self.fake.now_ms)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::release(self : Tester, x : Double, y : Double) -> Unit {
+  view_pointer(2, x, y, self.fake.now_ms)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::click(self : Tester, x : Double, y : Double) -> Unit {
+  view_pointer(1, x, y, self.fake.now_ms)
+  view_pointer(2, x, y, self.fake.now_ms)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::tap(self : Tester, x : Double, y : Double) -> Unit {
+  self.click(x, y)
+}
+
+/// Press a named control (by semantic label or drawn words) or key name ("Enter", "Space", "Tab", "Escape").
+pub fn Tester::press(self : Tester, name : String) -> Unit {
+  if name == "Enter" {
+    self.enter()
+    return
+  }
+  if name == "Space" {
+    self.key(key_space)
+    return
+  }
+  if name == "Tab" {
+    self.key(key_tab)
+    return
+  }
+  if name == "Escape" {
+    self.key(key_escape)
+    return
+  }
+  match self.get(name) {
+    Some(d) => self.click(d.x + d.w * 0.5, d.y + d.h * 0.5)
+    None => match self.find(name) {
+      Some((x, y)) => self.click(x, y)
+      None => ()
+    }
+  }
+}
+
+pub fn Tester::type_text(self : Tester, s : String) -> Unit {
+  view_text(0, s)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::compose(self : Tester, s : String) -> Unit {
+  view_text(1, s)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::wheel(self : Tester, x : Double, y : Double, dy : Double, dx~ : Double = 0.0) -> Unit {
+  view_wheel(x, y, dx, dy, self.fake.now_ms)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::key(self : Tester, code : Int, mods~ : Int = 0) -> Unit {
+  let _ = view_key(code, mods, self.fake.now_ms)
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+pub fn Tester::enter(self : Tester) -> Unit {
+  self.key(key_enter)
+}
+
+pub fn Tester::backspace(self : Tester) -> Unit {
+  self.key(key_code_backspace)
+}
+
+pub fn Tester::resize(self : Tester, w : Double, h : Double) -> Unit {
+  self.fake.width = w
+  self.fake.height = h
+  self.fake.frame_requested = true
+  self.frame()
+}
+
+/// Enable or disable incremental accessibility tree emission and full-tree parity checking.
+pub fn Tester::set_a11y(self : Tester, on : Bool) -> Unit {
+  self.fake.a11y_enabled = on
+  if on {
+    self.fake.frame_requested = true
+    self.frame()
+  }
+}
+
+/// Query a drawn node by semantic label (and optional role).
+pub fn Tester::get(self : Tester, name : String, role? : view::Role) -> Option[view::Drawn] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return None
+  }
+  for sn in tree.said_order() {
+    let sd = match sn.said {
+      Some(v) => v
+      None => continue
+    }
+    let lbl = if sd.label.length() > 0 { sd.label } else { tree.said_label(sn.id) }
+    let role_ok = match role {
+      Some(r) => sd.role == r
+      None => true
+    }
+    if role_ok && lbl == name {
+      match tree.drawn_of(sn.id) {
+        Some(d) => return Some(d)
+        None => ()
+      }
+    }
+  }
+  None
+}
+
+/// Find the center coordinates of the first drawn node whose text contains `s`.
+pub fn Tester::find(self : Tester, s : String) -> Option[(Double, Double)] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return None
+  }
+  for d in tree.drawn() {
+    let w = d.words
+    if w == s || str_contains(w, s) {
+      return Some((d.x + d.w * 0.5, d.y + d.h * 0.5))
+    }
+  }
+  None
+}
+
+pub fn Tester::scene(self : Tester) -> Scene {
+  let _ = self
+  view_scene_last().copy()
+}
+
+pub fn Tester::drawn(self : Tester) -> Array[view::Drawn] {
+  let _ = self
+  match view_tree() {
+    Some(tr) => tr.drawn()
+    None => []
+  }
+}
+
+/// Report why the app is not idle (None when completely at rest).
+pub fn Tester::idle_said(self : Tester) -> Option[String] {
+  if self.fake.frame_requested {
+    return Some("frame_requested")
+  }
+  match self.fake.next_due() {
+    Some(at) => return Some("due timer at \{at}ms")
+    None => ()
+  }
+  match view_tree() {
+    Some(tr) => {
+      if tr.clock_read() {
+        return Some("tree clock_read active")
+      }
+      match tr.wake() {
+        Some(at) => Some("tree wake at \{at}ms")
+        None => None
+      }
+    }
+    None => None
+  }
+}
+
+/// Faults where an unrequested frame drew a different scene (AGENTS.md: Tester::unasked_faults).
+pub fn Tester::unasked_faults(self : Tester) -> Array[String] {
+  self.unasked_issues.copy()
+}
+
+/// Incremental accessibility parity faults detected while `set_a11y(true)` is active.
+pub fn Tester::a11y_faults(self : Tester) -> Array[String] {
+  self.a11y_issues.copy()
+}
+
+pub fn Tester::time(self : Tester) -> Double {
+  self.fake.now_ms
+}
+
+pub fn Tester::dispose(self : Tester) -> Unit {
+  if self.disposed {
+    return
+  }
+  self.disposed = true
+  view_forget()
+  let _ = hostapi::set_host(self.prev_host)
+}

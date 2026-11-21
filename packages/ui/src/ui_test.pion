@@ -1,0 +1,430 @@
+// Comprehensive unit test suite for packages/ui (22 core tests covering Pure-Tree runtime,
+// Tester, FakeHost, Field, Stream, Image, ScrollBar, Theme/Glass, Keys, A11y, WindowSlots,
+// answered_from_outside, line_baseline, and paint/codec integration).
+
+import "codec"
+import "paint"
+import "signals"
+import "view"
+
+test "01 Tester::tree first frame renders scene instances via FakeHost" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.padding(view::Live::Is((16.0, 16.0, 16.0, 16.0))).ground(view::Live::Is(Theme::light().bg))
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(140.0)))
+        .height(view::Live::Is(Some(44.0)))
+        .ground(view::Live::Is(Theme::light().accent))
+        .radius(view::Live::Is(12.0))
+        .words(view::Live::Is("Hello Invar"), ink=Theme::light().on_accent, look=view::words_plain)
+    })
+  })
+  let sc = t.scene()
+  debug_assert(sc.ninst >= 3, "expected root + card + text instances")
+  debug_assert(t.fake.frame_count == 1, "one frame presented")
+  debug_assert(t.find("Hello Invar").is_some(), "should find rendered text")
+  t.dispose()
+}
+
+test "02 reactive click updates signal and re-renders incrementally" {
+  let clicks = signals::signal(0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(btn : view::View) {
+      let _ = btn.width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(Theme::light().primary))
+        .words(view::Live::By(fn() { "Count: \{clicks.get()}" }), ink=Theme::light().on_primary, look=view::words_plain)
+        .says(view::Live::Is(Some(view::said(view::Role::Button, label="Increment"))))
+        .on_press(fn() { clicks.set(clicks.untracked() + 1) })
+    })
+  })
+  debug_assert(t.find("Count: 0").is_some(), "initial label Count: 0")
+  t.press("Increment")
+  debug_assert(clicks.get() == 1, "click incremented counter to 1")
+  debug_assert(t.find("Count: 1").is_some(), "updated label Count: 1")
+  t.press("Increment")
+  debug_assert(clicks.get() == 2, "second click incremented counter to 2")
+  t.dispose()
+}
+
+test "03 transitions_only=true settles immediately and unasked_faults is empty" {
+  let wide = signals::signal(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::By(fn() { Some(if wide.get() { 240.0 } else { 100.0 }) }))
+        .height(view::Live::Is(Some(36.0)))
+        .ground(view::Live::Is(Theme::light().card))
+        .says(view::Live::Is(Some(view::said(view::Role::Region, label="Panel"))))
+    })
+  }, transitions_only=true)
+  wide.set(true)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  match t.get("Panel") {
+    Some(d) => debug_assert((d.w - 240.0).abs() < 0.01, "transitions_only settles at once")
+    None => debug_assert(false, "Panel should exist")
+  }
+  // Unrequested frame must draw nothing new
+  t.frame(ms=16.0)
+  debug_assert(t.unasked_faults().length() == 0, "no unasked frame faults")
+  debug_assert(t.idle_said().is_none(), "tree should be idle at rest")
+  t.dispose()
+}
+
+test "04 run_shown skips idle time without stepping empty frames" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(30.0))).ground(view::Live::Is(Theme::light().card))
+    })
+  })
+  let before_frames = t.fake.frame_count
+  t.run_shown(5000.0)
+  debug_assert((t.time() - 5000.0).abs() < 0.01, "virtual clock jumped to 5000ms")
+  debug_assert(t.fake.frame_count == before_frames, "no empty frames stepped while idle")
+  t.dispose()
+}
+
+test "05 Field typing, backspace, selection, copy/cut/paste and undo/redo" {
+  let fld = Field::new(text="hi")
+  let submitted_val = ref_new("")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(
+      root,
+      fld,
+      placeholder="Type here",
+      max_lines=1,
+      submitted=fn(s) { submitted_val.v = s },
+      label="Message",
+    )
+  })
+  t.press("Message")
+  debug_assert(fld.focused(), "field focused on press")
+  debug_assert(field_has_focus(), "field_has_focus is true")
+  t.type_text(" world")
+  debug_assert(fld.text() == "hi world", "typed text appended")
+  t.backspace()
+  debug_assert(fld.text() == "hi worl", "backspace removed last char")
+  fld.pick(0, 2)
+  let copied = fld.copy_selection()
+  debug_assert(copied == "hi", "copied selection")
+  debug_assert(clipboard_get() == "hi", "clipboard updated")
+  let _ = fld.cut_selection()
+  debug_assert(fld.text() == " worl", "cut removed selected range")
+  debug_assert(fld.undo(), "undo restored cut")
+  debug_assert(fld.text() == "hi worl", "text restored after undo")
+  debug_assert(fld.redo(), "redo reapplied cut")
+  debug_assert(fld.text() == " worl", "text after redo")
+  t.enter()
+  debug_assert(submitted_val.v == " worl", "Enter submitted field text")
+  t.dispose()
+}
+
+test "06 Field IME composition and paste_limit callback" {
+  let fld = Field::new()
+  let oversized = ref_new("")
+  fld.paste_limit = 5
+  fld.on_pasted = Some(fn(s) { oversized.v = s })
+  fld.focus()
+  fld.compose("ni")
+  debug_assert(fld.composing(), "field is composing")
+  debug_assert(fld.composed_said() == "ni", "composed text matches")
+  fld.insert("你好")
+  debug_assert(!fld.composing(), "commit clears composing")
+  debug_assert(fld.text() == "你好", "committed text inserted")
+  fld.paste_text("123456")
+  debug_assert(oversized.v == "123456", "paste_limit intercepted large paste")
+  debug_assert(fld.text() == "你好", "large paste not inserted directly")
+  fld.let_go()
+}
+
+test "07 Stream mount, frame decode, visibility hide, and unmount close" {
+  let acked : Array[Double] = []
+  let broken_count = ref_new(0)
+  let s = Stream::new(
+    shown=fn(ts) { acked.push(ts) },
+    broken=fn() { broken_count.v = broken_count.v + 1 },
+  )
+  let show_stream = signals::signal(true)
+  let t = Tester::tree(fn(root : view::View) {
+    root.show(fn() { show_stream.get() }, fn(v : view::View) {
+      let _ = stream(v, s, fit=Fit::FitContain, closes=true)
+        .width(view::Live::Is(Some(320.0)))
+        .height(view::Live::Is(Some(180.0)))
+    }, at_once=true)
+  })
+  s.jpeg("JPEG".to_bytes(), 100.0)
+  debug_assert(s.id > 0, "stream opened on host")
+  t.fake.stream_push_event(s.id, "ok 640 360 100.0")
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(s.is_visible(), "stream is visible when drawn")
+  debug_assert(acked.length() == 1 && (acked[0] - 100.0).abs() < 0.01, "frame ack delivered")
+  // Unmount closes stream when closes=true
+  show_stream.set(false)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(s.is_closed(), "stream closed on unmount")
+  debug_assert(!s.is_visible(), "stream not visible after unmount")
+  t.dispose()
+}
+
+test "08 add_image, add_vector_image, forget_image, host_image_bytes_known" {
+  images_reset()
+  let png_stub = "PNG!".to_bytes()
+  add_image("mem:avatar", png_stub)
+  debug_assert(image_bytes_for("mem:avatar").is_some(), "raster image registered")
+  debug_assert(image_cache_count() == 1, "cache count is 1")
+  let svg_stub = "<svg".to_bytes()
+  add_vector_image("mem:icon", svg_stub, fn(_b, px) {
+    Some((px, px, [0xFF as Byte, 0x00 as Byte, 0x00 as Byte, 0xFF as Byte]))
+  })
+  debug_assert(image_has_vector_drawer("mem:icon"), "vector drawer registered")
+  match image_rasterize_vector("mem:icon", 32) {
+    Some((w, h, _px)) => debug_assert(w == 32 && h == 32, "vector rasterized at requested px")
+    None => debug_assert(false, "expected rasterized vector")
+  }
+  host_image_bytes_known([("avatar", 4096), ("banner", 65536)])
+  debug_assert(host_image_bytes_bar("avatar") == 4096, "known byte bar recorded")
+  forget_image("mem:avatar")
+  debug_assert(image_bytes_for("mem:avatar").is_none(), "forgotten image removed")
+  images_reset()
+}
+
+test "09 tree_scroll_bar configuration and mouse vs finger visibility" {
+  set_pointing(Some(Pointing::Mouse))
+  let bar = tree_scroll_bar()
+  debug_assert((bar.drawn)(), "scrollbar drawn on mouse")
+  debug_assert((bar.size - scroll_bar_size).abs() < 0.001, "bar size matches constant")
+  debug_assert((bar.ink)() != (bar.ink_held)(), "held ink differs from resting ink")
+  set_pointing(Some(Pointing::Finger))
+  debug_assert(!(bar.drawn)(), "scrollbar hidden on finger")
+  set_pointing(None)
+}
+
+test "10 Theme light/dark switching, concentric corners, and WCAG contrast_ratio" {
+  let dark_sig = signals::signal(false)
+  set_tree_theme(fn() { if dark_sig.get() { Theme::dark() } else { Theme::light() } })
+  debug_assert(!tree_theme().dark, "starts in light theme")
+  let light_contrast = contrast_ratio(Theme::light().fg, Theme::light().bg)
+  debug_assert(light_contrast > 10.0, "light theme fg/bg high contrast")
+  dark_sig.set(true)
+  debug_assert(tree_theme().dark, "switched to dark theme")
+  let dark_contrast = contrast_ratio(Theme::dark().fg, Theme::dark().bg)
+  debug_assert(dark_contrast > 10.0, "dark theme fg/bg high contrast")
+  debug_assert((concentric(24.0, 8.0) - 16.0).abs() < 0.001, "concentric inner radius")
+  debug_assert((concentric_out(16.0, 8.0) - 24.0).abs() < 0.001, "concentric outer radius")
+  debug_assert((capsule_in(24.0, 20.0) - 14.0).abs() < 0.001, "capsule_in matches")
+  clear_tree_theme()
+}
+
+test "11 Glass frosted/liquid and set_glass_solid toggle" {
+  let g_frosted = Glass::frosted(blur=12.0, tint=c64(0xFFFF, 0xFF80), solid=c64(0xF0F0, 0xF0FF))
+  debug_assert(!g_frosted.liquid && (g_frosted.blur - 12.0).abs() < 0.001, "frosted glass params")
+  let g_liquid = Glass::liquid(blur=2.0, rim=0.6)
+  debug_assert(g_liquid.liquid && g_liquid.adaptive, "liquid glass params")
+  let pg = g_liquid.to_paint()
+  debug_assert(pg.liquid && (pg.rim - 0.6).abs() < 0.001, "converted to paint::Glass")
+  set_glass_solid(Some(true))
+  debug_assert(glass_solid(), "forced solid")
+  set_glass_solid(Some(false))
+  debug_assert(!glass_solid(), "forced glass")
+  set_glass_solid(None)
+}
+
+test "12 keyboard constants, key_of_char, keys_system, and Tab focus navigation" {
+  debug_assert(key_of_char('a') == key_of_char('A'), "key_of_char case-insensitive")
+  debug_assert(key_of_char('a') == 1097, "key_of_char('a') == 1097")
+  debug_assert(key_code_left == 3 && key_code_right == 4, "arrow key codes")
+  debug_assert(key_escape == 17 && key_tab == 18 && key_space == 1032, "special key codes")
+  debug_assert(mod_shift_key == 1 && mod_ctrl_key == 2 && mod_alt_key == 4 && mod_meta_key == 8, "modifier masks")
+  let activated = ref_new(0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(32.0)))
+        .focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
+        .says(view::Live::Is(Some(view::said(view::Role::Button, label="First"))))
+        .on_press(fn() { activated.v = 1 })
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(32.0)))
+        .focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
+        .says(view::Live::Is(Some(view::said(view::Role::Button, label="Second"))))
+        .on_press(fn() { activated.v = 2 })
+    })
+  })
+  debug_assert(keys_system() == 0, "default FakeHost keys_system is macOS (0)")
+  t.key(key_tab)
+  t.key(key_space)
+  debug_assert(activated.v == 1, "Tab focused First and Space activated it")
+  t.key(key_tab)
+  t.enter()
+  debug_assert(activated.v == 2, "Second Tab focused Second and Enter activated it")
+  t.dispose()
+}
+
+test "13 incremental a11y semantics tree matches full tree across updates" {
+  let label_sig = signals::signal("Save")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(90.0))).height(view::Live::Is(Some(32.0)))
+        .says(view::Live::By(fn() { Some(view::said(view::Role::Button, label=label_sig.get())) }))
+    })
+  })
+  t.set_a11y(true)
+  debug_assert(t.fake.a11y_wires.length() >= 1, "initial a11y update emitted")
+  debug_assert(t.a11y_faults().length() == 0, "initial incremental == full")
+  label_sig.set("Saved")
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(t.fake.a11y_wires.length() >= 2, "incremental update emitted on label change")
+  debug_assert(t.a11y_faults().length() == 0, "post-update incremental == full")
+  t.dispose()
+}
+
+test "14 answered_from_outside increments outside event count and settles via view::answering" {
+  let before = outside_event_count()
+  let ran = ref_new(false)
+  answered_from_outside(fn() {
+    debug_assert(view::answering_now(), "inside view::answering")
+    ran.v = true
+  })
+  debug_assert(ran.v, "callback executed")
+  debug_assert(outside_event_count() == before + 1, "outside event counted")
+}
+
+test "15 line_baseline computes centered vertical baseline from font metrics" {
+  let b1 = line_baseline(24.0, size=16.0, em=(0.8, 0.2))
+  // asc = 12.8, desc = 3.2, total = 16.0, lead = 4.0, baseline = 16.8
+  debug_assert((b1 - 16.8).abs() < 0.01, "baseline with explicit em metrics")
+  let t = Tester::tree(fn(_root : view::View) {  })
+  let b2 = line_baseline(24.0, size=16.0)
+  debug_assert((b2 - 16.8).abs() < 0.01, "baseline via FakeHost font_metrics")
+  t.dispose()
+}
+
+test "16 window_slots and window_kept isolate per-window signals" {
+  set_tree_theme(fn() { Theme::light() })
+  debug_assert(current_window_id() == 0, "primary window is 0")
+  debug_assert(!tree_theme().dark, "window 0 is light")
+  in_window(1, fn() {
+    debug_assert(current_window_id() == 1, "inside window 1")
+    set_tree_theme(fn() { Theme::dark() })
+    debug_assert(tree_theme().dark, "window 1 is dark")
+  })
+  debug_assert(current_window_id() == 0, "restored to window 0")
+  debug_assert(!tree_theme().dark, "window 0 theme unaffected by window 1")
+  in_window(1, fn() {
+    debug_assert(tree_theme().dark, "window 1 kept its dark theme")
+  })
+  clear_tree_theme()
+}
+
+test "17 color algebra: alpha, over, blend, oklch, ink_on" {
+  let red = rgba(255, 0, 0, 255)
+  let half_red = alpha(red, 0.5)
+  debug_assert((half_red & 0xFFL) == 128L, "half alpha is 128")
+  let white = rgba(255, 255, 255, 255)
+  let black = rgba(0, 0, 0, 255)
+  let mid = blend(black, white, 0.5)
+  debug_assert(((mid >> 24) & 0xFFL) == 128L, "blend midpoint")
+  let comp = over(white, half_red)
+  debug_assert(((comp >> 24) & 0xFFL) == 255L, "red over white keeps R=255")
+  debug_assert(((comp >> 16) & 0xFFL) < 140L, "red over white reduces G")
+  let best = ink_on(black, [black, white])
+  debug_assert(best == white, "white chosen over black")
+  let ok_col = oklch(0.6, 0.15, 30.0)
+  debug_assert((ok_col & 0xFFL) == 255L, "oklch opaque output")
+}
+
+test "18 Style/Patch and TextStyle/TextPatch composition with then" {
+  let base = style(p=Space::S4, bg=Color::Card, radius=Radius::Xl)
+  let override_s = style(px=Space::S2, bg=Color::Accent)
+  let merged = base.then(override_s)
+  let bg_ok = match merged.base.bg { Some(Color::Accent) => true; _ => false }
+  let px_ok = match merged.base.px { Some(Space::S2) => true; _ => false }
+  let rad_ok = match merged.base.radius { Some(Radius::Xl) => true; _ => false }
+  debug_assert(bg_ok, "later bg wins")
+  debug_assert(px_ok, "later px wins")
+  debug_assert(rad_ok, "unspecified radius preserved")
+  let ts1 = text_style(size=TextSize::Body, weight=Weight::Normal)
+  let ts2 = text_style(weight=Weight::Bold)
+  let tm = ts1.then(ts2)
+  let sz_ok = match tm.base.size { Some(TextSize::Body) => true; _ => false }
+  let wt_ok = match tm.base.weight { Some(Weight::Bold) => true; _ => false }
+  debug_assert(sz_ok && wt_ok, "text_style merged")
+}
+
+test "19 Ease curves and motion timing helpers" {
+  debug_assert(ease_at(Ease::Linear, 0.5) == 0.5, "linear midpoint")
+  debug_assert(ease_at(Ease::Out, 0.0) == 0.0 && ease_at(Ease::Out, 1.0) == 1.0, "Out endpoints")
+  debug_assert(ease_at(Ease::Out, 0.5) > 0.5, "Out is front-loaded")
+  debug_assert(ease_at(Ease::InOut, 0.0) == 0.0 && ease_at(Ease::InOut, 1.0) == 1.0, "InOut endpoints")
+  debug_assert(ease_at(Ease::Move, 0.0) == 0.0 && ease_at(Ease::Move, 1.0) == 1.0, "Move endpoints")
+  debug_assert(move_ms(100.0) >= move_least_ms && move_ms(100.0) <= move_most_ms, "move_ms in bounds")
+  record_rest("sheet", 250.0)
+  debug_assert((rest_of("sheet") - 250.0).abs() < 0.001, "rest_of lookup")
+}
+
+test "20 NativeView mounts in tree, hides when undrawn, and respects kept flag" {
+  let show_nv = signals::signal(true)
+  let nv_kept_ref : Ref[Option[NativeView]] = ref_new(None)
+  let nv_owned_ref : Ref[Option[NativeView]] = ref_new(None)
+  let t = Tester::tree(fn(root : view::View) {
+    let nv1 = NativeView::new(1)
+    let nv2 = NativeView::new(2)
+    nv_kept_ref.v = Some(nv1)
+    nv_owned_ref.v = Some(nv2)
+    root.show(fn() { show_nv.get() }, fn(v : view::View) {
+      let _ = native(v, nv1, kept=true).width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+      let _ = native(v, nv2, kept=false).width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+    }, at_once=true)
+  })
+  show_nv.set(false)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  match nv_kept_ref.v {
+    Some(nv) => debug_assert(!nv.closed && !nv.visible, "kept native view hidden but not closed")
+    None => debug_assert(false, "nv1 should exist")
+  }
+  match nv_owned_ref.v {
+    Some(nv) => debug_assert(nv.closed, "owned native view closed on unmount")
+    None => debug_assert(false, "nv2 should exist")
+  }
+  t.dispose()
+}
+
+test "21 touch_slop, env, haptic, platform, pointing, stable_hash, and codec end-to-end" {
+  let t = Tester::tree(fn(_root : view::View) {  })
+  t.fake.env_vars["INVAR_MODE"] = "pure"
+  debug_assert(env("INVAR_MODE") == "pure", "env reads from FakeHost")
+  set_platform(Some(2))
+  debug_assert(platform() == 2, "platform override to Android")
+  debug_assert((touch_slop() - 12.0).abs() < 0.001, "Android finger touch_slop is 12")
+  set_platform(Some(0))
+  debug_assert((touch_slop() - 8.0).abs() < 0.001, "macOS mouse touch_slop is 8")
+  set_platform(None)
+  haptic(Haptic::Confirm)
+  debug_assert(t.fake.haptics.length() == 1, "haptic recorded by FakeHost")
+  debug_assert(stable_hash("invar") == stable_hash("invar"), "stable_hash deterministic")
+  debug_assert(stable_hash("invar") != stable_hash("mbui"), "stable_hash distinguishes inputs")
+  // End-to-end paint + codec linkage
+  let b64 = codec::base64("INV".to_bytes())
+  debug_assert(b64 == "SU5W", "codec base64 round-trip")
+  t.dispose()
+}
+
+test "22 resize updates scene dimensions and glass node encodes into FakeHost" {
+  let gl = Glass::liquid(blur=3.0, rim=0.5)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(80.0)))
+        .glass(view::Live::Is(Some(gl.to_paint())))
+        .radius(view::Live::Is(20.0))
+    })
+  }, width=640.0, height=480.0)
+  debug_assert((t.scene().width - 640.0).abs() < 0.01, "initial width 640")
+  debug_assert(t.scene().ninst >= 1, "glass instance encoded")
+  t.resize(1024.0, 768.0)
+  debug_assert((t.scene().width - 1024.0).abs() < 0.01 && (t.scene().height - 768.0).abs() < 0.01, "resized to 1024x768")
+  t.dispose()
+}

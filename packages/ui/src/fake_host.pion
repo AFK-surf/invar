@@ -1,0 +1,290 @@
+// Deterministic offscreen FakeHost implementing hostapi::Host for headless testing.
+// Ported from libs/mbui/src/ui/fake_host.mbt.
+
+import "hostapi"
+
+struct DueTimer {
+  at : Double
+  what : String
+  f : () -> Unit
+}
+
+struct FakeImage {
+  id : Int
+  w : Double
+  h : Double
+  mut state : Int // 0 decoding, 1 ready, -1 failed
+}
+
+struct FakeStream {
+  id : Int
+  events : Array[String]
+  mut closed : Bool
+  mut volume : Double
+}
+
+/// Deterministic offscreen host for Tester and headless verification.
+pub struct FakeHost {
+  pub mut now_ms : Double
+  pub mut width : Double
+  pub mut height : Double
+  pub mut scale : Double
+  pub mut platform_id : Int
+  pub mut keys_platform_id : Int
+  pub mut dark_mode : Bool
+  pub mut a11y_enabled : Bool
+  pub mut reduce_motion_flag : Bool
+  pub mut reduce_transparency_flag : Bool
+  pub mut frame_requested : Bool
+  pub mut frame_count : Int
+  pub mut last_inst : Array[Double]
+  pub mut last_ninst : Int
+  pub mut clipboard_text : String
+  pub mut ime_active : Bool
+  pub mut ime_text : String
+  pub mut ime_rect : (Double, Double, Double, Double)
+  pub mut cursor_id : Int
+  pub mut window_corner_r : Double
+  pub env_vars : Map[String, String]
+  pub haptics : Array[Int]
+  pub a11y_wires : Array[String]
+  pub a11y_mirror : A11yMirror
+  pub frames_log : Array[Int]
+  due_timers : Array[DueTimer]
+  images : Map[Int, FakeImage]
+  streams : Map[Int, FakeStream]
+  mut next_image_id : Int
+  mut next_stream_id : Int
+  mut next_view_id : Int
+  pub mut h264_supported : Bool
+  pub mut audio_supported : Bool
+}
+
+pub fn FakeHost::new(
+  width~ : Double = 800.0,
+  height~ : Double = 600.0,
+  scale~ : Double = 2.0,
+  platform~ : Int = 0,
+  dark~ : Bool = false,
+) -> FakeHost {
+  FakeHost::{
+    now_ms: 0.0,
+    width,
+    height,
+    scale,
+    platform_id: platform,
+    keys_platform_id: platform,
+    dark_mode: dark,
+    a11y_enabled: false,
+    reduce_motion_flag: false,
+    reduce_transparency_flag: false,
+    frame_requested: true,
+    frame_count: 0,
+    last_inst: [],
+    last_ninst: 0,
+    clipboard_text: "",
+    ime_active: false,
+    ime_text: "",
+    ime_rect: (0.0, 0.0, 0.0, 0.0),
+    cursor_id: 0,
+    window_corner_r: 0.0,
+    env_vars: Map::new(),
+    haptics: [],
+    a11y_wires: [],
+    a11y_mirror: A11yMirror::new(),
+    frames_log: [],
+    due_timers: [],
+    images: Map::new(),
+    streams: Map::new(),
+    next_image_id: 1,
+    next_stream_id: 1,
+    next_view_id: 1,
+    h264_supported: true,
+    audio_supported: true,
+  }
+}
+
+/// Schedule a deterministic callback at virtual timestamp `at`.
+pub fn FakeHost::due(self : FakeHost, at : Double, what : String, f : () -> Unit) -> Unit {
+  self.due_timers.push(DueTimer::{ at, what, f })
+}
+
+/// Next scheduled timer timestamp, if any.
+pub fn FakeHost::next_due(self : FakeHost) -> Option[Double] {
+  let mut best : Option[Double] = None
+  for d in self.due_timers {
+    best = match best {
+      Some(b) => if d.at < b { Some(d.at) } else { Some(b) }
+      None => Some(d.at)
+    }
+  }
+  best
+}
+
+/// Fire all timers due at or before `self.now_ms`.
+pub fn FakeHost::fire_due(self : FakeHost) -> Int {
+  let mut fired = 0
+  let mut keep_going = true
+  while keep_going {
+    keep_going = false
+    let mut i = 0
+    while i < self.due_timers.length() {
+      if self.due_timers[i].at <= self.now_ms {
+        let t = self.due_timers[i]
+        array_remove_at(self.due_timers, i)
+        (t.f)()
+        fired += 1
+        keep_going = true
+        break
+      }
+      i += 1
+    }
+  }
+  fired
+}
+
+/// Push a synthetic stream decode event ("ok W H TS", "drop TS", or "broken") for stream `id`.
+pub fn FakeHost::stream_push_event(self : FakeHost, id : Int, ev : String) -> Unit {
+  match self.streams.get(id) {
+    Some(st) => st.events.push(ev)
+    None => ()
+  }
+}
+
+/// Build a hostapi::Host backed by this FakeHost and install it as the active host.
+/// Returns the previous hostapi::Host for restoration on dispose.
+pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
+  let h = hostapi::Host::noop()
+  h.now = fn() { self.now_ms }
+  h.wall_ms = fn() { self.now_ms }
+  h.event_time = fn() { self.now_ms }
+  h.own_clock = fn() { true }
+  h.platform = fn() { self.platform_id }
+  h.keys_platform = fn() { self.keys_platform_id }
+  h.system_dark = fn() { self.dark_mode }
+  h.reduce_motion = fn() { self.reduce_motion_flag }
+  h.reduce_transparency = fn() { self.reduce_transparency_flag }
+  h.window_corner = fn() { self.window_corner_r }
+  h.env = fn(k : String) {
+    match self.env_vars.get(k) {
+      Some(v) => v
+      None => ""
+    }
+  }
+  h.request_frame = fn() { self.frame_requested = true }
+  h.request_frame_on = fn() { self.frame_requested = true }
+  h.wake_after = fn(ms : Double) {
+    self.due(self.now_ms + dmax(0.0, ms), "wake_after", fn() { self.frame_requested = true })
+  }
+  h.font_metrics = fn(size : Double, _weight : Int, _style : Int, out : Array[Double]) {
+    if out.length() >= 6 {
+      out[0] = size * 0.8
+      out[1] = size * 0.2
+      out[2] = size * 0.2
+      out[3] = size * 0.8
+      out[4] = size * 0.2
+      out[5] = 0.0
+    }
+  }
+  h.shape = fn(s : String, size : Double, _weight : Int, _style : Int, out : Array[Double]) {
+    let n = s.length()
+    let adv = size * 0.6
+    let mut i = 0
+    while i < n && i * 4 + 3 < out.length() {
+      out[i * 4] = s.code_unit_at(i).to_double()
+      out[i * 4 + 1] = adv
+      out[i * 4 + 2] = 0.0
+      out[i * 4 + 3] = 0.0
+      i += 1
+    }
+    n
+  }
+  h.present = fn(inst : Array[Double], ninst : Int, _w : Double, _h : Double, _scale : Double) {
+    self.frame_count = self.frame_count + 1
+    self.last_inst = inst.copy()
+    self.last_ninst = ninst
+    self.frames_log.push(ninst)
+  }
+  h.set_cursor = fn(c : Int) { self.cursor_id = c }
+  h.set_ime = fn(active : Bool, x : Double, y : Double, w : Double, h_rect : Double, text : String, _s : Int, _e : Int) {
+    self.ime_active = active
+    self.ime_text = text
+    self.ime_rect = (x, y, w, h_rect)
+  }
+  h.clipboard_set = fn(s : String) { self.clipboard_text = s }
+  h.cl_set = fn(s : String, _png : Bytes, _lbl : String) { self.clipboard_text = s }
+  h.dv_haptic = fn(kind : Int) { self.haptics.push(kind) }
+  h.a11y_on = fn() { self.a11y_enabled }
+  h.a11y_tree = fn(wire : String) { self.a11y_wires.push(wire) }
+  h.image_load = fn(_src : String, px : Int) {
+    let id = self.next_image_id
+    self.next_image_id = id + 1
+    let side = if px > 0 { px.to_double() } else { 64.0 }
+    self.images[id] = FakeImage::{ id, w: side, h: side, state: 1 }
+    id
+  }
+  h.image_load_bytes = fn(_bytes : Bytes, px : Int) {
+    let id = self.next_image_id
+    self.next_image_id = id + 1
+    let side = if px > 0 { px.to_double() } else { 64.0 }
+    self.images[id] = FakeImage::{ id, w: side, h: side, state: 1 }
+    id
+  }
+  h.image_info = fn(id : Int, out : Array[Double]) {
+    match self.images.get(id) {
+      Some(im) => {
+        if out.length() >= 4 {
+          out[0] = im.w
+          out[1] = im.h
+          out[2] = im.w
+          out[3] = im.h
+        }
+        im.state
+      }
+      None => -1
+    }
+  }
+  h.image_free = fn(id : Int) {
+    self.images.remove(id)
+  }
+  h.st_open = fn() {
+    let id = self.next_stream_id
+    self.next_stream_id = id + 1
+    self.streams[id] = FakeStream::{ id, events: [], closed: false, volume: 1.0 }
+    id
+  }
+  h.st_next = fn(id : Int) {
+    match self.streams.get(id) {
+      Some(st) if st.events.length() > 0 => {
+        let ev = st.events[0]
+        array_remove_at(st.events, 0)
+        ev
+      }
+      _ => ""
+    }
+  }
+  h.st_close = fn(id : Int) {
+    match self.streams.get(id) {
+      Some(st) => st.closed = true
+      None => ()
+    }
+  }
+  h.st_h264_here = fn() { if self.h264_supported { 1 } else { 0 } }
+  h.st_audio_here = fn() { if self.audio_supported { 1 } else { 0 } }
+  h.st_audio_volume = fn(id : Int, v : Double) {
+    match self.streams.get(id) {
+      Some(st) => st.volume = v
+      None => ()
+    }
+  }
+  h.view_open = fn(_kind : Int, _arg : String) {
+    let id = self.next_view_id
+    self.next_view_id = id + 1
+    id
+  }
+  h.windows_in_process = fn() { true }
+  h.window_open_id = fn(_what : String) { 1 }
+  let prev = hostapi::host()
+  hostapi::set_host(h)
+  prev
+}

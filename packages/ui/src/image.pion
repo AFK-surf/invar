@@ -1,0 +1,262 @@
+// Image registration, deduplication, vector rasterization hook, LRU cache, and byte accounting.
+// Ported from libs/mbui/src/ui/image.mbt and fake_host.mbt's host_image_bytes_known.
+
+import "hostapi"
+import "signals"
+
+/// Image fitting mode inside a box.
+#derive(Eq)
+pub enum Fit {
+  FitCover
+  FitCoverAt(Double)
+  FitCoverFrom(Double, Double)
+  FitContain
+  FitFill
+}
+
+pub fn Fit::cover_from(self : Fit) -> (Double, Double) {
+  match self {
+    Fit::FitCover => (0.5, 0.5)
+    Fit::FitCoverAt(down) => (0.5, dclamp(down, 0.0, 1.0))
+    Fit::FitCoverFrom(across, down) => (dclamp(across, 0.0, 1.0), dclamp(down, 0.0, 1.0))
+    Fit::FitContain => (0.5, 0.5)
+    Fit::FitFill => (0.5, 0.5)
+  }
+}
+
+struct ImageEntry {
+  id : Int
+  mut px : Int
+  mut state : Int // 0 decoding, 1 ready, -1 failed
+  mut w : Double
+  mut h : Double
+  mut used : Int
+  mut ready_at : Double
+}
+
+let image_budget : Double = 192.0 * 1024.0 * 1024.0
+let image_data : Map[String, Bytes] = Map::new()
+let image_vector_drawers : Map[String, (Bytes, Int) -> Option[(Int, Int, Array[Byte])]] = Map::new()
+let image_cache : Map[String, Array[ImageEntry]] = Map::new()
+let image_bytes_total : Ref[Double] = ref_new(0.0)
+let image_rev : Ref[signals::Signal[Int]] = ref_new(signals::signal(0))
+let host_image_byte_bars : Map[String, Int] = Map::new()
+
+fn bytes_equal(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn image_bump_rev() -> Unit {
+  image_rev.v.set(image_rev.v.untracked() + 1)
+}
+
+fn image_cache_renew(key : String) -> Unit {
+  match image_cache.get(key) {
+    Some(list) => {
+      let kept : Array[ImageEntry] = []
+      for e in list {
+        if e.state == 1 {
+          e.px = 0
+          kept.push(e)
+        } else {
+          hostapi::image_free(e.id)
+          image_bytes_total.v = dmax(0.0, image_bytes_total.v - e.w * e.h * 4.0)
+        }
+      }
+      if kept.length() == 0 {
+        image_cache.remove(key)
+      } else {
+        image_cache[key] = kept
+      }
+    }
+    None => ()
+  }
+  image_bump_rev()
+}
+
+/// Register an encoded raster image under `key`, deduplicating identical bytes.
+pub fn add_image(key : String, data : Bytes) -> Unit {
+  let changed = if image_vector_drawers.contains(key) {
+    true
+  } else {
+    match image_data.get(key) {
+      Some(old) => !bytes_equal(old, data)
+      None => true
+    }
+  }
+  image_vector_drawers.remove(key)
+  image_data[key] = data
+  if changed {
+    image_cache_renew(key)
+  }
+}
+
+/// Register a vector image under `key` with its custom rasterizer `(bytes, max_px) -> Option[(w, h, rgba)]`.
+pub fn add_vector_image(
+  key : String,
+  data : Bytes,
+  draw : (Bytes, Int) -> Option[(Int, Int, Array[Byte])],
+) -> Unit {
+  image_data[key] = data
+  image_vector_drawers[key] = draw
+  image_cache_renew(key)
+}
+
+/// Forget an image, releasing its cached decodes on the host and freeing its byte records.
+pub fn forget_image(key : String) -> Unit {
+  image_data.remove(key)
+  image_vector_drawers.remove(key)
+  match image_cache.get(key) {
+    Some(list) => {
+      for e in list {
+        hostapi::image_free(e.id)
+        image_bytes_total.v = dmax(0.0, image_bytes_total.v - e.w * e.h * 4.0)
+      }
+      image_cache.remove(key)
+    }
+    None => ()
+  }
+  image_bump_rev()
+}
+
+/// Record known host image byte budgets (matching upstream fake_host.mbt host_image_bytes_known).
+pub fn host_image_bytes_known(bars : Array[(String, Int)]) -> Unit {
+  host_image_byte_bars.clear()
+  for entry in bars {
+    host_image_byte_bars[entry.0] = entry.1
+  }
+}
+
+/// Query known byte budget for a named host image bar (0 if not set).
+pub fn host_image_bytes_bar(name : String) -> Int {
+  match host_image_byte_bars.get(name) {
+    Some(v) => v
+    None => 0
+  }
+}
+
+/// Look up registered encoded bytes for `key`.
+pub fn image_bytes_for(key : String) -> Option[Bytes] {
+  image_data.get(key)
+}
+
+/// Check if a vector drawer is registered for `key`.
+pub fn image_has_vector_drawer(key : String) -> Bool {
+  image_vector_drawers.contains(key)
+}
+
+/// Rasterize a registered vector image at target `px` if a drawer is registered.
+pub fn image_rasterize_vector(key : String, px : Int) -> Option[(Int, Int, Array[Byte])] {
+  match (image_data.get(key), image_vector_drawers.get(key)) {
+    (Some(data), Some(draw)) => draw(data, px)
+    _ => None
+  }
+}
+
+/// Ensure a host decode entry exists for `key` at `px` and poll its readiness.
+/// Returns Option[(host_id, w, h)] when ready.
+pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Option[(Int, Double, Double)] {
+  let _ = image_rev.v.get()
+  let req_px = if px <= 0 { 256 } else { px }
+  let list = match image_cache.get(key) {
+    Some(l) => l
+    None => {
+      let l : Array[ImageEntry] = []
+      image_cache[key] = l
+      l
+    }
+  }
+  // Check existing entries
+  let mut best_ready : Option[ImageEntry] = None
+  let mut has_target = false
+  for e in list {
+    if e.state == 0 {
+      let info : Array[Double] = [0.0, 0.0, 0.0, 0.0]
+      let st = hostapi::image_info(e.id, info)
+      if st == 1 {
+        e.state = 1
+        e.w = info[0]
+        e.h = info[1]
+        e.ready_at = now
+        image_bytes_total.v = image_bytes_total.v + e.w * e.h * 4.0
+      } else if st < 0 {
+        e.state = -1
+      }
+    }
+    if e.px >= req_px {
+      has_target = true
+    }
+    if e.state == 1 {
+      best_ready = Some(e)
+    }
+  }
+  if !has_target {
+    let id = match image_data.get(key) {
+      Some(bytes) => hostapi::image_load_bytes(bytes, req_px)
+      None =>
+        if str_has_prefix(key, "mem:") {
+          0
+        } else {
+          hostapi::image_load(key, req_px)
+        }
+    }
+    if id > 0 {
+      let entry = ImageEntry::{ id, px: req_px, state: 0, w: 0.0, h: 0.0, used: frame_no, ready_at: 0.0 }
+      let info : Array[Double] = [0.0, 0.0, 0.0, 0.0]
+      let st = hostapi::image_info(id, info)
+      if st == 1 {
+        entry.state = 1
+        entry.w = info[0]
+        entry.h = info[1]
+        entry.ready_at = now
+        image_bytes_total.v = image_bytes_total.v + entry.w * entry.h * 4.0
+        best_ready = Some(entry)
+      } else if st < 0 {
+        entry.state = -1
+      }
+      list.push(entry)
+    }
+  }
+  match best_ready {
+    Some(e) => {
+      e.used = frame_no
+      Some((e.id, e.w, e.h))
+    }
+    None => None
+  }
+}
+
+pub fn image_bytes_used() -> Double {
+  image_bytes_total.v
+}
+
+pub fn image_cache_count() -> Int {
+  image_data.length()
+}
+
+pub fn images_reset() -> Unit {
+  for k in image_cache.keys() {
+    match image_cache.get(k) {
+      Some(list) => {
+        for e in list {
+          hostapi::image_free(e.id)
+        }
+      }
+      None => ()
+    }
+  }
+  image_cache.clear()
+  image_data.clear()
+  image_vector_drawers.clear()
+  image_bytes_total.v = 0.0
+}

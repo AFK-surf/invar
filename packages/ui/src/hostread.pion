@@ -1,0 +1,250 @@
+// Host environment queries, Pointing, Haptic, touch_slop, clipboard, window_zoom,
+// FramePerf, line_baseline, after_frame, on_reset, and answered_from_outside.
+// Ported from libs/mbui/src/ui/hostread.mbt, device.mbt, perf.mbt, text.mbt, kept_part.mbt, app.mbt.
+
+import "hostapi"
+import "signals"
+import "view"
+
+/// Input pointing device class.
+#derive(Eq)
+pub enum Pointing {
+  Finger
+  Mouse
+}
+
+/// Haptic feedback kind.
+#derive(Eq)
+pub enum Haptic {
+  LongPress
+  ContextClick
+  TextHandleMove
+  Confirm
+  Reject
+  KeyboardTap
+}
+
+fn haptic_code(kind : Haptic) -> Int {
+  match kind {
+    Haptic::LongPress => hostapi::haptic_long_press
+    Haptic::ContextClick => hostapi::haptic_context_click
+    Haptic::TextHandleMove => hostapi::haptic_text_handle_move
+    Haptic::Confirm => hostapi::haptic_confirm
+    Haptic::Reject => hostapi::haptic_reject
+    Haptic::KeyboardTap => hostapi::haptic_keyboard_tap
+  }
+}
+
+let said_platform : Ref[Int] = ref_new(-1)
+let said_pointing : Ref[Option[Pointing]] = ref_new(None)
+let host_pointing : Ref[Option[Pointing]] = ref_new(None)
+let pointing_sig : Ref[signals::Signal[Int]] = ref_new(signals::signal(0))
+let haptics_on : Ref[Bool] = ref_new(true)
+let clipboard_shadow : Ref[String] = ref_new("")
+let zoom_value : Ref[Double] = ref_new(1.0)
+let web_lines : Ref[Bool] = ref_new(false)
+let outside_events : Ref[Int] = ref_new(0)
+let after_frame_cbs : Array[() -> Unit] = []
+let reset_hooks : Array[() -> Unit] = []
+
+fn platform_pointing(p : Int) -> Pointing {
+  if p == 1 || p == 2 { Pointing::Finger } else { Pointing::Mouse }
+}
+
+/// Current platform id (0 macOS, 1 iOS, 2 Android, 3 Windows, 4 Web, 5 Linux).
+pub fn platform() -> Int {
+  if said_platform.v >= 0 {
+    said_platform.v
+  } else {
+    hostapi::platform()
+  }
+}
+
+pub fn set_platform(p : Option[Int]) -> Unit {
+  match p {
+    Some(v) => said_platform.v = v
+    None => said_platform.v = -1
+  }
+  pointing_sig.v.set(pointing_sig.v.untracked() + 1)
+}
+
+pub fn pointing() -> Pointing {
+  let _ = pointing_sig.v.get()
+  match said_pointing.v {
+    Some(p) => p
+    None => match host_pointing.v {
+      Some(p) => p
+      None => match hostapi::pointing() {
+        1 => Pointing::Finger
+        0 => Pointing::Mouse
+        _ => platform_pointing(platform())
+      }
+    }
+  }
+}
+
+pub fn set_pointing(p : Option[Pointing]) -> Unit {
+  said_pointing.v = p
+  pointing_sig.v.set(pointing_sig.v.untracked() + 1)
+}
+
+/// Touch/pointer drag threshold in logical pixels (8 px for mouse, 12 px for finger).
+pub fn touch_slop() -> Double {
+  match pointing() {
+    Pointing::Finger => 12.0
+    Pointing::Mouse => 8.0
+  }
+}
+
+/// Read host environment variable.
+pub fn env(name : String) -> String {
+  hostapi::env(name)
+}
+
+/// Trigger haptic feedback unless disabled.
+pub fn haptic(kind : Haptic) -> Unit {
+  if haptics_on.v {
+    hostapi::haptic(haptic_code(kind))
+  }
+}
+
+pub fn set_haptics(on : Bool) -> Unit {
+  haptics_on.v = on
+}
+
+/// Write text to clipboard (updates host and local shadow for deterministic readback).
+pub fn clipboard_set(text : String, label~ : String = "") -> Unit {
+  clipboard_shadow.v = text
+  hostapi::clipboard_set(text)
+  hostapi::clip_set_text(text, label)
+}
+
+/// Read text from clipboard shadow (updated by clipboard_set or host delivery).
+pub fn clipboard_get() -> String {
+  clipboard_shadow.v
+}
+
+pub fn clipboard_set_png(png : Bytes, label~ : String = "") -> Unit {
+  hostapi::clip_set_png(png, label)
+}
+
+/// Window content zoom factor.
+pub fn window_zoom() -> Double {
+  zoom_value.v
+}
+
+pub fn set_window_zoom(z : Double) -> Unit {
+  let clamped = dclamp(z, 0.5, 3.0)
+  zoom_value.v = clamped
+  tree_window_zoom.v.set(clamped)
+  hostapi::set_window_zoom(clamped)
+}
+
+pub fn window_zoom_supported() -> Bool {
+  let p = platform()
+  p == 0 || p == 3 || p == 5
+}
+
+/// Frame timing breakdown for performance instrumentation.
+pub struct FramePerf {
+  pub mut frame_ms : Double
+  pub mut layout_ms : Double
+  pub mut paint_ms : Double
+  pub mut present_ms : Double
+  pub mut instances : Int
+  pub mut dirty_rects : Int
+}
+
+pub fn FramePerf::zero() -> FramePerf {
+  FramePerf::{
+    frame_ms: 0.0,
+    layout_ms: 0.0,
+    paint_ms: 0.0,
+    present_ms: 0.0,
+    instances: 0,
+    dirty_rects: 0,
+  }
+}
+
+let work_clock_fn : Ref[Option[() -> Double]] = ref_new(None)
+
+pub fn set_work_clock(f : Option[() -> Double]) -> Unit {
+  work_clock_fn.v = f
+}
+
+pub fn work_clock_now() -> Double {
+  match work_clock_fn.v {
+    Some(f) => f()
+    None => hostapi::now()
+  }
+}
+
+/// Compute baseline offset from the top of a line box of height `line` for given font metrics.
+pub fn line_baseline(
+  line : Double,
+  size~ : Double = 15.0,
+  weight~ : Int = 400,
+  em? : (Double, Double),
+) -> Double {
+  let (asc, desc) = match em {
+    Some((a, d)) =>
+      if web_lines.v {
+        ((a * size).round(), (d * size).round())
+      } else {
+        (a * size, d * size)
+      }
+    None => {
+      let out : Array[Double] = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+      hostapi::font_metrics(size, weight, 0, out)
+      let a = if out[0] > 0.0 { out[0] } else { size * 0.8 }
+      let d = if out[1] > 0.0 { out[1] } else { size * 0.2 }
+      if web_lines.v { (a.round(), d.round()) } else { (a, d) }
+    }
+  }
+  let h = if line > 0.0 { line } else { asc + desc }
+  let lead = (h - (asc + desc)) / 2.0
+  lead + asc
+}
+
+/// Schedule a callback to run after the current frame finishes.
+pub fn after_frame(f : () -> Unit) -> Unit {
+  after_frame_cbs.push(f)
+}
+
+fn drain_after_frame() -> Unit {
+  if after_frame_cbs.length() == 0 {
+    return
+  }
+  let todo = after_frame_cbs.copy()
+  after_frame_cbs.clear()
+  for f in todo {
+    f()
+  }
+}
+
+/// Register a cleanup hook invoked when resetting UI globals between test runs.
+pub fn on_reset(f : () -> Unit) -> Unit {
+  reset_hooks.push(f)
+}
+
+pub fn run_reset_hooks() -> Unit {
+  for f in reset_hooks {
+    f()
+  }
+}
+
+/// Deliver an external answer (e.g., core callback) settled via view::answering so it triggers no ambient motion.
+pub fn answered_from_outside(answer : () -> Unit, told~ : Bool = true) -> Unit {
+  if told {
+    outside_events.v = outside_events.v + 1
+  }
+  view::answering(answer)
+}
+
+pub fn came_from_outside() -> Unit {
+  answered_from_outside(fn() {  }, told=true)
+}
+
+pub fn outside_event_count() -> Int {
+  outside_events.v
+}

@@ -1,0 +1,215 @@
+// Multi-window state slots and per-window global swapping.
+// Ported from libs/mbui/src/ui/window_slots.mbt and window_kept.mbt.
+
+import "hostapi"
+import "view"
+import "signals"
+
+pub struct WindowKept {
+  pub take : () -> (() -> Unit)
+  pub fresh : () -> Unit
+}
+
+pub struct WindowSpec {
+  pub role : String
+  pub title : String
+  pub w : Double
+  pub h : Double
+  pub min_w : Double
+  pub min_h : Double
+  pub inset : Option[Bool]
+  pub what : String
+}
+
+pub fn WindowSpec::new(
+  what~ : String = "",
+  role~ : String = "",
+  title~ : String = "",
+  w~ : Double = 0.0,
+  h~ : Double = 0.0,
+  min_w~ : Double = 0.0,
+  min_h~ : Double = 0.0,
+  inset? : Bool,
+) -> WindowSpec {
+  WindowSpec::{ role, title, w, h, min_w, min_h, inset, what }
+}
+
+let windows_kept : Array[WindowKept] = []
+let window_now : Ref[Int] = ref_new(0)
+let window_slots : Map[Int, Array[() -> Unit]] = Map::new()
+let windows_beside : Map[Int, String] = Map::new()
+let window_trees : Map[Int, view::Tree] = Map::new()
+let window_tree_maker : Ref[Option[(Int, String) -> (view::View) -> Unit]] = ref_new(None)
+let window_closed_tell : Array[(Int) -> Unit] = []
+let ui_kept_registered : Ref[Bool] = ref_new(false)
+
+fn register_ui_window_kept() -> Unit {
+  if ui_kept_registered.v {
+    return
+  }
+  ui_kept_registered.v = true
+  // Per-window signals stored as Ref[Signal] so windows never wake each other.
+  window_kept(
+    fn() {
+      let saved_theme_fn = tree_theme_fn.v
+      let saved_theme_fb = tree_theme_fallback.v
+      let saved_corner = tree_window_corner.v
+      let saved_zoom = tree_window_zoom.v
+      let saved_glass = glass_forced_said.v
+      let saved_field = focused_field_ref.v
+      fn() {
+        tree_theme_fn.v = saved_theme_fn
+        tree_theme_fallback.v = saved_theme_fb
+        tree_window_corner.v = saved_corner
+        tree_window_zoom.v = saved_zoom
+        glass_forced_said.v = saved_glass
+        focused_field_ref.v = saved_field
+      }
+    },
+    fn() {
+      tree_theme_fn.v = signals::signal_ref(None)
+      tree_theme_fallback.v = signals::signal_ref(Theme::light())
+      tree_window_corner.v = signals::signal(0.0)
+      tree_window_zoom.v = signals::signal(1.0)
+      glass_forced_said.v = signals::signal(-1)
+      focused_field_ref.v = None
+    },
+  )
+}
+
+/// Active window id (0 = primary window, >0 = secondary in-process windows).
+pub fn current_window_id() -> Int {
+  window_now.v
+}
+
+/// Register a per-window global state slot (take returns restore closure; fresh initializes a new window).
+pub fn window_kept(take : () -> (() -> Unit), fresh : () -> Unit) -> Unit {
+  windows_kept.push(WindowKept::{ take, fresh })
+  for wid in window_slots.keys() {
+    match window_slots.get(wid) {
+      Some(slot) => slot.push(fresh)
+      None => ()
+    }
+  }
+}
+
+/// Swap globals to window `wid`, run `body`, and restore the previous window (typically window 0).
+pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
+  register_ui_window_kept()
+  let prev = window_now.v
+  if prev == wid {
+    body()
+    return
+  }
+  // Save current window's state
+  let prev_saved : Array[() -> Unit] = []
+  for k in windows_kept {
+    prev_saved.push((k.take)())
+  }
+  window_slots[prev] = prev_saved
+  // Load target window's state (or initialize fresh)
+  match window_slots.get(wid) {
+    Some(restore_list) => {
+      for r in restore_list {
+        r()
+      }
+      window_slots.remove(wid)
+    }
+    None => {
+      for k in windows_kept {
+        (k.fresh)()
+      }
+    }
+  }
+  window_now.v = wid
+  body()
+  // Save target window's state and restore previous window
+  let target_saved : Array[() -> Unit] = []
+  for k in windows_kept {
+    target_saved.push((k.take)())
+  }
+  window_slots[wid] = target_saved
+  match window_slots.get(prev) {
+    Some(restore_list) => {
+      for r in restore_list {
+        r()
+      }
+      window_slots.remove(prev)
+    }
+    None => ()
+  }
+  window_now.v = prev
+}
+
+pub fn set_window_tree(make : (Int, String) -> (view::View) -> Unit) -> Unit {
+  window_tree_maker.v = Some(make)
+}
+
+pub fn when_window_closed(f : (Int) -> Unit) -> Unit {
+  window_closed_tell.push(f)
+}
+
+pub fn windows_here() -> Bool {
+  match window_tree_maker.v {
+    Some(_) => hostapi::windows_in_process()
+    None => false
+  }
+}
+
+pub fn window_open_here(what : String) -> Int {
+  if !windows_here() {
+    return 0
+  }
+  let wid = hostapi::window_open_id(what)
+  if wid > 0 {
+    windows_beside[wid] = what
+  }
+  wid
+}
+
+pub fn window_close_here(wid : Int) -> Unit {
+  if wid <= 0 {
+    return
+  }
+  match window_trees.get(wid) {
+    Some(t) => {
+      t.dispose()
+      window_trees.remove(wid)
+    }
+    None => ()
+  }
+  windows_beside.remove(wid)
+  window_slots.remove(wid)
+  hostapi::window_close_id(wid)
+  for f in window_closed_tell {
+    f(wid)
+  }
+}
+
+pub fn windows_open_here() -> Array[(Int, String)] {
+  let out : Array[(Int, String)] = []
+  for k in windows_beside.keys() {
+    match windows_beside.get(k) {
+      Some(v) => out.push((k, v))
+      None => ()
+    }
+  }
+  out
+}
+
+pub fn window_shows(wid : Int) -> Option[String] {
+  windows_beside.get(wid)
+}
+
+fn windows_reset() -> Unit {
+  for k in window_trees.keys() {
+    match window_trees.get(k) {
+      Some(t) => t.dispose()
+      None => ()
+    }
+  }
+  window_trees.clear()
+  windows_beside.clear()
+  window_slots.clear()
+  window_now.v = 0
+}
