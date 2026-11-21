@@ -1,0 +1,744 @@
+// Real synchronous GPU offscreen frame benchmark suite (Layer 2).
+// Runs on Apple Metal (macOS) or EGL/GLES3 (Linux) at 1280x800 @2x (2560x1600 physical px).
+// Usage: invar-bench-gpu [--json] [--filter <substr>]
+
+import "film"
+import "host"
+import "hostapi"
+import "lg"
+import "lg_pages"
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+extern "C" fn c_gpu_now_ms() -> Double = "invar_bench_gpu_now_ms"
+extern "C" fn c_gpu_rss_kb() -> Int64 = "invar_bench_gpu_rss_kb"
+extern "C" fn c_gpu_platform_id() -> Int = "invar_bench_gpu_platform_id"
+extern "C" fn c_gpu_draw_timed(inst : Ptr, count : Int, r : Double, g : Double, b : Double, out : Ptr) -> Unit = "invar_bench_gpu_draw_timed"
+
+let gpu_timed_out : Array[Double] = [0.0, 0.0]
+
+fn install_sync_gpu_host() -> Unit {
+  let h = host::native_host()
+  h.present = fn(inst : Array[Double], count : Int, r : Double, g : Double, b : Double) -> Unit {
+    c_gpu_draw_timed(array_data_ptr(inst), count, r, g, b, array_data_ptr(gpu_timed_out))
+  }
+  hostapi::set_host(h)
+}
+
+fn gpu_now_ms() -> Double {
+  c_gpu_now_ms()
+}
+
+fn gpu_rss_kb() -> Int64 {
+  c_gpu_rss_kb()
+}
+
+fn renderer_name() -> String {
+  let pid = c_gpu_platform_id()
+  if pid == 1 {
+    "Apple Metal"
+  } else if pid == 2 {
+    "EGL/GLES3"
+  } else {
+    "Native GPU"
+  }
+}
+
+fn array_eq_int(a : Array[Int], b : Array[Int]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn sort_doubles(a : Array[Double]) -> Unit {
+  let n = a.length()
+  if n <= 1 {
+    return
+  }
+  let mut gap = n / 2
+  while gap > 0 {
+    let mut i = gap
+    while i < n {
+      let key = a[i]
+      let mut j = i
+      while j >= gap && a[j - gap] > key {
+        a[j] = a[j - gap]
+        j -= gap
+      }
+      a[j] = key
+      i += 1
+    }
+    gap = gap / 2
+  }
+}
+
+fn pct(sorted : Array[Double], p : Double) -> Double {
+  let n = sorted.length()
+  if n == 0 {
+    return 0.0
+  }
+  if n == 1 {
+    return sorted[0]
+  }
+  let pos = (p / 100.0) * (n - 1).to_double()
+  let lo = pos.floor().to_int()
+  let hi = if lo + 1 < n { lo + 1 } else { n - 1 }
+  let frac = pos - lo.to_double()
+  sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+fn fmt_d(x : Double, digits : Int) -> String {
+  if x != x {
+    return "0.0"
+  }
+  let inf = 1.0 / 0.0
+  if x == inf || x == -inf {
+    return "0.0"
+  }
+  let neg = x < 0.0
+  let ax = if neg { -x } else { x }
+  let mut scale = 1.0
+  let mut scale_i : Int64 = 1L
+  let mut d = 0
+  while d < digits {
+    scale = scale * 10.0
+    scale_i = scale_i * 10L
+    d += 1
+  }
+  let scaled = (ax * scale + 0.5).floor().to_int64()
+  let whole = scaled / scale_i
+  let frac = scaled - whole * scale_i
+  let sb = StringBuilder::new()
+  if neg && scaled > 0L {
+    sb.write_char('-')
+  }
+  sb.write_string(whole.to_string())
+  if digits > 0 {
+    sb.write_char('.')
+    let fs = frac.to_string()
+    let mut pad = digits - fs.length()
+    while pad > 0 {
+      sb.write_char('0')
+      pad -= 1
+    }
+    sb.write_string(fs)
+  }
+  sb.to_string()
+}
+
+fn pad_r(s : String, width : Int) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string(s)
+  let mut n = width - s.length()
+  while n > 0 {
+    sb.write_char(' ')
+    n -= 1
+  }
+  sb.to_string()
+}
+
+fn pad_l(s : String, width : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut n = width - s.length()
+  while n > 0 {
+    sb.write_char(' ')
+    n -= 1
+  }
+  sb.write_string(s)
+  sb.to_string()
+}
+
+struct GpuBenchResult {
+  name : String
+  frames : Int
+  frame_p50 : Double
+  frame_p95 : Double
+  frame_p99 : Double
+  frame_max : Double
+  layout_p50 : Double
+  layout_p95 : Double
+  paint_p50 : Double
+  paint_p95 : Double
+  present_p50 : Double
+  present_p95 : Double
+  present_p99 : Double
+  instances_avg : Double
+  dirty_rects_avg : Double
+  budget_120fps_hit_pct : Double
+  budget_60fps_hit_pct : Double
+  checksum : Int64
+}
+
+fn summarize_gpu(
+  name : String,
+  frame_s : Array[Double],
+  layout_s : Array[Double],
+  paint_s : Array[Double],
+  present_s : Array[Double],
+  inst_sum : Double,
+  dirty_sum : Double,
+  checksum : Int64,
+) -> GpuBenchResult {
+  let n = frame_s.length()
+  let fs = frame_s.copy()
+  let ls = layout_s.copy()
+  let ps = paint_s.copy()
+  let prs = present_s.copy()
+  sort_doubles(fs)
+  sort_doubles(ls)
+  sort_doubles(ps)
+  sort_doubles(prs)
+
+  let mut hit120 = 0
+  let mut hit60 = 0
+  for v in fs {
+    if v <= 8.333333 {
+      hit120 += 1
+    }
+    if v <= 16.666667 {
+      hit60 += 1
+    }
+  }
+  let nf = if n > 0 { n.to_double() } else { 1.0 }
+  GpuBenchResult::{
+    name,
+    frames: n,
+    frame_p50: pct(fs, 50.0),
+    frame_p95: pct(fs, 95.0),
+    frame_p99: pct(fs, 99.0),
+    frame_max: if n > 0 { fs[n - 1] } else { 0.0 },
+    layout_p50: pct(ls, 50.0),
+    layout_p95: pct(ls, 95.0),
+    paint_p50: pct(ps, 50.0),
+    paint_p95: pct(ps, 95.0),
+    present_p50: pct(prs, 50.0),
+    present_p95: pct(prs, 95.0),
+    present_p99: pct(prs, 99.0),
+    instances_avg: inst_sum / nf,
+    dirty_rects_avg: dirty_sum / nf,
+    budget_120fps_hit_pct: hit120.to_double() * 100.0 / nf,
+    budget_60fps_hit_pct: hit60.to_double() * 100.0 / nf,
+    checksum,
+  }
+}
+
+fn mix_h(h : Int64, v : Int64) -> Int64 {
+  let prime : Int64 = (0x00000100.to_int64() << 32) | 0x000001B3.to_int64()
+  (h ^ v) * prime
+}
+
+fn bench_glass(dark : Bool) -> paint::Glass {
+  paint::Glass::liquid(
+    blur=2.2,
+    tint=if dark { 0x1E2028D8L } else { 0xFDFCFD78L },
+    solid=if dark { 0x1E1F24FFL } else { 0xFAFAFAFFL },
+    saturation=1.15,
+    rim=0.65,
+    bezel=20.0,
+    refraction=28.0,
+    chroma=0.12,
+    merge=0.0,
+    adaptive=false,
+  )
+}
+
+// ── 1. gpu_vlist_10k_scroll_120f ───────────────────────────────────────
+
+fn bench_gpu_vlist_10k_scroll_120f() -> GpuBenchResult {
+  let w = 1280.0
+  let h = 800.0
+  let scale = 2.0
+  lg::set_dark(Some(true))
+  film::init_offscreen(w, h, scale)
+
+  let sc = view::Scroll::list()
+  let all_keys : Array[Int] = []
+  for i in 0..<10000 {
+    all_keys.push(i)
+  }
+  let keys_sig = signals::signal_by(all_keys, array_eq_int)
+
+  ui::set_view_app(
+    fn(root : view::View) {
+      let _ = root.transitions_only()
+      let _ = root.width(view::Live::Is(Some(w))).height(view::Live::Is(Some(h))).ground(view::Live::Is(0x0E1117FFL))
+      let _ = root.scrolls_window(
+        sc,
+        fn() { keys_sig.get() },
+        fn(v : view::View, k : Int) {
+          let bg = if k % 2 == 0 { 0x151923FFL } else { 0x1A1F2CFFL }
+          let accent = if k % 3 == 0 { 0x3B82F6FFL } else if k % 3 == 1 { 0x10B981FFL } else { 0xF59E0BFFL }
+          let _ = v
+            .row(view::Live::Is(true))
+            .height(view::Live::Is(Some(44.0)))
+            .padding(view::Live::Is((16.0, 6.0, 16.0, 6.0)))
+            .gap(view::Live::Is(12.0))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .ground(view::Live::Is(bg))
+          let _ = v.box(fn(badge : view::View) {
+            let _ = badge.width(view::Live::Is(Some(28.0))).height(view::Live::Is(Some(28.0))).radius(view::Live::Is(14.0)).ground(view::Live::Is(accent))
+          })
+          let _ = v.box(fn(col : view::View) {
+            let _ = col.grow(view::Live::Is(1.0)).gap(view::Live::Is(2.0))
+            let _ = col.box(fn(t : view::View) {
+              let _ = t.words(view::Live::Is("Virtual Row #" + k.to_string() + " · Telemetry Event Stream")).ink(view::Live::Is(0xF1F5F9FFL))
+            })
+          })
+          let _ = v.box(fn(pill : view::View) {
+            let _ = pill.width(view::Live::Is(Some(72.0))).height(view::Live::Is(Some(22.0))).radius(view::Live::Is(11.0)).ground(view::Live::Is(0x273043FFL))
+          })
+        },
+        est=44.0,
+        at_once=true,
+      )
+    },
+    theme=lg::ui_theme,
+  )
+
+  let dt = 1000.0 / 120.0
+  // Warmup 5 frames
+  for f in 0..<5 {
+    sc.put(f.to_double() * 24.0)
+    film::mark_dirty_full()
+    let _ = ui::view_frame(w, h, scale, f.to_double() * dt)
+  }
+
+  let frame_s : Array[Double] = []
+  let layout_s : Array[Double] = []
+  let paint_s : Array[Double] = []
+  let present_s : Array[Double] = []
+  let mut inst_sum = 0.0
+  let mut dirty_sum = 0.0
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for f in 0..<120 {
+    sc.put((f + 5).to_double() * 64.0)
+    film::mark_dirty_full()
+    let _ = ui::view_frame(w, h, scale, (f + 5).to_double() * dt)
+    let perf = ui::view_scene_last().perf
+    frame_s.push(perf.frame_ms)
+    layout_s.push(perf.layout_ms)
+    paint_s.push(perf.paint_ms)
+    present_s.push(perf.present_ms)
+    inst_sum = inst_sum + perf.instances.to_double()
+    dirty_sum = dirty_sum + perf.dirty_rects.to_double()
+    checksum = mix_h(checksum, (perf.instances * 31 + perf.dirty_rects).to_int64())
+  }
+
+  summarize_gpu("gpu_vlist_10k_scroll_120f", frame_s, layout_s, paint_s, present_s, inst_sum, dirty_sum, checksum)
+}
+
+// ── 2. gpu_canvas_2k_plus_6_glass_60f ──────────────────────────────────
+
+fn bench_gpu_canvas_2k_plus_6_glass_60f() -> GpuBenchResult {
+  let w = 1280.0
+  let h = 800.0
+  let scale = 2.0
+  lg::set_dark(Some(true))
+  film::init_offscreen(w, h, scale)
+
+  let pan_x = signals::signal(0.0)
+  let pan_y = signals::signal(0.0)
+
+  ui::set_view_app(
+    fn(root : view::View) {
+      let _ = root.transitions_only()
+      let _ = root.width(view::Live::Is(Some(w))).height(view::Live::Is(Some(h))).clips(view::Live::Is(true)).ground(view::Live::Is(0x0B0E14FFL))
+
+      // 2,000 canvas elements (40 rows x 50 columns) panning inside the viewport
+      let _ = root.box(fn(canvas : view::View) {
+        let _ = canvas
+          .over(view::Live::Is(true))
+          .offset(view::Live::By(fn() { (pan_x.get(), pan_y.get()) }))
+          .width(view::Live::Is(Some(1600.0)))
+          .height(view::Live::Is(Some(1040.0)))
+        for r in 0..<40 {
+          let _ = canvas.box(fn(row : view::View) {
+            let _ = row.row(view::Live::Is(true)).height(view::Live::Is(Some(26.0))).gap(view::Live::Is(4.0))
+            for c in 0..<50 {
+              let col = match (r * 7 + c * 13) % 6 {
+                0 => 0x2563EBFFL
+                1 => 0x7C3AEDFFL
+                2 => 0x059669FFL
+                3 => 0xD97706FFL
+                4 => 0xDC2626FFL
+                _ => 0x1E293BFFL
+              }
+              let _ = row.box(fn(card : view::View) {
+                let _ = card.width(view::Live::Is(Some(28.0))).height(view::Live::Is(Some(22.0))).radius(view::Live::Is(5.0)).ground(view::Live::Is(col))
+              })
+            }
+          })
+        }
+      })
+
+      // 6 independent non-overlapping single-layer Glass::liquid overlays (zero glass-on-glass)
+      let g = bench_glass(true)
+      let overlays : Array[(Double, Double, Double, Double, String)] = [
+        (24.0, 16.0, 420.0, 52.0, "Top Toolbar"),
+        (920.0, 16.0, 336.0, 52.0, "Inspector Pill"),
+        (24.0, 96.0, 210.0, 520.0, "Left Palette"),
+        (1046.0, 96.0, 210.0, 320.0, "Properties"),
+        (1046.0, 444.0, 210.0, 172.0, "Minimap"),
+        (360.0, 720.0, 560.0, 60.0, "Bottom Dock"),
+      ]
+      for ov in overlays {
+        let (ox, oy, ow, oh, label) = ov
+        let _ = root.box(fn(pane : view::View) {
+          let _ = pane
+            .over(view::Live::Is(true))
+            .offset(view::Live::Is((ox, oy)))
+            .width(view::Live::Is(Some(ow)))
+            .height(view::Live::Is(Some(oh)))
+            .radius(view::Live::Is(20.0))
+            .padding(view::Live::Is((16.0, 12.0, 16.0, 12.0)))
+            .glass(view::Live::Is(Some(g)))
+            .words(view::Live::Is(label))
+            .ink(view::Live::Is(0xF8FAFCFFL))
+        })
+      }
+    },
+    theme=lg::ui_theme,
+  )
+
+  let dt = 1000.0 / 60.0
+  for f in 0..<5 {
+    pan_x.set(-f.to_double() * 3.0)
+    pan_y.set(-f.to_double() * 2.0)
+    film::mark_dirty_full()
+    let _ = ui::view_frame(w, h, scale, f.to_double() * dt)
+  }
+
+  let frame_s : Array[Double] = []
+  let layout_s : Array[Double] = []
+  let paint_s : Array[Double] = []
+  let present_s : Array[Double] = []
+  let mut inst_sum = 0.0
+  let mut dirty_sum = 0.0
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for f in 0..<60 {
+    let phase = (f + 5).to_double()
+    pan_x.set(-160.0 + (phase * 4.5) % 160.0)
+    pan_y.set(-120.0 + (phase * 3.0) % 120.0)
+    film::mark_dirty_full()
+    let _ = ui::view_frame(w, h, scale, phase * dt)
+    let perf = ui::view_scene_last().perf
+    frame_s.push(perf.frame_ms)
+    layout_s.push(perf.layout_ms)
+    paint_s.push(perf.paint_ms)
+    present_s.push(perf.present_ms)
+    inst_sum = inst_sum + perf.instances.to_double()
+    dirty_sum = dirty_sum + perf.dirty_rects.to_double()
+    checksum = mix_h(checksum, (perf.instances * 17 + perf.dirty_rects).to_int64())
+  }
+
+  summarize_gpu("gpu_canvas_2k_plus_6_glass_60f", frame_s, layout_s, paint_s, present_s, inst_sum, dirty_sum, checksum)
+}
+
+// ── 3. gpu_lg_studio_34_interactive_120f ───────────────────────────────
+
+fn bench_gpu_lg_studio_34_interactive_120f() -> GpuBenchResult {
+  let w = 1280.0
+  let h = 800.0
+  let scale = 2.0
+  lg::set_dark(Some(true))
+  film::init_offscreen(w, h, scale)
+
+  ui::set_view_app(
+    fn(root : view::View) {
+      let _ = root.transitions_only()
+      lg_pages::gallery(root, "library", chrome=true)
+    },
+    theme=lg::ui_theme,
+  )
+
+  let dt = 1000.0 / 60.0
+  for f in 0..<5 {
+    film::mark_dirty_full()
+    let _ = ui::view_frame(w, h, scale, f.to_double() * dt)
+  }
+
+  let frame_s : Array[Double] = []
+  let layout_s : Array[Double] = []
+  let paint_s : Array[Double] = []
+  let present_s : Array[Double] = []
+  let mut inst_sum = 0.0
+  let mut dirty_sum = 0.0
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for f in 0..<120 {
+    let sim_t = (f + 5).to_double() * dt
+    // Drive real interactive state changes: hover sweep, slider drag, clicks, and dark/light theme flips
+    if f == 20 {
+      ui::view_pointer(1, 380.0, 345.0, sim_t)
+    } else if f > 20 && f < 40 {
+      ui::view_pointer(0, 380.0 + (f - 20).to_double() * 9.5, 345.0, sim_t)
+    } else if f == 40 {
+      ui::view_pointer(2, 570.0, 345.0, sim_t)
+    } else if f == 50 {
+      lg::set_dark(Some(false))
+    } else if f == 85 {
+      lg::set_dark(Some(true))
+    } else if f % 10 == 0 {
+      let mx = 220.0 + ((f * 37) % 800).to_double()
+      let my = 120.0 + ((f * 23) % 520).to_double()
+      ui::view_pointer(0, mx, my, sim_t)
+    }
+    film::mark_dirty_full()
+    let _ = ui::view_frame(w, h, scale, sim_t)
+    let perf = ui::view_scene_last().perf
+    frame_s.push(perf.frame_ms)
+    layout_s.push(perf.layout_ms)
+    paint_s.push(perf.paint_ms)
+    present_s.push(perf.present_ms)
+    inst_sum = inst_sum + perf.instances.to_double()
+    dirty_sum = dirty_sum + perf.dirty_rects.to_double()
+    checksum = mix_h(checksum, (perf.instances * 29 + perf.dirty_rects).to_int64())
+  }
+
+  summarize_gpu("gpu_lg_studio_34_interactive_120f", frame_s, layout_s, paint_s, present_s, inst_sum, dirty_sum, checksum)
+}
+
+// ── 4. gpu_resize_sweep_60f ────────────────────────────────────────────
+
+fn bench_gpu_resize_sweep_60f() -> GpuBenchResult {
+  let h = 800.0
+  let scale = 2.0
+  lg::set_dark(Some(true))
+  film::init_offscreen(800.0, h, scale)
+
+  ui::set_view_app(
+    fn(root : view::View) {
+      let _ = root.transitions_only()
+      let _ = root.row(view::Live::Is(true)).grow(view::Live::Is(1.0)).ground(view::Live::Is(0x0D1117FFL))
+      // Fixed sidebar
+      let _ = root.box(fn(side : view::View) {
+        let _ = side.width(view::Live::Is(Some(220.0))).padding(view::Live::Is((14.0, 14.0, 14.0, 14.0))).gap(view::Live::Is(8.0)).ground(view::Live::Is(0x161B22FFL))
+        for i in 0..<14 {
+          let _ = side.box(fn(item : view::View) {
+            let _ = item.height(view::Live::Is(Some(36.0))).radius(view::Live::Is(8.0)).padding(view::Live::Is((10.0, 8.0, 10.0, 8.0))).ground(view::Live::Is(if i == 0 { 0x2563EBFFL } else { 0x21262DFFL })).words(view::Live::Is("Workspace Item " + i.to_string())).ink(view::Live::Is(0xF0F6FCFFL))
+          })
+        }
+      })
+      // Responsive fluid main content with 60 cards
+      let _ = root.box(fn(main_col : view::View) {
+        let _ = main_col.grow(view::Live::Is(1.0)).padding(view::Live::Is((20.0, 20.0, 20.0, 20.0))).gap(view::Live::Is(12.0))
+        let g = bench_glass(true)
+        let _ = main_col.box(fn(hdr : view::View) {
+          let _ = hdr.height(view::Live::Is(Some(54.0))).radius(view::Live::Is(16.0)).padding(view::Live::Is((16.0, 14.0, 16.0, 14.0))).glass(view::Live::Is(Some(g))).words(view::Live::Is("Responsive Resize Sweep Header")).ink(view::Live::Is(0xF8FAFCFFL))
+        })
+        for r in 0..<12 {
+          let _ = main_col.box(fn(row : view::View) {
+            let _ = row.row(view::Live::Is(true)).gap(view::Live::Is(10.0)).height(view::Live::Is(Some(48.0)))
+            for c in 0..<5 {
+              let _ = row.box(fn(card : view::View) {
+                let _ = card.grow(view::Live::Is(1.0)).radius(view::Live::Is(10.0)).padding(view::Live::Is((10.0, 8.0, 10.0, 8.0))).ground(view::Live::Is(if (r + c) % 2 == 0 { 0x1C2128FFL } else { 0x22272EFFL })).words(view::Live::Is("Card " + (r * 5 + c).to_string())).ink(view::Live::Is(0xC9D1D9FFL))
+              })
+            }
+          })
+        }
+      })
+    },
+    theme=lg::ui_theme,
+  )
+
+  let dt = 1000.0 / 60.0
+  for f in 0..<5 {
+    let cw = 800.0 + f.to_double() * 20.0
+    film::init_offscreen(cw, h, scale)
+    film::mark_dirty_full()
+    let _ = ui::view_frame(cw, h, scale, f.to_double() * dt)
+  }
+
+  let frame_s : Array[Double] = []
+  let layout_s : Array[Double] = []
+  let paint_s : Array[Double] = []
+  let present_s : Array[Double] = []
+  let mut inst_sum = 0.0
+  let mut dirty_sum = 0.0
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for f in 0..<60 {
+    let cw = 800.0 + 600.0 * f.to_double() / 59.0
+    film::init_offscreen(cw, h, scale)
+    film::mark_dirty_full()
+    let _ = ui::view_frame(cw, h, scale, (f + 5).to_double() * dt)
+    let perf = ui::view_scene_last().perf
+    frame_s.push(perf.frame_ms)
+    layout_s.push(perf.layout_ms)
+    paint_s.push(perf.paint_ms)
+    present_s.push(perf.present_ms)
+    inst_sum = inst_sum + perf.instances.to_double()
+    dirty_sum = dirty_sum + perf.dirty_rects.to_double()
+    checksum = mix_h(checksum, (perf.instances * 19 + perf.dirty_rects).to_int64())
+  }
+
+  summarize_gpu("gpu_resize_sweep_60f", frame_s, layout_s, paint_s, present_s, inst_sum, dirty_sum, checksum)
+}
+
+fn format_gpu_json(results : Array[GpuBenchResult], rss_kb : Int64) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{\n")
+  sb.write_string("  \"suite\": \"gpu\",\n")
+  sb.write_string("  \"renderer\": \"")
+  sb.write_string(renderer_name())
+  sb.write_string("\",\n")
+  sb.write_string("  \"resolution\": \"1280x800@2x (2560x1600)\",\n")
+  sb.write_string("  \"rss_peak_kb\": ")
+  sb.write_string(rss_kb.to_string())
+  sb.write_string(",\n")
+  sb.write_string("  \"results\": [\n")
+  let mut i = 0
+  while i < results.length() {
+    let r = results[i]
+    sb.write_string("    {\n")
+    sb.write_string("      \"name\": \"")
+    sb.write_string(r.name)
+    sb.write_string("\",\n")
+    sb.write_string("      \"frames\": ")
+    sb.write_string(r.frames.to_string())
+    sb.write_string(",\n")
+    sb.write_string("      \"frame_ms\": {\"p50\": ")
+    sb.write_string(fmt_d(r.frame_p50, 3))
+    sb.write_string(", \"p95\": ")
+    sb.write_string(fmt_d(r.frame_p95, 3))
+    sb.write_string(", \"p99\": ")
+    sb.write_string(fmt_d(r.frame_p99, 3))
+    sb.write_string(", \"max\": ")
+    sb.write_string(fmt_d(r.frame_max, 3))
+    sb.write_string("},\n")
+    sb.write_string("      \"layout_ms\": {\"p50\": ")
+    sb.write_string(fmt_d(r.layout_p50, 3))
+    sb.write_string(", \"p95\": ")
+    sb.write_string(fmt_d(r.layout_p95, 3))
+    sb.write_string("},\n")
+    sb.write_string("      \"paint_ms\": {\"p50\": ")
+    sb.write_string(fmt_d(r.paint_p50, 3))
+    sb.write_string(", \"p95\": ")
+    sb.write_string(fmt_d(r.paint_p95, 3))
+    sb.write_string("},\n")
+    sb.write_string("      \"present_ms\": {\"p50\": ")
+    sb.write_string(fmt_d(r.present_p50, 3))
+    sb.write_string(", \"p95\": ")
+    sb.write_string(fmt_d(r.present_p95, 3))
+    sb.write_string(", \"p99\": ")
+    sb.write_string(fmt_d(r.present_p99, 3))
+    sb.write_string("},\n")
+    sb.write_string("      \"instances_avg\": ")
+    sb.write_string(fmt_d(r.instances_avg, 1))
+    sb.write_string(",\n")
+    sb.write_string("      \"dirty_rects_avg\": ")
+    sb.write_string(fmt_d(r.dirty_rects_avg, 2))
+    sb.write_string(",\n")
+    sb.write_string("      \"budget_120fps_hit_pct\": ")
+    sb.write_string(fmt_d(r.budget_120fps_hit_pct, 1))
+    sb.write_string(",\n")
+    sb.write_string("      \"budget_60fps_hit_pct\": ")
+    sb.write_string(fmt_d(r.budget_60fps_hit_pct, 1))
+    sb.write_string(",\n")
+    sb.write_string("      \"checksum\": ")
+    sb.write_string(r.checksum.to_string())
+    sb.write_string("\n    }")
+    if i + 1 < results.length() {
+      sb.write_string(",")
+    }
+    sb.write_string("\n")
+    i += 1
+  }
+  sb.write_string("  ]\n")
+  sb.write_string("}")
+  sb.to_string()
+}
+
+fn format_gpu_table(results : Array[GpuBenchResult], rss_kb : Int64) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("Invar GPU Benchmark Suite (" + renderer_name() + ", 1280x800@2x, rss_peak_kb=" + rss_kb.to_string() + ")\n")
+  sb.write_string(pad_r("Scenario", 35))
+  sb.write_string(pad_l("Frms", 5))
+  sb.write_string(pad_l("P50", 8))
+  sb.write_string(pad_l("P95", 8))
+  sb.write_string(pad_l("P99", 8))
+  sb.write_string(pad_l("Lay50", 8))
+  sb.write_string(pad_l("Pnt50", 8))
+  sb.write_string(pad_l("Prs50", 8))
+  sb.write_string(pad_l("Inst", 8))
+  sb.write_string(pad_l("120fps%", 9))
+  sb.write_string(pad_l("60fps%", 8))
+  sb.write_string("\n")
+  sb.write_string("-------------------------------------------------------------------------------------------------------------\n")
+  for r in results {
+    sb.write_string(pad_r(r.name, 35))
+    sb.write_string(pad_l(r.frames.to_string(), 5))
+    sb.write_string(pad_l(fmt_d(r.frame_p50, 2), 8))
+    sb.write_string(pad_l(fmt_d(r.frame_p95, 2), 8))
+    sb.write_string(pad_l(fmt_d(r.frame_p99, 2), 8))
+    sb.write_string(pad_l(fmt_d(r.layout_p50, 2), 8))
+    sb.write_string(pad_l(fmt_d(r.paint_p50, 2), 8))
+    sb.write_string(pad_l(fmt_d(r.present_p50, 2), 8))
+    sb.write_string(pad_l(fmt_d(r.instances_avg, 0), 8))
+    sb.write_string(pad_l(fmt_d(r.budget_120fps_hit_pct, 1), 9))
+    sb.write_string(pad_l(fmt_d(r.budget_60fps_hit_pct, 1), 8))
+    sb.write_string("\n")
+  }
+  sb.to_string()
+}
+
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  let mut as_json = false
+  let mut filter = ""
+  let mut i = 1
+  while i < args.length() {
+    let a = args[i]
+    if a == "--json" {
+      as_json = true
+    } else if a == "--filter" && i + 1 < args.length() {
+      filter = args[i + 1]
+      i += 1
+    } else if a == "--help" || a == "-h" {
+      io_println(world, "Usage: invar-bench-gpu [--json] [--filter <substr>]")
+      return 0
+    }
+    i += 1
+  }
+
+  install_sync_gpu_host()
+  ui::set_work_clock(Some(gpu_now_ms))
+  view::faults_stop.v = false
+
+  let want = fn(name : String) -> Bool {
+    filter == "" || ui::str_contains(name, filter)
+  }
+  let results : Array[GpuBenchResult] = []
+  if want("gpu_vlist_10k_scroll_120f") {
+    results.push(bench_gpu_vlist_10k_scroll_120f())
+  }
+  if want("gpu_canvas_2k_plus_6_glass_60f") {
+    results.push(bench_gpu_canvas_2k_plus_6_glass_60f())
+  }
+  if want("gpu_lg_studio_34_interactive_120f") {
+    results.push(bench_gpu_lg_studio_34_interactive_120f())
+  }
+  if want("gpu_resize_sweep_60f") {
+    results.push(bench_gpu_resize_sweep_60f())
+  }
+
+  let rss = gpu_rss_kb()
+  if as_json {
+    io_println(world, format_gpu_json(results, rss))
+  } else {
+    io_println(world, format_gpu_table(results, rss))
+  }
+  0
+}

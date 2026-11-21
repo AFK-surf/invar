@@ -1,0 +1,286 @@
+// Statistics, percentile calculation, anti-DCE sink, and JSON / table formatting.
+
+pub struct BenchCounter {
+  pub key : String
+  pub val_json : String
+}
+
+pub struct BenchResult {
+  pub name : String
+  pub iters : Int
+  pub p50_ms : Double
+  pub p95_ms : Double
+  pub p99_ms : Double
+  pub mean_ms : Double
+  pub min_ms : Double
+  pub max_ms : Double
+  pub ops_per_sec : Double
+  pub checksum : Int64
+  pub counters : Array[BenchCounter]
+}
+
+pub fn counter_int(key : String, v : Int) -> BenchCounter {
+  BenchCounter::{ key, val_json: v.to_string() }
+}
+
+pub fn counter_i64(key : String, v : Int64) -> BenchCounter {
+  BenchCounter::{ key, val_json: v.to_string() }
+}
+
+pub fn counter_f(key : String, v : Double, digits~ : Int = 4) -> BenchCounter {
+  BenchCounter::{ key, val_json: fmt_double(v, digits) }
+}
+
+pub fn sort_doubles(a : Array[Double]) -> Unit {
+  let n = a.length()
+  if n <= 1 {
+    return
+  }
+  let mut gap = n / 2
+  while gap > 0 {
+    let mut i = gap
+    while i < n {
+      let key = a[i]
+      let mut j = i
+      while j >= gap && a[j - gap] > key {
+        a[j] = a[j - gap]
+        j -= gap
+      }
+      a[j] = key
+      i += 1
+    }
+    gap = gap / 2
+  }
+}
+
+pub fn percentile_sorted(sorted : Array[Double], p : Double) -> Double {
+  let n = sorted.length()
+  if n == 0 {
+    return 0.0
+  }
+  if n == 1 {
+    return sorted[0]
+  }
+  let pos = (p / 100.0) * (n - 1).to_double()
+  let lo = pos.floor().to_int()
+  let hi = if lo + 1 < n { lo + 1 } else { n - 1 }
+  let frac = pos - lo.to_double()
+  sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+pub fn summarize_samples(
+  name : String,
+  samples : Array[Double],
+  checksum : Int64,
+  counters : Array[BenchCounter],
+) -> BenchResult {
+  let sorted = samples.copy()
+  sort_doubles(sorted)
+  let n = sorted.length()
+  let mut sum = 0.0
+  for s in sorted {
+    sum = sum + s
+  }
+  let mean_ms = if n > 0 { sum / n.to_double() } else { 0.0 }
+  let min_ms = if n > 0 { sorted[0] } else { 0.0 }
+  let max_ms = if n > 0 { sorted[n - 1] } else { 0.0 }
+  let p50_ms = percentile_sorted(sorted, 50.0)
+  let p95_ms = percentile_sorted(sorted, 95.0)
+  let p99_ms = percentile_sorted(sorted, 99.0)
+  let ops_per_sec = if mean_ms > 1.0e-9 { 1000.0 / mean_ms } else { 0.0 }
+  BenchResult::{
+    name,
+    iters: n,
+    p50_ms,
+    p95_ms,
+    p99_ms,
+    mean_ms,
+    min_ms,
+    max_ms,
+    ops_per_sec,
+    checksum,
+    counters,
+  }
+}
+
+pub fn fmt_double(x : Double, digits : Int) -> String {
+  if x != x {
+    return "0.0"
+  }
+  let inf = 1.0 / 0.0
+  if x == inf || x == -inf {
+    return "0.0"
+  }
+  let neg = x < 0.0
+  let ax = if neg { -x } else { x }
+  let mut scale = 1.0
+  let mut scale_i : Int64 = 1L
+  let mut d = 0
+  while d < digits {
+    scale = scale * 10.0
+    scale_i = scale_i * 10L
+    d += 1
+  }
+  let scaled = (ax * scale + 0.5).floor().to_int64()
+  let whole = scaled / scale_i
+  let frac = scaled - whole * scale_i
+  let sb = StringBuilder::new()
+  if neg && scaled > 0L {
+    sb.write_char('-')
+  }
+  sb.write_string(whole.to_string())
+  if digits > 0 {
+    sb.write_char('.')
+    let fs = frac.to_string()
+    let mut pad = digits - fs.length()
+    while pad > 0 {
+      sb.write_char('0')
+      pad -= 1
+    }
+    sb.write_string(fs)
+  }
+  sb.to_string()
+}
+
+pub fn json_escape(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let cu = s.code_unit_at(i)
+    if cu == 34 {
+      sb.write_string("\\\"")
+    } else if cu == 92 {
+      sb.write_string("\\\\")
+    } else if cu == 10 {
+      sb.write_string("\\n")
+    } else if cu == 13 {
+      sb.write_string("\\r")
+    } else if cu == 9 {
+      sb.write_string("\\t")
+    } else {
+      sb.write_char(cu.unsafe_to_char())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+pub fn pad_right(s : String, width : Int) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string(s)
+  let mut n = width - s.length()
+  while n > 0 {
+    sb.write_char(' ')
+    n -= 1
+  }
+  sb.to_string()
+}
+
+pub fn pad_left(s : String, width : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut n = width - s.length()
+  while n > 0 {
+    sb.write_char(' ')
+    n -= 1
+  }
+  sb.write_string(s)
+  sb.to_string()
+}
+
+pub fn format_cpu_json(results : Array[BenchResult], rss_kb : Int64) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{\n")
+  sb.write_string("  \"suite\": \"cpu\",\n")
+  sb.write_string("  \"rss_peak_kb\": ")
+  sb.write_string(rss_kb.to_string())
+  sb.write_string(",\n")
+  sb.write_string("  \"results\": [\n")
+  let mut i = 0
+  while i < results.length() {
+    let r = results[i]
+    sb.write_string("    {\n")
+    sb.write_string("      \"name\": \"")
+    sb.write_string(json_escape(r.name))
+    sb.write_string("\",\n")
+    sb.write_string("      \"iters\": ")
+    sb.write_string(r.iters.to_string())
+    sb.write_string(",\n")
+    sb.write_string("      \"p50_ms\": ")
+    sb.write_string(fmt_double(r.p50_ms, 4))
+    sb.write_string(",\n")
+    sb.write_string("      \"p95_ms\": ")
+    sb.write_string(fmt_double(r.p95_ms, 4))
+    sb.write_string(",\n")
+    sb.write_string("      \"p99_ms\": ")
+    sb.write_string(fmt_double(r.p99_ms, 4))
+    sb.write_string(",\n")
+    sb.write_string("      \"mean_ms\": ")
+    sb.write_string(fmt_double(r.mean_ms, 4))
+    sb.write_string(",\n")
+    sb.write_string("      \"min_ms\": ")
+    sb.write_string(fmt_double(r.min_ms, 4))
+    sb.write_string(",\n")
+    sb.write_string("      \"max_ms\": ")
+    sb.write_string(fmt_double(r.max_ms, 4))
+    sb.write_string(",\n")
+    sb.write_string("      \"ops_per_sec\": ")
+    sb.write_string(fmt_double(r.ops_per_sec, 2))
+    sb.write_string(",\n")
+    sb.write_string("      \"checksum\": ")
+    sb.write_string(r.checksum.to_string())
+    sb.write_string(",\n")
+    sb.write_string("      \"counters\": {")
+    let mut j = 0
+    while j < r.counters.length() {
+      if j > 0 {
+        sb.write_string(", ")
+      }
+      let c = r.counters[j]
+      sb.write_string("\"")
+      sb.write_string(json_escape(c.key))
+      sb.write_string("\": ")
+      sb.write_string(c.val_json)
+      j += 1
+    }
+    sb.write_string("}\n")
+    sb.write_string("    }")
+    if i + 1 < results.length() {
+      sb.write_string(",")
+    }
+    sb.write_string("\n")
+    i += 1
+  }
+  sb.write_string("  ]\n")
+  sb.write_string("}")
+  sb.to_string()
+}
+
+pub fn format_cpu_table(results : Array[BenchResult], rss_kb : Int64) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("Invar CPU Benchmark Suite (rss_peak_kb=")
+  sb.write_string(rss_kb.to_string())
+  sb.write_string(")\n")
+  sb.write_string(pad_right("Benchmark", 30))
+  sb.write_string(pad_left("Iters", 7))
+  sb.write_string(pad_left("P50(ms)", 11))
+  sb.write_string(pad_left("P95(ms)", 11))
+  sb.write_string(pad_left("P99(ms)", 11))
+  sb.write_string(pad_left("Mean(ms)", 11))
+  sb.write_string(pad_left("Ops/s", 12))
+  sb.write_string("  Checksum\n")
+  sb.write_string("--------------------------------------------------------------------------------------------------------\n")
+  for r in results {
+    sb.write_string(pad_right(r.name, 30))
+    sb.write_string(pad_left(r.iters.to_string(), 7))
+    sb.write_string(pad_left(fmt_double(r.p50_ms, 3), 11))
+    sb.write_string(pad_left(fmt_double(r.p95_ms, 3), 11))
+    sb.write_string(pad_left(fmt_double(r.p99_ms, 3), 11))
+    sb.write_string(pad_left(fmt_double(r.mean_ms, 3), 11))
+    sb.write_string(pad_left(fmt_double(r.ops_per_sec, 1), 12))
+    sb.write_string("  ")
+    sb.write_string(r.checksum.to_string())
+    sb.write_string("\n")
+  }
+  sb.to_string()
+}

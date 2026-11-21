@@ -1,0 +1,928 @@
+// Layer-1 Pure CPU Engine Microbenchmarks (12 named benchmarks across all 10 categories).
+// Zero GPU dependencies; uses real CLOCK_MONOTONIC wall-clock and anti-DCE checksums.
+
+import "damage"
+import "flex"
+import "hostapi"
+import "motion"
+import "signals"
+import "skia"
+import "svg"
+import "text"
+import "ui"
+import "view"
+
+fn array_eq_int(a : Array[Int], b : Array[Int]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn mix_hash(h : Int64, v : Int64) -> Int64 {
+  let prime : Int64 = (0x00000100.to_int64() << 32) | 0x000001B3.to_int64()
+  (h ^ v) * prime
+}
+
+// ── 1. signals_fanout_10k ──────────────────────────────────────────────
+
+pub struct FanoutMetrics {
+  pub result : BenchResult
+  pub single_evals : Int
+  pub batch_evals : Int
+}
+
+pub fn bench_signals_fanout_10k(warmup~ : Int = 5, iters~ : Int = 40) -> FanoutMetrics {
+  let roots : Array[signals::Signal[Int]] = []
+  let leaves : Array[signals::Computed[Int]] = []
+  let eval_count = ui::ref_new(0)
+  let acc_sum = ui::ref_new(0L)
+
+  let dispose_scope = signals::effect_scope(fn() {
+    for r in 0..<100 {
+      let sig = signals::signal(r)
+      roots.push(sig)
+      for c in 0..<100 {
+        let off = c + 1
+        let comp = signals::computed(fn(_prev : Option[Int]) -> Int {
+          eval_count.v = eval_count.v + 1
+          sig.get() * 3 + off
+        })
+        leaves.push(comp)
+        let _ = signals::effect(fn() {
+          acc_sum.v = acc_sum.v + comp.get().to_int64()
+        })
+      }
+    }
+  })
+
+  // Deterministic verification pass: 1 root -> 100 leaves; batch 10 roots -> 1000 leaves
+  eval_count.v = 0
+  roots[0].set(1000)
+  let single_evals = eval_count.v
+
+  eval_count.v = 0
+  signals::batch(fn() {
+    for k in 0..<10 {
+      roots[k].set(2000 + k)
+    }
+  })
+  let batch_evals = eval_count.v
+
+  let mut step = 3000
+  for _ in 0..<warmup {
+    roots[step % 100].set(step)
+    signals::batch(fn() {
+      for k in 0..<10 {
+        roots[(step + k) % 100].set(step + k + 1)
+      }
+    })
+    step += 1
+  }
+
+  let single_samples : Array[Double] = []
+  let batch_samples : Array[Double] = []
+  let total_samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for i in 0..<iters {
+    let idx = i % 100
+    let t0 = now_ms()
+    roots[idx].set(step + i * 17)
+    let t1 = now_ms()
+    signals::batch(fn() {
+      for k in 0..<10 {
+        roots[(idx + k) % 100].set(step + i * 17 + k + 1)
+      }
+    })
+    let t2 = now_ms()
+    single_samples.push(t1 - t0)
+    batch_samples.push(t2 - t1)
+    total_samples.push(t2 - t0)
+    checksum = mix_hash(checksum, acc_sum.v)
+  }
+
+  dispose_scope()
+
+  sort_doubles(single_samples)
+  sort_doubles(batch_samples)
+  let counters = [
+    counter_f("single_root_p50_ms", percentile_sorted(single_samples, 50.0)),
+    counter_f("batch_10_p50_ms", percentile_sorted(batch_samples, 50.0)),
+    counter_int("single_evals", single_evals),
+    counter_int("batch_evals", batch_evals),
+    counter_int("roots", 100),
+    counter_int("leaves", 10000),
+  ]
+  FanoutMetrics::{
+    result: summarize_samples("signals_fanout_10k", total_samples, checksum, counters),
+    single_evals,
+    batch_evals,
+  }
+}
+
+// ── 2. signals_diamond_200 ─────────────────────────────────────────────
+
+pub struct DiamondMetrics {
+  pub result : BenchResult
+  pub evals_per_write : Int
+}
+
+pub fn bench_signals_diamond_200(warmup~ : Int = 10, iters~ : Int = 100) -> DiamondMetrics {
+  let root = signals::signal(1)
+  let eval_count = ui::ref_new(0)
+  let last_val = ui::ref_new(0)
+
+  let dispose_scope = signals::effect_scope(fn() {
+    let mut cur = signals::computed(fn(_prev : Option[Int]) -> Int {
+      root.get()
+    })
+    for layer in 0..<200 {
+      let prev_c = cur
+      let l_add = layer + 1
+      let left = signals::computed(fn(_p : Option[Int]) -> Int {
+        eval_count.v = eval_count.v + 1
+        prev_c.get() + l_add
+      })
+      let right = signals::computed(fn(_p : Option[Int]) -> Int {
+        eval_count.v = eval_count.v + 1
+        prev_c.get() - l_add + 2
+      })
+      let join = signals::computed(fn(_p : Option[Int]) -> Int {
+        eval_count.v = eval_count.v + 1
+        (left.get() + right.get()) / 2
+      })
+      cur = join
+    }
+    let sink = cur
+    let _ = signals::effect(fn() {
+      last_val.v = sink.get()
+    })
+  })
+
+  // Verify exact evaluation count per root write (200 layers * 3 nodes = 600, zero duplicates)
+  eval_count.v = 0
+  root.set(2)
+  let evals_per_write = eval_count.v
+
+  for w in 0..<warmup {
+    root.set(10 + w)
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  for i in 0..<iters {
+    let t0 = now_ms()
+    root.set(1000 + i)
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, last_val.v.to_int64())
+  }
+
+  dispose_scope()
+
+  let counters = [
+    counter_int("layers", 200),
+    counter_int("evals_per_write", evals_per_write),
+  ]
+  DiamondMetrics::{
+    result: summarize_samples("signals_diamond_200", samples, checksum, counters),
+    evals_per_write,
+  }
+}
+
+// ── 3a & 3b. tree_mount_1k & tree_mount_10k ────────────────────────────
+
+pub fn bench_tree_mount(name : String, rows : Int, warmup~ : Int = 2, iters~ : Int = 10) -> BenchResult {
+  let keys : Array[Int] = []
+  for i in 0..<rows {
+    keys.push(i)
+  }
+
+  let run_once = fn() -> (Int64, Int) {
+    let items = signals::signal_by(keys, array_eq_int)
+    let tree = view::Tree::new(fn(root : view::View) {
+      let _ = root.width(view::Live::Is(Some(1280.0))).height(view::Live::Is(Some(800.0)))
+      root.each(fn() { items.get() }, fn(k : Int) { k }, fn(v : view::View, item : signals::Signal[Int]) {
+        let k = item.untracked()
+        let bg = if k % 2 == 0 { 0x1E222AFFL } else { 0x252A34FFL }
+        let _ = v.height(view::Live::Is(Some(28.0))).ground(view::Live::Is(bg))
+        let _ = v.words(view::Live::Is("Row #" + k.to_string()))
+      }, at_once=true)
+    })
+    let _ = tree.frame(1280.0, 800.0, now=0.0)
+    let drawn = tree.drawn()
+    let n = drawn.length()
+    let mut h : Int64 = n.to_int64()
+    if n > 0 {
+      let last = drawn[n - 1]
+      h = mix_hash(h, (last.y * 100.0).round().to_int64())
+      h = mix_hash(h, (last.w * 100.0).round().to_int64())
+    }
+    tree.dispose()
+    (h, n)
+  }
+
+  for _ in 0..<warmup {
+    let _ = run_once()
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  let mut drawn_n = 0
+  for _ in 0..<iters {
+    let t0 = now_ms()
+    let (h, n) = run_once()
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, h)
+    drawn_n = n
+  }
+
+  let counters = [
+    counter_int("rows", rows),
+    counter_int("drawn_nodes", drawn_n),
+  ]
+  summarize_samples(name, samples, checksum, counters)
+}
+
+// ── 4. tree_update_10pct_1k ────────────────────────────────────────────
+
+pub fn bench_tree_update_10pct_1k(warmup~ : Int = 3, iters~ : Int = 25) -> BenchResult {
+  ui::set_work_clock(Some(now_ms))
+  let texts : Array[signals::Signal[String]] = []
+  let colors : Array[signals::Signal[Int64]] = []
+  for i in 0..<1000 {
+    texts.push(signals::signal("Row " + i.to_string() + " val=0"))
+    colors.push(signals::signal(if i % 2 == 0 { 0x1E222AFFL } else { 0x262B36FFL }))
+  }
+
+  let tester = ui::Tester::tree(
+    fn(root : view::View) {
+      let _ = root.width(view::Live::Is(Some(1280.0))).height(view::Live::Is(Some(800.0)))
+      for i in 0..<1000 {
+        let tx = texts[i]
+        let co = colors[i]
+        let _ = root.box(fn(v : view::View) {
+          let _ = v
+            .height(view::Live::Is(Some(24.0)))
+            .ground(view::Live::By(fn() { co.get() }))
+            .words(view::Live::By(fn() { tx.get() }))
+        })
+      }
+    },
+    width=1280.0,
+    height=800.0,
+    scale=2.0,
+  )
+
+  let mut tick = 1
+  let do_step = fn(step_no : Int) -> Unit {
+    signals::batch(fn() {
+      let mut i = 0
+      while i < 1000 {
+        texts[i].set("Row " + i.to_string() + " val=" + step_no.to_string())
+        colors[i].set(if step_no % 2 == 0 { 0x2B4C7EFFL } else { 0x3B5F96FFL })
+        i += 10
+      }
+    })
+    let _ = ui::view_frame(1280.0, 800.0, 2.0, step_no.to_double() * 16.6667)
+  }
+
+  for _ in 0..<warmup {
+    do_step(tick)
+    tick += 1
+  }
+
+  let samples : Array[Double] = []
+  let layout_s : Array[Double] = []
+  let paint_s : Array[Double] = []
+  let mut last_dirty = 0
+  let mut last_inst = 0
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for _ in 0..<iters {
+    let t0 = now_ms()
+    do_step(tick)
+    let t1 = now_ms()
+    let perf = ui::view_scene_last().perf
+    samples.push(t1 - t0)
+    layout_s.push(perf.layout_ms)
+    paint_s.push(perf.paint_ms)
+    last_dirty = perf.dirty_rects
+    last_inst = perf.instances
+    checksum = mix_hash(checksum, (perf.instances * 31 + perf.dirty_rects).to_int64())
+    tick += 1
+  }
+
+  tester.dispose()
+
+  sort_doubles(layout_s)
+  sort_doubles(paint_s)
+  let counters = [
+    counter_f("layout_p50_ms", percentile_sorted(layout_s, 50.0)),
+    counter_f("paint_p50_ms", percentile_sorted(paint_s, 50.0)),
+    counter_int("dirty_rects", last_dirty),
+    counter_int("instances", last_inst),
+  ]
+  summarize_samples("tree_update_10pct_1k", samples, checksum, counters)
+}
+
+// ── 5. tree_swap_rows_1k ───────────────────────────────────────────────
+
+pub struct SwapMetrics {
+  pub result : BenchResult
+  pub initial_created : Int
+  pub final_created : Int
+}
+
+pub fn bench_tree_swap_rows_1k(warmup~ : Int = 5, iters~ : Int = 40) -> SwapMetrics {
+  let keys : Array[Int] = []
+  for i in 0..<1000 {
+    keys.push(i)
+  }
+  let items = signals::signal_by(keys.copy(), array_eq_int)
+  let created = ui::ref_new(0)
+
+  let tree = view::Tree::new(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(1280.0))).height(view::Live::Is(Some(800.0)))
+    root.each(fn() { items.get() }, fn(k : Int) { k }, fn(v : view::View, item : signals::Signal[Int]) {
+      created.v = created.v + 1
+      let k = item.untracked()
+      let _ = v.height(view::Live::Is(Some(24.0))).ground(view::Live::Is(0x22262EFFL))
+      let _ = v.words(view::Live::Is("Item " + k.to_string()))
+    }, at_once=true)
+  })
+  let _ = tree.frame(1280.0, 800.0, now=0.0)
+  let initial_created = created.v
+
+  let cur = keys.copy()
+  let frame_t = ui::ref_new(16.0)
+  let do_swap = fn() -> Int64 {
+    let tmp = cur[1]
+    cur[1] = cur[998]
+    cur[998] = tmp
+    items.set(cur.copy())
+    let _ = tree.frame(1280.0, 800.0, now=frame_t.v)
+    frame_t.v = frame_t.v + 16.0
+    let drawn = tree.drawn()
+    if drawn.length() > 2 {
+      (drawn[2].y * 100.0).round().to_int64() + drawn.length().to_int64()
+    } else {
+      drawn.length().to_int64()
+    }
+  }
+
+  for _ in 0..<warmup {
+    let _ = do_swap()
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  for _ in 0..<iters {
+    let t0 = now_ms()
+    let h = do_swap()
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, h)
+  }
+
+  let final_created = created.v
+  tree.dispose()
+
+  let counters = [
+    counter_int("rows", 1000),
+    counter_int("initial_created", initial_created),
+    counter_int("final_created", final_created),
+    counter_int("recreated_on_swap", final_created - initial_created),
+  ]
+  SwapMetrics::{
+    result: summarize_samples("tree_swap_rows_1k", samples, checksum, counters),
+    initial_created,
+    final_created,
+  }
+}
+
+// ── 6. flex_deep_20x2k_resize ──────────────────────────────────────────
+
+pub fn bench_flex_deep_20x2k_resize(warmup~ : Int = 5, iters~ : Int = 40) -> BenchResult {
+  // Build a 20-level deep spine; each level has 100 sibling leaf cards + 1 child container -> ~2,020 nodes
+  let root = flex::Node::new()
+  root.style.set_width(flex::Dim::Pt(1280.0))
+  root.style.set_height(flex::Dim::Pt(800.0))
+  root.style.direction = flex::FlexDirection::Column
+
+  let mut cur = root
+  let mut deep_leaf = root
+  let mut total_nodes = 1
+
+  for depth in 0..<20 {
+    let row = flex::Node::new()
+    row.style.direction = flex::FlexDirection::Row
+    row.style.grow = 0.0
+    row.style.set_height(flex::Dim::Pt(24.0))
+    cur.add(row)
+    total_nodes += 1
+
+    for c in 0..<99 {
+      let leaf = flex::Node::new()
+      leaf.style.grow = 1.0
+      leaf.style.set_height(flex::Dim::Pt(20.0 + (c % 5).to_double()))
+      row.add(leaf)
+      total_nodes += 1
+      if depth == 19 && c == 98 {
+        deep_leaf = leaf
+      }
+    }
+
+    let next_box = flex::Node::new()
+    next_box.style.direction = flex::FlexDirection::Column
+    next_box.style.grow = 1.0
+    cur.add(next_box)
+    total_nodes += 1
+    cur = next_box
+  }
+
+  flex::compute(root)
+
+  for w in 0..<warmup {
+    deep_leaf.style.set_height(flex::Dim::Pt(20.0 + (w % 7).to_double()))
+    flex::compute(root)
+    root.style.set_width(flex::Dim::Pt(if w % 2 == 0 { 960.0 } else { 1280.0 }))
+    flex::compute(root)
+  }
+
+  let leaf_samples : Array[Double] = []
+  let resize_samples : Array[Double] = []
+  let total_samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for i in 0..<iters {
+    let t0 = now_ms()
+    deep_leaf.style.set_height(flex::Dim::Pt(18.0 + (i % 13).to_double()))
+    flex::compute(root)
+    let t1 = now_ms()
+    let rw = 800.0 + ((i * 37) % 600).to_double()
+    root.style.set_width(flex::Dim::Pt(rw))
+    flex::compute(root)
+    let t2 = now_ms()
+
+    leaf_samples.push(t1 - t0)
+    resize_samples.push(t2 - t1)
+    total_samples.push(t2 - t0)
+    checksum = mix_hash(checksum, (deep_leaf.width * 1000.0 + deep_leaf.height * 100.0 + deep_leaf.top).round().to_int64())
+  }
+
+  sort_doubles(leaf_samples)
+  sort_doubles(resize_samples)
+  let counters = [
+    counter_int("depth", 20),
+    counter_int("nodes", total_nodes),
+    counter_f("leaf_mutate_p50_ms", percentile_sorted(leaf_samples, 50.0)),
+    counter_f("root_resize_p50_ms", percentile_sorted(resize_samples, 50.0)),
+  ]
+  summarize_samples("flex_deep_20x2k_resize", total_samples, checksum, counters)
+}
+
+// ── 7. scene_encode_2k_and_damage_1 ────────────────────────────────────
+
+pub struct DamageMetrics {
+  pub result : BenchResult
+  pub instances : Int
+  pub dirty_rects : Int
+  pub dirty_area_pct : Double
+}
+
+pub fn bench_scene_encode_2k_and_damage_1(warmup~ : Int = 3, iters~ : Int = 25) -> DamageMetrics {
+  ui::set_work_clock(Some(now_ms))
+  let btn_color = signals::signal(0x3B82F6FFL)
+  let fake = ui::FakeHost::new(width=1280.0, height=800.0, scale=2.0)
+  let prev_host = fake.install()
+
+  let tree = view::Tree::new(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(1280.0))).height(view::Live::Is(Some(800.0)))
+    for row_idx in 0..<40 {
+      let _ = root.box(fn(row : view::View) {
+        let _ = row.row(view::Live::Is(true)).height(view::Live::Is(Some(20.0)))
+        for col_idx in 0..<50 {
+          let is_target = row_idx == 20 && col_idx == 25
+          let _ = row.box(fn(cell : view::View) {
+            let _ = cell.width(view::Live::Is(Some(25.0))).height(view::Live::Is(Some(18.0))).radius(view::Live::Is(4.0))
+            if is_target {
+              let _ = cell.ground(view::Live::By(fn() { btn_color.get() }))
+            } else {
+              let c = if (row_idx + col_idx) % 2 == 0 { 0x1F2430FFL } else { 0x262C3AFFL }
+              let _ = cell.ground(view::Live::Is(c))
+            }
+          })
+        }
+      })
+    }
+  })
+
+  let dmg = damage::Damage::new()
+  let sc0 = ui::encode_tree_scene(tree, 1280.0, 800.0, 2.0, 0.0)
+  let _ = dmg.next(sc0.inst, sc0.ninst, 1280.0, 800.0, 2.0, 0.08, 0.09, 0.11)
+
+  for w in 0..<warmup {
+    btn_color.set(if w % 2 == 0 { 0xEF4444FFL } else { 0x3B82F6FFL })
+    let sc = ui::encode_tree_scene(tree, 1280.0, 800.0, 2.0, (w + 1).to_double() * 16.0)
+    let _ = dmg.next(sc.inst, sc.ninst, 1280.0, 800.0, 2.0, 0.08, 0.09, 0.11)
+  }
+
+  let encode_s : Array[Double] = []
+  let damage_s : Array[Double] = []
+  let total_s : Array[Double] = []
+  let mut last_inst = 0
+  let mut last_dirty = 0
+  let mut last_area_pct = 0.0
+  let mut checksum : Int64 = 1469598103934665603L
+
+  for i in 0..<iters {
+    btn_color.set(if i % 2 == 0 { 0x10B981FFL } else { 0xF59E0BFFL })
+    let t0 = now_ms()
+    let sc = ui::encode_tree_scene(tree, 1280.0, 800.0, 2.0, (warmup + i + 1).to_double() * 16.0)
+    let t1 = now_ms()
+    let rects = dmg.next(sc.inst, sc.ninst, 1280.0, 800.0, 2.0, 0.08, 0.09, 0.11)
+    let t2 = now_ms()
+
+    encode_s.push(t1 - t0)
+    damage_s.push(t2 - t1)
+    total_s.push(t2 - t0)
+    last_inst = sc.ninst
+    last_dirty = rects.length()
+    let mut area = 0.0
+    for r in rects {
+      let (_, _, rw, rh) = r
+      if rw < 0.0 || rh < 0.0 {
+        area = 1280.0 * 800.0
+      } else {
+        area = area + rw * rh
+      }
+    }
+    last_area_pct = area * 100.0 / (1280.0 * 800.0)
+    checksum = mix_hash(checksum, (sc.ninst * 13 + rects.length() * 97 + area.round().to_int()).to_int64())
+  }
+
+  tree.dispose()
+  hostapi::set_host(prev_host)
+
+  sort_doubles(encode_s)
+  sort_doubles(damage_s)
+  let counters = [
+    counter_int("instances", last_inst),
+    counter_int("dirty_rects", last_dirty),
+    counter_f("dirty_area_pct", last_area_pct, digits=4),
+    counter_f("encode_p50_ms", percentile_sorted(encode_s, 50.0)),
+    counter_f("damage_p50_ms", percentile_sorted(damage_s, 50.0)),
+  ]
+  DamageMetrics::{
+    result: summarize_samples("scene_encode_2k_and_damage_1", total_s, checksum, counters),
+    instances: last_inst,
+    dirty_rects: last_dirty,
+    dirty_area_pct: last_area_pct,
+  }
+}
+
+// ── 8. text_unicode_wrap_cjk ───────────────────────────────────────────
+
+pub fn bench_text_unicode_wrap_cjk(warmup~ : Int = 5, iters~ : Int = 40) -> BenchResult {
+  let chunk =
+    "Invar 渲染引擎支持中文、English、日本語（ひらがな・カタカナ・漢字）与标点符号，例如：「高速レイアウト」和\xE2\x80\x9CLiquid Glass\xE2\x80\x9D！\n" +
+    "Emoji ZWJ: \xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7 \xF0\x9F\x87\xA8\xF0\x9F\x87\xB3 \xF0\x9F\x87\xAF\xF0\x9F\x87\xB5 | Bidi: hello \xD7\xA9\xD7\x9C\xD7\x95\xD7\x9D 2026 (test).\n"
+  let sb = StringBuilder::new()
+  // ~10 KB mixed Unicode corpus
+  for _ in 0..<45 {
+    sb.write_string(chunk)
+  }
+  let corpus = sb.to_string()
+  let nbytes = corpus.length()
+
+  let run_once = fn() -> (Int64, Int, Int, Int) {
+    let gs = text::graphemes(corpus)
+    let br = text::break_opportunities(corpus)
+    let wr = text::width_runs(corpus)
+    let bd_flag = match text::bidi_mixed(corpus) {
+      Some(bd) => if bd.is_mixed() { 1 } else { 0 }
+      None => 0
+    }
+    let h = (gs.length() * 31 + br.length() * 17 + wr.length() * 7 + bd_flag).to_int64()
+    (h, gs.length(), br.length(), wr.length())
+  }
+
+  for _ in 0..<warmup {
+    let _ = run_once()
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  let mut g_cnt = 0
+  let mut b_cnt = 0
+  let mut w_cnt = 0
+  for _ in 0..<iters {
+    let t0 = now_ms()
+    let (h, gc, bc, wc) = run_once()
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, h)
+    g_cnt = gc
+    b_cnt = bc
+    w_cnt = wc
+  }
+
+  let res = summarize_samples("text_unicode_wrap_cjk", samples, checksum, [])
+  let mb_per_sec = if res.mean_ms > 1.0e-9 {
+    (nbytes.to_double() / (1024.0 * 1024.0)) / (res.mean_ms / 1000.0)
+  } else {
+    0.0
+  }
+  let counters = [
+    counter_int("bytes", nbytes),
+    counter_int("graphemes", g_cnt),
+    counter_int("breaks", b_cnt),
+    counter_int("width_runs", w_cnt),
+    counter_f("mb_per_sec", mb_per_sec, digits=2),
+  ]
+  summarize_samples("text_unicode_wrap_cjk", samples, checksum, counters)
+}
+
+// ── 9a. skia_aa_100x ───────────────────────────────────────────────────
+
+pub fn bench_skia_aa_100x(warmup~ : Int = 2, iters~ : Int = 10) -> BenchResult {
+  let pm = match skia::Pixmap::new(600, 400) {
+    Some(p) => p
+    None => return summarize_samples("skia_aa_100x", [0.0], 0L, [])
+  }
+  let circle = match skia::PathBuilder::from_circle(300.0f, 200.0f, 140.0f) {
+    Some(c) => c
+    None => return summarize_samples("skia_aa_100x", [0.0], 0L, [])
+  }
+  let rect = match skia::Rect::from_xywh(50.0f, 50.0f, 500.0f, 300.0f) {
+    Some(r) => r
+    None => return summarize_samples("skia_aa_100x", [0.0], 0L, [])
+  }
+  let p_solid = skia::Paint::default()
+  p_solid.set_color_rgba8(30, 120, 220, 255)
+  p_solid.anti_alias = true
+  let p_alpha = skia::Paint::default()
+  p_alpha.set_color_rgba8(240, 80, 60, 128)
+  p_alpha.anti_alias = true
+
+  let run_once = fn() -> Int64 {
+    for _ in 0..<100 {
+      pm.fill_rect(rect, p_alpha, skia::Transform::identity(), None)
+      pm.fill_path(circle, p_solid, skia::FillRule::Winding, skia::Transform::identity(), None)
+    }
+    let mut h : Int64 = 1L
+    match pm.pixel(300, 200) {
+      Some(c) => h = mix_hash(h, (c.r * 256 + c.g * 16 + c.b + c.a).to_int64())
+      None => ()
+    }
+    match pm.pixel(100, 100) {
+      Some(c) => h = mix_hash(h, (c.r * 256 + c.g * 16 + c.b + c.a).to_int64())
+      None => ()
+    }
+    h
+  }
+
+  for _ in 0..<warmup {
+    let _ = run_once()
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  for _ in 0..<iters {
+    let t0 = now_ms()
+    let h = run_once()
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, h)
+  }
+
+  let counters = [
+    counter_int("width", 600),
+    counter_int("height", 400),
+    counter_int("draws_per_iter", 200),
+  ]
+  summarize_samples("skia_aa_100x", samples, checksum, counters)
+}
+
+// ── 9b. svg_parse_raster ───────────────────────────────────────────────
+
+pub fn bench_svg_parse_raster(warmup~ : Int = 3, iters~ : Int = 25) -> BenchResult {
+  let src =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256' width='256' height='256'>" +
+    "<defs>" +
+    "<linearGradient id='bg' x1='0%' y1='0%' x2='100%' y2='100%'>" +
+    "<stop offset='0%' stop-color='#0f172a'/>" +
+    "<stop offset='50%' stop-color='#1e3a8a'/>" +
+    "<stop offset='100%' stop-color='#06b6d4'/>" +
+    "</linearGradient>" +
+    "<radialGradient id='orb' cx='40%' cy='35%' r='60%'>" +
+    "<stop offset='0%' stop-color='#fde047'/>" +
+    "<stop offset='60%' stop-color='#f97316'/>" +
+    "<stop offset='100%' stop-color='#be123c'/>" +
+    "</radialGradient>" +
+    "<clipPath id='cardClip'><rect x='16' y='16' width='224' height='224' rx='28'/></clipPath>" +
+    "</defs>" +
+    "<g clip-path='url(#cardClip)'>" +
+    "<rect width='256' height='256' fill='url(#bg)'/>" +
+    "<circle cx='128' cy='112' r='64' fill='url(#orb)'/>" +
+    "<path d='M 24 196 C 64 136, 112 224, 152 164 C 184 116, 212 180, 232 148 L 232 240 L 24 240 Z' fill='#38bdf8' fill-opacity='0.65'/>" +
+    "<path d='M 36 68 L 96 42 L 156 84 L 220 48 L 204 116 L 128 92 Z' fill='none' stroke='#f8fafc' stroke-width='4' stroke-linejoin='round'/>" +
+    "<rect x='48' y='168' width='160' height='36' rx='18' fill='#ffffff' fill-opacity='0.22' stroke='#ffffff' stroke-opacity='0.5' stroke-width='2'/>" +
+    "</g>" +
+    "</svg>"
+  let opt = svg::Options::default()
+
+  let run_once = fn() -> (Int64, Int, Int) {
+    match svg::render_svg_to_width(src, 256, opt) {
+      Some(pm) => {
+        let mut h : Int64 = (pm.width * 1000 + pm.height).to_int64()
+        let pts = [(64, 64), (128, 112), (128, 186), (192, 160), (200, 200)]
+        for pt in pts {
+          match pm.pixel(pt.0, pt.1) {
+            Some(c) => h = mix_hash(h, (c.r * 16777216 + c.g * 65536 + c.b * 256 + c.a).to_int64())
+            None => ()
+          }
+        }
+        (h, pm.width, pm.height)
+      }
+      None => (0L, 0, 0)
+    }
+  }
+
+  for _ in 0..<warmup {
+    let _ = run_once()
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  let mut pw = 0
+  let mut ph = 0
+  for _ in 0..<iters {
+    let t0 = now_ms()
+    let (h, w, hh) = run_once()
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, h)
+    pw = w
+    ph = hh
+  }
+
+  let counters = [
+    counter_int("width", pw),
+    counter_int("height", ph),
+    counter_int("svg_bytes", src.length()),
+  ]
+  summarize_samples("svg_parse_raster", samples, checksum, counters)
+}
+
+// ── 10. motion_springs_50x120f ─────────────────────────────────────────
+
+pub struct MotionMetrics {
+  pub result : BenchResult
+  pub fps_parity_ok : Bool
+  pub max_endpoint_err : Double
+}
+
+pub fn bench_motion_springs_50x120f(warmup~ : Int = 10, iters~ : Int = 100) -> MotionMetrics {
+  ui::set_reduced_motion(Some(false))
+  let ways60 : Array[motion::NodeWay] = []
+  let ways120 : Array[motion::NodeWay] = []
+  let nodes60 : Array[view::View] = []
+  let nodes120 : Array[view::View] = []
+
+  let tree = view::Tree::new(fn(root : view::View) {
+    for _ in 0..<50 {
+      let n1 = root.box(fn(v : view::View) { let _ = v.width(view::Live::Is(Some(10.0))).height(view::Live::Is(Some(10.0))) })
+      let n2 = root.box(fn(v : view::View) { let _ = v.width(view::Live::Is(Some(10.0))).height(view::Live::Is(Some(10.0))) })
+      nodes60.push(n1)
+      nodes120.push(n2)
+      ways60.push(motion::NodeWay::new(0.0))
+      ways120.push(motion::NodeWay::new(0.0))
+    }
+  })
+  let _ = tree.frame(400.0, 400.0, now=0.0)
+
+  // Verify 60fps vs 120fps closed-form endpoint parity across all 50 springs
+  for k in 0..<50 {
+    let spec = if k % 2 == 0 { motion::move_damped } else { motion::tactile_bounce }
+    let target = 100.0 + k.to_double() * 7.5
+    ways60[k].go(nodes60[k], target, spec)
+    ways120[k].go(nodes120[k], target, spec)
+  }
+  let mut max_err = 0.0
+  let dt60 = 1000.0 / 60.0
+  let dt120 = 1000.0 / 120.0
+  for f in 1..<61 {
+    let t60 = f.to_double() * dt60
+    let t120 = (f * 2).to_double() * dt120
+    for k in 0..<50 {
+      let v60 = ways60[k].value_at(t60)
+      let v120 = ways120[k].value_at(t120)
+      let err = (v60 - v120).abs()
+      if err > max_err {
+        max_err = err
+      }
+    }
+  }
+  let fps_parity_ok = max_err < 1.0e-6
+
+  // Timed benchmark: 50 concurrent NodeWay springs evaluated over 120 frames
+  let run_once = fn(base_target : Double) -> Int64 {
+    for k in 0..<50 {
+      let spec = if k % 2 == 0 { motion::move_damped } else { motion::tactile_bounce }
+      ways60[k].go(nodes60[k], base_target + k.to_double() * 3.0, spec)
+    }
+    let mut sum = 0.0
+    for f in 0..<120 {
+      let t = f.to_double() * dt120
+      for k in 0..<50 {
+        sum = sum + ways60[k].value_at(t)
+      }
+    }
+    (sum * 100.0).round().to_int64()
+  }
+
+  for w in 0..<warmup {
+    let _ = run_once(200.0 + w.to_double() * 5.0)
+  }
+
+  let samples : Array[Double] = []
+  let mut checksum : Int64 = 1469598103934665603L
+  for i in 0..<iters {
+    let target = if i % 2 == 0 { 320.0 + i.to_double() } else { 40.0 + i.to_double() }
+    let t0 = now_ms()
+    let h = run_once(target)
+    let t1 = now_ms()
+    samples.push(t1 - t0)
+    checksum = mix_hash(checksum, h)
+  }
+
+  tree.dispose()
+
+  let counters = [
+    counter_int("springs", 50),
+    counter_int("frames", 120),
+    counter_int("evals_per_iter", 6000),
+    counter_f("max_60_vs_120_err", max_err, digits=9),
+  ]
+  MotionMetrics::{
+    result: summarize_samples("motion_springs_50x120f", samples, checksum, counters),
+    fps_parity_ok,
+    max_endpoint_err: max_err,
+  }
+}
+
+pub fn run_all_cpu(filter : String) -> Array[BenchResult] {
+  ui::set_work_clock(Some(now_ms))
+  let out : Array[BenchResult] = []
+  let want = fn(name : String) -> Bool {
+    filter == "" || ui::str_contains(name, filter)
+  }
+  if want("signals_fanout_10k") {
+    out.push(bench_signals_fanout_10k().result)
+  }
+  if want("signals_diamond_200") {
+    out.push(bench_signals_diamond_200().result)
+  }
+  if want("tree_mount_1k") {
+    out.push(bench_tree_mount("tree_mount_1k", 1000, warmup=2, iters=12))
+  }
+  if want("tree_mount_10k") {
+    out.push(bench_tree_mount("tree_mount_10k", 10000, warmup=1, iters=5))
+  }
+  if want("tree_update_10pct_1k") {
+    out.push(bench_tree_update_10pct_1k())
+  }
+  if want("tree_swap_rows_1k") {
+    out.push(bench_tree_swap_rows_1k().result)
+  }
+  if want("flex_deep_20x2k_resize") {
+    out.push(bench_flex_deep_20x2k_resize())
+  }
+  if want("scene_encode_2k_and_damage_1") {
+    out.push(bench_scene_encode_2k_and_damage_1().result)
+  }
+  if want("text_unicode_wrap_cjk") {
+    out.push(bench_text_unicode_wrap_cjk())
+  }
+  if want("skia_aa_100x") {
+    out.push(bench_skia_aa_100x())
+  }
+  if want("svg_parse_raster") {
+    out.push(bench_svg_parse_raster())
+  }
+  if want("motion_springs_50x120f") {
+    out.push(bench_motion_springs_50x120f().result)
+  }
+  out
+}
