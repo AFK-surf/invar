@@ -868,10 +868,47 @@ static int make_own_chain(HWND hwnd) {
 
 static void make_pipeline(void);
 
+// The device, with its video side where the GPU has one (a remote screen decoded and shown by the GPU, win_stream.cpp),
+// else without, else WARP's.
+static bool make_any_device(void) {
+  return SUCCEEDED(make_device(D3D_DRIVER_TYPE_HARDWARE, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)) ||
+         SUCCEEDED(make_device(D3D_DRIVER_TYPE_HARDWARE, 0)) || SUCCEEDED(make_device(D3D_DRIVER_TYPE_WARP, 0));
+}
+
+// The device and its pipeline made as the program starts, on a thread of their own, while the window's thread runs the
+// app up to its window (its tree, CreateWindowEx): neither needs the window, and they were ~125 ms of a window's start
+// made after it, the driver loaded and the shaders handed to it (an RTX 4080's, 2026-11-22). mb_render_init waits for
+// it and makes only what is of the window (its swap chain, the composition); a program that draws without a window
+// (mb_render_init_offscreen: WARP's) lets what it made go. MBUI_NO_WARM=1: made in mb_render_init, as before.
+static HANDLE warm_thread;
+static bool warm_made;
+static DWORD WINAPI warm_make(LPVOID) {
+  if (make_any_device()) {
+    make_pipeline();
+    warm_made = true;
+  }
+  return 0;
+}
+static struct WarmStart {
+  WarmStart() {
+    const char *no = getenv("MBUI_NO_WARM");
+    if (no && *no && *no != '0') return;
+    warm_thread = CreateThread(NULL, 0, warm_make, NULL, 0, NULL);
+  }
+} warm_start;
+
+// What the start's thread made, once it is done (false: nothing, made here then).
+static bool warm_taken(void) {
+  if (!warm_thread) return false;
+  WaitForSingleObject(warm_thread, INFINITE);
+  CloseHandle(warm_thread);
+  warm_thread = NULL;
+  return warm_made;
+}
+
 int mb_render_init(void *hwnd) {
-  // (with its video side where the GPU has one: a remote screen decoded and shown by the GPU, win_stream.cpp)
-  if (FAILED(make_device(D3D_DRIVER_TYPE_HARDWARE, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)) &&
-      FAILED(make_device(D3D_DRIVER_TYPE_HARDWARE, 0)) && FAILED(make_device(D3D_DRIVER_TYPE_WARP, 0))) {
+  bool warm = warm_taken();
+  if (!warm && !make_any_device()) {
     fprintf(stderr, "no Direct3D 11 device\n");
     return 0;
   }
@@ -891,7 +928,7 @@ int mb_render_init(void *hwnd) {
   dxgi_factory->MakeWindowAssociation((HWND)hwnd, DXGI_MWA_NO_ALT_ENTER);
   adapter->Release();
   xdev->Release();
-  make_pipeline();
+  if (!warm) make_pipeline();
   return chain != NULL;
 }
 
@@ -1855,6 +1892,18 @@ static ID3D11Texture2D *off_target;
 
 extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+  // (the start's device let go of: drawn here by WARP's alone; what its pipeline holds of it is left, a run's)
+  if (warm_taken()) {
+    if (kinds_thread) {
+      WaitForSingleObject(kinds_thread, INFINITE);
+      CloseHandle(kinds_thread);
+      kinds_thread = NULL;
+    }
+    ctx->Release();
+    dev->Release();
+    ctx = NULL;
+    dev = NULL;
+  }
   if (FAILED(make_device(D3D_DRIVER_TYPE_WARP, 0))) {
     fprintf(stderr, "no Direct3D 11 WARP device\n");
     return;
