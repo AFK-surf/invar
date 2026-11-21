@@ -1,0 +1,281 @@
+// Comprehensive unit tests for packages/hostapi.
+// Ports all upstream tests (b64, passwords_test, turnable_test) plus Atlas, JSON, SystemSaid,
+// NavBar, Charset, Gamepad/PointerLock, Stream, Terminal, Pick/Keep/Gallery/Device/WorkNote tests.
+
+test "from_base64 decodes UTF-8 text" {
+  debug_assert(from_base64("5L2g5aW9LCBtYmVv") == "你好, mbeo", "utf8 base64")
+  debug_assert(from_base64("eyJhIjoxfQ==") == "{\"a\":1}", "json base64")
+}
+
+test "a login is for a site: exact, subdomain, parent; not suffix collision" {
+  debug_assert(login_for_host("https://github.com/login", "github.com"), "exact url")
+  debug_assert(login_for_host("github.com", "github.com"), "bare host")
+  debug_assert(login_for_host("https://google.com", "accounts.google.com"), "parent login for subdomain")
+  debug_assert(login_for_host("https://accounts.google.com:443/x?y#z", "google.com"), "subdomain with port/query")
+  debug_assert(login_for_host("HTTPS://GitHub.com", "github.com"), "case insensitive")
+  debug_assert(!login_for_host("https://notgithub.com", "github.com"), "suffix mismatch")
+  debug_assert(!login_for_host("", "github.com"), "empty href")
+}
+
+test "op answers: logins_for, login_fields, login_secret and trouble" {
+  let listed = "[{\"id\":\"a\",\"title\":\"GitHub\",\"additional_information\":\"demo-user\",\"vault\":{\"id\":\"v1\",\"name\":\"Personal\"},\"urls\":[{\"href\":\"https://github.com\"}]},{\"id\":\"b\",\"title\":\"GitLab\",\"urls\":[{\"href\":\"https://gitlab.com\"}]},{\"id\":\"c\",\"title\":\"No site\"}]"
+  let gh = logins_for(listed, "github.com")
+  debug_assert(gh.length() == 1, "one github login")
+  debug_assert(
+    password_login_eq(gh[0], PasswordLogin::{ id: "a", title: "GitHub", username: "demo-user", vault: "v1" }),
+    "github login fields",
+  )
+  let gl = logins_for(listed, "gitlab.com")
+  debug_assert(gl.length() == 1, "one gitlab login")
+  debug_assert(
+    password_login_eq(gl[0], PasswordLogin::{ id: "b", title: "GitLab", username: "", vault: "" }),
+    "gitlab login fields",
+  )
+  debug_assert(logins_for("not json", "github.com").length() == 0, "invalid json empty")
+
+  let got = "[{\"id\":\"username\",\"label\":\"username\",\"value\":\"demo-user\"},{\"id\":\"password\",\"label\":\"password\",\"purpose\":\"PASSWORD\",\"value\":\"s3cret\"}]"
+  let (u1, p1) = login_fields(got)
+  debug_assert(u1 == "demo-user" && p1 == "s3cret", "login_fields array")
+  let (u2, p2) = login_fields("{\"label\":\"password\",\"value\":\"only\"}")
+  debug_assert(u2 == "" && p2 == "only", "login_fields single object")
+
+  let item = "{\"id\":\"a\",\"fields\":[{\"id\":\"username\",\"purpose\":\"USERNAME\",\"value\":\"demo-user\"},{\"id\":\"password\",\"purpose\":\"PASSWORD\",\"value\":\"s3cret\"},{\"id\":\"otp\",\"type\":\"OTP\",\"label\":\"one-time password\",\"value\":\"otpauth://totp/x\",\"totp\":\"654321\"}]}"
+  let (u3, p3, otp3, has3) = login_secret(item)
+  debug_assert(u3 == "demo-user" && p3 == "s3cret" && otp3 == "654321" && has3, "login_secret with totp")
+
+  let item_no_totp = "{\"id\":\"a\",\"fields\":[{\"id\":\"username\",\"purpose\":\"USERNAME\",\"value\":\"demo-user\"},{\"id\":\"password\",\"purpose\":\"PASSWORD\",\"value\":\"s3cret\"},{\"id\":\"otp\",\"type\":\"OTP\",\"value\":\"otpauth://totp/x\"}]}"
+  let (u4, p4, otp4, has4) = login_secret(item_no_totp)
+  debug_assert(u4 == "demo-user" && p4 == "s3cret" && otp4 == "" && has4, "login_secret otp no code")
+
+  let (_, _, otp5, has5) = login_secret(got)
+  debug_assert(otp5 == "" && !has5, "no otp")
+
+  // OpDone::trouble
+  let d0 = OpDone::{ code: 0, out: "", err: "" }
+  debug_assert(d0.trouble().is_none(), "exit 0 ok")
+  let d1 = OpDone::{ code: -1, out: "", err: "op not found" }
+  match d1.trouble() {
+    Some(t) => debug_assert(op_trouble_eq(t, OpTrouble::NoTool), "no tool")
+    None => debug_assert(false, "expected NoTool")
+  }
+  let d2 = OpDone::{ code: 1, out: "", err: "[ERROR] You are not currently signed in." }
+  match d2.trouble() {
+    Some(t) => debug_assert(op_trouble_eq(t, OpTrouble::NoTool), "not signed in")
+    None => debug_assert(false, "expected NoTool")
+  }
+  let d3 = OpDone::{ code: 1, out: "", err: "[ERROR] Get \"https://my.1password.com/api/v2/account\": unexpected EOF\n" }
+  match d3.trouble() {
+    Some(t) => debug_assert(op_trouble_eq(t, OpTrouble::Unreached), "unreached")
+    None => debug_assert(false, "expected Unreached")
+  }
+  let d4 = OpDone::{ code: 1, out: "", err: "authorization prompt dismissed" }
+  match d4.trouble() {
+    Some(t) => debug_assert(op_trouble_eq(t, OpTrouble::Other("authorization prompt dismissed")), "other")
+    None => debug_assert(false, "expected Other")
+  }
+}
+
+test "passkey hex <-> base64url round-trip" {
+  debug_assert(b64url_of_hex("") == "", "empty")
+  debug_assert(b64url_of_hex("0909") == "CQk", "0909")
+  debug_assert(b64url_of_hex("010203") == "AQID", "010203")
+  debug_assert(b64url_of_hex("fbff") == "-_8", "fbff lower")
+  debug_assert(b64url_of_hex("FBFF") == "-_8", "FBFF upper")
+  debug_assert(b64url_of_hex("0g") == "", "invalid hex")
+  debug_assert(b64url_of_hex("abc") == "", "odd hex")
+  debug_assert(hex_of_b64url("CQk") == "0909", "decode CQk")
+  debug_assert(hex_of_b64url("AQID") == "010203", "decode AQID")
+  debug_assert(hex_of_b64url("-_8=") == "fbff", "decode -_8=")
+  debug_assert(hex_of_b64url("a+b") == "", "reject +")
+}
+
+test "turnable phone vs tablet and host reset" {
+  let phone_told : Array[Bool] = []
+  let phone = Host::noop()
+  phone.set_turnable = fn(on : Bool) -> Bool {
+    phone_told.push(on)
+    true
+  }
+  set_host(phone)
+  debug_assert(!sideways(), "initially upright")
+  set_turnable(true)
+  debug_assert(sideways(), "phone turnable counts as sideways")
+  set_turnable(false)
+  debug_assert(!sideways(), "back to upright")
+  debug_assert(phone_told.length() == 2 && phone_told[0] && !phone_told[1], "phone told")
+
+  let tablet_told : Array[Bool] = []
+  let tablet = Host::noop()
+  tablet.set_turnable = fn(on : Bool) -> Bool {
+    tablet_told.push(on)
+    false
+  }
+  set_host(tablet)
+  set_turnable(true)
+  debug_assert(!sideways(), "tablet never counts as app-turned")
+  debug_assert(tablet_told.length() == 1 && tablet_told[0], "tablet told")
+
+  set_host(phone)
+  set_turnable(true)
+  set_host(tablet)
+  debug_assert(!sideways(), "new host resets sideways")
+  set_host(Host::noop())
+}
+
+test "Atlas shelf packing, LRU eviction, and before_full callback" {
+  let a = Atlas::new(64)
+  debug_assert(a.sized(), "64px atlas sized")
+  debug_assert(a.holds(32, 32) && !a.holds(65, 10) && !a.holds(0, 10), "holds bounds")
+  let evicted : Array[Int] = []
+  let full_calls = [0]
+  a.before_full(fn() -> Unit { full_calls[0] = full_calls[0] + 1 })
+  a.next_frame()
+  let p1 = a.place(1, 30, 30, fn(k : Int) -> Unit { evicted.push(k) })
+  let p2 = a.place(2, 30, 30, fn(k : Int) -> Unit { evicted.push(k) })
+  let p3 = a.place(3, 30, 30, fn(k : Int) -> Unit { evicted.push(k) })
+  debug_assert(p1.is_some() && p2.is_some() && p3.is_some(), "first 3 fit in 64x64")
+  debug_assert(evicted.length() == 0, "no eviction yet")
+  // Same frame: all shelves drawn in frame 1, so a 5th 30x30 glyph cannot evict
+  let p4 = a.place(4, 30, 30, fn(k : Int) -> Unit { evicted.push(k) })
+  debug_assert(p4.is_some(), "4th fits")
+  let p5_same = a.place(5, 30, 30, fn(k : Int) -> Unit { evicted.push(k) })
+  debug_assert(p5_same.is_none() && full_calls[0] == 1, "full in same frame returns None and fires before_full once")
+  // Next frame: shelf 0 can now be evicted
+  a.next_frame()
+  let p5_next = a.place(5, 30, 30, fn(k : Int) -> Unit { evicted.push(k) })
+  debug_assert(p5_next.is_some() && evicted.length() >= 1, "evicted old shelf in next frame")
+  a.clear()
+}
+
+test "system_said JSON decoding and NavBar JSON serialization + dedup" {
+  let msg = "{\"link\":\"https://still.fail/c/1\",\"over\":true,\"bars\":{\"top\":44,\"bottom\":34,\"left\":0,\"right\":0},\"size_class\":{\"width\":\"expanded\",\"height\":\"medium\"},\"fold\":{\"hinge\":\"half\",\"divisions\":[{\"x\":100,\"y\":0,\"w\":12,\"h\":800}]},\"shown\":{\"away\":1500},\"install\":{\"name\":\"a.apk\",\"allow\":true},\"network\":true,\"menu\":\"new_chat\",\"nav_action\":{\"x\":10,\"y\":20,\"w\":40,\"h\":40},\"nav\":\"tab_home\",\"at\":[1,2,3,4]}"
+  let events = system_said(msg)
+  debug_assert(events.length() == 11, "all 11 system events parsed")
+  debug_assert(nav_tapped_at[0] == 1.0 && nav_tapped_at[3] == 4.0, "nav_tapped_at updated")
+
+  let sent : Array[String] = []
+  let h = Host::noop()
+  h.nv_bar = fn(spec : String) -> Int {
+    sent.push(spec)
+    1
+  }
+  set_host(h)
+  let bar = NavBar::{
+    floating: [],
+    groups: [
+      NavGroup::{
+        items: [
+          NavItem::{
+            id: "home",
+            title: "Home",
+            icon: "M0 0",
+            dot: true,
+            prominent: false,
+            menu: [("m1", "Menu 1", true, "")],
+          },
+        ],
+        foot: false,
+        foldable: true,
+      },
+    ],
+    selected: "home",
+    ink: 255.to_int64(),
+    chosen_ink: 65535.to_int64(),
+    more_icon: "...",
+    bare: false,
+    title: "App",
+  }
+  debug_assert(nav_bar(bar), "first nav_bar returns true")
+  debug_assert(nav_bar(bar), "second identical nav_bar deduped")
+  debug_assert(sent.length() == 1, "nv_bar called once due to dedup")
+  debug_assert(json_parse(sent[0]).is_some(), "serialized NavBar is valid JSON")
+  nav_bar_again()
+  let _ = nav_bar(bar)
+  debug_assert(sent.length() == 2, "nav_bar_again forces resend")
+  set_host(Host::noop())
+}
+
+test "decode_text BOM, UTF-8, UTF-16, and GB18030 host fallback" {
+  let (t1, e1) = decode_text("hello 世界".to_bytes(), false)
+  debug_assert(t1 == "hello 世界" && e1 == "UTF-8", "plain utf8")
+  let bom_sb = StringBuilder::new()
+  bom_sb.write_byte(0xEF as Byte)
+  bom_sb.write_byte(0xBB as Byte)
+  bom_sb.write_byte(0xBF as Byte)
+  bom_sb.write_byte(65 as Byte)
+  let (t2, e2) = decode_text(bom_sb.to_string().to_bytes(), false)
+  debug_assert(t2 == "A" && e2 == "UTF-8 BOM", "utf8 bom")
+
+  let h = Host::noop()
+  h.cs_known = fn(cs : String) -> Int { if cs == "GB18030" { 1 } else { 0 } }
+  h.cs_decode = fn(_b : Bytes, _cs : String) -> String { "中文" }
+  set_host(h)
+  let gb_sb = StringBuilder::new()
+  gb_sb.write_byte(0xD6 as Byte)
+  gb_sb.write_byte(0xD0 as Byte)
+  let (t3, e3) = decode_text(gb_sb.to_string().to_bytes(), false)
+  debug_assert(t3 == "中文" && e3 == "GB18030", "gb18030 fallback")
+  set_host(Host::noop())
+}
+
+test "style_face, gamepad deadzone, pointer_delta, stream, terminal, and work_part" {
+  debug_assert(face_of_style(style_face(7) | style_italic) == 7, "style_face roundtrip")
+  debug_assert(gamepad_axis(0.05) == 0.0, "inside deadzone")
+  debug_assert(gamepad_axis(0.5) == 0.5, "outside deadzone")
+  debug_assert(gamepad_axis(1.5) == 1.0, "clamped high")
+  debug_assert(gamepad_axis(-1.5) == -1.0, "clamped low")
+
+  let h = Host::noop()
+  h.pointer_delta = fn(out : Array[Double]) -> Unit {
+    out[0] = 12.5
+    out[1] = -3.5
+  }
+  h.gamepads = fn(out : Array[Double]) -> Int {
+    out[0] = 0.0
+    out[1] = 1.0
+    out[2] = 5.0
+    out[3] = 0.02
+    out[4] = 0.8
+    out[5] = -0.5
+    out[6] = 0.0
+    out[7] = 0.25
+    out[8] = 1.5
+    1
+  }
+  h.tm_open = fn(_c : Int, _r : Int) -> Int { 42 }
+  h.tm_modes = fn(_id : Int) -> Int { term_mode_alt_screen | term_mode_bracketed_paste }
+  h.st_open = fn() -> Int { 7 }
+  h.st_h264_here = fn() -> Int { 1 }
+  set_host(h)
+
+  let (dx, dy) = pointer_delta_take()
+  debug_assert(dx == 12.5 && dy == -3.5, "pointer delta")
+  let pads = gamepads()
+  debug_assert(pads.length() == 1 && pads[0].buttons == 5 && pads[0].lx == 0.0 && pads[0].ly == 0.8 && pads[0].rt == 1.0, "gamepad parsed")
+
+  match Terminal::open(80, 24) {
+    Some(tm) => {
+      debug_assert(tm.id == 42 && tm.modes() == (term_mode_alt_screen | term_mode_bracketed_paste), "terminal open/modes")
+      tm.close()
+    }
+    None => debug_assert(false, "expected terminal")
+  }
+  debug_assert(stream_open() == 7 && h264_here(), "stream open/h264")
+
+  let t = [10.0]
+  let noted : Array[String] = []
+  work_noted_by(Some((
+    fn() -> Double { t[0] },
+    fn(w : String, _ms : Double) -> Unit { noted.push(w) },
+  )))
+  let v = work_part(
+    fn() -> String { "layout" },
+    fn() -> Int {
+      t[0] = 12.5
+      99
+    },
+  )
+  debug_assert(v == 99 && noted.length() == 1 && noted[0] == "layout", "work_part noted")
+  work_noted_by(None)
+  set_host(Host::noop())
+}

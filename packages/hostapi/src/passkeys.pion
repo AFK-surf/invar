@@ -1,0 +1,215 @@
+// Platform passkeys / WebAuthn signing and hex <-> base64url conversion.
+// Ported from libs/mbui/src/hostapi/passkeys.mbt.
+
+/// A passkey signing request under way (`passkey_get`).
+pub struct PasskeyRun {
+  id : Int
+}
+
+/// Outcome of a passkey signing request.
+pub struct PasskeyDone {
+  pub code : Int
+  pub credential : String
+  pub authenticator_data : String
+  pub signature : String
+  pub user_handle : String
+  pub err : String
+  pub client_data : String
+}
+
+pub fn PasskeyDone::eq(self : PasskeyDone, other : PasskeyDone) -> Bool {
+  self.code == other.code &&
+  self.credential == other.credential &&
+  self.authenticator_data == other.authenticator_data &&
+  self.signature == other.signature &&
+  self.user_handle == other.user_handle &&
+  self.err == other.err &&
+  self.client_data == other.client_data
+}
+
+/// Whether this host can ask for a passkey.
+pub fn passkeys() -> Bool {
+  wa_able()
+}
+
+fn parse_signed_int(s : String, fallback : Int) -> Int {
+  let n = s.length()
+  if n == 0 {
+    return fallback
+  }
+  let mut neg = false
+  let mut i = 0
+  if s.code_unit_at(0) == 45 {
+    neg = true
+    i = 1
+  }
+  if i >= n {
+    return fallback
+  }
+  let mut acc = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return fallback
+    }
+    acc = acc * 10 + (c - 48)
+    i = i + 1
+  }
+  if neg { -acc } else { acc }
+}
+
+/// Requests a passkey assertion for `rp_id`.
+pub fn passkey_get(
+  rp_id : String,
+  client_data : String,
+  allow : Array[String],
+  user_verification : String,
+) -> Option[PasskeyRun] {
+  let sb = StringBuilder::new()
+  let mut first = true
+  for a in allow {
+    let h = hex_of_b64url(a)
+    if h != "" {
+      if !first {
+        sb.write_byte(44 as Byte) // ','
+      }
+      for j in 0..<h.length() {
+        sb.write_byte(h.code_unit_at(j) as Byte)
+      }
+      first = false
+    }
+  }
+  let ids = sb.to_string()
+  let ask = rp_id + "\u{1f}" + client_data + "\u{1f}" + user_verification + "\u{1f}" + ids + "\u{1f}"
+  let id = wa_get(ask)
+  if id <= 0 {
+    None
+  } else {
+    Some(PasskeyRun::{ id })
+  }
+}
+
+/// Polls completion of a passkey signing request; `None` while pending.
+pub fn PasskeyRun::done(self : PasskeyRun) -> Option[PasskeyDone] {
+  (hooks.polled)()
+  let s = wa_out(self.id)
+  if s == "" {
+    return None
+  }
+  let parts = split_unit_sep(s)
+  let p0 = if parts.length() > 0 { parts[0] } else { "-1" }
+  let p1 = if parts.length() > 1 { parts[1] } else { "" }
+  let p2 = if parts.length() > 2 { parts[2] } else { "" }
+  let p3 = if parts.length() > 3 { parts[3] } else { "" }
+  let p4 = if parts.length() > 4 { parts[4] } else { "" }
+  let p5 = if parts.length() > 5 { parts[5] } else { "" }
+  let p6 = if parts.length() > 6 { parts[6] } else { "" }
+  let code = parse_signed_int(p0, -1)
+  Some(PasskeyDone::{
+    code,
+    credential: b64url_of_hex(p1),
+    authenticator_data: b64url_of_hex(p2),
+    signature: b64url_of_hex(p3),
+    user_handle: b64url_of_hex(p4),
+    err: p5,
+    client_data: b64url_of_hex(p6),
+  })
+}
+
+/// Forgets the passkey request.
+pub fn PasskeyRun::end(self : PasskeyRun) -> Unit {
+  wa_end(self.id)
+}
+
+fn b64url_char_byte(idx : Int) -> Byte {
+  if idx < 26 {
+    (65 + idx) as Byte
+  } else if idx < 52 {
+    (97 + idx - 26) as Byte
+  } else if idx < 62 {
+    (48 + idx - 52) as Byte
+  } else if idx == 62 {
+    45 as Byte // '-'
+  } else {
+    95 as Byte // '_'
+  }
+}
+
+fn b64url_decode_char(c : Int) -> Int {
+  if c >= 65 && c <= 90 {
+    c - 65
+  } else if c >= 97 && c <= 122 {
+    c - 97 + 26
+  } else if c >= 48 && c <= 57 {
+    c - 48 + 52
+  } else if c == 45 {
+    62
+  } else if c == 95 {
+    63
+  } else {
+    -1
+  }
+}
+
+/// Hex (either case) to unpadded base64url; `""` on empty or invalid hex.
+pub fn b64url_of_hex(hex : String) -> String {
+  let len = hex.length()
+  if len % 2 != 0 {
+    return ""
+  }
+  let bytes : Array[Int] = []
+  let mut i = 0
+  while i < len {
+    let hi = json_hex_nibble(hex.code_unit_at(i))
+    let lo = json_hex_nibble(hex.code_unit_at(i + 1))
+    if hi < 0 || lo < 0 {
+      return ""
+    }
+    bytes.push(hi * 16 + lo)
+    i = i + 2
+  }
+  let out = StringBuilder::new()
+  let mut j = 0
+  while j < bytes.length() {
+    let n = bytes.length() - j
+    let b0 = bytes[j]
+    let b1 = if n > 1 { bytes[j + 1] } else { 0 }
+    let b2 = if n > 2 { bytes[j + 2] } else { 0 }
+    out.write_byte(b64url_char_byte(b0 >> 2))
+    out.write_byte(b64url_char_byte(((b0 & 3) << 4) | (b1 >> 4)))
+    if n > 1 {
+      out.write_byte(b64url_char_byte(((b1 & 15) << 2) | (b2 >> 6)))
+    }
+    if n > 2 {
+      out.write_byte(b64url_char_byte(b2 & 63))
+    }
+    j = j + 3
+  }
+  out.to_string()
+}
+
+/// Base64url (padded or not) to lowercase hex; `""` for invalid base64url.
+pub fn hex_of_b64url(s : String) -> String {
+  let out = StringBuilder::new()
+  let mut acc = 0
+  let mut held = 0
+  for i in 0..<s.length() {
+    let c = s.code_unit_at(i)
+    if c == 61 {
+      continue
+    }
+    let v = b64url_decode_char(c)
+    if v < 0 {
+      return ""
+    }
+    acc = ((acc << 6) | v) & 0xFFFF
+    held = held + 6
+    if held >= 8 {
+      held = held - 8
+      let b = (acc >> held) & 0xFF
+      out.write_byte(json_hex_byte(b >> 4))
+      out.write_byte(json_hex_byte(b & 15))
+    }
+  }
+  out.to_string()
+}

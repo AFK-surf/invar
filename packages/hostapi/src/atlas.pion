@@ -1,0 +1,279 @@
+// Shelf-based glyph atlas packer with LRU shelf/plot eviction.
+// Ported from libs/mbui/src/hostapi/atlas.mbt.
+
+/// A plot's side, in pixels: the largest glyph a host draws.
+pub let atlas_plot : Int = 512
+
+struct Plot {
+  x : Int
+  y : Int
+  mut free_y : Int
+  mut shelves : Array[Int]
+}
+
+struct Shelf {
+  mut plot : Int
+  mut y : Int
+  mut h : Int
+  mut x : Int
+  mut keys : Array[Int]
+  mut drawn : Int
+}
+
+/// A host's atlas `side` pixels a side, as its glyphs are placed in it.
+pub struct Atlas {
+  plot : Int
+  plots : Array[Plot]
+  mut shelves : Array[Shelf]
+  mut spare : Array[Int]
+  mut opens : Array[Int]
+  mut frame : Int
+  mut before_full_cb : Option[() -> Unit]
+  mut full_frame : Int
+}
+
+let atlas_open_most : Int = 16
+
+/// An atlas `side` pixels a side, empty (0: none, nothing placed in it).
+pub fn Atlas::new(side : Int) -> Atlas {
+  let plot = if side < atlas_plot { side } else { atlas_plot }
+  let n = if plot > 0 { side / plot } else { 0 }
+  let plots : Array[Plot] = []
+  for j in 0..<n {
+    for i in 0..<n {
+      plots.push(Plot::{ x: i * plot, y: j * plot, free_y: 0, shelves: [] })
+    }
+  }
+  Atlas::{
+    plot,
+    plots,
+    shelves: [],
+    spare: [],
+    opens: [],
+    frame: 0,
+    before_full_cb: None,
+    full_frame: -1,
+  }
+}
+
+/// The next frame begins: what it draws from is kept through it.
+pub fn Atlas::next_frame(self : Atlas) -> Unit {
+  self.frame = self.frame + 1
+}
+
+/// Shelf `plot` (`Atlas::place`'s) drawn from in this frame.
+pub fn Atlas::drawn(self : Atlas, plot : Int) -> Unit {
+  self.shelves[plot].drawn = self.frame
+}
+
+/// `f` asked, once a frame, before a shelf is emptied for what comes next.
+pub fn Atlas::before_full(self : Atlas, f : () -> Unit) -> Unit {
+  self.before_full_cb = Some(f)
+}
+
+/// Whether it is an atlas at all (one of a side of 0 is none).
+pub fn Atlas::sized(self : Atlas) -> Bool {
+  self.plots.length() > 0
+}
+
+/// Whether a glyph `w` × `h` pixels has a place in it at all.
+pub fn Atlas::holds(self : Atlas, w : Int, h : Int) -> Bool {
+  w > 0 && h > 0 && w <= self.plot && h <= self.plot && self.plots.length() > 0
+}
+
+fn Atlas::fits(self : Atlas, i : Int, w : Int, h : Int) -> Bool {
+  let s = self.shelves[i]
+  let p = self.plots[s.plot]
+  s.x + w <= self.plot &&
+  (h <= s.h || (p.free_y == s.y + s.h + 1 && s.y + h <= self.plot))
+}
+
+fn Atlas::shelf(self : Atlas, p : Int, y : Int, h : Int) -> Int {
+  match self.spare.pop() {
+    Some(i) => {
+      let s = self.shelves[i]
+      s.plot = p
+      s.y = y
+      s.h = h
+      s.x = 0
+      s.keys = []
+      s.drawn = -1
+      i
+    }
+    None => {
+      self.shelves.push(Shelf::{ plot: p, y, h, x: 0, keys: [], drawn: -1 })
+      self.shelves.length() - 1
+    }
+  }
+}
+
+fn Atlas::room(self : Atlas, h : Int, gone : (Int) -> Unit) -> Option[Int] {
+  let first = if self.opens.length() > 0 {
+    self.shelves[self.opens[self.opens.length() - 1]].plot
+  } else {
+    0
+  }
+  let np = self.plots.length()
+  for k in 0..<np {
+    let pi = (first + k) % np
+    let p = self.plots[pi]
+    if p.free_y + h <= self.plot {
+      let s = self.shelf(pi, p.free_y, h)
+      p.shelves.push(s)
+      p.free_y = p.free_y + h + 1
+      return Some(s)
+    }
+  }
+  match self.before_full_cb {
+    Some(f) => {
+      if self.full_frame != self.frame {
+        self.full_frame = self.frame
+        f()
+      }
+    }
+    None => ()
+  }
+  let mut best = -1
+  let mut fit = false
+  for i in 0..<self.shelves.length() {
+    let s = self.shelves[i]
+    if s.h < h || s.drawn >= self.frame || s.plot < 0 {
+      continue
+    }
+    let close = s.h <= h * 2 + 8
+    if best < 0 ||
+      (close && !fit) ||
+      (close == fit && s.drawn < self.shelves[best].drawn) {
+      best = i
+      fit = close
+    }
+  }
+  if best >= 0 {
+    let next_opens : Array[Int] = []
+    for i in self.opens {
+      if i != best {
+        next_opens.push(i)
+      }
+    }
+    self.opens = next_opens
+    let s = self.shelves[best]
+    for k in s.keys {
+      gone(k)
+    }
+    s.keys = []
+    s.x = 0
+    let pi = s.plot
+    let p = self.plots[pi]
+    if p.free_y == s.y + s.h + 1 {
+      p.free_y = s.y
+      let _ = p.shelves.pop()
+      self.spare.push(best)
+      s.plot = -1
+      let n = self.shelf(pi, p.free_y, h)
+      p.shelves.push(n)
+      p.free_y = p.free_y + h + 1
+      return Some(n)
+    }
+    return Some(best)
+  }
+  let mut at = -1
+  let mut at_last = self.frame
+  for pi in 0..<self.plots.length() {
+    let p = self.plots[pi]
+    let mut last = -1
+    for i in p.shelves {
+      if self.shelves[i].drawn > last {
+        last = self.shelves[i].drawn
+      }
+    }
+    if last < at_last {
+      at = pi
+      at_last = last
+    }
+  }
+  if at < 0 {
+    return None
+  }
+  let p = self.plots[at]
+  let keep_opens : Array[Int] = []
+  for i in self.opens {
+    if self.shelves[i].plot != at {
+      keep_opens.push(i)
+    }
+  }
+  self.opens = keep_opens
+  for i in p.shelves {
+    let s = self.shelves[i]
+    for k in s.keys {
+      gone(k)
+    }
+    s.keys = []
+    s.plot = -1
+    self.spare.push(i)
+  }
+  p.shelves = []
+  p.free_y = 0
+  let s = self.shelf(at, 0, h)
+  p.shelves.push(s)
+  p.free_y = h + 1
+  Some(s)
+}
+
+/// A glyph `w` × `h` pixels (`key`) placed: returns `(shelf_id, x, y)`.
+pub fn Atlas::place(
+  self : Atlas,
+  key : Int,
+  w : Int,
+  h : Int,
+  gone : (Int) -> Unit,
+) -> Option[(Int, Int, Int)] {
+  if !self.holds(w, h) {
+    return None
+  }
+  let mut at = -1
+  let mut at_h = 0
+  for i in self.opens {
+    let ih = if self.shelves[i].h > h { self.shelves[i].h } else { h }
+    if self.fits(i, w, h) && (at < 0 || ih < at_h) {
+      at = i
+      at_h = ih
+    }
+  }
+  if at < 0 {
+    let s = match self.room(h, gone) {
+      Some(idx) => idx
+      None => return None
+    }
+    self.opens.push(s)
+    if self.opens.length() > atlas_open_most {
+      let trimmed : Array[Int] = []
+      for i in 1..<self.opens.length() {
+        trimmed.push(self.opens[i])
+      }
+      self.opens = trimmed
+    }
+    at = s
+  }
+  let s = self.shelves[at]
+  let p = self.plots[s.plot]
+  if h > s.h {
+    s.h = h
+    p.free_y = s.y + h + 1
+  }
+  let x = s.x
+  s.x = x + w + 1
+  s.keys.push(key)
+  s.drawn = self.frame
+  Some((at, p.x + x, p.y + s.y))
+}
+
+/// Everything placed let go (`atlas_generation` changed).
+pub fn Atlas::clear(self : Atlas) -> Unit {
+  for p in self.plots {
+    p.free_y = 0
+    p.shelves = []
+  }
+  self.shelves = []
+  self.spare = []
+  self.opens = []
+}
