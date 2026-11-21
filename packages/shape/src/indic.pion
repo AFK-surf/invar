@@ -1,0 +1,1085 @@
+// The Indic shaper: syllables
+// found by the Ragel machine, consonants placed by what the font's below/post/pre-base forms would substitute, the
+// initial reordering before the basic features and the final one after them.
+// Ported from libs/mbui/src/shape/indic.mbt.
+
+import "font"
+
+let shaper_indic : Int = 2
+
+// categories (indic::category)
+let ot_c : Int = 1
+let ot_v : Int = 2
+let ot_n : Int = 3
+let ot_h : Int = 4
+let ot_zwnj : Int = 5
+let ot_zwj : Int = 6
+let ot_m : Int = 7
+let ot_sm : Int = 8
+let ot_placeholder : Int = 10
+let ot_dottedcircle : Int = 11
+let ot_rs : Int = 12
+let ot_mpst : Int = 13
+let ot_repha : Int = 14
+let ot_ra : Int = 15
+let ot_cm : Int = 16
+let ot_cs : Int = 18
+
+// positions (indic::position)
+let pos_ra_to_become_reph : Int = 1
+let pos_pre_m : Int = 2
+let pos_pre_c : Int = 3
+let pos_base_c : Int = 4
+let pos_after_main : Int = 5
+let pos_before_sub : Int = 7
+let pos_below_c : Int = 8
+let pos_after_sub : Int = 9
+let pos_before_post : Int = 10
+let pos_post_c : Int = 11
+let pos_after_post : Int = 12
+let pos_smvd : Int = 13
+let pos_end : Int = 14
+
+fn cat_flag(c : Int) -> Int {
+  if c < 32 && c >= 0 {
+    1 << c
+  } else {
+    0
+  }
+}
+
+let consonant_flags : Int = (1 << 1) | (1 << 18) | (1 << 15) | (1 << 16) | (1 << 2) | (1 << 10) | (1 << 11)
+let joiner_flags : Int = (1 << 6) | (1 << 5)
+
+fn GlyphInfo::is_one_of(self : GlyphInfo, flags : Int) -> Bool {
+  if self.ligated() {
+    return false
+  }
+  (cat_flag(self.shaper_category()) & flags) != 0
+}
+
+fn GlyphInfo::is_joiner(self : GlyphInfo) -> Bool {
+  self.is_one_of(joiner_flags)
+}
+
+fn GlyphInfo::is_consonant(self : GlyphInfo) -> Bool {
+  self.is_one_of(consonant_flags)
+}
+
+fn GlyphInfo::is_halant(self : GlyphInfo) -> Bool {
+  self.is_one_of(cat_flag(ot_h))
+}
+
+/// The Indic features, in order (indic_feature's indices), and whether each is global.
+fn get_indic_features() -> Array[(String, Int)] {
+  let base_flags = f_manual_zwnj | f_manual_zwj | f_per_syllable
+  [
+    ("nukt", f_global | base_flags),
+    ("akhn", f_global | base_flags),
+    ("rphf", base_flags),
+    ("rkrf", f_global | base_flags),
+    ("pref", base_flags),
+    ("blwf", base_flags),
+    ("abvf", base_flags),
+    ("half", base_flags),
+    ("pstf", base_flags),
+    ("vatu", f_global | base_flags),
+    ("cjct", f_global | base_flags),
+    ("init", base_flags),
+    ("pres", f_global | base_flags),
+    ("abvs", f_global | base_flags),
+    ("blws", f_global | base_flags),
+    ("psts", f_global | base_flags),
+    ("haln", f_global | base_flags),
+  ]
+}
+
+let f_rphf : Int = 2
+let f_pref : Int = 4
+let f_blwf : Int = 5
+let f_abvf : Int = 6
+let f_half : Int = 7
+let f_pstf : Int = 8
+let f_init : Int = 11
+
+// reph positions and modes
+let reph_implicit : Int = 0
+let reph_explicit : Int = 1
+let reph_log_repha : Int = 2
+
+/// A script's configuration: (script, has an old spec, virama, reph position, reph mode, blwf before and after).
+fn get_indic_configs() -> Array[(String, Bool, Int, Int, Int, Bool)] {
+  [
+    ("Deva", true, 0x094D, pos_before_post, reph_implicit, true),
+    ("Beng", true, 0x09CD, pos_after_sub, reph_implicit, true),
+    ("Guru", true, 0x0A4D, pos_before_sub, reph_implicit, true),
+    ("Gujr", true, 0x0ACD, pos_before_post, reph_implicit, true),
+    ("Orya", true, 0x0B4D, pos_after_main, reph_implicit, true),
+    ("Taml", true, 0x0BCD, pos_after_post, reph_implicit, true),
+    ("Telu", true, 0x0C4D, pos_after_post, reph_explicit, false),
+    ("Knda", true, 0x0CCD, pos_after_post, reph_implicit, false),
+    ("Mlym", true, 0x0D4D, pos_after_main, reph_log_repha, true),
+    ("Sinh", false, 0x0DCA, pos_after_post, reph_explicit, true),
+  ]
+}
+
+/// The Indic shaper's part of a plan.
+struct IndicPlan {
+  virama : Int
+  reph_pos : Int
+  reph_mode : Int
+  blwf_pre_and_post : Bool
+  is_old_spec : Bool
+  zero_context : Bool
+  /// each would-substitute feature's GSUB lookups (indices into the plan's lookups): rphf, pref, blwf, pstf, vatu
+  rphf : (Int, Int)
+  pref : (Int, Int)
+  blwf : (Int, Int)
+  pstf : (Int, Int)
+  vatu : (Int, Int)
+  mask_array : Array[Int]
+}
+
+fn indic_plan_new(
+  script : Int,
+  chosen_gsub_script : Int,
+  features : Array[FeatureMap],
+  stages : Array[(Int, Int)],
+) -> IndicPlan {
+  let mut config = ("", false, 0, pos_before_post, reph_implicit, true)
+  for c in get_indic_configs() {
+    if tag(c.0) == script {
+      config = c
+    }
+  }
+  let is_old_spec = config.1 && (chosen_gsub_script == 0 || (chosen_gsub_script & 0xFF) != 0x32)
+  let zero_context = is_old_spec && script != tag("Mlym")
+  let feature = fn(t : String) -> Option[FeatureMap] {
+    for f in features {
+      if f.tag == tag(t) {
+        return Some(f)
+      }
+    }
+    None
+  }
+  let range = fn(t : String) -> (Int, Int) {
+    match feature(t) {
+      Some(f) => {
+        let stage = f.stage[0]
+        if stage >= stages.length() {
+          return (0, 0)
+        }
+        let start = if stage == 0 { 0 } else { stages[stage - 1].0 }
+        (start, stages[stage].0)
+      }
+      None => (0, 0)
+    }
+  }
+  let mask_array : Array[Int] = []
+  for f in get_indic_features() {
+    if (f.1 & f_global) != 0 {
+      mask_array.push(0)
+    } else {
+      match feature(f.0) {
+        Some(m) => mask_array.push(m.one_mask)
+        None => mask_array.push(0)
+      }
+    }
+  }
+  IndicPlan::{
+    virama: config.2,
+    reph_pos: config.3,
+    reph_mode: config.4,
+    blwf_pre_and_post: config.5,
+    is_old_spec,
+    zero_context,
+    rphf: range("rphf"),
+    pref: range("pref"),
+    blwf: range("blwf"),
+    pstf: range("pstf"),
+    vatu: range("vatu"),
+    mask_array,
+  }
+}
+
+/// Whether a feature's lookups would substitute the glyphs (IndicWouldSubstituteFeature).
+fn ShapePlan::would_substitute(self : ShapePlan, lookups : (Int, Int), zero_context : Bool, glyphs : Array[Int]) -> Bool {
+  let table = match self.ot.gsub {
+    Some(t) => t
+    None => return false
+  }
+  for k in lookups.0..<lookups.1 {
+    let lm = self.lookups[0][k]
+    match table.lookup(self.ot.data, lm.index) {
+      Some(lookup) => if would_apply_lookup(self.ot, lookup, glyphs, zero_context) { return true }
+      None => ()
+    }
+  }
+  false
+}
+
+fn indic_decompose(ab : Int) -> Option[(Int, Int)] {
+  match ab {
+    0x0931 | 0x09DC | 0x09DD | 0x0B94 => None
+    _ => decompose(ab)
+  }
+}
+
+fn indic_compose(a : Int, b : Int) -> Option[Int] {
+  if gc_is_mark(general_category(a)) {
+    return None
+  }
+  if a == 0x09AF && b == 0x09BC {
+    return Some(0x09DF)
+  }
+  compose(a, b)
+}
+
+fn indic_setup_masks(buffer : Buffer) -> Unit {
+  for i in 0..<buffer.len {
+    let (c, p) = indic_categories(buffer.info[i].glyph_id)
+    buffer.info[i].set_shaper_category(c)
+    buffer.info[i].set_shaper_auxiliary(p)
+  }
+}
+
+fn ints_contains(arr : Array[Int], v : Int) -> Bool {
+  for x in arr {
+    if x == v {
+      return true
+    }
+  }
+  false
+}
+
+/// The vowel constraints: a dotted circle between vowels that would look like another.
+fn preprocess_vowel_constraints(buffer : Buffer) -> Unit {
+  let script = buffer.script
+  let rules : Array[(String, Int, Array[Int])] = []
+  for r in get_vowel_constraints() {
+    if tag(r.0) == script {
+      rules.push(r)
+    }
+  }
+  let deva = script == tag("Deva")
+  if rules.length() == 0 && !deva {
+    return
+  }
+  let cur = fn(i : Int) -> Int { if buffer.idx + i < buffer.len { buffer.info[buffer.idx + i].glyph_id } else { 0 } }
+  let dotted = fn() -> Unit {
+    buffer.output_glyph(0x25CC)
+    buffer.out_info()[buffer.out_len - 1].clear_continuation()
+  }
+  buffer.clear_output()
+  buffer.idx = 0
+  while buffer.idx + 1 < buffer.len {
+    let mut matched = false
+    let c0 = cur(0)
+    let c1 = cur(1)
+    for r in rules {
+      if r.1 == c0 && ints_contains(r.2, c1) {
+        matched = true
+      }
+    }
+    if deva && c0 == 0x0930 && c1 == 0x094D && buffer.idx + 2 < buffer.len && cur(2) == 0x0907 {
+      buffer.next_glyph()
+      buffer.next_glyph()
+      dotted()
+    }
+    buffer.next_glyph()
+    if matched {
+      dotted()
+      buffer.next_glyph()
+    }
+  }
+  let _ = buffer.sync()
+}
+
+fn indic_found_syllable(buffer : Buffer, ts : Int, te : Int, serial_box : Array[Int], kind : Int) -> Unit {
+  let s = serial_box[0]
+  for i in ts..<te {
+    if i < buffer.len {
+      buffer.info[i].set_syllable((s << 4) | kind)
+    }
+  }
+  let next_s = s + 1
+  serial_box[0] = if next_s == 16 { 1 } else { next_s }
+  if kind == 4 {
+    buffer.scratch_flags = buffer.scratch_flags | scratch_has_broken_syllable
+  }
+}
+
+/// The syllable machine (find_syllables_indic): each glyph's syllable byte is serial << 4 | kind.
+fn find_syllables_indic(buffer : Buffer) -> Unit {
+  let from_state_actions = get_indic_machine_from_state_actions()
+  let eof_trans = get_indic_machine_eof_trans()
+  let index_offsets = get_indic_machine_index_offsets()
+  let char_class = get_indic_machine_char_class()
+  let trans_keys = get_indic_machine_trans_keys()
+  let indices = get_indic_machine_indices()
+  let index_defaults = get_indic_machine_index_defaults()
+  let cond_targs = get_indic_machine_cond_targs()
+  let cond_actions = get_indic_machine_cond_actions()
+  let to_state_actions = get_indic_machine_to_state_actions()
+  let mut cs = 31
+  let mut ts = 0
+  let mut te = 0
+  let mut act = 0
+  let mut p = 0
+  let pe = buffer.len
+  let eof = buffer.len
+  let serial_box : Array[Int] = [1]
+  while p != pe || p == eof {
+    if from_state_actions[cs] == 10 {
+      ts = p
+    }
+    let mut trans = 0
+    if p == eof {
+      if eof_trans[cs] > 0 {
+        trans = eof_trans[cs] - 1
+      }
+    } else {
+      let keys = cs << 1
+      let inds = index_offsets[cs]
+      let c = buffer.info[p].shaper_category()
+      if c <= 57 && c >= 1 {
+        let ic = char_class[c - 1]
+        if ic <= trans_keys[keys + 1] && ic >= trans_keys[keys] {
+          trans = indices[inds + (ic - trans_keys[keys])]
+        } else {
+          trans = index_defaults[cs]
+        }
+      } else {
+        trans = index_defaults[cs]
+      }
+    }
+    cs = cond_targs[trans]
+    match cond_actions[trans] {
+      2 => te = p + 1
+      11 => {
+        te = p + 1
+        indic_found_syllable(buffer, ts, te, serial_box, 5)
+      }
+      14 => {
+        te = p
+        p = p - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 0)
+      }
+      15 => {
+        te = p
+        p = p - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 1)
+      }
+      18 => {
+        te = p
+        p = p - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 2)
+      }
+      20 => {
+        te = p
+        p = p - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 3)
+      }
+      16 => {
+        te = p
+        p = p - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 4)
+      }
+      17 => {
+        te = p
+        p = p - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 5)
+      }
+      1 => {
+        p = te - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 0)
+      }
+      3 => {
+        p = te - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 1)
+      }
+      7 => {
+        p = te - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 2)
+      }
+      8 => {
+        p = te - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 3)
+      }
+      4 => {
+        p = te - 1
+        indic_found_syllable(buffer, ts, te, serial_box, 4)
+      }
+      6 =>
+        match act {
+          1 => {
+            p = te - 1
+            indic_found_syllable(buffer, ts, te, serial_box, 0)
+          }
+          5 => {
+            p = te - 1
+            indic_found_syllable(buffer, ts, te, serial_box, 5)
+          }
+          6 => {
+            p = te - 1
+            indic_found_syllable(buffer, ts, te, serial_box, 4)
+          }
+          7 => {
+            p = te - 1
+            indic_found_syllable(buffer, ts, te, serial_box, 5)
+          }
+          _ => ()
+        }
+      19 => {
+        te = p + 1
+        act = 1
+      }
+      13 => {
+        te = p + 1
+        act = 5
+      }
+      5 => {
+        te = p + 1
+        act = 6
+      }
+      12 => {
+        te = p + 1
+        act = 7
+      }
+      _ => ()
+    }
+    if p == eof {
+      if cs >= 31 {
+        break
+      }
+    } else {
+      if to_state_actions[cs] == 9 {
+        ts = 0
+      }
+      p += 1
+      continue
+    }
+    break
+  }
+}
+
+/// Inserts a dotted circle at the start of each broken syllable.
+fn insert_dotted_circles(face : font::Face, buffer : Buffer, broken : Int, category : Int, repha : Int, position : Int) -> Bool {
+  if (buffer.scratch_flags & scratch_has_broken_syllable) == 0 {
+    return false
+  }
+  let glyph = match nominal_glyph(face, 0x25CC) {
+    Some(g) => g
+    None => return false
+  }
+  buffer.clear_output()
+  buffer.idx = 0
+  let mut last = 0
+  while buffer.idx < buffer.len {
+    let syllable = buffer.cur(0).syllable()
+    if last != syllable && (syllable & 0x0F) == broken {
+      last = syllable
+      let g = GlyphInfo::new()
+      g.glyph_id = glyph
+      g.set_shaper_category(category)
+      if position >= 0 {
+        g.set_shaper_auxiliary(position)
+      }
+      g.cluster = buffer.cur(0).cluster
+      g.mask = buffer.cur(0).mask
+      g.set_syllable(syllable)
+      if repha >= 0 {
+        while buffer.idx < buffer.len && last == buffer.cur(0).syllable() && buffer.cur(0).shaper_category() == repha {
+          buffer.next_glyph()
+        }
+      }
+      buffer.output_info(g)
+    } else {
+      buffer.next_glyph()
+    }
+  }
+  let _ = buffer.sync()
+  true
+}
+
+fn rotate_left(buffer : Buffer, a : Int, b : Int) -> Unit {
+  if b <= a {
+    return
+  }
+  let first = buffer.info[a]
+  for i in a..<b {
+    buffer.info[i] = buffer.info[i + 1]
+  }
+  buffer.info[b] = first
+}
+
+fn rotate_right(buffer : Buffer, a : Int, b : Int) -> Unit {
+  if b <= a {
+    return
+  }
+  let last = buffer.info[b]
+  let mut i = b
+  while i > a {
+    buffer.info[i] = buffer.info[i - 1]
+    i -= 1
+  }
+  buffer.info[a] = last
+}
+
+fn indic_pause(plan : ShapePlan, face : font::Face, buffer : Buffer, which : Int) -> Unit {
+  match which {
+    1 => find_syllables_indic(buffer)
+    2 => indic_initial_reordering(plan, face, buffer)
+    3 => indic_final_reordering(plan, face, buffer)
+    4 => {
+      for i in 0..<buffer.len {
+        buffer.info[i].set_syllable(0)
+      }
+    }
+    _ => ()
+  }
+}
+
+fn indic_initial_reordering(plan : ShapePlan, face : font::Face, buffer : Buffer) -> Unit {
+  let ip = match plan.indic {
+    Some(p) => p
+    None => return
+  }
+  // update_consonant_positions
+  if ip.virama != 0 {
+    match nominal_glyph(face, ip.virama) {
+      Some(virama) => {
+        for i in 0..<buffer.len {
+          let info = buffer.info[i]
+          if info.shaper_auxiliary() == pos_base_c {
+            info.set_shaper_auxiliary(consonant_position(plan, ip, info.glyph_id, virama))
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  let _ = insert_dotted_circles(face, buffer, 4, ot_dottedcircle, ot_repha, pos_end)
+  let mut start = 0
+  let mut end = buffer.next_syllable(0)
+  while start < buffer.len {
+    let kind = buffer.info[start].syllable() & 0x0F
+    if kind == 0 || kind == 1 || kind == 2 || kind == 4 {
+      initial_reordering_consonant_syllable(plan, ip, buffer, start, end)
+    }
+    start = end
+    end = buffer.next_syllable(start)
+  }
+}
+
+fn consonant_position(plan : ShapePlan, ip : IndicPlan, consonant : Int, virama : Int) -> Int {
+  let ws = fn(r : (Int, Int), g : Array[Int]) -> Bool { plan.would_substitute(r, ip.zero_context, g) }
+  if ws(ip.blwf, [virama, consonant]) ||
+    ws(ip.blwf, [consonant, virama]) ||
+    ws(ip.vatu, [virama, consonant]) ||
+    ws(ip.vatu, [consonant, virama]) {
+    return pos_below_c
+  }
+  if ws(ip.pstf, [virama, consonant]) || ws(ip.pstf, [consonant, virama]) {
+    return pos_post_c
+  }
+  if ws(ip.pref, [virama, consonant]) || ws(ip.pref, [consonant, virama]) {
+    return pos_post_c
+  }
+  pos_base_c
+}
+
+fn initial_reordering_consonant_syllable(plan : ShapePlan, ip : IndicPlan, buffer : Buffer, start : Int, end : Int) -> Unit {
+  let info = fn(i : Int) -> GlyphInfo { buffer.info[i] }
+  let cat = fn(i : Int) -> Int { buffer.info[i].shaper_category() }
+  let pos = fn(i : Int) -> Int { buffer.info[i].shaper_auxiliary() }
+  let set_pos = fn(i : Int, p : Int) -> Unit { buffer.info[i].set_shaper_auxiliary(p) }
+  if buffer.script == tag("Knda") &&
+    start + 3 <= end &&
+    info(start).is_one_of(cat_flag(ot_ra)) &&
+    info(start + 1).is_one_of(cat_flag(ot_h)) &&
+    info(start + 2).is_one_of(cat_flag(ot_zwj)) {
+    buffer.merge_clusters(start + 1, start + 3)
+    let t = buffer.info[start + 1]
+    buffer.info[start + 1] = buffer.info[start + 2]
+    buffer.info[start + 2] = t
+  }
+  let mut base = end
+  let mut has_reph = false
+  let mut limit = start
+  if ip.mask_array[f_rphf] != 0 &&
+    start + 3 <= end &&
+    (
+      (ip.reph_mode == reph_implicit && !info(start + 2).is_joiner()) ||
+      (ip.reph_mode == reph_explicit && cat(start + 2) == ot_zwj)
+    ) {
+    let g = [info(start).glyph_id, info(start + 1).glyph_id]
+    let g3 = [info(start).glyph_id, info(start + 1).glyph_id, if ip.reph_mode == reph_explicit { info(start + 2).glyph_id } else { 0 }]
+    if plan.would_substitute(ip.rphf, ip.zero_context, g) ||
+      (ip.reph_mode == reph_explicit && plan.would_substitute(ip.rphf, ip.zero_context, g3)) {
+      limit += 2
+      while limit < end && info(limit).is_joiner() {
+        limit += 1
+      }
+      base = start
+      has_reph = true
+    }
+  } else if ip.reph_mode == reph_log_repha && cat(start) == ot_repha {
+    limit += 1
+    while limit < end && info(limit).is_joiner() {
+      limit += 1
+    }
+    base = start
+    has_reph = true
+  }
+  let mut i = end
+  let mut seen_below = false
+  while true {
+    i -= 1
+    let inf = info(i)
+    if inf.is_consonant() {
+      if pos(i) != pos_below_c && (pos(i) != pos_post_c || seen_below) {
+        base = i
+        break
+      }
+      if pos(i) == pos_below_c {
+        seen_below = true
+      }
+      base = i
+    } else if start < i && cat(i) == ot_zwj && cat(i - 1) == ot_h {
+      break
+    }
+    if i <= limit {
+      break
+    }
+  }
+  if has_reph && base == start && limit - base <= 2 {
+    has_reph = false
+  }
+  for k in start..<base {
+    set_pos(k, if pos(k) < pos_pre_c { pos(k) } else { pos_pre_c })
+  }
+  if base < end {
+    set_pos(base, pos_base_c)
+  }
+  if has_reph {
+    set_pos(start, pos_ra_to_become_reph)
+  }
+  if ip.is_old_spec {
+    let disallow_double_halants = buffer.script == tag("Knda")
+    for k in (base + 1)..<end {
+      if cat(k) == ot_h {
+        let mut j = end - 1
+        while j > k {
+          if info(j).is_consonant() || (disallow_double_halants && cat(j) == ot_h) {
+            break
+          }
+          j -= 1
+        }
+        if cat(j) != ot_h && j > k {
+          rotate_left(buffer, k, j)
+        }
+        break
+      }
+    }
+  }
+  // attach misc marks to the previous char
+  let mut last_pos = 0
+  for k in start..<end {
+    let c = cat(k)
+    let ok = (
+        cat_flag(c) &
+        (cat_flag(ot_zwj) | cat_flag(ot_zwnj) | cat_flag(ot_n) | cat_flag(ot_rs) | cat_flag(ot_cm) | cat_flag(ot_h))
+      ) !=
+      0
+    if ok {
+      let mut p = last_pos
+      if c == ot_h && p == pos_pre_m {
+        let mut j = k
+        while j >= start + 1 {
+          let prev = pos(j - 1)
+          if prev != pos_pre_m {
+            p = prev
+            break
+          }
+          j -= 1
+        }
+      }
+      set_pos(k, p)
+    } else if pos(k) != pos_smvd {
+      if c == ot_mpst && k > start && cat(k - 1) == ot_sm {
+        set_pos(k - 1, pos(k))
+      }
+      last_pos = pos(k)
+    }
+  }
+  let mut last = base
+  for k in (base + 1)..<end {
+    if info(k).is_consonant() {
+      for o in (last + 1)..<k {
+        if pos(o) < pos_smvd {
+          set_pos(o, pos(k))
+        }
+      }
+      last = k
+    } else if (cat_flag(cat(k)) & (cat_flag(ot_m) | cat_flag(ot_mpst))) != 0 {
+      last = k
+    }
+  }
+  // sort by position, remembering where each came from
+  let syllable = info(start).syllable()
+  for k in start..<end {
+    buffer.info[k].set_syllable(k - start)
+  }
+  for k in (start + 1)..<end {
+    let item = buffer.info[k]
+    let mut j = k
+    while j > start && buffer.info[j - 1].shaper_auxiliary() > item.shaper_auxiliary() {
+      buffer.info[j] = buffer.info[j - 1]
+      j -= 1
+    }
+    buffer.info[j] = item
+  }
+  let mut first_left_matra = end
+  let mut last_left_matra = end
+  base = end
+  for k in start..<end {
+    if pos(k) == pos_base_c {
+      base = k
+      break
+    } else if pos(k) == pos_pre_m {
+      if first_left_matra == end {
+        first_left_matra = k
+      }
+      last_left_matra = k
+    }
+  }
+  if first_left_matra < last_left_matra {
+    buffer.reverse_range(first_left_matra, last_left_matra + 1)
+    let mut k = first_left_matra
+    for j in first_left_matra..<(last_left_matra + 1) {
+      if (cat_flag(cat(j)) & (cat_flag(ot_m) | cat_flag(ot_mpst))) != 0 {
+        buffer.reverse_range(k, j + 1)
+        k = j + 1
+      }
+    }
+  }
+  if ip.is_old_spec || end - start > 127 {
+    buffer.merge_clusters(base, end)
+  } else {
+    for k in base..<end {
+      let order = info(k).syllable()
+      if order != 255 {
+        let mut mn = k
+        let mut mx = k
+        let mut j = start + order
+        while j != k {
+          mn = if j < mn { j } else { mn }
+          mx = if j > mx { j } else { mx }
+          let next = start + info(j).syllable()
+          info(j).set_syllable(255)
+          j = next
+        }
+        buffer.merge_clusters(if base > mn { base } else { mn }, mx + 1)
+      }
+    }
+  }
+  for k in start..<end {
+    buffer.info[k].set_syllable(syllable)
+  }
+  // masks
+  for k in start..<end {
+    if pos(k) != pos_ra_to_become_reph {
+      break
+    }
+    info(k).mask = info(k).mask | ip.mask_array[f_rphf]
+  }
+  let mut mask = ip.mask_array[f_half]
+  if !ip.is_old_spec && ip.blwf_pre_and_post {
+    mask = mask | ip.mask_array[f_blwf]
+  }
+  for k in start..<base {
+    info(k).mask = info(k).mask | mask
+  }
+  mask = ip.mask_array[f_blwf] | ip.mask_array[f_abvf] | ip.mask_array[f_pstf]
+  for k in (base + 1)..<end {
+    info(k).mask = info(k).mask | mask
+  }
+  if ip.is_old_spec && buffer.script == tag("Deva") {
+    let top = if base > 0 { base - 1 } else { 0 }
+    for k in start..<top {
+      if cat(k) == ot_ra && cat(k + 1) == ot_h && (k + 2 == base || cat(k + 2) != ot_zwj) {
+        info(k).mask = info(k).mask | ip.mask_array[f_blwf]
+        info(k + 1).mask = info(k + 1).mask | ip.mask_array[f_blwf]
+      }
+    }
+  }
+  let pref_len = 2
+  if ip.mask_array[f_pref] != 0 && base + pref_len < end {
+    for k in (base + 1)..<(end - pref_len + 1) {
+      if plan.would_substitute(ip.pref, ip.zero_context, [info(k).glyph_id, info(k + 1).glyph_id]) {
+        for j in k..<(k + pref_len) {
+          info(j).mask = info(j).mask | ip.mask_array[f_pref]
+        }
+        break
+      }
+    }
+  }
+  for k in (start + 1)..<end {
+    if info(k).is_joiner() {
+      let non_joiner = cat(k) == ot_zwnj
+      let mut j = k
+      while true {
+        j -= 1
+        if non_joiner {
+          info(j).mask = info(j).mask & (ip.mask_array[f_half] ^ (-1))
+        }
+        if j <= start || info(j).is_consonant() {
+          break
+        }
+      }
+    }
+  }
+}
+
+fn indic_final_reordering(plan : ShapePlan, face : font::Face, buffer : Buffer) -> Unit {
+  let ip = match plan.indic {
+    Some(p) => p
+    None => return
+  }
+  if buffer.len == 0 {
+    return
+  }
+  let virama = if ip.virama != 0 { nominal_glyph(face, ip.virama) } else { None }
+  let mut start = 0
+  let mut end = buffer.next_syllable(0)
+  while start < buffer.len {
+    final_reordering_syllable(buffer, ip, virama, start, end)
+    start = end
+    end = buffer.next_syllable(start)
+  }
+}
+
+fn final_reordering_syllable(buffer : Buffer, ip : IndicPlan, virama : Option[Int], start : Int, end : Int) -> Unit {
+  let info = fn(i : Int) -> GlyphInfo { buffer.info[i] }
+  let cat = fn(i : Int) -> Int { buffer.info[i].shaper_category() }
+  let pos = fn(i : Int) -> Int { buffer.info[i].shaper_auxiliary() }
+  let mlym_or_taml = buffer.script == tag("Mlym") || buffer.script == tag("Taml")
+  match virama {
+    Some(v) => {
+      for k in start..<end {
+        let inf = info(k)
+        if inf.glyph_id == v && inf.ligated() && inf.multiplied() {
+          inf.set_shaper_category(ot_h)
+          inf.clear_ligated_and_multiplied()
+        }
+      }
+    }
+    None => ()
+  }
+  let mut try_pref = ip.mask_array[f_pref] != 0
+  let mut base = start
+  while base < end {
+    if pos(base) >= pos_base_c {
+      if try_pref && base + 1 < end {
+        for k in (base + 1)..<end {
+          let inf = info(k)
+          if (inf.mask & ip.mask_array[f_pref]) != 0 {
+            if !(inf.substituted() && inf.ligated_and_didnt_multiply()) {
+              base = k
+              while base < end && info(base).is_halant() {
+                base += 1
+              }
+              if base < end {
+                info(base).set_shaper_auxiliary(pos_base_c)
+              }
+              try_pref = false
+            }
+            break
+          }
+          if base == end {
+            break
+          }
+        }
+      }
+      if buffer.script == tag("Mlym") {
+        let mut k = base + 1
+        while k < end {
+          while k < end && info(k).is_joiner() {
+            k += 1
+          }
+          if k == end || !info(k).is_halant() {
+            break
+          }
+          k += 1
+          while k < end && info(k).is_joiner() {
+            k += 1
+          }
+          if k < end && info(k).is_consonant() && pos(k) == pos_below_c {
+            base = k
+            info(k).set_shaper_auxiliary(pos_base_c)
+          }
+          k += 1
+        }
+      }
+      if start < base && pos(base) > pos_base_c {
+        base -= 1
+      }
+      break
+    }
+    base += 1
+  }
+  if base == end && start < base && info(base - 1).is_one_of(cat_flag(ot_zwj)) {
+    base -= 1
+  }
+  if base < end {
+    while start < base && info(base).is_one_of(cat_flag(ot_n) | cat_flag(ot_h)) {
+      base -= 1
+    }
+  }
+  // reorder matras
+  if start + 1 < end && start < base {
+    let mut new_pos = if base == end { base - 2 } else { base - 1 }
+    if !mlym_or_taml {
+      while true {
+        while new_pos > start && !info(new_pos).is_one_of(cat_flag(ot_m) | cat_flag(ot_mpst) | cat_flag(ot_h)) {
+          new_pos -= 1
+        }
+        if info(new_pos).is_halant() && pos(new_pos) != pos_pre_m {
+          if new_pos + 1 < end && cat(new_pos + 1) == ot_zwj && new_pos > start {
+            new_pos -= 1
+            continue
+          }
+        } else {
+          new_pos = start
+        }
+        break
+      }
+    }
+    if start < new_pos && pos(new_pos) != pos_pre_m {
+      let mut k = new_pos
+      while k >= start + 1 {
+        if pos(k - 1) == pos_pre_m {
+          let old_pos = k - 1
+          if old_pos < base && base <= new_pos {
+            base -= 1
+          }
+          rotate_left(buffer, old_pos, new_pos)
+          buffer.merge_clusters(new_pos, if end < base + 1 { end } else { base + 1 })
+          new_pos -= 1
+        }
+        k -= 1
+      }
+    } else {
+      for k in start..<base {
+        if pos(k) == pos_pre_m {
+          buffer.merge_clusters(k, if end < base + 1 { end } else { base + 1 })
+          break
+        }
+      }
+    }
+  }
+  // reph
+  if start + 1 < end &&
+    pos(start) == pos_ra_to_become_reph &&
+    ((cat(start) == ot_repha) != info(start).ligated_and_didnt_multiply()) {
+    let mut new_reph_pos = start + 1
+    let mut done = false
+    let reph_pos = ip.reph_pos
+    if reph_pos != pos_after_post {
+      new_reph_pos = start + 1
+      while new_reph_pos < base && !info(new_reph_pos).is_halant() {
+        new_reph_pos += 1
+      }
+      if new_reph_pos < base && info(new_reph_pos).is_halant() {
+        if new_reph_pos + 1 < base && info(new_reph_pos + 1).is_joiner() {
+          new_reph_pos += 1
+        }
+        done = true
+      }
+      if !done && reph_pos == pos_after_main {
+        new_reph_pos = base
+        while new_reph_pos + 1 < end && pos(new_reph_pos + 1) <= pos_after_main {
+          new_reph_pos += 1
+        }
+        if new_reph_pos < end {
+          done = true
+        }
+      }
+      if !done && reph_pos == pos_after_sub {
+        new_reph_pos = base
+        while new_reph_pos + 1 < end &&
+          (cat_flag(pos(new_reph_pos + 1)) & (cat_flag(pos_post_c) | cat_flag(pos_after_post) | cat_flag(pos_smvd))) ==
+          0 {
+          new_reph_pos += 1
+        }
+        if new_reph_pos < end {
+          done = true
+        }
+      }
+    }
+    if !done {
+      new_reph_pos = start + 1
+      while new_reph_pos < base && !info(new_reph_pos).is_halant() {
+        new_reph_pos += 1
+      }
+      if new_reph_pos < base && info(new_reph_pos).is_halant() {
+        if new_reph_pos + 1 < base && info(new_reph_pos + 1).is_joiner() {
+          new_reph_pos += 1
+        }
+        done = true
+      }
+    }
+    if !done {
+      new_reph_pos = end - 1
+      while new_reph_pos > start && pos(new_reph_pos) == pos_smvd {
+        new_reph_pos -= 1
+      }
+      if info(new_reph_pos).is_halant() {
+        for k in (base + 1)..<new_reph_pos {
+          if (cat_flag(cat(k)) & (cat_flag(ot_m) | cat_flag(ot_mpst))) != 0 {
+            new_reph_pos -= 1
+          }
+        }
+      }
+    }
+    buffer.merge_clusters(start, new_reph_pos + 1)
+    rotate_left(buffer, start, new_reph_pos)
+    if start < base && base <= new_reph_pos {
+      base -= 1
+    }
+  }
+  // pre-base reordering forms
+  if try_pref && base + 1 < end {
+    for k in (base + 1)..<end {
+      if (info(k).mask & ip.mask_array[f_pref]) != 0 {
+        if info(k).ligated_and_didnt_multiply() {
+          let mut new_pos = base
+          if !mlym_or_taml {
+            while new_pos > start && !info(new_pos - 1).is_one_of(cat_flag(ot_m) | cat_flag(ot_mpst) | cat_flag(ot_h)) {
+              new_pos -= 1
+            }
+          }
+          if new_pos > start && info(new_pos - 1).is_halant() {
+            if new_pos < end && info(new_pos).is_joiner() {
+              new_pos += 1
+            }
+          }
+          let old_pos = k
+          buffer.merge_clusters(new_pos, old_pos + 1)
+          rotate_right(buffer, new_pos, old_pos)
+          if new_pos <= base && base < old_pos {
+            base += 1
+          }
+        }
+        break
+      }
+    }
+  }
+  if pos(start) == pos_pre_m {
+    let prev_gc = if start == 0 { -1 } else { info(start - 1).general_category() }
+    if start == 0 || !(prev_gc >= gc_format && prev_gc <= gc_non_spacing_mark) {
+      info(start).mask = info(start).mask | ip.mask_array[f_init]
+    }
+  }
+}

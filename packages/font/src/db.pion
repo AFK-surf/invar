@@ -1,0 +1,399 @@
+// A font database (fontdb 0.24): faces loaded from font files with their families, style, weight and stretch, and
+// CSS's font matching over them (CSS Fonts 3 §5.2, as fontdb does it after font-kit).
+// Ported from libs/mbui/src/font/db.mbt.
+
+#derive(Eq)
+pub enum FontStyle {
+  Normal
+  Italic
+  Oblique
+}
+
+/// By its name, as a font's key says it (svg's SFont::key).
+pub fn FontStyle::to_string(self : FontStyle) -> String {
+  match self {
+    FontStyle::Normal => "Normal"
+    FontStyle::Italic => "Italic"
+    FontStyle::Oblique => "Oblique"
+  }
+}
+
+pub struct FaceInfo {
+  pub id : Int
+  pub data : Bytes
+  pub index : Int
+  /// (family, is English US)
+  pub families : Array[(String, Bool)]
+  pub post_script_name : String
+  pub style : FontStyle
+  pub weight : Int
+  /// usWidthClass, 1 (ultra-condensed) to 9 (ultra-expanded)
+  pub stretch : Int
+  pub monospaced : Bool
+}
+
+pub struct FontDb {
+  faces : Array[FaceInfo]
+  mut serif : String
+  mut sans_serif : String
+  mut cursive : String
+  mut fantasy : String
+  mut monospace : String
+  /// faces parsed, by id
+  parsed : Map[Int, Face]
+}
+
+pub fn FontDb::new() -> FontDb {
+  FontDb::{
+    faces: [],
+    serif: "Times New Roman",
+    sans_serif: "Arial",
+    cursive: "Comic Sans MS",
+    fantasy: "Impact",
+    monospace: "Courier New",
+    parsed: Map::new(),
+  }
+}
+
+pub fn FontDb::set_serif_family(self : FontDb, f : String) -> Unit {
+  self.serif = f
+}
+
+pub fn FontDb::set_sans_serif_family(self : FontDb, f : String) -> Unit {
+  self.sans_serif = f
+}
+
+pub fn FontDb::set_cursive_family(self : FontDb, f : String) -> Unit {
+  self.cursive = f
+}
+
+pub fn FontDb::set_fantasy_family(self : FontDb, f : String) -> Unit {
+  self.fantasy = f
+}
+
+pub fn FontDb::set_monospace_family(self : FontDb, f : String) -> Unit {
+  self.monospace = f
+}
+
+pub fn FontDb::faces(self : FontDb) -> Array[FaceInfo] {
+  self.faces
+}
+
+/// Adds every face of a font file (one that cannot be read or has no family name is left out).
+pub fn FontDb::load_font_data(self : FontDb, data : Bytes) -> Unit {
+  let n = face_count(data)
+  for i in 0..<n {
+    match face_info(data, i, self.faces.length()) {
+      Some(info) => self.faces.push(info)
+      None => ()
+    }
+  }
+}
+
+pub fn FontDb::face(self : FontDb, id : Int) -> Option[Face] {
+  match self.parsed.get(id) {
+    Some(f) => Some(f)
+    None => {
+      if id < 0 || id >= self.faces.length() {
+        return None
+      }
+      let info = self.faces[id]
+      match Face::parse(info.data, info.index) {
+        Some(f) => {
+          self.parsed.set(id, f)
+          Some(f)
+        }
+        None => None
+      }
+    }
+  }
+}
+
+fn face_info(data : Bytes, index : Int, id : Int) -> Option[FaceInfo] {
+  let face = match Face::parse(data, index) {
+    Some(f) => f
+    None => return None
+  }
+  let names = face.names()
+  let is_unicode = fn(r : NameRecord) -> Bool { r.platform == 0 || r.platform == 3 }
+  let is_mac_roman = fn(r : NameRecord) -> Bool { r.platform == 1 && r.encoding == 0 }
+  let is_english_us = fn(r : NameRecord) -> Bool {
+    (r.platform == 3 && r.language == 0x409) || (r.platform == 1 && r.language == 0)
+  }
+  let collect = fn(name_id : Int) -> Array[(String, Bool)] {
+    let out : Array[(String, Bool)] = []
+    let mut has_en_us = false
+    for r in names {
+      if r.name_id == name_id && is_unicode(r) {
+        let en = is_english_us(r)
+        if en { has_en_us = true }
+        out.push((r.text, en))
+      }
+    }
+    if !has_en_us {
+      for r in names {
+        if r.name_id == name_id && is_mac_roman(r) {
+          out.push((r.text, is_english_us(r)))
+          break
+        }
+      }
+    }
+    out
+  }
+  let mut families = collect(16)
+  if families.length() == 0 {
+    families = collect(1)
+  }
+  if families.length() > 1 {
+    let mut idx = -1
+    for i in 0..<families.length() {
+      if families[i].1 {
+        idx = i
+        break
+      }
+    }
+    if idx > 0 {
+      let t = families[0]
+      families[0] = families[idx]
+      families[idx] = t
+    }
+  }
+  if families.length() == 0 {
+    return None
+  }
+  let mut ps_name : Option[String] = None
+  for r in names {
+    if r.name_id == 6 && (is_unicode(r) || is_mac_roman(r)) {
+      ps_name = Some(r.text)
+      break
+    }
+  }
+  let post_script_name = match ps_name {
+    Some(p) => p
+    None => return None
+  }
+  let mut style : FontStyle = FontStyle::Normal
+  let mut weight = 400
+  let mut stretch = 5
+  if face.has_table("OS/2") {
+    let sel = face.fs_selection()
+    style = if (sel & 1) != 0 {
+      FontStyle::Italic
+    } else if (sel & 0x200) != 0 {
+      FontStyle::Oblique
+    } else {
+      FontStyle::Normal
+    }
+    weight = face.weight()
+    let w = face.width_class()
+    stretch = if w >= 1 && w <= 9 { w } else { 5 }
+  }
+  let (monospaced, italic) = match face.table("post") {
+    Some((o, len)) =>
+      if len >= 16 {
+        (u32(data, o + 12) != 0, u32(data, o + 4) != 0)
+      } else {
+        (false, false)
+      }
+    None => (false, false)
+  }
+  if style == FontStyle::Normal && italic {
+    style = FontStyle::Italic
+  }
+  Some(FaceInfo::{ id, data, index, families, post_script_name, style, weight, stretch, monospaced })
+}
+
+/// A CSS font family: a name or a generic one.
+#derive(Eq)
+pub enum Family {
+  Named(String)
+  Serif
+  SansSerif
+  Cursive
+  Fantasy
+  Monospace
+}
+
+pub fn FontDb::family_name(self : FontDb, f : Family) -> String {
+  match f {
+    Family::Named(n) => n
+    Family::Serif => self.serif
+    Family::SansSerif => self.sans_serif
+    Family::Cursive => self.cursive
+    Family::Fantasy => self.fantasy
+    Family::Monospace => self.monospace
+  }
+}
+
+/// The face that best matches a CSS query (Database::query), None where no family has a face.
+pub fn FontDb::query(self : FontDb, families : Array[Family], weight : Int, stretch : Int, style : FontStyle) -> Option[Int] {
+  for family in families {
+    let name = self.family_name(family)
+    let candidates : Array[FaceInfo] = []
+    for f in self.faces {
+      let mut found = false
+      for n in f.families {
+        if n.0 == name {
+          found = true
+          break
+        }
+      }
+      if found {
+        candidates.push(f)
+      }
+    }
+    if candidates.length() > 0 {
+      match find_best_match(candidates, weight, stretch, style) {
+        Some(i) => return Some(candidates[i].id)
+        None => ()
+      }
+    }
+  }
+  None
+}
+
+fn find_best_match(c : Array[FaceInfo], weight : Int, stretch : Int, style : FontStyle) -> Option[Int] {
+  let mut set : Array[Int] = []
+  for i in 0..<c.length() {
+    set.push(i)
+  }
+  // 4a: font-stretch
+  let mut has_exact_stretch = false
+  for i in set {
+    if c[i].stretch == stretch {
+      has_exact_stretch = true
+      break
+    }
+  }
+  let matching_stretch = if has_exact_stretch {
+    stretch
+  } else if stretch <= 5 {
+    let narrower : Array[Int] = []
+    for i in set {
+      if c[i].stretch < stretch {
+        narrower.push(i)
+      }
+    }
+    if narrower.length() > 0 {
+      c[min_by(narrower, fn(i : Int) -> Int { stretch - c[i].stretch })].stretch
+    } else {
+      c[min_by(set, fn(i : Int) -> Int { c[i].stretch - stretch })].stretch
+    }
+  } else {
+    let wider : Array[Int] = []
+    for i in set {
+      if c[i].stretch > stretch {
+        wider.push(i)
+      }
+    }
+    if wider.length() > 0 {
+      c[min_by(wider, fn(i : Int) -> Int { c[i].stretch - stretch })].stretch
+    } else {
+      c[min_by(set, fn(i : Int) -> Int { stretch - c[i].stretch })].stretch
+    }
+  }
+  let set2 : Array[Int] = []
+  for i in set {
+    if c[i].stretch == matching_stretch {
+      set2.push(i)
+    }
+  }
+  set = set2
+  // 4b: font-style
+  let prefs : Array[FontStyle] = match style {
+    FontStyle::Italic => [FontStyle::Italic, FontStyle::Oblique, FontStyle::Normal]
+    FontStyle::Oblique => [FontStyle::Oblique, FontStyle::Italic, FontStyle::Normal]
+    FontStyle::Normal => [FontStyle::Normal, FontStyle::Oblique, FontStyle::Italic]
+  }
+  let mut matching_style : Option[FontStyle] = None
+  for p in prefs {
+    let mut found = false
+    for i in set {
+      if c[i].style == p {
+        found = true
+        break
+      }
+    }
+    if found {
+      matching_style = Some(p)
+      break
+    }
+  }
+  let ms = match matching_style {
+    Some(s) => s
+    None => return None
+  }
+  let set3 : Array[Int] = []
+  for i in set {
+    if c[i].style == ms {
+      set3.push(i)
+    }
+  }
+  set = set3
+  // 4c: font-weight
+  let w = weight
+  let mut has_exact_w = false
+  let mut has_500 = false
+  let mut has_400 = false
+  for i in set {
+    if c[i].weight == w { has_exact_w = true }
+    if c[i].weight == 500 { has_500 = true }
+    if c[i].weight == 400 { has_400 = true }
+  }
+  let matching_weight = if has_exact_w {
+    w
+  } else if w >= 400 && w < 450 && has_500 {
+    500
+  } else if w >= 450 && w <= 500 && has_400 {
+    400
+  } else if w <= 500 {
+    let thinner : Array[Int] = []
+    for i in set {
+      if c[i].weight <= w {
+        thinner.push(i)
+      }
+    }
+    if thinner.length() > 0 {
+      c[min_by(thinner, fn(i : Int) -> Int { w - c[i].weight })].weight
+    } else {
+      c[min_by(set, fn(i : Int) -> Int { c[i].weight - w })].weight
+    }
+  } else {
+    let fatter : Array[Int] = []
+    for i in set {
+      if c[i].weight >= w {
+        fatter.push(i)
+      }
+    }
+    if fatter.length() > 0 {
+      c[min_by(fatter, fn(i : Int) -> Int { c[i].weight - w })].weight
+    } else {
+      c[min_by(set, fn(i : Int) -> Int { w - c[i].weight })].weight
+    }
+  }
+  let set4 : Array[Int] = []
+  for i in set {
+    if c[i].weight == matching_weight {
+      set4.push(i)
+    }
+  }
+  if set4.length() > 0 {
+    Some(set4[0])
+  } else {
+    None
+  }
+}
+
+/// The first index with the least key (Iterator::min_by_key keeps the first of equals).
+fn min_by(set : Array[Int], key : (Int) -> Int) -> Int {
+  let mut best = set[0]
+  let mut best_key = key(best)
+  for i in set {
+    let k = key(i)
+    if k < best_key {
+      best = i
+      best_key = k
+    }
+  }
+  best
+}

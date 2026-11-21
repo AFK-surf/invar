@@ -1,0 +1,653 @@
+// Comprehensive unit tests for packages/font.
+
+fn push_u16(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn push_i16(buf : Array[Int], v : Int) -> Unit {
+  push_u16(buf, v & 0xFFFF)
+}
+
+fn push_u24(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 16) & 0xFF)
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn push_u32(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 24) & 0xFF)
+  buf.push((v >> 16) & 0xFF)
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn push_tag(buf : Array[Int], s : String) -> Unit {
+  let bs = s.to_bytes()
+  for i in 0..<4 {
+    buf.push(bs[i].to_int())
+  }
+}
+
+fn to_bytes_buf(buf : Array[Int]) -> Bytes {
+  let sb = StringBuilder::new()
+  for x in buf {
+    sb.write_byte((x & 0xFF) as Byte)
+  }
+  sb.to_string().to_bytes()
+}
+
+/// Build a valid minimal SFNT font from (tag, table_bytes) pairs.
+fn build_sfnt(flavor : String, tables : Array[(String, Array[Int])]) -> Bytes {
+  let buf : Array[Int] = []
+  if flavor == "ttf" {
+    buf.push(0)
+    buf.push(1)
+    buf.push(0)
+    buf.push(0)
+  } else {
+    push_tag(buf, flavor)
+  }
+  let n = tables.length()
+  push_u16(buf, n)
+  push_u16(buf, 16)
+  push_u16(buf, 0)
+  push_u16(buf, 0)
+  let mut offset = 12 + n * 16
+  for t in tables {
+    let (tag, data) = t
+    push_tag(buf, tag)
+    push_u32(buf, 0)
+    push_u32(buf, offset)
+    push_u32(buf, data.length())
+    offset += data.length()
+    // pad to 4 bytes
+    let pad = (4 - (data.length() % 4)) % 4
+    offset += pad
+  }
+  for t in tables {
+    let (_, data) = t
+    for x in data {
+      buf.push(x)
+    }
+    let pad = (4 - (data.length() % 4)) % 4
+    for _ in 0..<pad {
+      buf.push(0)
+    }
+  }
+  to_bytes_buf(buf)
+}
+
+fn make_head(upem : Int, loca_long : Bool, xmin : Int, ymin : Int, xmax : Int, ymax : Int, mac_style : Int) -> Array[Int] {
+  let b = Array::make(54, 0)
+  // unitsPerEm at 18
+  b[18] = (upem >> 8) & 0xFF
+  b[19] = upem & 0xFF
+  // bbox at 36..44
+  b[36] = (xmin >> 8) & 0xFF
+  b[37] = xmin & 0xFF
+  b[38] = (ymin >> 8) & 0xFF
+  b[39] = ymin & 0xFF
+  b[40] = (xmax >> 8) & 0xFF
+  b[41] = xmax & 0xFF
+  b[42] = (ymax >> 8) & 0xFF
+  b[43] = ymax & 0xFF
+  // macStyle at 44
+  b[44] = (mac_style >> 8) & 0xFF
+  b[45] = mac_style & 0xFF
+  // indexToLocFormat at 50
+  b[51] = if loca_long { 1 } else { 0 }
+  b
+}
+
+fn make_maxp(num_glyphs : Int) -> Array[Int] {
+  let b : Array[Int] = []
+  push_u32(b, 0x00010000)
+  push_u16(b, num_glyphs)
+  b
+}
+
+fn make_hhea(asc : Int, desc : Int, gap : Int, num_h_metrics : Int) -> Array[Int] {
+  let b = Array::make(36, 0)
+  b[4] = (asc >> 8) & 0xFF
+  b[5] = asc & 0xFF
+  b[6] = (desc >> 8) & 0xFF
+  b[7] = desc & 0xFF
+  b[8] = (gap >> 8) & 0xFF
+  b[9] = gap & 0xFF
+  b[34] = (num_h_metrics >> 8) & 0xFF
+  b[35] = num_h_metrics & 0xFF
+  b
+}
+
+fn make_hmtx(metrics : Array[(Int, Int)], extra_lsbs : Array[Int]) -> Array[Int] {
+  let b : Array[Int] = []
+  for m in metrics {
+    push_u16(b, m.0)
+    push_i16(b, m.1)
+  }
+  for l in extra_lsbs {
+    push_i16(b, l)
+  }
+  b
+}
+
+test "SFNT parse, metrics, hmtx, OS/2, post, kern" {
+  let head = make_head(1000, false, -50, -200, 900, 800, 1)
+  let maxp = make_maxp(4)
+  let hhea = make_hhea(820, -180, 40, 2)
+  let hmtx = make_hmtx([(500, 20), (600, -10)], [15, 25])
+
+  // OS/2 version 2 (96 bytes), fsSelection USE_TYPO_METRICS (0x80) | BOLD (0x20)
+  let os2 = Array::make(96, 0)
+  os2[1] = 2 // version 2
+  os2[4] = (700 >> 8) & 0xFF
+  os2[5] = 700 & 0xFF // weight = 700
+  os2[7] = 5 // width_class = 5
+  // subscript y offset at 16 = 120, superscript y offset at 24 = 350
+  os2[17] = 120
+  os2[24] = (350 >> 8) & 0xFF
+  os2[25] = 350 & 0xFF
+  // strikeout size at 26 = 50, pos at 28 = 300
+  os2[27] = 50
+  os2[28] = (300 >> 8) & 0xFF
+  os2[29] = 300 & 0xFF
+  // fsSelection at 62 = 0x80
+  os2[63] = 0x80
+  // sTypoAscender at 68 = 850, sTypoDescender at 70 = -200, sTypoLineGap at 72 = 50
+  os2[68] = (850 >> 8) & 0xFF
+  os2[69] = 850 & 0xFF
+  let desc_u16 = (-200) & 0xFFFF
+  os2[70] = (desc_u16 >> 8) & 0xFF
+  os2[71] = desc_u16 & 0xFF
+  os2[73] = 50
+  // sxHeight at 86 = 520, sCapHeight at 88 = 710
+  os2[86] = (520 >> 8) & 0xFF
+  os2[87] = 520 & 0xFF
+  os2[88] = (710 >> 8) & 0xFF
+  os2[89] = 710 & 0xFF
+
+  // post table (32 bytes): italicAngle = -12.5 deg (-12.5 * 65536 = -819200), underlinePos=-100, underlineThick=50, isFixedPitch=1
+  let post = Array::make(32, 0)
+  let ia = -819200
+  post[4] = (ia >> 24) & 0xFF
+  post[5] = (ia >> 16) & 0xFF
+  post[6] = (ia >> 8) & 0xFF
+  post[7] = ia & 0xFF
+  let upos = (-100) & 0xFFFF
+  post[8] = (upos >> 8) & 0xFF
+  post[9] = upos & 0xFF
+  post[11] = 50
+  post[15] = 1 // isFixedPitch = 1
+
+  // kern table: 1 format-0 horizontal subtable with 2 pairs: (1,2)->-40, (2,3)->+15
+  let kern : Array[Int] = []
+  push_u16(kern, 0) // version
+  push_u16(kern, 1) // nTables
+  // subtable header (6 bytes) + format0 header (8 bytes) + 2*6 = 26 bytes
+  push_u16(kern, 0) // subtable version
+  push_u16(kern, 26) // length
+  push_u16(kern, 1) // coverage: format 0, horizontal=1
+  push_u16(kern, 2) // nPairs
+  push_u16(kern, 12) // searchRange
+  push_u16(kern, 1) // entrySelector
+  push_u16(kern, 0) // rangeShift
+  push_u16(kern, 1)
+  push_u16(kern, 2)
+  push_i16(kern, -40)
+  push_u16(kern, 2)
+  push_u16(kern, 3)
+  push_i16(kern, 15)
+
+  let data = build_sfnt("ttf", [
+    ("OS/2", os2),
+    ("head", head),
+    ("hhea", hhea),
+    ("hmtx", hmtx),
+    ("kern", kern),
+    ("maxp", maxp),
+    ("post", post),
+  ])
+  debug_assert(face_count(data) == 1, "single ttf face_count")
+  let face = match Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "Face::parse failed")
+      return
+    }
+  }
+  debug_assert(face.units_per_em() == 1000, "upem")
+  debug_assert(face.num_glyphs() == 4, "num_glyphs")
+  debug_assert(face.has_table("OS/2") && !face.has_table("CFF "), "has_table")
+  debug_assert(face.advance(0) == 500 && face.advance(1) == 600 && face.advance(3) == 600, "advance")
+  debug_assert(face.lsb(0) == 20 && face.lsb(1) == -10 && face.lsb(2) == 15 && face.lsb(3) == 25, "lsb")
+  debug_assert(face.weight() == 700 && face.width_class() == 5 && face.mac_style() == 1, "os2/head attrs")
+  debug_assert(face.is_monospace(), "is_monospace")
+  debug_assert(face.kerning(1, 2) == -40 && face.kerning(2, 3) == 15 && face.kerning(1, 3) == 0, "kerning")
+  let m = face.metrics()
+  let f850 : Float = 850.0
+  let fm200 : Float = -200.0
+  let f50 : Float = 50.0
+  let fm12_5 : Float = -12.5
+  debug_assert(m.ascent == f850 && m.descent == fm200 && m.leading == f50, "typo metrics")
+  debug_assert(m.italic_angle == fm12_5, "italic_angle")
+  match m.x_height {
+    Some(xh) => debug_assert(xh == (520.0 as Float), "x_height")
+    None => debug_assert(false, "expected x_height")
+  }
+  match m.cap_height {
+    Some(ch) => debug_assert(ch == (710.0 as Float), "cap_height")
+    None => debug_assert(false, "expected cap_height")
+  }
+}
+
+test "cmap format 4, format 12, and format 14 variation selectors" {
+  // Build cmap with 2 subtables:
+  // 1) platform 3, encoding 10 -> format 12 (maps 'A' (65) -> 1, U+1F600 -> 10)
+  // 2) platform 0, encoding 5 -> format 14 (VS 0xFE0F: default U+1F600, non-default 'A' -> 2)
+  let cmap : Array[Int] = []
+  push_u16(cmap, 0) // version
+  push_u16(cmap, 2) // numTables
+  // record 0: (3, 10) at offset 20
+  push_u16(cmap, 3)
+  push_u16(cmap, 10)
+  push_u32(cmap, 20)
+  // record 1: (0, 5) at offset 20 + 40 = 60
+  push_u16(cmap, 0)
+  push_u16(cmap, 5)
+  push_u32(cmap, 60)
+  // format 12 at offset 20 (16 + 2*12 = 40 bytes)
+  push_u16(cmap, 12)
+  push_u16(cmap, 0)
+  push_u32(cmap, 40)
+  push_u32(cmap, 0)
+  push_u32(cmap, 2) // numGroups
+  // group 0: 65..67 -> 1..3
+  push_u32(cmap, 65)
+  push_u32(cmap, 67)
+  push_u32(cmap, 1)
+  // group 1: 0x1F600..0x1F600 -> 10
+  push_u32(cmap, 0x1F600)
+  push_u32(cmap, 0x1F600)
+  push_u32(cmap, 10)
+  // format 14 at offset 60:
+  // header (10) + 1 varSelectorRecord (11) = 21 bytes
+  // defaultUVS at +21 (4 + 4 = 8 bytes)
+  // nonDefaultUVS at +29 (4 + 5 = 9 bytes)
+  push_u16(cmap, 14)
+  push_u32(cmap, 38) // length
+  push_u32(cmap, 1) // numVarSelectorRecords
+  push_u24(cmap, 0xFE0F)
+  push_u32(cmap, 21) // defaultUVSOffset
+  push_u32(cmap, 29) // nonDefaultUVSOffset
+  // defaultUVS: 1 range [0x1F600, +0]
+  push_u32(cmap, 1)
+  push_u24(cmap, 0x1F600)
+  cmap.push(0)
+  // nonDefaultUVS: 1 mapping (65 -> 2)
+  push_u32(cmap, 1)
+  push_u24(cmap, 65)
+  push_u16(cmap, 2)
+
+  let data = build_sfnt("ttf", [
+    ("cmap", cmap),
+    ("head", make_head(1000, false, 0, 0, 1000, 1000, 0)),
+    ("maxp", make_maxp(20)),
+  ])
+  let face = match Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse")
+      return
+    }
+  }
+  debug_assert(face.glyph_index(65) == 1, "A -> 1")
+  debug_assert(face.glyph_index(67) == 3, "C -> 3")
+  debug_assert(face.glyph_index(68) == 0, "D -> 0")
+  debug_assert(face.glyph_index(0x1F600) == 10, "emoji -> 10")
+  match face.glyph_variant(65, 0xFE0F) {
+    Some(g) => debug_assert(g == 2, "non-default variant A -> 2")
+    None => debug_assert(false, "expected non-default variant")
+  }
+  match face.glyph_variant(0x1F600, 0xFE0F) {
+    Some(g) => debug_assert(g == 10, "default variant emoji -> 10")
+    None => debug_assert(false, "expected default variant")
+  }
+  debug_assert(face.glyph_variant(66, 0xFE0F).is_none(), "no variant for B")
+}
+
+test "glyf simple outline with quadratic curve and gvar IUP variation" {
+  // Simple glyph 1: 1 contour of 3 points:
+  // p0 = (0, 0) on-curve (flag 0x01)
+  // p1 = (100, 200) off-curve (flag 0x00)
+  // p2 = (200, 0) on-curve (flag 0x01)
+  let g1 : Array[Int] = []
+  push_i16(g1, 1) // numberOfContours
+  push_i16(g1, 0) // xMin
+  push_i16(g1, 0) // yMin
+  push_i16(g1, 200) // xMax
+  push_i16(g1, 200) // yMax
+  push_u16(g1, 2) // endPtsOfContours[0] = 2
+  push_u16(g1, 0) // instructionLength = 0
+  // flags:
+  // p0: on-curve(1) | x-short(2) | x-pos(16) | y-short(4) | y-pos(32) = 55 -> dx=0, dy=0 (use same flag 0x31 = on+same_x+same_y)
+  // Let's use 16-bit deltas (flags without short/same): on=0x01, off=0x00
+  g1.push(0x01) // p0 on-curve
+  g1.push(0x00) // p1 off-curve
+  g1.push(0x01) // p2 on-curve
+  // x deltas: 0, +100, +100
+  push_i16(g1, 0)
+  push_i16(g1, 100)
+  push_i16(g1, 100)
+  // y deltas: 0, +200, -200
+  push_i16(g1, 0)
+  push_i16(g1, 200)
+  push_i16(g1, -200)
+
+  // loca (long format): glyph 0 empty [0,0], glyph 1 [0, g1.len]
+  let loca : Array[Int] = []
+  push_u32(loca, 0)
+  push_u32(loca, 0)
+  push_u32(loca, g1.length())
+
+  // fvar: 1 axis 'wght' min=100, def=400, max=900
+  let fvar : Array[Int] = []
+  push_u16(fvar, 1) // major
+  push_u16(fvar, 0) // minor
+  push_u16(fvar, 16) // axesArrayOffset
+  push_u16(fvar, 2) // reserved
+  push_u16(fvar, 1) // axisCount
+  push_u16(fvar, 20) // axisSize
+  push_u16(fvar, 0) // instanceCount
+  push_u16(fvar, 0) // instanceSize
+  push_tag(fvar, "wght")
+  push_u32(fvar, 100 << 16)
+  push_u32(fvar, 400 << 16)
+  push_u32(fvar, 900 << 16)
+  push_u16(fvar, 0)
+  push_u16(fvar, 256)
+
+  // gvar: 1 axis, 0 shared tuples, 2 glyphs, long offsets
+  // glyph 1 has 1 tuple with embedded peak (+1.0 = 0x4000) and private points [0, 2]
+  // dx for pts [0, 2] = [0, +100], dy = [0, 0]
+  // IUP should interpolate p1 (x=100, halfway between 0 and 200) by +50 -> x=150!
+  let tuple_data : Array[Int] = []
+  // packed points: count=2, run=2 (control=1, byte deltas): 0, +2
+  tuple_data.push(2)
+  tuple_data.push(1)
+  tuple_data.push(0)
+  tuple_data.push(2)
+  // packed dx deltas: 2 byte deltas (control=1): 0, 100
+  tuple_data.push(1)
+  tuple_data.push(0)
+  tuple_data.push(100)
+  // packed dy deltas: 2 zero deltas (control=0x81)
+  tuple_data.push(0x81)
+
+  let gvd1 : Array[Int] = []
+  push_u16(gvd1, 1) // tupleVariationCount = 1
+  push_u16(gvd1, 10) // dataOffset = 4 + 6 = 10
+  // tuple header (6 bytes): size, index (0x8000 embedded peak | 0x2000 private points), peak F2Dot14 (+1.0 = 0x4000)
+  push_u16(gvd1, tuple_data.length())
+  push_u16(gvd1, 0xA000)
+  push_i16(gvd1, 0x4000)
+  for x in tuple_data {
+    gvd1.push(x)
+  }
+
+  let gvar : Array[Int] = []
+  push_u16(gvar, 1) // major
+  push_u16(gvar, 0) // minor
+  push_u16(gvar, 1) // axisCount
+  push_u16(gvar, 0) // sharedTupleCount
+  push_u32(gvar, 20 + 12) // sharedTuplesOffset
+  push_u16(gvar, 2) // glyphCount
+  push_u16(gvar, 1) // flags: long offsets
+  push_u32(gvar, 20 + 12) // glyphVariationDataArrayOffset
+  // offsets for 2 glyphs (3 * u32 = 12 bytes)
+  push_u32(gvar, 0)
+  push_u32(gvar, 0)
+  push_u32(gvar, gvd1.length())
+  for x in gvd1 {
+    gvar.push(x)
+  }
+
+  let data = build_sfnt("ttf", [
+    ("fvar", fvar),
+    ("glyf", g1),
+    ("gvar", gvar),
+    ("head", make_head(1000, true, 0, 0, 200, 200, 0)),
+    ("loca", loca),
+    ("maxp", make_maxp(2)),
+  ])
+  let face = match Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse")
+      return
+    }
+  }
+  debug_assert(face.has_axis("wght") && !face.has_axis("wdth"), "has_axis")
+  let coords = face.coords([("wght", 900.0 as Float)])
+  debug_assert(coords.length() == 1 && coords[0] == 0x4000, "normalized coord +1.0")
+
+  // Default outline
+  let cmds0 = match face.outline(1) {
+    Some(c) => c
+    None => {
+      debug_assert(false, "outline default")
+      return
+    }
+  }
+  debug_assert(cmds0.length() == 3, "MoveTo, QuadTo, Close")
+  debug_assert(cmds0[0] == PathCmd::MoveTo(0.0 as Float, 0.0 as Float), "MoveTo(0,0)")
+  debug_assert(cmds0[1] == PathCmd::QuadTo(100.0 as Float, 200.0 as Float, 200.0 as Float, 0.0 as Float), "QuadTo")
+  debug_assert(cmds0[2] == PathCmd::Close, "Close")
+
+  // Varied outline at wght=900: p2 shifts +100 -> 300, IUP shifts p1 +50 -> 150!
+  let cmds1 = match face.outline(1, coords=coords) {
+    Some(c) => c
+    None => {
+      debug_assert(false, "outline varied")
+      return
+    }
+  }
+  debug_assert(cmds1[1] == PathCmd::QuadTo(150.0 as Float, 200.0 as Float, 300.0 as Float, 0.0 as Float), "IUP QuadTo")
+}
+
+test "CFF outline evaluation (rmoveto, hlineto, vlineto, endchar)" {
+  // Minimal CFF table with 1 glyph (glyph 0):
+  // Header (4 bytes): major=1, minor=0, hdrSize=4, offSize=1
+  // Name INDEX (count=1, "A"): [0,1, 1, 1, 2, 65] -> 6 bytes (ends at 10)
+  // Top DICT INDEX (count=1): CharStrings offset (op 17)
+  // String INDEX (count=0): [0, 0] -> 2 bytes
+  // Global Subr INDEX (count=0): [0, 0] -> 2 bytes
+  // CharStrings INDEX (count=1): rmoveto(10,20), hlineto(50), vlineto(30), endchar
+  //   10 -> 149, 20 -> 159, op 21 (rmoveto)
+  //   50 -> 189, op 6 (hlineto)
+  //   30 -> 169, op 7 (vlineto)
+  //   op 14 (endchar)
+  let cs : Array[Int] = [149, 159, 21, 189, 6, 169, 7, 14]
+  // Top DICT: operand = cs_off, op = 17.
+  // Layout:
+  //   0..4: header
+  //   4..10: Name INDEX (6 bytes)
+  //   10..18: Top DICT INDEX (2+1+2+3 = 8 bytes, dict = [139+cs_off, 17] -> wait: if cs_off=22, 22+139=161 -> 2 bytes dict -> index=2+1+2+2=7 bytes)
+  //   17..19: String INDEX (2 bytes)
+  //   19..21: Global Subr INDEX (2 bytes)
+  //   21..: CharStrings INDEX! So cs_off = 21 -> 21+139 = 160!
+  let cff : Array[Int] = [
+    1, 0, 4, 1,
+    0, 1, 1, 1, 2, 65,
+    0, 1, 1, 1, 3, 160, 17,
+    0, 0,
+    0, 0,
+    0, 1, 1, 1, 1 + cs.length(),
+  ]
+  for x in cs {
+    cff.push(x)
+  }
+  let data = build_sfnt("OTTO", [
+    ("CFF ", cff),
+    ("head", make_head(1000, false, 0, 0, 1000, 1000, 0)),
+    ("maxp", make_maxp(1)),
+  ])
+  let face = match Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse CFF")
+      return
+    }
+  }
+  let cmds = match face.outline(0) {
+    Some(c) => c
+    None => {
+      debug_assert(false, "CFF outline")
+      return
+    }
+  }
+  debug_assert(cmds.length() == 4, "MoveTo, LineTo, LineTo, Close")
+  debug_assert(cmds[0] == PathCmd::MoveTo(10.0 as Float, 20.0 as Float), "CFF MoveTo")
+  debug_assert(cmds[1] == PathCmd::LineTo(60.0 as Float, 20.0 as Float), "CFF hlineto")
+  debug_assert(cmds[2] == PathCmd::LineTo(60.0 as Float, 50.0 as Float), "CFF vlineto")
+  debug_assert(cmds[3] == PathCmd::Close, "CFF Close")
+  match face.glyph_bbox(0) {
+    Some((x0, y0, x1, y1)) => debug_assert(x0 == 10 && y0 == 20 && x1 == 60 && y1 == 50, "CFF glyph_bbox")
+    None => debug_assert(false, "expected CFF bbox")
+  }
+}
+
+test "COLR v0 and CPAL palette colors" {
+  // COLR v0: 1 base glyph (glyph 5, first=0, count=2), 2 layers: (glyph 6, pal 0), (glyph 7, pal 1)
+  let colr : Array[Int] = []
+  push_u16(colr, 0) // version 0
+  push_u16(colr, 1) // numBaseGlyphRecords
+  push_u32(colr, 14) // baseGlyphRecordsOffset
+  push_u32(colr, 20) // layerRecordsOffset
+  push_u16(colr, 2) // numLayerRecords
+  // base record (6 bytes)
+  push_u16(colr, 5)
+  push_u16(colr, 0)
+  push_u16(colr, 2)
+  // layer records (2*4 = 8 bytes)
+  push_u16(colr, 6)
+  push_u16(colr, 0)
+  push_u16(colr, 7)
+  push_u16(colr, 1)
+
+  // CPAL v0: 2 entries, 1 palette, 2 color records (BGRA)
+  let cpal : Array[Int] = []
+  push_u16(cpal, 0) // version
+  push_u16(cpal, 2) // numPaletteEntries
+  push_u16(cpal, 1) // numPalettes
+  push_u16(cpal, 2) // numColorRecords
+  push_u32(cpal, 14) // colorRecordsArrayOffset
+  push_u16(cpal, 0) // colorRecordIndices[0]
+  // color 0: B=10, G=20, R=30, A=255 -> (30, 20, 10, 255)
+  cpal.push(10)
+  cpal.push(20)
+  cpal.push(30)
+  cpal.push(255)
+  // color 1: B=0, G=128, R=255, A=200 -> (255, 128, 0, 200)
+  cpal.push(0)
+  cpal.push(128)
+  cpal.push(255)
+  cpal.push(200)
+
+  let data = build_sfnt("ttf", [
+    ("COLR", colr),
+    ("CPAL", cpal),
+    ("head", make_head(1000, false, 0, 0, 1000, 1000, 0)),
+    ("maxp", make_maxp(10)),
+  ])
+  let face = match Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse COLR")
+      return
+    }
+  }
+  match face.palette_color(0) {
+    Some((r, g, b, a)) => debug_assert(r == 30 && g == 20 && b == 10 && a == 255, "palette 0")
+    None => debug_assert(false, "expected palette 0")
+  }
+  match face.palette_color(1) {
+    Some((r, g, b, a)) => debug_assert(r == 255 && g == 128 && b == 0 && a == 200, "palette 1")
+    None => debug_assert(false, "expected palette 1")
+  }
+  match face.color_glyph(5) {
+    Some(ops) => {
+      debug_assert(ops.length() == 2, "2 COLRv0 layers")
+      match ops[0] {
+        ColorOp::FillGlyph(gid, None, Brush::Solid(pal, _)) => debug_assert(gid == 6 && pal == 0, "layer 0")
+        _ => debug_assert(false, "unexpected op 0")
+      }
+    }
+    None => debug_assert(false, "expected color_glyph")
+  }
+}
+
+test "FontDb CSS matching (family, weight, style)" {
+  let make_named_font = fn(family : String, ps : String, weight : Int, italic : Bool) -> Bytes {
+    // name table with platform 3, encoding 1, language 0x409 (UTF-16BE) for nameID 1 and 6
+    let fam_bs = family.to_bytes()
+    let ps_bs = ps.to_bytes()
+    let storage : Array[Int] = []
+    for i in 0..<fam_bs.length() {
+      storage.push(0)
+      storage.push(fam_bs[i].to_int())
+    }
+    let ps_off = storage.length()
+    for i in 0..<ps_bs.length() {
+      storage.push(0)
+      storage.push(ps_bs[i].to_int())
+    }
+    let name_tbl : Array[Int] = []
+    push_u16(name_tbl, 0) // format
+    push_u16(name_tbl, 2) // count
+    push_u16(name_tbl, 6 + 24) // stringOffset
+    // record 0: family (id 1)
+    push_u16(name_tbl, 3)
+    push_u16(name_tbl, 1)
+    push_u16(name_tbl, 0x409)
+    push_u16(name_tbl, 1)
+    push_u16(name_tbl, fam_bs.length() * 2)
+    push_u16(name_tbl, 0)
+    // record 1: ps name (id 6)
+    push_u16(name_tbl, 3)
+    push_u16(name_tbl, 1)
+    push_u16(name_tbl, 0x409)
+    push_u16(name_tbl, 6)
+    push_u16(name_tbl, ps_bs.length() * 2)
+    push_u16(name_tbl, ps_off)
+    for x in storage {
+      name_tbl.push(x)
+    }
+    let os2 = Array::make(78, 0)
+    os2[4] = (weight >> 8) & 0xFF
+    os2[5] = weight & 0xFF
+    os2[7] = 5
+    os2[63] = if italic { 1 } else { 0 }
+    build_sfnt("ttf", [
+      ("OS/2", os2),
+      ("head", make_head(1000, false, 0, 0, 1000, 1000, 0)),
+      ("maxp", make_maxp(2)),
+      ("name", name_tbl),
+    ])
+  }
+  let db = FontDb::new()
+  db.set_sans_serif_family("Inter")
+  db.load_font_data(make_named_font("Inter", "Inter-Regular", 400, false))
+  db.load_font_data(make_named_font("Inter", "Inter-Bold", 700, false))
+  db.load_font_data(make_named_font("Inter", "Inter-Italic", 400, true))
+  debug_assert(db.faces().length() == 3, "3 faces loaded")
+  match db.query([Family::SansSerif], 700, 5, FontStyle::Normal) {
+    Some(id) => debug_assert(id == 1, "matched Bold id=1")
+    None => debug_assert(false, "expected bold match")
+  }
+  match db.query([Family::Named("Inter")], 400, 5, FontStyle::Italic) {
+    Some(id) => debug_assert(id == 2, "matched Italic id=2")
+    None => debug_assert(false, "expected italic match")
+  }
+  debug_assert(db.face(1).is_some(), "FontDb::face cached parse")
+}

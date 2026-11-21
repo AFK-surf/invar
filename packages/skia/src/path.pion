@@ -1,0 +1,295 @@
+// tiny-skia's Path: verbs and points, never empty, with its bounds.
+
+#derive(Eq)
+pub enum PathVerb {
+  Move
+  Line
+  Quad
+  Cubic
+  Close
+}
+
+#derive(Eq)
+pub enum PathSegment {
+  MoveTo(Point)
+  LineTo(Point)
+  QuadTo(Point, Point)
+  CubicTo(Point, Point, Point)
+  Close
+}
+
+/// A path of at least one segment past its first move (PathBuilder::finish), its points' bounds.
+pub struct Path {
+  pub verbs : Array[PathVerb]
+  pub points : Array[Point]
+  pub mut bounds : Rect
+}
+
+pub fn Path::len(self : Path) -> Int {
+  self.verbs.length()
+}
+
+pub fn Path::is_empty(self : Path) -> Bool {
+  self.verbs.length() == 0
+}
+
+pub fn Path::bounds(self : Path) -> Rect {
+  self.bounds
+}
+
+/// The bounds of the curves themselves, not of their control points.
+pub fn Path::compute_tight_bounds(self : Path) -> Option[Rect] {
+  let extremas = Array::make(5, Point::zero())
+  let mut min = self.points[0]
+  let mut max = self.points[0]
+  let iter = self.segments()
+  let mut last_point = Point::zero()
+  while true {
+    let segment = match iter.next() {
+      Some(s) => s
+      None => break
+    }
+    let mut count = 0
+    match segment {
+      PathSegment::MoveTo(p) => {
+        extremas[0] = p
+        count = 1
+      }
+      PathSegment::LineTo(p) => {
+        extremas[0] = p
+        count = 1
+      }
+      PathSegment::QuadTo(p0, p1) => count = compute_quad_extremas(last_point, p0, p1, extremas)
+      PathSegment::CubicTo(p0, p1, p2) => count = compute_cubic_extremas(last_point, p0, p1, p2, extremas)
+      PathSegment::Close => ()
+    }
+    last_point = iter.last_point
+    for i in 0..<count {
+      let tmp = extremas[i]
+      min = Point::{ x: fmin(min.x, tmp.x), y: fmin(min.y, tmp.y) }
+      max = Point::{ x: fmax(max.x, tmp.x), y: fmax(max.y, tmp.y) }
+    }
+  }
+  Rect::from_ltrb(min.x, min.y, max.x, max.y)
+}
+
+/// The path moved by `ts` (its points mapped), None when its bounds would not be finite.
+pub fn Path::transform(self : Path, ts : Transform) -> Option[Path] {
+  if ts.is_identity() {
+    return Some(self)
+  }
+  let points = self.points.copy()
+  ts.map_points(points)
+  match Rect::from_points(points) {
+    Some(bounds) => Some(Path::{ verbs: self.verbs.copy(), points, bounds })
+    None => None
+  }
+}
+
+pub fn Path::segments(self : Path) -> PathSegmentsIter {
+  PathSegmentsIter::{
+    path: self,
+    verb_index: 0,
+    points_index: 0,
+    is_auto_close: false,
+    last_move_to: Point::zero(),
+    last_point: Point::zero(),
+  }
+}
+
+pub fn Path::clear(_self : Path) -> PathBuilder {
+  PathBuilder::new()
+}
+
+/// The path as SVG path data (Debug's segments: "M 1 2 L 3 4 Z").
+pub fn Path::to_svg(self : Path) -> String {
+  let sb = StringBuilder::new()
+  let iter = self.segments()
+  let mut first = true
+  while true {
+    let seg = match iter.next() {
+      Some(s) => s
+      None => break
+    }
+    if !first {
+      sb.write_string(" ")
+    }
+    first = false
+    match seg {
+      PathSegment::MoveTo(p) => sb.write_string("M " + fs(p.x) + " " + fs(p.y))
+      PathSegment::LineTo(p) => sb.write_string("L " + fs(p.x) + " " + fs(p.y))
+      PathSegment::QuadTo(p0, p1) => sb.write_string("Q " + fs(p0.x) + " " + fs(p0.y) + " " + fs(p1.x) + " " + fs(p1.y))
+      PathSegment::CubicTo(p0, p1, p2) =>
+        sb.write_string("C " + fs(p0.x) + " " + fs(p0.y) + " " + fs(p1.x) + " " + fs(p1.y) + " " + fs(p2.x) + " " + fs(p2.y))
+      PathSegment::Close => sb.write_string("Z")
+    }
+  }
+  sb.to_string()
+}
+
+/// A float as Rust's Display writes it (whole numbers without a point).
+fn fs(x : Float) -> String {
+  let s = x.to_string()
+  if s.ends_with(".0") {
+    s.slice(0, s.length() - 2)
+  } else {
+    s
+  }
+}
+
+fn compute_quad_extremas(p0 : Point, p1 : Point, p2 : Point, extremas : Array[Point]) -> Int {
+  let src = [p0, p1, p2]
+  let mut idx = 0
+  match find_quad_extrema(p0.x, p1.x, p2.x) {
+    Some(t) => {
+      extremas[idx] = eval_quad_at(src, t)
+      idx += 1
+    }
+    None => ()
+  }
+  match find_quad_extrema(p0.y, p1.y, p2.y) {
+    Some(t) => {
+      extremas[idx] = eval_quad_at(src, t)
+      idx += 1
+    }
+    None => ()
+  }
+  extremas[idx] = p2
+  idx + 1
+}
+
+fn compute_cubic_extremas(p0 : Point, p1 : Point, p2 : Point, p3 : Point, extremas : Array[Point]) -> Int {
+  let ts0 = new_t_values()
+  let ts1 = new_t_values()
+  let n0 = find_cubic_extrema(p0.x, p1.x, p2.x, p3.x, ts0)
+  let n1 = find_cubic_extrema(p0.y, p1.y, p2.y, p3.y, ts1)
+  let total = n0 + n1
+  let src = [p0, p1, p2, p3]
+  let mut idx = 0
+  for i in 0..<n0 {
+    extremas[idx] = eval_cubic_pos_at(src, ts0[i])
+    idx += 1
+  }
+  for i in 0..<n1 {
+    extremas[idx] = eval_cubic_pos_at(src, ts1[i])
+    idx += 1
+  }
+  extremas[total] = p3
+  total + 1
+}
+
+pub struct PathSegmentsIter {
+  pub path : Path
+  pub mut verb_index : Int
+  pub mut points_index : Int
+  pub mut is_auto_close : Bool
+  pub mut last_move_to : Point
+  pub mut last_point : Point
+}
+
+fn PathSegmentsIter::clone(self : PathSegmentsIter) -> PathSegmentsIter {
+  PathSegmentsIter::{
+    path: self.path,
+    verb_index: self.verb_index,
+    points_index: self.points_index,
+    is_auto_close: self.is_auto_close,
+    last_move_to: self.last_move_to,
+    last_point: self.last_point,
+  }
+}
+
+pub fn PathSegmentsIter::set_auto_close(self : PathSegmentsIter, flag : Bool) -> Unit {
+  self.is_auto_close = flag
+}
+
+fn PathSegmentsIter::auto_close(self : PathSegmentsIter) -> PathSegment {
+  if self.is_auto_close && self.last_point != self.last_move_to {
+    self.verb_index -= 1
+    PathSegment::LineTo(self.last_move_to)
+  } else {
+    PathSegment::Close
+  }
+}
+
+fn PathSegmentsIter::has_valid_tangent(self : PathSegmentsIter) -> Bool {
+  let iter = self.clone()
+  while true {
+    let segment = match iter.next() {
+      Some(s) => s
+      None => break
+    }
+    match segment {
+      PathSegment::MoveTo(_) => return false
+      PathSegment::LineTo(p) => {
+        if iter.last_point == p {
+          continue
+        }
+        return true
+      }
+      PathSegment::QuadTo(p1, p2) => {
+        if iter.last_point == p1 && iter.last_point == p2 {
+          continue
+        }
+        return true
+      }
+      PathSegment::CubicTo(p1, p2, p3) => {
+        if iter.last_point == p1 && iter.last_point == p2 && iter.last_point == p3 {
+          continue
+        }
+        return true
+      }
+      PathSegment::Close => return false
+    }
+  }
+  false
+}
+
+pub fn PathSegmentsIter::curr_verb(self : PathSegmentsIter) -> PathVerb {
+  self.path.verbs[self.verb_index - 1]
+}
+
+pub fn PathSegmentsIter::next_verb(self : PathSegmentsIter) -> Option[PathVerb] {
+  if self.verb_index >= 0 && self.verb_index < self.path.verbs.length() {
+    Some(self.path.verbs[self.verb_index])
+  } else {
+    None
+  }
+}
+
+pub fn PathSegmentsIter::next(self : PathSegmentsIter) -> Option[PathSegment] {
+  if self.verb_index < self.path.verbs.length() {
+    let verb = self.path.verbs[self.verb_index]
+    self.verb_index += 1
+    let pts = self.path.points
+    match verb {
+      PathVerb::Move => {
+        self.points_index += 1
+        self.last_move_to = pts[self.points_index - 1]
+        self.last_point = self.last_move_to
+        Some(PathSegment::MoveTo(self.last_move_to))
+      }
+      PathVerb::Line => {
+        self.points_index += 1
+        self.last_point = pts[self.points_index - 1]
+        Some(PathSegment::LineTo(self.last_point))
+      }
+      PathVerb::Quad => {
+        self.points_index += 2
+        self.last_point = pts[self.points_index - 1]
+        Some(PathSegment::QuadTo(pts[self.points_index - 2], self.last_point))
+      }
+      PathVerb::Cubic => {
+        self.points_index += 3
+        self.last_point = pts[self.points_index - 1]
+        Some(PathSegment::CubicTo(pts[self.points_index - 3], pts[self.points_index - 2], self.last_point))
+      }
+      PathVerb::Close => {
+        let seg = self.auto_close()
+        self.last_point = self.last_move_to
+        Some(seg)
+      }
+    }
+  } else {
+    None
+  }
+}

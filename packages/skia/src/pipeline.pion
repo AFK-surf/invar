@@ -1,0 +1,317 @@
+// tiny-skia's raster pipeline (src/pipeline/mod.rs, after Skia's SkRasterPipeline): a list of stages run over a
+// rect 8 pixels at a time in floats (highp) or 16 at a time in 0..=255 integers (lowp, where every stage has one).
+
+enum Stage {
+  MoveDestinationToSource
+  Clamp0
+  ClampA
+  Premultiply
+  UniformColor
+  SeedShader
+  LoadDestination
+  Store
+  LoadDestinationU8
+  StoreU8
+  Gather
+  LoadMaskU8
+  MaskU8
+  ScaleU8
+  LerpU8
+  Scale1Float
+  Lerp1Float
+  StDestinationAtop
+  StDestinationIn
+  StDestinationOut
+  StDestinationOver
+  StSourceAtop
+  StSourceIn
+  StSourceOut
+  StSourceOver
+  StClear
+  StModulate
+  StMultiply
+  StPlus
+  StScreen
+  StXor
+  StColorBurn
+  StColorDodge
+  StDarken
+  StDifference
+  StExclusion
+  StHardLight
+  StLighten
+  StOverlay
+  StSoftLight
+  StHue
+  StSaturation
+  StColor
+  StLuminosity
+  SourceOverRgba
+  StTransform
+  StReflect
+  StRepeat
+  StBilinear
+  StBicubic
+  PadX1
+  ReflectX1
+  RepeatX1
+  StGradient
+  EvenlySpaced2StopGradient
+  XYToUnitAngle
+  XYToRadius
+  XYTo2PtConicalFocalOnCircle
+  XYTo2PtConicalWellBehaved
+  XYTo2PtConicalSmaller
+  XYTo2PtConicalGreater
+  XYTo2PtConicalStrip
+  Mask2PtConicalNan
+  Mask2PtConicalDegenerates
+  ApplyVectorMask
+  Alter2PtConicalCompensateFocal
+  Alter2PtConicalUnswap
+  NegateX
+  ApplyConcentricScaleBias
+  GammaExpand2
+  GammaExpandDestination2
+  GammaCompress2
+  GammaExpand22
+  GammaExpandDestination22
+  GammaCompress22
+  GammaExpandSrgb
+  GammaExpandDestinationSrgb
+  GammaCompressSrgb
+}
+
+/// Whether lowp has the stage (lowp::STAGES' entries that are not null_fn).
+fn stage_lowp(s : Stage) -> Bool {
+  match s {
+    Stage::Clamp0
+    | Stage::ClampA
+    | Stage::Gather
+    | Stage::StColorBurn
+    | Stage::StColorDodge
+    | Stage::StSoftLight
+    | Stage::StHue
+    | Stage::StSaturation
+    | Stage::StColor
+    | Stage::StLuminosity
+    | Stage::StReflect
+    | Stage::StRepeat
+    | Stage::StBilinear
+    | Stage::StBicubic
+    | Stage::XYToUnitAngle
+    | Stage::XYTo2PtConicalFocalOnCircle
+    | Stage::XYTo2PtConicalWellBehaved
+    | Stage::XYTo2PtConicalSmaller
+    | Stage::XYTo2PtConicalGreater
+    | Stage::XYTo2PtConicalStrip
+    | Stage::Mask2PtConicalNan
+    | Stage::Mask2PtConicalDegenerates
+    | Stage::ApplyVectorMask
+    | Stage::Alter2PtConicalCompensateFocal
+    | Stage::Alter2PtConicalUnswap
+    | Stage::NegateX
+    | Stage::ApplyConcentricScaleBias
+    | Stage::GammaExpand2
+    | Stage::GammaExpandDestination2
+    | Stage::GammaCompress2
+    | Stage::GammaExpand22
+    | Stage::GammaExpandDestination22
+    | Stage::GammaCompress22
+    | Stage::GammaExpandSrgb
+    | Stage::GammaExpandDestinationSrgb
+    | Stage::GammaCompressSrgb => false
+    _ => true
+  }
+}
+
+#derive(Eq)
+pub enum SpreadMode {
+  Pad
+  Reflect
+  Repeat
+}
+
+struct GradientColor {
+  r : Float
+  g : Float
+  b : Float
+  a : Float
+}
+
+fn gc(c : Color) -> GradientColor {
+  GradientColor::{ r: c.r, g: c.g, b: c.b, a: c.a }
+}
+
+struct GradientCtx {
+  mut len : Int
+  factors : Array[GradientColor]
+  biases : Array[GradientColor]
+  t_values : Array[Float]
+}
+
+fn GradientCtx::push_const_color(self : GradientCtx, color : GradientColor) -> Unit {
+  self.factors.push(GradientColor::{ r: 0.0f, g: 0.0f, b: 0.0f, a: 0.0f })
+  self.biases.push(color)
+}
+
+/// The pipeline's shared state (Context).
+struct Context {
+  mut current_coverage : Float
+  mut sampler_spread : SpreadMode
+  mut sampler_inv_width : Float
+  mut sampler_inv_height : Float
+  mut uniform : (Float, Float, Float, Float)
+  mut uniform_rgba : (Int, Int, Int, Int)
+  mut es2_factor : GradientColor
+  mut es2_bias : GradientColor
+  mut gradient : GradientCtx
+  /// two point conical: its mask (one bool a lane) and p0, p1
+  conical_mask : FixedArray[Bool]
+  mut conical_p0 : Float
+  mut conical_p1 : Float
+  mut limit_x : (Float, Float)
+  mut limit_y : (Float, Float)
+  mut transform : Transform
+}
+
+fn Context::new() -> Context {
+  let z = GradientColor::{ r: 0.0f, g: 0.0f, b: 0.0f, a: 0.0f }
+  Context::{
+    current_coverage: 0.0f,
+    sampler_spread: SpreadMode::Pad,
+    sampler_inv_width: 0.0f,
+    sampler_inv_height: 0.0f,
+    uniform: (0.0f, 0.0f, 0.0f, 0.0f),
+    uniform_rgba: (0, 0, 0, 0),
+    es2_factor: z,
+    es2_bias: z,
+    gradient: GradientCtx::{ len: 0, factors: [], biases: [], t_values: [] },
+    conical_mask: FixedArray::make(8, false),
+    conical_p0: 0.0f,
+    conical_p1: 0.0f,
+    limit_x: (0.0f, 0.0f),
+    limit_y: (0.0f, 0.0f),
+    transform: Transform::identity(),
+  }
+}
+
+/// A two-pixel coverage mask of a hairline (AAMaskCtx): its bytes, row stride and where it starts.
+struct AAMaskCtx {
+  p0 : Int
+  p1 : Int
+  stride : Int
+  shift : Int
+}
+
+fn aa_mask_none() -> AAMaskCtx {
+  AAMaskCtx::{ p0: 0, p1: 0, stride: 0, shift: 0 }
+}
+
+fn AAMaskCtx::copy_at_xy(self : AAMaskCtx, dx : Int, dy : Int, tail : Int) -> (Int, Int) {
+  let offset = self.stride * dy + dx - self.shift
+  if offset == 0 && tail == 1 {
+    (self.p0, 0)
+  } else if offset == 0 && tail == 2 {
+    (self.p0, self.p1)
+  } else if offset == 1 && tail == 1 {
+    (self.p1, 0)
+  } else {
+    (0, 0)
+  }
+}
+
+/// A clip mask drawn through (MaskCtx): its bytes from `offset`, rows `real_width` apart.
+struct MaskCtx {
+  data : FixedArray[Byte]
+  offset : Int
+  real_width : Int
+}
+
+fn mask_none() -> MaskCtx {
+  MaskCtx::{ data: FixedArray::make(0, 0 as Byte), offset: 0, real_width: 0 }
+}
+
+fn MaskCtx::at(self : MaskCtx, dx : Int, dy : Int) -> Int {
+  self.offset + self.real_width * dy + dx
+}
+
+struct RasterPipelineBuilder {
+  stages : Array[Stage]
+  mut force_hq_pipeline : Bool
+  ctx : Context
+}
+
+fn RasterPipelineBuilder::new() -> RasterPipelineBuilder {
+  RasterPipelineBuilder::{ stages: [], force_hq_pipeline: false, ctx: Context::new() }
+}
+
+fn RasterPipelineBuilder::push(self : RasterPipelineBuilder, stage : Stage) -> Unit {
+  self.stages.push(stage)
+}
+
+fn RasterPipelineBuilder::push_transform(self : RasterPipelineBuilder, ts : Transform) -> Unit {
+  if ts.is_finite() && !ts.is_identity() {
+    self.stages.push(Stage::StTransform)
+    self.ctx.transform = ts
+  }
+}
+
+fn RasterPipelineBuilder::push_uniform_color(self : RasterPipelineBuilder, c : PremultipliedColor) -> Unit {
+  let r16 = f2u16(c.r * 255.0f + 0.5f)
+  let g16 = f2u16(c.g * 255.0f + 0.5f)
+  let b16 = f2u16(c.b * 255.0f + 0.5f)
+  let a16 = f2u16(c.a * 255.0f + 0.5f)
+  self.ctx.uniform = (c.r, c.g, c.b, c.a)
+  self.ctx.uniform_rgba = (r16, g16, b16, a16)
+  self.stages.push(Stage::UniformColor)
+}
+
+/// Rust's `x as u16` of a f32.
+fn f2u16(x : Float) -> Int {
+  if f_is_nan(x) || x <= 0.0f {
+    0
+  } else if x >= 65535.0f {
+    65535
+  } else {
+    x.to_int()
+  }
+}
+
+struct RasterPipeline {
+  stages : Array[Stage]
+  low : Bool
+  ctx : Context
+}
+
+fn RasterPipelineBuilder::compile(self : RasterPipelineBuilder) -> RasterPipeline {
+  if self.stages.length() == 0 {
+    return RasterPipeline::{ stages: [], low: false, ctx: Context::new() }
+  }
+  let mut lowp_ok = true
+  for s in self.stages {
+    if !stage_lowp(s) {
+      lowp_ok = false
+      break
+    }
+  }
+  RasterPipeline::{ stages: self.stages, low: !self.force_hq_pipeline && lowp_ok, ctx: self.ctx }
+}
+
+fn RasterPipeline::run(
+  self : RasterPipeline,
+  rect : ScreenIntRect,
+  aa_mask_ctx : AAMaskCtx,
+  mask_ctx : MaskCtx,
+  pixmap_src : Pixmap,
+  pixmap_dst : SubPixmap,
+) -> Unit {
+  if self.stages.length() == 0 {
+    return
+  }
+  if self.low {
+    lowp_start(self.stages, rect, aa_mask_ctx, mask_ctx, self.ctx, pixmap_dst)
+  } else {
+    highp_start(self.stages, rect, aa_mask_ctx, mask_ctx, self.ctx, pixmap_src, pixmap_dst)
+  }
+}

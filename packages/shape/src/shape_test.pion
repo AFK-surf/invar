@@ -1,0 +1,458 @@
+// Comprehensive unit tests for packages/shape.
+
+import "font"
+
+fn sp_u16(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn sp_i16(buf : Array[Int], v : Int) -> Unit {
+  sp_u16(buf, v & 0xFFFF)
+}
+
+fn sp_u32(buf : Array[Int], v : Int) -> Unit {
+  buf.push((v >> 24) & 0xFF)
+  buf.push((v >> 16) & 0xFF)
+  buf.push((v >> 8) & 0xFF)
+  buf.push(v & 0xFF)
+}
+
+fn sp_tag(buf : Array[Int], s : String) -> Unit {
+  let bs = s.to_bytes()
+  for i in 0..<4 {
+    buf.push(bs[i].to_int())
+  }
+}
+
+fn sp_bytes(buf : Array[Int]) -> Bytes {
+  let sb = StringBuilder::new()
+  for x in buf {
+    sb.write_byte((x & 0xFF) as Byte)
+  }
+  sb.to_string().to_bytes()
+}
+
+fn sp_build_sfnt(tables : Array[(String, Array[Int])]) -> Bytes {
+  let buf : Array[Int] = [0, 1, 0, 0]
+  let n = tables.length()
+  sp_u16(buf, n)
+  sp_u16(buf, 16)
+  sp_u16(buf, 0)
+  sp_u16(buf, 0)
+  let mut offset = 12 + n * 16
+  for t in tables {
+    let (tg, data) = t
+    sp_tag(buf, tg)
+    sp_u32(buf, 0)
+    sp_u32(buf, offset)
+    sp_u32(buf, data.length())
+    offset += data.length()
+    offset += (4 - (data.length() % 4)) % 4
+  }
+  for t in tables {
+    let (_, data) = t
+    for x in data {
+      buf.push(x)
+    }
+    let pad = (4 - (data.length() % 4)) % 4
+    for _ in 0..<pad {
+      buf.push(0)
+    }
+  }
+  sp_bytes(buf)
+}
+
+fn sp_head(upem : Int) -> Array[Int] {
+  let b = Array::make(54, 0)
+  b[18] = (upem >> 8) & 0xFF
+  b[19] = upem & 0xFF
+  b
+}
+
+fn sp_maxp(ng : Int) -> Array[Int] {
+  let b : Array[Int] = []
+  sp_u32(b, 0x00010000)
+  sp_u16(b, ng)
+  b
+}
+
+fn sp_hhea(nhm : Int) -> Array[Int] {
+  let b = Array::make(36, 0)
+  b[4] = (800 >> 8) & 0xFF
+  b[5] = 800 & 0xFF
+  let d = (-200) & 0xFFFF
+  b[6] = (d >> 8) & 0xFF
+  b[7] = d & 0xFF
+  b[34] = (nhm >> 8) & 0xFF
+  b[35] = nhm & 0xFF
+  b
+}
+
+fn sp_hmtx(advs : Array[Int]) -> Array[Int] {
+  let b : Array[Int] = []
+  for a in advs {
+    sp_u16(b, a)
+    sp_i16(b, 0)
+  }
+  b
+}
+
+/// Format 12 cmap mapping sorted (cp, gid) pairs.
+fn sp_cmap12(pairs : Array[(Int, Int)]) -> Array[Int] {
+  let b : Array[Int] = []
+  sp_u16(b, 0) // version
+  sp_u16(b, 1) // numTables
+  sp_u16(b, 3)
+  sp_u16(b, 10)
+  sp_u32(b, 12)
+  // format 12
+  sp_u16(b, 12)
+  sp_u16(b, 0)
+  sp_u32(b, 16 + pairs.length() * 12)
+  sp_u32(b, 0)
+  sp_u32(b, pairs.length())
+  for p in pairs {
+    sp_u32(b, p.0)
+    sp_u32(b, p.0)
+    sp_u32(b, p.1)
+  }
+  b
+}
+
+/// Build a simple GSUB or GPOS table with 1 script, 1 feature list, and lookup tables.
+fn sp_layout(script_tag : String, feat_specs : Array[(String, Array[Int])], lookup_blobs : Array[Array[Int]]) -> Array[Int] {
+  // ScriptList: 1 script, default langSys with all features [0..nf)
+  let sl : Array[Int] = []
+  sp_u16(sl, 1)
+  sp_tag(sl, script_tag)
+  sp_u16(sl, 8) // offset to Script table
+  // Script table at +8: defaultLangSys=4, langSysCount=0
+  sp_u16(sl, 4)
+  sp_u16(sl, 0)
+  // LangSys table at +12: lookupOrder=0, reqFeature=0xFFFF, featureIndexCount=nf
+  sp_u16(sl, 0)
+  sp_u16(sl, 0xFFFF)
+  sp_u16(sl, feat_specs.length())
+  for i in 0..<feat_specs.length() {
+    sp_u16(sl, i)
+  }
+
+  // FeatureList
+  let fl : Array[Int] = []
+  let nf = feat_specs.length()
+  sp_u16(fl, nf)
+  let mut foff = 2 + nf * 6
+  for fs in feat_specs {
+    sp_tag(fl, fs.0)
+    sp_u16(fl, foff)
+    foff += 4 + fs.1.length() * 2
+  }
+  for fs in feat_specs {
+    sp_u16(fl, 0) // featureParamsOffset
+    sp_u16(fl, fs.1.length())
+    for li in fs.1 {
+      sp_u16(fl, li)
+    }
+  }
+
+  // LookupList
+  let ll : Array[Int] = []
+  let nl = lookup_blobs.length()
+  sp_u16(ll, nl)
+  let mut loff = 2 + nl * 2
+  for lb in lookup_blobs {
+    sp_u16(ll, loff)
+    loff += lb.length()
+  }
+  for lb in lookup_blobs {
+    for x in lb {
+      ll.push(x)
+    }
+  }
+
+  // Header (10 bytes): major=1, minor=0, scriptList, featureList, lookupList
+  let out : Array[Int] = []
+  sp_u16(out, 1)
+  sp_u16(out, 0)
+  let sl_off = 10
+  let fl_off = sl_off + sl.length()
+  let ll_off = fl_off + fl.length()
+  sp_u16(out, sl_off)
+  sp_u16(out, fl_off)
+  sp_u16(out, ll_off)
+  for x in sl { out.push(x) }
+  for x in fl { out.push(x) }
+  for x in ll { out.push(x) }
+  out
+}
+
+/// GSUB Lookup type 1 format 2 (SingleSubst mapping 1 glyph -> 1 glyph).
+fn sp_gsub_single(from_gid : Int, to_gid : Int) -> Array[Int] {
+  let b : Array[Int] = []
+  // Lookup header (8 bytes): type=1, flag=0, subtableCount=1, subtableOff=8
+  sp_u16(b, 1)
+  sp_u16(b, 0)
+  sp_u16(b, 1)
+  sp_u16(b, 8)
+  // SingleSubst format 2 (8 bytes): format=2, covOff=8, glyphCount=1, subst[0]=to_gid
+  sp_u16(b, 2)
+  sp_u16(b, 8)
+  sp_u16(b, 1)
+  sp_u16(b, to_gid)
+  // Coverage format 1 (6 bytes): format=1, count=1, glyph=from_gid
+  sp_u16(b, 1)
+  sp_u16(b, 1)
+  sp_u16(b, from_gid)
+  b
+}
+
+/// GSUB Lookup type 4 format 1 (LigatureSubst: g1 + g2 -> lig_gid).
+fn sp_gsub_lig2(g1 : Int, g2 : Int, lig_gid : Int) -> Array[Int] {
+  let b : Array[Int] = []
+  // Lookup header (8 bytes)
+  sp_u16(b, 4)
+  sp_u16(b, 0)
+  sp_u16(b, 1)
+  sp_u16(b, 8)
+  // Subtable (8 bytes): format=1, covOff=8, ligSetCount=1, ligSetOff=14
+  sp_u16(b, 1)
+  sp_u16(b, 8)
+  sp_u16(b, 1)
+  sp_u16(b, 14)
+  // Coverage format 1 at +8 (6 bytes)
+  sp_u16(b, 1)
+  sp_u16(b, 1)
+  sp_u16(b, g1)
+  // LigatureSet at +14 (4 bytes): ligCount=1, ligOff=4
+  sp_u16(b, 1)
+  sp_u16(b, 4)
+  // Ligature at +18 (6 bytes): ligGlyph, compCount=2, comp[0]=g2
+  sp_u16(b, lig_gid)
+  sp_u16(b, 2)
+  sp_u16(b, g2)
+  b
+}
+
+/// GPOS Lookup type 2 format 1 (PairPos: g1 + g2 -> xAdvance delta on g1).
+fn sp_gpos_pair_kern(g1 : Int, g2 : Int, dx_adv : Int) -> Array[Int] {
+  let b : Array[Int] = []
+  // Lookup header (8 bytes)
+  sp_u16(b, 2)
+  sp_u16(b, 0)
+  sp_u16(b, 1)
+  sp_u16(b, 8)
+  // PairPos format 1 (12 bytes): format=1, covOff=12, vf1=4 (XAdvance), vf2=0, pairSetCount=1, pairSetOff=18
+  sp_u16(b, 1)
+  sp_u16(b, 12)
+  sp_u16(b, 4)
+  sp_u16(b, 0)
+  sp_u16(b, 1)
+  sp_u16(b, 18)
+  // Coverage format 1 at +12 (6 bytes)
+  sp_u16(b, 1)
+  sp_u16(b, 1)
+  sp_u16(b, g1)
+  // PairSet at +18 (6 bytes): pairValueCount=1, secondGlyph=g2, xAdv=dx_adv
+  sp_u16(b, 1)
+  sp_u16(b, g2)
+  sp_i16(b, dx_adv)
+  b
+}
+
+test "canonical decompositions and UCD properties" {
+  // Upstream unicode_test.mbt vectors
+  match decompose(0x212B) {
+    Some((a, b)) => debug_assert(a == 0xC5 && b == 0, "ANGSTROM SIGN -> Å")
+    None => debug_assert(false, "expected 0x212B decompose")
+  }
+  match decompose(0x2000) {
+    Some((a, b)) => debug_assert(a == 0x2002 && b == 0, "EN QUAD -> EN SPACE")
+    None => debug_assert(false, "expected 0x2000 decompose")
+  }
+  match decompose(0x2F803) {
+    Some((a, b)) => debug_assert(a == 0x20122 && b == 0, "CJK compat -> plane 2")
+    None => debug_assert(false, "expected 0x2F803 decompose")
+  }
+  match decompose(0xC5) {
+    Some((a, b)) => debug_assert(a == 0x41 && b == 0x30A, "Å -> A + ring")
+    None => debug_assert(false, "expected 0xC5 decompose")
+  }
+  match decompose(0x1E0A) {
+    Some((a, b)) => debug_assert(a == 0x44 && b == 0x307, "Ḋ -> D + dot")
+    None => debug_assert(false, "expected 0x1E0A decompose")
+  }
+  debug_assert(decompose(0x41).is_none(), "A has no decomposition")
+  match compose(0x65, 0x301) {
+    Some(c) => debug_assert(c == 0xE9, "e + acute -> é")
+    None => debug_assert(false, "expected compose é")
+  }
+  debug_assert(script_of(0x41) == tag("Latn"), "A -> Latn")
+  debug_assert(script_of(0x0628) == tag("Arab"), "BEH -> Arab")
+  debug_assert(script_of(0x0915) == tag("Deva"), "KA -> Deva")
+  match mirroring(0x28) {
+    Some(m) => debug_assert(m == 0x29, "mirror ( -> )")
+    None => debug_assert(false, "expected mirror")
+  }
+}
+
+test "Latin GSUB ligature, GPOS pair kerning, and feature toggle" {
+  // Glyphs: 1='f'(102), 2='i'(105), 3='V'(86), 4='A'(65), 5='fi' ligature
+  let cmap = sp_cmap12([(65, 4), (86, 3), (102, 1), (105, 2)])
+  let gsub = sp_layout("latn", [("liga", [0])], [sp_gsub_lig2(1, 2, 5)])
+  let gpos = sp_layout("latn", [("kern", [0])], [sp_gpos_pair_kern(3, 4, -80)])
+  let data = sp_build_sfnt([
+    ("GPOS", gpos),
+    ("GSUB", gsub),
+    ("cmap", cmap),
+    ("head", sp_head(1000)),
+    ("hhea", sp_hhea(6)),
+    ("hmtx", sp_hmtx([500, 350, 280, 600, 600, 580])),
+    ("maxp", sp_maxp(6)),
+  ])
+  let face = match font::Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse")
+      return
+    }
+  }
+  let sf = ShapeFont::new(face)
+
+  // "fiVA" with default features (liga on, kern on)
+  let buf = Buffer::new()
+  buf.push(102, 0) // 'f'
+  buf.push(105, 1) // 'i'
+  buf.push(86, 2) // 'V'
+  buf.push(65, 3) // 'A'
+  shape(sf, buf, [])
+  let infos = buf.glyph_infos()
+  let pos = buf.glyph_positions()
+  debug_assert(infos.length() == 3, "fi ligated -> 3 glyphs")
+  debug_assert(infos[0].glyph_id == 5 && infos[0].cluster == 0, "fi ligature glyph 5")
+  debug_assert(infos[1].glyph_id == 3 && pos[1].x_advance == 520, "V kerned 600 - 80 = 520")
+  debug_assert(infos[2].glyph_id == 4 && pos[2].x_advance == 600, "A advance 600")
+
+  // Disable liga=0
+  let buf2 = Buffer::new()
+  buf2.push(102, 0)
+  buf2.push(105, 1)
+  shape(sf, buf2, [Feature::new("liga", 0)])
+  debug_assert(buf2.glyph_infos().length() == 2 && buf2.glyph_infos()[0].glyph_id == 1, "liga=0 keeps f,i")
+}
+
+test "Arabic joining forms (init/medi/fina) and RTL visual order" {
+  // Arabic BEH (U+0628) dual-joining: nominal gid=1, init=2, medi=3, fina=4
+  let cmap = sp_cmap12([(0x0628, 1)])
+  let gsub = sp_layout(
+    "arab",
+    [("init", [0]), ("medi", [1]), ("fina", [2])],
+    [sp_gsub_single(1, 2), sp_gsub_single(1, 3), sp_gsub_single(1, 4)],
+  )
+  let data = sp_build_sfnt([
+    ("GSUB", gsub),
+    ("cmap", cmap),
+    ("head", sp_head(1000)),
+    ("hhea", sp_hhea(5)),
+    ("hmtx", sp_hmtx([500, 500, 480, 460, 520])),
+    ("maxp", sp_maxp(5)),
+  ])
+  let face = match font::Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse arab")
+      return
+    }
+  }
+  let sf = ShapeFont::new(face)
+  let buf = Buffer::new()
+  buf.set_direction(Direction::RightToLeft)
+  buf.push(0x0628, 0)
+  buf.push(0x0628, 1)
+  buf.push(0x0628, 2)
+  shape(sf, buf, [])
+  let infos = buf.glyph_infos()
+  // Logical order: [init(2) c=0, medi(3) c=1, fina(4) c=2]
+  // Visual RTL order: [fina(4) c=2, medi(3) c=1, init(2) c=0]
+  debug_assert(infos.length() == 3, "3 arabic glyphs")
+  debug_assert(infos[0].glyph_id == 4 && infos[0].cluster == 2, "visual[0] = fina")
+  debug_assert(infos[1].glyph_id == 3 && infos[1].cluster == 1, "visual[1] = medi")
+  debug_assert(infos[2].glyph_id == 2 && infos[2].cluster == 0, "visual[2] = init")
+}
+
+test "Indic Devanagari syllable reordering (pre-base matra U+093F before KA)" {
+  // Devanagari KA (U+0915 -> gid 1) + Vowel Sign I (U+093F -> gid 2)
+  // Indic shaper must reorder pre-base matra I before base KA: visual [2, 1] with merged cluster 0!
+  let cmap = sp_cmap12([(0x0915, 1), (0x093F, 2), (0x094D, 3), (0x25CC, 4)])
+  let gsub = sp_layout("dev2", [("locl", [])], [])
+  let data = sp_build_sfnt([
+    ("GSUB", gsub),
+    ("cmap", cmap),
+    ("head", sp_head(1000)),
+    ("hhea", sp_hhea(5)),
+    ("hmtx", sp_hmtx([500, 600, 250, 0, 500])),
+    ("maxp", sp_maxp(5)),
+  ])
+  let face = match font::Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse deva")
+      return
+    }
+  }
+  let sf = ShapeFont::new(face)
+  let buf = Buffer::new()
+  buf.push(0x0915, 0) // KA
+  buf.push(0x093F, 1) // VOWEL SIGN I (pre-base)
+  shape(sf, buf, [])
+  let infos = buf.glyph_infos()
+  debug_assert(infos.length() == 2, "2 devanagari glyphs")
+  debug_assert(infos[0].glyph_id == 2 && infos[1].glyph_id == 1, "pre-base matra I reordered before KA")
+  debug_assert(infos[0].cluster == 0 && infos[1].cluster == 0, "reordered syllable merges cluster")
+}
+
+test "Unicode normalization (recompose e + acute -> é) and fallback kern table" {
+  // Font has 'e'(0x65->1), acute(0x301->2), 'é'(0xE9->3), 'A'(0x41->4), plus legacy kern (3,4)->-50
+  let cmap = sp_cmap12([(0x41, 4), (0x65, 1), (0xE9, 3), (0x301, 2)])
+  let kern : Array[Int] = []
+  sp_u16(kern, 0)
+  sp_u16(kern, 1)
+  sp_u16(kern, 0)
+  sp_u16(kern, 20)
+  sp_u16(kern, 1)
+  sp_u16(kern, 1)
+  sp_u16(kern, 6)
+  sp_u16(kern, 0)
+  sp_u16(kern, 0)
+  sp_u16(kern, 3)
+  sp_u16(kern, 4)
+  sp_i16(kern, -50)
+
+  let data = sp_build_sfnt([
+    ("cmap", cmap),
+    ("head", sp_head(1000)),
+    ("hhea", sp_hhea(5)),
+    ("hmtx", sp_hmtx([500, 500, 0, 500, 600])),
+    ("kern", kern),
+    ("maxp", sp_maxp(5)),
+  ])
+  let face = match font::Face::parse(data, 0) {
+    Some(f) => f
+    None => {
+      debug_assert(false, "parse norm")
+      return
+    }
+  }
+  let sf = ShapeFont::new(face)
+  let buf = Buffer::new()
+  buf.push(0x65, 0)
+  buf.push(0x301, 1)
+  buf.push(0x41, 2)
+  shape(sf, buf, [])
+  let infos = buf.glyph_infos()
+  let pos = buf.glyph_positions()
+  debug_assert(infos.length() == 2, "e + acute recomposed to é, followed by A")
+  debug_assert(infos[0].glyph_id == 3 && infos[1].glyph_id == 4, "glyphs [é(3), A(4)]")
+  // Legacy kern splits -50 into (-25, -25) across the pair
+  debug_assert(pos[0].x_advance == 475 && pos[1].x_advance == 575 && pos[1].x_offset == -25, "fallback kern split")
+}

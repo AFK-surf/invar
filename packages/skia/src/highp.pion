@@ -1,0 +1,880 @@
+// tiny-skia's high precision pipeline: 8 pixels at a time in floats, lane by lane as the
+// SIMD types compute them (src/wide: SSE's min, max and conversions; reciprocals exact).
+
+/// _mm_max_ps: a where a > b, else b.
+fn smax(a : Float, b : Float) -> Float {
+  if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+/// _mm_min_ps: a where a < b, else b.
+fn smin(a : Float, b : Float) -> Float {
+  if a < b {
+    a
+  } else {
+    b
+  }
+}
+
+/// cvttps: towards zero; NaN and what is out of range i32::MIN.
+fn trunc_int(x : Float) -> Int {
+  if f_is_nan(x) || x >= 2147483648.0f || x < -2147483648.0f {
+    -2147483648
+  } else {
+    x.to_double().to_int()
+  }
+}
+
+/// cvtps: to the nearest, ties to even; NaN and what is out of range i32::MIN.
+fn round_int(x : Float) -> Int {
+  if f_is_nan(x) || x >= 2147483648.0f || x < -2147483648.0f {
+    return -2147483648
+  }
+  let r = round_even(x)
+  r.to_double().to_int()
+}
+
+fn round_even(x : Float) -> Float {
+  let t = x.trunc()
+  let d = x - t
+  if d.abs() == 0.5f {
+    let ti = t.to_double().to_int()
+    if (ti & 1) == 0 {
+      t
+    } else if x > 0.0f {
+      t + 1.0f
+    } else {
+      t - 1.0f
+    }
+  } else if d.abs() > 0.5f {
+    if x > 0.0f {
+      t + 1.0f
+    } else {
+      t - 1.0f
+    }
+  } else {
+    t
+  }
+}
+
+/// f32x8::floor: the truncation, less 1 where it is above.
+fn lfloor(x : Float) -> Float {
+  let rt = fi(trunc_int(x))
+  if rt > x {
+    rt - 1.0f
+  } else {
+    rt
+  }
+}
+
+fn lnormalize(x : Float) -> Float {
+  smin(smax(x, 0.0f), 1.0f)
+}
+
+struct HighP {
+  r : FixedArray[Float]
+  g : FixedArray[Float]
+  b : FixedArray[Float]
+  a : FixedArray[Float]
+  dr : FixedArray[Float]
+  dg : FixedArray[Float]
+  db : FixedArray[Float]
+  da : FixedArray[Float]
+  mut tail : Int
+  mut dx : Int
+  mut dy : Int
+  ctx : Context
+  mask_ctx : MaskCtx
+  aa_mask_ctx : AAMaskCtx
+  src : Pixmap
+  dst : SubPixmap
+}
+
+fn highp_start(
+  stages : Array[Stage],
+  rect : ScreenIntRect,
+  aa_mask_ctx : AAMaskCtx,
+  mask_ctx : MaskCtx,
+  ctx : Context,
+  src : Pixmap,
+  dst : SubPixmap,
+) -> Unit {
+  let p = HighP::{
+    r: FixedArray::make(8, 0.0f),
+    g: FixedArray::make(8, 0.0f),
+    b: FixedArray::make(8, 0.0f),
+    a: FixedArray::make(8, 0.0f),
+    dr: FixedArray::make(8, 0.0f),
+    dg: FixedArray::make(8, 0.0f),
+    db: FixedArray::make(8, 0.0f),
+    da: FixedArray::make(8, 0.0f),
+    tail: 0,
+    dx: 0,
+    dy: 0,
+    ctx,
+    mask_ctx,
+    aa_mask_ctx,
+    src,
+    dst,
+  }
+  for y in rect.y..<rect.bottom() {
+    let mut x = rect.x
+    let end = rect.right()
+    while x + 8 <= end {
+      p.dx = x
+      p.dy = y
+      p.tail = 8
+      p.run(stages)
+      x += 8
+    }
+    if x != end {
+      p.dx = x
+      p.dy = y
+      p.tail = end - x
+      p.run(stages)
+    }
+  }
+}
+
+fn HighP::run(self : HighP, stages : Array[Stage]) -> Unit {
+  for s in stages {
+    if !self.stage(s) {
+      return
+    }
+  }
+}
+
+fn HighP::stage(self : HighP, s : Stage) -> Bool {
+  let p = self
+  match s {
+    Stage::MoveDestinationToSource => {
+      for i in 0..<8 {
+        p.r[i] = p.dr[i]
+        p.g[i] = p.dg[i]
+        p.b[i] = p.db[i]
+        p.a[i] = p.da[i]
+      }
+    }
+    Stage::Clamp0 => {
+      for i in 0..<8 {
+        p.r[i] = smax(p.r[i], 0.0f)
+        p.g[i] = smax(p.g[i], 0.0f)
+        p.b[i] = smax(p.b[i], 0.0f)
+        p.a[i] = smax(p.a[i], 0.0f)
+      }
+    }
+    Stage::ClampA => {
+      for i in 0..<8 {
+        p.r[i] = smin(p.r[i], 1.0f)
+        p.g[i] = smin(p.g[i], 1.0f)
+        p.b[i] = smin(p.b[i], 1.0f)
+        p.a[i] = smin(p.a[i], 1.0f)
+      }
+    }
+    Stage::Premultiply => {
+      for i in 0..<8 {
+        p.r[i] = p.r[i] * p.a[i]
+        p.g[i] = p.g[i] * p.a[i]
+        p.b[i] = p.b[i] * p.a[i]
+      }
+    }
+    Stage::UniformColor => {
+      let (r, g, b, a) = p.ctx.uniform
+      for i in 0..<8 {
+        p.r[i] = r
+        p.g[i] = g
+        p.b[i] = b
+        p.a[i] = a
+      }
+    }
+    Stage::SeedShader => {
+      for i in 0..<8 {
+        p.r[i] = fi(p.dx) + (fi(i) + 0.5f)
+        p.g[i] = fi(p.dy) + 0.5f
+        p.b[i] = 1.0f
+        p.a[i] = 0.0f
+        p.dr[i] = 0.0f
+        p.dg[i] = 0.0f
+        p.db[i] = 0.0f
+        p.da[i] = 0.0f
+      }
+    }
+    Stage::LoadDestination => p.load_dst()
+    Stage::Store => p.store()
+    Stage::LoadDestinationU8 | Stage::StoreU8 | Stage::LoadMaskU8 => return false
+    Stage::Gather => {
+      let ix = gather_ix(p.src, p.r, p.g)
+      load_8888_gather(p.src, ix, p.r, p.g, p.b, p.a)
+    }
+    Stage::MaskU8 => {
+      let offset = p.mask_ctx.at(p.dx, p.dy)
+      let c : FixedArray[Float] = FixedArray::make(8, 0.0f)
+      let mut all_zero = true
+      for i in 0..<p.tail {
+        c[i] = fi(p.mask_ctx.data[offset + i].to_int()) / 255.0f
+      }
+      for i in 0..<8 {
+        if c[i] != 0.0f {
+          all_zero = false
+        }
+      }
+      if all_zero {
+        return false
+      }
+      for i in 0..<8 {
+        p.r[i] = p.r[i] * c[i]
+        p.g[i] = p.g[i] * c[i]
+        p.b[i] = p.b[i] * c[i]
+        p.a[i] = p.a[i] * c[i]
+      }
+    }
+    Stage::ScaleU8 => {
+      let (d0, d1) = p.aa_mask_ctx.copy_at_xy(p.dx, p.dy, p.tail)
+      for i in 0..<8 {
+        let c : Float = if i == 0 { fi(d0) / 255.0f } else if i == 1 { fi(d1) / 255.0f } else { 0.0f }
+        p.r[i] = p.r[i] * c
+        p.g[i] = p.g[i] * c
+        p.b[i] = p.b[i] * c
+        p.a[i] = p.a[i] * c
+      }
+    }
+    Stage::LerpU8 => {
+      let (d0, d1) = p.aa_mask_ctx.copy_at_xy(p.dx, p.dy, p.tail)
+      for i in 0..<8 {
+        let c : Float = if i == 0 { fi(d0) / 255.0f } else if i == 1 { fi(d1) / 255.0f } else { 0.0f }
+        p.r[i] = hlerp(p.dr[i], p.r[i], c)
+        p.g[i] = hlerp(p.dg[i], p.g[i], c)
+        p.b[i] = hlerp(p.db[i], p.b[i], c)
+        p.a[i] = hlerp(p.da[i], p.a[i], c)
+      }
+    }
+    Stage::Scale1Float => {
+      let c = p.ctx.current_coverage
+      for i in 0..<8 {
+        p.r[i] = p.r[i] * c
+        p.g[i] = p.g[i] * c
+        p.b[i] = p.b[i] * c
+        p.a[i] = p.a[i] * c
+      }
+    }
+    Stage::Lerp1Float => {
+      let c = p.ctx.current_coverage
+      for i in 0..<8 {
+        p.r[i] = hlerp(p.dr[i], p.r[i], c)
+        p.g[i] = hlerp(p.dg[i], p.g[i], c)
+        p.b[i] = hlerp(p.db[i], p.b[i], c)
+        p.a[i] = hlerp(p.da[i], p.a[i], c)
+      }
+    }
+    Stage::StClear => p.blend1(fn(_s : Float, _d : Float, _sa : Float, _da : Float) -> Float { 0.0f })
+    Stage::StSourceAtop => p.blend1(fn(s : Float, d : Float, sa : Float, da : Float) -> Float { s * da + d * (1.0f - sa) })
+    Stage::StDestinationAtop => p.blend1(fn(s : Float, d : Float, sa : Float, da : Float) -> Float { d * sa + s * (1.0f - da) })
+    Stage::StSourceIn => p.blend1(fn(s : Float, _d : Float, _sa : Float, da : Float) -> Float { s * da })
+    Stage::StDestinationIn => p.blend1(fn(_s : Float, d : Float, sa : Float, _da : Float) -> Float { d * sa })
+    Stage::StSourceOut => p.blend1(fn(s : Float, _d : Float, _sa : Float, da : Float) -> Float { s * (1.0f - da) })
+    Stage::StDestinationOut => p.blend1(fn(_s : Float, d : Float, sa : Float, _da : Float) -> Float { d * (1.0f - sa) })
+    Stage::StSourceOver => p.blend1(fn(s : Float, d : Float, sa : Float, _da : Float) -> Float { d * (1.0f - sa) + s })
+    Stage::StDestinationOver => p.blend1(fn(s : Float, d : Float, _sa : Float, da : Float) -> Float { s * (1.0f - da) + d })
+    Stage::StModulate => p.blend1(fn(s : Float, d : Float, _sa : Float, _da : Float) -> Float { s * d })
+    Stage::StMultiply => p.blend1(fn(s : Float, d : Float, sa : Float, da : Float) -> Float { s * (1.0f - da) + d * (1.0f - sa) + s * d })
+    Stage::StScreen => p.blend1(fn(s : Float, d : Float, _sa : Float, _da : Float) -> Float { s + d - s * d })
+    Stage::StXor => p.blend1(fn(s : Float, d : Float, sa : Float, da : Float) -> Float { s * (1.0f - da) + d * (1.0f - sa) })
+    Stage::StPlus => p.blend1(fn(s : Float, d : Float, _sa : Float, _da : Float) -> Float { smin(s + d, 1.0f) })
+    Stage::StDarken => p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float { s + d - smax(s * da, d * sa) })
+    Stage::StLighten => p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float { s + d - smin(s * da, d * sa) })
+    Stage::StDifference =>
+      p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float {
+        let m = smin(s * da, d * sa)
+        s + d - (m + m)
+      })
+    Stage::StExclusion =>
+      p.blend2(fn(s : Float, d : Float, _sa : Float, _da : Float) -> Float {
+        let m = s * d
+        s + d - (m + m)
+      })
+    Stage::StColorBurn =>
+      p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float {
+        if d == da {
+          d + s * (1.0f - da)
+        } else if s == 0.0f {
+          d * (1.0f - sa)
+        } else {
+          sa * (da - smin(da, (da - d) * sa * (1.0f / s))) + s * (1.0f - da) + d * (1.0f - sa)
+        }
+      })
+    Stage::StColorDodge =>
+      p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float {
+        if d == 0.0f {
+          s * (1.0f - da)
+        } else if s == sa {
+          s + d * (1.0f - sa)
+        } else {
+          sa * smin(da, d * sa * (1.0f / (sa - s))) + s * (1.0f - da) + d * (1.0f - sa)
+        }
+      })
+    Stage::StHardLight =>
+      p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float {
+        s * (1.0f - da) +
+        d * (1.0f - sa) +
+        (if s + s <= sa {
+          let m = s * d
+          m + m
+        } else {
+          let m = (da - d) * (sa - s)
+          sa * da - (m + m)
+        })
+      })
+    Stage::StOverlay =>
+      p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float {
+        s * (1.0f - da) +
+        d * (1.0f - sa) +
+        (if d + d <= da {
+          let m = s * d
+          m + m
+        } else {
+          let m = (da - d) * (sa - s)
+          sa * da - (m + m)
+        })
+      })
+    Stage::StSoftLight =>
+      p.blend2(fn(s : Float, d : Float, sa : Float, da : Float) -> Float {
+        let m : Float = if da > 0.0f { d / da } else { 0.0f }
+        let s2 = s + s
+        let m4 = m + m + (m + m)
+        let dark_src = d * (sa + (s2 - sa) * (1.0f - m))
+        let dark_dst = (m4 * m4 + m4) * (m - 1.0f) + 7.0f * m
+        let lite_dst = m.sqrt() - m
+        let d4 = d + d + (d + d)
+        let lite_src = d * sa + da * (s2 - sa) * (if d4 <= da { dark_dst } else { lite_dst })
+        s * (1.0f - da) + d * (1.0f - sa) + (if s2 <= sa { dark_src } else { lite_src })
+      })
+    Stage::StHue => p.blend3(0)
+    Stage::StSaturation => p.blend3(1)
+    Stage::StColor => p.blend3(2)
+    Stage::StLuminosity => p.blend3(3)
+    Stage::SourceOverRgba => {
+      p.load_dst()
+      for i in 0..<8 {
+        let ia : Float = 1.0f - p.a[i]
+        p.r[i] = p.dr[i] * ia + p.r[i]
+        p.g[i] = p.dg[i] * ia + p.g[i]
+        p.b[i] = p.db[i] * ia + p.b[i]
+        p.a[i] = p.da[i] * ia + p.a[i]
+      }
+      p.store()
+    }
+    Stage::StTransform => {
+      let ts = p.ctx.transform
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        p.r[i] = x * ts.sx + (y * ts.kx + ts.tx)
+        p.g[i] = x * ts.ky + (y * ts.sy + ts.ty)
+      }
+    }
+    Stage::StReflect => {
+      let (sx, ix) = p.ctx.limit_x
+      let (sy, iy) = p.ctx.limit_y
+      for i in 0..<8 {
+        p.r[i] = exclusive_reflect(p.r[i], sx, ix)
+        p.g[i] = exclusive_reflect(p.g[i], sy, iy)
+      }
+    }
+    Stage::StRepeat => {
+      let (sx, ix) = p.ctx.limit_x
+      let (sy, iy) = p.ctx.limit_y
+      for i in 0..<8 {
+        p.r[i] = exclusive_repeat(p.r[i], sx, ix)
+        p.g[i] = exclusive_repeat(p.g[i], sy, iy)
+      }
+    }
+    Stage::StBilinear => p.sampler(2)
+    Stage::StBicubic => p.sampler(4)
+    Stage::PadX1 => { for i in 0..<8 { p.r[i] = lnormalize(p.r[i]) } }
+    Stage::ReflectX1 => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let f = lfloor((x - 1.0f) * 0.5f)
+        p.r[i] = lnormalize((x - 1.0f - (f + f) - 1.0f).abs())
+      }
+    }
+    Stage::RepeatX1 => { for i in 0..<8 { p.r[i] = lnormalize(p.r[i] - lfloor(p.r[i])) } }
+    Stage::StGradient => {
+      let g = p.ctx.gradient
+      for i in 0..<8 {
+        let t = p.r[i]
+        let mut idx = 0
+        for k in 1..<g.len {
+          if t >= g.t_values[k] {
+            idx += 1
+          }
+        }
+        let f = g.factors[idx]
+        let bb = g.biases[idx]
+        p.r[i] = t * f.r + bb.r
+        p.g[i] = t * f.g + bb.g
+        p.b[i] = t * f.b + bb.b
+        p.a[i] = t * f.a + bb.a
+      }
+    }
+    Stage::EvenlySpaced2StopGradient => {
+      let f = p.ctx.es2_factor
+      let bb = p.ctx.es2_bias
+      for i in 0..<8 {
+        let t = p.r[i]
+        p.r[i] = t * f.r + bb.r
+        p.g[i] = t * f.g + bb.g
+        p.b[i] = t * f.b + bb.b
+        p.a[i] = t * f.a + bb.a
+      }
+    }
+    Stage::XYToUnitAngle => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        let x_abs = x.abs()
+        let y_abs = y.abs()
+        let slope = smin(x_abs, y_abs) / smax(x_abs, y_abs)
+        let sq = slope * slope
+        let mut phi = slope *
+          (0.15912117063999176025390625f +
+          sq *
+          (-5.185396969318389892578125e-2f +
+          sq * (2.476101927459239959716796875e-2f + sq * -7.0547382347285747528076171875e-3f)))
+        phi = if x_abs < y_abs { 0.25f - phi } else { phi }
+        phi = if x < 0.0f { 0.5f - phi } else { phi }
+        phi = if y < 0.0f { 1.0f - phi } else { phi }
+        phi = if phi != phi { 0.0f } else { phi }
+        p.r[i] = phi
+      }
+    }
+    Stage::XYToRadius => {
+      for i in 0..<8 {
+        let x2 = p.r[i] * p.r[i]
+        let y2 = p.g[i] * p.g[i]
+        p.r[i] = (x2 + y2).sqrt()
+      }
+    }
+    Stage::XYTo2PtConicalFocalOnCircle => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        p.r[i] = x + y * y / x
+      }
+    }
+    Stage::XYTo2PtConicalWellBehaved => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        p.r[i] = (x * x + y * y).sqrt() - x * p.ctx.conical_p0
+      }
+    }
+    Stage::XYTo2PtConicalGreater => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        p.r[i] = (x * x - y * y).sqrt() - x * p.ctx.conical_p0
+      }
+    }
+    Stage::XYTo2PtConicalSmaller => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        p.r[i] = -(x * x - y * y).sqrt() - x * p.ctx.conical_p0
+      }
+    }
+    Stage::XYTo2PtConicalStrip => {
+      for i in 0..<8 {
+        let x = p.r[i]
+        let y = p.g[i]
+        p.r[i] = x + (p.ctx.conical_p0 - y * y).sqrt()
+      }
+    }
+    Stage::Mask2PtConicalNan => {
+      for i in 0..<8 {
+        let t = p.r[i]
+        let degenerate = t != t
+        p.r[i] = if degenerate { 0.0f } else { t }
+        p.ctx.conical_mask[i] = !degenerate
+      }
+    }
+    Stage::Mask2PtConicalDegenerates => {
+      for i in 0..<8 {
+        let t = p.r[i]
+        let degenerate = t <= 0.0f || t != t
+        p.r[i] = if degenerate { 0.0f } else { t }
+        p.ctx.conical_mask[i] = !degenerate
+      }
+    }
+    Stage::ApplyVectorMask => {
+      for i in 0..<8 {
+        if !p.ctx.conical_mask[i] {
+          p.r[i] = 0.0f
+          p.g[i] = 0.0f
+          p.b[i] = 0.0f
+          p.a[i] = 0.0f
+        }
+      }
+    }
+    Stage::Alter2PtConicalCompensateFocal => { for i in 0..<8 { p.r[i] = p.r[i] + p.ctx.conical_p1 } }
+    Stage::Alter2PtConicalUnswap => { for i in 0..<8 { p.r[i] = 1.0f - p.r[i] } }
+    Stage::NegateX => { for i in 0..<8 { p.r[i] = -p.r[i] } }
+    Stage::ApplyConcentricScaleBias => { for i in 0..<8 { p.r[i] = p.r[i] * p.ctx.conical_p0 + p.ctx.conical_p1 } }
+    Stage::GammaExpand2 => {
+      for i in 0..<8 {
+        p.r[i] = p.r[i] * p.r[i]
+        p.g[i] = p.g[i] * p.g[i]
+        p.b[i] = p.b[i] * p.b[i]
+      }
+    }
+    Stage::GammaExpandDestination2 => {
+      for i in 0..<8 {
+        p.dr[i] = p.dr[i] * p.dr[i]
+        p.dg[i] = p.dg[i] * p.dg[i]
+        p.db[i] = p.db[i] * p.db[i]
+      }
+    }
+    Stage::GammaCompress2 => {
+      for i in 0..<8 {
+        p.r[i] = p.r[i].sqrt()
+        p.g[i] = p.g[i].sqrt()
+        p.b[i] = p.b[i].sqrt()
+      }
+    }
+    Stage::GammaExpand22 => {
+      for i in 0..<8 {
+        p.r[i] = lane_powf(p.r[i], 2.2f)
+        p.g[i] = lane_powf(p.g[i], 2.2f)
+        p.b[i] = lane_powf(p.b[i], 2.2f)
+      }
+    }
+    Stage::GammaExpandDestination22 => {
+      for i in 0..<8 {
+        p.dr[i] = lane_powf(p.dr[i], 2.2f)
+        p.dg[i] = lane_powf(p.dg[i], 2.2f)
+        p.db[i] = lane_powf(p.db[i], 2.2f)
+      }
+    }
+    Stage::GammaCompress22 => {
+      for i in 0..<8 {
+        p.r[i] = lane_powf(p.r[i], 0.45454545f)
+        p.g[i] = lane_powf(p.g[i], 0.45454545f)
+        p.b[i] = lane_powf(p.b[i], 0.45454545f)
+      }
+    }
+    Stage::GammaExpandSrgb => {
+      for i in 0..<8 {
+        p.r[i] = srgb_expand(p.r[i])
+        p.g[i] = srgb_expand(p.g[i])
+        p.b[i] = srgb_expand(p.b[i])
+      }
+    }
+    Stage::GammaExpandDestinationSrgb => {
+      for i in 0..<8 {
+        p.dr[i] = srgb_expand(p.dr[i])
+        p.dg[i] = srgb_expand(p.dg[i])
+        p.db[i] = srgb_expand(p.db[i])
+      }
+    }
+    Stage::GammaCompressSrgb => {
+      for i in 0..<8 {
+        p.r[i] = srgb_compress(p.r[i])
+        p.g[i] = srgb_compress(p.g[i])
+        p.b[i] = srgb_compress(p.b[i])
+      }
+    }
+  }
+  true
+}
+
+fn hlerp(from : Float, to : Float, t : Float) -> Float {
+  (to - from) * t + from
+}
+
+fn HighP::blend1(self : HighP, f : (Float, Float, Float, Float) -> Float) -> Unit {
+  for i in 0..<8 {
+    let sa = self.a[i]
+    let da = self.da[i]
+    self.r[i] = f(self.r[i], self.dr[i], sa, da)
+    self.g[i] = f(self.g[i], self.dg[i], sa, da)
+    self.b[i] = f(self.b[i], self.db[i], sa, da)
+    self.a[i] = f(sa, da, sa, da)
+  }
+}
+
+fn HighP::blend2(self : HighP, f : (Float, Float, Float, Float) -> Float) -> Unit {
+  for i in 0..<8 {
+    let sa = self.a[i]
+    let da = self.da[i]
+    self.r[i] = f(self.r[i], self.dr[i], sa, da)
+    self.g[i] = f(self.g[i], self.dg[i], sa, da)
+    self.b[i] = f(self.b[i], self.db[i], sa, da)
+    self.a[i] = da * (1.0f - sa) + sa
+  }
+}
+
+/// The non-separable modes: 0 hue, 1 saturation, 2 color, 3 luminosity.
+fn HighP::blend3(self : HighP, mode : Int) -> Unit {
+  for i in 0..<8 {
+    let r = self.r[i]
+    let g = self.g[i]
+    let b = self.b[i]
+    let a = self.a[i]
+    let dr = self.dr[i]
+    let dg = self.dg[i]
+    let db = self.db[i]
+    let da = self.da[i]
+    let (rr, gg, bb) = if mode == 0 {
+      let (r1, g1, b1) = set_sat(r * a, g * a, b * a, sat(dr, dg, db) * a)
+      let (r2, g2, b2) = set_lum(r1, g1, b1, lum(dr, dg, db) * a)
+      clip_color(r2, g2, b2, a * da)
+    } else if mode == 1 {
+      let (r1, g1, b1) = set_sat(dr * a, dg * a, db * a, sat(r, g, b) * da)
+      let (r2, g2, b2) = set_lum(r1, g1, b1, lum(dr, dg, db) * a)
+      clip_color(r2, g2, b2, a * da)
+    } else if mode == 2 {
+      let (r2, g2, b2) = set_lum(r * da, g * da, b * da, lum(dr, dg, db) * a)
+      clip_color(r2, g2, b2, a * da)
+    } else {
+      let (r2, g2, b2) = set_lum(dr * a, dg * a, db * a, lum(r, g, b) * da)
+      clip_color(r2, g2, b2, a * da)
+    }
+    self.r[i] = r * (1.0f - da) + dr * (1.0f - a) + rr
+    self.g[i] = g * (1.0f - da) + dg * (1.0f - a) + gg
+    self.b[i] = b * (1.0f - da) + db * (1.0f - a) + bb
+    self.a[i] = a + da - a * da
+  }
+}
+
+fn sat(r : Float, g : Float, b : Float) -> Float {
+  smax(r, smax(g, b)) - smin(r, smin(g, b))
+}
+
+fn lum(r : Float, g : Float, b : Float) -> Float {
+  r * 0.30f + g * 0.59f + b * 0.11f
+}
+
+fn set_sat(r : Float, g : Float, b : Float, s : Float) -> (Float, Float, Float) {
+  let mn = smin(r, smin(g, b))
+  let mx = smax(r, smax(g, b))
+  let sv = mx - mn
+  if sv == 0.0f {
+    (0.0f, 0.0f, 0.0f)
+  } else {
+    ((r - mn) * s / sv, (g - mn) * s / sv, (b - mn) * s / sv)
+  }
+}
+
+fn set_lum(r : Float, g : Float, b : Float, l : Float) -> (Float, Float, Float) {
+  let diff = l - lum(r, g, b)
+  (r + diff, g + diff, b + diff)
+}
+
+fn clip_channel(c_in : Float, mn : Float, mx : Float, l : Float, a : Float) -> Float {
+  let c1 = if mx >= 0.0f { c_in } else { l + (c_in - l) * l / (l - mn) }
+  let c2 = if mx > a { l + (c1 - l) * (a - l) / (mx - l) } else { c1 }
+  smax(c2, 0.0f)
+}
+
+fn clip_color(r : Float, g : Float, b : Float, a : Float) -> (Float, Float, Float) {
+  let mn = smin(r, smin(g, b))
+  let mx = smax(r, smax(g, b))
+  let l = lum(r, g, b)
+  (clip_channel(r, mn, mx, l, a), clip_channel(g, mn, mx, l, a), clip_channel(b, mn, mx, l, a))
+}
+
+fn exclusive_reflect(v : Float, limit : Float, inv_limit : Float) -> Float {
+  (v - limit - (limit + limit) * lfloor((v - limit) * (inv_limit * 0.5f)) - limit).abs()
+}
+
+fn exclusive_repeat(v : Float, limit : Float, inv_limit : Float) -> Float {
+  v - lfloor(v * inv_limit) * limit
+}
+
+/// f32x8::powf: approx_powf in lanes, 0 and 1 kept.
+fn lane_powf(x : Float, exp : Float) -> Float {
+  if x == 0.0f || x == 1.0f {
+    return x
+  }
+  let e = fi(x.reinterpret_as_int()) * (1.0f / 8388608.0f)
+  let m = ((x.reinterpret_as_uint() & 0x007fffffU) | 0x3f000000U).reinterpret_as_float()
+  let log2_x = e - 124.225514990f - 1.498030302f * m - 1.725879990f / (0.3520887068f + m)
+  let x2 = log2_x * exp
+  let f = x2 - lfloor(x2)
+  let mut a = x2 + 121.274057500f
+  a = a - f * 1.490129070f
+  a = a + 27.728023300f / (4.84252568f - f)
+  a = a * 8388608.0f
+  let inf_bits = (0x7f800000U).to_float()
+  Float::from_bits(round_int(smin(smax(a, 0.0f), inf_bits)))
+}
+
+fn srgb_expand(x : Float) -> Float {
+  if x <= 0.04045f {
+    x / 12.92f
+  } else {
+    lane_powf((x + 0.055f) / 1.055f, 2.4f)
+  }
+}
+
+fn srgb_compress(x : Float) -> Float {
+  if x <= 0.0031308f {
+    x * 12.92f
+  } else {
+    lane_powf(x, 0.416666666f) * 1.055f - 0.055f
+  }
+}
+
+fn HighP::load_dst(self : HighP) -> Unit {
+  let o = self.dst.offset_at(self.dx, self.dy) * 4
+  let d = self.dst.data
+  for i in 0..<8 {
+    if i < self.tail {
+      self.dr[i] = fi(d[o + i * 4].to_int()) * (1.0f / 255.0f)
+      self.dg[i] = fi(d[o + i * 4 + 1].to_int()) * (1.0f / 255.0f)
+      self.db[i] = fi(d[o + i * 4 + 2].to_int()) * (1.0f / 255.0f)
+      self.da[i] = fi(d[o + i * 4 + 3].to_int()) * (1.0f / 255.0f)
+    } else {
+      self.dr[i] = 0.0f
+      self.dg[i] = 0.0f
+      self.db[i] = 0.0f
+      self.da[i] = 0.0f
+    }
+  }
+}
+
+fn unnorm(v : Float) -> Int {
+  round_int(smin(smax(v, 0.0f), 1.0f) * 255.0f) & 0xFF
+}
+
+fn HighP::store(self : HighP) -> Unit {
+  let o = self.dst.offset_at(self.dx, self.dy) * 4
+  let d = self.dst.data
+  for i in 0..<self.tail {
+    d[o + i * 4] = unnorm(self.r[i]).to_byte()
+    d[o + i * 4 + 1] = unnorm(self.g[i]).to_byte()
+    d[o + i * 4 + 2] = unnorm(self.b[i]).to_byte()
+    d[o + i * 4 + 3] = unnorm(self.a[i]).to_byte()
+  }
+}
+
+fn ulp_sub(v : Float) -> Float {
+  (v.reinterpret_as_uint() - 1U).reinterpret_as_float()
+}
+
+fn gather_ix(pixmap : Pixmap, xs : FixedArray[Float], ys : FixedArray[Float]) -> FixedArray[Int] {
+  let w = ulp_sub(fi(pixmap.width))
+  let h = ulp_sub(fi(pixmap.height))
+  let pw = pixmap.width
+  FixedArray::makei(8, fn(i : Int) -> Int {
+    let x = smin(smax(xs[i], 0.0f), w)
+    let y = smin(smax(ys[i], 0.0f), h)
+    trunc_int(y) * pw + trunc_int(x)
+  })
+}
+
+fn load_8888_gather(
+  pixmap : Pixmap,
+  ix : FixedArray[Int],
+  r : FixedArray[Float],
+  g : FixedArray[Float],
+  b : FixedArray[Float],
+  a : FixedArray[Float],
+) -> Unit {
+  let d = pixmap.data
+  for i in 0..<8 {
+    let o = ix[i] * 4
+    r[i] = fi(d[o].to_int()) * (1.0f / 255.0f)
+    g[i] = fi(d[o + 1].to_int()) * (1.0f / 255.0f)
+    b[i] = fi(d[o + 2].to_int()) * (1.0f / 255.0f)
+    a[i] = fi(d[o + 3].to_int()) * (1.0f / 255.0f)
+  }
+}
+
+fn bicubic_near(t : Float) -> Float {
+  t * (t * ((-21.0f / 18.0f) * t + (27.0f / 18.0f)) + (9.0f / 18.0f)) + (1.0f / 18.0f)
+}
+
+fn bicubic_far(t : Float) -> Float {
+  t * t * ((7.0f / 18.0f) * t + (-6.0f / 18.0f))
+}
+
+/// bilinear (n 2) and bicubic (n 4) sampling of the source.
+fn HighP::sampler(self : HighP, n : Int) -> Unit {
+  let cx = FixedArray::makei(8, fn(i : Int) -> Float { self.r[i] })
+  let cy = FixedArray::makei(8, fn(i : Int) -> Float { self.g[i] })
+  let wx : Array[FixedArray[Float]] = []
+  let wy : Array[FixedArray[Float]] = []
+  for _ in 0..<n {
+    wx.push(FixedArray::make(8, 0.0f))
+    wy.push(FixedArray::make(8, 0.0f))
+  }
+  for i in 0..<8 {
+    let fx = (cx[i] + 0.5f) - lfloor(cx[i] + 0.5f)
+    let fy = (cy[i] + 0.5f) - lfloor(cy[i] + 0.5f)
+    if n == 2 {
+      wx[0][i] = 1.0f - fx
+      wx[1][i] = fx
+      wy[0][i] = 1.0f - fy
+      wy[1][i] = fy
+    } else {
+      wx[0][i] = bicubic_far(1.0f - fx)
+      wx[1][i] = bicubic_near(1.0f - fx)
+      wx[2][i] = bicubic_near(fx)
+      wx[3][i] = bicubic_far(fx)
+      wy[0][i] = bicubic_far(1.0f - fy)
+      wy[1][i] = bicubic_near(1.0f - fy)
+      wy[2][i] = bicubic_near(fy)
+      wy[3][i] = bicubic_far(fy)
+    }
+  }
+  for i in 0..<8 {
+    self.r[i] = 0.0f
+    self.g[i] = 0.0f
+    self.b[i] = 0.0f
+    self.a[i] = 0.0f
+  }
+  let start : Float = if n == 2 { -0.5f } else { -1.5f }
+  let pix = self.src
+  let ys = FixedArray::makei(8, fn(i : Int) -> Float { cy[i] + start })
+  let rr : FixedArray[Float] = FixedArray::make(8, 0.0f)
+  let gg : FixedArray[Float] = FixedArray::make(8, 0.0f)
+  let bb : FixedArray[Float] = FixedArray::make(8, 0.0f)
+  let aa : FixedArray[Float] = FixedArray::make(8, 0.0f)
+  let spread = self.ctx.sampler_spread
+  let inv_w = self.ctx.sampler_inv_width
+  let inv_h = self.ctx.sampler_inv_height
+  let pw = fi(pix.width)
+  let ph = fi(pix.height)
+  for j in 0..<n {
+    let xs = FixedArray::makei(8, fn(i : Int) -> Float { cx[i] + start })
+    for k in 0..<n {
+      let tx = FixedArray::makei(8, fn(i : Int) -> Float { tile(xs[i], spread, pw, inv_w) })
+      let ty = FixedArray::makei(8, fn(i : Int) -> Float { tile(ys[i], spread, ph, inv_h) })
+      let ix = gather_ix(pix, tx, ty)
+      load_8888_gather(pix, ix, rr, gg, bb, aa)
+      for i in 0..<8 {
+        let w = wx[k][i] * wy[j][i]
+        self.r[i] = w * rr[i] + self.r[i]
+        self.g[i] = w * gg[i] + self.g[i]
+        self.b[i] = w * bb[i] + self.b[i]
+        self.a[i] = w * aa[i] + self.a[i]
+        xs[i] = xs[i] + 1.0f
+      }
+    }
+    for i in 0..<8 {
+      ys[i] = ys[i] + 1.0f
+    }
+  }
+}
+
+fn tile(v : Float, mode : SpreadMode, limit : Float, inv_limit : Float) -> Float {
+  match mode {
+    SpreadMode::Pad => v
+    SpreadMode::Repeat => exclusive_repeat(v, limit, inv_limit)
+    SpreadMode::Reflect => exclusive_reflect(v, limit, inv_limit)
+  }
+}

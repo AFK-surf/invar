@@ -1,0 +1,701 @@
+// tiny-skia's shaders (src/shaders/: solid colour, linear, radial and sweep gradients, patterns), after Skia's
+// SkGradientShader, SkTwoPointConicalGradient and SkImageShader.
+
+#derive(Eq)
+pub struct GradientStop {
+  pub position : Float
+  pub color : Color
+}
+
+pub fn GradientStop::new(position : Float, color : Color) -> GradientStop {
+  GradientStop::{ position: norm_clamped(position), color }
+}
+
+let degenerate_threshold : Float = 1.0f / 32768.0f
+
+struct Gradient {
+  stops : Array[GradientStop]
+  tile_mode : SpreadMode
+  transform : Transform
+  points_to_unit : Transform
+  mut colors_are_opaque : Bool
+  has_uniform_stops : Bool
+}
+
+fn all_stops_opaque(stops : Array[GradientStop]) -> Bool {
+  for s in stops {
+    if !s.color.is_opaque() {
+      return false
+    }
+  }
+  true
+}
+
+fn Gradient::new(
+  stops_in : Array[GradientStop],
+  tile_mode : SpreadMode,
+  transform : Transform,
+  points_to_unit : Transform,
+) -> Gradient {
+  let dummy_first = stops_in[0].position != 0.0f
+  let dummy_last = stops_in[stops_in.length() - 1].position != 1.0f
+  let stops : Array[GradientStop] = []
+  if dummy_first {
+    stops.push(GradientStop::new(0.0f, stops_in[0].color))
+  }
+  for s in stops_in {
+    stops.push(s)
+  }
+  if dummy_last {
+    stops.push(GradientStop::new(1.0f, stops[stops.length() - 1].color))
+  }
+  let colors_are_opaque = all_stops_opaque(stops)
+  let start_index = if dummy_first { 0 } else { 1 }
+  let mut prev : Float = 0.0f
+  let mut has_uniform_stops = true
+  let uniform_step = stops[start_index].position - prev
+  for i in start_index..<stops.length() {
+    let curr = if i + 1 == stops.length() { 1.0f } else { bound(stops[i].position, prev, 1.0f) }
+    has_uniform_stops = has_uniform_stops && is_nearly_equal(uniform_step, curr - prev)
+    stops[i] = GradientStop::{ position: norm_clamped(curr), color: stops[i].color }
+    prev = curr
+  }
+  Gradient::{ stops, tile_mode, transform, points_to_unit, colors_are_opaque, has_uniform_stops }
+}
+
+fn Gradient::push_stages(
+  self : Gradient,
+  p : RasterPipelineBuilder,
+  cs : ColorSpace,
+  pre : (RasterPipelineBuilder) -> Unit,
+  post : (RasterPipelineBuilder) -> Unit,
+) -> Bool {
+  p.push(Stage::SeedShader)
+  let ts = match self.transform.invert() {
+    Some(v) => v
+    None => return false
+  }
+  p.push_transform(ts.post_concat(self.points_to_unit))
+  pre(p)
+  match self.tile_mode {
+    SpreadMode::Reflect => p.push(Stage::ReflectX1)
+    SpreadMode::Repeat => p.push(Stage::RepeatX1)
+    SpreadMode::Pad => if self.has_uniform_stops { p.push(Stage::PadX1) }
+  }
+  let stops = self.stops
+  if stops.length() == 2 {
+    let c0 = color_space_expand_color(cs, stops[0].color)
+    let c1 = color_space_expand_color(cs, stops[1].color)
+    p.ctx.es2_factor = GradientColor::{ r: c1.r - c0.r, g: c1.g - c0.g, b: c1.b - c0.b, a: c1.a - c0.a }
+    p.ctx.es2_bias = gc(c0)
+    p.push(Stage::EvenlySpaced2StopGradient)
+  } else {
+    let ctx = GradientCtx::{ len: 0, factors: [], biases: [], t_values: [] }
+    let (first_stop, last_stop) = if stops.length() > 2 {
+      let first = if stops[0].color != stops[1].color { 0 } else { 1 }
+      let len = stops.length()
+      let last = if stops[len - 2].color != stops[len - 1].color { len - 1 } else { len - 2 }
+      (first, last)
+    } else {
+      (0, 1)
+    }
+    let mut t_l = stops[first_stop].position
+    let mut c_l = gc(color_space_expand_color(cs, stops[first_stop].color))
+    ctx.push_const_color(c_l)
+    ctx.t_values.push(0.0f)
+    for i in first_stop..<last_stop {
+      let t_r = stops[i + 1].position
+      let c_r = gc(color_space_expand_color(cs, stops[i + 1].color))
+      if t_l < t_r {
+        let f = GradientColor::{
+          r: (c_r.r - c_l.r) / (t_r - t_l),
+          g: (c_r.g - c_l.g) / (t_r - t_l),
+          b: (c_r.b - c_l.b) / (t_r - t_l),
+          a: (c_r.a - c_l.a) / (t_r - t_l),
+        }
+        ctx.factors.push(f)
+        ctx.biases.push(GradientColor::{ r: c_l.r - f.r * t_l, g: c_l.g - f.g * t_l, b: c_l.b - f.b * t_l, a: c_l.a - f.a * t_l })
+        ctx.t_values.push(norm_clamped(t_l))
+      }
+      t_l = t_r
+      c_l = c_r
+    }
+    ctx.push_const_color(c_l)
+    ctx.t_values.push(norm_clamped(t_l))
+    ctx.len = ctx.factors.length()
+    p.push(Stage::StGradient)
+    p.ctx.gradient = ctx
+  }
+  if !self.colors_are_opaque {
+    p.push(Stage::Premultiply)
+  }
+  post(p)
+  true
+}
+
+fn Gradient::apply_opacity(self : Gradient, opacity : Float) -> Unit {
+  for i, s in self.stops {
+    self.stops[i] = GradientStop::{ position: s.position, color: s.color.with_opacity(opacity) }
+  }
+  self.colors_are_opaque = all_stops_opaque(self.stops)
+}
+
+enum RadialKind {
+  RRadial(Float, Float)
+  RStrip(Float)
+  RFocal(FocalData)
+}
+
+struct FocalData {
+  mut r1 : Float
+  mut focal_x : Float
+  mut is_swapped : Bool
+}
+
+fn FocalData::set(self : FocalData, r0 : Float, r1_in : Float, matrix_in : Transform) -> Option[Transform] {
+  let mut matrix = matrix_in
+  let mut r1 = r1_in
+  self.is_swapped = false
+  self.focal_x = r0 / (r0 - r1)
+  if is_nearly_zero(self.focal_x - 1.0f) {
+    matrix = matrix.post_translate(-1.0f, 0.0f).post_scale(-1.0f, 1.0f)
+    r1 = r0
+    self.focal_x = 0.0f
+    self.is_swapped = true
+  }
+  let focal_matrix = match
+    ts_from_poly_to_poly(
+      Point::from_xy(self.focal_x, 0.0f),
+      Point::from_xy(1.0f, 0.0f),
+      Point::from_xy(0.0f, 0.0f),
+      Point::from_xy(1.0f, 0.0f),
+    ) {
+    Some(m) => m
+    None => return None
+  }
+  matrix = matrix.post_concat(focal_matrix)
+  self.r1 = r1 / (1.0f - self.focal_x).abs()
+  if self.is_focal_on_circle() {
+    matrix = matrix.post_scale(0.5f, 0.5f)
+  } else {
+    matrix = matrix.post_scale(self.r1 / (self.r1 * self.r1 - 1.0f), 1.0f / (self.r1 * self.r1 - 1.0f).abs().sqrt())
+  }
+  matrix = matrix.post_scale((1.0f - self.focal_x).abs(), (1.0f - self.focal_x).abs())
+  Some(matrix)
+}
+
+fn FocalData::is_focal_on_circle(self : FocalData) -> Bool {
+  is_nearly_zero(1.0f - self.r1)
+}
+
+fn FocalData::is_well_behaved(self : FocalData) -> Bool {
+  !self.is_focal_on_circle() && self.r1 > 1.0f
+}
+
+fn FocalData::is_natively_focal(self : FocalData) -> Bool {
+  is_nearly_zero(self.focal_x)
+}
+
+pub struct Pattern {
+  pub pixmap : Pixmap
+  pub quality : FilterQuality
+  pub spread_mode : SpreadMode
+  pub mut opacity : Float
+  pub transform : Transform
+}
+
+#derive(Eq)
+pub enum FilterQuality {
+  Nearest
+  Bilinear
+  Bicubic
+}
+
+/// What a path is painted with (Shader).
+pub enum Shader {
+  SolidColor(Color)
+  LinearGradient(LinearGradient)
+  RadialGradient(RadialGradient)
+  SweepGradient(SweepGradient)
+  PatternShader(Pattern)
+}
+
+pub struct LinearGradient {
+  base : Gradient
+}
+
+pub struct RadialGradient {
+  base : Gradient
+  kind : RadialKind
+}
+
+pub struct SweepGradient {
+  base : Gradient
+  t0 : Float
+  t1 : Float
+}
+
+fn shader_is_opaque(s : Shader) -> Bool {
+  match s {
+    Shader::SolidColor(c) => c.is_opaque()
+    Shader::LinearGradient(g) => g.base.colors_are_opaque
+    Shader::RadialGradient(_) => false
+    Shader::SweepGradient(g) => g.base.colors_are_opaque
+    Shader::PatternShader(_) => false
+  }
+}
+
+fn shader_push_stages(s : Shader, cs : ColorSpace, p : RasterPipelineBuilder) -> Bool {
+  match s {
+    Shader::SolidColor(color) => {
+      p.push_uniform_color(color_space_expand_color(cs, color).premultiply())
+      true
+    }
+    Shader::LinearGradient(g) => g.base.push_stages(p, cs, fn(_b : RasterPipelineBuilder) -> Unit {}, fn(_b : RasterPipelineBuilder) -> Unit {})
+    Shader::RadialGradient(g) => g.push_stages(cs, p)
+    Shader::SweepGradient(g) => g.push_stages(cs, p)
+    Shader::PatternShader(patt) => patt.push_stages(cs, p)
+  }
+}
+
+fn gradient_with_transform(g : Gradient, ts : Transform) -> Gradient {
+  Gradient::{
+    stops: g.stops,
+    tile_mode: g.tile_mode,
+    transform: g.transform.post_concat(ts),
+    points_to_unit: g.points_to_unit,
+    colors_are_opaque: g.colors_are_opaque,
+    has_uniform_stops: g.has_uniform_stops,
+  }
+}
+
+fn gradient_with_opacity(g : Gradient, opacity : Float) -> Gradient {
+  let b = Gradient::{
+    stops: g.stops.copy(),
+    tile_mode: g.tile_mode,
+    transform: g.transform,
+    points_to_unit: g.points_to_unit,
+    colors_are_opaque: g.colors_are_opaque,
+    has_uniform_stops: g.has_uniform_stops,
+  }
+  b.apply_opacity(opacity)
+  b
+}
+
+/// The shader moved by `ts` after its own transform (Shader::transform).
+pub fn shader_transformed(s : Shader, ts : Transform) -> Shader {
+  match s {
+    Shader::SolidColor(_) => s
+    Shader::LinearGradient(g) => Shader::LinearGradient(LinearGradient::{ base: gradient_with_transform(g.base, ts) })
+    Shader::RadialGradient(g) => Shader::RadialGradient(RadialGradient::{ base: gradient_with_transform(g.base, ts), kind: g.kind })
+    Shader::SweepGradient(g) => Shader::SweepGradient(SweepGradient::{ base: gradient_with_transform(g.base, ts), t0: g.t0, t1: g.t1 })
+    Shader::PatternShader(pt) => Shader::PatternShader(Pattern::{
+      pixmap: pt.pixmap,
+      quality: pt.quality,
+      spread_mode: pt.spread_mode,
+      opacity: pt.opacity,
+      transform: pt.transform.post_concat(ts),
+    })
+  }
+}
+
+/// The shader with its alpha times `opacity` (Shader::apply_opacity).
+pub fn shader_with_opacity(s : Shader, opacity : Float) -> Shader {
+  match s {
+    Shader::SolidColor(c) => Shader::SolidColor(c.with_opacity(opacity))
+    Shader::LinearGradient(g) => Shader::LinearGradient(LinearGradient::{ base: gradient_with_opacity(g.base, opacity) })
+    Shader::RadialGradient(g) => Shader::RadialGradient(RadialGradient::{ base: gradient_with_opacity(g.base, opacity), kind: g.kind })
+    Shader::SweepGradient(g) => Shader::SweepGradient(SweepGradient::{ base: gradient_with_opacity(g.base, opacity), t0: g.t0, t1: g.t1 })
+    Shader::PatternShader(pt) => Shader::PatternShader(Pattern::{
+      pixmap: pt.pixmap,
+      quality: pt.quality,
+      spread_mode: pt.spread_mode,
+      opacity: pt.opacity * bound(opacity, 0.0f, 1.0f),
+      transform: pt.transform,
+    })
+  }
+}
+
+pub fn LinearGradient::new(
+  start : Point,
+  end : Point,
+  stops : Array[GradientStop],
+  mode : SpreadMode,
+  transform : Transform,
+) -> Option[Shader] {
+  if stops.length() == 0 {
+    return None
+  }
+  if stops.length() == 1 {
+    return Some(Shader::SolidColor(stops[0].color))
+  }
+  let length = end.sub(start).length()
+  if !fin(length) {
+    return None
+  }
+  if is_nearly_zero_within(length, degenerate_threshold) {
+    match mode {
+      SpreadMode::Pad => return Some(Shader::SolidColor(stops[stops.length() - 1].color))
+      SpreadMode::Reflect | SpreadMode::Repeat => return Some(Shader::SolidColor(average_gradient_color(stops)))
+    }
+  }
+  if transform.invert().is_none() {
+    return None
+  }
+  let unit_ts = points_to_unit_ts(start, end)
+  Some(Shader::LinearGradient(LinearGradient::{ base: Gradient::new(stops, mode, transform, unit_ts) }))
+}
+
+fn points_to_unit_ts(start : Point, end : Point) -> Transform {
+  let vec0 = end.sub(start)
+  let mag = vec0.length()
+  let inv : Float = if mag != 0.0f { invert(mag) } else { 0.0f }
+  let vec = vec0.scaled(inv)
+  ts_from_sin_cos_at(-vec.y, vec.x, start.x, start.y)
+  .post_translate(-start.x, -start.y)
+  .post_scale(inv, inv)
+}
+
+fn average_gradient_color(points : Array[GradientStop]) -> Color {
+  let blend : FixedArray[Float] = FixedArray::make(4, 0.0f)
+  for i in 0..<(points.length() - 1) {
+    let c0 = points[i].color
+    let c1 = points[i + 1].color
+    let w = points[i + 1].position - points[i].position
+    blend[0] = blend[0] + 0.5f * w * (c1.r + c0.r)
+    blend[1] = blend[1] + 0.5f * w * (c1.g + c0.g)
+    blend[2] = blend[2] + 0.5f * w * (c1.b + c0.b)
+    blend[3] = blend[3] + 0.5f * w * (c1.a + c0.a)
+  }
+  if points[0].position > 0.0f {
+    let c = points[0].color
+    let p = points[0].position
+    blend[0] = blend[0] + p * c.r
+    blend[1] = blend[1] + p * c.g
+    blend[2] = blend[2] + p * c.b
+    blend[3] = blend[3] + p * c.a
+  }
+  let last = points[points.length() - 1]
+  if last.position < 1.0f {
+    let c = last.color
+    let w = 1.0f - last.position
+    blend[0] = blend[0] + w * c.r
+    blend[1] = blend[1] + w * c.g
+    blend[2] = blend[2] + w * c.b
+    blend[3] = blend[3] + w * c.a
+  }
+  unwrap_opt(Color::from_rgba(blend[0], blend[1], blend[2], blend[3]), "average_gradient_color")
+}
+
+fn ts_from_sin_cos_at(sin : Float, cos : Float, px : Float, py : Float) -> Transform {
+  let cos_inv : Float = 1.0f - cos
+  Transform::from_row(cos, sin, -sin, cos, sin * py + cos_inv * px, -sin * px + cos_inv * py)
+}
+
+pub fn RadialGradient::new(
+  start_point : Point,
+  start_radius : Float,
+  end_point : Point,
+  end_radius : Float,
+  stops : Array[GradientStop],
+  mode : SpreadMode,
+  transform : Transform,
+) -> Option[Shader] {
+  if start_radius < 0.0f || end_radius < 0.0f {
+    return None
+  }
+  if stops.length() == 0 {
+    return None
+  }
+  if stops.length() == 1 {
+    return Some(Shader::SolidColor(stops[0].color))
+  }
+  if transform.invert().is_none() {
+    return None
+  }
+  let length = start_point.sub(end_point).length()
+  if !fin(length) {
+    return None
+  }
+  if is_nearly_zero_within(length, degenerate_threshold) {
+    if is_nearly_equal_within(start_radius, end_radius, degenerate_threshold) {
+      if mode == SpreadMode::Pad && end_radius > degenerate_threshold {
+        let start_color = stops[0].color
+        let end_color = stops[stops.length() - 1].color
+        let new_stops = [
+          GradientStop::new(0.0f, start_color),
+          GradientStop::new(1.0f, start_color),
+          GradientStop::new(1.0f, end_color),
+        ]
+        return radial_unchecked(start_point, end_radius, new_stops, mode, transform)
+      }
+      return None
+    }
+    if is_nearly_zero_within(start_radius, degenerate_threshold) {
+      return radial_unchecked(start_point, end_radius, stops, mode, transform)
+    }
+  }
+  radial_create(start_point, start_radius, end_point, end_radius, stops, mode, transform)
+}
+
+fn radial_unchecked(
+  center : Point,
+  radius : Float,
+  stops : Array[GradientStop],
+  mode : SpreadMode,
+  transform : Transform,
+) -> Option[Shader] {
+  let inv = invert(radius)
+  let points_to_unit = Transform::from_translate(-center.x, -center.y).post_scale(inv, inv)
+  Some(Shader::RadialGradient(RadialGradient::{ base: Gradient::new(stops, mode, transform, points_to_unit), kind: RadialKind::RRadial(0.0f, radius) }))
+}
+
+fn radial_create(
+  c0 : Point,
+  r0 : Float,
+  c1 : Point,
+  r1 : Float,
+  stops : Array[GradientStop],
+  mode : SpreadMode,
+  transform : Transform,
+) -> Option[Shader] {
+  let mut kind = RadialKind::RRadial(0.0f, 0.0f)
+  let mut matrix = Transform::identity()
+  if is_nearly_zero(c0.sub(c1).length()) {
+    if is_nearly_zero(fmax(r0, r1)) || is_nearly_equal(r0, r1) {
+      return None
+    }
+    let scale : Float = 1.0f / fmax(r0, r1)
+    matrix = Transform::from_translate(-c1.x, -c1.y).post_scale(scale, scale)
+    kind = RadialKind::RRadial(r0, r1)
+  } else {
+    matrix = match map_to_unit_x(c0, c1) {
+      Some(m) => m
+      None => return None
+    }
+    let d_center = c0.sub(c1).length()
+    kind = if is_nearly_zero(r0 - r1) {
+      RadialKind::RStrip(r0 / d_center)
+    } else {
+      RadialKind::RFocal(FocalData::{ r1: 0.0f, focal_x: 0.0f, is_swapped: false })
+    }
+  }
+  match kind {
+    RadialKind::RFocal(fdat) => {
+      let d_center = c0.sub(c1).length()
+      matrix = match fdat.set(r0 / d_center, r1 / d_center, matrix) {
+        Some(m) => m
+        None => return None
+      }
+    }
+    _ => ()
+  }
+  Some(Shader::RadialGradient(RadialGradient::{ base: Gradient::new(stops, mode, transform, matrix), kind }))
+}
+
+fn map_to_unit_x(origin : Point, x_is_one : Point) -> Option[Transform] {
+  ts_from_poly_to_poly(origin, x_is_one, Point::from_xy(0.0f, 0.0f), Point::from_xy(1.0f, 0.0f))
+}
+
+fn ts_from_poly_to_poly(src1 : Point, src2 : Point, dst1 : Point, dst2 : Point) -> Option[Transform] {
+  match from_poly2(src1, src2).invert() {
+    Some(res) => Some(from_poly2(dst1, dst2).pre_concat(res))
+    None => None
+  }
+}
+
+fn from_poly2(p0 : Point, p1 : Point) -> Transform {
+  Transform::from_row(p1.y - p0.y, p0.x - p1.x, p1.x - p0.x, p1.y - p0.y, p0.x, p0.y)
+}
+
+fn RadialGradient::push_stages(self : RadialGradient, cs : ColorSpace, p : RasterPipelineBuilder) -> Bool {
+  let (p0, p1) : (Float, Float) = match self.kind {
+    RadialKind::RRadial(radius1, radius2) =>
+      if radius1 == 0.0f {
+        (1.0f, 0.0f)
+      } else {
+        let d_radius = radius2 - radius1
+        (fmax(radius1, radius2) / d_radius, -radius1 / d_radius)
+      }
+    RadialKind::RStrip(scaled_r0) => (scaled_r0 * scaled_r0, 0.0f)
+    RadialKind::RFocal(fdat) => (1.0f / fdat.r1, fdat.focal_x)
+  }
+  p.ctx.conical_p0 = p0
+  p.ctx.conical_p1 = p1
+  let kind = self.kind
+  self.base.push_stages(
+    p,
+    cs,
+    fn(pb : RasterPipelineBuilder) -> Unit {
+      match kind {
+        RadialKind::RRadial(_, _) => {
+          pb.push(Stage::XYToRadius)
+          if !(p0 == 1.0f && p1 == 0.0f) {
+            pb.push(Stage::ApplyConcentricScaleBias)
+          }
+        }
+        RadialKind::RStrip(_) => {
+          pb.push(Stage::XYTo2PtConicalStrip)
+          pb.push(Stage::Mask2PtConicalNan)
+        }
+        RadialKind::RFocal(fdat) => {
+          if fdat.is_focal_on_circle() {
+            pb.push(Stage::XYTo2PtConicalFocalOnCircle)
+          } else if fdat.is_well_behaved() {
+            pb.push(Stage::XYTo2PtConicalWellBehaved)
+          } else if fdat.is_swapped || 1.0f - fdat.focal_x < 0.0f {
+            pb.push(Stage::XYTo2PtConicalSmaller)
+          } else {
+            pb.push(Stage::XYTo2PtConicalGreater)
+          }
+          if !fdat.is_well_behaved() {
+            pb.push(Stage::Mask2PtConicalDegenerates)
+          }
+          if 1.0f - fdat.focal_x < 0.0f {
+            pb.push(Stage::NegateX)
+          }
+          if !fdat.is_natively_focal() {
+            pb.push(Stage::Alter2PtConicalCompensateFocal)
+          }
+          if fdat.is_swapped {
+            pb.push(Stage::Alter2PtConicalUnswap)
+          }
+        }
+      }
+    },
+    fn(pb : RasterPipelineBuilder) -> Unit {
+      match kind {
+        RadialKind::RStrip(_) => pb.push(Stage::ApplyVectorMask)
+        RadialKind::RFocal(fdat) => if !fdat.is_well_behaved() { pb.push(Stage::ApplyVectorMask) }
+        _ => ()
+      }
+    },
+  )
+}
+
+pub fn SweepGradient::new(
+  center : Point,
+  start_angle : Float,
+  end_angle : Float,
+  stops : Array[GradientStop],
+  mode_in : SpreadMode,
+  transform : Transform,
+) -> Option[Shader] {
+  let mut mode = mode_in
+  if !fin(start_angle) || !fin(end_angle) || start_angle > end_angle {
+    return None
+  }
+  if stops.length() == 0 {
+    return None
+  }
+  if stops.length() == 1 {
+    return Some(Shader::SolidColor(stops[0].color))
+  }
+  if transform.invert().is_none() {
+    return None
+  }
+  if is_nearly_equal_within(start_angle, end_angle, degenerate_threshold) {
+    if mode == SpreadMode::Pad && end_angle > degenerate_threshold {
+      let front = stops[0].color
+      let back = stops[stops.length() - 1].color
+      let new_stops = [GradientStop::new(0.0f, front), GradientStop::new(1.0f, front), GradientStop::new(1.0f, back)]
+      return SweepGradient::new(center, 0.0f, end_angle, new_stops, mode, transform)
+    }
+    return None
+  }
+  if start_angle <= 0.0f && end_angle >= 360.0f {
+    mode = SpreadMode::Pad
+  }
+  Some(
+    Shader::SweepGradient(SweepGradient::{
+      base: Gradient::new(stops, mode, transform, Transform::from_translate(-center.x, -center.y)),
+      t0: start_angle / 360.0f,
+      t1: end_angle / 360.0f,
+    }),
+  )
+}
+
+fn SweepGradient::push_stages(self : SweepGradient, cs : ColorSpace, p : RasterPipelineBuilder) -> Bool {
+  let scale : Float = 1.0f / (self.t1 - self.t0)
+  let bias = -scale * self.t0
+  p.ctx.conical_p0 = scale
+  p.ctx.conical_p1 = bias
+  self.base.push_stages(
+    p,
+    cs,
+    fn(pb : RasterPipelineBuilder) -> Unit {
+      pb.push(Stage::XYToUnitAngle)
+      if scale != 1.0f && bias != 0.0f {
+        pb.push(Stage::ApplyConcentricScaleBias)
+      }
+    },
+    fn(_pb : RasterPipelineBuilder) -> Unit {},
+  )
+}
+
+pub fn Pattern::new(
+  pixmap : Pixmap,
+  spread_mode : SpreadMode,
+  quality : FilterQuality,
+  opacity : Float,
+  transform : Transform,
+) -> Shader {
+  Shader::PatternShader(Pattern::{ pixmap, spread_mode, quality, opacity: norm_clamped(opacity), transform })
+}
+
+fn Pattern::push_stages(self : Pattern, cs : ColorSpace, p : RasterPipelineBuilder) -> Bool {
+  let ts = match self.transform.invert() {
+    Some(v) => v
+    None => return false
+  }
+  p.push(Stage::SeedShader)
+  p.push_transform(ts)
+  let mut quality = self.quality
+  if ts.is_identity() || ts.is_translate() {
+    quality = FilterQuality::Nearest
+  }
+  if quality == FilterQuality::Bilinear {
+    if ts.is_translate() {
+      if ts.tx == ts.tx.trunc() && ts.ty == ts.ty.trunc() {
+        quality = FilterQuality::Nearest
+      }
+    }
+  }
+  let w = fi(self.pixmap.width)
+  let h = fi(self.pixmap.height)
+  match quality {
+    FilterQuality::Nearest => {
+      p.ctx.limit_x = (w, 1.0f / w)
+      p.ctx.limit_y = (h, 1.0f / h)
+      match self.spread_mode {
+        SpreadMode::Pad => ()
+        SpreadMode::Repeat => p.push(Stage::StRepeat)
+        SpreadMode::Reflect => p.push(Stage::StReflect)
+      }
+      p.push(Stage::Gather)
+    }
+    FilterQuality::Bilinear => {
+      p.ctx.sampler_spread = self.spread_mode
+      p.ctx.sampler_inv_width = 1.0f / w
+      p.ctx.sampler_inv_height = 1.0f / h
+      p.push(Stage::StBilinear)
+    }
+    FilterQuality::Bicubic => {
+      p.ctx.sampler_spread = self.spread_mode
+      p.ctx.sampler_inv_width = 1.0f / w
+      p.ctx.sampler_inv_height = 1.0f / h
+      p.push(Stage::StBicubic)
+      p.push(Stage::Clamp0)
+      p.push(Stage::ClampA)
+    }
+  }
+  if self.opacity != 1.0f {
+    p.ctx.current_coverage = self.opacity
+    p.push(Stage::Scale1Float)
+  }
+  match color_space_expand_stage(cs) {
+    Some(s) => p.push(s)
+    None => ()
+  }
+  true
+}
