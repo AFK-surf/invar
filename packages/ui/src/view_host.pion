@@ -290,9 +290,9 @@ pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
   view_app.maker = Some(make)
   let tree = view::Tree::new(
     make,
-    measure=view::words_measure,
-    measure_runs=view::runs_measure,
-    measure_runs_least=view::runs_least_measure,
+    measure=host_words_measure,
+    measure_runs=host_runs_measure,
+    measure_runs_least=host_runs_least_measure,
   )
   view_app.tree = Some(tree)
 }
@@ -538,6 +538,8 @@ fn flush_deferred_shadows(scene : Scene, pending : Array[DeferredGlassShadow]) -
 fn encode_drawn_node(
   scene : Scene,
   d : view::Drawn,
+  gd : view::GroundShape,
+  node_scale : Double,
   frame_no : Int,
   now : Double,
   scale : Double,
@@ -545,10 +547,24 @@ fn encode_drawn_node(
   rc : (Double, Double, Double, Double),
   deferred_shadows : Array[DeferredGlassShadow],
 ) -> Unit {
-  if d.alpha <= 0.0 || d.w <= 0.0 || d.h <= 0.0 {
+  if d.alpha <= 0.0 || (d.w <= 0.0 && gd.dw <= 0.0) || (d.h <= 0.0 && gd.dh <= 0.0) {
     return
   }
   let (clip_x, clip_y, clip_x1, clip_y1) = clip
+  let gx = d.x + gd.dx * node_scale
+  let gy = d.y + gd.dy * node_scale
+  let gw = d.w + gd.dw * node_scale
+  let gh = d.h + gd.dh * node_scale
+  let gcorners = match gd.corners {
+    Some((c0, c1, c2, c3)) => Some((c0 * node_scale, c1 * node_scale, c2 * node_scale, c3 * node_scale))
+    None => d.corners
+  }
+  let gradius = match gcorners {
+    Some((c0, _, _, _)) => c0
+    None => d.radius
+  }
+  let gd_visible = gw > 0.0 && gh > 0.0
+  let gd_d = view::Drawn::{ ..d, x: gx, y: gy, w: gw, h: gh, radius: gradius, corners: gcorners }
   let is_glass = d.glass.is_some() && !glass_solid()
   let is_merged_liquid = match d.glass {
     Some(gl) => gl.liquid && gl.merge > 0.0 && !glass_solid()
@@ -560,36 +576,36 @@ fn encode_drawn_node(
   let start_idx = scene.ninst
 
   // 1. Non-glass shadow drawn before ground (glass shadow is drawn after glass, outside-only)
-  if !is_glass {
-    emit_node_shadow(scene, d, false, clip_x, clip_y, clip_x1, clip_y1, rc)
+  if gd_visible && !is_glass {
+    emit_node_shadow(scene, gd_d, false, clip_x, clip_y, clip_x1, clip_y1, rc)
   }
 
   // 2. Glass (kind 5 frosted / 6 liquid) + outside-only shadow after glass
   match d.glass {
-    Some(gl) => {
-      encode_glass(scene, d, gl, clip_x, clip_y, clip_x1, clip_y1)
+    Some(gl) if gd_visible => {
+      encode_glass(scene, gd_d, gl, clip_x, clip_y, clip_x1, clip_y1)
       if is_glass {
         let (sblur, _sy, scol) = d.shadow
         if sblur > 0.0 && (scol & 0xFFL) != 0L {
           if is_merged_liquid {
-            deferred_shadows.push(DeferredGlassShadow::{ d, clip, rc })
+            deferred_shadows.push(DeferredGlassShadow::{ d: gd_d, clip, rc })
           } else {
-            emit_node_shadow(scene, d, true, clip_x, clip_y, clip_x1, clip_y1, rc)
+            emit_node_shadow(scene, gd_d, true, clip_x, clip_y, clip_x1, clip_y1, rc)
           }
         }
       }
     }
-    None => ()
+    _ => ()
   }
 
   // 3. Ground fill + Border/edge merged into a single kind=0.0 instance (apple_render.m:629-634: bw=p6, bc=c2)
   let (ew, ecol) = d.edge
   let has_ground = (d.ground & 0xFFL) != 0L
   let has_edge = ew > 0.0 && (ecol & 0xFFL) != 0L
-  if has_ground || has_edge {
+  if gd_visible && (has_ground || has_edge) {
     let (br, bg_c, bb, ba) = if has_edge { color_rgba_tuple(ecol, d.alpha) } else { (0.0, 0.0, 0.0, 0.0) }
     let idx = scene.push_inst(
-      d.x, d.y, d.w, d.h, d.radius, 0.0,
+      gd_d.x, gd_d.y, gd_d.w, gd_d.h, gd_d.radius, 0.0,
       if has_edge { ew } else { 0.0 },
       0.0,
       if has_ground { d.ground } else { 0L },
@@ -597,8 +613,9 @@ fn encode_drawn_node(
       br, bg_c, bb, ba,
       clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
     )
-    apply_node_corners(scene, idx, d)
+    apply_node_corners(scene, idx, gd_d)
   }
+  let after_ground_idx = scene.ninst
 
   // 4. Image (kind 4)
   match d.image {
@@ -739,6 +756,8 @@ fn encode_drawn_node(
   let has_rc = rc.0 > 0.0 || rc.1 > 0.0 || rc.2 > 0.0 || rc.3 > 0.0
   let has_rot = d.turn != 0.0
   if has_rc || has_rot {
+    let gox = gx + gw * 0.5
+    let goy = gy + gh * 0.5
     let ox = d.x + d.w * 0.5
     let oy = d.y + d.h * 0.5
     let mut idx = start_idx
@@ -749,8 +768,8 @@ fn encode_drawn_node(
       if has_rot {
         let base = idx * inst_size
         scene.inst[base + 32] = d.turn
-        scene.inst[base + 33] = ox
-        scene.inst[base + 34] = oy
+        scene.inst[base + 33] = if idx < after_ground_idx { gox } else { ox }
+        scene.inst[base + 34] = if idx < after_ground_idx { goy } else { oy }
         scene.inst[base + 35] = 1.0
       }
       idx += 1
@@ -759,7 +778,8 @@ fn encode_drawn_node(
 }
 
 fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Double, scale : Double) -> Unit {
-  let held = tree.drawn_held()
+  let scales : Array[Double] = []
+  let held = tree.drawn_held(scales=scales)
   let n = held.length()
   let eff_clip : Array[(Double, Double, Double, Double)] = []
   let eff_rc : Array[(Double, Double, Double, Double)] = []
@@ -767,6 +787,8 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
+    let node_scale = if i < scales.length() { scales[i] } else { 1.0 }
+    let gd = tree.ground_drawn_of(d.id)
     let (in_clip, in_rc) = if holder >= 0 && holder < i {
       let p = held[holder].0
       if p.clips {
@@ -784,7 +806,7 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     } else {
       (in_clip, in_rc)
     }
-    encode_drawn_node(scene, d, frame_no, now, scale, draw_clip, draw_rc, deferred_shadows)
+    encode_drawn_node(scene, d, gd, node_scale, frame_no, now, scale, draw_clip, draw_rc, deferred_shadows)
     i += 1
   }
   flush_deferred_shadows(scene, deferred_shadows)

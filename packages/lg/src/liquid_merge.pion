@@ -1,0 +1,527 @@
+// Apple iOS 27 GlassEffectContainer-style liquid merge & split control driven by motion::LiquidBond.
+
+import "motion"
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+pub let merge_main_w : Double = 180.0
+pub let merge_main_h : Double = 56.0
+pub let merge_sat_size : Double = 56.0
+pub let merge_merged_gap : Double = -8.0
+pub let merge_separated_gap : Double = 48.0
+pub let merge_max_gap : Double = 72.0
+pub let merge_k_max : Double = 34.0
+pub let merge_break_gap : Double = 9.5
+pub let merge_contact_gap : Double = 1.5
+
+fn merge_smoothstep(lo : Double, hi : Double, x : Double) -> Double {
+  if hi <= lo {
+    return if x >= hi { 1.0 } else { 0.0 }
+  }
+  let u = clamp((x - lo) / (hi - lo), 0.0, 1.0)
+  u * u * (3.0 - 2.0 * u)
+}
+
+fn merge_glass(merge : Double, rim~ : Double = 0.6, spot~ : Option[(Double, Double)] = None) -> paint::Glass {
+  let d = is_dark()
+  let tint = if d { 0x202020FFL } else { 0xFDFCFD67L }
+  let solid = if d { 0x1E1F24FFL } else { 0xFAFAFAFFL }
+  match spot {
+    Some(sp) =>
+      paint::Glass::liquid(
+        blur=2.1,
+        tint=tint,
+        solid=solid,
+        saturation=1.0,
+        rim=rim,
+        bezel=20.0,
+        refraction=28.0,
+        chroma=0.0,
+        merge=merge,
+        adaptive=false,
+        spot=sp,
+      )
+    None =>
+      paint::Glass::liquid(
+        blur=2.1,
+        tint=tint,
+        solid=solid,
+        saturation=1.0,
+        rim=rim,
+        bezel=20.0,
+        refraction=28.0,
+        chroma=0.0,
+        merge=merge,
+        adaptive=false,
+      )
+  }
+}
+
+pub struct LiquidMerge {
+  merged_gap : Double
+  separated_gap : Double
+  max_gap : Double
+  auto_separate : Bool
+  bond : motion::LiquidBond
+  x_way : motion::Way
+  y_way : motion::Way
+  recoil_x : motion::Way
+  recoil_y : motion::Way
+  separated_sig : signals::Signal[Bool]
+  dragging_sig : signals::Signal[Bool]
+  dragging : ui::Ref[Bool]
+  drag_start_wx : DoubleCell
+  drag_start_wy : DoubleCell
+  drag_start_x : DoubleCell
+  drag_start_y : DoubleCell
+  split_this_drag : ui::Ref[Bool]
+  geom : ui::Ref[(Double, Double, Double, Double, Double)]
+  bounds : ui::Ref[(Double, Double, Double, Double)]
+  scheduled : ui::Ref[Option[() -> Unit]]
+  node : ui::Ref[Option[view::View]]
+}
+
+pub fn LiquidMerge::new(
+  separated~ : Bool = false,
+  merge_max~ : Double = merge_k_max,
+  break_gap~ : Double = merge_break_gap,
+  merged_gap~ : Double = merge_merged_gap,
+  separated_gap~ : Double = merge_separated_gap,
+  max_gap~ : Double = merge_max_gap,
+  auto_separate~ : Bool = true,
+) -> LiquidMerge {
+  let start_x = (if separated { separated_gap } else { merged_gap }) + merge_contact_gap
+  LiquidMerge::{
+    merged_gap,
+    separated_gap,
+    max_gap,
+    auto_separate,
+    bond: motion::LiquidBond::new(merged=!separated, merge_max=merge_max, break_gap=break_gap, contact_gap=0.0),
+    x_way: motion::Way::new(start_x),
+    y_way: motion::Way::new(0.0),
+    recoil_x: motion::Way::new(0.0),
+    recoil_y: motion::Way::new(0.0),
+    separated_sig: signals::signal(separated),
+    dragging_sig: signals::signal(false),
+    dragging: ui::ref_new(false),
+    drag_start_wx: fref(0.0),
+    drag_start_wy: fref(0.0),
+    drag_start_x: fref(start_x),
+    drag_start_y: fref(0.0),
+    split_this_drag: ui::ref_new(false),
+    geom: ui::ref_new((0.0, 12.0, merge_main_w, merge_main_h, merge_sat_size)),
+    bounds: ui::ref_new((merged_gap - 6.0, max_gap, 0.0, 0.0)),
+    scheduled: ui::ref_new(None),
+    node: ui::ref_new(None),
+  }
+}
+
+pub fn LiquidMerge::attach(self : LiquidMerge, n : view::View) -> Unit {
+  self.node.v = Some(n)
+}
+
+fn LiquidMerge::cancel_scheduled(self : LiquidMerge) -> Unit {
+  match self.scheduled.v {
+    Some(stop) => {
+      self.scheduled.v = None
+      stop()
+    }
+    None => ()
+  }
+}
+
+fn LiquidMerge::surface_gap(self : LiquidMerge, dx : Double, dy : Double) -> Double {
+  let (mx, my, mw, mh, sat) = self.geom.v
+  let bx = mx + mw + dx
+  let by = my + (mh - sat) * 0.5 + dy
+  motion::rounded_rect_gap(mx, my, mw, mh, mh * 0.5, bx, by, sat, sat, sat * 0.5) - merge_contact_gap
+}
+
+fn LiquidMerge::surface_normal(self : LiquidMerge, dx : Double, dy : Double) -> (Double, Double) {
+  let eps = 0.5
+  let gx = self.surface_gap(dx + eps, dy) - self.surface_gap(dx - eps, dy)
+  let gy = self.surface_gap(dx, dy + eps) - self.surface_gap(dx, dy - eps)
+  let len = (gx * gx + gy * gy).sqrt()
+  if len < 1.0e-6 {
+    (1.0, 0.0)
+  } else {
+    (gx / len, gy / len)
+  }
+}
+
+pub fn LiquidMerge::is_separated(self : LiquidMerge) -> Bool {
+  self.separated_sig.get()
+}
+
+pub fn LiquidMerge::is_bonded(self : LiquidMerge) -> Bool {
+  self.bond.is_bonded()
+}
+
+pub fn LiquidMerge::pos_at(self : LiquidMerge, t : Double) -> (Double, Double) {
+  (self.x_way.value_at(t) + self.recoil_x.value_at(t), self.y_way.value_at(t) + self.recoil_y.value_at(t))
+}
+
+pub fn LiquidMerge::pos_on(self : LiquidMerge, n : view::View) -> (Double, Double) {
+  (self.x_way.shown_on(n) + self.recoil_x.shown_on(n), self.y_way.shown_on(n) + self.recoil_y.shown_on(n))
+}
+
+pub fn LiquidMerge::gap_on(self : LiquidMerge, n : view::View) -> Double {
+  let (dx, dy) = self.pos_on(n)
+  self.surface_gap(dx, dy)
+}
+
+pub fn LiquidMerge::gap_at(self : LiquidMerge, t : Double) -> Double {
+  let (dx, dy) = self.pos_at(t)
+  self.surface_gap(dx, dy)
+}
+
+pub fn LiquidMerge::merge_on(self : LiquidMerge, n : view::View) -> Double {
+  self.bond.merge_on(n)
+}
+
+pub fn LiquidMerge::merge_at(self : LiquidMerge, t : Double) -> Double {
+  self.bond.merge_at(t)
+}
+
+pub fn LiquidMerge::recoil_on(self : LiquidMerge, n : view::View) -> Double {
+  self.bond.recoil_on(n)
+}
+
+pub fn LiquidMerge::end(self : LiquidMerge) -> Double {
+  let mut m = self.x_way.end()
+  let ye = self.y_way.end()
+  if ye > m { m = ye }
+  let rxe = self.recoil_x.end()
+  if rxe > m { m = rxe }
+  let rye = self.recoil_y.end()
+  if rye > m { m = rye }
+  let be = self.bond.end()
+  if be > m { m = be }
+  m
+}
+
+pub fn LiquidMerge::set_separated(
+  self : LiquidMerge,
+  separated : Bool,
+  at~ : Double = 0.0,
+  loc~ : String = "",
+) -> Unit {
+  self.cancel_scheduled()
+  self.dragging.v = false
+  self.dragging_sig.set(false)
+  self.split_this_drag.v = false
+  let (cur_x, cur_y) = self.pos_at(at)
+  self.x_way.put(cur_x)
+  self.y_way.put(cur_y)
+  self.recoil_x.put(0.0)
+  self.recoil_y.put(0.0)
+  self.separated_sig.set(separated)
+  let target_x = (if separated { self.separated_gap } else { self.merged_gap }) + merge_contact_gap
+  self.x_way.go(target_x, motion::liquid_toggle_spring, at=at, loc=loc)
+  self.y_way.go(0.0, motion::liquid_toggle_spring, at=at, loc=loc)
+  let threshold = if separated { self.bond.break_gap() } else { self.bond.contact_gap() }
+  let xe = self.x_way.end()
+  let ye = self.y_way.end()
+  let t_end = if xe > ye { xe } else { ye }
+  let cross = motion::liquid_bond_cross_time(
+    at,
+    if t_end > at { t_end } else { at },
+    fn(t : Double) -> Double { self.surface_gap(self.x_way.value_at(t), self.y_way.value_at(t)) },
+    separated,
+    threshold,
+  )
+  match cross {
+    Some(tc) =>
+      if tc <= at {
+        let _ = self.bond.update(threshold, at=tc, loc=loc)
+      } else {
+        match self.node.v {
+          Some(n) => {
+            let stop = n.at_moment(tc, fn() -> Unit {
+              self.scheduled.v = None
+              let _ = self.bond.update(threshold, at=tc, loc=loc)
+            })
+            self.scheduled.v = Some(stop)
+          }
+          None => { let _ = self.bond.update(threshold, at=tc, loc=loc) }
+        }
+      }
+    None => ()
+  }
+}
+
+fn LiquidMerge::on_press(self : LiquidMerge, d : view::Drag) -> Unit {
+  self.cancel_scheduled()
+  let (cur_x, cur_y) = self.pos_at(d.at)
+  self.x_way.put(cur_x)
+  self.y_way.put(cur_y)
+  self.recoil_x.put(0.0)
+  self.recoil_y.put(0.0)
+  self.dragging.v = true
+  self.dragging_sig.set(true)
+  self.split_this_drag.v = false
+  self.drag_start_wx.v = d.wx
+  self.drag_start_wy.v = d.wy
+  self.drag_start_x.v = cur_x
+  self.drag_start_y.v = cur_y
+}
+
+fn LiquidMerge::on_drag(self : LiquidMerge, d : view::Drag) -> Unit {
+  match d.kind {
+    Down => {
+      if !self.dragging.v {
+        self.on_press(d)
+      }
+    }
+    Moved => {
+      if !self.dragging.v {
+        return
+      }
+      let (min_dx, max_dx, min_dy, max_dy) = self.bounds.v
+      let raw_x = clamp(self.drag_start_x.v + (d.wx - self.drag_start_wx.v), min_dx, max_dx)
+      let raw_y = clamp(self.drag_start_y.v + (d.wy - self.drag_start_wy.v), min_dy, max_dy)
+      let raw_gap = self.surface_gap(raw_x, raw_y)
+      if self.bond.is_bonded() {
+        if raw_gap > 0.0 {
+          let (nx, ny) = self.surface_normal(raw_x, raw_y)
+          let pull = raw_gap * 0.12
+          let eff_x = clamp(raw_x - nx * pull, min_dx, max_dx)
+          let eff_y = clamp(raw_y - ny * pull, min_dy, max_dy)
+          let eff_gap = self.surface_gap(eff_x, eff_y)
+          match self.bond.update(eff_gap, at=d.at) {
+            Split => {
+              self.separated_sig.set(true)
+              self.split_this_drag.v = true
+              self.x_way.put(raw_x)
+              self.y_way.put(raw_y)
+              self.recoil_x.put(eff_x - raw_x)
+              self.recoil_y.put(eff_y - raw_y)
+              self.recoil_x.go(0.0, motion::liquid_snap_back_spring, at=d.at)
+              self.recoil_y.go(0.0, motion::liquid_snap_back_spring, at=d.at)
+            }
+            _ => {
+              self.x_way.put(eff_x)
+              self.y_way.put(eff_y)
+            }
+          }
+        } else {
+          self.x_way.put(raw_x)
+          self.y_way.put(raw_y)
+        }
+      } else {
+        self.x_way.put(raw_x)
+        self.y_way.put(raw_y)
+        match self.bond.update(raw_gap, at=d.at) {
+          Fused => {
+            self.separated_sig.set(false)
+            self.split_this_drag.v = false
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => {
+      self.dragging.v = false
+      self.dragging_sig.set(false)
+      let (cur_x, cur_y) = self.pos_at(d.at)
+      self.x_way.put(cur_x)
+      self.y_way.put(cur_y)
+      self.recoil_x.put(0.0)
+      self.recoil_y.put(0.0)
+      let cur_gap = self.surface_gap(cur_x, cur_y)
+      let (min_dx, max_dx, min_dy, max_dy) = self.bounds.v
+      if self.bond.is_bonded() {
+        let (nx, ny) = self.surface_normal(cur_x, cur_y)
+        let shift = self.merged_gap - cur_gap
+        let tx = clamp(cur_x + nx * shift, min_dx, max_dx)
+        let ty = clamp(cur_y + ny * shift, min_dy, max_dy)
+        let spec = if cur_gap > 0.0 { motion::liquid_snap_back_spring } else { motion::liquid_auto_fuse_spring }
+        self.x_way.go(tx, spec, at=d.at)
+        self.y_way.go(ty, spec, at=d.at)
+      } else if self.auto_separate && self.split_this_drag.v && cur_gap < self.separated_gap {
+        let (nx, ny) = self.surface_normal(cur_x, cur_y)
+        let shift = self.separated_gap - cur_gap
+        let tx = clamp(cur_x + nx * shift, min_dx, max_dx)
+        let ty = clamp(cur_y + ny * shift, min_dy, max_dy)
+        self.x_way.go(tx, motion::liquid_auto_split_spring, at=d.at)
+        self.y_way.go(ty, motion::liquid_auto_split_spring, at=d.at)
+      }
+    }
+  }
+}
+
+pub fn liquid_merge_node(
+  parent : view::View,
+  controller? : LiquidMerge,
+  main_w~ : Double = merge_main_w,
+  main_h~ : Double = merge_main_h,
+  sat_size~ : Double = merge_sat_size,
+  arena_w~ : Double = 0.0,
+  arena_h~ : Double = 0.0,
+  arena? : () -> (Double, Double),
+  main_label~ : () -> String = fn() { "Capsule" },
+  sat_label~ : () -> String = fn() { "+" },
+  label~ : () -> String = fn() { "Liquid Merge" },
+  loc~ : String = "",
+) -> view::View {
+  let ctrl = match controller {
+    Some(c) => c
+    None => LiquidMerge::new()
+  }
+  let compact_w = main_w + ctrl.max_gap + sat_size + 16.0
+  let compact_h = (if main_h > sat_size { main_h } else { sat_size }) + 24.0
+  let resolve = fn() -> (Double, Double, Double, Double, Double, Double) {
+    let (aw, ah) = match arena {
+      Some(f) => f()
+      None => (arena_w, arena_h)
+    }
+    let is_arena = aw > 0.0 && ah > 0.0
+    let sw = if is_arena { aw } else { compact_w }
+    let sh = if is_arena { ah } else { compact_h }
+    let mx = if is_arena { (sw - main_w) * 0.5 - 24.0 } else { 0.0 }
+    let my = (sh - main_h) * 0.5
+    let sx = mx + main_w
+    let sy = my + (main_h - sat_size) * 0.5
+    ctrl.geom.v = (mx, my, main_w, main_h, sat_size)
+    if is_arena {
+      let margin = 8.0
+      ctrl.bounds.v = (
+        margin - sx,
+        sw - margin - sat_size - sx,
+        margin - sy,
+        sh - margin - sat_size - sy,
+      )
+    } else {
+      ctrl.bounds.v = (ctrl.merged_gap - 6.0, ctrl.max_gap, 0.0, 0.0)
+    }
+    (sw, sh, mx, my, sx, sy)
+  }
+  match arena {
+    None => { let _ = resolve() }
+    Some(_) => ()
+  }
+  let brk = ctrl.bond.break_gap()
+  let sat_move = fn(_x : Double, _y : Double, t : Double) -> (Double, Double) {
+    ctrl.x_way.said()
+    ctrl.y_way.said()
+    ctrl.recoil_x.said()
+    ctrl.recoil_y.said()
+    ctrl.pos_at(t)
+  }
+  let sat_end = fn(_x : Double, _y : Double) -> Double {
+    ctrl.x_way.said()
+    ctrl.y_way.said()
+    ctrl.recoil_x.said()
+    ctrl.recoil_y.said()
+    ctrl.end()
+  }
+  let main_off = fn() -> (Double, Double) {
+    let (_, _, mx, my, _, _) = resolve()
+    (mx, my)
+  }
+  let sat_off = fn() -> (Double, Double) {
+    let (_, _, _, _, sx, sy) = resolve()
+    (sx, sy)
+  }
+  parent.box(loc=loc, fn(stage : view::View) -> Unit {
+    ctrl.attach(stage)
+    let _ = stage
+      .width(view::Live::By(fn() { Some(resolve().0) }))
+      .height(view::Live::By(fn() { Some(resolve().1) }))
+      .shrink(view::Live::Is(0.0))
+    let _ = stage.box(fn(shadows : view::View) -> Unit {
+      let _ = shadows.over(view::Live::Is(true))
+      let _ = shadows.box(fn(ms : view::View) -> Unit {
+        let _ = ms
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(main_w)))
+          .height(view::Live::Is(Some(main_h)))
+          .offset(view::Live::By(main_off))
+          .radius(view::Live::Is(main_h / 2.0))
+          .shadow(view::Live::Is(shadow_default))
+          .shadow_outside(view::Live::Is(true))
+      })
+      let _ = shadows.box(fn(ss : view::View) -> Unit {
+        let _ = ss
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(sat_size)))
+          .height(view::Live::Is(Some(sat_size)))
+          .offset(view::Live::By(sat_off))
+          .radius(view::Live::Is(sat_size / 2.0))
+          .shadow(view::Live::Is(shadow_default))
+          .shadow_outside(view::Live::Is(true))
+          .alpha(view::Live::By(fn() { merge_smoothstep(0.0, brk, ctrl.gap_on(ss)) }))
+        let _ = ss.moved_by(sat_move, sat_end)
+      })
+    })
+    let _ = stage.box(fn(mg : view::View) -> Unit {
+      let _ = mg
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(main_w)))
+        .height(view::Live::Is(Some(main_h)))
+        .offset(view::Live::By(main_off))
+        .radius(view::Live::Is(main_h / 2.0))
+        .glass(view::Live::By(fn() { Some(merge_glass(ctrl.merge_on(mg))) }))
+    })
+    let _ = stage.box(fn(sg : view::View) -> Unit {
+      let _ = sg
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(sat_size)))
+        .height(view::Live::Is(Some(sat_size)))
+        .offset(view::Live::By(sat_off))
+        .radius(view::Live::Is(sat_size / 2.0))
+        .glass(view::Live::By(fn() {
+          let rim = if ctrl.dragging_sig.get() { 0.78 } else { 0.6 }
+          let m = ctrl.merge_on(sg)
+          if m > 0.0 {
+            Some(merge_glass(m, rim=rim))
+          } else {
+            Some(merge_glass(0.0, rim=rim).sharing())
+          }
+        }))
+        .ground_drawn(view::Live::By(fn() {
+          let r = clamp(ctrl.recoil_on(sg), -0.3, 0.3)
+          if r.abs() < 0.001 {
+            return view::ground_as_laid
+          }
+          let sx = 1.0 - r * 0.25
+          let sy = 1.0 + r * 0.22
+          stretched(sat_size, sat_size, 0.0, 0.0, sx, sy)
+        }))
+      let _ = sg.moved_by(sat_move, sat_end)
+    })
+    let _ = stage.box(fn(fg : view::View) -> Unit {
+      let _ = fg.over(view::Live::Is(true))
+      let _ = fg.box(fn(ml : view::View) -> Unit {
+        let _ = ml
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(main_w)))
+          .height(view::Live::Is(Some(main_h)))
+          .offset(view::Live::By(main_off))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .lies_along(view::Live::Is(view::Lies::Middle))
+        let _ = ml.box(fn(w : view::View) -> Unit {
+          let _ = w.words(view::Live::By(main_label), look=words_at(type_body, weight=weight_medium)).ink(view::Live::By(fn() { colors().content }))
+        })
+      })
+      let _ = fg.box(fn(hit : view::View) -> Unit {
+        let _ = hit
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(sat_size)))
+          .height(view::Live::Is(Some(sat_size)))
+          .offset(view::Live::By(sat_off))
+          .radius(view::Live::Is(sat_size / 2.0))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .lies_along(view::Live::Is(view::Lies::Middle))
+          .says(view::Live::By(fn() { Some(view::said(view::Role::Group, label=label())) }))
+          .gesture(2.0, press=fn(d : view::Drag) -> Unit { ctrl.on_press(d) }, drag=fn(d : view::Drag) -> Unit { ctrl.on_drag(d) })
+        let _ = hit.moved_by(sat_move, sat_end)
+        let _ = hit.box(fn(w : view::View) -> Unit {
+          let _ = w.words(view::Live::By(sat_label), look=words_at(22.0, weight=weight_medium)).ink(view::Live::By(fn() { colors().content }))
+        })
+      })
+    })
+  })
+}

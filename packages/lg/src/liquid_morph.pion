@@ -1,0 +1,545 @@
+// Apple iOS 26/27 Liquid Glass Menu Morph with zero-double-glass trigger handoff,
+// C2-continuous emergence, physically gap-driven GPU SDF capillary bridge,
+// and zero-cliff pinch-off for anchored floating overlays.
+
+import "motion"
+import "paint"
+import "ui"
+import "view"
+
+let ovl_morph_leave_ms : Double = 340.0
+let ovl_morph_handoff_p : Double = 0.025
+let ovl_morph_merge_max : Double = 28.0
+let ovl_morph_break_gap : Double = 5.8
+let ovl_morph_ghost_gone_gap : Double = 7.6
+let ovl_morph_reveal_open_ms : Double = 160.0
+let ovl_morph_reveal_delay_ms : Double = 170.0
+let ovl_morph_reveal_close_ms : Double = 65.0
+let ovl_morph_mat_open_ms : Double = 150.0
+let ovl_morph_mat_delay_ms : Double = 190.0
+let ovl_morph_mat_close_ms : Double = 45.0
+
+fn ovl_smoothstep(edge0 : Double, edge1 : Double, x : Double) -> Double {
+  if edge0 == edge1 {
+    return if x >= edge1 { 1.0 } else { 0.0 }
+  }
+  let u = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+  u * u * (3.0 - 2.0 * u)
+}
+
+fn ovl_morph_pivot(side : view::Side, along : view::Along) -> view::Pivot {
+  let ax = match along {
+    Start => 0.12
+    End => 0.88
+    Middle => 0.5
+  }
+  let ay = match along {
+    Start => 0.15
+    End => 0.85
+    Middle => 0.5
+  }
+  match side {
+    Bottom => view::Pivot::At(ax, 0.0)
+    Top => view::Pivot::At(ax, 1.0)
+    Right => view::Pivot::At(0.0, ay)
+    Left => view::Pivot::At(1.0, ay)
+  }
+}
+
+fn ovl_morph_gap(side : view::Side, anchor_size : (Double, Double), p : Double) -> Double {
+  let pt = clamp((p - ovl_morph_handoff_p) / (1.0 - ovl_morph_handoff_p), 0.0, 1.0)
+  let axis = match side {
+    Bottom => anchor_size.1
+    Top => anchor_size.1
+    Right => anchor_size.0
+    Left => anchor_size.0
+  }
+  (ovl_float_gap + axis) * pt - axis
+}
+
+fn ovl_morph_bridge_merge_for_gap(p : Double, gap : Double) -> Double {
+  if gap >= ovl_morph_break_gap || p <= ovl_morph_handoff_p {
+    return 0.0
+  }
+  let onset = ovl_smoothstep(ovl_morph_handoff_p, 0.24, p)
+  if gap <= 0.0 {
+    let m = ovl_morph_merge_max * onset
+    if m < 0.02 { 0.02 } else { m }
+  } else {
+    ovl_morph_merge_max * (1.0 - ovl_smoothstep(0.0, ovl_morph_break_gap, gap)) * onset
+  }
+}
+
+fn ovl_morph_bridge_glass(merge~ : Double) -> paint::Glass {
+  let d = is_dark()
+  let m = if merge > 0.0 { merge } else { 0.0 }
+  paint::Glass::liquid(
+    blur=2.1,
+    tint=if d { 0x202020FFL } else { 0xFDFCFD67L },
+    solid=if d { 0x1E1F24FFL } else { 0xFAFAFAFFL },
+    saturation=1.0,
+    rim=0.6,
+    bezel=14.0,
+    refraction=18.0,
+    chroma=0.0,
+    merge=m,
+    adaptive=false,
+  )
+}
+
+fn ovl_morph_shell_glass(mat_t : Double, gap : Double, merge~ : Double) -> paint::Glass {
+  if merge > 0.01 {
+    return ovl_morph_bridge_glass(merge=merge)
+  }
+  let mt = clamp(mat_t, 0.0, 1.0)
+  let gt = ovl_smoothstep(ovl_morph_break_gap, ovl_float_gap - 0.1, gap)
+  let t = if mt < gt { mt } else { gt }
+  if t >= 0.999 {
+    return ovl_panel_glass()
+  }
+  let d = is_dark()
+  paint::Glass::liquid(
+    blur=lerp(2.1, 8.0, t),
+    tint=if d { 0x202020FFL } else { 0xFDFCFD67L },
+    solid=if d { 0x1C1C1EFFL } else { 0xF7F7FAFFL },
+    saturation=1.0,
+    rim=0.6,
+    bezel=lerp(14.0, 20.0, t),
+    refraction=lerp(18.0, 36.0, t),
+    chroma=0.0,
+    merge=0.0,
+    adaptive=false,
+  )
+}
+
+fn ovl_trigger_recoil_way(trigger : view::View, open : () -> Bool) -> motion::NodeWay {
+  let way = motion::NodeWay::new(1.0)
+  trigger.reacts(at_start=false, open, fn(is_open : Bool) -> Unit {
+    if is_open {
+      way.go_from(trigger, 0.94, 1.0, motion::tactile_bounce)
+    }
+  })
+  way
+}
+
+struct PairCell {
+  mut v : (Double, Double)
+}
+
+struct BoolFnCell {
+  mut v : () -> Bool
+}
+
+struct OvlMorphHandoff {
+  trigger : view::View
+  p_way : motion::NodeWay
+  side : view::Side
+  anchor_size : (Double, Double)
+  live_anchor : PairCell
+  open : () -> Bool
+  trigger_face : Option[(view::View) -> Unit]
+  attach_recoil : Bool
+  layer_live : BoolFnCell
+}
+
+fn OvlMorphHandoff::is_bridging(self : OvlMorphHandoff, node : view::View) -> Bool {
+  let p = self.p_way.shown(node)
+  let gap = ovl_morph_gap(self.side, self.live_anchor.v, p)
+  let active = (self.layer_live.v)()
+  active && gap < ovl_morph_break_gap && ((self.open)() || p > ovl_morph_handoff_p)
+}
+
+fn ovl_setup_trigger_handoff(
+  trigger : view::View,
+  open : () -> Bool,
+  side : view::Side,
+  anchor_size : (Double, Double),
+  trigger_face : Option[(view::View) -> Unit],
+  attach_recoil~ : Bool = true,
+) -> OvlMorphHandoff {
+  let handoff = OvlMorphHandoff::{
+    trigger,
+    p_way: motion::NodeWay::new(0.0),
+    side,
+    anchor_size,
+    live_anchor: PairCell::{ v: anchor_size },
+    open,
+    trigger_face,
+    attach_recoil,
+    layer_live: BoolFnCell::{ v: fn() { false } },
+  }
+  match trigger_face {
+    Some(_) => {
+      let _ = trigger.alpha(view::Live::By(fn() { if handoff.is_bridging(trigger) { 0.0 } else { 1.0 } }))
+    }
+    None =>
+      if attach_recoil {
+        let way = ovl_trigger_recoil_way(trigger, open)
+        let _ = trigger.scale(view::Live::By(fn() { way.shown(trigger) }))
+      }
+  }
+  handoff
+}
+
+fn ovl_morph_trigger_rect(
+  w : Double,
+  h : Double,
+  side : view::Side,
+  along : view::Along,
+  anchor_size : (Double, Double),
+) -> (Double, Double, Double, Double, Double) {
+  let tw = anchor_size.0
+  let th = anchor_size.1
+  let tr = th * 0.5
+  let ax = match along {
+    Start => 0.0
+    End => w - tw
+    Middle => (w - tw) * 0.5
+  }
+  let ay = match along {
+    Start => 0.0
+    End => h - th
+    Middle => (h - th) * 0.5
+  }
+  let (tx, ty) = match side {
+    Bottom => (ax, -ovl_float_gap - th)
+    Top => (ax, h + ovl_float_gap)
+    Right => (-ovl_float_gap - tw, ay)
+    Left => (w + ovl_float_gap, ay)
+  }
+  (tx, ty, tw, th, tr)
+}
+
+fn ovl_morph_shell_geom(
+  w : Double,
+  h : Double,
+  side : view::Side,
+  along : view::Along,
+  anchor_size : (Double, Double),
+  panel_radius : Double,
+  sx : Double,
+  sy : Double,
+  p : Double,
+) -> (view::GroundShape, Double) {
+  if (sx - 1.0).abs() < 0.001 && (sy - 1.0).abs() < 0.001 && (p - 1.0).abs() < 0.001 {
+    return (view::ground_as_laid, ovl_float_gap)
+  }
+  if w <= 0.0 || h <= 0.0 {
+    return (view::ground_as_laid, ovl_float_gap)
+  }
+  let (tx, ty, tw, th, tr) = ovl_morph_trigger_rect(w, h, side, along, anchor_size)
+  let remap_scale = fn(v : Double) -> Double {
+    let u = (v - ovl_morph_handoff_p) / (1.0 - ovl_morph_handoff_p)
+    if u > 0.0 { u } else { 0.0 }
+  }
+  let px = remap_scale(sx)
+  let py = remap_scale(sy)
+  let pt = clamp((p - ovl_morph_handoff_p) / (1.0 - ovl_morph_handoff_p), 0.0, 1.0)
+  let (mx, my, mw, mh, gap) = match side {
+    Bottom => {
+      let y = lerp(ty, 0.0, pt)
+      let g = y - (ty + th)
+      let clear_t = ovl_smoothstep(-th * 0.65, ovl_float_gap, g)
+      let grow_w = lerp(px * 0.22, px, clear_t)
+      let grow_h = lerp(py * 0.32, py, ovl_smoothstep(-th * 0.75, ovl_float_gap, g))
+      let raw_mw = lerp(tw, w, grow_w)
+      let raw_mh = lerp(th, h, grow_h)
+      let cur_w = if raw_mw > 4.0 { raw_mw } else { 4.0 }
+      let cur_h = if raw_mh > 4.0 { raw_mh } else { 4.0 }
+      let x = match along {
+        Start => 0.0
+        End => w - cur_w
+        Middle => (w - cur_w) * 0.5
+      }
+      (x, y, cur_w, cur_h, g)
+    }
+    Top => {
+      let bot = lerp(ty + th, h, pt)
+      let g = ty - bot
+      let clear_t = ovl_smoothstep(-th * 0.65, ovl_float_gap, g)
+      let grow_w = lerp(px * 0.22, px, clear_t)
+      let grow_h = lerp(py * 0.32, py, ovl_smoothstep(-th * 0.75, ovl_float_gap, g))
+      let raw_mw = lerp(tw, w, grow_w)
+      let raw_mh = lerp(th, h, grow_h)
+      let cur_w = if raw_mw > 4.0 { raw_mw } else { 4.0 }
+      let cur_h = if raw_mh > 4.0 { raw_mh } else { 4.0 }
+      let x = match along {
+        Start => 0.0
+        End => w - cur_w
+        Middle => (w - cur_w) * 0.5
+      }
+      (x, bot - cur_h, cur_w, cur_h, g)
+    }
+    Right => {
+      let x = lerp(tx, 0.0, pt)
+      let g = x - (tx + tw)
+      let clear_t = ovl_smoothstep(-tw * 0.65, ovl_float_gap, g)
+      let grow_h = lerp(py * 0.22, py, clear_t)
+      let grow_w = lerp(px * 0.32, px, ovl_smoothstep(-tw * 0.75, ovl_float_gap, g))
+      let raw_mw = lerp(tw, w, grow_w)
+      let raw_mh = lerp(th, h, grow_h)
+      let cur_w = if raw_mw > 4.0 { raw_mw } else { 4.0 }
+      let cur_h = if raw_mh > 4.0 { raw_mh } else { 4.0 }
+      let y = match along {
+        Start => 0.0
+        End => h - cur_h
+        Middle => (h - cur_h) * 0.5
+      }
+      (x, y, cur_w, cur_h, g)
+    }
+    Left => {
+      let r_edge = lerp(tx + tw, w, pt)
+      let g = tx - r_edge
+      let clear_t = ovl_smoothstep(-tw * 0.65, ovl_float_gap, g)
+      let grow_h = lerp(py * 0.22, py, clear_t)
+      let grow_w = lerp(px * 0.32, px, ovl_smoothstep(-tw * 0.75, ovl_float_gap, g))
+      let raw_mw = lerp(tw, w, grow_w)
+      let raw_mh = lerp(th, h, grow_h)
+      let cur_w = if raw_mw > 4.0 { raw_mw } else { 4.0 }
+      let cur_h = if raw_mh > 4.0 { raw_mh } else { 4.0 }
+      let y = match along {
+        Start => 0.0
+        End => h - cur_h
+        Middle => (h - cur_h) * 0.5
+      }
+      (r_edge - cur_w, y, cur_w, cur_h, g)
+    }
+  }
+  let half_min = (if mw < mh { mw } else { mh }) * 0.5
+  let raw_r = lerp(tr, panel_radius, pt)
+  let mr = if raw_r < half_min { raw_r } else { half_min }
+  (view::GroundShape::{ dx: mx, dy: my, dw: mw - w, dh: mh - h, corners: Some((mr, mr, mr, mr)) }, gap)
+}
+
+fn ovl_attach_liquid_morph(
+  layer : view::View,
+  panel : view::View,
+  side : view::Side,
+  along : view::Along,
+  panel_radius : Double,
+  handoff : OvlMorphHandoff,
+  content : (view::View) -> Unit,
+) -> () -> Bool {
+  let (_, _, pw, ph) = handoff.trigger.placed_now()
+  let anchor_size = if pw > 0.0 && ph > 0.0 { (pw, ph) } else { handoff.anchor_size }
+  handoff.live_anchor.v = anchor_size
+  let has_face = match handoff.trigger_face { Some(_) => true; None => false }
+  let p_way = handoff.p_way
+  let sx_way = motion::NodeWay::new(0.0)
+  let sy_way = motion::NodeWay::new(0.0)
+  let reveal_way = motion::NodeWay::new(0.0)
+  let material_way = motion::NodeWay::new(0.0)
+  let icon_recoil_way = motion::NodeWay::new(1.0)
+  handoff.layer_live.v = fn() -> Bool { layer.alive() && ((handoff.open)() || layer.leaving()) }
+  layer.reacts(fn() { layer.leaving() }, fn(leaving : Bool) -> Unit {
+    if leaving {
+      sx_way.go(layer, 0.0, motion::snappy_damped)
+      sy_way.go(layer, 0.0, motion::snappy_damped)
+      p_way.go(layer, 0.0, motion::snappy_damped)
+      reveal_way.go(layer, 0.0, motion::tween(ovl_morph_reveal_close_ms, ease=ui::Ease::Out))
+      material_way.go(layer, 0.0, motion::tween(ovl_morph_mat_close_ms, ease=ui::Ease::Out))
+    } else {
+      sx_way.go(layer, 1.0, motion::backdrop_scale_x_spring)
+      sy_way.go(layer, 1.0, motion::backdrop_scale_y_spring)
+      p_way.go(layer, 1.0, motion::backdrop_scale_y_spring)
+      reveal_way.go(
+        layer,
+        1.0,
+        motion::tween(ovl_morph_reveal_open_ms, ease=ui::Ease::Out, delay=ovl_morph_reveal_delay_ms),
+      )
+      material_way.go(
+        layer,
+        1.0,
+        motion::tween(ovl_morph_mat_open_ms, ease=ui::Ease::Out, delay=ovl_morph_mat_delay_ms),
+      )
+      if has_face && handoff.attach_recoil {
+        icon_recoil_way.go_from(layer, 0.92, 1.0, motion::tactile_bounce)
+      }
+    }
+  })
+  let modal_live = fn() -> Bool { !layer.leaving() }
+  let _ = panel.by_room(fn(inner : view::View, room : view::Room) -> Unit {
+    let content_ref : ui::Ref[Option[view::View]] = ui::ref_new(None)
+    let panel_h = fn() -> Double {
+      match content_ref.v {
+        Some(c) => room.tall(c)
+        None => 0.0
+      }
+    }
+    let tw = anchor_size.0
+    let th = anchor_size.1
+    let tr = th * 0.5
+    if has_face {
+      let _ = inner.box(fn(trigger_shadow_box : view::View) -> Unit {
+        let _ = trigger_shadow_box
+          .over(view::Live::Is(true))
+          .points(view::Live::Is(false))
+          .width(view::Live::Is(Some(tw)))
+          .height(view::Live::Is(Some(th)))
+          .radius(view::Live::Is(tr))
+          .shadow_outside(view::Live::Is(true))
+          .offset(view::Live::By(fn() {
+            let (tx, ty, _, _, _) = ovl_morph_trigger_rect(room.width(), panel_h(), side, along, anchor_size)
+            (tx, ty)
+          }))
+          .shadow(view::Live::By(fn() {
+            if handoff.is_bridging(trigger_shadow_box) { shadow_default } else { shadow_none }
+          }))
+      })
+    }
+    let _ = inner.box(fn(shadow_box : view::View) -> Unit {
+      let _ = shadow_box
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .radius(view::Live::Is(panel_radius))
+        .shadow_outside(view::Live::Is(true))
+        .shadow(view::Live::By(fn() {
+          let ga = ovl_smoothstep(0.06, 0.30, p_way.shown(shadow_box))
+          if ga <= 0.001 {
+            shadow_none
+          } else {
+            let (s, dy, ink) = shadow_default
+            (s, dy, alpha(ink, ga))
+          }
+        }))
+        .ground_drawn(view::Live::By(fn() {
+          let (shape, _) = ovl_morph_shell_geom(
+            room.width(),
+            panel_h(),
+            side,
+            along,
+            anchor_size,
+            panel_radius,
+            sx_way.shown(shadow_box),
+            sy_way.shown(shadow_box),
+            p_way.shown(shadow_box),
+          )
+          shape
+        }))
+    })
+    let _ = inner.box(fn(trigger_ghost : view::View) -> Unit {
+      let ghost_alpha = fn() -> Double {
+        if has_face {
+          if handoff.is_bridging(trigger_ghost) { 1.0 } else { 0.0 }
+        } else {
+          let p = p_way.shown(trigger_ghost)
+          let ga = ovl_smoothstep(ovl_morph_handoff_p, 0.18, p)
+          let gap = ovl_morph_gap(side, anchor_size, p)
+          let m = ovl_morph_bridge_merge_for_gap(p, gap)
+          if m > 0.01 {
+            ga
+          } else {
+            ga * (1.0 - ovl_smoothstep(ovl_morph_break_gap, ovl_morph_ghost_gone_gap, gap))
+          }
+        }
+      }
+      let _ = trigger_ghost
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(tw)))
+        .height(view::Live::Is(Some(th)))
+        .radius(view::Live::Is(tr))
+        .offset(view::Live::By(fn() {
+          let (tx, ty, _, _, _) = ovl_morph_trigger_rect(room.width(), panel_h(), side, along, anchor_size)
+          (tx, ty)
+        }))
+        .alpha(view::Live::By(ghost_alpha))
+        .glass(view::Live::By(fn() {
+          let p = p_way.shown(trigger_ghost)
+          let a = ghost_alpha()
+          if a > 0.01 {
+            let gap = ovl_morph_gap(side, anchor_size, p)
+            let m = ovl_morph_bridge_merge_for_gap(p, gap)
+            Some(ovl_morph_bridge_glass(merge=m))
+          } else {
+            None
+          }
+        }))
+    })
+    let _ = inner.box(fn(shell : view::View) -> Unit {
+      let _ = shell
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .radius(view::Live::Is(panel_radius))
+        .alpha(view::Live::By(fn() {
+          let p = p_way.shown(shell)
+          if has_face {
+            if p <= ovl_morph_handoff_p { 0.0 } else { 1.0 }
+          } else {
+            ovl_smoothstep(ovl_morph_handoff_p, 0.18, p)
+          }
+        }))
+        .glass(view::Live::By(fn() {
+          let p = p_way.shown(shell)
+          if has_face && p <= ovl_morph_handoff_p {
+            return None
+          }
+          let ga = if has_face { 1.0 } else { ovl_smoothstep(ovl_morph_handoff_p, 0.18, p) }
+          if ga > 0.01 {
+            let gap = ovl_morph_gap(side, anchor_size, p)
+            let m = ovl_morph_bridge_merge_for_gap(p, gap)
+            let mat_t = material_way.shown(shell)
+            Some(ovl_morph_shell_glass(mat_t, gap, merge=m))
+          } else {
+            None
+          }
+        }))
+        .ground_drawn(view::Live::By(fn() {
+          let (shape, _) = ovl_morph_shell_geom(
+            room.width(),
+            panel_h(),
+            side,
+            along,
+            anchor_size,
+            panel_radius,
+            sx_way.shown(shell),
+            sy_way.shown(shell),
+            p_way.shown(shell),
+          )
+          shape
+        }))
+    })
+    match handoff.trigger_face {
+      Some(draw_face) => {
+        let _ = inner.box(fn(trigger_face_box : view::View) -> Unit {
+          let _ = trigger_face_box
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .width(view::Live::Is(Some(tw)))
+            .height(view::Live::Is(Some(th)))
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .lies_along(view::Live::Is(view::Lies::Middle))
+            .offset(view::Live::By(fn() {
+              let (tx, ty, _, _, _) = ovl_morph_trigger_rect(room.width(), panel_h(), side, along, anchor_size)
+              (tx, ty)
+            }))
+            .scale(view::Live::By(fn() { icon_recoil_way.shown(trigger_face_box) }))
+            .alpha(view::Live::By(fn() { if handoff.is_bridging(trigger_face_box) { 1.0 } else { 0.0 } }))
+          draw_face(trigger_face_box)
+        })
+      }
+      None => ()
+    }
+    let _ = inner.box(fn(content_box : view::View) -> Unit {
+      content_ref.v = Some(content_box)
+      let _ = content_box
+        .scale(
+          view::Live::By(fn() { lerp(0.95, 1.0, reveal_way.shown(content_box)) }),
+          about=ovl_morph_pivot(side, along),
+        )
+        .alpha(view::Live::By(fn() { reveal_way.shown(content_box) }))
+        .offset(view::Live::By(fn() {
+          let d = (1.0 - reveal_way.shown(content_box)) * 4.0
+          match side {
+            Bottom => (0.0, -d)
+            Top => (0.0, d)
+            Right => (-d, 0.0)
+            Left => (d, 0.0)
+          }
+        }))
+      content(content_box)
+    })
+  })
+  modal_live
+}
