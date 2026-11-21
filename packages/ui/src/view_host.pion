@@ -4,6 +4,7 @@
 // Ported from libs/mbui/src/ui/view_host.mbt, app.mbt, scene.mbt.
 
 import "damage"
+import "dmath"
 import "hostapi"
 import "paint"
 import "signals"
@@ -257,7 +258,8 @@ pub fn Scene::set_rot(
   }
 }
 
-/// Emit a single antialiased line segment (`kind = 10.0` per apple_render.m:540-545).
+/// Emit a single antialiased line segment as a rotated rounded capsule (`kind = 0.0`)
+/// so diagonal lines avoid AABB overdraw while sharing the renderer's `1.0pt` AA expansion.
 pub fn Scene::emit_line(
   self : Scene,
   x0 : Double,
@@ -275,22 +277,25 @@ pub fn Scene::emit_line(
   if width <= 0.0 || (color & 0xFFL) == 0L || alpha <= 0.0 {
     return
   }
-  let half_w = width * 0.5
-  let rx0 = dmin(x0, x1) - half_w - 1.0
-  let ry0 = dmin(y0, y1) - half_w - 1.0
-  let rx1 = dmax(x0, x1) + half_w + 1.0
-  let ry1 = dmax(y0, y1) + half_w + 1.0
-  let rw = dmax(rx1 - rx0, 1.0)
-  let rh = dmax(ry1 - ry0, 1.0)
-  let nx0 = (x0 - rx0) / rw
-  let ny0 = (y0 - ry0) / rh
-  let nx1 = (x1 - rx0) / rw
-  let ny1 = (y1 - ry0) / rh
-  let _ = self.push_inst(
-    rx0, ry0, rw, rh, half_w, 10.0, 0.0, 0.0, color, alpha,
-    nx0, ny0, nx1, ny1,
+  let dx = x1 - x0
+  let dy = y1 - y0
+  let len = dmath::sqrt(dx * dx + dy * dy)
+  let mx = (x0 + x1) * 0.5
+  let my = (y0 + y1) * 0.5
+  let w = len + width
+  let h = width
+  let r = width * 0.5
+  let idx = self.push_inst(
+    mx - w * 0.5, my - h * 0.5, w, h, r, 0.0, 0.0, 0.0, color, alpha,
+    0.0, 0.0, 0.0, 0.0,
     clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
   )
+  if len > 1.0e-9 {
+    let angle = dmath::atan2(dy, dx)
+    if angle.abs() > 1.0e-9 {
+      self.set_rot(idx, angle, mx, my, outer_clip=true)
+    }
+  }
 }
 
 pub fn Scene::copy(self : Scene) -> Scene {
@@ -932,33 +937,43 @@ fn encode_drawn_node(
     encode_shapes(scene, d, clip_x, clip_y, clip_x1, clip_y1)
   }
 
-  // 8. Polylines (kind = 10.0 per apple_render.m:540-545: p.x = half_width, c2 = normalized x0,y0,x1,y1)
+  // 8. Polylines (delegated to Scene::emit_line rotated capsules)
+  let lines_start_idx = scene.ninst
+  let line_turn = d.turn != 0.0 && d.lines.length() > 0
+  let line_ox = d.x + d.w * 0.5
+  let line_oy = d.y + d.h * 0.5
+  let line_tc = if line_turn { dmath::cos(d.turn) } else { 1.0 }
+  let line_ts = if line_turn { dmath::sin(d.turn) } else { 0.0 }
   for ln in d.lines {
     if ln.width > 0.0 && (ln.color & 0xFFL) != 0L && ln.points.length() >= 2 {
-      let half_w = ln.width * 0.5
       let mut pi = 0
       while pi + 1 < ln.points.length() {
         let (ax, ay) = ln.points[pi]
         let (bx, by) = ln.points[pi + 1]
-        let rx0 = dmin(ax, bx) - half_w - 1.0
-        let ry0 = dmin(ay, by) - half_w - 1.0
-        let rx1 = dmax(ax, bx) + half_w + 1.0
-        let ry1 = dmax(ay, by) + half_w + 1.0
-        let rw = dmax(rx1 - rx0, 1.0)
-        let rh = dmax(ry1 - ry0, 1.0)
-        let nx0 = (ax - rx0) / rw
-        let ny0 = (ay - ry0) / rh
-        let nx1 = (bx - rx0) / rw
-        let ny1 = (by - ry0) / rh
-        let _ = scene.push_inst(
-          d.x + rx0, d.y + ry0, rw, rh, half_w, 10.0, 0.0, 0.0, ln.color, d.alpha,
-          nx0, ny0, nx1, ny1,
+        let mut p0x = d.x + ax
+        let mut p0y = d.y + ay
+        let mut p1x = d.x + bx
+        let mut p1y = d.y + by
+        if line_turn {
+          let adx = p0x - line_ox
+          let ady = p0y - line_oy
+          p0x = line_ox + line_tc * adx - line_ts * ady
+          p0y = line_oy + line_ts * adx + line_tc * ady
+          let bdx = p1x - line_ox
+          let bdy = p1y - line_oy
+          p1x = line_ox + line_tc * bdx - line_ts * bdy
+          p1y = line_oy + line_ts * bdx + line_tc * bdy
+        }
+        scene.emit_line(
+          p0x, p0y, p1x, p1y,
+          ln.width, ln.color, alpha=d.alpha,
           clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
         )
         pi += 1
       }
     }
   }
+  let lines_end_idx = scene.ninst
 
   // 9. Text glyphs via real CoreText/hostapi shaping + atlas (kind=1.0 mono / 3.0 color)
   if d.runs.length() > 0 {
@@ -1010,7 +1025,7 @@ fn encode_drawn_node(
       if has_rc {
         scene.set_clip_corners(idx, rc.0, rc.1, rc.2, rc.3)
       }
-      if has_rot {
+      if has_rot && (idx < lines_start_idx || idx >= lines_end_idx) {
         let base = idx * inst_size
         scene.inst[base + 32] = d.turn
         scene.inst[base + 33] = if idx < after_ground_idx { gox } else { ox }
