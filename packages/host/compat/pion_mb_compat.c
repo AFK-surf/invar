@@ -1,8 +1,12 @@
-// MoonBit C runtime shim + zero-copy Pion FFI bridges for mbui native Apple/macOS host.
-// Lets unmodified upstream libs/mbui/src/host/{apple_*.m,mac_app.m,*.h} link directly into Pion
+// MoonBit C runtime shim + zero-copy Pion FFI bridges for mbui native hosts (Apple/macOS and Windows).
+// Lets unmodified upstream libs/mbui/src/host/{apple_*.m,mac_app.m,win_*.{c,cpp},*.h} link directly into Pion
 // with zero MoonBit runtime dependency.
 #include "moonbit.h"
+#if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -384,8 +388,25 @@ int32_t pion_host_snapshot(const char *path, int64_t path_len) {
 }
 
 void pion_host_pump_main_loop(double ms) {
+#if defined(__APPLE__)
   double sec = ms > 0.0 ? ms / 1000.0 : 0.001;
   CFRunLoopRunInMode(kCFRunLoopDefaultMode, sec, true);
+#elif defined(_WIN32)
+  // Deliver what is waiting on this thread's queue (decodes and other posted callbacks), then wait up to `ms` for more.
+  DWORD until = GetTickCount() + (DWORD)(ms > 0.0 ? ms : 1.0);
+  for (;;) {
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+    DWORD now = GetTickCount();
+    if ((int32_t)(until - now) <= 0) break;
+    MsgWaitForMultipleObjects(0, NULL, FALSE, until - now, QS_ALLINPUT);
+  }
+#else
+  (void)ms;
+#endif
 }
 
 // ---- Run callback bridge ----
