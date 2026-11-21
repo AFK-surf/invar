@@ -4,7 +4,30 @@ Invar 是一个纯 Pion 编写的「细粒度 Signals + 保留模式纯节点树
 
 Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-platform GPU UI framework (**zero MoonBit runtime, zero DOM widgets**), targeting five native and web GPU hosts.
 
-> 开发与 Agent 协作红线见 [`AGENTS.md`](AGENTS.md)；液态玻璃设计规范见 [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md)；组件速查目录见 [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md)。
+## For AI Agents
+
+If you are an AI coding agent (Claude Code, Codex, Cursor, etc.) working with Invar:
+
+1. **Read [`AGENTS.md`](AGENTS.md) first** before writing or modifying any code.
+2. **Never run blocking IO on the render thread**: isolate all network, filesystem, process, and heavy compute work on a background thread using `ui::Worker::pair()` + `ui::WorkerCtx::run_loop()` + `worker.bind()` + `ui::wake_now()` + `#render_thread` (use `ui::Worker::inline()` for `wasm32` and `ui::Tester` tests; see [`examples/worker_app/`](examples/worker_app/)).
+3. **Build all Liquid Glass UI with `packages/lg` (never hand-roll `paint::Glass::liquid`)**: pick components from [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md), follow [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md), and verify with `lg::assert_no_nested_glass` and native offscreen rendering (`film::picture` / `film::film`).
+
+---
+
+## 双线程渲染与 Worker 骨架 / Dual-Thread Worker Architecture
+
+Invar 渲染线程专注于细粒度 `Signals`、纯节点树排版与 GPU 帧提交；所有阻塞 IO 与重计算通过 `ui::Worker::pair()` 放到独立 OS 线程，结果通过线程安全的 `ui::wake_now()` 唤醒主循环并在帧前（`ui::on_before_frame`）自动 drain 到 `Signals`。`wasm32` 与确定性 `ui::Tester` 单测可直接切换为 `ui::Worker::inline()`，100% 复用同一套视图与命令处理逻辑（完整范例见 [`examples/worker_app/`](examples/worker_app/)）：
+
+```pion
+let (worker, ctx) : (ui::Worker[Cmd, Ev], ui::WorkerCtx[Cmd, Ev]) = ui::Worker::pair()
+scope(world, fn(s : Scope) -> Unit {
+  spawn(s, fn() -> Unit {
+    ctx.run_loop(fn(cmd, emit) { handle_cmd(world, cmd, emit) })
+  })
+  ui::run("Invar App", fn(root) { build_view(root, worker) })
+  worker.close()
+})
+```
 
 ---
 
@@ -27,7 +50,7 @@ Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-
 | **Layer 0（基础库）** | `halt`、`dmath`、`codec`、`zip`、`text`、`signals`、`layer0_check` | 7 | 中止原语、确定性数学、二进制编解码、inflate/SHA-256、Unicode（Bidi/断行/字素）、细粒度响应式 Signals 及联合检查 |
 | **Layer 1A（布局与绘制基础）** | `flex`、`pixels`、`paint`、`damage`、`layer1a_check` | 5 | Flexbox 布局、图像解码（PNG/JPEG/WebP）、矢量/圆角/液态玻璃绘制指令、脏区与遮挡裁剪及联合检查 |
 | **Layer 1B（图形与动效引擎）** | `shape`、`svg`、`font`、`skia`、`effect`、`motion`、`render`、`layer1b_check` | 8 | 文本塑形、SVG 解析、字体管理、2D 路径光栅化、后处理效果、闭式弹簧动效、实例合批渲染及联合检查 |
-| **Layer 2（节点树与交互框架）** | `view`、`headless`、`ui` | 3 | 保留模式纯节点树（`View`）、无头交互与无障碍原语（`headless`）、主题/输入法/离屏 `Tester` 门禁（`ui`） |
+| **Layer 2（节点树与交互框架）** | `view`、`headless`、`ui` | 3 | 保留模式纯节点树（`View`）、无头交互与无障碍原语（`headless`）、主题/输入法/`ui::Worker`/离屏 `Tester` 门禁（`ui`） |
 | **Layer 3（宿主桥接与出片）** | `hostapi`、`host`、`host_web`、`invar_host`、`film`、`kit` | 6 | 统一宿主 ABI、多端原生宿主、Web 宿主、兼容宿主包、确定性离屏出图/录片引擎（`film`）、基础 UI 套件（`kit`） |
 | **Liquid Glass 组件与展台** | `lg`、`lg_pages`、`lg_shots`、`lg_web` | 4 | iOS 27 液态玻璃组件库（37+ 公开组件 + `audit_glass` 门禁）、展厅页面、Metal 离屏出图器、WebAssembly 展台 |
 | **站点与性能基准** | `site`、`bench`、`bench_gpu` | 3 | 官方展示站点、Layer-1 CPU 基准套件、Layer-2 同步 GPU 帧时基准套件 |
@@ -47,17 +70,23 @@ pionc2 test packages/layer1b_check
 pionc2 test packages/view
 pionc2 test packages/damage
 pionc2 test packages/headless
+pionc2 test packages/hostapi
 pionc2 test packages/ui
 pionc2 test packages/lg
 pionc2 test packages/bench
 pionc2 test packages/site
+pionc2 test examples/worker_app
 
 # 2. 宿主与 Liquid Glass 包类型检查
+pionc2 check packages/hostapi
 pionc2 check packages/host
+pionc2 check packages/host_web
+pionc2 check packages/ui
 pionc2 check packages/lg
 pionc2 check packages/lg_pages
 pionc2 check packages/lg_shots
 pionc2 check packages/lg_web
+pionc2 check examples/worker_app
 
 # 3. Web wasm32 产物构建
 pionc2 build --release --target wasm32 packages/lg_web
@@ -88,6 +117,7 @@ PIONC=/path/to/pionc2 bash scripts/bench.sh --cpu-only --filter flex
 
 ## 文档导航 / Documentation
 
-- [`AGENTS.md`](AGENTS.md) — 仓库架构红线、防手搓规范与快检命令
+- [`AGENTS.md`](AGENTS.md) — 仓库架构红线、双线程 Worker 规范、防手搓规范与快检命令
 - [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md) — Liquid Glass 五大光学与架构铁律
 - [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) — `packages/lg` 一页纸组件速查目录与复制即用样例
+- [`examples/worker_app/`](examples/worker_app/) — 标准双线程 Invar App 完整范例

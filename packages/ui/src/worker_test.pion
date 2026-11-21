@@ -1,0 +1,111 @@
+// Deterministic unit tests for `ui::Worker`, `WorkerCtx`, `EventQueue`,
+// `hostapi::wake_now`, `FakeHost.wake_count`, and `on_before_frame`.
+// Note: Pion `test "..."` blocks do not receive a `World` capability (needed for `scope`/`spawn`).
+
+import "signals"
+import "view"
+
+enum TestCmd {
+  Add(Int)
+  Tag(String)
+}
+
+enum TestEv {
+  Added(Int)
+  Tagged(String)
+}
+
+test "worker inline mode dispatches synchronously and drains on Tester::frame" {
+  let sum = signals::signal(0)
+  let label = signals::signal("init")
+  let worker : Worker[TestCmd, TestEv] = Worker::inline(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n * 10))
+      TestCmd::Tag(s) => emit(TestEv::Tagged("tag:" + s))
+    }
+  })
+
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    worker.bind(fn(ev : TestEv) -> Unit {
+      match ev {
+        TestEv::Added(v) => sum.set(sum.untracked() + v)
+        TestEv::Tagged(s) => label.set(s)
+      }
+    })
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b.words(
+        view::Live::By(fn() { "sum=\{sum.get()} label=\{label.get()}" }),
+        look=view::words_plain,
+      )
+    })
+  })
+
+  debug_assert(t.find("sum=0 label=init").is_some(), "initial render before commands")
+  let before_wakes = t.fake.wake_count
+  debug_assert(worker.send(TestCmd::Add(3)), "inline send Add(3)")
+  debug_assert(worker.send(TestCmd::Add(4)), "inline send Add(4)")
+  debug_assert(worker.send(TestCmd::Tag("ok")), "inline send Tag(ok)")
+  debug_assert(t.fake.wake_count == before_wakes + 3, "each emit triggers hostapi::wake_now")
+
+  t.frame(ms=16.0)
+  debug_assert(sum.get() == 70, "drained both Added events (30 + 40 = 70)")
+  debug_assert(label.get() == "tag:ok", "drained Tagged event")
+  debug_assert(t.find("sum=70 label=tag:ok").is_some(), "UI re-rendered with drained signal values")
+
+  worker.close()
+  debug_assert(!worker.send(TestCmd::Add(1)), "send returns false after close")
+  t.dispose()
+}
+
+test "worker pair channel, EventQueue emit/drain, wake_now and re-bind lifecycle" {
+  let sum = signals::signal(0)
+  let tag = signals::signal("none")
+  let (worker, ctx) : (Worker[TestCmd, TestEv], WorkerCtx[TestCmd, TestEv]) = Worker::pair()
+
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    // Re-binding replaces previous hook without duplicate drains
+    worker.bind(fn(_ev : TestEv) -> Unit { sum.set(9999) })
+    worker.bind(fn(ev : TestEv) -> Unit {
+      match ev {
+        TestEv::Added(v) => sum.set(sum.untracked() + v)
+        TestEv::Tagged(s) => tag.set(s)
+      }
+    })
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b.words(
+        view::Live::By(fn() { "pair=\{sum.get()} tag=\{tag.get()}" }),
+        look=view::words_plain,
+      )
+    })
+  })
+
+  let wakes_before = t.fake.wake_count
+  debug_assert(worker.send(TestCmd::Add(5)), "send Add(5) into unbounded channel")
+  debug_assert(worker.send(TestCmd::Add(7)), "send Add(7) into unbounded channel")
+  debug_assert(worker.send(TestCmd::Tag("ok")), "send Tag(ok) into unbounded channel")
+  worker.close()
+
+  // Drain command channel via WorkerCtx::run_loop until closed
+  ctx.run_loop(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n * 2))
+      TestCmd::Tag(s) => emit(TestEv::Tagged("bg:" + s))
+    }
+  })
+
+  debug_assert(t.fake.wake_count == wakes_before + 3, "ctx.run_loop emit called wake_now 3 times")
+  debug_assert(t.fake.frame_requested, "FakeHost.frame_requested set by wake_now")
+
+  // Re-bind after close to verify drain on Tester::frame
+  worker.bind(fn(ev : TestEv) -> Unit {
+    match ev {
+      TestEv::Added(v) => sum.set(sum.untracked() + v)
+      TestEv::Tagged(s) => tag.set(s)
+    }
+  })
+  t.frame(ms=16.0)
+  debug_assert(sum.get() == 24, "sum updated to (5 + 7) * 2 = 24")
+  debug_assert(tag.get() == "bg:ok", "tag updated to bg:ok")
+  debug_assert(t.find("pair=24 tag=bg:ok").is_some(), "UI re-rendered with drained WorkerCtx events")
+  t.dispose()
+}

@@ -1393,6 +1393,8 @@ void mb_host_request_frame(void) {
 
 void mb_app_wake(void) { PostMessageW(hwnd, WM_APP, 0, 0); }
 
+void mb_host_wake_now(void) { mb_app_wake(); }
+
 // A message posted from outside the frames (post.h), on whatever thread: the app told on the window's thread
 // (told_between), which takes what changes only signals (a remote screen's frame) without a frame.
 static void mb_post_wake(void) { PostMessageW(hwnd, WM_MB_POSTED, 0, 0); }

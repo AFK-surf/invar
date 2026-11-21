@@ -1,0 +1,157 @@
+// First-class dual-thread worker skeleton API for Invar apps.
+// Keeps blocking IO and heavy computation off the render thread while providing
+// a synchronous inline mode for `wasm32` and deterministic `Tester` suites.
+
+import "hostapi"
+
+/// Thread-safe event queue bridging background worker threads to the render thread.
+/// Contains no `mut` or closure fields so `EventQueue[Ev]` is statically `Send` whenever `Ev : Send`.
+pub struct EventQueue[Ev] {
+  buf : Mutex[Array[Ev]]
+}
+
+pub fn EventQueue::new[Ev]() -> EventQueue[Ev] {
+  let empty : Array[Ev] = []
+  EventQueue::{ buf: Mutex::new(empty) }
+}
+
+/// Push an event onto the queue from any thread and wake the render loop immediately.
+pub fn EventQueue::emit[Ev](self : EventQueue[Ev], ev : Ev) -> Unit {
+  self.buf.with_lock(fn(q : Array[Ev]) -> Unit {
+    q.push(ev)
+  })
+  hostapi::wake_now()
+}
+
+/// Drain all queued events on the render thread and apply them after releasing the lock.
+pub fn EventQueue::drain[Ev](self : EventQueue[Ev], apply : (Ev) -> Unit) -> Int {
+  let batch : Array[Ev] = []
+  self.buf.with_lock(fn(q : Array[Ev]) -> Unit {
+    let mut i = 0
+    while i < q.length() {
+      batch.push(q[i])
+      i += 1
+    }
+    q.clear()
+  })
+  let n = batch.length()
+  let mut i = 0
+  while i < n {
+    apply(batch[i])
+    i += 1
+  }
+  n
+}
+
+/// Background-thread endpoint of a `Worker` pair (`Send` whenever `Cmd : Send, Ev : Send`).
+pub struct WorkerCtx[Cmd, Ev] {
+  cmds : Channel[Cmd]
+  events : EventQueue[Ev]
+}
+
+/// Block until the next command arrives, or return `None` when the worker is closed.
+pub fn WorkerCtx::recv[Cmd, Ev](self : WorkerCtx[Cmd, Ev]) -> Option[Cmd] {
+  self.cmds.recv()
+}
+
+/// Emit an event back to the render thread and wake the host frame loop.
+pub fn WorkerCtx::emit[Cmd, Ev](self : WorkerCtx[Cmd, Ev], ev : Ev) -> Unit {
+  self.events.emit(ev)
+}
+
+/// Run the command loop until the render-thread `Worker` is closed.
+pub fn WorkerCtx::run_loop[Cmd, Ev](
+  self : WorkerCtx[Cmd, Ev],
+  handle : (Cmd, (Ev) -> Unit) -> Unit,
+) -> Unit {
+  let emit_fn = fn(ev : Ev) -> Unit {
+    self.events.emit(ev)
+  }
+  while true {
+    match self.cmds.recv() {
+      Some(cmd) => handle(cmd, emit_fn)
+      None => break
+    }
+  }
+}
+
+/// Render-thread endpoint of a dual-thread (or synchronous inline) worker.
+pub struct Worker[Cmd, Ev] {
+  cmds : Channel[Cmd]
+  events : EventQueue[Ev]
+  inline_handler : Option[(Cmd, (Ev) -> Unit) -> Unit]
+  mut closed : Bool
+  mut hook_id : Int
+}
+
+/// Create a paired render-thread `Worker` and background-thread `WorkerCtx`.
+/// Uses an unbounded channel (`Channel::new(0)`) so `send` never blocks the render thread.
+pub fn Worker::pair[Cmd, Ev]() -> (Worker[Cmd, Ev], WorkerCtx[Cmd, Ev]) {
+  let cmds : Channel[Cmd] = Channel::new(0)
+  let events : EventQueue[Ev] = EventQueue::new()
+  let worker = Worker::{
+    cmds,
+    events,
+    inline_handler: None,
+    closed: false,
+    hook_id: 0,
+  }
+  let ctx = WorkerCtx::{ cmds, events }
+  (worker, ctx)
+}
+
+/// Create an inline synchronous worker for `wasm32` and deterministic `Tester` suites.
+pub fn Worker::inline[Cmd, Ev](handle : (Cmd, (Ev) -> Unit) -> Unit) -> Worker[Cmd, Ev] {
+  let cmds : Channel[Cmd] = Channel::new(0)
+  let events : EventQueue[Ev] = EventQueue::new()
+  Worker::{
+    cmds,
+    events,
+    inline_handler: Some(handle),
+    closed: false,
+    hook_id: 0,
+  }
+}
+
+/// Send a command to the worker. Returns `false` if the worker has already been closed.
+pub fn Worker::send[Cmd, Ev](self : Worker[Cmd, Ev], cmd : Cmd) -> Bool {
+  if self.closed {
+    return false
+  }
+  match self.inline_handler {
+    Some(handle) => {
+      handle(cmd, fn(ev : Ev) -> Unit { self.events.emit(ev) })
+      true
+    }
+    None => self.cmds.send(move cmd)
+  }
+}
+
+/// Drain queued worker events and apply each to render-thread signals.
+pub fn Worker::drain[Cmd, Ev](self : Worker[Cmd, Ev], apply : (Ev) -> Unit) -> Int {
+  self.events.drain(apply)
+}
+
+/// Automatically drain queued events before every frame via `on_before_frame`.
+/// Calling `bind` again replaces any previously bound hook for this worker.
+pub fn Worker::bind[Cmd, Ev](self : Worker[Cmd, Ev], apply : (Ev) -> Unit) -> Unit {
+  if self.hook_id > 0 {
+    remove_before_frame(self.hook_id)
+    self.hook_id = 0
+  }
+  self.hook_id = on_before_frame(fn() -> Unit {
+    let _ = self.drain(apply)
+  })
+}
+
+/// Unbind any `on_before_frame` hook and close the command channel so `WorkerCtx::run_loop` exits.
+pub fn Worker::close[Cmd, Ev](self : Worker[Cmd, Ev]) -> Unit {
+  if self.hook_id > 0 {
+    remove_before_frame(self.hook_id)
+    self.hook_id = 0
+  }
+  if !self.closed {
+    self.closed = true
+    self.cmds.close()
+  }
+}

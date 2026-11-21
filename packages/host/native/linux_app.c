@@ -1462,6 +1462,8 @@ int32_t mb_host_platform(void) { return 5; }
 // A frame asked for: of every window of the run where there are several, else the one.
 void mb_host_request_frame(void) { schedule_all(); }
 
+void mb_host_wake_now(void) { mb_app_wake(); }
+
 // A frame for what moves on by the clock that needs fewer (@hostapi.frames_paced): not paced here, the next drawn.
 void mb_host_frames_paced(double hz) {
   (void)hz;

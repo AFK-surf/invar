@@ -417,7 +417,60 @@ pub fn set_text_interceptor(f : Option[(Int, String, Int, Int) -> Bool]) -> Unit
   view_app.text_interceptor = f
 }
 
+/// Thread-safe frame wake-up callable from any background OS thread.
+pub fn wake_now() -> Unit {
+  hostapi::wake_now()
+}
+
+struct BeforeFrameHook {
+  id : Int
+  cb : () -> Unit
+}
+
+struct BeforeFrameState {
+  mut next_id : Int
+  hooks : Array[BeforeFrameHook]
+}
+
+let before_frame_state : BeforeFrameState = BeforeFrameState::{ next_id: 1, hooks: [] }
+
+/// Register a callback invoked at the start of every `view_frame`, before `tree.frame(...)`.
+/// Returns a hook id that can be passed to `remove_before_frame`.
+pub fn on_before_frame(cb : () -> Unit) -> Int {
+  let id = before_frame_state.next_id
+  before_frame_state.next_id = id + 1
+  before_frame_state.hooks.push(BeforeFrameHook::{ id, cb })
+  id
+}
+
+/// Remove a previously registered `on_before_frame` callback by id.
+pub fn remove_before_frame(id : Int) -> Unit {
+  let mut i = 0
+  while i < before_frame_state.hooks.length() {
+    if before_frame_state.hooks[i].id == id {
+      array_remove_at(before_frame_state.hooks, i)
+      return
+    }
+    i += 1
+  }
+}
+
+fn clear_before_frame_hooks() -> Unit {
+  before_frame_state.hooks.clear()
+}
+
+fn run_before_frame_hooks() -> Unit {
+  if before_frame_state.hooks.length() == 0 {
+    return
+  }
+  let snapshot = before_frame_state.hooks.copy()
+  for h in snapshot {
+    (h.cb)()
+  }
+}
+
 fn view_forget() -> Unit {
+  clear_before_frame_hooks()
   match view_app.tree {
     Some(t) => t.dispose()
     None => ()
@@ -952,6 +1005,48 @@ fn encode_drawn_node(
   }
 }
 
+let cut_soft_most : Double = 24.0
+
+fn cut_soft(out : Double, left : Double) -> Double {
+  dmax(dmin(cut_soft_most, dmin(out, left)), 0.0)
+}
+
+fn inst_fade(
+  inst : Array[Double],
+  b : Int,
+  top : Double,
+  top_soft : Double,
+  foot : Double,
+  foot_soft : Double,
+) -> Unit {
+  if top_soft > 0.0 && (inst[b + 53] <= 0.0 || top + top_soft > inst[b + 52] + inst[b + 53]) {
+    inst[b + 52] = top
+    inst[b + 53] = top_soft
+  }
+  if foot_soft > 0.0 && (inst[b + 55] <= 0.0 || foot - foot_soft < inst[b + 54] - inst[b + 55]) {
+    inst[b + 54] = foot
+    inst[b + 55] = foot_soft
+  }
+}
+
+fn inst_fade_across(
+  inst : Array[Double],
+  b : Int,
+  start : Double,
+  start_soft : Double,
+  end : Double,
+  end_soft : Double,
+) -> Unit {
+  if start_soft > 0.0 && (inst[b + 57] <= 0.0 || start + start_soft > inst[b + 56] + inst[b + 57]) {
+    inst[b + 56] = start
+    inst[b + 57] = start_soft
+  }
+  if end_soft > 0.0 && (inst[b + 59] <= 0.0 || end - end_soft < inst[b + 58] - inst[b + 59]) {
+    inst[b + 58] = end
+    inst[b + 59] = end_soft
+  }
+}
+
 fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Double, scale : Double) -> Unit {
   ensure_glyph_atlas(scale)
   let scales : Array[Double] = []
@@ -960,9 +1055,13 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
   let eff_clip : Array[(Double, Double, Double, Double)] = []
   let eff_rc : Array[(Double, Double, Double, Double)] = []
   let deferred_shadows : Array[DeferredGlassShadow] = []
+  let fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
+    while fading.length() > 0 && !tree.holds_in_order(fading[fading.length() - 1].0, d.id) {
+      let _ = fading.pop()
+    }
     let node_scale = if i < scales.length() { scales[i] } else { 1.0 }
     let gd = tree.ground_drawn_of(d.id)
     let (in_clip, in_rc) = if holder >= 0 && holder < i {
@@ -982,7 +1081,38 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     } else {
       (in_clip, in_rc)
     }
+    let k0 = scene.ninst
     encode_drawn_node(scene, d, gd, node_scale, frame_no, now, scale, draw_clip, draw_rc, deferred_shadows)
+    for f in fading {
+      let (by, fbox, fsoft) = f
+      let (fx0, fy0, fx1, fy1) = fbox
+      let (fstart, ftop, fend, ffoot) = fsoft
+      if tree.drawn_clear_of(d.id, by) {
+        continue
+      }
+      let mut k = k0
+      while k < scene.ninst {
+        let b = k * inst_size
+        inst_fade(scene.inst, b, fy0, ftop, fy1, ffoot)
+        inst_fade_across(scene.inst, b, fx0, fstart, fx1, fend)
+        k += 1
+      }
+    }
+    let (fstart, ftop, fend, ffoot) = match tree.cut_soft_of(d.id) {
+      Some((over_top, over_foot, ch)) => (0.0, cut_soft(over_top, ch / 2.0), 0.0, cut_soft(over_foot, ch / 2.0))
+      None => tree.fades_of(d.id)
+    }
+    if fstart > 0.0 || ftop > 0.0 || fend > 0.0 || ffoot > 0.0 {
+      let past = if d.clips && !d.clips_self { tree.clips_past_of(d.id) } else { 0.0 }
+      let fh = dmax(0.0, d.h + past)
+      fading.push(
+        (
+          d.id,
+          (d.x, d.y, d.x + d.w * node_scale, d.y + fh * node_scale),
+          (fstart * node_scale, ftop * node_scale, fend * node_scale, ffoot * node_scale),
+        ),
+      )
+    }
     i += 1
   }
   flush_deferred_shadows(scene, deferred_shadows)
@@ -1028,6 +1158,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
     Some(t) => t
     None => return false
   }
+  run_before_frame_hooks()
   let _ = tree.frame(w, h, now=now)
   let t1 = work_clock_now()
   hostapi::set_glass_light_angle(glass_light_angle_now())

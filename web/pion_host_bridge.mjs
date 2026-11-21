@@ -185,6 +185,10 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const H = host();
       if (H && H.requestFrame) H.requestFrame();
     },
+    mb_web_wake_now() {
+      const H = host();
+      if (H && H.requestFrame) H.requestFrame();
+    },
     mb_web_frames_paced(hz) {
       const H = host();
       if (!H) return;

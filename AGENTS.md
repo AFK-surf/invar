@@ -10,30 +10,79 @@ Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-
 
 ---
 
-## 1. Non-Negotiable Rules (铁律红线)
+## 1. Non-Negotiable Rules
 
-### 1.1 Never hand-roll `Glass::liquid` in downstream app code
+### 1.1 Zero blocking IO on the render thread (`ui::Worker` + `ui::wake_now()` + `#render_thread`)
+- The render thread owns `view::Tree`, `signals::Signal`, layout, and frame presentation. **Never run blocking IO (TCP/HTTP, filesystem, subprocesses, sleep, heavy CPU compute) or pass `World` on the render thread.**
+- Always isolate IO/compute in a background OS thread using `ui::Worker::pair()` + `ui::WorkerCtx::run_loop()` + `worker.bind()` + `ui::wake_now()` (and mark render-thread view code with `#render_thread`).
+- For `wasm32` and deterministic `ui::Tester` unit tests, use `ui::Worker::inline(handle_cmd)` so view and command logic are 100% shared without OS threads.
+
+Standard 30-line dual-thread template (see [`examples/worker_app/`](examples/worker_app/) for a complete runnable app):
+
+```pion
+import "host"
+import "signals"
+import "ui"
+import "view"
+
+pub enum Cmd { Fetch(String) }
+pub enum Ev { Loaded(String) }
+
+pub fn handle_cmd(world : World, cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+  match cmd {
+    Cmd::Fetch(url) => emit(Ev::Loaded("ok: " + url))
+  }
+}
+
+pub fn build_view(root : view::View, worker : ui::Worker[Cmd, Ev]) -> Unit {
+  let status = signals::signal("Idle")
+  worker.bind(fn(ev : Ev) {
+    match ev {
+      Ev::Loaded(msg) => status.set(msg)
+    }
+  })
+  let _ = root.box(fn(b : view::View) {
+    let _ = b.words(view::Live::By(fn() { status.get() }), look=view::words_plain)
+      .on_press(fn() { let _ = worker.send(Cmd::Fetch("/api/status")) })
+  })
+}
+
+pub fn main(world : World) -> Int {
+  host::install()
+  let (worker, ctx) : (ui::Worker[Cmd, Ev], ui::WorkerCtx[Cmd, Ev]) = ui::Worker::pair()
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      ctx.run_loop(fn(cmd : Cmd, emit : (Ev) -> Unit) { handle_cmd(world, cmd, emit) })
+    })
+    ui::run("Invar Worker App", fn(root : view::View) { build_view(root, worker) })
+    worker.close()
+  })
+  0
+}
+```
+
+### 1.2 Never hand-roll `Glass::liquid` in downstream app code
 - Downstream application and business packages **MUST NEVER** call `paint::Glass::liquid(...)` directly.
 - 100% of Liquid Glass UI must be built from `packages/lg` components. Before building any glass surface, control, toolbar, panel, menu, or overlay, look up the right component in [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) and read [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md).
 - Downstream repos must enforce two automated gates:
   1. Static grep gate: `grep -rn "Glass::liquid" src/` must return **0 hits** outside `invar/packages/lg`.
   2. Runtime/layout test gate: every UI test suite must run `lg::assert_no_nested_glass(t, label="...")` (exported from `packages/lg/src/audit.pion`).
 
-### 1.2 Upstream missing primitives to `AFK-surf/invar` first
+### 1.3 Upstream missing primitives to `AFK-surf/invar` first
 - If `packages/lg` lacks a desktop size, variant, or reusable glass primitive, **add it to `AFK-surf/invar` (`packages/lg`) first** with full unit tests and offscreen verification. Never degrade or hand-roll a one-off glass surface in downstream business code.
 
-### 1.3 Keep all 4 GPU renderers in lockstep
+### 1.4 Keep all 4 GPU renderers in lockstep
 - Any shader, optical transfer model, or instance-layout change in the GPU renderer **MUST** be updated simultaneously across all 4 backends:
   - `packages/host/native/apple_render.m` (macOS / iOS Metal)
   - `packages/host/native/gles_render.h` (Linux EGL / GLES3)
   - `packages/host/native/win_render.cpp` (Windows D3D11)
   - `web/host.js` (Web WebGL2)
 
-### 1.4 Offscreen GPU evidence for every UI change
+### 1.5 Offscreen GPU evidence for every UI change
 - Any visible UI, optical, or motion change must be verified with same-size, same-data **before/after** offscreen renders via Invar's native Metal (`film::picture` / `film::film` on macOS) or Linux GLES3 offscreen pipeline.
 - Never use browser or simulator screenshots/screen-recordings as UI verification evidence.
 
-### 1.5 Clean branches & merge discipline
+### 1.6 Clean branches & merge discipline
 - Never push directly to `main`; commit on feature branches and verify all gates before merge.
 
 ---
@@ -44,11 +93,15 @@ Set `PIONC=/path/to/pionc2` (with sibling `qbe` and `libpionrt.a`, or `PION_QBE`
 
 ```sh
 # Type-check key packages
+$PIONC check packages/hostapi
 $PIONC check packages/host
+$PIONC check packages/host_web
+$PIONC check packages/ui
 $PIONC check packages/lg
 $PIONC check packages/lg_pages
 $PIONC check packages/lg_shots
 $PIONC check packages/lg_web
+$PIONC check examples/worker_app
 
 # Unit tests across core layers & Liquid Glass
 $PIONC test packages/layer0_check
@@ -57,10 +110,12 @@ $PIONC test packages/layer1b_check
 $PIONC test packages/view
 $PIONC test packages/damage
 $PIONC test packages/headless
+$PIONC test packages/hostapi
 $PIONC test packages/ui
 $PIONC test packages/lg
 $PIONC test packages/bench
 $PIONC test packages/site
+$PIONC test examples/worker_app
 
 # Web wasm32 release build
 $PIONC build --release --target wasm32 packages/lg_web
@@ -80,3 +135,4 @@ PIONC=$PIONC bash scripts/bench.sh [--out bench.json] [--compare baseline.json] 
 - [`README.md`](README.md) — 36-package architecture overview and 5-platform host matrix.
 - [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md) — The 5 optical and architectural laws of Invar Liquid Glass.
 - [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) — One-page quick-reference catalog of all `lg::*` components and audit gates.
+- [`examples/worker_app/`](examples/worker_app/) — Reference dual-thread Invar app using `ui::Worker` and `packages/lg`.
