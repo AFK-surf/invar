@@ -116,7 +116,7 @@ pub fn build_page(root : view::View) -> Unit {
 - Never push directly to `main`; commit on feature branches and verify all gates before merge.
 
 ### 1.8 Desktop apps: what a window needs (learned shipping one on Windows, 2026-11-22)
-- **Hooks go inside the maker.** `ui::run` forgets every `ui::on_before_frame` hook (and `worker.bind`) made before it: register them inside the `fn(root)` passed to `ui::run`, as `examples/worker_app` does.
+- **Hooks survive startup.** `ui::on_before_frame` hooks (and `worker.bind`) registered before the first `ui::run` / `Tester::tree` call are preserved; hooks are cleared when replacing an already-running app (`set_view_app` with a live tree) or on `Tester::dispose()` / `view_forget()`.
 - **The tree's clock is the host's.** `ui::run`'s tree starts at `hostapi::now()` (on Windows, ms since boot). Schedule with `View::at_moment(v.cause_at() + ms, ...)`; never with a moment of your own counted from 0. A device or service to watch is a `ui::Worker` (or an `EventQueue` fed by a thread that blocks on it) that emits on change, not a timer polling it.
 - **Windows draws only when asked.** `ui::run` asks for the frames; any other loop must turn `tree.on_due` into `hostapi::request_frame`.
 - **Shaders.** The startup shaders are baked into the program (`win_shaders_baked.h`, `packages/host/tools/bake_win_shaders.c`: rebake when `win_render.cpp`'s shaders change). Others are compiled at first use and kept on disk only where the program is an app (`MBUI_APP_ID`) or says where (`MBUI_SHADERS`): set them in an `MBUI_ENV` RCDATA resource (`NAME=VALUE` lines) in the program's `.rc`, or each run compiles them again.
