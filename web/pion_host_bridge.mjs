@@ -297,6 +297,21 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const H = host();
       if (H && H.glassLightAngle) H.glassLightAngle(rad);
     },
+    mb_web_layer_supported() {
+      const H = host();
+      return H && H.layerSupported ? (H.layerSupported() | 0) : 0;
+    },
+    mb_web_layer_render(id, physW, physH, scale, ptr, count) {
+      const H = host();
+      if (!H || !H.layerRender) return 0;
+      const n = count | 0;
+      const view = f64View(ptr, n * INST);
+      return H.layerRender(id | 0, physW | 0, physH | 0, scale, view, n) ? 1 : 0;
+    },
+    mb_web_layer_destroy(id) {
+      const H = host();
+      if (H && H.layerDestroy) H.layerDestroy(id | 0);
+    },
 
     // IME, text menu & clipboard
     mb_web_set_ime(active, x, y, w, h, textPtr, textLen, selStart, selEnd) {

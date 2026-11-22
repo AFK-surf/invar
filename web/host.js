@@ -30,7 +30,11 @@
       under: null, underN: 0, whole: 0, picked: 0, grab: null, key: null, valid: false, used: 0,
     }));
   }
-  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta;
+  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta;
+  let curW = 0, curH = 0, curScale = 1;
+  const rtW = () => curW || canvas.width;
+  const rtH = () => curH || canvas.height;
+  const rtScale = () => curScale || dpr;
   let U = {}, PU = {};
   let cssW = 0, cssH = 0, dpr = 1;
   let rectLeft = 0, rectTop = 0, rectValid = false;
@@ -1222,6 +1226,24 @@
   flat in vec4 v_color;
   out vec4 o;
   void main() { o = vec4(v_color.rgb, 1.0) * v_color.a; }`;
+  // fast path for simple axis-aligned, sharp-cornered, borderless rectangles (same AA as FS)
+  const FS_RECT = `#version 300 es
+  precision highp float;
+  precision highp int;
+  in vec2 v_pos;
+  flat in vec4 v_rect;
+  flat in vec4 v_color;
+  flat in vec4 v_clip;
+  uniform float u_scale;
+  out vec4 o;
+  void main() {
+    vec2 p = v_pos;
+    if (p.x < v_clip.x || p.y < v_clip.y || p.x > v_clip.z || p.y > v_clip.w) discard;
+    vec2 hs = v_rect.zw * 0.5;
+    vec2 q = abs(p - (v_rect.xy + hs)) - hs;
+    float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+    o = (vec4(v_color.rgb, 1.0) * v_color.a) * clamp(0.5 - d * u_scale, 0.0, 1.0);
+  }`;
   // glass's passes over its copy of what is under it
   const PVS = `#version 300 es
   void main() {
@@ -1322,8 +1344,9 @@
     const u = k.u;
     // The framebuffer's rounded size may not be exactly cssW*dpr. Mapping to cssW would stretch its pixels by that
     // remainder, sampling glyphs between atlas texels. A point must cover exactly dpr pixels, including at 125% zoom.
-    gl.uniform2f(u.u_vp, canvas.width / dpr, canvas.height / dpr);
-    gl.uniform1f(u.u_scale, dpr);
+    const rw = rtW(), rh = rtH(), rs = rtScale();
+    gl.uniform2f(u.u_vp, rw / rs, rh / rs);
+    gl.uniform1f(u.u_scale, rs);
     gl.uniform4fv(u.u_map, gmap);
     gl.uniform4fv(u.u_uvc, guvc);
     gl.uniform4fv(u.u_gb, ggb);
@@ -1351,6 +1374,15 @@
     if (!gl.getProgramParameter(progFlat, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(progFlat));
     gl.deleteShader(fsFlat);
     ufVp = gl.getUniformLocation(progFlat, 'u_vp');
+    const fsRect = compile(gl.FRAGMENT_SHADER, FS_RECT);
+    progRect = gl.createProgram();
+    gl.attachShader(progRect, vs);
+    gl.attachShader(progRect, fsRect);
+    gl.linkProgram(progRect);
+    if (!gl.getProgramParameter(progRect, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(progRect));
+    gl.deleteShader(fsRect);
+    urVp = gl.getUniformLocation(progRect, 'u_vp');
+    urScale = gl.getUniformLocation(progRect, 'u_scale');
     progGen++;
     progNow = null;
     post = gl.createProgram();
@@ -1636,7 +1668,7 @@
         x1 = Math.max(x1, Math.min(f32[b] + f32[b + 2], f32[b + 18])); y1 = Math.max(y1, Math.min(f32[b + 1] + f32[b + 3], f32[b + 19]));
       }
     }
-    const W = canvas.width, Hh = canvas.height, sc = dpr;
+    const W = rtW(), Hh = rtH(), sc = rtScale();
     // in the canvas's pixels, from its foot (GL's way up)
     const px0 = Math.max(0, Math.floor((x0 - margin) * sc)), px1 = Math.min(W, Math.ceil((x1 + margin) * sc));
     const pb0 = Math.max(0, Hh - Math.ceil((y1 + margin) * sc)), pb1 = Math.min(Hh, Hh - Math.floor((y0 - margin) * sc));
@@ -1685,7 +1717,7 @@
 
   function showBlur(m, bt, bw, bh) {
     const [lw, lh] = grabLevels(m);
-    const k = m.k, d = 1 << k, sc = dpr;
+    const k = m.k, d = 1 << k, sc = rtScale();
     for (let i = 0; i < 4; i++) ggb[i] = m.gb[i];
     gshape.set(m.shape);
     grad.set(m.rad);
@@ -1760,7 +1792,7 @@
   }
 
   function underTake(start, count, pieces, m) {
-    const sc = dpr;
+    const sc = rtScale();
     const g = [m.px0 / sc - 1, (m.top - (m.pb0 + m.h)) / sc - 1, (m.px0 + m.w) / sc + 1, (m.top - m.pb0) / sc + 1];
     let whole = 0, run = 0;
     for (let i = 0; i < start; i++) {
@@ -1895,7 +1927,7 @@
   function capture(start, end, count, pieces, r, g, b, frameClock) {
     const m = grabOf(start, end, count);
     if (!m) return false;
-    const key = [canvas.width, canvas.height, dpr, r, g, b];
+    const key = [rtW(), rtH(), rtScale(), r, g, b];
     const known = underTake(start, count, pieces, m);
     let s = known ? slotSame(m, key) : null;
     if (!s) {
@@ -1911,7 +1943,7 @@
   // the main programs' state, after the passes
   function mainState() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, target);
-    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.viewport(0, 0, rtW(), rtH());
     if (cutOn) {
       gl.enable(gl.SCISSOR_TEST);
       gl.scissor(cut[0], cut[1], cut[2], cut[3]);
@@ -2237,8 +2269,20 @@
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
   }
 
+  function isSimpleRect(i) {
+    if (H.env('MBUI_FAST_RECT') === '0') return false;
+    const b = i * INST;
+    return Math.round(f32[b + 5]) === 0 && f32[b + 6] <= 0 &&
+      f32[b + 20] === 0 && f32[b + 21] === 0 && f32[b + 22] === 0 && f32[b + 23] === 0 &&
+      f32[b + 24] <= 0 && f32[b + 25] <= 0 && f32[b + 26] <= 0 && f32[b + 27] <= 0 &&
+      f32[b + 32] === 0 &&
+      f32[b + 36] <= 0 && f32[b + 37] <= 0 && f32[b + 38] <= 0 && f32[b + 39] <= 0 &&
+      f32[b + 44] <= 0 && f32[b + 45] <= 0 && f32[b + 46] <= 0 && f32[b + 47] <= 0 &&
+      f32[b + 53] <= 0 && f32[b + 55] <= 0 && f32[b + 57] <= 0 && f32[b + 59] <= 0;
+  }
+
   function drawBanded(start, end, count) {
-    const W = canvas.width, Hh = canvas.height;
+    const W = rtW(), Hh = rtH(), sc = rtScale();
     const toX0 = cutOn ? cut[0] : 0;
     const toY0 = cutOn ? Hh - (cut[1] + cut[3]) : 0;
     const toX1 = cutOn ? cut[0] + cut[2] : W;
@@ -2246,7 +2290,7 @@
     let s = start;
     for (let i = start; i < end; i++) {
       if (!mbBandKind(i)) continue;
-      const n = mbBands(i, count, dpr, toX0, toY0, toX1, toY1, bandOut);
+      const n = mbBands(i, count, sc, toX0, toY0, toX1, toY1, bandOut);
       if (n < 0) continue;
       if (i > s) drawRun(s, i - s);
       gl.enable(gl.SCISSOR_TEST);
@@ -2255,7 +2299,7 @@
         const flat = bandOut[o + 4];
         if (k === 0 || flat !== bandOut[o - 1]) {
           gl.useProgram(flat ? progFlat : progNow);
-          if (flat) gl.uniform2f(ufVp, W / dpr, Hh / dpr);
+          if (flat) gl.uniform2f(ufVp, W / sc, Hh / sc);
         }
         gl.scissor(bandOut[o], Hh - bandOut[o + 3], bandOut[o + 2] - bandOut[o], bandOut[o + 3] - bandOut[o + 1]);
         drawRun(i, 1);
@@ -2268,6 +2312,93 @@
     if (end > s) drawRun(s, end - s);
   }
 
+  // ---- offscreen physical-pixel tile layers (MB_LAYER_TEX + id) ----
+  const LAYER_TEX = 12582912;
+  const layers = new Map();
+  let layerF32 = new Float32Array(INST * 256);
+
+  function flipLayerUVs(arr, count) {
+    for (let i = 0; i < count; i++) {
+      const b = i * INST;
+      if (Math.round(arr[b + 5]) === 4 && (arr[b + 20] | 0) > LAYER_TEX) {
+        arr[b + 13] = 1 - arr[b + 13];
+        arr[b + 15] = -arr[b + 15];
+      }
+    }
+  }
+
+  H.layerSupported = () => (gl ? 1 : 0);
+  H.layerRender = (id, physW, physH, scale, f64, count) => {
+    if (!gl || id <= 0 || physW <= 0 || physH <= 0 || !(scale > 0) || count < 0) return 0;
+    let L = layers.get(id);
+    if (!L || L.w !== physW || L.h !== physH) {
+      if (L) {
+        if (L.fb) gl.deleteFramebuffer(L.fb);
+        if (L.tex) gl.deleteTexture(L.tex);
+      }
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, physW, physH);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      L = { tex, fb, w: physW, h: physH };
+      layers.set(id, L);
+    }
+    const len = count * INST;
+    if (layerF32.length < len + INST) layerF32 = new Float32Array(len * 2 + INST);
+    if (len > 0) {
+      if (typeof f64.subarray === 'function') layerF32.set(f64.subarray(0, len), 0);
+      else for (let i = 0; i < len; i++) layerF32[i] = f64[i];
+      flipLayerUVs(layerF32, count);
+    }
+    layerF32.fill(0, len, len + INST);
+
+    const savedF32 = f32;
+    const savedTarget = target;
+    const savedCurW = curW, savedCurH = curH, savedCurScale = curScale;
+    const savedCutOn = cutOn;
+    const savedCut0 = cut[0], savedCut1 = cut[1], savedCut2 = cut[2], savedCut3 = cut[3];
+    const savedDrewMissing = drewMissing;
+    try {
+      f32 = layerF32;
+      target = L.fb;
+      uploadedFor = -1;
+      frameUpload(count);
+      drawFrame(count, 0, 0, 0, false, 0, physW, physH, scale);
+    } finally {
+      f32 = savedF32;
+      target = savedTarget;
+      uploadedFor = -1;
+      curW = savedCurW;
+      curH = savedCurH;
+      curScale = savedCurScale;
+      cutOn = savedCutOn;
+      cut[0] = savedCut0; cut[1] = savedCut1; cut[2] = savedCut2; cut[3] = savedCut3;
+      drewMissing = savedDrewMissing;
+      progGen++;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+    slotsForget(LAYER_TEX + id);
+    cvOk = false;
+    return 1;
+  };
+  H.layerDestroy = (id) => {
+    const L = layers.get(id);
+    if (!L) return;
+    layers.delete(id);
+    if (gl) {
+      if (L.fb) gl.deleteFramebuffer(L.fb);
+      if (L.tex) gl.deleteTexture(L.tex);
+    }
+    slotsForget(LAYER_TEX + id);
+    cvOk = false;
+  };
+
   // A frame presented: whole-screen frames straight onto the default framebuffer (null); once the app reports partial
   // dirty rects, into cv (building a baseline if !cvOk, then scissor-updating dirty rects) and blitted onto null.
   H.present = (buf, n, r, g, b) => {
@@ -2276,6 +2407,7 @@
     if (f32.length < len + INST) f32 = new Float32Array(len * 2 + INST);
     if (typeof buf.subarray === 'function') f32.set(buf.subarray(0, len), 0);
     else for (let i = 0; i < len; i++) f32[i] = buf[i];
+    flipLayerUVs(f32, n);
     f32.fill(0, len, len + INST);
     f32[len] = -16; f32[len + 1] = -16; f32[len + 2] = cssW + 32; f32[len + 3] = cssH + 32;
     f32[len + 8] = r; f32[len + 9] = g; f32[len + 10] = b; f32[len + 11] = 1;
@@ -2376,19 +2508,19 @@
 
   // The frame's `n` instances (in f32, its ground after them) drawn into `target`: `part`, only into `cut` over what
   // it holds, else all of it, cleared to the ground.
-  function drawFrame(n, r, g, b, part) {
+  function drawFrame(n, r, g, b, part, clearA = 1, tw = canvas.width, th = canvas.height, sc = dpr) {
     const len = n * INST;
     drewMissing = false;
     cutOn = part;
     const origTarget = target;
     const origCutOn = cutOn;
     const origCut0 = cut[0], origCut1 = cut[1], origCut2 = cut[2], origCut3 = cut[3];
-    const tw = canvas.width, th = canvas.height, sc = dpr;
+    curW = tw; curH = th; curScale = sc;
     gl.bindFramebuffer(gl.FRAMEBUFFER, target);
     gl.viewport(0, 0, tw, th);
     if (!part) {
       gl.disable(gl.SCISSOR_TEST);
-      gl.clearColor(r, g, b, 1);
+      gl.clearColor(r, g, b, clearA);
       gl.clear(gl.COLOR_BUFFER_BIT);
       if (n === 0) return;
     }
@@ -2543,15 +2675,24 @@
       }
       const h = kind === 9;
       const own = tid >= 0 && !h && hasOwnProg(kind);
+      const simple = tid === 0 && kind === 0 && progRect && isSimpleRect(start);
       let end = start + 1;
       while (end < n && (f32[end * INST + 20] | 0) === tid) {
         const k = Math.round(f32[end * INST + 5]);
         if (k === 14 || k === 15) break;
         if ((k === 9) !== h) break;
         if (own ? k !== kind : (tid >= 0 && !h && hasOwnProg(k))) break;
+        if (tid === 0 && kind === 0 && progRect && isSimpleRect(end) !== simple) break;
         end++;
       }
-      useProg(own ? kind : -1);
+      if (simple) {
+        progNow = progRect;
+        gl.useProgram(progRect);
+        gl.uniform2f(urVp, tw / sc, th / sc);
+        gl.uniform1f(urScale, sc);
+      } else {
+        useProg(own ? kind : -1);
+      }
       if (tid < 0) {
         glassDrawn = true;
         if (!levelsSized) {
@@ -2573,7 +2714,7 @@
       // a stream's picture (STREAM_TEX + its id): nothing until a frame of its own shows; a hole's image is its
       // view's (src/hostapi/host.mbt view_tex_base + its id), the element under the canvas here
       // (in a window beside the page, its own texture of each: slotTex)
-      const im = h ? null : tid > STREAM_TEX ? streams.get(tid - STREAM_TEX) : tid ? images.get(tid) : null;
+      const im = h ? null : tid > LAYER_TEX ? layers.get(tid - LAYER_TEX) : tid > STREAM_TEX ? streams.get(tid - STREAM_TEX) : tid ? images.get(tid) : null;
       const tex = !im || !im.tex ? null : winActive === 0 ? im.tex : slotTex(wins[winActive], tid, im);
       if (!h && tid > STREAM_TEX && !tex) {
         start = end;
@@ -4397,6 +4538,7 @@
   const contextRestored = () => {
     setupGL();
     glassLost();
+    layers.clear();
     segsTex = null; segsRows = 0; segsHad = null; segsHadRows = 0;
     uploadedFor = -1;
     textChanged();
@@ -5051,8 +5193,8 @@
   const rolesKept = new Map();
   function winSave(s) {
     Object.assign(s, {
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
-      cssW, cssH, dpr, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
+      cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
       segsTex, segsRows, segsHad, segsHadRows, uploadedFor, imeActive, composing, taHad, imeKind, viewLayer,
       under, coverBoxes, takePresses, doc, hostWin, glassIdle,
@@ -5060,8 +5202,8 @@
   }
   function winLoad(s) {
     ({
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
-      cssW, cssH, dpr, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
+      cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
       segsTex, segsRows, segsHad, segsHadRows, uploadedFor, imeActive, composing, taHad, imeKind, viewLayer,
       under, coverBoxes, takePresses, doc, hostWin, glassIdle,
@@ -5123,7 +5265,7 @@
   function slotTex(s, tid, im) {
     if (!s || !gl) return null;
     let e = s.texs.get(tid);
-    if (tid > STREAM_TEX) {
+    if (tid > STREAM_TEX && tid <= LAYER_TEX) {
       if (!im.shown) return null;
       const gen = im.shownGen || 0;
       if (e && e.gen === gen) return e.tex;
@@ -5199,6 +5341,7 @@
         if (s.blCompVao) sg.deleteVertexArray(s.blCompVao);
         for (const kp of s.progs || []) if (kp && kp.p) sg.deleteProgram(kp.p);
         if (s.progFlat) sg.deleteProgram(s.progFlat);
+        if (s.progRect) sg.deleteProgram(s.progRect);
         if (s.post) sg.deleteProgram(s.post);
         if (s.vs) sg.deleteShader(s.vs);
         const loser = sg.getExtension('WEBGL_lose_context');
@@ -5206,7 +5349,7 @@
       } catch (err) { /* its context gone */ }
     }
     Object.assign(s, {
-      gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null,
+      gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null,
       progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       cv: null, cvOk: false, target: null,
@@ -5322,7 +5465,7 @@
       wid, win: child, role, minW, minH, closed: false, closing: false, pending: false, raf: 0, wake: { at: -1 },
       texs: new Map(),
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
-      ufVp: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
+      ufVp: null, progRect: null, urVp: null, urScale: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,

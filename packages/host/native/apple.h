@@ -59,6 +59,11 @@ id<MTLTexture> mb_image_texture(int iid);
 // MB_STREAM_TEX + sid is it (src/hostapi/stream.mbt)
 #define MB_STREAM_TEX 4194304
 id<MTLTexture> mb_stream_texture(int sid);
+// offscreen physical-pixel tile layers (apple_render.m): an instance's image MB_LAYER_TEX + id is layer `id`
+#define MB_LAYER_TEX 12582912
+int32_t mb_host_layer_supported(void);
+int32_t mb_host_layer_render(int32_t layer_id, int32_t phys_w, int32_t phys_h, double scale, const double *inst, int32_t count);
+void mb_host_layer_destroy(int32_t layer_id);
 // the layer stream sid's frames are put on as they are shown as well (their IOSurfaces, the contents of a native view's
 // of kind 4, apple_views.m), nil none: what it shows now on it at once
 void mb_stream_attach_layer(int sid, CALayer *layer);

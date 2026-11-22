@@ -79,6 +79,9 @@ REQUIRED_SYMS=(
   _mb_host_present
   _mb_host_shape
   _mb_host_glass_light_angle
+  _mb_host_layer_supported
+  _mb_host_layer_render
+  _mb_host_layer_destroy
   _mb_host_wake_now
   _mb_host_wake_now_ptr
   _invar_hostapi_set_native_wake

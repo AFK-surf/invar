@@ -17,10 +17,15 @@ static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
 static id<MTLRenderPipelineState> mpipe;
 static id<MTLRenderPipelineState> rpipe_off;
+// fast path for simple axis-aligned, sharp-cornered, borderless rectangles (frect)
+static id<MTLRenderPipelineState> rpipe_rect;
+static id<MTLRenderPipelineState> rpipe_rect_off;
 // holes for native views (kind 9): written, not blended
 static id<MTLRenderPipelineState> hpipe;
 // a ground's flat middle (bands.h mb_pieces)
 static id<MTLRenderPipelineState> fpipe;
+// offscreen physical-pixel tile layers (MB_LAYER_TEX + id)
+static NSMutableDictionary<NSNumber *, id<MTLTexture>> *layer_texs;
 // the words' glyphs (R8) and colour glyphs (RGBA), square (apple.h)
 static id<MTLTexture> atlas, catlas;
 static id<MTLBuffer> bufs[3];
@@ -674,6 +679,16 @@ MB_CORNER_SL
 "  float4 col = inst[in.iid].color;\n"
 "  return float4(col.rgb, 1.0) * col.a;\n"
 "}\n"
+"// fast path for simple axis-aligned, sharp-cornered, borderless rectangles (same AA as fmain)\n"
+"fragment float4 frect(VOut in [[stage_in]], const device Inst* inst [[buffer(0)]], constant U& u [[buffer(1)]]) {\n"
+"  Inst I = inst[in.iid];\n"
+"  float2 p = in.p;\n"
+"  if (p.x < I.clip.x || p.y < I.clip.y || p.x > I.clip.z || p.y > I.clip.w) discard_fragment();\n"
+"  float2 hs = I.rect.zw * 0.5;\n"
+"  float2 q = abs(p - (I.rect.xy + hs)) - hs;\n"
+"  float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);\n"
+"  return (float4(I.color.rgb, 1.0) * I.color.a) * clamp(0.5 - d * u.scale, 0.0, 1.0);\n"
+"}\n"
 "// The backdrop's passes: a.xy the source's texel, a.z 1 halving (dual Kawase's down), 2 a Gaussian along b.zw of\n"
 "// deviation a.w (texels); b.xy the last texel's centre of what the source holds\n"
 "struct PU { float4 a; float4 b; float4 map, box, rr, clip, rc, rs, outer, orc, ors; };\n"
@@ -790,7 +805,9 @@ static void prepare_gpu(void) {
   mpipe = make_pipe(lib, MTLPixelFormatBGRA8Unorm, YES, @"fmain", -1);
   hpipe = make_pipe(lib, MTLPixelFormatBGRA8Unorm, NO, @"fmain", -1);
   fpipe = make_pipe(lib, MTLPixelFormatBGRA8Unorm, YES, @"fflat", -1);
+  rpipe_rect = make_pipe(lib, MTLPixelFormatBGRA8Unorm, YES, @"frect", -1);
   rpipe_off = mpipe;
+  rpipe_rect_off = rpipe_rect;
   MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
   pd.vertexFunction = [lib newFunctionWithName:@"vpost"];
   pd.fragmentFunction = [lib newFunctionWithName:@"fpost"];
@@ -1536,16 +1553,45 @@ static void draw_banded(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineSta
   if (end > s) [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:end - s baseInstance:s];
 }
 
-// The texture of picture or stream `tid` (> 0) for the frame being drawn (at_texs), nil where it has none yet.
+static int fast_rect_enabled = -1;
+
+static int fast_rect_on(void) {
+  if (fast_rect_enabled < 0) {
+    const char *v = getenv("MBUI_FAST_RECT");
+    fast_rect_enabled = !(v && v[0] == '0');
+  }
+  return fast_rect_enabled;
+}
+
+static int is_simple_rect(const float *f, int32_t i) {
+  if (!fast_rect_on()) return 0;
+  const float *b = f + (size_t)i * MB_INST;
+  return (int)(b[5] + 0.5f) == 0 && b[6] <= 0.0f &&
+         b[20] == 0.0f && b[21] == 0.0f && b[22] == 0.0f && b[23] == 0.0f &&
+         b[24] <= 0.0f && b[25] <= 0.0f && b[26] <= 0.0f && b[27] <= 0.0f &&
+         b[32] == 0.0f &&
+         b[36] <= 0.0f && b[37] <= 0.0f && b[38] <= 0.0f && b[39] <= 0.0f &&
+         b[44] <= 0.0f && b[45] <= 0.0f && b[46] <= 0.0f && b[47] <= 0.0f &&
+         b[53] <= 0.0f && b[55] <= 0.0f && b[57] <= 0.0f && b[59] <= 0.0f;
+}
+
+static id<MTLTexture> layer_tex_of(int lid) {
+  if (lid <= 0 || !layer_texs) return nil;
+  return layer_texs[@(lid)];
+}
+
+// The texture of picture, stream, or offscreen layer `tid` (> 0) for the frame being drawn (at_texs), nil where it has none yet.
 static id<MTLTexture> tex_of(int tid) {
   if (at_texs) {
     id t = at_texs[@(tid)];
     return t == (id)NSNull.null ? nil : t;
   }
-  return tid > MB_STREAM_TEX ? mb_stream_texture(tid - MB_STREAM_TEX) : tid > 0 ? mb_image_texture(tid) : nil;
+  return tid > MB_LAYER_TEX ? layer_tex_of(tid - MB_LAYER_TEX)
+       : tid > MB_STREAM_TEX ? mb_stream_texture(tid - MB_STREAM_TEX)
+       : tid > 0 ? mb_image_texture(tid) : nil;
 }
 
-// The textures of the pictures and streams `f` draws (`count` instances), looked up now (the main thread), for the
+// The textures of the pictures, streams, and layers `f` draws (`count` instances), looked up now (the main thread), for the
 // queue to draw them by: a picture's not decoded yet NSNull (drawn without it, encode_missing).
 static NSMutableDictionary<NSNumber *, id> *frame_texs(const float *f, int32_t count) {
   NSMutableDictionary<NSNumber *, id> *d = [NSMutableDictionary new];
@@ -1557,7 +1603,9 @@ static NSMutableDictionary<NSNumber *, id> *frame_texs(const float *f, int32_t c
     last = tid;
     NSNumber *k = @(tid);
     if (d[k]) continue;
-    id<MTLTexture> t = tid > MB_STREAM_TEX ? mb_stream_texture(tid - MB_STREAM_TEX) : mb_image_texture(tid);
+    id<MTLTexture> t = tid > MB_LAYER_TEX ? layer_tex_of(tid - MB_LAYER_TEX)
+                     : tid > MB_STREAM_TEX ? mb_stream_texture(tid - MB_STREAM_TEX)
+                     : mb_image_texture(tid);
     d[k] = t ?: (id)NSNull.null;
   }
   return d;
@@ -1757,11 +1805,14 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
     }
     // (kinds without their own pipeline one run, as before)
     int own = tid >= 0 && has_own_pipe(kind);
+    id<MTLRenderPipelineState> rect_pipe = (p == rpipe_off) ? rpipe_rect_off : rpipe_rect;
+    int simple = (tid == 0 && kind == 0 && rect_pipe) ? is_simple_rect(f, start) : 0;
     int32_t end = start + 1;
     while (end < count && (int)f[end * MB_INST + 20] == tid) {
       int k = (int)(f[end * MB_INST + 5] + 0.5f);
       if (k == 14 || k == 15) break;
       if ((k == 9) != hole || (own ? k != kind : tid >= 0 && has_own_pipe(k))) break;
+      if (tid == 0 && kind == 0 && rect_pipe && is_simple_rect(f, end) != simple) break;
       end++;
     }
     if (tid < 0) {
@@ -1808,7 +1859,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       start = end;
       continue;
     }
-    id<MTLRenderPipelineState> kp = own ? kind_pipe(p, kind) : p;
+    id<MTLRenderPipelineState> kp = simple ? rect_pipe : (own ? kind_pipe(p, kind) : p);
     [enc setRenderPipelineState:(hole ? hpipe : kp)];
     // (a hole's image is its view's, src/hostapi/host.mbt view_tex_base + its id: the view is under the canvas here)
     id<MTLTexture> t = hole ? nil : tex_of(tid);
@@ -2203,7 +2254,10 @@ void mb_render_present(const double *inst, int32_t count, double r, double g, do
   fr->lat = mb_latency_built();
   through_n = 0;
   int streams = 0;
-  for (int32_t i = 0; i < count && !streams; i++) streams = f[i * MB_INST + 20] > (float)MB_STREAM_TEX;
+  for (int32_t i = 0; i < count && !streams; i++) {
+    float t = f[i * MB_INST + 20];
+    streams = t > (float)MB_STREAM_TEX && t <= (float)MB_LAYER_TEX;
+  }
   if (mlayer.presentsWithTransaction || with_views || partial_checking()) {
     // drawn here, in the main thread's transaction, once the queue has drawn what it holds
     present_drain();
@@ -2553,3 +2607,78 @@ void mb_render_draw_timed(const double *inst, int32_t count, double r, double g,
 double mb_host_gpu_ms(void) { return last_gpu; }
 
 int32_t mb_host_frames_dropped(void) { return present_dropped; }
+
+int32_t mb_host_layer_supported(void) {
+  dispatch_group_wait(prepared, DISPATCH_TIME_FOREVER);
+  return dev != nil ? 1 : 0;
+}
+
+int32_t mb_host_layer_render(int32_t layer_id, int32_t phys_w, int32_t phys_h, double scale, const double *inst,
+                             int32_t count) {
+  if (layer_id <= 0 || phys_w <= 0 || phys_h <= 0 || !(scale > 0.0) || count < 0 || (count > 0 && !inst)) return 0;
+  dispatch_group_wait(prepared, DISPATCH_TIME_FOREVER);
+  if (!dev || !queue || !rpipe_off) return 0;
+  @autoreleasepool {
+    present_drain();
+    atlas_flush(UINT64_MAX);
+    if (!layer_texs) layer_texs = [NSMutableDictionary new];
+    NSNumber *key = @(layer_id);
+    id<MTLTexture> tex = layer_texs[key];
+    if (!tex || (int)tex.width != phys_w || (int)tex.height != phys_h) {
+      MTLTextureDescriptor *td = [MTLTextureDescriptor
+          texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                       width:(NSUInteger)phys_w
+                                      height:(NSUInteger)phys_h
+                                   mipmapped:NO];
+      td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+      td.storageMode = MTLStorageModePrivate;
+      tex = [dev newTextureWithDescriptor:td];
+      if (!tex) return 0;
+      layer_texs[key] = tex;
+    }
+    double saved_w = at_w, saved_h = at_h, saved_scale = at_scale;
+    NSDictionary<NSNumber *, id> *saved_texs = at_texs;
+    int saved_through_n = at_through_n;
+    at_w = (double)phys_w / scale;
+    at_h = (double)phys_h / scale;
+    at_scale = scale;
+    at_texs = nil;
+    at_through_n = 0;
+
+    size_t nfloats = (size_t)(count > 0 ? count : 1) * MB_INST;
+    float *tmp = malloc(nfloats * sizeof(float));
+    if (!tmp) {
+      at_w = saved_w;
+      at_h = saved_h;
+      at_scale = saved_scale;
+      at_texs = saved_texs;
+      at_through_n = saved_through_n;
+      return 0;
+    }
+    if (count > 0) mb_groups_floats(tmp, inst, count);
+    else memset(tmp, 0, nfloats * sizeof(float));
+
+    id<MTLBuffer> buf = [dev newBufferWithBytes:tmp
+                                         length:nfloats * sizeof(float)
+                                        options:MTLResourceStorageModeShared];
+    free(tmp);
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    encode(cb, tex, rpipe_off, buf, count, 0.0, 0.0, 0.0, 0.0, NULL);
+    [cb commit];
+
+    at_w = saved_w;
+    at_h = saved_h;
+    at_scale = saved_scale;
+    at_texs = saved_texs;
+    at_through_n = saved_through_n;
+    if (rw) shown_ok = 0;
+  }
+  return 1;
+}
+
+void mb_host_layer_destroy(int32_t layer_id) {
+  if (layer_id <= 0 || !layer_texs) return;
+  present_drain();
+  [layer_texs removeObjectForKey:@(layer_id)];
+  if (rw) shown_ok = 0;
+}
