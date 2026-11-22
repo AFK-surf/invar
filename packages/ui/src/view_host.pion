@@ -534,7 +534,13 @@ struct ViewAppState {
   mut pressed_node : Option[view::NodeId]
   mut dragging_node : Option[view::NodeId]
   mut claim_chain : Array[(view::NodeId, Int)]
+  mut press_events : Array[(Double, Double, Double)]
+  mut down2 : Option[(Double, Double, Array[(Double, Double, Double)])]
   mut active_touch_id : Option[Int]
+  mut secondary_touch_id : Option[Int]
+  mut finger_0 : Int
+  mut finger_1 : Int
+  mut finger_next : Int
   mut last_present_hash : Int64
   mut underlay_painter : Option[(Scene, Double, Double, Double, Double) -> Unit]
   mut fast_present : Bool
@@ -564,7 +570,13 @@ let view_app : ViewAppState = ViewAppState::{
   pressed_node: None,
   dragging_node: None,
   claim_chain: [],
+  press_events: [],
+  down2: None,
   active_touch_id: None,
+  secondary_touch_id: None,
+  finger_0: 0,
+  finger_1: -1,
+  finger_next: 1,
   last_present_hash: 0L,
   underlay_painter: None,
   fast_present: false,
@@ -693,7 +705,13 @@ fn view_forget_inner(clear_hooks : Bool) -> Unit {
   view_app.pressed_node = None
   view_app.dragging_node = None
   view_app.claim_chain.clear()
+  view_app.press_events.clear()
+  view_app.down2 = None
   view_app.active_touch_id = None
+  view_app.secondary_touch_id = None
+  view_app.finger_0 = 0
+  view_app.finger_1 = -1
+  view_app.finger_next = 1
   view_app.last_present_hash = 0L
   view_app.underlay_painter = None
   view_app.fast_present = false
@@ -2493,14 +2511,47 @@ fn blur_focused_field() -> Unit {
   }
 }
 
+fn view_events_before(events : Array[(Double, Double, Double)], at : Double, x : Double, y : Double) -> Array[(Double, Double, Double)] {
+  let before : Array[(Double, Double, Double)] = []
+  let mut n = events.length()
+  if n > 1 {
+    let last = events[n - 1]
+    if last.0 == at && last.1 == x && last.2 == y {
+      n = n - 1
+    }
+  }
+  let mut i = 0
+  while i < n {
+    before.push(events[i])
+    i += 1
+  }
+  before
+}
+
+fn view_events_push(events : Array[(Double, Double, Double)], at : Double, x : Double, y : Double) -> Unit {
+  events.push((at, x, y))
+  if events.length() > 20 {
+    let mut i = 0
+    while i + 1 < events.length() {
+      events[i] = events[i + 1]
+      i += 1
+    }
+    let _ = events.pop()
+  }
+}
+
 /// Route a pointer event into the active view::Tree:
-///   kind: 0 = move, 1 = down, 2 = up, 3 = cancel
+///   kind: 0 = move, 1 = down, 2 = up, 3 = cancel,
+///         4 = second down, 5 = second move, 6 = second up, 8 = primary up handing over to second,
+///         9 = third+ finger down
 ///   button: 1 = primary (left), 2 = secondary (right / Ctrl-click)
 /// Note: `mac_app.m` sends `0=down, 1=move, 2=up, 3=cancel` with `btn=0` primary / `btn=2` secondary;
 /// `ui::run` translates `mac_app.m`'s `(kind, btn)` into this convention before calling `view_pointer`.
 pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : Int = 1) -> Unit {
-  view_app.pointer_x = x
-  view_app.pointer_y = y
+  if kind <= 3 {
+    view_app.pointer_x = x
+    view_app.pointer_y = y
+  }
   match view_app.pointer_interceptor {
     Some(f) => if f(kind, x, y, button, hostapi::mods_held()) { return }
     None => ()
@@ -2510,11 +2561,25 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : 
     None => return
   }
   if kind == 0 {
-    // Move
+    // Move (primary)
+    if view_app.press_down && view_app.claim_chain.length() > 0 {
+      view_events_push(view_app.press_events, now, x, y)
+    }
     if view_app.press_down && view_app.dragging_node.is_none() && view_app.claim_chain.length() > 0 {
       match tree.claimer_of(view_app.claim_chain, x - view_app.press_x, y - view_app.press_y) {
         Some(cid) => {
           view_app.claim_chain.clear()
+          let second : Option[(Double, Double)] = match view_app.down2 {
+            Some((x2, y2, events2)) if tree.claims_scroll(cid) =>
+            if events2.length() > 0 {
+              let last = events2[events2.length() - 1]
+              Some((last.1, last.2))
+            } else {
+              Some((x2, y2))
+            }
+            _ => None
+          }
+          view_app.down2 = None
           match view_app.pressed_node {
             Some(pid) => {
               let _ = tree.press_held(pid)
@@ -2524,7 +2589,20 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : 
           }
           blur_focused_field()
           view_app.dragging_node = Some(cid)
-          let _ = tree.drag_at(cid, view::DragIs::Down, view_app.press_x, view_app.press_y, now, finger=0)
+          view_app.finger_0 = 0
+          view_app.finger_1 = -1
+          view_app.finger_next = 1
+          match second {
+            Some((x2, y2)) => {
+              view_app.finger_1 = 1
+              view_app.finger_next = 2
+              let _ = tree.drag_at(cid, view::DragIs::Down, x2, y2, now, finger=1)
+            }
+            None => ()
+          }
+          let before = view_events_before(view_app.press_events, now, x, y)
+          view_app.press_events.clear()
+          let _ = tree.drag_at(cid, view::DragIs::Down, view_app.press_x, view_app.press_y, now, finger=0, track=before)
           let _ = tree.drag_at(cid, view::DragIs::Moved, x, y, now, finger=0)
           tree.point_at(x, y)
           return
@@ -2534,13 +2612,15 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : 
     }
     match view_app.dragging_node {
       Some(nid) => {
-        let _ = tree.drag_at(nid, view::DragIs::Moved, x, y, now, finger=0)
+        if view_app.finger_0 >= 0 {
+          let _ = tree.drag_at(nid, view::DragIs::Moved, x, y, now, finger=view_app.finger_0)
+        }
       }
       None => ()
     }
     tree.point_at(x, y)
   } else if kind == 1 {
-    // Down
+    // Down (primary)
     tree.went_down(now, x=x, y=y)
     tree.point_at(x, y)
     if button == 2 {
@@ -2552,8 +2632,14 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : 
     view_app.press_down = true
     view_app.press_x = x
     view_app.press_y = y
+    view_app.press_events.clear()
+    view_app.press_events.push((now, x, y))
+    view_app.down2 = None
     view_app.pressed_node = None
     view_app.dragging_node = None
+    view_app.finger_0 = 0
+    view_app.finger_1 = -1
+    view_app.finger_next = 1
     view_app.claim_chain = tree.claimers_at(x, y)
     match tree.target_at(x, y) {
       view::Target::Dragged(nid) => {
@@ -2576,10 +2662,143 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : 
         if tree.moves_window(nid) {
           view_app.press_down = false
           view_app.claim_chain.clear()
+          view_app.press_events.clear()
           hostapi::window_drag()
         }
       }
       view::Target::Nothing => blur_focused_field()
+    }
+  } else if kind == 4 {
+    // Second finger down
+    match view_app.dragging_node {
+      Some(nid) if !tree.yields(nid) => {
+        let f = view_app.finger_next
+        view_app.finger_1 = f
+        view_app.finger_next = f + 1
+        let _ = tree.drag_at(nid, view::DragIs::Down, x, y, now, finger=f)
+        return
+      }
+      _ => ()
+    }
+    if view_app.press_down && view_app.claim_chain.length() > 0 {
+      let scrolls : Array[(view::NodeId, Int)] = []
+      for e in view_app.claim_chain {
+        if tree.claims_scroll(e.0) {
+          scrolls.push(e)
+        }
+      }
+      if scrolls.length() > 0 {
+        view_app.claim_chain = scrolls
+        view_app.down2 = Some((x, y, [(now, x, y)]))
+      } else {
+        view_app.claim_chain.clear()
+        view_app.down2 = None
+      }
+    } else {
+      view_app.down2 = None
+    }
+  } else if kind == 5 {
+    // Second finger move
+    match view_app.dragging_node {
+      Some(nid) if view_app.finger_1 >= 0 => {
+        let _ = tree.drag_at(nid, view::DragIs::Moved, x, y, now, finger=view_app.finger_1)
+        return
+      }
+      _ => ()
+    }
+    match view_app.down2 {
+      Some((x2, y2, events2)) if view_app.claim_chain.length() > 0 => {
+        view_events_push(events2, now, x, y)
+        match tree.claimer_of(view_app.claim_chain, x - x2, y - y2) {
+          Some(cid) => {
+            view_app.claim_chain.clear()
+            view_app.down2 = None
+            match view_app.pressed_node {
+              Some(pid) => {
+                let _ = tree.press_held(pid)
+                view_app.pressed_node = None
+              }
+              None => ()
+            }
+            blur_focused_field()
+            view_app.dragging_node = Some(cid)
+            view_app.finger_0 = 0
+            view_app.finger_1 = 1
+            view_app.finger_next = 2
+            let (f1x, f1y) = if view_app.press_events.length() > 0 {
+              let last = view_app.press_events[view_app.press_events.length() - 1]
+              (last.1, last.2)
+            } else {
+              (view_app.press_x, view_app.press_y)
+            }
+            view_app.press_events.clear()
+            let _ = tree.drag_at(cid, view::DragIs::Down, f1x, f1y, now, finger=0)
+            let before2 = view_events_before(events2, now, x, y)
+            let _ = tree.drag_at(cid, view::DragIs::Down, x2, y2, now, finger=1, track=before2)
+            let _ = tree.drag_at(cid, view::DragIs::Moved, x, y, now, finger=1)
+          }
+          None => ()
+        }
+      }
+      _ => ()
+    }
+  } else if kind == 6 {
+    // Second finger up
+    view_app.down2 = None
+    match view_app.dragging_node {
+      Some(nid) if view_app.finger_1 >= 0 => {
+        let f = view_app.finger_1
+        view_app.finger_1 = -1
+        let _ = tree.drag_at(nid, view::DragIs::Up, x, y, now, finger=f)
+      }
+      _ => ()
+    }
+  } else if kind == 8 {
+    // Primary finger up while second finger remains down (second becomes primary)
+    match view_app.dragging_node {
+      Some(nid) => {
+        let f0 = view_app.finger_0
+        view_app.finger_0 = view_app.finger_1
+        view_app.finger_1 = -1
+        if f0 >= 0 {
+          let _ = tree.drag_at(nid, view::DragIs::Up, x, y, now, finger=f0)
+        }
+      }
+      None => {
+        match view_app.pressed_node {
+          Some(pid) => {
+            let _ = tree.press_held(pid)
+            view_app.pressed_node = None
+          }
+          None => ()
+        }
+        match view_app.down2 {
+          Some((x2, y2, events2)) if view_app.claim_chain.length() > 0 => {
+            view_app.press_x = x2
+            view_app.press_y = y2
+            view_app.press_events = events2
+          }
+          _ => {
+            view_app.claim_chain.clear()
+            view_app.press_events.clear()
+          }
+        }
+        view_app.down2 = None
+      }
+    }
+  } else if kind == 9 {
+    // Third+ finger down: cancel active 2-finger drag cleanly
+    view_app.down2 = None
+    match view_app.dragging_node {
+      Some(nid) => {
+        let f = view_app.finger_next
+        view_app.finger_next = f + 1
+        let _ = tree.drag_at(nid, view::DragIs::Down, x, y, now, finger=f)
+        view_app.dragging_node = None
+        view_app.finger_0 = 0
+        view_app.finger_1 = -1
+      }
+      None => ()
     }
   } else if kind == 2 || kind == 3 {
     // Up (2) or Cancel (3)
@@ -2588,14 +2807,20 @@ pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : 
     let was_down = view_app.press_down
     view_app.press_down = false
     view_app.claim_chain.clear()
+    view_app.press_events.clear()
+    view_app.down2 = None
     match view_app.dragging_node {
       Some(nid) => {
         let drag_end = if is_cancel { view::DragIs::Off } else { view::DragIs::Up }
-        let _ = tree.drag_at(nid, drag_end, x, y, now, finger=0)
+        let f0 = if view_app.finger_0 >= 0 { view_app.finger_0 } else { 0 }
+        let _ = tree.drag_at(nid, drag_end, x, y, now, finger=f0)
         view_app.dragging_node = None
       }
       None => ()
     }
+    view_app.finger_0 = 0
+    view_app.finger_1 = -1
+    view_app.finger_next = 1
     let slop = touch_slop()
     let within_slop = (x - view_app.press_x).abs() <= slop && (y - view_app.press_y).abs() <= slop
     match view_app.pressed_node {
@@ -2772,24 +2997,39 @@ pub fn view_text(kind : Int, s : String, a~ : Int = 0, b~ : Int = 0) -> Unit {
 /// Map native/web host pointer & touch events into `view_pointer`:
 /// - Mouse: `0=down, 1=move, 2=up, 3=cancel, 7=leave` (`btn`: `0=left, 1|3=middle, 2=right`).
 /// - Touch: `10=down, 11=move, 12=up, 13=cancel` (`btn` carries `pointerId`, never mouse button).
-/// Tracks a single primary touch id so secondary fingers cannot hijack press/drag/scroll.
+/// Tracks up to two active touch fingers so two fingers can take turns scrolling a column.
 pub fn view_host_pointer(host_kind : Int, x : Double, y : Double, btn : Int, now : Double) -> Unit {
   if host_kind == 10 {
     match view_app.active_touch_id {
       None => {
         view_app.active_touch_id = Some(btn)
+        view_app.secondary_touch_id = None
         view_pointer(0, x, y, now, button=1)
         view_pointer(1, x, y, now, button=1)
       }
-      Some(_) => ()
+      Some(primary) if primary != btn => {
+        match view_app.secondary_touch_id {
+          None => {
+            view_app.secondary_touch_id = Some(btn)
+            view_pointer(4, x, y, now, button=1)
+          }
+          Some(sec) if sec != btn => {
+            view_pointer(9, x, y, now, button=1)
+          }
+          _ => ()
+        }
+      }
+      _ => ()
     }
   } else if host_kind == 11 {
-    let is_primary = match view_app.active_touch_id {
-      Some(id) => id == btn
-      None => true
-    }
-    if is_primary {
-      view_pointer(0, x, y, now, button=1)
+    match view_app.active_touch_id {
+      Some(id) if id == btn => view_pointer(0, x, y, now, button=1)
+      None => view_pointer(0, x, y, now, button=1)
+      _ =>
+      match view_app.secondary_touch_id {
+        Some(sid) if sid == btn => view_pointer(5, x, y, now, button=1)
+        _ => ()
+      }
     }
   } else if host_kind == 12 {
     let is_primary = match view_app.active_touch_id {
@@ -2797,17 +3037,40 @@ pub fn view_host_pointer(host_kind : Int, x : Double, y : Double, btn : Int, now
       None => true
     }
     if is_primary {
-      view_app.active_touch_id = None
-      view_pointer(2, x, y, now, button=1)
-      view_pointer(0, -10000.0, -10000.0, now, button=1)
+      match view_app.secondary_touch_id {
+        Some(sid) => {
+          view_app.active_touch_id = Some(sid)
+          view_app.secondary_touch_id = None
+          view_pointer(8, x, y, now, button=1)
+        }
+        None => {
+          view_app.active_touch_id = None
+          view_pointer(2, x, y, now, button=1)
+          view_pointer(0, -10000.0, -10000.0, now, button=1)
+        }
+      }
+    } else {
+      match view_app.secondary_touch_id {
+        Some(sid) if sid == btn => {
+          view_app.secondary_touch_id = None
+          view_pointer(6, x, y, now, button=1)
+        }
+        _ => ()
+      }
     }
   } else if host_kind == 13 {
-    let is_primary = match view_app.active_touch_id {
-      Some(id) => id == btn
+    let matches_any = match view_app.active_touch_id {
+      Some(id) if id == btn => true
       None => true
+      _ =>
+      match view_app.secondary_touch_id {
+        Some(sid) if sid == btn => true
+        _ => false
+      }
     }
-    if is_primary {
+    if matches_any {
       view_app.active_touch_id = None
+      view_app.secondary_touch_id = None
       view_pointer(3, x, y, now, button=1)
     }
   } else if host_kind == 7 {

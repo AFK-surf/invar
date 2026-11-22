@@ -1152,6 +1152,8 @@ static void gl_setup(void) {
 typedef struct { GLuint t, fb; int w, h; GLenum format; } level;
 static level lv[5];
 static int lv_w, lv_h;
+static int lv_shrink_frames, lv_win_max_w, lv_win_max_h;
+static int lv_frame_max_w, lv_frame_max_h;
 static int levels_rebuilt;
 static GLuint bd_tex;
 static float gmap[4], guvc[4], ggb[4], gshape[32], grad[32];
@@ -1162,6 +1164,7 @@ static int vy0, vhp;
 // the last capture's blur is kept to be shown again (capture, below)
 static int kept_ok;
 static void slots_invalidate(void);
+static void slots_drop_textures(void);
 static void glass_forget(void);
 
 static level level_tex(GLenum format, int w, int h) {
@@ -1195,6 +1198,9 @@ static void ensure_levels(int w, int h) {
   lv_w = nw > lv_w ? nw : lv_w;
   lv_h = nh > lv_h ? nh : lv_h;
   levels_rebuilt++;
+  lv_shrink_frames = 0;
+  lv_win_max_w = lv_win_max_h = 0;
+  lv_frame_max_w = lv_frame_max_h = 0;
   // Each cached slot owns its own texture (`bt` + `bw`/`bh`) and `show_blur` reads `bw`/`bh` directly,
   // so growing the shared scratch pyramid must not invalidate cached glass slots.
   for (int j = 0; j < 4; j++)
@@ -1427,6 +1433,7 @@ static void ensure_canvas(void) {
 // so two of the same compare the same (as Metal's: apple_render.m Grab).
 typedef struct {
   int px0, pb0, w, h, top, k, contained, progressive, n;
+  int vis_x, vis_y, vis_w, vis_h;
   float sg, sp;
   float fade[4], fadex[4];
   float gb[4], shape[32], rad[32];
@@ -1514,6 +1521,17 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
       m->fade[i] = a[52 + i];
       m->fadex[i] = a[56 + i];
     }
+    int vx0 = (int)floorf(x0 * sc) - px0 - 2;
+    int vy0_v = (top - (int)ceilf(y1 * sc)) - pb0 - 2;
+    int vx1 = (int)ceilf(x1 * sc) - px0 + 2;
+    int vy1_v = (top - (int)floorf(y0 * sc)) - pb0 + 2;
+    if (vx0 < 0) vx0 = 0;
+    if (vy0_v < 0) vy0_v = 0;
+    if (vx1 > m->w) vx1 = m->w;
+    if (vy1_v > m->h) vy1_v = m->h;
+    if (vx1 <= vx0) { vx0 = 0; vx1 = m->w; }
+    if (vy1_v <= vy0_v) { vy0_v = 0; vy1_v = m->h; }
+    m->vis_x = vx0; m->vis_y = vy0_v; m->vis_w = vx1 - vx0; m->vis_h = vy1_v - vy0_v;
   }
   float sp = blur * sc;
   int k = 0;
@@ -1538,22 +1556,31 @@ static void grab_levels(const Grab *m, int lw[4], int lh[4]) {
   }
 }
 
-// What the glass shows of a grab's blur in texture `bt` (bw × bh, level k's place in it): bd_tex and the uniforms
-// that say where in it it is.
-static void show_blur(const Grab *m, GLuint bt, int bw, int bh) {
+static void grab_map_uvc(const Grab *m, int bw, int bh, float map[4], float uvc[4]) {
   int lw[4], lh[4];
   grab_levels(m, lw, lh);
   int sk = m->progressive ? 0 : m->k, px0 = m->px0, pb0 = m->pb0, top = m->top;
   float sc = (float)cur_scale;
+  float d = (float)(1 << sk);
+  map[0] = sc / d / bw; map[1] = -sc / d / bh;
+  map[2] = -(float)px0 / d / bw; map[3] = (float)(top - pb0) / d / bh;
+  if (m->progressive) {
+    uvc[0] = ((float)m->vis_x + 0.5f) / bw; uvc[1] = ((float)m->vis_y + 0.5f) / bh;
+    uvc[2] = ((float)(m->vis_x + m->vis_w) - 0.5f) / bw; uvc[3] = ((float)(m->vis_y + m->vis_h) - 0.5f) / bh;
+  } else {
+    uvc[0] = 0.5f / bw; uvc[1] = 0.5f / bh; uvc[2] = (lw[sk] - 0.5f) / bw; uvc[3] = (lh[sk] - 0.5f) / bh;
+  }
+}
+
+// What the glass shows of a grab's blur in texture `bt` (bw × bh, level k's place in it): bd_tex and the uniforms
+// that say where in it it is.
+static void show_blur(const Grab *m, GLuint bt, int bw, int bh) {
   memcpy(ggb, m->gb, sizeof ggb);
   memcpy(gshape, m->shape, sizeof gshape);
   memcpy(grad, m->rad, sizeof grad);
   gn = m->n;
-  float d = (float)(1 << sk);
   bd_tex = bt;
-  gmap[0] = sc / d / bw; gmap[1] = -sc / d / bh;
-  gmap[2] = -(float)px0 / d / bw; gmap[3] = (float)(top - pb0) / d / bh;
-  guvc[0] = 0.5f / bw; guvc[1] = 0.5f / bh; guvc[2] = (lw[sk] - 0.5f) / bw; guvc[3] = (lh[sk] - 0.5f) / bh;
+  grab_map_uvc(m, bw, bh, gmap, guvc);
 }
 
 // The level a grab's blur is left in.
@@ -1581,6 +1608,10 @@ static void blur(const Grab *m) {
 #endif
   glBlitFramebuffer(m->px0, m->pb0, m->px0 + w, m->pb0 + h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
   glUseProgram(post);
+  glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE0);
   int lw[4], lh[4];
   grab_levels(m, lw, lh);
   if (m->progressive) {
@@ -1614,7 +1645,13 @@ static void blur(const Grab *m) {
     glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, lv[1].t); glUniform1i(pu_lv1, 1);
     glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, lv[2].t); glUniform1i(pu_lv2, 2);
     glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, lv[3].t); glUniform1i(pu_lv3, 3);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(m->vis_x, m->vis_y, m->vis_w, m->vis_h);
     post_pass(&lv[0], w, h, &lv[4], w, h, 4, 0, 0, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, 0);
     glActiveTexture(GL_TEXTURE0);
     return;
   }
@@ -1644,6 +1681,11 @@ static void blur(const Grab *m) {
 // group's blur again, the others' kept. A stream or a native view's picture drawn into it (its pictures change under
 // the same instances) is blurred anew each frame, as is a frame an image under it had no texture for yet.
 #define MB_GLASS_SLOTS 32
+#ifdef __ANDROID__
+#define MB_GLASS_CACHE_MAX_BYTES ((size_t)32 * 1024 * 1024)
+#else
+#define MB_GLASS_CACHE_MAX_BYTES ((size_t)64 * 1024 * 1024)
+#endif
 typedef struct {
   GLuint bt, bfb;
   int bw, bh;
@@ -1655,9 +1697,38 @@ typedef struct {
   double key[9];
   int valid;
   unsigned used;
+  unsigned gen;
 } glass_slot;
 static glass_slot slots[MB_GLASS_SLOTS];
 static unsigned slots_clock;
+static unsigned slots_gen;
+
+static size_t glass_tex_bytes(int w, int h) {
+  if (w <= 0 || h <= 0) return 0;
+  return (size_t)w * (size_t)h * 4;
+}
+
+static size_t slots_total_bytes(void) {
+  size_t total = 0;
+  for (int i = 0; i < MB_GLASS_SLOTS; i++) {
+    if (slots[i].bt) total += glass_tex_bytes(slots[i].bw, slots[i].bh);
+  }
+  return total;
+}
+
+static void slot_drop_tex(glass_slot *s) {
+  if (s->bt) {
+    glDeleteFramebuffers(1, &s->bfb);
+    glDeleteTextures(1, &s->bt);
+    s->bt = s->bfb = 0;
+    s->bw = s->bh = 0;
+    s->bf = 0;
+  }
+}
+
+static void slots_drop_textures(void) {
+  for (int i = 0; i < MB_GLASS_SLOTS; i++) slot_drop_tex(&slots[i]);
+}
 // what the capture now is of (under_now), as a slot keeps it
 static float *under_now;
 static size_t under_now_cap, under_now_n;
@@ -1667,18 +1738,33 @@ static int32_t under_whole, under_picked;
 #define MB_AD_TAU 0.070
 #define MB_AD_SETTLE_SEC 0.42
 #define MB_AD_MATCH_DIST 64.0
+#define MB_AD_RB_N 3
 
 typedef struct {
   int active;
   float cx, cy, hx, hy;
   int is_dark;
   double settle_left;
+  uint64_t settle_serial;
   uint64_t updated_serial;
   uint64_t seen_serial;
 } mb_ad_slot;
 
+typedef struct {
+  GLuint pbo;
+  GLsync fence;
+  uint32_t mask;
+  uint64_t serial;
+} gl_ad_rb;
+
 static GLuint ad_tex[2], ad_fb[2];
 static int ad_cur;
+static gl_ad_rb ad_rb[MB_AD_RB_N];
+static int ad_rb_i;
+static int ad_rb_cur = -1;
+static int ad_rb_prev_copied;
+static uint32_t ad_track_mask;
+static uint64_t ad_conv_serial[MB_ADAPTIVE_MAX];
 static mb_ad_slot ad_slots[MB_ADAPTIVE_MAX];
 static double ad_last_time, ad_fixed_dt;
 static uint64_t ad_frame_serial;
@@ -1691,26 +1777,73 @@ static int gad_n;
 
 static void ad_forget(void) {
   memset(ad_slots, 0, sizeof ad_slots);
+  memset(ad_conv_serial, 0, sizeof ad_conv_serial);
+  for (int i = 0; i < MB_AD_RB_N; i++) ad_rb[i].mask = 0;
+  ad_track_mask = 0;
+  ad_rb_prev_copied = 0;
+  ad_rb_cur = -1;
   ad_last_time = 0.0;
   ad_settling = 0;
   gad_n = 0;
 }
 
 static void ensure_ad_tex(void) {
-  if (ad_tex[0]) return;
-  for (int i = 0; i < 2; i++) {
-    glGenTextures(1, &ad_tex[i]);
-    glBindTexture(GL_TEXTURE_2D, ad_tex[i]);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, MB_ADAPTIVE_MAX, 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glGenFramebuffers(1, &ad_fb[i]);
-    glBindFramebuffer(GL_FRAMEBUFFER, ad_fb[i]);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ad_tex[i], 0);
+  if (!ad_tex[0]) {
+    for (int i = 0; i < 2; i++) {
+      glGenTextures(1, &ad_tex[i]);
+      glBindTexture(GL_TEXTURE_2D, ad_tex[i]);
+      glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, MB_ADAPTIVE_MAX, 1);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glGenFramebuffers(1, &ad_fb[i]);
+      glBindFramebuffer(GL_FRAMEBUFFER, ad_fb[i]);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ad_tex[i], 0);
+    }
+    ad_cur = 0;
   }
-  ad_cur = 0;
+  if (!ad_rb[0].pbo) {
+    for (int i = 0; i < MB_AD_RB_N; i++) {
+      glGenBuffers(1, &ad_rb[i].pbo);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, ad_rb[i].pbo);
+      glBufferData(GL_PIXEL_PACK_BUFFER, MB_ADAPTIVE_MAX * 4 * 2, NULL, GL_STREAM_READ);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  }
+}
+
+static void ad_poll_readbacks(void) {
+  for (int i = 0; i < MB_AD_RB_N; i++) {
+    if (!ad_rb[i].fence) continue;
+    GLenum st = glClientWaitSync(ad_rb[i].fence, 0, 0);
+    if (st == GL_ALREADY_SIGNALED || st == GL_CONDITION_SATISFIED) {
+      if (ad_rb[i].pbo && ad_rb[i].mask) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, ad_rb[i].pbo);
+        const uint8_t *p = (const uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, MB_ADAPTIVE_MAX * 4 * 2,
+                                                             GL_MAP_READ_BIT);
+        if (p) {
+          const uint8_t *prev = p;
+          const uint8_t *next = p + MB_ADAPTIVE_MAX * 4;
+          for (int s = 0; s < MB_ADAPTIVE_MAX; s++) {
+            if (!(ad_rb[i].mask & (1u << s))) continue;
+            if (prev[s * 4 + 0] == next[s * 4 + 0] && prev[s * 4 + 1] == next[s * 4 + 1]) {
+              if (ad_rb[i].serial > ad_conv_serial[s]) ad_conv_serial[s] = ad_rb[i].serial;
+            }
+          }
+          glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      }
+      glDeleteSync(ad_rb[i].fence);
+      ad_rb[i].fence = NULL;
+      ad_rb[i].mask = 0;
+    } else if (st == GL_WAIT_FAILED) {
+      glDeleteSync(ad_rb[i].fence);
+      ad_rb[i].fence = NULL;
+      ad_rb[i].mask = 0;
+    }
+  }
 }
 
 static void ad_fill_uniforms(void) {
@@ -1827,12 +1960,17 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
     }
     mb_ad_slot *s = &ad_slots[sid];
     if (s->updated_serial == serial) continue;
+    if (!is_new && !backdrop_changed && s->settle_left > 0.0 && ad_conv_serial[sid] >= s->settle_serial) {
+      s->settle_left = 0.0;
+    }
     int need = is_new || backdrop_changed || s->settle_left > 0.0;
     if (need) {
       if (is_new) {
         s->settle_left = 0.0;
+        s->settle_serial = serial;
       } else if (backdrop_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;
+        s->settle_serial = serial;
       } else {
         s->settle_left -= dt;
         if (s->settle_left <= 0.0) s->settle_left = 0.0;
@@ -1844,12 +1982,40 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
   return n_upd;
 }
 
-static void ad_run_updates(const gl_ad_pend *pend, int n_upd, double dt) {
-  if (n_upd <= 0 || !bd_tex || !ad_prog) return;
+typedef struct {
+  gl_ad_pend p;
+  GLuint bt;
+  float map[4];
+  float uvc[4];
+} gl_ad_batch;
+
+static void ad_run_updates_batch(const gl_ad_batch *items, int n_upd, double dt) {
+  if (n_upd <= 0 || !ad_prog) return;
   ensure_ad_tex();
   int cur = ad_cur, nxt = 1 - cur;
+  uint32_t batch_mask = 0;
+  for (int i = 0; i < n_upd; i++) {
+    if (!items[i].p.is_new && dt > 0.0) batch_mask |= (1u << items[i].p.sid);
+  }
   glDisable(GL_BLEND);
   glDisable(GL_SCISSOR_TEST);
+  if (batch_mask && !ad_rb_prev_copied) {
+    int slot = -1;
+    for (int k = 0; k < MB_AD_RB_N; k++) {
+      int idx = (ad_rb_i + k) % MB_AD_RB_N;
+      if (!ad_rb[idx].fence && ad_rb[idx].pbo) { slot = idx; break; }
+    }
+    if (slot >= 0) {
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, ad_fb[cur]);
+      glPixelStorei(GL_PACK_ALIGNMENT, 1);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, ad_rb[slot].pbo);
+      glReadPixels(0, 0, MB_ADAPTIVE_MAX, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void *)0);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      ad_rb_cur = slot;
+      ad_rb_prev_copied = 1;
+    }
+  }
+  ad_track_mask |= batch_mask;
   glBindFramebuffer(GL_READ_FRAMEBUFFER, ad_fb[cur]);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ad_fb[nxt]);
   glBlitFramebuffer(0, 0, MB_ADAPTIVE_MAX, 1, 0, 0, MB_ADAPTIVE_MAX, 1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -1857,21 +2023,53 @@ static void ad_run_updates(const gl_ad_pend *pend, int n_upd, double dt) {
   glViewport(0, 0, MB_ADAPTIVE_MAX, 1);
   glEnable(GL_SCISSOR_TEST);
   glUseProgram(ad_prog);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, bd_tex);
-  glUniform1i(adu_bd, 0);
   glActiveTexture(GL_TEXTURE1);
   glBindTexture(GL_TEXTURE_2D, ad_tex[cur]);
   glUniform1i(adu_prev, 1);
-  glUniform4fv(adu_map, 1, gmap);
-  glUniform4fv(adu_uvc, 1, guvc);
+  glActiveTexture(GL_TEXTURE0);
+  glUniform1i(adu_bd, 0);
   for (int i = 0; i < n_upd; i++) {
-    glScissor(pend[i].sid, 0, 1, 1);
-    glUniform4f(adu_box, pend[i].cx, pend[i].cy, pend[i].hx, pend[i].hy);
-    glUniform4f(adu_param, (float)pend[i].is_dark, (float)pend[i].is_new, (float)dt, (float)pend[i].sid);
+    if (!items[i].bt) continue;
+    glBindTexture(GL_TEXTURE_2D, items[i].bt);
+    glUniform4fv(adu_map, 1, items[i].map);
+    glUniform4fv(adu_uvc, 1, items[i].uvc);
+    glScissor(items[i].p.sid, 0, 1, 1);
+    glUniform4f(adu_box, items[i].p.cx, items[i].p.cy, items[i].p.hx, items[i].p.hy);
+    glUniform4f(adu_param, (float)items[i].p.is_dark, (float)items[i].p.is_new, (float)dt, (float)items[i].p.sid);
     glDrawArrays(GL_TRIANGLES, 0, 3);
   }
   ad_cur = nxt;
+}
+
+static void ad_rb_finish(uint64_t serial) {
+  if (ad_rb_prev_copied && ad_rb_cur >= 0 && ad_track_mask && ad_fb[ad_cur] && ad_rb[ad_rb_cur].pbo) {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ad_fb[ad_cur]);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, ad_rb[ad_rb_cur].pbo);
+    glReadPixels(0, 0, MB_ADAPTIVE_MAX, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void *)(uintptr_t)(MB_ADAPTIVE_MAX * 4));
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    ad_rb[ad_rb_cur].fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    ad_rb[ad_rb_cur].mask = ad_track_mask;
+    ad_rb[ad_rb_cur].serial = serial;
+    ad_rb_i = (ad_rb_cur + 1) % MB_AD_RB_N;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fb);
+  }
+  ad_rb_prev_copied = 0;
+  ad_track_mask = 0;
+  ad_rb_cur = -1;
+}
+
+static void ad_run_updates(const gl_ad_pend *pend, int n_upd, double dt) {
+  if (n_upd <= 0 || !bd_tex || !ad_prog) return;
+  gl_ad_batch items[MB_ADAPTIVE_MAX];
+  int m = n_upd > MB_ADAPTIVE_MAX ? MB_ADAPTIVE_MAX : n_upd;
+  for (int i = 0; i < m; i++) {
+    items[i].p = pend[i];
+    items[i].bt = bd_tex;
+    memcpy(items[i].map, gmap, sizeof items[i].map);
+    memcpy(items[i].uvc, guvc, sizeof items[i].uvc);
+  }
+  ad_run_updates_batch(items, m, dt);
 }
 
 static double ad_next_dt(void) {
@@ -1896,6 +2094,7 @@ static void ad_finalize_frame(int whole_frame, uint64_t serial) {
       s->settle_left = 0.0;
       continue;
     }
+    if (s->settle_left > 0.0 && ad_conv_serial[i] >= s->settle_serial) s->settle_left = 0.0;
     if (s->settle_left > 0.0) settling = 1;
   }
   ad_settling = settling;
@@ -1919,19 +2118,51 @@ static void glass_forget(void) {
 static void glass_lost(void) {
   memset(lv, 0, sizeof lv);
   lv_w = lv_h = 0;
+  lv_shrink_frames = lv_win_max_w = lv_win_max_h = 0;
+  lv_frame_max_w = lv_frame_max_h = 0;
   for (int i = 0; i < MB_GLASS_SLOTS; i++) {
     glass_slot *s = &slots[i];
     s->bt = s->bfb = 0;
     s->bw = s->bh = 0;
+    s->bf = 0;
   }
   ad_tex[0] = ad_tex[1] = 0;
   ad_fb[0] = ad_fb[1] = 0;
   ad_cur = 0;
+  memset(ad_rb, 0, sizeof ad_rb);
+  ad_rb_i = 0;
+  ad_rb_cur = -1;
   glass_forget();
 }
 
+static void shrink_levels(int w, int h) {
+  for (int j = 0; j < 5; j++)
+    if (lv[j].t) {
+      glDeleteTextures(1, &lv[j].t);
+      glDeleteFramebuffers(1, &lv[j].fb);
+    }
+  lv_w = w > 0 ? w : 1;
+  lv_h = h > 0 ? h : 1;
+  levels_rebuilt++;
+  for (int j = 0; j < 4; j++)
+    lv[j] = level_tex(j == 0 ? GL_RGBA8 : GL_RGB10_A2, (lv_w + (1 << j) - 1) >> j, (lv_h + (1 << j) - 1) >> j);
+  lv[4] = level_tex(GL_RGB10_A2, lv_w, lv_h);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  for (int i = 0; i < MB_GLASS_SLOTS; i++) {
+    glass_slot *s = &slots[i];
+    if (!s->bt) continue;
+    int sk = s->grab.progressive ? 0 : s->grab.k;
+    int max_sw = (lv_w + (1 << sk) - 1) >> sk;
+    int max_sh = (lv_h + (1 << sk) - 1) >> sk;
+    if (!s->valid || s->bw > max_sw || s->bh > max_sh) {
+      slot_drop_tex(s);
+      s->valid = 0;
+    }
+  }
+}
+
 // The glass's own textures given back, in the context they were made in (current): the levels, the slots' copies and
-// what each slot was of. The next capture makes what it needs again at its size (ensure_levels, slot_copy), its blur
+// what each slot was of. The next capture makes what it needs again at its size (ensure_levels, slot_fill), its blur
 // the same to the byte (a blur is of what is drawn under it, not of what was kept).
 static void glass_free(void) {
   for (int j = 0; j < 5; j++)
@@ -1953,6 +2184,10 @@ static void glass_free(void) {
     if (ad_fb[i]) glDeleteFramebuffers(1, &ad_fb[i]);
     if (ad_tex[i]) glDeleteTextures(1, &ad_tex[i]);
   }
+  for (int i = 0; i < MB_AD_RB_N; i++) {
+    if (ad_rb[i].fence) glDeleteSync(ad_rb[i].fence);
+    if (ad_rb[i].pbo) glDeleteBuffers(1, &ad_rb[i].pbo);
+  }
   bd_tex = 0;
   glass_lost();
 }
@@ -1964,8 +2199,24 @@ static int glass_idle_frames;
 static int glass_drawn;  // the frame drawing now reached glass (draw_into)
 
 static void glass_idle_tick(void) {
-  if (glass_drawn) glass_idle_frames = 0;
-  else if (glass_idle_frames < MB_GLASS_IDLE && ++glass_idle_frames == MB_GLASS_IDLE && lv_w > 0) glass_free();
+  if (glass_drawn) {
+    glass_idle_frames = 0;
+    if (lv_w > 0 && lv_h > 0 && lv_frame_max_w > 0 && lv_frame_max_h > 0) {
+      if (lv_frame_max_w > lv_win_max_w) lv_win_max_w = lv_frame_max_w;
+      if (lv_frame_max_h > lv_win_max_h) lv_win_max_h = lv_frame_max_h;
+      if (++lv_shrink_frames >= MB_GLASS_IDLE) {
+        if ((size_t)lv_win_max_w * (size_t)lv_win_max_h * 2 < (size_t)lv_w * (size_t)lv_h) {
+          shrink_levels(lv_win_max_w, lv_win_max_h);
+        }
+        lv_shrink_frames = 0;
+        lv_win_max_w = lv_win_max_h = 0;
+      }
+    }
+    lv_frame_max_w = lv_frame_max_h = 0;
+  } else {
+    lv_frame_max_w = lv_frame_max_h = 0;
+    if (glass_idle_frames < MB_GLASS_IDLE && ++glass_idle_frames == MB_GLASS_IDLE && lv_w > 0) glass_free();
+  }
   glass_drawn = 0;
 }
 
@@ -1974,6 +2225,7 @@ static void glass_idle_tick(void) {
 static int reaches(const float *f, int32_t i, int32_t run, const float g[4]) {
   const float *b = f + (size_t)i * MB_INST;
   int kind = (int)(b[5] + 0.5f);
+  if (b[32] != 0.0f && kind == 6 && (b[23] > 0.0f || f[(size_t)run * MB_INST + 23] > 0.0f)) return 1;
   float e = kind == 2 ? fabsf(b[7]) * 3.0f + 2.0f : 1.0f;
   if (kind == 14 || kind == 15) e = fabsf(b[7]) * 3.0f + 2.0f;
   // (liquid: its group's bounds, each shape and the first's reach round it, 2 more: grab_of)
@@ -1997,25 +2249,94 @@ static int reaches(const float *f, int32_t i, int32_t run, const float g[4]) {
       if (ay < y0) y0 = ay;
       if (ay > y1) y1 = ay;
     }
+    x0 -= 1.0f; x1 += 1.0f;
+    y0 -= 1.0f; y1 += 1.0f;
   }
   return x1 > g[0] && x0 < g[2] && y1 > g[1] && y0 < g[3];
 }
 
-// What the capture of the run at start is of (under_now): every instance before the last glass (or what draws by a
-// glass's blur) that reaches into its rectangle (that glass shows what is under it, wherever that is), those after it that reach into it, and the frame's
-// shapes' pieces (from `pieces` on). 0 when a stream or a native view's picture is among them.
+// What the capture of the run at start is of (under_now): exact spatial dependency closure of every instance before
+// start whose pixels (directly, or transitively through an earlier glass capture or adaptive ink sample) reach into
+// the capture's rectangle, plus the frame's referenced shapes' pieces (from `pieces` on). 0 when a stream or a native
+// view's picture is among them.
 static int under_take(const float *f, int32_t start, int32_t count, int32_t pieces, const Grab *m) {
   float sc = (float)cur_scale;
-  float g[4] = {(float)m->px0 / sc - 1.0f, (float)(m->top - (m->pb0 + m->h)) / sc - 1.0f,
-                (float)(m->px0 + m->w) / sc + 1.0f, (float)(m->top - m->pb0) / sc + 1.0f};
-  int32_t whole = 0, run = 0;
-  for (int32_t i = 0; i < start; i++) {
-    float tid = f[(size_t)i * MB_INST + 20];
-    if (i > 0 && tid != f[(size_t)(i - 1) * MB_INST + 20]) run = i;
-    // (glass, and what is drawn by what a glass's blur shows: adaptive words/icons/lines over it)
-    int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
-    int sees = tid < 0.0f || k == 7 || ((k == 10 || k == 11) && f[(size_t)i * MB_INST + 23] > 0.0f);
-    if (sees && reaches(f, i, run, g)) whole = i + 1;
+  float dep[4] = {(float)m->px0 / sc - 1.0f, (float)(m->top - (m->pb0 + m->h)) / sc - 1.0f,
+                  (float)(m->px0 + m->w) / sc + 1.0f, (float)(m->top - m->pb0) / sc + 1.0f};
+  float seen_tids[32];
+  int seen_n = 0;
+  for (int pass = 0; pass < 4; pass++) {
+    int grew = 0;
+    for (int32_t i = start - 1; i >= 0; i--) {
+      const float *bi = f + (size_t)i * MB_INST;
+      float tid = bi[20];
+      int k = (int)(bi[5] + 0.5f);
+      int is_glass = tid < 0.0f;
+      int is_ad = k == 7 || ((k == 10 || k == 11) && bi[23] > 0.0f);
+      if (!is_glass && !is_ad) continue;
+      int32_t run = i;
+      if (is_glass) {
+        while (run > 0 && f[(size_t)(run - 1) * MB_INST + 20] == tid) run--;
+      }
+      if (!reaches(f, i, run, dep)) continue;
+      if (is_glass) {
+        int already = 0;
+        for (int s = 0; s < seen_n; s++) {
+          if (seen_tids[s] == tid) { already = 1; break; }
+        }
+        if (already) continue;
+        if (seen_n < 32) seen_tids[seen_n++] = tid;
+        int32_t first_i = run;
+        for (int32_t j = 0; j < run; j++) {
+          if (f[(size_t)j * MB_INST + 20] == tid) { first_i = j; break; }
+        }
+        const float *a = f + (size_t)first_i * MB_INST;
+        int gkind = (int)(a[5] + 0.5f);
+        int is_contained = (gkind == 5 && a[7] < 0.0f);
+        float blur_r = (gkind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
+        int merged_liquid = (gkind == 6 && a[23] > 0.0f);
+        int unmerged_liquid = (gkind == 6 && !merged_liquid);
+        float margin = is_contained ? 0.0f : 3.0f * blur_r + (gkind == 6 ? a[21] * (1.0f + fabsf(a[22])) + fmaxf(a[23], 0.0f) : 0.0f) + 2.0f;
+        float gx0 = 1e9f, gy0 = 1e9f, gx1 = -1e9f, gy1 = -1e9f;
+        for (int32_t j = first_i; j < count; j++) {
+          const float *b = f + (size_t)j * MB_INST;
+          if (b[20] != tid) continue;
+          float bx0, by0, bx1, by1;
+          if (gkind == 6) {
+            float m23 = fmaxf(unmerged_liquid ? b[23] : a[23], 0.0f);
+            bx0 = b[0] - m23; by0 = b[1] - m23; bx1 = b[0] + b[2] + m23; by1 = b[1] + b[3] + m23;
+            if (unmerged_liquid) {
+              float bm = 3.0f * blur_r + b[21] * (1.0f + fabsf(b[22])) + m23 + 2.0f;
+              if (bm > margin) margin = bm;
+            }
+          } else {
+            bx0 = b[0] > b[16] ? b[0] : b[16]; by0 = b[1] > b[17] ? b[1] : b[17];
+            bx1 = b[0] + b[2] < b[18] ? b[0] + b[2] : b[18]; by1 = b[1] + b[3] < b[19] ? b[1] + b[3] : b[19];
+          }
+          if (bx0 < gx0) gx0 = bx0;
+          if (by0 < gy0) gy0 = by0;
+          if (bx1 > gx1) gx1 = bx1;
+          if (by1 > gy1) gy1 = by1;
+        }
+        if (gx1 > gx0 && gy1 > gy0) {
+          float ex0 = gx0 - margin - 2.0f, ey0 = gy0 - margin - 2.0f;
+          float ex1 = gx1 + margin + 2.0f, ey1 = gy1 + margin + 2.0f;
+          if (ex0 < dep[0]) { dep[0] = ex0; grew = 1; }
+          if (ey0 < dep[1]) { dep[1] = ey0; grew = 1; }
+          if (ex1 > dep[2]) { dep[2] = ex1; grew = 1; }
+          if (ey1 > dep[3]) { dep[3] = ey1; grew = 1; }
+        }
+      } else {
+        float rad = bi[23] + 4.0f;
+        float ex0 = bi[21] - rad, ey0 = bi[22] - rad;
+        float ex1 = bi[21] + rad, ey1 = bi[22] + rad;
+        if (ex0 < dep[0]) { dep[0] = ex0; grew = 1; }
+        if (ey0 < dep[1]) { dep[1] = ey0; grew = 1; }
+        if (ex1 > dep[2]) { dep[2] = ex1; grew = 1; }
+        if (ey1 > dep[3]) { dep[3] = ey1; grew = 1; }
+      }
+    }
+    if (!grew) break;
   }
   size_t need_base = (size_t)start * MB_INST;
   if (under_now_cap < need_base) {
@@ -2023,37 +2344,17 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     under_now = (float *)realloc(under_now, under_now_cap * sizeof(float));
   }
   float *o = under_now;
-  for (int32_t i = 0; i < whole; i++)
-    if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
-  memcpy(o, f, (size_t)whole * MB_INST * sizeof(float));
-  o += (size_t)whole * MB_INST;
   int in_blur = 0, blur_hit = 0;
   int has_vec = 0;
   long seg_min = 0, seg_max = 0;
-  for (int32_t i = 0; i < whole; i++) {
-    int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
-    if (k == 14) {
-      if (in_blur == 0) blur_hit = reaches(f, i, i, g);
-      in_blur++;
-    } else if (k == 15 && in_blur > 0) {
-      in_blur--;
-      if (in_blur == 0) blur_hit = 0;
-    } else if (k == 11) {
-      long f0 = lroundf(f[(size_t)i * MB_INST + 12]);
-      long fn = lroundf(f[(size_t)i * MB_INST + 13]);
-      if (fn > 0) {
-        if (!has_vec || f0 < seg_min) seg_min = f0;
-        if (!has_vec || f0 + fn > seg_max) seg_max = f0 + fn;
-        has_vec = 1;
-      }
-    }
-  }
-  int32_t picked = 0;
-  for (int32_t i = whole; i < start; i++) {
+  int32_t picked = 0, run = 0;
+  for (int32_t i = 0; i < start; i++) {
+    float tid = f[(size_t)i * MB_INST + 20];
+    if (i > 0 && tid != f[(size_t)(i - 1) * MB_INST + 20]) run = i;
     int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
     int take = 0;
     if (k == 14) {
-      if (in_blur == 0) blur_hit = reaches(f, i, i, g);
+      if (in_blur == 0) blur_hit = reaches(f, i, run, dep);
       in_blur++;
       take = blur_hit;
     } else if (k == 15) {
@@ -2063,10 +2364,10 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
         if (in_blur == 0) blur_hit = 0;
       }
     } else {
-      take = (in_blur > 0 && blur_hit) || reaches(f, i, i, g);
+      take = (in_blur > 0 && blur_hit) || reaches(f, i, run, dep);
     }
     if (!take) continue;
-    if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
+    if (tid > (float)MB_STREAM_TEX) return 0;
     if (k == 11) {
       long f0 = lroundf(f[(size_t)i * MB_INST + 12]);
       long fn = lroundf(f[(size_t)i * MB_INST + 13]);
@@ -2101,7 +2402,7 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     }
   }
   under_now_n = (size_t)(o - under_now);
-  under_whole = whole;
+  under_whole = 0;
   under_picked = picked;
   return 1;
 }
@@ -2118,26 +2419,66 @@ static glass_slot *slot_same(const Grab *m, const double key[9]) {
   return NULL;
 }
 
-// The blur just made (blur) kept in the slot least lately shown by swapping texture/FBO handles with the level
-// (zero GPU blit). Not yet said to be of anything (valid).
+static void slots_evict_budget(int keep_idx, unsigned frame_clock, int allow_frame_slots) {
+  while (slots_total_bytes() > MB_GLASS_CACHE_MAX_BYTES) {
+    int victim = -1;
+    for (int j = 0; j < MB_GLASS_SLOTS; j++) {
+      if (j == keep_idx || !slots[j].bt) continue;
+      if (!allow_frame_slots && slots[j].used > frame_clock) continue;
+      if (victim < 0 || (!slots[j].valid && slots[victim].valid) ||
+          (slots[j].valid == slots[victim].valid && slots[j].used < slots[victim].used)) {
+        victim = j;
+      }
+    }
+    if (victim < 0) break;
+    slot_drop_tex(&slots[victim]);
+    slots[victim].valid = 0;
+  }
+}
+
+// The blur just made (blur) kept in the slot least lately shown: by swapping texture/FBO handles with the level
+// (zero GPU blit) when the level is close to the grab's size, or copying only the grab's active bottom-left region
+// into a compact 64-px-aligned slot texture when the shared level is much larger than the grab.
 static glass_slot *slot_fill(const Grab *m, unsigned frame_clock) {
   level *L = grab_blurred(m);
+  int lw[4], lh[4];
+  grab_levels(m, lw, lh);
+  int sk = m->progressive ? 0 : m->k;
+  int gw = lw[sk] > 0 ? lw[sk] : 1;
+  int gh = lh[sk] > 0 ? lh[sk] : 1;
+  int Lw = L->w, Lh = L->h;
+  int bw = (gw + 63) & ~63;
+  int bh = (gh + 63) & ~63;
+  if (bw > Lw) bw = Lw;
+  if (bh > Lh) bh = Lh;
+  if (bw < 1) bw = 1;
+  if (bh < 1) bh = 1;
+  size_t L_area = (size_t)Lw * (size_t)Lh;
+  size_t b_area = (size_t)bw * (size_t)bh;
+  int full_size = (bw >= Lw && bh >= Lh);
+  int use_swap = full_size || (L_area <= 2 * b_area && glass_tex_bytes(Lw, Lh) <= MB_GLASS_CACHE_MAX_BYTES);
   int t0 = -1, t1 = -1, t2 = -1, t3 = -1, t4 = -1, fallback = 0;
   for (int i = 0; i < MB_GLASS_SLOTS; i++) {
     glass_slot *s = &slots[i];
     if (s->used < slots[fallback].used) fallback = i;
     if (s->used > frame_clock) continue;
     int has_bt = s->bt != 0;
-    int same_tex = has_bt && s->bw == L->w && s->bh == L->h && s->bf == L->format;
+    int reuse_tex = 0;
+    if (use_swap) {
+      reuse_tex = has_bt && s->bw == Lw && s->bh == Lh && s->bf == L->format;
+    } else {
+      reuse_tex = has_bt && s->bf == L->format && s->bw >= gw && s->bh >= gh &&
+                  (size_t)s->bw * (size_t)s->bh <= 2 * b_area;
+    }
     if (!s->valid) {
-      if (same_tex) {
+      if (reuse_tex) {
         if (t0 < 0) t0 = i;
       } else if (!has_bt) {
         if (t1 < 0) t1 = i;
       } else {
         if (t3 < 0) t3 = i;
       }
-    } else if (same_tex) {
+    } else if (reuse_tex) {
       if (t2 < 0 || s->used < slots[t2].used) t2 = i;
     }
     if (t4 < 0 || s->used < slots[t4].used) t4 = i;
@@ -2145,24 +2486,47 @@ static glass_slot *slot_fill(const Grab *m, unsigned frame_clock) {
   int idx = t0 >= 0 ? t0 : t1 >= 0 ? t1 : t2 >= 0 ? t2 : t3 >= 0 ? t3 : t4 >= 0 ? t4 : fallback;
   glass_slot *s = &slots[idx];
   s->valid = 0;
-  if (s->bt != 0 && s->bw == L->w && s->bh == L->h && s->bf == L->format) {
-    GLuint tmp_t = s->bt, tmp_fb = s->bfb;
-    s->bt = L->t;
-    s->bfb = L->fb;
-    L->t = tmp_t;
-    L->fb = tmp_fb;
-  } else {
-    if (s->bt) {
-      glDeleteFramebuffers(1, &s->bfb);
-      glDeleteTextures(1, &s->bt);
+  s->gen = ++slots_gen;
+  if (use_swap) {
+    if (s->bt != 0 && s->bw == Lw && s->bh == Lh && s->bf == L->format) {
+      GLuint tmp_t = s->bt, tmp_fb = s->bfb;
+      s->bt = L->t;
+      s->bfb = L->fb;
+      L->t = tmp_t;
+      L->fb = tmp_fb;
+    } else {
+      slot_drop_tex(s);
+      s->bt = L->t;
+      s->bfb = L->fb;
+      s->bw = Lw;
+      s->bh = Lh;
+      s->bf = L->format;
+      *L = level_tex(s->bf, s->bw, s->bh);
     }
-    s->bt = L->t;
-    s->bfb = L->fb;
-    s->bw = L->w;
-    s->bh = L->h;
-    s->bf = L->format;
-    *L = level_tex(s->bf, s->bw, s->bh);
+  } else {
+    if (!(s->bt != 0 && s->bf == L->format && s->bw >= gw && s->bh >= gh &&
+          (size_t)s->bw * (size_t)s->bh <= 2 * b_area)) {
+      slot_drop_tex(s);
+      level nl = level_tex(L->format, bw, bh);
+      s->bt = nl.t;
+      s->bfb = nl.fb;
+      s->bw = nl.w;
+      s->bh = nl.h;
+      s->bf = nl.format;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, L->fb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s->bfb);
+#ifdef GL_ES_VERSION_3_0
+    {
+      const GLenum att = GL_COLOR_ATTACHMENT0;
+      glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &att);
+    }
+#endif
+    glBlitFramebuffer(0, 0, gw, gh, 0, 0, gw, gh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
   }
+  slots_evict_budget(idx, frame_clock, 0);
   return s;
 }
 
@@ -2187,35 +2551,71 @@ static void slot_keep(glass_slot *s, const Grab *m, const double key[9]) {
 
 static void main_state(void);
 
+typedef struct {
+  int tid;
+  glass_slot *slot;
+  unsigned gen;
+  Grab grab;
+} gl_pre_hit;
+
 // What the run [start, end) of glass sees (`pieces`: where the frame's shapes' pieces start, `r`, `g`, `b` the ground it
 // was cleared to), blurred anew or as a slot keeps it; 0 when none of it shows. Leaves the main programs' state.
 static int capture(const float *f, int32_t start, int32_t end, int32_t count, int32_t pieces, double r, double g,
-                   double b, unsigned frame_clock) {
+                   double b, unsigned frame_clock, const gl_pre_hit *pre_hits, int pre_hits_n) {
   Grab m;
-  int shows = grab_of(&m, f, start, end, count);
+  int tid = (int)f[start * MB_INST + 20];
+  int shows = 0;
+  glass_slot *s = NULL;
+  for (int h = 0; h < pre_hits_n; h++) {
+    if (pre_hits[h].tid == tid) {
+      glass_slot *hs = pre_hits[h].slot;
+      if (hs && hs->valid && hs->bt && hs->gen == pre_hits[h].gen) {
+        m = pre_hits[h].grab;
+        shows = 1;
+        s = hs;
+      }
+      break;
+    }
+  }
   double stretch_w = ((int)(cur_w * cur_scale + 0.5) != fb_w) ? cur_w : 0.0;
   double stretch_h = (vhp == fb_h && (int)(cur_h * cur_scale + 0.5) != fb_h) ? cur_h : 0.0;
   double key[9] = {fb_w, fb_h, cur_scale, r, g, b, over_other, stretch_w, stretch_h};
+  int switched = 0;
+  if (!s) shows = grab_of(&m, f, start, end, count);
   if (shows) {
-    int known = under_take(f, start, count, pieces, &m);
-    glass_slot *s = known ? slot_same(&m, key) : NULL;
     int reblurred = 0;
     if (!s) {
-      reblurred = 1;
-      blur(&m);
-      s = slot_fill(&m, frame_clock);
-      // (an image drawn under it that had no texture yet: it comes under the same instances, so this blur is not kept
-      // to be shown again as theirs)
-      if (known && !encode_missing) slot_keep(s, &m, key);
+      int known = under_take(f, start, count, pieces, &m);
+      s = known ? slot_same(&m, key) : NULL;
+      if (!s) {
+        reblurred = 1;
+        switched = 1;
+        blur(&m);
+        s = slot_fill(&m, frame_clock);
+        // (an image drawn under it that had no texture yet: it comes under the same instances, so this blur is not kept
+        // to be shown again as theirs)
+        if (known && !encode_missing) slot_keep(s, &m, key);
+      }
     }
     kept_ok = s->valid;
     slot_show(&m, s);
     gl_ad_pend ad_pend[MB_ADAPTIVE_MAX];
     int ad_n_upd = ad_collect_and_match(f, start, end, count, &m, reblurred, ad_cur_dt, ad_frame_serial, ad_pend);
-    if (ad_n_upd > 0) ad_run_updates(ad_pend, ad_n_upd, ad_cur_dt);
+    if (ad_n_upd > 0) {
+      switched = 1;
+      ad_run_updates(ad_pend, ad_n_upd, ad_cur_dt);
+    }
     ad_fill_uniforms();
   }
-  main_state();
+  if (switched) {
+    main_state();
+  } else if (shows) {
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, ad_tex[ad_cur] ? ad_tex[ad_cur] : atlas);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : atlas);
+    prog_gen++;
+  }
   return shows;
 }
 
@@ -2498,6 +2898,7 @@ static int32_t gl_layer_render(int32_t id, int32_t pw, int32_t ph, double scale,
 // thread and handed over) kept and drawn, as gl_present says.
 static void gl_present_drawn(int32_t count, double r, double g, double b);
 static void gl_present_kept(int32_t count, double r, double g, double b) {
+  ad_poll_readbacks();
   glass_drawn = 0;
   ad_mode = 1;
   ad_cur_dt = ad_next_dt();
@@ -2513,12 +2914,32 @@ static void gl_present_kept(int32_t count, double r, double g, double b) {
       dirty_whole = 1;
   }
   gl_present_drawn(count, r, g, b);
+  ad_rb_finish(ad_frame_serial);
   ad_finalize_frame(whole, ad_frame_serial);
   glass_idle_tick();
 }
 
 static int gl_adaptive_step(void) {
   if (!ad_settling || kept_count <= 0 || !fbuf) return 0;
+  ad_poll_readbacks();
+  int need = 0;
+  for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
+    mb_ad_slot *s = &ad_slots[i];
+    if (!s->active || s->settle_left <= 0.0) continue;
+    if (ad_conv_serial[i] >= s->settle_serial) {
+      s->settle_left = 0.0;
+    } else {
+      need = 1;
+    }
+  }
+  if (!need) {
+    ad_settling = 0;
+    if (!offscreen) {
+      if (canvas_ok && canvas_fb) canvas_shown();
+      else draw_kept();
+    }
+    return 0;
+  }
   dirty_told = 1;
   dirty_whole = dirty_n = 0;
   gl_present_kept(kept_count, kept_r, kept_g, kept_b);
@@ -2802,6 +3223,107 @@ static void draw_into(GLuint fb, int part) {
   // (where the pieces of the frame's shapes start: what a capture is of, with what is before it)
   int32_t pieces = count;
   while (pieces > 0 && (int)(fbuf[(pieces - 1) * MB_INST + 5] + 0.5f) == 12) pieces--;
+  // Pre-scan glass captures before binding target_fb: size blur levels once, cache slot hits (kind 5 & 6),
+  // and batch adaptive updates for hit kind-6 groups into a single pass so tile-based GPUs avoid mid-frame splits.
+  gl_pre_hit pre_hits[16];
+  int pre_hits_n = 0;
+  if (count > 0) {
+    int max_w = 0, max_h = 0, scan_bound = 0, any_glass = 0, scan_bd = 0;
+    for (int32_t s0 = 0; s0 < count;) {
+      int sk = (int)(fbuf[s0 * MB_INST + 5] + 0.5f);
+      if (sk == 14) { scan_bd++; s0++; continue; }
+      if (sk == 15) { if (scan_bd > 0) scan_bd--; s0++; continue; }
+      int stid = (int)fbuf[s0 * MB_INST + 20];
+      int32_t e0 = s0 + 1;
+      if (scan_bd == 0 && stid < 0) {
+        any_glass = 1;
+        while (e0 < count && (int)fbuf[e0 * MB_INST + 20] == stid) {
+          int ek = (int)(fbuf[e0 * MB_INST + 5] + 0.5f);
+          if (ek == 14 || ek == 15) break;
+          e0++;
+        }
+        if (stid != scan_bound) {
+          scan_bound = stid;
+          Grab gm;
+          if (grab_of(&gm, fbuf, s0, e0, count)) {
+            if (gm.w > max_w) max_w = gm.w;
+            if (gm.h > max_h) max_h = gm.h;
+          }
+        }
+      }
+      s0 = e0;
+    }
+    if (any_glass) {
+      levels_sized = 1;
+      if (max_w > lv_w || max_h > lv_h) {
+        ensure_levels(max_w, max_h);
+      } else if (ad_mode > 0 && lv[0].t && max_w > 0 && max_h > 0) {
+        if (max_w > lv_frame_max_w) lv_frame_max_w = max_w;
+        if (max_h > lv_frame_max_h) lv_frame_max_h = max_h;
+      }
+      if (ad_mode > 0 && ad_cur_dt >= 0.0) {
+        gl_ad_batch pre_batch[MB_ADAPTIVE_MAX];
+        int pre_n = 0;
+        double stretch_w = ((int)(cur_w * cur_scale + 0.5) != fb_w) ? cur_w : 0.0;
+        double stretch_h = (vhp == fb_h && (int)(cur_h * cur_scale + 0.5) != fb_h) ? cur_h : 0.0;
+        double key[9] = {fb_w, fb_h, cur_scale, r, g, b, over_other, stretch_w, stretch_h};
+        int pre_bound = 0, pre_bd = 0;
+        for (int32_t s0 = 0; s0 < count;) {
+          int skind = (int)(fbuf[s0 * MB_INST + 5] + 0.5f);
+          if (skind == 14) { pre_bd++; s0++; continue; }
+          if (skind == 15) { if (pre_bd > 0) pre_bd--; s0++; continue; }
+          int stid = (int)fbuf[s0 * MB_INST + 20];
+          int32_t e0 = s0 + 1;
+          if (pre_bd == 0 && stid < 0) {
+            while (e0 < count && (int)fbuf[e0 * MB_INST + 20] == stid) {
+              int ek = (int)(fbuf[e0 * MB_INST + 5] + 0.5f);
+              if (ek == 14 || ek == 15) break;
+              e0++;
+            }
+            if (stid != pre_bound) {
+              pre_bound = stid;
+              if (skind == 5 || skind == 6) {
+                Grab gm;
+                if (grab_of(&gm, fbuf, s0, e0, count) && under_take(fbuf, s0, count, pieces, &gm)) {
+                  glass_slot *sl = slot_same(&gm, key);
+                  if (sl && sl->bt) {
+                    if (pre_hits_n < 16) {
+                      pre_hits[pre_hits_n].tid = stid;
+                      pre_hits[pre_hits_n].slot = sl;
+                      pre_hits[pre_hits_n].gen = sl->gen;
+                      pre_hits[pre_hits_n].grab = gm;
+                      pre_hits_n++;
+                    }
+                    if (skind == 6 && pre_n < MB_ADAPTIVE_MAX) {
+                      gl_ad_pend tmp[MB_ADAPTIVE_MAX];
+                      int nu = ad_collect_and_match(fbuf, s0, e0, count, &gm, 0, ad_cur_dt, ad_frame_serial, tmp);
+                      if (nu > 0) {
+                        float map[4], uvc[4];
+                        grab_map_uvc(&gm, sl->bw, sl->bh, map, uvc);
+                        for (int i = 0; i < nu && pre_n < MB_ADAPTIVE_MAX; i++) {
+                          pre_batch[pre_n].p = tmp[i];
+                          pre_batch[pre_n].bt = sl->bt;
+                          memcpy(pre_batch[pre_n].map, map, sizeof map);
+                          memcpy(pre_batch[pre_n].uvc, uvc, sizeof uvc);
+                          pre_n++;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          s0 = e0;
+        }
+        if (pre_n > 0) {
+          ad_run_updates_batch(pre_batch, pre_n, ad_cur_dt);
+          ad_fill_uniforms();
+          main_state();
+        }
+      }
+    }
+  }
   while (start < count) {
     int tid = (int)fbuf[start * MB_INST + 20];
     int kind = (int)(fbuf[start * MB_INST + 5] + 0.5f);
@@ -2980,7 +3502,8 @@ static void draw_into(GLuint fb, int part) {
         if (max_w > lv_w || max_h > lv_h) ensure_levels(max_w, max_h);
       }
       if (tid != bound) {
-        shows = capture(fbuf, start, end, count, pieces, r, g, b, frame_clock);
+        shows = capture(fbuf, start, end, count, pieces, r, g, b, frame_clock,
+                        bdepth == 0 ? pre_hits : NULL, bdepth == 0 ? pre_hits_n : 0);
         bound = tid;
       }
       if (shows) {
@@ -3029,6 +3552,7 @@ static void draw_into(GLuint fb, int part) {
     }
     start = end;
   }
+  if (levels_sized && slots_total_bytes() > MB_GLASS_CACHE_MAX_BYTES) slots_evict_budget(-1, frame_clock, 1);
   if (cut_on) glDisable(GL_SCISSOR_TEST);
   cut_on = 0;
   target_fb = was;

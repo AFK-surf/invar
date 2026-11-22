@@ -119,6 +119,10 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
     @Override
     public void onPause() {
         paused = true;
+        lastSettleNs = 0L;
+        if (settleScheduled.getAndSet(false)) {
+            Host.main.post(() -> Choreographer.getInstance().removeFrameCallback(settleVsync));
+        }
         pacer.setImeMoving(false);
         trim();
         if (!ONE && logic != null) logic.post(this::closeHints);
@@ -383,6 +387,38 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
         if (mail.handOver(shows, MBText.placed)) requestRender();
     }
 
+    /** VSync-paced settle wakeup for adaptive glass (main thread Choreographer -> GLThread requestRender, capped <= 60 Hz). */
+    private final AtomicBoolean settleScheduled = new AtomicBoolean();
+    private volatile long lastSettleNs;
+    private final Choreographer.FrameCallback settleVsync = this::onSettleVsync;
+
+    private void onSettleVsync(long t) {
+        if (paused || Host.view != this || !Native.adaptiveSettling()) {
+            settleScheduled.set(false);
+            return;
+        }
+        if (t - lastSettleNs < 15_000_000L) {
+            Choreographer.getInstance().postFrameCallback(settleVsync);
+            return;
+        }
+        settleScheduled.set(false);
+        lastSettleNs = t;
+        requestRender();
+    }
+
+    private void scheduleAdaptiveSettle() {
+        if (paused) return;
+        if (settleScheduled.compareAndSet(false, true)) {
+            Host.main.post(() -> {
+                if (paused || Host.view != this) {
+                    settleScheduled.set(false);
+                    return;
+                }
+                Choreographer.getInstance().postFrameCallback(settleVsync);
+            });
+        }
+    }
+
     private volatile long glWorked;
     private boolean swapPending;
     private long swapT0, swapD0, swapEnd;
@@ -425,7 +461,10 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
         } else {
             Native.redraw();
         }
-        if (Native.adaptiveSettling()) requestRender();
+        if (Native.adaptiveSettling()) {
+            if (t.took) lastSettleNs = System.nanoTime();
+            scheduleAdaptiveSettle();
+        }
         mail.runAll(t.retire);
         showAt(t.shows);
         if (t.ref != null) MBText.frameDrawn(t.ref);

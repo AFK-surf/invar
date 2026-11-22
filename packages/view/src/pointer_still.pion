@@ -1,0 +1,325 @@
+// A pointer-dependent layout can have no fixed point: showing something under
+// the pointer can move it out from under it, and hiding it move it back. Once
+// Tree::laid_out has tried enough passes, remember the pointer's observations
+// and their geometry so unrelated layouts do not restart that cycle. A moved
+// pointer, changed geometry or changed observation is tried again.
+
+///|
+struct PointerBox {
+  at : Int
+  gen : Int
+  placed : (Double, Double, Double)
+  width : Double
+  height : Double
+}
+
+///|
+struct PointerWithinObs {
+  box : PointerBox
+  inside : Option[Bool]
+  last_inside : Option[Bool]
+  piece : Option[Int]
+  last_piece : Option[Int]
+}
+
+///|
+struct PointerBarObs {
+  box : PointerBox
+  bounds : (Double, Double, Double, Double)
+  bar_near : Double
+  bar_across : Bool
+  last_near : Bool
+  now_near : Bool
+}
+
+///|
+struct PointerStill {
+  pass : Int
+  within : Array[PointerWithinObs]
+  bars : Array[PointerBarObs]
+}
+
+///|
+fn pointer_box_eq(a : PointerBox, b : PointerBox) -> Bool {
+  a.at == b.at &&
+  a.gen == b.gen &&
+  a.placed.0 == b.placed.0 &&
+  a.placed.1 == b.placed.1 &&
+  a.placed.2 == b.placed.2 &&
+  a.width == b.width &&
+  a.height == b.height
+}
+
+///|
+fn opt_bool_eq(a : Option[Bool], b : Option[Bool]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+///|
+fn opt_int_eq(a : Option[Int], b : Option[Int]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+///|
+fn pointer_within_obs_eq(a : PointerWithinObs, b : PointerWithinObs) -> Bool {
+  pointer_box_eq(a.box, b.box) &&
+  opt_bool_eq(a.inside, b.inside) &&
+  opt_bool_eq(a.last_inside, b.last_inside) &&
+  opt_int_eq(a.piece, b.piece) &&
+  opt_int_eq(a.last_piece, b.last_piece)
+}
+
+///|
+fn pointer_bar_obs_eq(a : PointerBarObs, b : PointerBarObs) -> Bool {
+  pointer_box_eq(a.box, b.box) &&
+  a.bounds.0 == b.bounds.0 &&
+  a.bounds.1 == b.bounds.1 &&
+  a.bounds.2 == b.bounds.2 &&
+  a.bounds.3 == b.bounds.3 &&
+  a.bar_near == b.bar_near &&
+  a.bar_across == b.bar_across &&
+  a.last_near == b.last_near &&
+  a.now_near == b.now_near
+}
+
+///|
+fn pointer_still_eq(a : PointerStill, b : PointerStill) -> Bool {
+  if a.pass != b.pass ||
+  a.within.length() != b.within.length() ||
+  a.bars.length() != b.bars.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.within.length() {
+    if !pointer_within_obs_eq(a.within[i], b.within[i]) {
+      return false
+    }
+    i += 1
+  }
+  let mut j = 0
+  while j < a.bars.length() {
+    if !pointer_bar_obs_eq(a.bars[j], b.bars[j]) {
+      return false
+    }
+    j += 1
+  }
+  true
+}
+
+///|
+fn Tree::pointer_box(self : Tree, at : Int) -> PointerBox {
+  let n = self.nodes[at]
+  PointerBox::{ at, gen: n.gen, placed: self.placed(at), width: n.lw, height: n.lh }
+}
+
+///|
+fn Tree::pointer_observations(self : Tree) -> PointerStill {
+  let within : Array[PointerWithinObs] = []
+  for entry in self.withins_at {
+    let (at, gen) = entry
+    if at < 0 || at >= self.nodes.length() {
+      continue
+    }
+    let n = self.nodes[at]
+    if !n.live || n.gen != gen {
+      continue
+    }
+    let (inside, last_inside) = match n.within_cell {
+      Some(cell) => (Some(self.within(at)), Some(cell.untracked()))
+      None => (None, None)
+    }
+    let (piece, last_piece) = match n.piece_cell {
+      Some((cell, f)) => (Some(self.piece_in(at, f)), Some(cell.untracked()))
+      None => (None, None)
+    }
+    within.push(
+      PointerWithinObs::{
+        box: self.pointer_box(at),
+        inside,
+        last_inside,
+        piece,
+        last_piece,
+      },
+    )
+  }
+  let bars : Array[PointerBarObs] = []
+  let bar_at = if self.bar_cols.length() == 0 { None } else { self.bar_near_at() }
+  for entry in self.bar_cols {
+    let (at, gen) = entry
+    if at < 0 || at >= self.nodes.length() {
+      continue
+    }
+    let n = self.nodes[at]
+    if !n.live || n.gen != gen {
+      continue
+    }
+    match n.bar_near_cell {
+      Some(cell) =>
+      bars.push(
+        PointerBarObs::{
+          box: self.pointer_box(at),
+          bounds: self.input_bounds(NodeId::{ at, gen }),
+          bar_near: n.bar_near,
+          bar_across: n.bar_across,
+          last_near: cell.untracked(),
+          now_near: opt_eq(bar_at, Some(at)),
+        },
+      )
+      None => ()
+    }
+  }
+  PointerStill::{ pass: self.pointer_pass, within, bars }
+}
+
+///|
+/// Keep a few states, not bindings or callbacks, so a long chain with changing
+/// geometry can finish while an oscillation stops without holding a frame.
+fn Tree::pointer_cycle_seen(
+  self : Tree,
+  passes : Int,
+  seen : Array[PointerStill],
+) -> Bool {
+  if passes < pointer_passes_check {
+    return false
+  }
+  let now = self.pointer_observations()
+  let mut repeated = false
+  for old in seen {
+    if pointer_still_eq(old, now) {
+      repeated = true
+      break
+    }
+  }
+  if passes >= pointer_passes_most || repeated {
+    // Only hold the observers that changed in the loop. Other observers must
+    // keep working while these wait for their own geometry or inputs to change.
+    let within : Array[PointerWithinObs] = []
+    let mut i = 0
+    while i < now.within.length() {
+      let w = now.within[i]
+      let mut differed = false
+      for old in seen {
+        if i >= old.within.length() || !pointer_within_obs_eq(old.within[i], w) {
+          differed = true
+          break
+        }
+      }
+      if differed {
+        within.push(w)
+      }
+      i += 1
+    }
+    let bars : Array[PointerBarObs] = []
+    let mut j = 0
+    while j < now.bars.length() {
+      let b = now.bars[j]
+      let mut differed = false
+      for old in seen {
+        if j >= old.bars.length() || !pointer_bar_obs_eq(old.bars[j], b) {
+          differed = true
+          break
+        }
+      }
+      if differed {
+        bars.push(b)
+      }
+      j += 1
+    }
+    self.pointer_still = if within.length() == 0 && bars.length() == 0 {
+      Some(now)
+    } else {
+      Some(PointerStill::{ pass: now.pass, within, bars })
+    }
+    true
+  } else {
+    if seen.length() < 16 {
+      seen.push(now)
+    }
+    false
+  }
+}
+
+///|
+fn Tree::pointer_still_holds(self : Tree) -> Bool {
+  match self.pointer_still {
+    None => false
+    Some(was) => {
+      let now = self.pointer_observations()
+      // The stopped observations remain in their original order even when
+      // unrelated nodes are added or removed.
+      let mut within = 0
+      for w in now.within {
+        if within < was.within.length() &&
+        pointer_within_obs_eq(w, was.within[within]) {
+          within += 1
+        }
+      }
+      let mut bars = 0
+      for b in now.bars {
+        if bars < was.bars.length() && pointer_bar_obs_eq(b, was.bars[bars]) {
+          bars += 1
+        }
+      }
+      if within == was.within.length() && bars == was.bars.length() {
+        true
+      } else {
+        self.pointer_still = None
+        false
+      }
+    }
+  }
+}
+
+///|
+fn Tree::pointer_within_still(self : Tree, at : Int, gen : Int) -> Bool {
+  match self.pointer_still {
+    None => false
+    Some(was) => {
+      for w in was.within {
+        if w.box.at == at && w.box.gen == gen {
+          return true
+        }
+      }
+      false
+    }
+  }
+}
+
+///|
+fn Tree::pointer_bar_still(self : Tree, at : Int, gen : Int) -> Bool {
+  match self.pointer_still {
+    None => false
+    Some(was) => {
+      for b in was.bars {
+        if b.box.at == at && b.box.gen == gen {
+          return true
+        }
+      }
+      false
+    }
+  }
+}
+
+///|
+/// A binding marked by the pointer may also read other inputs. A change to
+/// one of them can remove the feedback even when the box stays where it was.
+fn Tree::pointer_binding_changed(self : Tree, b : Bound) -> Unit {
+  match self.pointer_still {
+    Some(was) if b.pointer_pass == was.pass => {
+      self.pointer_still = None
+      self.pointer_again = true
+    }
+    _ => ()
+  }
+  if self.withins_passing {
+    b.pointer_pass = self.pointer_pass
+  }
+}

@@ -2366,8 +2366,23 @@
     const sg = Math.sqrt(Math.max(sk * sk - pre, 0));
     const fade = isProgressive ? [f32[a + 52], f32[a + 53], f32[a + 54], f32[a + 55]] : null;
     const fadex = isProgressive ? [f32[a + 56], f32[a + 57], f32[a + 58], f32[a + 59]] : null;
+    let visX = 0, visY = 0, visW = w, visH = h;
+    if (isProgressive) {
+      let vx0 = Math.floor(x0 * sc) - px0 - 2;
+      let vy0 = (Hh - Math.ceil(y1 * sc)) - pb0 - 2;
+      let vx1 = Math.ceil(x1 * sc) - px0 + 2;
+      let vy1 = (Hh - Math.floor(y0 * sc)) - pb0 + 2;
+      if (vx0 < 0) vx0 = 0;
+      if (vy0 < 0) vy0 = 0;
+      if (vx1 > w) vx1 = w;
+      if (vy1 > h) vy1 = h;
+      if (vx1 <= vx0) { vx0 = 0; vx1 = w; }
+      if (vy1 <= vy0) { vy0 = 0; vy1 = h; }
+      visX = vx0; visY = vy0; visW = vx1 - vx0; visH = vy1 - vy0;
+    }
     return {
       px0, pb0, w, h, top: Hh, k, contained, progressive: isProgressive, n: mN, sg, sp, fade, fadex,
+      visX, visY, visW, visH,
       gb: [x0 - 2, y0 - 2, x1 + 2, y1 + 2],
       shape: mShape, rad: mRad, edge,
     };
@@ -2449,7 +2464,12 @@
     bdTex = bt;
     gmap[0] = sc / d / bw; gmap[1] = -sc / d / bh;
     gmap[2] = -m.px0 / d / bw; gmap[3] = (m.top - m.pb0) / d / bh;
-    guvc[0] = 0.5 / bw; guvc[1] = 0.5 / bh; guvc[2] = (lw[sk] - 0.5) / bw; guvc[3] = (lh[sk] - 0.5) / bh;
+    if (m.progressive) {
+      guvc[0] = (m.visX + 0.5) / bw; guvc[1] = (m.visY + 0.5) / bh;
+      guvc[2] = (m.visX + m.visW - 0.5) / bw; guvc[3] = (m.visY + m.visH - 0.5) / bh;
+    } else {
+      guvc[0] = 0.5 / bw; guvc[1] = 0.5 / bh; guvc[2] = (lw[sk] - 0.5) / bw; guvc[3] = (lh[sk] - 0.5) / bh;
+    }
   }
 
   function blurGlass(m) {
@@ -2463,6 +2483,10 @@
     if (gl.invalidateFramebuffer) gl.invalidateFramebuffer(gl.DRAW_FRAMEBUFFER, [gl.COLOR_ATTACHMENT0]);
     gl.blitFramebuffer(m.px0, m.pb0, m.px0 + w, m.pb0 + h, 0, 0, w, h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     gl.useProgram(post);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
     const [lw, lh] = grabLevels(m);
     if (m.progressive) {
       let prevVar = 0;
@@ -2495,7 +2519,13 @@
       gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, lv[1].t); gl.uniform1i(PU.u_lv1, 1);
       gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, lv[2].t); gl.uniform1i(PU.u_lv2, 2);
       gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, lv[3].t); gl.uniform1i(PU.u_lv3, 3);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(m.visX, m.visY, m.visW, m.visH);
       postPass(lv[0], w, h, lv[4], w, h, 4, 0, 0, 0);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, null);
       gl.activeTexture(gl.TEXTURE0);
       return;
     }
@@ -2516,6 +2546,8 @@
   function reaches(i, run, g) {
     const b = i * INST;
     const kind = Math.round(f32[b + 5]);
+    const angle = f32[b + 32];
+    if (angle !== 0 && kind === 6 && (f32[b + 23] > 0 || f32[run * INST + 23] > 0)) return true;
     let e = (kind === 2 || kind === 14 || kind === 15) ? Math.abs(f32[b + 7]) * 3 + 2 : 1;
     if (kind === 6) e = Math.max(f32[b + 23], f32[run * INST + 23], 0) + 2;
     e += 1;
@@ -2524,7 +2556,6 @@
     const ry0 = Math.min(f32[b + 1], f32[b + 1] + f32[b + 3]) - e;
     const ry1 = Math.max(f32[b + 1], f32[b + 1] + f32[b + 3]) + e;
     let x0 = rx0, x1 = rx1, y0 = ry0, y1 = ry1;
-    const angle = f32[b + 32];
     if (angle !== 0) {
       const c = Math.cos(angle), s = Math.sin(angle);
       const ox = f32[b + 33], oy = f32[b + 34];
@@ -2533,10 +2564,10 @@
       const ax1 = ox + c * dx1 - s * dy0, ay1 = oy + s * dx1 + c * dy0;
       const ax2 = ox + c * dx0 - s * dy1, ay2 = oy + s * dx0 + c * dy1;
       const ax3 = ox + c * dx1 - s * dy1, ay3 = oy + s * dx1 + c * dy1;
-      x0 = Math.min(ax0, ax1, ax2, ax3);
-      x1 = Math.max(ax0, ax1, ax2, ax3);
-      y0 = Math.min(ay0, ay1, ay2, ay3);
-      y1 = Math.max(ay0, ay1, ay2, ay3);
+      x0 = Math.min(ax0, ax1, ax2, ax3) - 1;
+      x1 = Math.max(ax0, ax1, ax2, ax3) + 1;
+      y0 = Math.min(ay0, ay1, ay2, ay3) - 1;
+      y1 = Math.max(ay0, ay1, ay2, ay3) + 1;
     }
     return x1 > g[0] && x0 < g[2] && y1 > g[1] && y0 < g[3];
   }
@@ -2553,47 +2584,92 @@
 
   function underTake(start, count, pieces, m) {
     const sc = rtScale();
-    const g = [m.px0 / sc - 1, (m.top - (m.pb0 + m.h)) / sc - 1, (m.px0 + m.w) / sc + 1, (m.top - m.pb0) / sc + 1];
-    let whole = 0, run = 0;
-    for (let i = 0; i < start; i++) {
-      const tid = f32[i * INST + 20];
-      if (i > 0 && tid !== f32[(i - 1) * INST + 20]) run = i;
-      const k = Math.round(f32[i * INST + 5]);
-      const sees = tid < 0 || k === 7 || ((k === 10 || k === 11) && f32[i * INST + 23] > 0);
-      if (sees && reaches(i, run, g)) whole = i + 1;
+    const dep = [m.px0 / sc - 1, (m.top - (m.pb0 + m.h)) / sc - 1, (m.px0 + m.w) / sc + 1, (m.top - m.pb0) / sc + 1];
+    const seenTids = [];
+    for (let pass = 0; pass < 4; pass++) {
+      let grew = false;
+      for (let i = start - 1; i >= 0; i--) {
+        const bi = i * INST;
+        const tid = f32[bi + 20];
+        const k = Math.round(f32[bi + 5]);
+        const isGlass = tid < 0;
+        const isAd = k === 7 || ((k === 10 || k === 11) && f32[bi + 23] > 0);
+        if (!isGlass && !isAd) continue;
+        let run = i;
+        if (isGlass) {
+          while (run > 0 && f32[(run - 1) * INST + 20] === tid) run--;
+        }
+        if (!reaches(i, run, dep)) continue;
+        if (isGlass) {
+          if (seenTids.indexOf(tid) >= 0) continue;
+          if (seenTids.length < 32) seenTids.push(tid);
+          let firstI = run;
+          for (let j = 0; j < run; j++) {
+            if (f32[j * INST + 20] === tid) { firstI = j; break; }
+          }
+          const a = firstI * INST;
+          const gkind = Math.round(f32[a + 5]);
+          const isContained = gkind === 5 && f32[a + 7] < 0;
+          const blurR = (gkind === 6 && f32[a + 7] < 0) ? 0 : Math.abs(f32[a + 7]);
+          const mergedLiquid = gkind === 6 && f32[a + 23] > 0;
+          const unmergedLiquid = gkind === 6 && !mergedLiquid;
+          let margin = isContained ? 0 : 3 * blurR + (gkind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
+          let gx0 = 1e9, gy0 = 1e9, gx1 = -1e9, gy1 = -1e9;
+          for (let j = firstI; j < count; j++) {
+            const b = j * INST;
+            if (f32[b + 20] !== tid) continue;
+            let bx0, by0, bx1, by1;
+            if (gkind === 6) {
+              const m23 = Math.max(unmergedLiquid ? f32[b + 23] : f32[a + 23], 0);
+              bx0 = f32[b] - m23; by0 = f32[b + 1] - m23;
+              bx1 = f32[b] + f32[b + 2] + m23; by1 = f32[b + 1] + f32[b + 3] + m23;
+              if (unmergedLiquid) {
+                const bm = 3 * blurR + f32[b + 21] * (1 + Math.abs(f32[b + 22])) + m23 + 2;
+                if (bm > margin) margin = bm;
+              }
+            } else {
+              bx0 = Math.max(f32[b], f32[b + 16]); by0 = Math.max(f32[b + 1], f32[b + 17]);
+              bx1 = Math.min(f32[b] + f32[b + 2], f32[b + 18]); by1 = Math.min(f32[b + 1] + f32[b + 3], f32[b + 19]);
+            }
+            if (bx0 < gx0) gx0 = bx0;
+            if (by0 < gy0) gy0 = by0;
+            if (bx1 > gx1) gx1 = bx1;
+            if (by1 > gy1) gy1 = by1;
+          }
+          if (gx1 > gx0 && gy1 > gy0) {
+            const ex0 = gx0 - margin - 2, ey0 = gy0 - margin - 2;
+            const ex1 = gx1 + margin + 2, ey1 = gy1 + margin + 2;
+            if (ex0 < dep[0]) { dep[0] = ex0; grew = true; }
+            if (ey0 < dep[1]) { dep[1] = ey0; grew = true; }
+            if (ex1 > dep[2]) { dep[2] = ex1; grew = true; }
+            if (ey1 > dep[3]) { dep[3] = ey1; grew = true; }
+          }
+        } else {
+          const rad = f32[bi + 23] + 4;
+          const ex0 = f32[bi + 21] - rad, ey0 = f32[bi + 22] - rad;
+          const ex1 = f32[bi + 21] + rad, ey1 = f32[bi + 22] + rad;
+          if (ex0 < dep[0]) { dep[0] = ex0; grew = true; }
+          if (ey0 < dep[1]) { dep[1] = ey0; grew = true; }
+          if (ex1 > dep[2]) { dep[2] = ex1; grew = true; }
+          if (ey1 > dep[3]) { dep[3] = ey1; grew = true; }
+        }
+      }
+      if (!grew) break;
     }
     const baseNeed = start * INST;
     if (underNow.length < baseNeed) underNow = new Float32Array(Math.max(baseNeed, underNow.length * 2));
     let inBlur = 0, blurHit = false;
     let hasVec = false, segMin = 0x7fffffff, segMax = 0;
-    for (let i = 0; i < whole; i++) {
-      if (unstableUnder(i)) return false;
+    let off = 0, picked = 0, run = 0;
+    for (let i = 0; i < start; i++) {
+      const tid = f32[i * INST + 20];
+      if (i > 0 && tid !== f32[(i - 1) * INST + 20]) run = i;
       const k = Math.round(f32[i * INST + 5]);
       if (k === 14) {
-        if (inBlur === 0) blurHit = reaches(i, i, g);
-        inBlur++;
-      } else if (k === 15 && inBlur > 0) {
-        if (--inBlur === 0) blurHit = false;
-      } else if (k === 11) {
-        const f0 = Math.round(f32[i * INST + 12]);
-        const fn = Math.round(f32[i * INST + 13]);
-        if (fn > 0 && f0 >= 0) {
-          hasVec = true;
-          if (f0 < segMin) segMin = f0;
-          if (f0 + fn > segMax) segMax = f0 + fn;
-        }
-      }
-    }
-    let off = whole * INST;
-    if (off > 0) underNow.set(f32.subarray(0, off), 0);
-    let picked = 0;
-    for (let i = whole; i < start; i++) {
-      const k = Math.round(f32[i * INST + 5]);
-      if (k === 14) {
-        if (inBlur === 0) blurHit = reaches(i, i, g);
+        if (inBlur === 0) blurHit = reaches(i, run, dep);
         inBlur++;
       }
-      const hit = blurHit || reaches(i, i, g);
+      const hit = blurHit || reaches(i, run, dep);
       if (k === 15 && inBlur > 0) {
         if (--inBlur === 0) blurHit = false;
       }
@@ -2628,7 +2704,7 @@
       }
     }
     underNowN = off;
-    underWhole = whole;
+    underWhole = 0;
     underPicked = picked;
     return true;
   }
@@ -2636,6 +2712,7 @@
   function grabSame(a, b) {
     if (a.px0 !== b.px0 || a.pb0 !== b.pb0 || a.w !== b.w || a.h !== b.h || a.top !== b.top ||
         a.k !== b.k || a.contained !== b.contained || a.progressive !== b.progressive || a.n !== b.n ||
+        a.visX !== b.visX || a.visY !== b.visY || a.visW !== b.visW || a.visH !== b.visH ||
         a.sg !== b.sg || a.sp !== b.sp) return false;
     for (let i = 0; i < 4; i++) if (a.gb[i] !== b.gb[i]) return false;
     for (let i = 0; i < a.n * 4; i++) if (a.shape[i] !== b.shape[i]) return false;

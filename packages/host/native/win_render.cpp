@@ -2280,6 +2280,20 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   // (a capture outside the part drawn: neither copied nor drawn. One that meets it is in it whole: @damage)
   if (cut_on && (px1 <= cut.left || cut.right <= px0 || py1 <= cut.top || cut.bottom <= py0)) return 0;
   int w = px1 - px0, h = py1 - py0;
+  int vis_x = 0, vis_y = 0, vis_w = w, vis_h = h;
+  if (is_progressive) {
+    int vx0 = (int)floorf(x0 * sc) - px0 - 2;
+    int vy0 = (int)floorf(y0 * sc) - py0 - 2;
+    int vx1 = (int)ceilf(x1 * sc) - px0 + 2;
+    int vy1 = (int)ceilf(y1 * sc) - py0 + 2;
+    if (vx0 < 0) vx0 = 0;
+    if (vy0 < 0) vy0 = 0;
+    if (vx1 > w) vx1 = w;
+    if (vy1 > h) vy1 = h;
+    if (vx1 <= vx0) { vx0 = 0; vx1 = w; }
+    if (vy1 <= vy0) { vy0 = 0; vy1 = h; }
+    vis_x = vx0; vis_y = vy0; vis_w = vx1 - vx0; vis_h = vy1 - vy0;
+  }
   if (!ensure_levels(w, h, pw, ph)) return 0;
   ID3D11Resource *res = NULL;
   target->GetResource(&res);
@@ -2340,7 +2354,11 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
     ctx->PSSetConstantBuffers(0, 1, &pbuf);
     ID3D11ShaderResourceView *srvs[4] = {lv[0].srv, lv[1].srv, lv[2].srv, lv[3].srv};
     ctx->PSSetShaderResources(0, 4, srvs);
+    ctx->RSSetState(raster_cut);
+    D3D11_RECT vsc = {vis_x, vis_y, vis_x + vis_w, vis_y + vis_h};
+    ctx->RSSetScissorRects(1, &vsc);
     ctx->Draw(3, 0);
+    ctx->RSSetState(raster);
     ctx->PSSetShaderResources(0, 4, none4);
   } else {
     if (contained) {
@@ -2369,7 +2387,12 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   gsrv = L->srv;
   gu.map[0] = sc / d / L->w; gu.map[1] = sc / d / L->h;
   gu.map[2] = -(float)px0 / d / L->w; gu.map[3] = -(float)py0 / d / L->h;
-  gu.uvc[0] = 0.5f / L->w; gu.uvc[1] = 0.5f / L->h; gu.uvc[2] = (lw[sk] - 0.5f) / L->w; gu.uvc[3] = (lh[sk] - 0.5f) / L->h;
+  if (is_progressive && prog_ps) {
+    gu.uvc[0] = ((float)vis_x + 0.5f) / L->w; gu.uvc[1] = ((float)vis_y + 0.5f) / L->h;
+    gu.uvc[2] = ((float)(vis_x + vis_w) - 0.5f) / L->w; gu.uvc[3] = ((float)(vis_y + vis_h) - 0.5f) / L->h;
+  } else {
+    gu.uvc[0] = 0.5f / L->w; gu.uvc[1] = 0.5f / L->h; gu.uvc[2] = (lw[sk] - 0.5f) / L->w; gu.uvc[3] = (lh[sk] - 0.5f) / L->h;
+  }
   WinAdPend ad_pend[MB_ADAPTIVE_MAX];
   int ad_n_upd = ad_collect_and_match(rw, f, start, count, ad_backdrop_changed, encode_missing, ad_cur_dt,
                                       rw ? rw->ad_frame_serial : 0, ad_pend);
