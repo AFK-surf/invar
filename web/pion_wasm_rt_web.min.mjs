@@ -2,7 +2,11 @@
 // Synced from AFK-surf/pion runtime/pion_wasm_rt_web.mjs with zero-copy host bridge helpers exposed.
 const TAG_STRING = 1, TAG_BYTES = 2, TAG_ARRAY = 3, TAG_MAP = 7, TAG_CHANNEL = 8, TAG_MUTEX = 9, TAG_ATOMIC = 10, TAG_STRBUF = 11, TAG_SCOPE = 12, TAG_WORLD = 13;
 const FLAG_FROZEN = 1, FLAG_IMMORTAL = 2, HDR = 24, PAGE = 65536;
-const CLASSES = [32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048];
+const FREE_MAGIC = 0xFEEEFEEE;
+const CLASSES = [32, 48, 64, 80, 96, 128, 144, 192, 256, 272, 384, 512, 528, 768, 1024, 1040, 1536, 2048, 2064];
+for (let p = 4096; p <= 268435456; p *= 2) {
+  CLASSES.push((p * 3) / 4 + 16, p + 16);
+}
 const dec = new TextDecoder("utf-8", { fatal: false });
 const enc = new TextEncoder();
 
@@ -40,6 +44,7 @@ export function createPionRuntime(opts = {}) {
   let memory = opts.memory || null, exp = opts.exports || null, buf = null, dv = null, u8 = null;
   let heapPtr = 0, heapEnd = 0;
   const free = CLASSES.map(() => []);
+  const largeFree = new Map();
   const channels = new Map();
   const out = [], err = [];
   const printFn = opts.print || ((s) => out.push(s));
@@ -67,14 +72,31 @@ export function createPionRuntime(opts = {}) {
     heapPtr = (base + 15) & ~15; heapEnd = memory.buffer.byteLength;
   }
 
-  function clsIdx(n) { for (let i = 0; i < CLASSES.length; i++) if (n <= CLASSES[i]) return i; return -1; }
+  function clsIdx(n) {
+    let lo = 0, hi = CLASSES.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (n <= CLASSES[mid]) { ans = mid; hi = mid - 1; }
+      else lo = mid + 1;
+    }
+    return ans;
+  }
   function rawAlloc(sz) {
     sync();
-    const need = ((sz + 7) & ~7) + 8, c = clsIdx(need);
+    const need = ((((sz >>> 0) + 7) & ~7) >>> 0) + 8, c = clsIdx(need);
     if (c >= 0 && free[c].length) {
       const b = free[c].pop(); su32(b, CLASSES[c]); su32(b + 4, 0); return b + 8;
     }
-    const asz = c >= 0 ? CLASSES[c] : ((need + 15) & ~15);
+    let asz;
+    if (c >= 0) {
+      asz = CLASSES[c];
+    } else {
+      asz = (((need + 65535) >>> 16) * 65536);
+      const list = largeFree.get(asz);
+      if (list && list.length) {
+        const b = list.pop(); su32(b, asz); su32(b + 4, 0); return b + 8;
+      }
+    }
     if (heapPtr + asz > heapEnd) {
       memory.grow(Math.max(16, Math.ceil((heapPtr + asz - heapEnd) / PAGE))); sync();
     }
@@ -83,8 +105,16 @@ export function createPionRuntime(opts = {}) {
   const rawZero = (sz) => { const p = rawAlloc(sz); u8.fill(0, p, p + sz); return p; };
   function rawFree(ptr) {
     if (!ptr) return; sync();
-    const b = ptr - 8, asz = gu32(b), c = clsIdx(asz);
-    if (c >= 0 && CLASSES[c] === asz) free[c].push(b);
+    const b = ptr - 8;
+    if (gu32(b + 4) === FREE_MAGIC) return;
+    const asz = gu32(b);
+    su32(b + 4, FREE_MAGIC);
+    if (b + asz === heapPtr) { heapPtr = b; return; }
+    const c = clsIdx(asz);
+    if (c >= 0 && CLASSES[c] === asz) { free[c].push(b); return; }
+    let list = largeFree.get(asz);
+    if (!list) { list = []; largeFree.set(asz, list); }
+    list.push(b);
   }
 
   function allocObj(sz, tag, drop, zero) {
