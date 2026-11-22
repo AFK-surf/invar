@@ -1766,3 +1766,100 @@ test "48 Scene::emit_line and View::lines emit tight rotated capsules (zero-leng
   debug_assert((tsc2.inst[turned_idx + 33] - 155.0).abs() < 1.0e-5 && (tsc2.inst[turned_idx + 34] - 70.0).abs() < 1.0e-5 && (tsc2.inst[turned_idx + 35] - 1.0).abs() < 1.0e-5, "rotated View::lines rot center is pre-rotated midpoint (155, 70) with outer_clip=1")
   t2.dispose()
 }
+
+test "49 View::image falls back to stand_in while primary src decodes and skips empty src load" {
+  let src_sig = signals::signal("async:hero")
+  let ph_sig = signals::signal("mem:stand_in")
+  let src_ready : Ref[Bool] = ref_new(false)
+  let src_hid : Ref[Int] = ref_new(0)
+  let empty_load_calls : Ref[Int] = ref_new(0)
+  let t = Tester::tree(fn(root : view::View) {
+    forget_image("async:hero")
+    forget_image("mem:stand_in")
+    forget_image("mem:missing")
+    let h = hostapi::host()
+    let orig_load = h.image_load
+    let orig_info = h.image_info
+    h.image_load = fn(src : String, px : Int) -> Int {
+      if src == "" {
+        empty_load_calls.v = empty_load_calls.v + 1
+      }
+      let id = orig_load(src, px)
+      if src == "async:hero" {
+        src_hid.v = id
+      }
+      id
+    }
+    h.image_info = fn(id : Int, out : Array[Double]) -> Int {
+      if id == src_hid.v && !src_ready.v {
+        0
+      } else {
+        orig_info(id, out)
+      }
+    }
+    add_image("mem:stand_in", "fake-stand-in-bytes".to_bytes())
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(80.0)))
+        .image(view::Live::By(fn() { Some((src_sig.get(), ph_sig.get(), 256)) }))
+    })
+  }, width=200.0, height=200.0, scale=1.0)
+
+  let find_image_tex = fn(sc : Scene) -> Option[Int] {
+    let mut i = 0
+    while i < sc.ninst {
+      let b = i * inst_size
+      if (sc.inst[b + 5] - 4.0).abs() < 0.01 {
+        return Some(sc.inst[b + 20].round().to_int())
+      }
+      i += 1
+    }
+    None
+  }
+
+  // 1. Primary src is still decoding (image_info == 0), stand_in is ready -> renders stand_in
+  debug_assert(src_hid.v > 0, "primary async:hero started decoding via image_load")
+  let ph_hid = match find_image_tex(t.scene()) {
+    Some(tid) => {
+      debug_assert(tid > 0 && tid != src_hid.v, "pending src falls back to stand_in tex_id")
+      tid
+    }
+    None => {
+      debug_assert(false, "expected kind=4.0 stand_in instance while primary src is decoding")
+      0
+    }
+  }
+
+  // 2. Primary src finishes decoding -> next frame switches automatically to src_hid
+  src_ready.v = true
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  match find_image_tex(t.scene()) {
+    Some(tid) => debug_assert(tid == src_hid.v, "once primary src is ready, scene switches to src_hid")
+    None => debug_assert(false, "expected kind=4.0 primary instance after decode completes")
+  }
+
+  // 3. Unready src with empty stand_in -> emits no kind=4.0 instance
+  src_sig.set("mem:missing")
+  ph_sig.set("")
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(find_image_tex(t.scene()).is_none(), "unready src with empty ph emits no kind=4.0 instance")
+
+  // 4. Empty src with ready stand_in -> renders stand_in without calling image_load("")
+  src_sig.set("")
+  ph_sig.set("mem:stand_in")
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  match find_image_tex(t.scene()) {
+    Some(tid) => debug_assert(tid == ph_hid, "empty src falls back to ready stand_in ph_hid")
+    None => debug_assert(false, "expected kind=4.0 stand_in instance when src is empty")
+  }
+  debug_assert(empty_load_calls.v == 0, "empty src must never trigger hostapi::image_load(\"\")")
+
+  forget_image("async:hero")
+  forget_image("mem:stand_in")
+  forget_image("mem:missing")
+  t.dispose()
+}
