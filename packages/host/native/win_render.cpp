@@ -46,6 +46,8 @@ static ID3D11VertexShader *vs;
 static ID3D11PixelShader *ps;
 // a ground's flat middle (bands.h mb_pieces)
 static ID3D11PixelShader *ps_flat;
+// lossless fast path for axis-aligned solid/translucent rects (kind == 0)
+static ID3D11PixelShader *rect_ps;
 static ID3D11InputLayout *layout;
 static ID3D11Buffer *vbuf, *ubuf;
 static size_t vbuf_cap;
@@ -650,6 +652,49 @@ static const char *edge_src =
     "  return src.SampleLevel(samp, clamp((p - pc[0].xy) / pc[0].zw * ts, lo, hi), 0);\n"
     "}\n";
 
+// Separate HLSL source for the lossless axis-aligned rect fast path (kept outside shader_src so baked shader keys stay intact).
+static const char *rect_src =
+    "cbuffer U : register(b0) { float2 vp; float scale; float pad; };\n"
+    "struct VOut { float4 pos : SV_Position; float2 p : POS; float2 cp : CPOS;\n"
+    "  nointerpolation float4 rect : INST0; nointerpolation float4 prm : INST1;\n"
+    "  nointerpolation float4 color : INST2; nointerpolation float4 c2 : INST3;\n"
+    "  nointerpolation float4 clip : INST4; nointerpolation float4 pd : INST5; nointerpolation float4 rc : INST6;\n"
+    "  nointerpolation float4 rs : INST7; nointerpolation float4 rr : INST8;\n"
+    "  nointerpolation float4 oclip : INST9; nointerpolation float4 orc : INST10; nointerpolation float4 ors : INST11;\n"
+    "  nointerpolation float4 fade : INST12; nointerpolation float4 fadex : INST13; };\n"
+    "struct FOut { float4 c : SV_Target0; float4 w : SV_Target1; };\n"
+    "FOut frect(VOut I) {\n"
+    "  float2 p = I.p;\n"
+    "  if (p.x < I.clip.x || p.y < I.clip.y || p.x > I.clip.z || p.y > I.clip.w) discard;\n"
+    "  float2 hs = I.rect.zw * 0.5;\n"
+    "  float2 q = abs(p - (I.rect.xy + hs)) - hs;\n"
+    "  float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);\n"
+    "  float a = clamp(0.5 - d * scale, 0.0, 1.0);\n"
+    "  FOut o;\n"
+    "  o.c = (float4(I.color.rgb, 1.0) * I.color.a) * a;\n"
+    "  o.w = o.c.aaaa;\n"
+    "  return o;\n"
+    "}\n";
+
+static int fast_rect_enabled(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const wchar_t *e = mb_win_env(L"MBUI_FAST_RECT");
+    enabled = (e && e[0] == L'0' && e[1] == L'\0') ? 0 : 1;
+  }
+  return enabled;
+}
+
+static int is_simple_rect(const float *f, int32_t i) {
+  const float *b = f + (size_t)i * MB_INST;
+  return (int)(b[5] + 0.5f) == 0 && b[2] >= 0.0f && b[3] >= 0.0f && b[6] <= 0.0f &&
+         b[20] == 0.0f && b[21] == 0.0f && b[22] == 0.0f && b[23] == 0.0f &&
+         b[32] == 0.0f && b[4] <= 0.0f && b[36] <= 0.0f && b[37] <= 0.0f && b[38] <= 0.0f && b[39] <= 0.0f &&
+         b[24] <= 0.0f && b[25] <= 0.0f && b[26] <= 0.0f && b[27] <= 0.0f &&
+         b[44] <= 0.0f && b[45] <= 0.0f && b[46] <= 0.0f && b[47] <= 0.0f &&
+         b[53] <= 0.0f && b[55] <= 0.0f && b[57] <= 0.0f && b[59] <= 0.0f;
+}
+
 // A shader's bytecode kept on disk once compiled (shader_dir: an app's own folder, or the one its program says; a
 // program that is neither, a demo, keeps none), so a run after the first takes it from there: compiling these at level
 // 3 took 2.4 to 3.6 s of a window's start on a fast machine (measured on an RTX 5080's, 2026-11-13), all of it before
@@ -1026,13 +1071,25 @@ static ID3D11PixelShader *kind_ps(int kind) {
 
 // The shaders, buffers, atlas and states every target is drawn with (the window's, the offscreen one).
 static void blur_layers_release(void);
+static void win_layers_release(void);
 static ID3D11Buffer *bl_comp_vbuf;
+static ID3D11Buffer *layer_vbuf;
+static size_t layer_vbuf_cap;
 
 static void make_pipeline(void) {
   // (those of a device before, if there was one, let go once made)
   if (bl_comp_vbuf) {
     bl_comp_vbuf->Release();
     bl_comp_vbuf = NULL;
+  }
+  if (layer_vbuf) {
+    layer_vbuf->Release();
+    layer_vbuf = NULL;
+    layer_vbuf_cap = 0;
+  }
+  if (rect_ps) {
+    rect_ps->Release();
+    rect_ps = NULL;
   }
   if (kinds_thread) {
     WaitForSingleObject(kinds_thread, INFINITE);
@@ -1068,6 +1125,12 @@ static void make_pipeline(void) {
   pv->Release();
   pp->Release();
   ep->Release();
+  ID3DBlob *rcode = compile("frect", "ps_4_0", rect_src);
+  if (rcode) {
+    if (FAILED(dev->CreatePixelShader(rcode->GetBufferPointer(), rcode->GetBufferSize(), NULL, &rect_ps)))
+      rect_ps = NULL;
+    rcode->Release();
+  }
 
   D3D11_BUFFER_DESC ud = {16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
   dev->CreateBuffer(&ud, NULL, &ubuf);
@@ -1344,6 +1407,38 @@ static int ensure_bl_comp_vbuf(void) {
     return 0;
   }
   return 1;
+}
+
+// Physical-pixel offscreen tile layers (MB_LAYER_TEX + id): lazily allocated B8G8R8A8_UNORM texture + RTV + SRV.
+struct MBWinLayer {
+  int32_t id;
+  ID3D11Texture2D *t;
+  ID3D11RenderTargetView *rt;
+  ID3D11ShaderResourceView *srv;
+  int pw, ph;
+};
+static MBWinLayer *win_layers;
+static int win_layers_n, win_layers_cap;
+
+static ID3D11ShaderResourceView *mb_layer_srv(int id) {
+  for (int i = 0; i < win_layers_n; i++)
+    if (win_layers[i].id == id) return win_layers[i].srv;
+  return NULL;
+}
+
+static void win_layers_release(void) {
+  if (ctx) {
+    ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
+    ctx->PSSetShaderResources(0, 3, none);
+  }
+  for (int i = 0; i < win_layers_n; i++) {
+    if (win_layers[i].srv) win_layers[i].srv->Release();
+    if (win_layers[i].rt) win_layers[i].rt->Release();
+    if (win_layers[i].t) win_layers[i].t->Release();
+  }
+  free(win_layers);
+  win_layers = NULL;
+  win_layers_n = win_layers_cap = 0;
 }
 
 // What drawing holds beyond the frames given back (a window minimized or hidden: win_app.c): glass's levels, made
@@ -1694,8 +1789,9 @@ static void draw_banded(const float *f, int32_t start, int32_t end, int32_t coun
 // `part`: only that part of the target drawn again, over what it holds (the frame's ground first: the instance after
 // the frame's in the vertex buffer, submit's); NULL, all of it, cleared to the ground.
 static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count, const float *bg,
-                   const float *f, const D3D11_RECT *part = NULL) {
-  float clear[4] = {bg[0], bg[1], bg[2], 1};
+                   const float *f, const D3D11_RECT *part = NULL, int transparent = 0) {
+  float clear[4] = {transparent ? 0.0f : bg[0], transparent ? 0.0f : bg[1], transparent ? 0.0f : bg[2],
+                    transparent ? 0.0f : 1.0f};
   encode_missing = 0;
   ctx->OMSetRenderTargets(1, &target, NULL);
   cut_on = part != NULL;
@@ -1882,26 +1978,29 @@ static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count
     }
     // holes for native views (kind 9) apart, written without blending: transparent there
     int kind = kind0, hole = kind == 9, own = has_own_ps(kind);
+    int fast_rect = !hole && tid == 0 && kind == 0 && rect_ps && fast_rect_enabled() && is_simple_rect(f, start);
     // (kinds without their own pixel shader one run, as before)
     end = start + 1;
     while (end < count && (int)f[end * MB_INST + 20] == tid) {
       int k = (int)(f[end * MB_INST + 5] + 0.5f);
       if (k == 14 || k == 15) break;
       if ((k == 9) != hole || (own ? k != kind : has_own_ps(k))) break;
+      if (!hole && tid == 0 && kind == 0 && rect_ps && fast_rect_enabled() && is_simple_rect(f, end) != fast_rect) break;
       end++;
     }
     // (a hole's image is its view's, src/hostapi/host.mbt view_tex_base + its id: the view is under the canvas here)
     ID3D11ShaderResourceView *t = hole ? atlas_srv
+                                  : tid > MB_LAYER_TEX ? mb_layer_srv(tid - MB_LAYER_TEX)
                                   : tid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(tid - MB_STREAM_TEX)
                                   : tid ? (ID3D11ShaderResourceView *)mb_image_srv(tid) : atlas_srv;
-    // (a stream with no frame of its own yet: nothing, not the atlas)
+    // (a stream or offscreen layer with no texture yet: nothing, not the atlas)
     if (!hole && tid > MB_STREAM_TEX && !t) {
       start = end;
       continue;
     }
     if (!hole && tid > 0 && tid <= MB_STREAM_TEX && !t) encode_missing = 1;
     ctx->PSSetShaderResources(1, 1, t ? &t : &atlas_srv);
-    ID3D11PixelShader *run = own ? kind_ps(kind) : ps;
+    ID3D11PixelShader *run = fast_rect ? rect_ps : own ? kind_ps(kind) : ps;
     ctx->PSSetShader(run, NULL, 0);
     if (hole) ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
     if (hole) ctx->DrawInstanced(6, (UINT)(end - start), 0, (UINT)start);
@@ -2145,9 +2244,19 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
       kinds_thread = NULL;
     }
     blur_layers_release();
+    win_layers_release();
     if (bl_comp_vbuf) {
       bl_comp_vbuf->Release();
       bl_comp_vbuf = NULL;
+    }
+    if (layer_vbuf) {
+      layer_vbuf->Release();
+      layer_vbuf = NULL;
+      layer_vbuf_cap = 0;
+    }
+    if (rect_ps) {
+      rect_ps->Release();
+      rect_ps = NULL;
     }
     ctx->Release();
     dev->Release();
@@ -2442,3 +2551,114 @@ int mb_screen_snapshot(void *hwnd, const wchar_t *path) {
 extern "C" double mb_host_gpu_ms(void) { return -1; }
 // Each frame drawn as it is made, on the window's thread: none dropped.
 extern "C" int32_t mb_host_frames_dropped(void) { return 0; }
+
+extern "C" int32_t mb_host_layer_supported(void) { return dev != NULL ? 1 : 0; }
+
+extern "C" void mb_host_layer_destroy(int32_t id) {
+  for (int i = 0; i < win_layers_n; i++) {
+    if (win_layers[i].id != id) continue;
+    if (ctx) {
+      ID3D11ShaderResourceView *none = NULL;
+      ctx->PSSetShaderResources(1, 1, &none);
+    }
+    if (win_layers[i].srv) win_layers[i].srv->Release();
+    if (win_layers[i].rt) win_layers[i].rt->Release();
+    if (win_layers[i].t) win_layers[i].t->Release();
+    win_layers[i] = win_layers[--win_layers_n];
+    return;
+  }
+}
+
+extern "C" int32_t mb_host_layer_render(int32_t id, int32_t pw, int32_t ph, double scale, const double *inst,
+                                        int32_t count) {
+  if (!dev || !ctx || id <= 0 || pw <= 0 || ph <= 0 || !(scale > 0) || count < 0 || (count > 0 && !inst)) return 0;
+  if ((size_t)count > (size_t)UINT_MAX / ((size_t)MB_INST * sizeof(float))) return 0;
+  MBWinLayer *L = NULL;
+  for (int i = 0; i < win_layers_n; i++) {
+    if (win_layers[i].id == id) {
+      L = &win_layers[i];
+      break;
+    }
+  }
+  if (!L) {
+    if (win_layers_n == win_layers_cap) {
+      int ncap = win_layers_cap ? win_layers_cap * 2 : 16;
+      MBWinLayer *grown = (MBWinLayer *)realloc(win_layers, (size_t)ncap * sizeof(MBWinLayer));
+      if (!grown) return 0;
+      win_layers = grown;
+      win_layers_cap = ncap;
+    }
+    L = &win_layers[win_layers_n++];
+    memset(L, 0, sizeof *L);
+    L->id = id;
+  }
+  ID3D11ShaderResourceView *none = NULL;
+  ctx->PSSetShaderResources(1, 1, &none);
+  if (!L->t || L->pw != pw || L->ph != ph) {
+    if (L->srv) L->srv->Release();
+    if (L->rt) L->rt->Release();
+    if (L->t) L->t->Release();
+    L->srv = NULL;
+    L->rt = NULL;
+    L->t = NULL;
+    L->pw = L->ph = 0;
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT)pw;
+    td.Height = (UINT)ph;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(dev->CreateTexture2D(&td, NULL, &L->t)) || !L->t) {
+      L->t = NULL;
+      return 0;
+    }
+    if (FAILED(dev->CreateRenderTargetView(L->t, NULL, &L->rt)) || !L->rt) {
+      L->t->Release();
+      L->t = NULL;
+      L->rt = NULL;
+      return 0;
+    }
+    if (FAILED(dev->CreateShaderResourceView(L->t, NULL, &L->srv)) || !L->srv) {
+      L->rt->Release();
+      L->t->Release();
+      L->rt = NULL;
+      L->t = NULL;
+      L->srv = NULL;
+      return 0;
+    }
+    L->pw = pw;
+    L->ph = ph;
+  }
+  float *lf = NULL;
+  if (count > 0) {
+    lf = (float *)malloc((size_t)count * MB_INST * sizeof(float));
+    if (!lf) return 0;
+    mb_groups_floats(lf, inst, count);
+  }
+  ID3D11Buffer *saved_vbuf = vbuf;
+  size_t saved_vbuf_cap = vbuf_cap;
+  vbuf = layer_vbuf;
+  vbuf_cap = layer_vbuf_cap;
+  int ok = (count == 0) || fill_vbuf(lf, count);
+  if (ok) {
+    static const float zero_bg[3] = {0.0f, 0.0f, 0.0f};
+    double kw = vw, kh = vh, ks = vscale;
+    vscale = scale;
+    vw = (double)pw / scale;
+    vh = (double)ph / scale;
+    encode(L->rt, pw, ph, count, zero_bg, lf, NULL, 1);
+    vw = kw;
+    vh = kh;
+    vscale = ks;
+  }
+  layer_vbuf = vbuf;
+  layer_vbuf_cap = vbuf_cap;
+  vbuf = saved_vbuf;
+  vbuf_cap = saved_vbuf_cap;
+  free(lf);
+  if (rtv) ctx->OMSetRenderTargets(1, &rtv, NULL);
+  else ctx->OMSetRenderTargets(0, NULL, NULL);
+  return ok ? 1 : 0;
+}

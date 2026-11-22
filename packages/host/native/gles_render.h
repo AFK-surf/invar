@@ -24,6 +24,9 @@
 
 // the numbers of an instance (src/ui/scene.mbt)
 #define MB_INST 60
+#ifndef MB_LAYER_TEX
+#define MB_LAYER_TEX 12582912
+#endif
 // the glyphs' atlases, square, what goes where in them MoonBit's (hostapi's atlas.mbt): the words' (a byte a texel,
 // how much of it the glyph covers: drawn in the text's colour; as many bytes as one RGBA atlas half as wide) and colour
 // glyphs' (RGBA: an emoji's own). A colour glyph's place across is MB_ATLAS_COLOR_U past its place in its atlas (what
@@ -503,6 +506,27 @@ static const char *FS_FLAT =
     "out vec4 o;\n"
     "void main() { o = vec4(v_color.rgb, 1.0) * v_color.a; }\n";
 
+// lossless fast path for unrotated axis-aligned solid/translucent rects (kind == 0, no radius/border/notch/rounded-clip/fade)
+static const char *FS_RECT =
+    "#version 300 es\n"
+    "precision highp float;\n"
+    "precision highp int;\n"
+    "in vec2 v_pos;\n"
+    "flat in vec4 v_rect;\n"
+    "flat in vec4 v_color;\n"
+    "flat in vec4 v_clip;\n"
+    "uniform float u_scale;\n"
+    "out vec4 o;\n"
+    "void main() {\n"
+    "  vec2 p = v_pos;\n"
+    "  if (p.x < v_clip.x || p.y < v_clip.y || p.x > v_clip.z || p.y > v_clip.w) discard;\n"
+    "  vec2 hs = v_rect.zw * 0.5;\n"
+    "  vec2 q = abs(p - (v_rect.xy + hs)) - hs;\n"
+    "  float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);\n"
+    "  float a = clamp(0.5 - d * u_scale, 0.0, 1.0);\n"
+    "  o = (vec4(v_color.rgb, 1.0) * v_color.a) * a;\n"
+    "}\n";
+
 static const char *PVS =
     "#version 300 es\n"
     "void main() {\n"
@@ -564,7 +588,28 @@ static GLuint vao, vbo, atlas, catlas, post;
 // a ground's flat middle (bands.h mb_pieces), and where its window's size goes
 static GLuint prog_flat;
 static GLint uf_vp;
+static GLuint prog_rect;
+static GLint ur_vp = -1, ur_scale = -1;
 static GLint pu_src, pu_a, pu_b, pu_c;
+
+static int fast_rect_enabled(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *e = getenv("MBUI_FAST_RECT");
+    enabled = (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;
+  }
+  return enabled;
+}
+
+static int is_simple_rect(const float *f, int32_t i) {
+  const float *b = f + (size_t)i * MB_INST;
+  return (int)(b[5] + 0.5f) == 0 && b[2] >= 0.0f && b[3] >= 0.0f && b[6] <= 0.0f &&
+         b[20] == 0.0f && b[21] == 0.0f && b[22] == 0.0f && b[23] == 0.0f &&
+         b[32] == 0.0f && b[4] <= 0.0f && b[36] <= 0.0f && b[37] <= 0.0f && b[38] <= 0.0f && b[39] <= 0.0f &&
+         b[24] <= 0.0f && b[25] <= 0.0f && b[26] <= 0.0f && b[27] <= 0.0f &&
+         b[44] <= 0.0f && b[45] <= 0.0f && b[46] <= 0.0f && b[47] <= 0.0f &&
+         b[53] <= 0.0f && b[55] <= 0.0f && b[57] <= 0.0f && b[59] <= 0.0f;
+}
 
 // The kinds drawn by a program of their own: the shader with its kind fixed (ONE_KIND), so each is compiled to its
 // kind's branch alone and a pixel of it is shaded with the registers that branch needs, not the most any kind's does
@@ -602,6 +647,7 @@ static void glass_lost(void);
 static void canvas_lost(void);
 static void blur_layers_lost(void);
 static void blur_layers_free(void);
+static void gl_layers_lost(void);
 static void offscreen_lost(void);
 
 // What the app does not paint left clear, what is under the surface showing (Android's over another app: OverActivity,
@@ -672,6 +718,22 @@ static void gl_setup(void) {
   glAttachShader(prog_flat, compile(GL_FRAGMENT_SHADER, FS_FLAT));
   glLinkProgram(prog_flat);
   uf_vp = glGetUniformLocation(prog_flat, "u_vp");
+  GLuint rfs = compile(GL_FRAGMENT_SHADER, FS_RECT);
+  prog_rect = glCreateProgram();
+  glAttachShader(prog_rect, vs);
+  glAttachShader(prog_rect, rfs);
+  glLinkProgram(prog_rect);
+  glDeleteShader(rfs);
+  GLint rok = 0;
+  glGetProgramiv(prog_rect, GL_LINK_STATUS, &rok);
+  if (rok) {
+    ur_vp = glGetUniformLocation(prog_rect, "u_vp");
+    ur_scale = glGetUniformLocation(prog_rect, "u_scale");
+  } else {
+    glDeleteProgram(prog_rect);
+    prog_rect = 0;
+    ur_vp = ur_scale = -1;
+  }
   glDeleteShader(vs);
   segs_tex = 0;
   segs_rows = 0;
@@ -948,6 +1010,7 @@ static void canvas_lost(void) {
   canvas_w = canvas_h = 0;
   canvas_ok = 0;
   blur_layers_lost();
+  gl_layers_lost();
   offscreen_lost();
 }
 
@@ -1265,9 +1328,9 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     int sees = tid < 0.0f || (int)(f[(size_t)i * MB_INST + 5] + 0.5f) == 7;
     if (sees && reaches(f, i, run, g)) whole = i + 1;
   }
-  size_t n = ((size_t)whole + (size_t)(count - pieces)) * MB_INST;
-  if (under_now_cap < n + (size_t)(start - whole) * MB_INST) {
-    under_now_cap = n + (size_t)(start - whole) * MB_INST;
+  size_t need_base = (size_t)start * MB_INST;
+  if (under_now_cap < need_base) {
+    under_now_cap = need_base;
     under_now = (float *)realloc(under_now, under_now_cap * sizeof(float));
   }
   float *o = under_now;
@@ -1276,6 +1339,8 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
   memcpy(o, f, (size_t)whole * MB_INST * sizeof(float));
   o += (size_t)whole * MB_INST;
   int in_blur = 0, blur_hit = 0;
+  int has_vec = 0;
+  long seg_min = 0, seg_max = 0;
   for (int32_t i = 0; i < whole; i++) {
     int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
     if (k == 14) {
@@ -1284,6 +1349,14 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     } else if (k == 15 && in_blur > 0) {
       in_blur--;
       if (in_blur == 0) blur_hit = 0;
+    } else if (k == 11) {
+      long f0 = lroundf(f[(size_t)i * MB_INST + 12]);
+      long fn = lroundf(f[(size_t)i * MB_INST + 13]);
+      if (fn > 0) {
+        if (!has_vec || f0 < seg_min) seg_min = f0;
+        if (!has_vec || f0 + fn > seg_max) seg_max = f0 + fn;
+        has_vec = 1;
+      }
     }
   }
   int32_t picked = 0;
@@ -1305,12 +1378,39 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     }
     if (!take) continue;
     if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
+    if (k == 11) {
+      long f0 = lroundf(f[(size_t)i * MB_INST + 12]);
+      long fn = lroundf(f[(size_t)i * MB_INST + 13]);
+      if (fn > 0) {
+        if (!has_vec || f0 < seg_min) seg_min = f0;
+        if (!has_vec || f0 + fn > seg_max) seg_max = f0 + fn;
+        has_vec = 1;
+      }
+    }
     memcpy(o, f + (size_t)i * MB_INST, MB_INST * sizeof(float));
     o += MB_INST;
     picked++;
   }
-  memcpy(o, f + (size_t)pieces * MB_INST, (size_t)(count - pieces) * MB_INST * sizeof(float));
-  o += (size_t)(count - pieces) * MB_INST;
+  size_t used = (size_t)(o - under_now);
+  if (has_vec && count > pieces) {
+    long max_seg_insts = (long)(count - pieces);
+    long i0 = seg_min / 6;
+    long i1 = (seg_max + 5) / 6;
+    if (i0 < 0) i0 = 0;
+    if (i1 > max_seg_insts) i1 = max_seg_insts;
+    if (i1 > i0) {
+      size_t s0 = (size_t)i0 * MB_INST;
+      size_t s1 = (size_t)i1 * MB_INST;
+      size_t seg_floats = s1 - s0;
+      if (under_now_cap < used + seg_floats) {
+        under_now_cap = used + seg_floats;
+        under_now = (float *)realloc(under_now, under_now_cap * sizeof(float));
+        o = under_now + used;
+      }
+      memcpy(o, f + (size_t)pieces * MB_INST + s0, seg_floats * sizeof(float));
+      o += seg_floats;
+    }
+  }
   under_now_n = (size_t)(o - under_now);
   under_whole = whole;
   under_picked = picked;
@@ -1519,13 +1619,57 @@ static void canvas_shown(void);
 static int views_drawn_in(void) {
   for (int32_t i = 0; i < kept_count; i++) {
     int tid = (int)fbuf[i * MB_INST + 20];
-    if (tid <= MB_VIEW_TEX) continue;
+    if (tid <= MB_VIEW_TEX || tid > MB_LAYER_TEX) continue;
 #ifdef MB_VIEWS_UNDER
     if (view_under(tid)) continue;
 #endif
     return 1;
   }
   return 0;
+}
+
+// Physical-pixel offscreen tile layers (MB_LAYER_TEX + id): lazily allocated GL_RGBA8 texture + FBO.
+typedef struct {
+  int32_t id;
+  GLuint tex;
+  GLuint fb;
+  int pw, ph;
+} MBOffLayer;
+static MBOffLayer *gl_layers;
+static int gl_layers_n, gl_layers_cap;
+
+static GLuint mb_layer_gl_tex(int id) {
+  for (int i = 0; i < gl_layers_n; i++)
+    if (gl_layers[i].id == id) return gl_layers[i].tex;
+  return 0;
+}
+
+static void gl_layers_lost(void) {
+  free(gl_layers);
+  gl_layers = NULL;
+  gl_layers_n = gl_layers_cap = 0;
+}
+
+static void gl_layer_destroy(int32_t id) {
+  for (int i = 0; i < gl_layers_n; i++) {
+    if (gl_layers[i].id != id) continue;
+    if (gl_layers[i].fb) glDeleteFramebuffers(1, &gl_layers[i].fb);
+    if (gl_layers[i].tex) glDeleteTextures(1, &gl_layers[i].tex);
+    gl_layers[i] = gl_layers[--gl_layers_n];
+    canvas_ok = 0;
+    return;
+  }
+}
+
+// GLES3 FBOs have Y=0 at the bottom, whereas callers supply top-down UV coordinates for kind == 4 layer samples.
+static void flip_layer_uvs(float *buf, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    size_t b = (size_t)i * MB_INST;
+    if ((int)(buf[b + 5] + 0.5f) == 4 && (int)buf[b + 20] > MB_LAYER_TEX) {
+      buf[b + 13] = 1.0f - buf[b + 13];
+      buf[b + 15] = -buf[b + 15];
+    }
+  }
 }
 
 // A frame presented (the host's mb_host_present, its glyphs in the atlases first): kept as floats, its groups' headers
@@ -1551,7 +1695,102 @@ static void gl_present(const double *buf, int32_t count, double r, double g, dou
     fbuf = (float *)realloc(fbuf, fcap * sizeof(float));
   }
   mb_groups_floats(fbuf, buf, count);
+  flip_layer_uvs(fbuf, count);
   gl_present_kept(count, r, g, b);
+}
+
+static int32_t gl_layer_render(int32_t id, int32_t pw, int32_t ph, double scale, const double *inst, int32_t count) {
+  if (id <= 0 || pw <= 0 || ph <= 0 || !(scale > 0) || count < 0 || (count > 0 && !inst)) return 0;
+  MBOffLayer *L = NULL;
+  for (int i = 0; i < gl_layers_n; i++) {
+    if (gl_layers[i].id == id) {
+      L = &gl_layers[i];
+      break;
+    }
+  }
+  if (!L) {
+    if (gl_layers_n == gl_layers_cap) {
+      int ncap = gl_layers_cap ? gl_layers_cap * 2 : 16;
+      MBOffLayer *grown = (MBOffLayer *)realloc(gl_layers, (size_t)ncap * sizeof(MBOffLayer));
+      if (!grown) return 0;
+      gl_layers = grown;
+      gl_layers_cap = ncap;
+    }
+    L = &gl_layers[gl_layers_n++];
+    memset(L, 0, sizeof *L);
+    L->id = id;
+  }
+  GLint prev_fb = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fb);
+  if (!L->fb || L->pw != pw || L->ph != ph) {
+    if (L->fb) glDeleteFramebuffers(1, &L->fb);
+    if (L->tex) glDeleteTextures(1, &L->tex);
+    L->fb = L->tex = 0;
+    L->pw = L->ph = 0;
+    glGenTextures(1, &L->tex);
+    glBindTexture(GL_TEXTURE_2D, L->tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, pw, ph);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &L->fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, L->fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, L->tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      glDeleteFramebuffers(1, &L->fb);
+      glDeleteTextures(1, &L->tex);
+      L->fb = L->tex = 0;
+      glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
+      return 0;
+    }
+    L->pw = pw;
+    L->ph = ph;
+  }
+  size_t need = gl_frame_floats(count);
+  float *lf = (float *)malloc(need * sizeof(float));
+  if (!lf) {
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
+    return 0;
+  }
+  if (count > 0) {
+    mb_groups_floats(lf, inst, count);
+    flip_layer_uvs(lf, count);
+  }
+  float *kf = fbuf;
+  size_t kc = fcap;
+  int32_t kn = kept_count;
+  double kr = kept_r, kg = kept_g, kb = kept_b;
+  int kfw = fb_w, kfh = fb_h;
+  double kw = cur_w, kh = cur_h, ks = cur_scale;
+  int prev_over = over_other;
+  fbuf = lf;
+  fcap = need;
+  kept_count = count;
+  kept_r = kept_g = kept_b = 0.0;
+  fb_w = pw;
+  fb_h = ph;
+  cur_scale = scale;
+  cur_w = (double)pw / scale;
+  cur_h = (double)ph / scale;
+  over_other = 1;
+  draw_into(L->fb, 0);
+  over_other = prev_over;
+  fbuf = kf;
+  fcap = kc;
+  kept_count = kn;
+  kept_r = kr;
+  kept_g = kg;
+  kept_b = kb;
+  fb_w = kfw;
+  fb_h = kfh;
+  cur_w = kw;
+  cur_h = kh;
+  cur_scale = ks;
+  free(lf);
+  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev_fb);
+  canvas_ok = 0;
+  return 1;
 }
 
 // The frame in fbuf (`count` instances as floats, its groups drawn out: gl_present's, or Android's made on the app's
@@ -1978,14 +2217,25 @@ static void draw_into(GLuint fb, int part) {
     }
     // (kinds without their own program one run, as before)
     int own = tid >= 0 && has_own_prog(kind);
+    int fast_rect = tid == 0 && kind == 0 && prog_rect && fast_rect_enabled() && is_simple_rect(fbuf, start);
     int32_t end = start + 1;
     while (end < count && (int)fbuf[end * MB_INST + 20] == tid) {
       int k = (int)(fbuf[end * MB_INST + 5] + 0.5f);
       if (k == 14 || k == 15) break;
       if (own ? k != kind : tid >= 0 && has_own_prog(k)) break;
+      if (tid == 0 && kind == 0 && prog_rect && fast_rect_enabled() && is_simple_rect(fbuf, end) != fast_rect) break;
       end++;
     }
-    use_prog(own ? kind : -1);
+    if (fast_rect) {
+      if (prog_now != prog_rect) {
+        prog_now = prog_rect;
+        glUseProgram(prog_rect);
+      }
+      glUniform2f(ur_vp, (float)cur_w, (float)cur_h);
+      glUniform1f(ur_scale, (float)cur_scale);
+    } else {
+      use_prog(own ? kind : -1);
+    }
     if (tid < 0) {
       glass_drawn = 1;
       if (!levels_sized) {
@@ -2026,7 +2276,7 @@ static void draw_into(GLuint fb, int part) {
     GLuint t = tid ? image_tex(tid) : atlas;
     if (!t && tid > 0 && tid <= MB_STREAM_TEX) encode_missing = 1;
     if (t) {  // 0: lost with the context, decoding again; a stream's or a view's with no picture yet
-      if (tid > MB_VIEW_TEX) view_parts_in(tid, start, end);
+      if (tid > MB_VIEW_TEX && tid <= MB_LAYER_TEX) view_parts_in(tid, start, end);
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, t);
       for (int i = 0; i < MB_INST / 4; i++)
@@ -2035,7 +2285,7 @@ static void draw_into(GLuint fb, int part) {
       // (a view under the surface: its picture a white texel, so what kind 9 draws is how much of each pixel it covers,
       // and that much of the canvas is taken away there: a hole the view shows through, its round edge as soft as a
       // drawn one's; what is drawn after it draws over it)
-      int under = tid > MB_VIEW_TEX && view_under(tid);
+      int under = tid > MB_VIEW_TEX && tid <= MB_LAYER_TEX && view_under(tid);
       if (under) glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA);
 #endif
       if (tid == 0) draw_banded(start, end, count);

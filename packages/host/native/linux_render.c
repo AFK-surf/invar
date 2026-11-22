@@ -22,9 +22,12 @@ static GLuint white_tex;  // a page's picture here: one white texel (its coverag
 
 static int view_under(int tid) { return !mb_view_is_player(tid - MB_VIEW_TEX); }
 
-// what an instance's image (slot 20) is drawn from: a stream's picture, a decoded image's, a player's frame, a page's
-// white texel
+static GLuint mb_layer_gl_tex(int id);
+
+// what an instance's image (slot 20) is drawn from: an offscreen layer's, a stream's picture, a decoded image's,
+// a player's frame, a page's white texel
 static GLuint image_tex(int id) {
+  if (id > MB_LAYER_TEX) return mb_layer_gl_tex(id - MB_LAYER_TEX);
   if (id > MB_VIEW_TEX && !view_under(id)) return (GLuint)mb_player_tex(id - MB_VIEW_TEX);
   if (id > MB_VIEW_TEX) {
     if (!white_tex) {
@@ -179,6 +182,21 @@ void mb_render_present(const double *inst, int32_t count, double r, double g, do
   mb_images_upload();
   mb_streams_upload();
   gl_present((double *)inst, count, r, g, b);
+}
+
+int32_t mb_host_layer_supported(void) { return ready ? 1 : 0; }
+
+int32_t mb_host_layer_render(int32_t id, int32_t pw, int32_t ph, double scale, const double *inst, int32_t count) {
+  if (!ready) return 0;
+  atlas_upload();
+  mb_images_upload();
+  mb_streams_upload();
+  return gl_layer_render(id, pw, ph, scale, inst, count);
+}
+
+void mb_host_layer_destroy(int32_t id) {
+  if (!ready) return;
+  gl_layer_destroy(id);
 }
 
 // (the window's frame is GTK's once drawn: drawn again into a framebuffer of its own)

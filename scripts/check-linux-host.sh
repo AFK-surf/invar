@@ -64,6 +64,9 @@ REQUIRED_SYMS=(
   mb_host_present
   mb_host_shape
   mb_host_glass_light_angle
+  mb_host_layer_supported
+  mb_host_layer_render
+  mb_host_layer_destroy
   mb_host_wake_now
   mb_host_wake_now_ptr
   invar_hostapi_set_native_wake
@@ -82,7 +85,7 @@ REQUIRED_SYMS=(
 
 MISSING=0
 for sym in "${REQUIRED_SYMS[@]}"; do
-  if echo "$NM_OUT" | grep -q " T ${sym}$"; then
+  if printf '%s\n' "$NM_OUT" | grep " T ${sym}$" >/dev/null; then
     echo "  OK   $sym"
   else
     echo "  MISS $sym" >&2

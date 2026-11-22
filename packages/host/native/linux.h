@@ -63,6 +63,10 @@ void mb_images_lost(void);
 // streams (src/hostapi/stream.mbt): an instance's image MB_STREAM_TEX + its id is its picture now
 #define MB_STREAM_TEX 4194304
 #define MB_VIEW_TEX 8388608
+#define MB_LAYER_TEX 12582912
+int32_t mb_host_layer_supported(void);
+int32_t mb_host_layer_render(int32_t id, int32_t pw, int32_t ph, double scale, const double *inst, int32_t count);
+void mb_host_layer_destroy(int32_t id);
 unsigned mb_stream_tex(int id);
 void mb_streams_upload(void);
 void mb_streams_lost(void);

@@ -105,6 +105,10 @@ HGLOBAL mb_dib_of_png(const void *png, size_t n);
 // streams (win_stream.cpp): what stream id is drawn with now (ID3D11ShaderResourceView *), NULL before a frame shows;
 // an instance's image MB_STREAM_TEX + id is it (src/hostapi/stream.mbt)
 #define MB_STREAM_TEX 4194304
+#define MB_LAYER_TEX 12582912
+int32_t mb_host_layer_supported(void);
+int32_t mb_host_layer_render(int32_t id, int32_t pw, int32_t ph, double scale, const double *inst, int32_t count);
+void mb_host_layer_destroy(int32_t id);
 void *mb_stream_srv(int id);
 // the frame stream id shows, whole, read back for an app's own native code (win_stream.cpp): `done` is handed its
 // BGRA rows on a thread of its own (NULL: not read), let go as it returns; 1 asked, 0 none shown
