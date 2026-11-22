@@ -16,7 +16,14 @@ echo "==> Invar multi-FPS determinism check (${RATES[*]} fps) on: ${PKGS[*]}"
 for rate in "${RATES[@]}"; do
   echo ""
   echo "--- INVAR_TEST_FPS=${rate} ---"
-  if INVAR_TEST_FPS="${rate}" "${PIONC}" test "${PKGS[@]}"; then
+  RATE_OK=1
+  for pkg in "${PKGS[@]}"; do
+    echo "  [pkg=${pkg}]"
+    if ! INVAR_TEST_FPS="${rate}" "${PIONC}" test "${pkg}"; then
+      RATE_OK=0
+    fi
+  done
+  if [ "${RATE_OK}" -eq 1 ]; then
     STATUS+=("PASS")
   else
     STATUS+=("FAIL")

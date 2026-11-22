@@ -619,6 +619,9 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const mem = rt.getMemory();
       return mem ? mem.buffer.byteLength : 0;
     },
+    getenv() {
+      return 0n;
+    },
   };
 
   Object.assign(rt.imports.pion_rt, bridge);
