@@ -257,8 +257,8 @@ let _ = lg::liquid_select_node(page, page, fn() {
 ```
 
 ### 19. `lg::liquid_segmented_node`
-- **适用场景**：分段切换控件（默认 `height=36.0`、内胶囊 `30.0`，`18 - 3 = 15` 精确同心；支持拖拽滑动与按压清透透镜）。
-- **签名**：`pub fn liquid_segmented_node(parent : view::View, labels : () -> Array[String], selected : () -> Int, on_select : (Int) -> Unit, width? : Double, height~ : Double = 36.0, drag? : DampedDrag, loc~ : String = "") -> view::View`
+- **适用场景**：分段切换控件（默认 `height=30.0`、内胶囊 `25.0`，`15 - 2.5 = 12.5` 精确同心；支持拖拽滑动与按压清透透镜）。
+- **签名**：`pub fn liquid_segmented_node(parent : view::View, labels : () -> Array[String], selected : () -> Int, on_select : (Int) -> Unit, width? : Double, height~ : Double = 30.0, drag? : DampedDrag, loc~ : String = "") -> view::View`
 
 ### 19b. `lg::liquid_swatch_grid_node` & `lg::LiquidSwatch`
 - **适用场景**：基于 `headless::radio_group` 的圆形色板单选网格（选中项带 `2pt` 主题色同心外环 + `2pt` 内缝，`transparent=true` 项带浅底与红色对角矢量斜杠，无内部 `Glass::liquid`，可直接嵌入 `liquid_popover_node` / 工具栏弹层）。

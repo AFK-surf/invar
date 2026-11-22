@@ -3259,6 +3259,7 @@
   H.layerSupported = () => (gl ? 1 : 0);
   H.layerRender = (id, physW, physH, scale, f64, count) => {
     if (!gl || id <= 0 || physW <= 0 || physH <= 0 || !(scale > 0) || count < 0) return 0;
+    if (!bootReady && bootProgs) finalizeBootProgs();
     let L = layers.get(id);
     if (!L || L.w !== physW || L.h !== physH) {
       if (L) {

@@ -2477,3 +2477,95 @@ test "58 view_host_pointer two fingers take turns scrolling a column without jum
   debug_assert(pressed.get() == 0, "claiming with second finger never fires row press")
   t.dispose()
 }
+
+test "59 view_frame refreshes text measurement, layout, and full dirty on atlas_generation change" {
+  let dirty_log : Array[(Double, Double, Double, Double)] = []
+  let atlas_gen = ref_new(1)
+  let char_adv = ref_new(6.0)
+  let redone_seen = ref_new(0)
+  let fake = FakeHost::new(width=400.0, height=300.0, scale=2.0)
+  let prev_host = fake.install()
+  let h = hostapi::host()
+  h.atlas_generation = fn() -> Int { atlas_gen.v }
+  h.shape = fn(s : String, _size : Double, _weight : Int, _style : Int, out : Array[Double]) -> Int {
+    let n = s.length()
+    let adv = char_adv.v
+    let mut i = 0
+    while i < n && i * 4 + 3 < out.length() {
+      let ch = s.code_unit_at(i)
+      out[i * 4] = i.to_double()
+      out[i * 4 + 1] = 1.0
+      out[i * 4 + 2] = if ch == 10 { 0.0 } else { adv }
+      out[i * 4 + 3] = if ch == 10 || ch == 32 || ch == 9 { -1.0 } else { ch.to_double() }
+      i += 1
+    }
+    n
+  }
+  h.rn_dirty = fn(x : Double, y : Double, w : Double, h : Double) -> Unit {
+    dirty_log.push((x, y, w, h))
+  }
+  set_view_app(fn(root : view::View) {
+    let _ = root.transitions_only().lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(lbl : view::View) {
+      let _ = lbl
+      .words(view::Live::Is("Canvas"), ink=0x000000FFL, look=view::words_plain)
+      .alpha(view::Live::By(fn() {
+        redone_seen.v = lbl.words_redone()
+        1.0
+      }))
+    })
+  })
+
+  // Frame 1: narrow fallback font (6.0pt/char -> "Canvas" = 36.0pt)
+  dirty_log.clear()
+  let c1 = view_frame(400.0, 300.0, 2.0, 0.0)
+  debug_assert(c1, "frame 1 must return true")
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => { debug_assert(false, "tree must exist"); view_forget(); hostapi::set_host(prev_host); return }
+  }
+  let mut w1 = 0.0
+  for d in tree.drawn() {
+    if d.words == "Canvas" {
+      w1 = d.w
+    }
+  }
+  debug_assert(w1 >= 36.0 && w1 <= 37.5, "frame 1 Canvas width=\{w1} expected ~36..37")
+  let redone_before = redone_seen.v
+
+  // Frame 2: async web font finishes loading (atlas_generation 1 -> 2, 9.0pt/char -> "Canvas" = 54.0pt)
+  atlas_gen.v = 2
+  char_adv.v = 9.0
+  dirty_log.clear()
+  let c2 = view_frame(400.0, 300.0, 2.0, 16.0)
+  debug_assert(c2, "atlas_generation change must make view_frame return true")
+  let mut w2 = 0.0
+  for d in tree.drawn() {
+    if d.words == "Canvas" {
+      w2 = d.w
+    }
+  }
+  debug_assert(w2 >= 54.0 && w2 <= 55.5 && w2 - w1 >= 17.5, "frame 2 Canvas width=\{w2} (w1=\{w1}) expected ~54..55 after font load")
+  debug_assert(redone_seen.v > redone_before, "words_redone() must increment on atlas_generation change")
+  let mut has_full_dirty = false
+  for d in dirty_log {
+    let (dx, dy, dw, dh) = d
+    if dx == 0.0 && dy == 0.0 && dw == -1.0 && dh == -1.0 {
+      has_full_dirty = true
+    }
+  }
+  debug_assert(has_full_dirty, "atlas_generation change must emit full repaint (0, 0, -1, -1)")
+  let sc = view_scene_last()
+  let mut glyph_count = 0
+  let mut gi = 0
+  while gi < sc.ninst {
+    if (sc.inst[gi * inst_size + 5] - 1.0).abs() < 0.01 {
+      glyph_count += 1
+    }
+    gi += 1
+  }
+  debug_assert(glyph_count == 6, "Canvas must emit all 6 glyph instances without ellipsis truncation, got \{glyph_count}")
+
+  view_forget()
+  hostapi::set_host(prev_host)
+}
