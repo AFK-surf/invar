@@ -8,6 +8,70 @@ import "view"
 pub let frame_period_default : Double = 1000.0 / 60.0
 pub let input_step_ms : Double = 1000.0 / 60.0
 
+extern "C" fn c_test_getenv(name : Ptr) -> Ptr = "getenv"
+
+fn parse_positive_double(raw : String) -> Option[Double] {
+  let n = raw.length()
+  let mut i = 0
+  while i < n {
+    let c = raw.code_unit_at(i)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      i += 1
+    } else {
+      break
+    }
+  }
+  let mut end = n
+  while end > i {
+    let c = raw.code_unit_at(end - 1)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      end -= 1
+    } else {
+      break
+    }
+  }
+  if i >= end {
+    return None
+  }
+  let mut acc = 0.0
+  let mut saw_digit = false
+  let mut saw_dot = false
+  let mut frac = 0.1
+  while i < end {
+    let c = raw.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      saw_digit = true
+      let d = (c - 48).to_double()
+      if saw_dot {
+        acc = acc + d * frac
+        frac = frac * 0.1
+      } else {
+        acc = acc * 10.0 + d
+      }
+    } else if c == 46 && !saw_dot {
+      saw_dot = true
+    } else {
+      return None
+    }
+    i += 1
+  }
+  if saw_digit && acc > 0.0 {
+    Some(acc)
+  } else {
+    None
+  }
+}
+
+fn test_env_fps() -> Double {
+  let p = c_test_getenv("INVAR_TEST_FPS".as_cstr())
+  let os_raw = cstr_to_str(p)
+  let raw = if os_raw.length() > 0 { os_raw } else { hostapi::env("INVAR_TEST_FPS") }
+  match parse_positive_double(raw) {
+    Some(v) => v
+    None => 60.0
+  }
+}
+
 /// Deterministic pure-tree UI test driver backed by FakeHost.
 pub struct Tester {
   pub fake : FakeHost
@@ -21,6 +85,7 @@ pub struct Tester {
 
 /// Create a pure-tree Tester, install FakeHost, build the tree, and render frame 0.
 /// `transitions_only` defaults to true so changes outside `view::transition` settle immediately.
+/// `fps` overrides `INVAR_TEST_FPS` when > 0.0; otherwise reads `INVAR_TEST_FPS` or defaults to 60.0.
 pub fn Tester::tree(
   make : (view::View) -> Unit,
   width~ : Double = 800.0,
@@ -30,6 +95,7 @@ pub fn Tester::tree(
   transitions_only~ : Bool = true,
   platform~ : Int = 0,
   dark~ : Bool = false,
+  fps~ : Double = 0.0,
 ) -> Tester {
   run_reset_hooks()
   let fake = FakeHost::new(width=width, height=height, scale=scale, platform=platform, dark=dark)
@@ -46,10 +112,11 @@ pub fn Tester::tree(
     Some(tf) => set_view_app(made, theme=tf)
     None => set_view_app(made)
   }
+  let eff_fps = if fps > 0.0 { fps } else { test_env_fps() }
   let t = Tester::{
     fake,
     prev_host,
-    period_ms: frame_period_default,
+    period_ms: 1000.0 / eff_fps,
     each_frame_cb: None,
     unasked_issues: [],
     a11y_issues: [],
@@ -444,6 +511,62 @@ pub fn Tester::assert_scrollable(self : Tester, label~ : String = "") -> Unit {
   }
 }
 
+/// Set the frame cadence in frames per second (must be > 0.0).
+pub fn Tester::set_fps(self : Tester, fps : Double) -> Unit {
+  if fps > 0.0 {
+    self.period_ms = 1000.0 / fps
+  }
+}
+
+/// Current frame cadence in frames per second.
+pub fn Tester::fps(self : Tester) -> Double {
+  if self.period_ms > 0.0 {
+    1000.0 / self.period_ms
+  } else {
+    60.0
+  }
+}
+
+/// Advance `ms` in fixed `period_ms` frame steps, checking `unasked_faults` and `a11y_faults` on every frame.
+pub fn Tester::run_for(self : Tester, ms : Double) -> Unit {
+  let span = dmax(0.0, ms)
+  if span <= 0.0 {
+    return
+  }
+  let target = self.fake.now_ms + span
+  let step_ms = if self.period_ms > 0.0 { self.period_ms } else { frame_period_default }
+  let mut guard_steps = 0
+  while self.fake.now_ms + 1.0e-9 < target && guard_steps < 100000 {
+    guard_steps += 1
+    let rem = target - self.fake.now_ms
+    let step = if rem < step_ms { rem } else { step_ms }
+    self.frame(ms=step)
+  }
+}
+
+/// Run `run(rate)` across `rates` (default `[60.0, 120.0, 24.0, 7.0]`) and collect any mismatches against the first rate.
+pub fn check_fps_matrix(
+  rates~ : Array[Double] = [60.0, 120.0, 24.0, 7.0],
+  probe : (Double) -> String,
+) -> Array[String] {
+  let diffs : Array[String] = []
+  if rates.length() == 0 {
+    return diffs
+  }
+  let base_rate = rates[0]
+  let base_out = probe(base_rate)
+  let mut i = 1
+  while i < rates.length() {
+    let r = rates[i]
+    let out = probe(r)
+    if out != base_out {
+      diffs.push("fps \{r} != \{base_rate}: got '\{out}', expected '\{base_out}'")
+    }
+    i += 1
+  }
+  diffs
+}
+
 pub fn Tester::time(self : Tester) -> Double {
   self.fake.now_ms
 }
@@ -453,6 +576,7 @@ pub fn Tester::dispose(self : Tester) -> Unit {
     return
   }
   self.disposed = true
+  reset_press_rules()
   view_forget()
   let _ = hostapi::set_host(self.prev_host)
 }

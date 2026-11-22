@@ -1,0 +1,213 @@
+// Touch/desktop hit-target minimum size (`room:`) and anti-overlap (`apart:`) automated UI gates.
+// Ported from monoid's libs/mbui/src/ui/rooms.mbt.
+
+import "view"
+
+/// Hit-target sizing rules: minimum size for touch (`finger`), pointer (`mouse`),
+/// and optional width threshold (`large_from`) above which touch devices use `mouse` sizing.
+pub struct PressRules {
+  pub finger : Double
+  pub mouse : Double
+  pub large_from : Option[Double]
+}
+
+struct PressRulesBox {
+  mut rules : PressRules
+}
+
+let press_rules_state : PressRulesBox = PressRulesBox::{
+  rules: PressRules::{ finger: 44.0, mouse: 36.0, large_from: None },
+}
+
+/// Set the active press-target sizing rules.
+pub fn set_press_rules(rules : PressRules) -> Unit {
+  press_rules_state.rules = rules
+}
+
+/// Return the currently active press-target sizing rules.
+pub fn press_rules_now() -> PressRules {
+  press_rules_state.rules
+}
+
+/// Reset press-target sizing rules back to defaults (`finger: 44.0, mouse: 36.0, large_from: None`).
+pub fn reset_press_rules() -> Unit {
+  press_rules_state.rules = PressRules::{ finger: 44.0, mouse: 36.0, large_from: None }
+}
+
+/// Minimum hit-target dimension in points for the given platform and window width.
+/// iOS (`1`) and Android (`2`) use `rules.finger` (44pt) unless `width >= large_from`;
+/// desktop/web platforms (`0`, `3`, `4`, `5`) or large screens use `rules.mouse` (36pt).
+pub fn room_least(platform~ : Int = 0, width~ : Double = 800.0) -> Double {
+  let r = press_rules_state.rules
+  let is_touch = platform == 1 || platform == 2
+  if !is_touch {
+    return r.mouse
+  }
+  match r.large_from {
+    Some(from) => if width >= from { r.mouse } else { r.finger }
+    None => r.finger
+  }
+}
+
+struct RoomTarget {
+  id : view::NodeId
+  vx0 : Double
+  vy0 : Double
+  vx1 : Double
+  vy1 : Double
+  label : String
+}
+
+fn room_label(tree : view::Tree, d : view::Drawn) -> String {
+  match tree.said_of(d.id) {
+    Some(s) => {
+      if s.label.length() > 0 {
+        return s.label
+      }
+    }
+    None => ()
+  }
+  if d.words.length() > 0 {
+    return d.words
+  }
+  let sl = tree.said_label(d.id)
+  if sl.length() > 0 {
+    return sl
+  }
+  "node#\{d.id.at}"
+}
+
+fn clipped_visible_rect(
+  held : Array[(view::Drawn, Int, Bool)],
+  idx : Int,
+  win_w : Double,
+  win_h : Double,
+) -> (Double, Double, Double, Double) {
+  let d = held[idx].0
+  let mut x0 = dmax(0.0, d.x)
+  let mut y0 = dmax(0.0, d.y)
+  let mut x1 = dmin(win_w, d.x + d.w)
+  let mut y1 = dmin(win_h, d.y + d.h)
+  let mut p = held[idx].1
+  while p >= 0 {
+    let anc = held[p].0
+    if anc.clips || anc.clips_self {
+      if anc.clips_way != 1 {
+        x0 = dmax(x0, anc.x)
+        x1 = dmin(x1, anc.x + anc.w)
+      }
+      if anc.clips_way != 2 {
+        y0 = dmax(y0, anc.y)
+        y1 = dmin(y1, anc.y + anc.h)
+      }
+    }
+    p = held[p].1
+  }
+  (x0, y0, x1, y1)
+}
+
+/// Inspect all visible clickable targets in the last frame for size (`room:`) and overlap (`apart:`) faults.
+pub fn Tester::room_faults(self : Tester) -> Array[String] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let targets : Array[RoomTarget] = []
+  let mut i = 0
+  while i < n {
+    let entry = held[i]
+    if entry.2 {
+      let d = entry.0
+      if d.w > 0.0 && d.h > 0.0 {
+        let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, self.fake.width, self.fake.height)
+        let vw = vx1 - vx0
+        let vh = vy1 - vy0
+        if vw > 0.5 && vh > 0.5 {
+          let mut occluded = false
+          let mut j = i + 1
+          while j < n {
+            let dj = held[j].0
+            if !tree.holds_in_order(d.id, dj.id) &&
+            !tree.holds_in_order(dj.id, d.id) &&
+            tree.covered_under(d.id, dj.id, (vx0, vy0, vx1, vy1)) {
+              occluded = true
+              break
+            }
+            j += 1
+          }
+          if !occluded {
+            targets.push(RoomTarget::{
+              id: d.id,
+              vx0,
+              vy0,
+              vx1,
+              vy1,
+              label: room_label(tree, d),
+            })
+          }
+        }
+      }
+    }
+    i += 1
+  }
+  let faults : Array[String] = []
+  let min_room = room_least(platform=self.fake.platform_id, width=self.fake.width)
+  let nt = targets.length()
+  // Rule 1 (`room:`): visible hit-target must meet minimum dimension
+  let mut a = 0
+  while a < nt {
+    let ta = targets[a]
+    if !tree.pressed_as_drawn(ta.id) {
+      let vw = ta.vx1 - ta.vx0
+      let vh = ta.vy1 - ta.vy0
+      if vw < min_room - 0.5 || vh < min_room - 0.5 {
+        faults.push("room: \{ta.label} (\{vw}x\{vh} < \{min_room}pt)")
+      }
+    }
+    a += 1
+  }
+  // Rule 2 (`apart:`): sibling/unrelated visible hit-targets must not overlap
+  a = 0
+  while a < nt {
+    let ta = targets[a]
+    let mut b = a + 1
+    while b < nt {
+      let tb = targets[b]
+      if !tree.holds_in_order(ta.id, tb.id) && !tree.holds_in_order(tb.id, ta.id) {
+        let ix0 = dmax(ta.vx0, tb.vx0)
+        let iy0 = dmax(ta.vy0, tb.vy0)
+        let ix1 = dmin(ta.vx1, tb.vx1)
+        let iy1 = dmin(ta.vy1, tb.vy1)
+        let ow = ix1 - ix0
+        let oh = iy1 - iy0
+        if ow > 0.5 && oh > 0.5 && ow * oh > 1.0 {
+          let part = (ix0, iy0, ix1, iy1)
+          if !tree.covered_under(ta.id, tb.id, part) && !tree.covered_under(tb.id, ta.id, part) {
+            faults.push("apart: \{ta.label} overlaps \{tb.label} (\{ow}x\{oh})")
+          }
+        }
+      }
+      b += 1
+    }
+    a += 1
+  }
+  faults
+}
+
+/// Assert that all visible clickable targets pass `room_faults()` (panics with full diagnostics otherwise).
+pub fn Tester::assert_rooms(self : Tester, label~ : String = "") -> Unit {
+  let faults = self.room_faults()
+  if faults.length() > 0 {
+    let mut msg = if label.length() > 0 {
+      "room_faults failed in \{label} (\{faults.length()} fault(s)):"
+    } else {
+      "room_faults failed (\{faults.length()} fault(s)):"
+    }
+    for f in faults {
+      msg = "\{msg}\n  - \{f}"
+    }
+    debug_assert(false, msg)
+  }
+}

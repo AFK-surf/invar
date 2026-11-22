@@ -1,0 +1,188 @@
+// Automated UI quality gate tests:
+// 1. Multi-framerate animation determinism (`fps`, `set_fps`, `run_for`, `check_fps_matrix`).
+// 2. Touch/desktop hit-target size (`room:`) and anti-overlap (`apart:`) gates (`PressRules`, `room_faults`, `assert_rooms`).
+
+import "signals"
+import "view"
+
+test "fps gate: set_fps, fps, and multi-rate transition determinism (60/120/24/7 fps)" {
+  let diffs = check_fps_matrix(fn(rate : Double) -> String {
+    let shifted = signals::signal(false)
+    let start_ms = signals::signal(0.0)
+    let dur = 300.0
+    let t = Tester::tree(
+      fn(root : view::View) {
+        let _ = root.box(fn(b : view::View) {
+          let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+          let _ = b.moved_by(
+            fn(_w : Double, _h : Double, now : Double) {
+              if !shifted.get() {
+                (0.0, 0.0)
+              } else {
+                let p = dclamp((now - start_ms.get()) / dur, 0.0, 1.0)
+                (120.0 * ease_at(Ease::Move, p), 0.0)
+              }
+            },
+            fn(_w : Double, _h : Double) {
+              if shifted.get() { start_ms.get() + dur } else { 0.0 }
+            },
+          )
+          let _ = b.says(view::Live::Is(Some(view::said(view::Role::Button, label="Mover"))))
+        })
+      },
+      width=400.0,
+      height=200.0,
+      fps=rate,
+    )
+    debug_assert((t.fps() - rate).abs() < 1.0e-6, "Tester::fps should match configured rate")
+    view::transition(fn() {
+      start_ms.set(t.time())
+      shifted.set(true)
+    })
+    t.run_for(450.0)
+    debug_assert(t.unasked_faults().length() == 0, "no unasked frame faults during run_for")
+    let pos = match t.get("Mover") {
+      Some(d) => "\{d.x.round().to_int()},\{d.y.round().to_int()},\{d.w.round().to_int()},\{d.h.round().to_int()}"
+      None => "missing"
+    }
+    debug_assert(pos == "120,0,100,48", "Mover must settle at (120, 0, 100, 48)")
+    t.dispose()
+    pos
+  })
+  debug_assert(diffs.length() == 0, "all 4 frame rates (60/120/24/7) must settle identically")
+
+  // Verify set_fps dynamically updates period_ms and fps()
+  let t2 = Tester::tree(fn(_root : view::View) { () }, fps=60.0)
+  debug_assert((t2.fps() - 60.0).abs() < 1.0e-6, "initial fps is 60")
+  t2.set_fps(120.0)
+  debug_assert((t2.fps() - 120.0).abs() < 1.0e-6, "set_fps updates to 120")
+  t2.set_fps(0.0)
+  debug_assert((t2.fps() - 120.0).abs() < 1.0e-6, "non-positive set_fps is ignored")
+  t2.dispose()
+}
+
+test "rooms gate: 32x32 fails on desktop (36pt) and iOS (44pt)" {
+  let make_small = fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+      let _ = b.on_press(fn() { () })
+      let _ = b.says(view::Live::Is(Some(view::said(view::Role::Button, label="Tiny"))))
+    })
+  }
+  let td = Tester::tree(make_small, width=400.0, height=200.0, platform=0)
+  let fd = td.room_faults()
+  debug_assert(fd.length() == 1 && str_has_prefix(fd[0], "room:"), "32x32 must report room: on desktop")
+  td.dispose()
+
+  let ti = Tester::tree(make_small, width=400.0, height=200.0, platform=1)
+  let fi = ti.room_faults()
+  debug_assert(fi.length() == 1 && str_has_prefix(fi[0], "room:"), "32x32 must report room: on iOS")
+  ti.dispose()
+}
+
+test "rooms gate: 40x40 passes desktop, fails iOS, passes wide iOS with large_from" {
+  let make_40 = fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+      let _ = b.on_press(fn() { () })
+      let _ = b.says(view::Live::Is(Some(view::said(view::Role::Button, label="Medium"))))
+    })
+  }
+  // Desktop (36pt): 40x40 passes
+  let td = Tester::tree(make_40, width=800.0, height=600.0, platform=0)
+  td.assert_rooms(label="desktop 40x40")
+  td.dispose()
+
+  // iOS default (44pt): 40x40 fails room:
+  let ti = Tester::tree(make_40, width=390.0, height=844.0, platform=1)
+  let fi = ti.room_faults()
+  debug_assert(fi.length() == 1 && str_has_prefix(fi[0], "room:"), "40x40 must report room: on iOS")
+  ti.dispose()
+
+  // Wide iOS 800x600 with large_from: Some(768.0) -> uses 36pt -> passes
+  set_press_rules(PressRules::{ finger: 44.0, mouse: 36.0, large_from: Some(768.0) })
+  debug_assert(room_least(platform=1, width=800.0) == 36.0, "wide iOS uses mouse rule 36pt")
+  debug_assert(room_least(platform=1, width=390.0) == 44.0, "narrow iOS keeps finger rule 44pt")
+  let tw = Tester::tree(make_40, width=800.0, height=600.0, platform=1)
+  tw.assert_rooms(label="wide iOS large_from 40x40")
+  tw.dispose()
+  debug_assert(press_rules_now().large_from is None, "dispose resets press_rules to defaults")
+}
+
+test "rooms gate: two separated 44x44 buttons pass with 0 faults" {
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(r : view::View) {
+        let _ = r.as_row().gap(view::Live::Is(12.0))
+        let _ = r.box(fn(a : view::View) {
+          let _ = a.width(view::Live::Is(Some(44.0))).height(view::Live::Is(Some(44.0)))
+          let _ = a.on_press(fn() { () })
+          let _ = a.says(view::Live::Is(Some(view::said(view::Role::Button, label="Left"))))
+        })
+        let _ = r.box(fn(b : view::View) {
+          let _ = b.width(view::Live::Is(Some(44.0))).height(view::Live::Is(Some(44.0)))
+          let _ = b.on_press(fn() { () })
+          let _ = b.says(view::Live::Is(Some(view::said(view::Role::Button, label="Right"))))
+        })
+      })
+    },
+    width=400.0,
+    height=200.0,
+    platform=1,
+  )
+  t.assert_rooms(label="two separated 44x44 buttons")
+  t.dispose()
+}
+
+test "rooms gate: overlapping buttons report apart:, opaque overlay suppresses false apart:" {
+  // Two overlapping buttons without opaque cover -> must report apart:
+  let t_over = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.over(view::Live::Is(true)).offset(view::Live::Is((20.0, 20.0)))
+        let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(48.0)))
+        let _ = a.on_press(fn() { () })
+        let _ = a.says(view::Live::Is(Some(view::said(view::Role::Button, label="First"))))
+      })
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.over(view::Live::Is(true)).offset(view::Live::Is((50.0, 30.0)))
+        let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(48.0)))
+        let _ = b.on_press(fn() { () })
+        let _ = b.says(view::Live::Is(Some(view::said(view::Role::Button, label="Second"))))
+      })
+    },
+    width=400.0,
+    height=200.0,
+    platform=0,
+  )
+  let fo = t_over.room_faults()
+  debug_assert(fo.length() == 1 && str_has_prefix(fo[0], "apart:"), "overlapping buttons must report apart:")
+  t_over.dispose()
+
+  // Underlying button covered by an upper opaque overlay -> must NOT report apart:
+  let t_cov = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(under : view::View) {
+        let _ = under.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(60.0)))
+        let _ = under.on_press(fn() { () })
+        let _ = under.says(view::Live::Is(Some(view::said(view::Role::Button, label="Under"))))
+      })
+      let _ = root.box(fn(sheet : view::View) {
+        let _ = sheet.over(view::Live::Is(true))
+        let _ = sheet.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(200.0)))
+        let _ = sheet.ground(view::Live::Is(rgba(255, 255, 255, 255)))
+        let _ = sheet.box(fn(top : view::View) {
+          let _ = top.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(60.0)))
+          let _ = top.on_press(fn() { () })
+          let _ = top.says(view::Live::Is(Some(view::said(view::Role::Button, label="Top"))))
+        })
+      })
+    },
+    width=400.0,
+    height=200.0,
+    platform=0,
+  )
+  let fc = t_cov.room_faults()
+  debug_assert(fc.length() == 0, "button under opaque overlay must not falsely report apart:")
+  t_cov.dispose()
+}
