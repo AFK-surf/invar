@@ -1,0 +1,248 @@
+// Inline clickable hyperlinks in rich text runs: multi-line span hit-testing,
+// hover pointer cursor switching (`Cursor::Hand`), and click callback (`LinkSpan` + `LinkedText` + `linked_words`).
+
+import "dmath"
+import "editor"
+import "paint"
+import "signals"
+import "text"
+import "view"
+
+/// A contiguous inline hyperlink span within a rich-text paragraph and its laid-out hit rectangles.
+pub struct LinkSpan {
+  pub run_index : Int
+  pub byte_start : Int
+  pub byte_end : Int
+  pub text : String
+  pub href : String
+  pub mut rects : Array[paint::Rect]
+}
+
+/// Stateful inline hyperlink manager for a sequence of `text::Run` pieces.
+pub struct LinkedText {
+  pub editor : editor::EditorState
+  pub mut runs : Array[text::Run]
+  pub mut spans : Array[LinkSpan]
+  pub hovered_sig : signals::Signal[Int]
+  pub pressed_sig : signals::Signal[Int]
+  layout_sig : signals::Signal[Int]
+  pub mut last_font_size : Double
+  pub mut last_line_h : Double
+  pub mut last_max_w : Double
+}
+
+fn build_link_spans(runs : Array[text::Run]) -> (String, Array[LinkSpan]) {
+  let sb = StringBuilder::new()
+  let spans : Array[LinkSpan] = []
+  let mut off = 0
+  let mut i = 0
+  while i < runs.length() {
+    let r = runs[i]
+    let len = r.text.length()
+    sb.write_string(r.text)
+    if r.link.length() > 0 && len > 0 {
+      let n = spans.length()
+      if n > 0 && spans[n - 1].href == r.link && spans[n - 1].byte_end == off {
+        let prev = spans[n - 1]
+        spans[n - 1] = LinkSpan::{
+          run_index: prev.run_index,
+          byte_start: prev.byte_start,
+          byte_end: off + len,
+          text: prev.text + r.text,
+          href: prev.href,
+          rects: [],
+        }
+      } else {
+        spans.push(
+          LinkSpan::{
+            run_index: i,
+            byte_start: off,
+            byte_end: off + len,
+            text: r.text,
+            href: r.link,
+            rects: [],
+          },
+        )
+      }
+    }
+    off += len
+    i += 1
+  }
+  (sb.to_string(), spans)
+}
+
+pub fn LinkedText::new(runs : Array[text::Run]) -> LinkedText {
+  let (full_text, spans) = build_link_spans(runs)
+  let cfg = editor::EditorConfig::default()
+  let ed = editor::EditorState::new(text=full_text, config=cfg)
+  ed.set_selection(0, 0)
+  LinkedText::{
+    editor: ed,
+    runs,
+    spans,
+    hovered_sig: signals::signal(-1),
+    pressed_sig: signals::signal(-1),
+    layout_sig: signals::signal(0),
+    last_font_size: 15.0,
+    last_line_h: 22.0,
+    last_max_w: 0.0,
+  }
+}
+
+/// Recompute multi-line bounding hit rectangles for every link span using real font shaping.
+pub fn LinkedText::layout_for(
+  self : LinkedText,
+  max_w : Double,
+  font_size~ : Double = 0.0,
+  line_h~ : Double = 0.0,
+) -> Unit {
+  let sz = if font_size > 0.0 { font_size } else { self.last_font_size }
+  let lh = if line_h > 0.0 { line_h } else if self.last_line_h > 0.0 { self.last_line_h } else { sz * 1.4 }
+  self.last_font_size = sz
+  self.last_line_h = lh
+  self.last_max_w = max_w
+  let _ = self.editor.layout_lines(max_w, fn(s : String) { measure_text_width(s, sz) }, lh)
+  for i in 0..<self.spans.length() {
+    let sp = self.spans[i]
+    self.editor.set_selection(sp.byte_start, sp.byte_end)
+    sp.rects = self.editor.selection_rects(color=0L)
+  }
+  self.editor.set_selection(0, 0)
+  self.layout_sig.set(self.layout_sig.untracked() + 1)
+}
+
+/// Return the index of the `LinkSpan` containing local coordinates `(x, y)`, or `-1` if none.
+pub fn LinkedText::hit_test_index(self : LinkedText, x : Double, y : Double) -> Int {
+  for i in 0..<self.spans.length() {
+    let sp = self.spans[i]
+    for r in sp.rects {
+      if x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h {
+        return i
+      }
+    }
+  }
+  -1
+}
+
+/// Return the `LinkSpan` at local coordinates `(x, y)`, or `None`.
+pub fn LinkedText::hit_test_link(self : LinkedText, x : Double, y : Double) -> Option[LinkSpan] {
+  let idx = self.hit_test_index(x, y)
+  if idx >= 0 { Some(self.spans[idx]) } else { None }
+}
+
+/// Update hovered link index from pointer local coordinates `(x, y)`.
+pub fn LinkedText::update_hover(self : LinkedText, x : Double, y : Double) -> Option[String] {
+  let idx = self.hit_test_index(x, y)
+  self.hovered_sig.set(idx)
+  if idx >= 0 { Some(self.spans[idx].href) } else { None }
+}
+
+pub fn LinkedText::clear_hover(self : LinkedText) -> Unit {
+  self.hovered_sig.set(-1)
+  self.pressed_sig.set(-1)
+}
+
+pub fn LinkedText::hovered_href(self : LinkedText) -> Option[String] {
+  let idx = self.hovered_sig.get()
+  if idx >= 0 && idx < self.spans.length() {
+    Some(self.spans[idx].href)
+  } else {
+    None
+  }
+}
+
+/// Hit-test a click at `(x, y)` and return `Some(href)` if it landed on a link span.
+pub fn LinkedText::click_at(self : LinkedText, x : Double, y : Double) -> Option[String] {
+  match self.hit_test_link(x, y) {
+    Some(sp) => Some(sp.href)
+    None => None
+  }
+}
+
+/// Pure-tree rich-text paragraph with styled inline hyperlinks, hover `Cursor::Hand`,
+/// and click dispatch to `on_open(href)`.
+pub fn linked_words(
+  parent : view::View,
+  lt : LinkedText,
+  on_open : (String) -> Unit,
+  font_size~ : Double = 15.0,
+  line~ : Double = 0.0,
+  color~ : Int64 = c64(0x1D1D, 0x1FFF),
+  link_color~ : Int64 = c64(0x0066, 0xCCFF),
+  underline~ : Bool = true,
+  label~ : String = "",
+) -> view::View {
+  let line_h = if line > 0.0 { line } else { font_size * 1.4 }
+  lt.last_font_size = font_size
+  lt.last_line_h = line_h
+  let look = view::WordsLook::of(font_size, line=line_h, wrap=true)
+
+  // Style link runs with `link_color` and optional underline.
+  let styled_runs : Array[text::Run] = []
+  for r in lt.runs {
+    if r.link.length() > 0 {
+      styled_runs.push(
+        text::Run::{
+          ..r,
+          color: if r.color != 0L { r.color } else { link_color },
+          underline: if underline { true } else { r.underline },
+        },
+      )
+    } else {
+      styled_runs.push(r)
+    }
+  }
+
+  parent.box(fn(v : view::View) {
+    let ensure_laid = fn() {
+      let (_, _, w, _) = v.rect()
+      if w > 0.0 && (dmath::abs(lt.last_max_w - w) > 0.5 || lt.editor.lines.length() == 0) {
+        lt.layout_for(w, font_size=font_size, line_h=line_h)
+      }
+    }
+    let _ = v
+    .words_runs(view::Live::Is(styled_runs), ink=color, look=look)
+    .cursor(
+      view::Live::By(fn() {
+        if lt.hovered_sig.get() >= 0 {
+          Some(view::Cursor::Hand)
+        } else {
+          Some(view::Cursor::Arrow)
+        }
+      }),
+    )
+    .on_pointer_moved(fn() {
+      ensure_laid()
+      match v.pointer_here() {
+        Some((x, y)) => {
+          let _ = lt.update_hover(x, y)
+        }
+        None => lt.clear_hover()
+      }
+    })
+    .on_drag(fn(d : view::Drag) {
+      ensure_laid()
+      match d.kind {
+        view::DragKind::Down => {
+          let idx = lt.hit_test_index(d.x, d.y)
+          lt.pressed_sig.set(idx)
+        }
+        view::DragKind::Moved => {
+          let _ = lt.update_hover(d.x, d.y)
+        }
+        view::DragKind::Up => {
+          let down_idx = lt.pressed_sig.untracked()
+          lt.pressed_sig.set(-1)
+          let up_idx = lt.hit_test_index(d.x, d.y)
+          if down_idx >= 0 && down_idx == up_idx && up_idx < lt.spans.length() {
+            on_open(lt.spans[up_idx].href)
+          }
+        }
+        view::DragKind::Off => lt.pressed_sig.set(-1)
+      }
+    })
+    if label.length() > 0 {
+      let _ = v.says(view::Live::Is(Some(view::said(view::Role::Text, label=label, value=lt.editor.text))))
+    }
+  })
+}

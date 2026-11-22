@@ -42,6 +42,7 @@ pub struct Field {
   layout_sig : signals::Signal[Int]
   pub handles_sig : signals::Signal[Bool]
   pub loupe_sig : signals::Signal[Option[(Double, Double)]]
+  pub menu_open_sig : signals::Signal[Bool]
   pub mut color : Int64
   pub mut ph_color : Int64
   pub mut caret_color : Int64
@@ -99,6 +100,7 @@ pub fn Field::new(text~ : String = "") -> Field {
         _ => false
       }
     }),
+    menu_open_sig: signals::signal(false),
     color: c64(0x1D1D, 0x1FFF),
     ph_color: c64(0x8E8E, 0x93FF),
     caret_color: c64(0x0A84, 0xFFFF),
@@ -136,6 +138,180 @@ pub fn Field::set_loupe_at(self : Field, pt : Option[(Double, Double)]) -> Unit 
 
 pub fn Field::loupe_at(self : Field) -> Option[(Double, Double)] {
   self.loupe_sig.get()
+}
+
+pub fn Field::set_menu_open(self : Field, on : Bool) -> Unit {
+  self.menu_open_sig.set(on)
+}
+
+pub fn Field::menu_open(self : Field) -> Bool {
+  self.menu_open_sig.get()
+}
+
+pub fn Field::dismiss_menu(self : Field) -> Unit {
+  self.menu_open_sig.set(false)
+}
+
+/// Bitmask flags for floating editing bar actions.
+pub let edit_menu_cut : Int = 1
+pub let edit_menu_copy : Int = 2
+pub let edit_menu_paste : Int = 4
+pub let edit_menu_select_all : Int = 8
+
+/// Discrete editing action offered by a floating editing bar.
+pub enum EditAction {
+  Cut
+  Copy
+  Paste
+  SelectAll
+}
+
+pub fn edit_action_eq(a : EditAction, b : EditAction) -> Bool {
+  match (a, b) {
+    (EditAction::Cut, EditAction::Cut) => true
+    (EditAction::Copy, EditAction::Copy) => true
+    (EditAction::Paste, EditAction::Paste) => true
+    (EditAction::SelectAll, EditAction::SelectAll) => true
+    _ => false
+  }
+}
+
+pub fn EditAction::label(self : EditAction) -> String {
+  match self {
+    EditAction::Cut => "Cut"
+    EditAction::Copy => "Copy"
+    EditAction::Paste => "Paste"
+    EditAction::SelectAll => "Select All"
+  }
+}
+
+pub fn EditAction::label_zh(self : EditAction) -> String {
+  match self {
+    EditAction::Cut => "剪切"
+    EditAction::Copy => "复制"
+    EditAction::Paste => "粘贴"
+    EditAction::SelectAll => "全选"
+  }
+}
+
+pub fn EditAction::bit(self : EditAction) -> Int {
+  match self {
+    EditAction::Cut => edit_menu_cut
+    EditAction::Copy => edit_menu_copy
+    EditAction::Paste => edit_menu_paste
+    EditAction::SelectAll => edit_menu_select_all
+  }
+}
+
+/// Anchor rectangle (window coordinates) and capability bitmask for a field's floating editing bar.
+pub struct EditMenuRect {
+  pub x : Double
+  pub y : Double
+  pub w : Double
+  pub h : Double
+  pub can : Int
+  pub selected : Bool
+}
+
+/// Compute available editing actions bitmask for this field (`edit_menu_*`).
+pub fn Field::edit_menu_can(self : Field) -> Int {
+  self.sync_config()
+  let (lo, hi) = self.editor.selection_range()
+  let n = self.editor.text.length()
+  let mut mask = edit_menu_paste
+  if lo < hi && !self.secret {
+    mask = mask | edit_menu_cut | edit_menu_copy
+  }
+  if n > 0 && !(lo == 0 && hi == n) {
+    mask = mask | edit_menu_select_all
+  }
+  mask
+}
+
+/// Ordered list of available editing actions for the floating editing bar.
+pub fn Field::edit_menu_actions(self : Field) -> Array[EditAction] {
+  let can = self.edit_menu_can()
+  let out : Array[EditAction] = []
+  if (can & edit_menu_cut) != 0 {
+    out.push(EditAction::Cut)
+  }
+  if (can & edit_menu_copy) != 0 {
+    out.push(EditAction::Copy)
+  }
+  if (can & edit_menu_paste) != 0 {
+    out.push(EditAction::Paste)
+  }
+  if (can & edit_menu_select_all) != 0 {
+    out.push(EditAction::SelectAll)
+  }
+  out
+}
+
+/// Execute a floating editing bar action on this field.
+pub fn Field::perform_edit_action(self : Field, action : EditAction) -> Unit {
+  match action {
+    EditAction::Cut => {
+      let _ = self.cut_selection()
+      self.set_handles_shown(false)
+      self.dismiss_menu()
+    }
+    EditAction::Copy => {
+      let _ = self.copy_selection()
+      let (_, hi) = self.editor.selection_range()
+      self.editor.set_selection(hi, hi)
+      self.set_handles_shown(false)
+      self.dismiss_menu()
+    }
+    EditAction::Paste => {
+      self.paste_text(clipboard_get())
+      self.set_handles_shown(false)
+      self.dismiss_menu()
+    }
+    EditAction::SelectAll => {
+      self.editor.select_all()
+      self.set_handles_shown(self.editor.text.length() > 0)
+    }
+  }
+}
+
+/// Compute the selection or caret bounding rectangle in window coordinates for anchoring a floating editing bar.
+pub fn Field::edit_menu_rect(self : Field) -> EditMenuRect {
+  self.sync_config()
+  let can = self.edit_menu_can()
+  let has_sel = self.editor.has_selection()
+  if has_sel {
+    let rects = self.selection_rects()
+    if rects.length() > 0 {
+      let mut min_x = rects[0].x
+      let mut min_y = rects[0].y
+      let mut max_x = rects[0].x + rects[0].w
+      let mut max_y = rects[0].y + rects[0].h
+      for i in 1..<rects.length() {
+        let r = rects[i]
+        if r.x < min_x { min_x = r.x }
+        if r.y < min_y { min_y = r.y }
+        if r.x + r.w > max_x { max_x = r.x + r.w }
+        if r.y + r.h > max_y { max_y = r.y + r.h }
+      }
+      return EditMenuRect::{
+        x: self.last_win_x + min_x,
+        y: self.last_win_y + min_y,
+        w: dmax(max_x - min_x, 2.0),
+        h: dmax(max_y - min_y, self.last_line_h),
+        can,
+        selected: true,
+      }
+    }
+  }
+  let cp = self.caret_pos()
+  EditMenuRect::{
+    x: self.last_win_x + cp.x,
+    y: self.last_win_y + cp.y,
+    w: 2.0,
+    h: dmax(cp.height, self.last_line_h),
+    can,
+    selected: has_sel,
+  }
 }
 
 fn Field::sync_config(self : Field) -> Unit {

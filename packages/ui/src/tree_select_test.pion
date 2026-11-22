@@ -1,0 +1,145 @@
+// End-to-end tests for Wave 11-C:
+// - Field floating edit menu protocol (`edit_menu_actions`, `edit_menu_rect`, `perform_edit_action`)
+// - Read-only selectable text (`SelectableText` + `selectable_words`: drag, double-tap word, Cmd/Ctrl+C)
+// - Inline clickable hyperlinks (`LinkSpan` + `LinkedText` + `linked_words`: hit-test, hover cursor, click)
+
+import "text"
+import "view"
+
+test "tree_select 01: Field edit_menu_actions, edit_menu_rect, and perform_edit_action" {
+  let fld = Field::new(text="Hello World")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.over_at(view::Live::Is((Some(20.0), Some(40.0), None, None))).width(view::Live::Is(Some(240.0)))
+      let _ = field(b, fld, max_lines=3, font_size=15.0, line=22.0, label="MenuField")
+    })
+  })
+  t.resize(400.0, 240.0)
+  fld.focus()
+  fld.pick(0, 5) // "Hello"
+  t.frame(ms=16.0)
+
+  // Partial selection offers Cut, Copy, Paste, SelectAll
+  let actions = fld.edit_menu_actions()
+  debug_assert(actions.length() == 4, "partial selection offers Cut/Copy/Paste/SelectAll")
+  debug_assert(edit_action_eq(actions[0], EditAction::Cut), "first action is Cut")
+  debug_assert(edit_action_eq(actions[1], EditAction::Copy), "second action is Copy")
+  debug_assert(edit_action_eq(actions[2], EditAction::Paste), "third action is Paste")
+  debug_assert(edit_action_eq(actions[3], EditAction::SelectAll), "fourth action is SelectAll")
+
+  // edit_menu_rect anchors at window coordinates of selection
+  let mr = fld.edit_menu_rect()
+  debug_assert(mr.selected && mr.w > 10.0 && mr.x >= 20.0 && mr.y >= 40.0, "edit_menu_rect matches selection box")
+
+  // Perform Copy -> clipboard updated, selection collapses
+  fld.set_menu_open(true)
+  fld.perform_edit_action(EditAction::Copy)
+  debug_assert(clipboard_get() == "Hello", "Copy action populated clipboard")
+  debug_assert(!fld.menu_open(), "Copy action dismissed menu")
+
+  // Perform SelectAll -> selects entire text, removes SelectAll from available actions
+  fld.perform_edit_action(EditAction::SelectAll)
+  let (sa, sb) = fld.selection()
+  debug_assert(sa == 0 && sb == 11, "SelectAll selected full text")
+  let full_actions = fld.edit_menu_actions()
+  debug_assert(full_actions.length() == 3, "SelectAll omitted when entire text already selected")
+
+  // Perform Cut + Paste round-trip
+  fld.perform_edit_action(EditAction::Cut)
+  debug_assert(fld.text() == "" && clipboard_get() == "Hello World", "Cut cleared text and set clipboard")
+  fld.perform_edit_action(EditAction::Paste)
+  debug_assert(fld.text() == "Hello World", "Paste restored text from clipboard")
+
+  // Secret field hides Cut and Copy even with selection
+  fld.secret = true
+  fld.pick(0, 5)
+  let secret_can = fld.edit_menu_can()
+  debug_assert((secret_can & edit_menu_cut) == 0 && (secret_can & edit_menu_copy) == 0, "secret hides Cut/Copy")
+  t.dispose()
+}
+
+test "tree_select 02: SelectableText drag selection, double-tap word, multi-line rects, and Cmd/Ctrl+C" {
+  let sel = SelectableText::new(text="Alpha Beta\nGamma Delta")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(260.0)))
+      let _ = selectable_words(b, sel, font_size=15.0, line=22.0, label="ReadOnly")
+    })
+  })
+  let _ = sel.layout_for(260.0, font_size=15.0, line_h=22.0)
+
+  // Drag from line 0 ("Beta") down to line 1 ("Gamma")
+  let p_start = sel.editor.caret_pos(6)
+  let p_end = sel.editor.caret_pos(16)
+  sel.pointer_down(p_start.x, p_start.y + 5.0, now=100.0)
+  sel.pointer_move(p_end.x, p_end.y + 5.0)
+  sel.pointer_up()
+  debug_assert(sel.has_selection(), "drag created selection")
+  debug_assert(sel.selected_text() == "Beta\nGamma", "drag selected across lines")
+  debug_assert(sel.selection_rects().length() == 2, "cross-line selection produces 2 rects")
+
+  // Cmd/Ctrl+C copies to clipboard
+  let primary = if keys_apple() { mod_cmd } else { mod_ctrl }
+  debug_assert(sel.handle_key(key_of_char('c'), primary), "Cmd/Ctrl+C handled")
+  debug_assert(clipboard_get() == "Beta\nGamma", "clipboard received selected read-only text")
+
+  // Double-tap selects word under pointer
+  let p_alpha = sel.editor.caret_pos(2)
+  sel.pointer_down(p_alpha.x, p_alpha.y + 5.0, now=1000.0)
+  sel.pointer_up()
+  sel.pointer_down(p_alpha.x, p_alpha.y + 5.0, now=1150.0)
+  sel.pointer_up()
+  debug_assert(sel.selected_text() == "Alpha", "double-tap selected word 'Alpha'")
+
+  // Escape clears selection
+  debug_assert(sel.handle_key(key_escape, 0), "Escape handled")
+  debug_assert(!sel.has_selection(), "Escape cleared selection")
+  t.dispose()
+}
+
+test "tree_select 03: LinkedText inline hyperlink hit-test, hover cursor, and click callback" {
+  let runs : Array[text::Run] = [
+    text::plain("See "),
+    text::link("Invar Docs", "https://invar.dev/docs"),
+    text::plain(" and "),
+    text::link("API Guide", "https://invar.dev/api"),
+    text::plain(" for details."),
+  ]
+  let lt = LinkedText::new(runs)
+  let opened = ref_new("")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(320.0)))
+      let _ = linked_words(b, lt, fn(href : String) { opened.v = href }, font_size=15.0, line=22.0, label="Links")
+    })
+  })
+  lt.layout_for(320.0, font_size=15.0, line_h=22.0)
+
+  debug_assert(lt.spans.length() == 2, "2 inline link spans extracted")
+  debug_assert(lt.spans[0].rects.length() >= 1 && lt.spans[1].rects.length() >= 1, "link spans have hit rects")
+
+  // Hover over first link -> hovered_href matches & cursor switches to Hand
+  let r0 = lt.spans[0].rects[0]
+  let h0 = lt.update_hover(r0.x + r0.w * 0.5, r0.y + r0.h * 0.5)
+  match h0 {
+    Some(href) => debug_assert(href == "https://invar.dev/docs", "hovered first link")
+    None => debug_assert(false, "expected hover hit on first link")
+  }
+  debug_assert(lt.hovered_sig.untracked() == 0, "hovered_sig == 0")
+
+  // Hover on plain text prefix (x=2, y=5) -> miss
+  debug_assert(lt.update_hover(2.0, 5.0).is_none(), "plain text is not a link")
+  debug_assert(lt.hovered_sig.untracked() == -1, "hovered_sig reset to -1")
+
+  // Click on second link -> returns second href
+  let r1 = lt.spans[1].rects[0]
+  match lt.click_at(r1.x + r1.w * 0.5, r1.y + r1.h * 0.5) {
+    Some(href) => {
+      debug_assert(href == "https://invar.dev/api", "clicked second link")
+      opened.v = href
+    }
+    None => debug_assert(false, "expected click hit on second link")
+  }
+  debug_assert(opened.v == "https://invar.dev/api", "open callback received href")
+  t.dispose()
+}

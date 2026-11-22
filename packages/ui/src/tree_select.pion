@@ -1,0 +1,272 @@
+// Read-only rich/plain text drag selection, double-tap word selection, multi-line highlight,
+// and Cmd/Ctrl+C clipboard copy (`SelectableText` + `selectable_words`).
+
+import "dmath"
+import "editor"
+import "hostapi"
+import "paint"
+import "signals"
+import "view"
+
+/// Read-only selectable text state backed by `packages/editor` layout and grapheme/word boundaries.
+pub struct SelectableText {
+  pub editor : editor::EditorState
+  layout_sig : signals::Signal[Int]
+  dragging_sig : signals::Signal[Bool]
+  pub mut sel_color : Int64
+  pub mut last_font_size : Double
+  pub mut last_line_h : Double
+  pub mut last_max_w : Double
+  mut drag_anchor : Int
+  mut last_tap_at : Double
+  mut last_tap_x : Double
+  mut last_tap_y : Double
+}
+
+pub fn SelectableText::new(text~ : String = "") -> SelectableText {
+  let cfg = editor::EditorConfig::default()
+  let ed = editor::EditorState::new(text=text, config=cfg)
+  ed.set_selection(0, 0)
+  SelectableText::{
+    editor: ed,
+    layout_sig: signals::signal(0),
+    dragging_sig: signals::signal(false),
+    sel_color: c64(0x0A84, 0xFF40),
+    last_font_size: 15.0,
+    last_line_h: 22.0,
+    last_max_w: 0.0,
+    drag_anchor: 0,
+    last_tap_at: -10000.0,
+    last_tap_x: 0.0,
+    last_tap_y: 0.0,
+  }
+}
+
+pub fn SelectableText::set_text(self : SelectableText, s : String) -> Unit {
+  self.editor.set(s, caret=0)
+  self.layout_sig.set(self.layout_sig.untracked() + 1)
+}
+
+pub fn SelectableText::text(self : SelectableText) -> String {
+  self.editor.text_signal().get()
+}
+
+pub fn SelectableText::has_selection(self : SelectableText) -> Bool {
+  let a = self.editor.anchor_signal().get()
+  let c = self.editor.caret_signal().get()
+  a != c
+}
+
+pub fn SelectableText::selection(self : SelectableText) -> (Int, Int) {
+  let a = self.editor.anchor_signal().get()
+  let c = self.editor.caret_signal().get()
+  if a <= c { (a, c) } else { (c, a) }
+}
+
+pub fn SelectableText::selected_text(self : SelectableText) -> String {
+  let _ = self.selection()
+  self.editor.selected_text()
+}
+
+pub fn SelectableText::clear_selection(self : SelectableText) -> Unit {
+  self.editor.set_selection(0, 0)
+  self.dragging_sig.set(false)
+}
+
+pub fn SelectableText::select_all(self : SelectableText) -> Unit {
+  self.editor.select_all()
+}
+
+pub fn SelectableText::select_range(self : SelectableText, from : Int, to : Int) -> Unit {
+  self.editor.set_selection(from, to)
+}
+
+/// Lay out visual lines for `max_w` using real font shaping via `measure_text_width`.
+pub fn SelectableText::layout_for(
+  self : SelectableText,
+  max_w : Double,
+  font_size~ : Double = 0.0,
+  line_h~ : Double = 0.0,
+) -> Array[editor::VisualLine] {
+  let sz = if font_size > 0.0 { font_size } else { self.last_font_size }
+  let lh = if line_h > 0.0 { line_h } else if self.last_line_h > 0.0 { self.last_line_h } else { sz * 1.4 }
+  self.last_font_size = sz
+  self.last_line_h = lh
+  self.last_max_w = max_w
+  let lines = self.editor.layout_lines(max_w, fn(s : String) { measure_text_width(s, sz) }, lh)
+  self.layout_sig.set(self.layout_sig.untracked() + 1)
+  lines
+}
+
+pub fn SelectableText::selection_rects(self : SelectableText) -> Array[paint::Rect] {
+  self.editor.selection_rects(color=self.sel_color)
+}
+
+/// Select the word at local coordinates `(x, y)`.
+pub fn SelectableText::select_word_at_point(self : SelectableText, x : Double, y : Double) -> (Int, Int) {
+  let off = self.editor.hit_test(x, y)
+  self.editor.select_word_at(off)
+}
+
+/// Copy the current selection to the system clipboard and return it.
+pub fn SelectableText::copy_selection(self : SelectableText) -> String {
+  let s = self.editor.copy()
+  if s.length() > 0 {
+    clipboard_set(s)
+  }
+  s
+}
+
+/// Begin pointer selection at local `(x, y)` (double-tap within 400ms & 12pt selects the word).
+pub fn SelectableText::pointer_down(self : SelectableText, x : Double, y : Double, now~ : Double = 0.0) -> Unit {
+  let dx = x - self.last_tap_x
+  let dy = y - self.last_tap_y
+  let dist = dmath::sqrt(dx * dx + dy * dy)
+  if now > 0.0 && now - self.last_tap_at <= 400.0 && dist <= 12.0 {
+    let _ = self.select_word_at_point(x, y)
+    self.dragging_sig.set(false)
+    self.last_tap_at = -10000.0
+    return
+  }
+  self.last_tap_at = now
+  self.last_tap_x = x
+  self.last_tap_y = y
+  let off = self.editor.hit_test(x, y)
+  self.drag_anchor = off
+  self.editor.set_selection(off, off)
+  self.dragging_sig.set(true)
+}
+
+/// Extend drag selection to local `(x, y)`.
+pub fn SelectableText::pointer_move(self : SelectableText, x : Double, y : Double) -> Unit {
+  if !self.dragging_sig.untracked() {
+    return
+  }
+  let off = self.editor.hit_test(x, y)
+  self.editor.set_selection(self.drag_anchor, off)
+}
+
+/// End pointer drag selection.
+pub fn SelectableText::pointer_up(self : SelectableText) -> Unit {
+  self.dragging_sig.set(false)
+}
+
+/// Handle read-only selection keyboard shortcuts: Cmd/Ctrl+C (copy), Cmd/Ctrl+A (select all), Escape (clear).
+pub fn SelectableText::handle_key(self : SelectableText, code : Int, mods : Int) -> Bool {
+  let platform = hostapi::keys_platform()
+  let is_apple = platform == editor::platform_macos || platform == editor::platform_ios
+  let primary = if is_apple { (mods & mod_cmd) != 0 } else { (mods & mod_ctrl) != 0 }
+  let shift = (mods & mod_shift_key) != 0
+  let alt = (mods & mod_alt) != 0
+  if code == key_code_copy || (primary && !alt && !shift && code == key_of_char('c')) {
+    let _ = self.copy_selection()
+    return true
+  }
+  if code == key_code_select_all || (primary && !alt && !shift && code == key_of_char('a')) {
+    self.select_all()
+    return true
+  }
+  if code == key_escape {
+    self.clear_selection()
+    return true
+  }
+  false
+}
+
+/// Pure-tree read-only selectable paragraph node with I-beam cursor, multi-line selection highlight,
+/// drag/double-click selection, and Cmd/Ctrl+C copy.
+pub fn selectable_words(
+  parent : view::View,
+  sel : SelectableText,
+  font_size~ : Double = 15.0,
+  line~ : Double = 0.0,
+  color~ : Int64 = c64(0x1D1D, 0x1FFF),
+  sel_color~ : Int64 = c64(0x0A84, 0xFF40),
+  label~ : String = "",
+) -> view::View {
+  let line_h = if line > 0.0 { line } else { font_size * 1.4 }
+  sel.sel_color = sel_color
+  sel.last_font_size = font_size
+  sel.last_line_h = line_h
+  let look = view::WordsLook::of(font_size, line=line_h, wrap=true)
+
+  parent.box(fn(v : view::View) {
+    let _ = v
+    .cursor(view::Live::Is(Some(view::Cursor::IBeam)))
+    .focusable(view::Live::Is(true), keys=0)
+    .words(view::Live::By(fn() { sel.text() }), ink=color, look=look)
+    .on_drag(fn(d : view::Drag) {
+      let (_, _, w, _) = v.rect()
+      if w > 0.0 && (dmath::abs(sel.last_max_w - w) > 0.5 || sel.editor.lines.length() == 0) {
+        let _ = sel.layout_for(w, font_size=font_size, line_h=line_h)
+      }
+      match d.kind {
+        view::DragKind::Down => sel.pointer_down(d.x, d.y, now=work_clock_now())
+        view::DragKind::Moved => sel.pointer_move(d.x, d.y)
+        view::DragKind::Up | view::DragKind::Off => sel.pointer_up()
+      }
+    })
+    .on_key(fn(k : view::Key) -> Bool {
+      sel.handle_key(k.code, k.mods)
+    })
+    if label.length() > 0 {
+      let _ = v.says(view::Live::By(fn() { Some(view::said(view::Role::Text, label=label, value=sel.text())) }))
+    }
+    // Pure-tree multi-line selection highlight overlay.
+    let _ = v.box(fn(sel_layer : view::View) {
+      let _ = sel_layer.over(view::Live::Is(true)).presses(view::Live::Is(false))
+      sel_layer.each_of(
+        fn() {
+          let _ = sel.text()
+          let _ = sel.selection()
+          let _ = sel.layout_sig.get()
+          let rects = sel.selection_rects()
+          let idxs : Array[Int] = []
+          for i in 0..<rects.length() {
+            idxs.push(i)
+          }
+          idxs
+        },
+        fn(row : view::View, idx : Int) {
+          let _ = row
+          .over_at(
+            view::Live::By(fn() {
+              let _ = sel.text()
+              let _ = sel.selection()
+              let _ = sel.layout_sig.get()
+              let rects = sel.selection_rects()
+              if idx < rects.length() {
+                let r = rects[idx]
+                (Some(r.x), Some(r.y), None, None)
+              } else {
+                (Some(0.0), Some(0.0), None, None)
+              }
+            }),
+          )
+          .width(
+            view::Live::By(fn() {
+              let _ = sel.text()
+              let _ = sel.selection()
+              let _ = sel.layout_sig.get()
+              let rects = sel.selection_rects()
+              if idx < rects.length() { Some(rects[idx].w) } else { Some(0.0) }
+            }),
+          )
+          .height(
+            view::Live::By(fn() {
+              let _ = sel.text()
+              let _ = sel.selection()
+              let _ = sel.layout_sig.get()
+              let rects = sel.selection_rects()
+              if idx < rects.length() { Some(rects[idx].h) } else { Some(0.0) }
+            }),
+          )
+          .ground(view::Live::Is(sel.sel_color))
+          .radius(view::Live::Is(3.0))
+          .presses(view::Live::Is(false))
+        },
+        at_once=true,
+      )
+    })
+  })
+}
