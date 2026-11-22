@@ -1,0 +1,367 @@
+// Unit tests for Wave 13-C overlay glass recipes, composable overlay shells,
+// iOS 26/27 compact dialog geometry, headless/narrow-clamped drawer, swipe-to-dismiss toast,
+// tooltip bubble shortcut badge, and progressive scroll-edge backdrop.
+
+import "headless"
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+fn ovl_host_case(
+  make : (view::View, view::View) -> Unit,
+  dark~ : Bool = false,
+  w~ : Double = 800.0,
+  h~ : Double = 600.0,
+) -> ui::Tester {
+  set_dark(Some(dark))
+  ui::Tester::tree(
+    fn(root : view::View) -> Unit {
+      let _ = root.box(fn(stage : view::View) -> Unit {
+        let _ = stage
+        .grow(view::Live::Is(1.0))
+        .ground(view::Live::By(fn() { if is_dark() { 0x202024FFL } else { 0x8899AAFFL } }))
+        let page_ref : ui::Ref[Option[view::View]] = ui::ref_new(None)
+        let _ = stage.box(fn(page : view::View) -> Unit {
+          let _ = page
+          .grow(view::Live::Is(1.0))
+          .padding(view::Live::Is((32.0, 32.0, 32.0, 32.0)))
+          .gap(view::Live::Is(16.0))
+          .lines_up(view::Live::Is(Some(view::Along::Start)))
+          page_ref.v = Some(page)
+        })
+        let _ = stage.box(fn(host : view::View) -> Unit {
+          let _ = host.over(view::Live::Is(true)).points(view::Live::Is(false))
+          match page_ref.v {
+            Some(page) => make(page, host)
+            None => ()
+          }
+        })
+      })
+    },
+    width=w,
+    height=h,
+    theme=ui_theme,
+    platform=0,
+    dark=dark,
+  )
+}
+
+fn count_frosted_glass(t : ui::Tester) -> Int {
+  let mut n = 0
+  for g in t.drawn_glass() {
+    if g.4 != 6 {
+      n = n + 1
+    }
+  }
+  n
+}
+
+test "exported_liquid_glass_recipes_match_symmetric_density_solid_override_and_scroll_edge_spec" {
+  let modes = [false, true]
+  for dark in modes {
+    set_dark(Some(dark))
+    let custom_solid = 0x112233FFL
+    let pg = liquid_panel_glass(solid=custom_solid)
+    let dg = liquid_dialog_glass(solid=custom_solid)
+    let sg = liquid_sheet_glass(solid=custom_solid)
+    let drg = liquid_drawer_glass(solid=custom_solid)
+    let tg = liquid_toast_glass(solid=custom_solid)
+    let cg = liquid_capsule_glass(solid=custom_solid)
+    let expected_70 = if dark { 0x202020B3L } else { 0xFDFCFDB3L }
+    let expected_75 = if dark { 0x202020BFL } else { 0xFDFCFDBFL }
+    let expected_80 = if dark { 0x202020CCL } else { 0xFDFCFDCCL }
+    debug_assert(pg.tint == expected_75, "panel glass tint must be symmetric 75%")
+    debug_assert(pg.solid == custom_solid, "panel glass solid override")
+    debug_assert((pg.bezel - 16.0).abs() < 0.01 && (pg.refraction - 22.0).abs() < 0.01, "panel glass bevel/refraction")
+    debug_assert(dg.tint == expected_70, "dialog glass tint must be symmetric 70%")
+    debug_assert((dg.blur - 9.0).abs() < 0.01 && (dg.rim - 0.65).abs() < 0.01, "dialog glass blur/rim")
+    debug_assert((dg.bezel - 22.0).abs() < 0.01 && (dg.refraction - 32.0).abs() < 0.01, "dialog glass bevel/refraction")
+    debug_assert(dg.solid == custom_solid, "dialog glass solid override")
+    debug_assert(sg.tint == expected_80 && (sg.refraction - 24.0).abs() < 0.01, "sheet glass 80% tint and refraction")
+    debug_assert(drg.tint == expected_80 && (drg.refraction - 36.0).abs() < 0.01, "drawer glass 80% tint and refraction")
+    debug_assert(tg.tint == expected_75 && (tg.blur - 2.1).abs() < 0.01, "toast glass 75% tint and blur")
+    debug_assert((tg.bezel - 12.0).abs() < 0.01 && (tg.refraction - 14.0).abs() < 0.01, "toast glass bevel/refraction")
+    debug_assert(cg.solid == custom_solid, "capsule glass solid override")
+    let seg_default = liquid_scroll_edge_glass()
+    let expected_bg = if dark { 0x121212FFL } else { 0xFFFFFFFFL }
+    debug_assert(seg_default.progressive, "scroll edge glass must set progressive=true")
+    debug_assert((seg_default.blur - 8.5).abs() < 0.01, "scroll edge blur must be 8.5")
+    debug_assert((seg_default.saturation - 1.25).abs() < 0.01, "scroll edge saturation must be 1.25")
+    debug_assert(seg_default.solid == expected_bg, "scroll edge default solid")
+    debug_assert(seg_default.tint == alpha(expected_bg, 0.50), "scroll edge 50% veil tint")
+    let seg_custom = liquid_scroll_edge_glass(bg=0x223344FFL)
+    debug_assert(seg_custom.solid == 0x223344FFL && seg_custom.tint == alpha(0x223344FFL, 0.50), "scroll edge custom bg")
+    let (ew, ec) = liquid_overlay_solid_edge()
+    let expected_edge = if dark { 0xFFFFFF24L } else { 0x00000018L }
+    debug_assert((ew - 1.0).abs() < 0.01 && ec == expected_edge, "overlay solid edge 1pt hairline")
+    let (sb, sy, sc) = glass_overlay_shadow()
+    let expected_sc = if dark { 0x00000042L } else { 0x00000014L }
+    debug_assert((sb - 8.0).abs() < 0.01 && (sy - 4.0).abs() < 0.01 && sc == expected_sc, "glass_overlay_shadow values")
+  }
+}
+
+test "liquid_scroll_edge_node_progressive_zero_hidden_and_click_shield" {
+  ui::set_glass_solid(None)
+  let bar_h = signals::signal(64.0)
+  let under_taps = ui::ref_new(0)
+  let t = ovl_host_case(
+    fn(page : view::View, _host : view::View) -> Unit {
+      let _ = page.box(fn(stage : view::View) -> Unit {
+        let _ = stage.width(view::Live::Is(Some(356.0))).height(view::Live::Is(Some(320.0)))
+        let _ = liquid_button_node(stage, fn() { "Behind Top" }, fn() -> Unit { under_taps.v = under_taps.v + 1 })
+        let _ = liquid_scroll_edge_node(
+          stage,
+          fn(_v : view::View) { bar_h.get() },
+          fn(_v : view::View) { bar_h.get() },
+          side=ScrollEdgeSide::Top,
+          shield=true,
+        )
+        let _ = liquid_scroll_edge_node(
+          stage,
+          fn(_v : view::View) { bar_h.get() },
+          fn(_v : view::View) { bar_h.get() },
+          side=ScrollEdgeSide::Bottom,
+          shield=false,
+        )
+      })
+    },
+    w=420.0,
+    h=500.0,
+  )
+  t.run_shown(springs_out)
+  debug_assert(count_frosted_glass(t) == 2, "expected 2 frosted progressive scroll-edge bands")
+  let btn = require_drawn(t, "Behind Top", view::Role::Button)
+  t.tap(btn.x + btn.w * 0.5, btn.y + btn.h * 0.5)
+  t.run_shown(a_frame)
+  debug_assert(under_taps.v == 0, "shielded Top scroll edge must block click-through")
+  bar_h.set(0.0)
+  t.run_shown(a_frame)
+  debug_assert(count_frosted_glass(t) == 0, "collapsing base_h to 0 must emit 0 hidden scroll-edge glass")
+  assert_no_nested_glass(t, label="liquid_scroll_edge_node")
+  t.dispose()
+}
+
+test "liquid_overlay_shells_and_tooltip_bubble_single_layer_glass_and_solid_fallback" {
+  let modes = [false, true]
+  for dark in modes {
+    ui::set_glass_solid(None)
+    let t = ovl_host_case(
+      fn(page : view::View, _host : view::View) -> Unit {
+        let _ = page.box(fn(col : view::View) -> Unit {
+          let _ = col.width(view::Live::Is(Some(420.0))).gap(view::Live::Is(16.0))
+          let _ = liquid_dialog_shell_node(col, radius=24.0, fn(d : view::View) -> Unit {
+            let _ = d.padding(view::Live::Is((20.0, 20.0, 20.0, 20.0))).gap(view::Live::Is(8.0))
+            let _ = d.box(fn(w : view::View) -> Unit {
+              let _ = w
+              .words(view::Live::Is("Custom Dialog Shell"), look=words_at(ovl_type_title, weight=ovl_weight_semibold))
+              .ink(view::Live::By(fn() { colors().content }))
+            })
+            let _ = d.box(fn(w : view::View) -> Unit {
+              let _ = w
+              .words(view::Live::Is("Composable dense glass surface for panels and switchers."), look=words_at(ovl_type_body, wrap=true))
+              .ink(view::Live::By(ovl_muted_ink))
+            })
+          })
+          let _ = liquid_toast_shell_node(col, fn(tb : view::View) -> Unit {
+            let _ = tb.row(view::Live::Is(true)).padding(view::Live::Is((16.0, 10.0, 16.0, 10.0))).lines_up(view::Live::Is(Some(view::Along::Middle)))
+            let _ = tb.box(fn(w : view::View) -> Unit {
+              let _ = w.words(view::Live::Is("Toast shell message"), look=words_at(ovl_type_body)).ink(view::Live::By(fn() { colors().content }))
+            })
+          })
+          let _ = liquid_tooltip_bubble_node(col, fn() { "Quick Open" }, shortcut=fn() { "⌘K" })
+          let _ = liquid_toolbar_node(col, pad=16.0, gap=12.0, fn(bar : view::View) -> Unit {
+            let _ = bar.box(fn(w : view::View) -> Unit {
+              let _ = w.words(view::Live::Is("Custom Toolbar"), look=words_at(ovl_type_sub)).ink(view::Live::By(fn() { colors().content }))
+            })
+          })
+        })
+      },
+      dark=dark,
+      w=700.0,
+      h=600.0,
+    )
+    t.set_a11y(true)
+    t.run_shown(springs_out)
+    debug_assert(count_liquid_glass(t) == 4, "expected 4 single-layer liquid glass shells")
+    assert_no_nested_glass(t, label="overlay shells")
+    assert_clean_tester(t, "overlay shells")
+    t.dispose()
+
+    ui::set_glass_solid(Some(true))
+    let ts = ovl_host_case(
+      fn(page : view::View, _host : view::View) -> Unit {
+        let _ = page.box(fn(col : view::View) -> Unit {
+          let _ = col.width(view::Live::Is(Some(420.0))).gap(view::Live::Is(16.0))
+          let _ = liquid_dialog_shell_node(col, fn(d : view::View) -> Unit {
+            let _ = d.padding(view::Live::Is((16.0, 16.0, 16.0, 16.0)))
+            let _ = d.box(fn(w : view::View) -> Unit {
+              let _ = w.words(view::Live::Is("Solid Shell"), look=words_at(ovl_type_body)).ink(view::Live::By(fn() { colors().content }))
+            })
+          })
+          let _ = liquid_toast_shell_node(col, fn(tb : view::View) -> Unit {
+            let _ = tb.padding(view::Live::Is((14.0, 8.0, 14.0, 8.0)))
+            let _ = tb.box(fn(w : view::View) -> Unit {
+              let _ = w.words(view::Live::Is("Solid Toast"), look=words_at(ovl_type_body)).ink(view::Live::By(fn() { colors().content }))
+            })
+          })
+          let _ = liquid_tooltip_bubble_node(col, fn() { "Solid Tip" }, shortcut=fn() { "⌘P" })
+        })
+      },
+      dark=dark,
+      w=700.0,
+      h=600.0,
+    )
+    ts.run_shown(springs_out)
+    debug_assert(count_liquid_glass(ts) == 0, "glass_solid=true must emit 0 liquid glass")
+    assert_clean_tester(ts, "overlay shells solid")
+    ui::set_glass_solid(None)
+    ts.dispose()
+  }
+}
+
+test "liquid_drawer_headless_no_scrim_and_narrow_width_clamping" {
+  ui::set_glass_solid(None)
+  let open = signals::signal(true)
+  let t = ovl_host_case(
+    fn(_page : view::View, host : view::View) -> Unit {
+      let _ = liquid_drawer_node(
+        host,
+        fn() { open.get() },
+        fn() -> Unit { open.set(false) },
+        fn() { "Workspace Sidebar" },
+        fn(b : view::View) -> Unit {
+          let _ = b.box(fn(w : view::View) -> Unit {
+            let _ = w.words(view::Live::Is("Headless custom header"), look=words_at(ovl_type_body)).ink(view::Live::By(fn() { colors().content }))
+          })
+        },
+        width=360.0,
+        show_header=false,
+        scrim=false,
+        inset=10.0,
+        body_pad=16.0,
+      )
+    },
+    w=300.0,
+    h=600.0,
+  )
+  t.set_a11y(true)
+  t.run_shown(springs_out)
+  let rect = require_drawn(t, "Workspace Sidebar", view::Role::Dialog)
+  debug_assert((rect.w - 280.0).abs() < 1.0, "expected clamped drawer width 280")
+  let close_opt = t.get("Close", role=view::Role::Button)
+  let has_close = match close_opt { Some(_) => true; None => false }
+  debug_assert(!has_close, "show_header=false must omit built-in Close button")
+  assert_no_nested_glass(t, label="liquid_drawer_headless_narrow")
+  assert_clean_tester(t, "liquid_drawer_headless_narrow")
+  t.dispose()
+}
+
+test "liquid_toast_horizontal_swipe_to_dismiss_and_spring_back" {
+  ui::set_glass_solid(None)
+  let visible = signals::signal(true)
+  let dismissed = ui::ref_new(0)
+  let t = ovl_host_case(
+    fn(page : view::View, _host : view::View) -> Unit {
+      let _ = page.box(fn(col : view::View) -> Unit {
+        let _ = col.width(view::Live::Is(Some(360.0)))
+        let _ = liquid_toast_node(
+          col,
+          fn() { visible.get() },
+          fn() { "Swipeable notice" },
+          on_dismiss=fn() -> Unit {
+            dismissed.v = dismissed.v + 1
+            visible.set(false)
+          },
+        )
+      })
+    },
+    w=600.0,
+    h=400.0,
+  )
+  t.run_shown(springs_out)
+  let r = require_drawn(t, "Swipeable notice", view::Role::Status)
+  let cx = r.x + r.w * 0.5
+  let cy = r.y + r.h * 0.5
+  // Short drag (30pt < 72pt) springs back and stays visible
+  t.press_at(cx, cy)
+  t.frame(ms=a_frame)
+  t.move_to(cx + 30.0, cy)
+  t.frame(ms=200.0)
+  t.release(cx + 30.0, cy)
+  t.run_shown(springs_out)
+  debug_assert(visible.get() && dismissed.v == 0, "short drag must not dismiss toast")
+  // Long swipe right (110pt > 72pt) triggers on_dismiss
+  t.press_at(cx, cy)
+  t.frame(ms=a_frame)
+  t.move_to(cx + 110.0, cy)
+  t.frame(ms=200.0)
+  t.release(cx + 110.0, cy)
+  t.run_shown(springs_out)
+  debug_assert(!visible.get() && dismissed.v == 1, "long horizontal swipe must dismiss toast")
+  t.dispose()
+}
+
+test "liquid_tooltip_shortcut_badge_without_blocking_clicks" {
+  ui::set_glass_solid(None)
+  let clicked = ui::ref_new(0)
+  let t = ovl_host_case(
+    fn(page : view::View, host : view::View) -> Unit {
+      let _ = liquid_tooltip_node(
+        page,
+        host,
+        fn() { "Command Palette" },
+        fn(wrap : view::View) -> Unit {
+          let _ = liquid_button_node(wrap, fn() { "Palette" }, fn() -> Unit { clicked.v = clicked.v + 1 })
+        },
+        shortcut=fn() { "⌘K" },
+      )
+    },
+  )
+  let btn = require_drawn(t, "Palette", view::Role::Button)
+  let bx = btn.x + btn.w * 0.5
+  let by = btn.y + btn.h * 0.5
+  t.move_to(bx, by)
+  t.run_shown(headless::tooltip_delay_ms + springs_out)
+  let _ = require_drawn(t, "Command Palette", view::Role::Tooltip)
+  assert_clean_tester(t, "liquid_tooltip_shortcut")
+  t.tap(bx, by)
+  t.run_shown(springs_out)
+  debug_assert(clicked.v == 1, "tooltip bubble must not block clicks on trigger")
+  t.dispose()
+}
+
+test "liquid_dialog_ios27_compact_geometry_and_concentric_buttons" {
+  let modes = [false, true]
+  for dark in modes {
+    ui::set_glass_solid(None)
+    let open = signals::signal(true)
+    let t = ovl_host_case(
+      fn(_page : view::View, host : view::View) -> Unit {
+        let _ = liquid_dialog_node(
+          host,
+          fn() { open.get() },
+          fn() -> Unit { open.set(false) },
+          fn() { "Publish Invar Bundle" },
+          fn() { "Compile one pure Pion UI tree into native GPU bundles." },
+          cancel=fn() { "Cancel" },
+          action=fn() { "Publish" },
+        )
+      },
+      dark=dark,
+      w=700.0,
+      h=600.0,
+    )
+    t.set_a11y(true)
+    t.run_shown(springs_out)
+    let rect = require_drawn(t, "Publish Invar Bundle", view::Role::Dialog)
+    let cancel_btn = require_drawn(t, "Cancel", view::Role::Button)
+    let action_btn = require_drawn(t, "Publish", view::Role::Button)
+    debug_assert((rect.w - 320.0).abs() < 1.0, "expected compact dialog default width 320")
+    debug_assert((cancel_btn.h - 40.0).abs() < 0.01 && (action_btn.h - 40.0).abs() < 0.01, "dialog buttons must be 40pt tall")
+    debug_assert((dialog_card_radius - (14.0 + dialog_button_h / 2.0)).abs() < 0.01, "dialog concentric: 14 + 20 == 34")
+    assert_no_nested_glass(t, label="liquid_dialog_ios27")
+    assert_clean_tester(t, "liquid_dialog_ios27")
+    t.dispose()
+  }
+}
