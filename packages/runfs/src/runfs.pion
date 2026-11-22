@@ -1,0 +1,289 @@
+// Cross-platform sandboxed path utilities and hostapi-backed virtual storage (all 6 targets including wasm32).
+
+import "hostapi"
+
+fn slice_str(s : String, start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  let src = s.to_bytes()
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < end {
+    sb.write_byte(src[i])
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn is_sep(c : Int) -> Bool {
+  c == 47 || c == 92 // '/' or '\\'
+}
+
+fn has_drive_prefix(path : String) -> Bool {
+  if path.length() < 2 {
+    return false
+  }
+  let c0 = path.code_unit_at(0)
+  let c1 = path.code_unit_at(1)
+  let is_alpha = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122)
+  is_alpha && c1 == 58 // ':'
+}
+
+/// Normalize a path: convert `\` to `/`, collapse repeated slashes, resolve `.` and `..`.
+pub fn normalize_path(path : String) -> String {
+  let n = path.length()
+  if n == 0 {
+    return "."
+  }
+  let abs = is_sep(path.code_unit_at(0))
+  let segs : Array[String] = []
+  let mut i = 0
+  while i < n {
+    while i < n && is_sep(path.code_unit_at(i)) {
+      i += 1
+    }
+    let start = i
+    while i < n && !is_sep(path.code_unit_at(i)) {
+      i += 1
+    }
+    if i > start {
+      let seg = slice_str(path, start, i)
+      if seg == "." {
+        ()
+      } else if seg == ".." {
+        let sn = segs.length()
+        if sn > 0 && segs[sn - 1] != ".." {
+          let _ = segs.pop()
+        } else if !abs {
+          segs.push("..")
+        }
+      } else {
+        segs.push(seg)
+      }
+    }
+  }
+  if segs.length() == 0 {
+    return if abs { "/" } else { "." }
+  }
+  let mut out = if abs { "/" } else { "" }
+  let mut j = 0
+  while j < segs.length() {
+    if j > 0 {
+      out = out + "/"
+    }
+    out = out + segs[j]
+    j += 1
+  }
+  out
+}
+
+/// Join `base` and `rel` and normalize the result.
+pub fn join_path(base : String, rel : String) -> String {
+  if rel.length() == 0 {
+    return normalize_path(base)
+  }
+  if base.length() == 0 || is_sep(rel.code_unit_at(0)) || has_drive_prefix(rel) {
+    return normalize_path(rel)
+  }
+  normalize_path(base + "/" + rel)
+}
+
+/// Return the final path component (`"/"` -> `"/"`, `""` -> `""`).
+pub fn basename(path : String) -> String {
+  if path.length() == 0 {
+    return ""
+  }
+  let norm = normalize_path(path)
+  if norm == "/" {
+    return "/"
+  }
+  let n = norm.length()
+  let mut i = n - 1
+  while i >= 0 {
+    if norm.code_unit_at(i) == 47 {
+      return slice_str(norm, i + 1, n)
+    }
+    i -= 1
+  }
+  norm
+}
+
+/// Return the parent directory of `path`.
+pub fn dirname(path : String) -> String {
+  if path.length() == 0 {
+    return "."
+  }
+  let norm = normalize_path(path)
+  if norm == "/" {
+    return "/"
+  }
+  let n = norm.length()
+  let mut i = n - 1
+  while i >= 0 {
+    if norm.code_unit_at(i) == 47 {
+      if i == 0 {
+        return "/"
+      }
+      return slice_str(norm, 0, i)
+    }
+    i -= 1
+  }
+  "."
+}
+
+/// Return the file extension without leading dot (empty string if none or hidden dotfile without extension).
+pub fn ext_of(path : String) -> String {
+  let base = basename(path)
+  let n = base.length()
+  if n <= 1 || base == "/" || base == "." || base == ".." {
+    return ""
+  }
+  let mut i = n - 1
+  while i > 0 {
+    if base.code_unit_at(i) == 46 {
+      return slice_str(base, i + 1, n)
+    }
+    i -= 1
+  }
+  ""
+}
+
+/// Verify that `path` is a safe relative path confined within a sandbox root (no leading slash, drive letter, NUL, or `..` escape).
+pub fn is_safe_rel_path(path : String) -> Bool {
+  let n = path.length()
+  if n == 0 {
+    return false
+  }
+  if is_sep(path.code_unit_at(0)) || has_drive_prefix(path) {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    if path.code_unit_at(i) == 0 {
+      return false
+    }
+    i += 1
+  }
+  let norm = normalize_path(path)
+  if norm == "." || norm == ".." || norm == "/" {
+    return false
+  }
+  if norm.length() >= 3 && norm.code_unit_at(0) == 46 && norm.code_unit_at(1) == 46 && norm.code_unit_at(2) == 47 {
+    return false
+  }
+  true
+}
+
+/// Sandboxed in-memory virtual file store with strict relative-path confinement and `hostapi::save_file` export.
+pub struct SandboxStore {
+  files : Map[String, Bytes]
+}
+
+pub fn SandboxStore::new() -> SandboxStore {
+  SandboxStore::{ files: Map::new() }
+}
+
+pub fn SandboxStore::write_bytes(self : SandboxStore, rel_path : String, data : Bytes) -> Bool {
+  if !is_safe_rel_path(rel_path) {
+    return false
+  }
+  let key = normalize_path(rel_path)
+  self.files[key] = data
+  true
+}
+
+pub fn SandboxStore::read_bytes(self : SandboxStore, rel_path : String) -> Option[Bytes] {
+  if !is_safe_rel_path(rel_path) {
+    return None
+  }
+  let key = normalize_path(rel_path)
+  self.files.get(key)
+}
+
+pub fn SandboxStore::write_text(self : SandboxStore, rel_path : String, text : String) -> Bool {
+  self.write_bytes(rel_path, text.to_bytes())
+}
+
+pub fn SandboxStore::read_text(self : SandboxStore, rel_path : String) -> Option[String] {
+  match self.read_bytes(rel_path) {
+    Some(b) => Some(b.to_string())
+    None => None
+  }
+}
+
+pub fn SandboxStore::exists(self : SandboxStore, rel_path : String) -> Bool {
+  if !is_safe_rel_path(rel_path) {
+    return false
+  }
+  self.files.contains(normalize_path(rel_path))
+}
+
+pub fn SandboxStore::remove(self : SandboxStore, rel_path : String) -> Bool {
+  if !is_safe_rel_path(rel_path) {
+    return false
+  }
+  let key = normalize_path(rel_path)
+  if !self.files.contains(key) {
+    return false
+  }
+  let _ = self.files.remove(key)
+  true
+}
+
+pub fn SandboxStore::clear(self : SandboxStore) -> Unit {
+  self.files.clear()
+}
+
+/// Export a stored file through the active `hostapi::save_file` hook.
+pub fn SandboxStore::export_file(self : SandboxStore, rel_path : String) -> Bool {
+  match self.read_bytes(rel_path) {
+    Some(data) => hostapi::save_file(basename(rel_path), data)
+    None => false
+  }
+}
+
+let default_store : SandboxStore = SandboxStore::new()
+
+/// Write raw bytes to the default sandbox store under a validated relative path.
+pub fn write_bytes(path : String, data : Bytes) -> Bool {
+  default_store.write_bytes(path, data)
+}
+
+/// Read raw bytes from the default sandbox store.
+pub fn read_bytes(path : String) -> Option[Bytes] {
+  default_store.read_bytes(path)
+}
+
+/// Write UTF-8 text to the default sandbox store.
+pub fn write_text(path : String, text : String) -> Bool {
+  default_store.write_text(path, text)
+}
+
+/// Read UTF-8 text from the default sandbox store.
+pub fn read_text(path : String) -> Option[String] {
+  default_store.read_text(path)
+}
+
+/// Check whether a relative path exists in the default sandbox store.
+pub fn exists(path : String) -> Bool {
+  default_store.exists(path)
+}
+
+/// Remove a file from the default sandbox store.
+pub fn remove(path : String) -> Bool {
+  default_store.remove(path)
+}
+
+/// Save a file to the default sandbox store and forward to `hostapi::save_file`.
+pub fn save_sandbox_file(path : String, data : Bytes) -> Bool {
+  if !default_store.write_bytes(path, data) {
+    return false
+  }
+  hostapi::save_file(basename(path), data)
+}
+
+/// Clear all entries from the default sandbox store.
+pub fn reset_sandbox() -> Unit {
+  default_store.clear()
+}

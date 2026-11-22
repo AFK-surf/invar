@@ -1,0 +1,102 @@
+// Unit tests for runfs: path normalization/joining, traversal protection, basename/dirname/ext_of, and sandbox storage.
+
+import "hostapi"
+
+test "runfs: normalize_path and join_path" {
+  debug_assert(normalize_path("") == ".", "empty normalizes to dot")
+  debug_assert(normalize_path("a//b/./c/../d") == "a/b/d", "collapse slashes and dots")
+  debug_assert(normalize_path("a\\b\\c\\..\\d") == "a/b/d", "backslashes converted to forward slashes")
+  debug_assert(normalize_path("/a/b/../../..") == "/", "absolute root clamps ..")
+  debug_assert(normalize_path("a/../../b") == "../b", "relative escape preserves leading ..")
+
+  debug_assert(join_path("assets", "icons/logo.png") == "assets/icons/logo.png", "simple join")
+  debug_assert(join_path("assets/ui/", "../img/bg.jpg") == "assets/img/bg.jpg", "join with parent segment")
+  debug_assert(join_path("assets", "") == "assets", "join with empty rel")
+  debug_assert(join_path("", "sub/a.txt") == "sub/a.txt", "join with empty base")
+  debug_assert(join_path("assets", "/etc/hosts") == "/etc/hosts", "absolute rel overrides base")
+}
+
+test "runfs: basename, dirname, ext_of" {
+  debug_assert(basename("dir/sub/file.tar.gz") == "file.tar.gz", "basename with ext")
+  debug_assert(basename("dir/sub/") == "sub", "basename strips trailing slash")
+  debug_assert(basename("/") == "/", "basename of root")
+  debug_assert(basename("") == "", "basename of empty")
+
+  debug_assert(dirname("dir/sub/file.txt") == "dir/sub", "dirname nested")
+  debug_assert(dirname("file.txt") == ".", "dirname bare file")
+  debug_assert(dirname("/file.txt") == "/", "dirname root child")
+  debug_assert(dirname("/") == "/", "dirname root")
+
+  debug_assert(ext_of("dir/sub/file.tar.gz") == "gz", "ext_of compound extension")
+  debug_assert(ext_of("dir.v1/README") == "", "ext_of ignores dots in parent dir")
+  debug_assert(ext_of(".gitignore") == "", "ext_of dotfile has no extension")
+  debug_assert(ext_of("archive.ZIP") == "ZIP", "ext_of preserves case")
+}
+
+test "runfs: is_safe_rel_path blocks traversal and absolute paths" {
+  debug_assert(is_safe_rel_path("notes/hello.txt"), "normal rel path is safe")
+  debug_assert(is_safe_rel_path("a/b/../c.json"), "internal .. staying inside root is safe")
+  debug_assert(!is_safe_rel_path(""), "empty is unsafe")
+  debug_assert(!is_safe_rel_path("."), "dot is unsafe")
+  debug_assert(!is_safe_rel_path(".."), "dotdot is unsafe")
+  debug_assert(!is_safe_rel_path("../secret.txt"), "leading .. escape is unsafe")
+  debug_assert(!is_safe_rel_path("a/../../secret.txt"), "nested .. escape is unsafe")
+  debug_assert(!is_safe_rel_path("/etc/passwd"), "absolute unix path is unsafe")
+  debug_assert(!is_safe_rel_path("\\windows\\system32"), "leading backslash is unsafe")
+  debug_assert(!is_safe_rel_path("C:\\temp\\a.txt"), "windows drive path is unsafe")
+}
+
+test "runfs: sandbox store read/write round-trip and hostapi save_file integration" {
+  reset_sandbox()
+  debug_assert(!write_text("../escape.txt", "nope"), "traversal write rejected")
+  debug_assert(!exists("../escape.txt"), "traversal exists is false")
+
+  debug_assert(write_text("docs/hello.txt", "你好 Invar!"), "UTF-8 text write succeeds")
+  debug_assert(exists("docs/./hello.txt"), "normalized lookup finds written file")
+  match read_text("docs/hello.txt") {
+    Some(s) => debug_assert(s == "你好 Invar!", "UTF-8 text round-trip matches")
+    None => debug_assert(false, "expected stored UTF-8 text")
+  }
+
+  let sb = StringBuilder::new()
+  sb.write_byte(0 as Byte)
+  sb.write_byte(1 as Byte)
+  sb.write_byte(255 as Byte)
+  sb.write_byte(42 as Byte)
+  let bin = sb.to_string().to_bytes()
+  debug_assert(write_bytes("cache/blob.bin", bin), "binary write succeeds")
+  match read_bytes("cache/blob.bin") {
+    Some(got) => {
+      debug_assert(
+        got.length() == 4 &&
+        got[0].to_int() == 0 &&
+        got[1].to_int() == 1 &&
+        got[2].to_int() == 255 &&
+        got[3].to_int() == 42,
+        "binary round-trip matches",
+      )
+    }
+    None => debug_assert(false, "expected stored binary blob")
+  }
+
+  // Verify hostapi::save_file hook receives basename and payload
+  let saved_name : Array[String] = []
+  let saved_len : Array[Int] = []
+  let h = hostapi::Host::noop()
+  h.save_file = fn(name : String, data : Bytes) -> Bool {
+    saved_name.push(name)
+    saved_len.push(data.length())
+    true
+  }
+  hostapi::set_host(h)
+  let ok = save_sandbox_file("exports/report.bin", bin)
+  hostapi::set_host(hostapi::Host::noop())
+  debug_assert(ok, "save_sandbox_file succeeds with host hook")
+  debug_assert(saved_name.length() == 1 && saved_name[0] == "report.bin", "hostapi::save_file receives basename")
+  debug_assert(saved_len.length() == 1 && saved_len[0] == 4, "hostapi::save_file receives exact bytes")
+
+  debug_assert(remove("docs/hello.txt"), "remove existing file returns true")
+  debug_assert(!exists("docs/hello.txt"), "removed file no longer exists")
+  debug_assert(!remove("docs/hello.txt"), "removing missing file returns false")
+  reset_sandbox()
+}

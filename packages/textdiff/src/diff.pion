@@ -1,0 +1,418 @@
+// Pure-Pion line-level Myers O(ND) diff, UTF-8 codepoint inline diff, and unified hunk formatting.
+
+/// Single line-level edit operation.
+#derive(Eq)
+pub enum DiffOp {
+  Equal(String)
+  Insert(String)
+  Delete(String)
+}
+
+/// A contiguous unified-diff hunk with 1-based line ranges.
+pub struct DiffHunk {
+  pub old_start : Int
+  pub old_count : Int
+  pub new_start : Int
+  pub new_count : Int
+  pub ops : Array[DiffOp]
+}
+
+/// A highlighted span inside a single changed line.
+#derive(Eq)
+pub struct InlineSpan {
+  pub text : String
+  pub changed : Bool
+}
+
+fn slice_bytes_str(s : String, start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  let src = s.to_bytes()
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < end {
+    sb.write_byte(src[i])
+    i += 1
+  }
+  sb.to_string()
+}
+
+/// Split text into lines (`\n` and `\r\n`). Empty text produces `[]`.
+pub fn split_lines(text : String) -> Array[String] {
+  let n = text.length()
+  if n == 0 {
+    return []
+  }
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    let c = text.code_unit_at(i)
+    if c == 10 {
+      let mut end = i
+      if end > start && text.code_unit_at(end - 1) == 13 {
+        end -= 1
+      }
+      out.push(slice_bytes_str(text, start, end))
+      start = i + 1
+    }
+    i += 1
+  }
+  if start < n {
+    let mut end = n
+    if end > start && text.code_unit_at(end - 1) == 13 {
+      end -= 1
+    }
+    out.push(slice_bytes_str(text, start, end))
+  }
+  out
+}
+
+/// Split a UTF-8 string into individual Unicode scalar strings without breaking multi-byte characters.
+fn split_utf8_chars(s : String) -> Array[String] {
+  let n = s.length()
+  let out : Array[String] = []
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    let step = if (b & 0x80) == 0 {
+      1
+    } else if (b & 0xE0) == 0xC0 {
+      2
+    } else if (b & 0xF0) == 0xE0 {
+      3
+    } else if (b & 0xF8) == 0xF0 {
+      4
+    } else {
+      1
+    }
+    let end = if i + step <= n { i + step } else { n }
+    out.push(slice_bytes_str(s, i, end))
+    i = end
+  }
+  out
+}
+
+/// Myers O(ND) shortest edit script on string slices `a[0..n]` -> `b[0..m]`.
+/// Returns an array of `(kind, token)` where `kind`: 0 = Equal, 1 = Insert, 2 = Delete.
+fn myers_seq(a : Array[String], b : Array[String]) -> Array[(Int, String)] {
+  let n = a.length()
+  let m = b.length()
+  // Trim common prefix and suffix for O(N) fast path on mostly-equal inputs.
+  let mut pre = 0
+  while pre < n && pre < m && a[pre] == b[pre] {
+    pre += 1
+  }
+  let mut suf = 0
+  while suf < n - pre && suf < m - pre && a[n - 1 - suf] == b[m - 1 - suf] {
+    suf += 1
+  }
+  let out : Array[(Int, String)] = []
+  let mut i = 0
+  while i < pre {
+    out.push((0, a[i]))
+    i += 1
+  }
+  let an = n - pre - suf
+  let bm = m - pre - suf
+  if an == 0 {
+    let mut j = 0
+    while j < bm {
+      out.push((1, b[pre + j]))
+      j += 1
+    }
+  } else if bm == 0 {
+    let mut j = 0
+    while j < an {
+      out.push((2, a[pre + j]))
+      j += 1
+    }
+  } else {
+    let max_d = an + bm
+    let offset = max_d
+    let v_len = 2 * max_d + 1
+    let v : Array[Int] = []
+    let mut vi = 0
+    while vi < v_len {
+      v.push(0)
+      vi += 1
+    }
+    let trace : Array[Array[Int]] = []
+    let mut found_d = max_d
+    let mut d = 0
+    let mut done = false
+    while d <= max_d && !done {
+      let mut k = -d
+      while k <= d {
+        let idx = k + offset
+        let mut x = if k == -d || (k != d && v[idx - 1] < v[idx + 1]) {
+          v[idx + 1]
+        } else {
+          v[idx - 1] + 1
+        }
+        let mut y = x - k
+        while x < an && y < bm && a[pre + x] == b[pre + y] {
+          x += 1
+          y += 1
+        }
+        v[idx] = x
+        if x >= an && y >= bm {
+          found_d = d
+          done = true
+          break
+        }
+        k += 2
+      }
+      // Snapshot current v for backtracking
+      let snap : Array[Int] = []
+      let mut si = 0
+      while si < v_len {
+        snap.push(v[si])
+        si += 1
+      }
+      trace.push(snap)
+      d += 1
+    }
+    // Backtrack from (an, bm) to (0, 0)
+    let rev : Array[(Int, String)] = []
+    let mut x = an
+    let mut y = bm
+    let mut bd = found_d
+    while bd > 0 {
+      let prev_v = trace[bd - 1]
+      let k = x - y
+      let prev_k = if k == -bd || (k != bd && prev_v[k - 1 + offset] < prev_v[k + 1 + offset]) {
+        k + 1
+      } else {
+        k - 1
+      }
+      let prev_x = prev_v[prev_k + offset]
+      let prev_y = prev_x - prev_k
+      while x > prev_x && y > prev_y {
+        rev.push((0, a[pre + x - 1]))
+        x -= 1
+        y -= 1
+      }
+      if x == prev_x {
+        rev.push((1, b[pre + prev_y]))
+      } else {
+        rev.push((2, a[pre + prev_x]))
+      }
+      x = prev_x
+      y = prev_y
+      bd -= 1
+    }
+    while x > 0 && y > 0 {
+      rev.push((0, a[pre + x - 1]))
+      x -= 1
+      y -= 1
+    }
+    let mut ri = rev.length() - 1
+    while ri >= 0 {
+      out.push(rev[ri])
+      ri -= 1
+    }
+  }
+  let mut si = 0
+  while si < suf {
+    out.push((0, a[n - suf + si]))
+    si += 1
+  }
+  out
+}
+
+/// Compute line-level Myers O(ND) diff between `old_text` and `new_text`.
+pub fn diff_lines(old_text : String, new_text : String) -> Array[DiffOp] {
+  let old_ls = split_lines(old_text)
+  let new_ls = split_lines(new_text)
+  let raw = myers_seq(old_ls, new_ls)
+  let ops : Array[DiffOp] = []
+  let mut i = 0
+  while i < raw.length() {
+    let (k, s) = raw[i]
+    if k == 0 {
+      ops.push(DiffOp::Equal(s))
+    } else if k == 1 {
+      ops.push(DiffOp::Insert(s))
+    } else {
+      ops.push(DiffOp::Delete(s))
+    }
+    i += 1
+  }
+  ops
+}
+
+fn push_span(spans : Array[InlineSpan], text : String, changed : Bool) -> Unit {
+  if text.length() == 0 {
+    return
+  }
+  let n = spans.length()
+  if n > 0 && spans[n - 1].changed == changed {
+    let prev = spans[n - 1].text
+    spans[n - 1] = InlineSpan::{ text: prev + text, changed }
+  } else {
+    spans.push(InlineSpan::{ text, changed })
+  }
+}
+
+/// Compute inline character-level (UTF-8 scalar safe) diff spans for a single changed line pair.
+/// Returns `(old_spans, new_spans)`.
+pub fn diff_inline(old_line : String, new_line : String) -> (Array[InlineSpan], Array[InlineSpan]) {
+  let a = split_utf8_chars(old_line)
+  let b = split_utf8_chars(new_line)
+  let raw = myers_seq(a, b)
+  let old_spans : Array[InlineSpan] = []
+  let new_spans : Array[InlineSpan] = []
+  let mut i = 0
+  while i < raw.length() {
+    let (k, tok) = raw[i]
+    if k == 0 {
+      push_span(old_spans, tok, false)
+      push_span(new_spans, tok, false)
+    } else if k == 1 {
+      push_span(new_spans, tok, true)
+    } else {
+      push_span(old_spans, tok, true)
+    }
+    i += 1
+  }
+  (old_spans, new_spans)
+}
+
+/// Count `(added, deleted, equal)` lines in a diff operation sequence.
+pub fn diff_stats(ops : Array[DiffOp]) -> (Int, Int, Int) {
+  let mut added = 0
+  let mut deleted = 0
+  let mut equal = 0
+  let mut i = 0
+  while i < ops.length() {
+    match ops[i] {
+      DiffOp::Equal(_) => equal += 1
+      DiffOp::Insert(_) => added += 1
+      DiffOp::Delete(_) => deleted += 1
+    }
+    i += 1
+  }
+  (added, deleted, equal)
+}
+
+/// Group line-level diff operations into unified hunks with `context` surrounding unchanged lines.
+pub fn unified_hunks(old_text : String, new_text : String, context~ : Int = 3) -> Array[DiffHunk] {
+  let ctx = if context < 0 { 0 } else { context }
+  let ops = diff_lines(old_text, new_text)
+  let n = ops.length()
+  if n == 0 {
+    return []
+  }
+  // Precompute 1-based (old_line, new_line) cursor before each op.
+  let old_pos : Array[Int] = []
+  let new_pos : Array[Int] = []
+  let mut ol = 1
+  let mut nl = 1
+  let mut i = 0
+  while i < n {
+    old_pos.push(ol)
+    new_pos.push(nl)
+    match ops[i] {
+      DiffOp::Equal(_) => {
+        ol += 1
+        nl += 1
+      }
+      DiffOp::Delete(_) => ol += 1
+      DiffOp::Insert(_) => nl += 1
+    }
+    i += 1
+  }
+  // Collect change index ranges [start, end) expanded by `ctx`, merging overlapping/adjacent ranges.
+  let ranges : Array[(Int, Int)] = []
+  i = 0
+  while i < n {
+    let is_chg = match ops[i] {
+      DiffOp::Equal(_) => false
+      _ => true
+    }
+    if is_chg {
+      let mut j = i + 1
+      while j < n {
+        let next_chg = match ops[j] {
+          DiffOp::Equal(_) => false
+          _ => true
+        }
+        if !next_chg {
+          break
+        }
+        j += 1
+      }
+      let r0 = if i - ctx > 0 { i - ctx } else { 0 }
+      let r1 = if j + ctx < n { j + ctx } else { n }
+      let rn = ranges.length()
+      if rn > 0 && r0 <= ranges[rn - 1].1 {
+        let prev = ranges[rn - 1]
+        ranges[rn - 1] = (prev.0, if r1 > prev.1 { r1 } else { prev.1 })
+      } else {
+        ranges.push((r0, r1))
+      }
+      i = j
+    } else {
+      i += 1
+    }
+  }
+  let hunks : Array[DiffHunk] = []
+  let mut r = 0
+  while r < ranges.length() {
+    let (r0, r1) = ranges[r]
+    let hops : Array[DiffOp] = []
+    let mut oc = 0
+    let mut nc = 0
+    let mut k = r0
+    while k < r1 {
+      let op = ops[k]
+      hops.push(op)
+      match op {
+        DiffOp::Equal(_) => {
+          oc += 1
+          nc += 1
+        }
+        DiffOp::Delete(_) => oc += 1
+        DiffOp::Insert(_) => nc += 1
+      }
+      k += 1
+    }
+    let os = if oc == 0 { old_pos[r0] - 1 } else { old_pos[r0] }
+    let ns = if nc == 0 { new_pos[r0] - 1 } else { new_pos[r0] }
+    hunks.push(DiffHunk::{
+      old_start: os,
+      old_count: oc,
+      new_start: ns,
+      new_count: nc,
+      ops: hops,
+    })
+    r += 1
+  }
+  hunks
+}
+
+/// Format unified diff hunks into standard `--- / +++ / @@ ... @@` text.
+pub fn format_unified(old_name : String, new_name : String, hunks : Array[DiffHunk]) -> String {
+  if hunks.length() == 0 {
+    return ""
+  }
+  let mut out = "--- \{old_name}\n+++ \{new_name}\n"
+  let mut i = 0
+  while i < hunks.length() {
+    let h = hunks[i]
+    out = "\{out}@@ -\{h.old_start},\{h.old_count} +\{h.new_start},\{h.new_count} @@\n"
+    let mut j = 0
+    while j < h.ops.length() {
+      match h.ops[j] {
+        DiffOp::Equal(s) => out = "\{out} \{s}\n"
+        DiffOp::Delete(s) => out = "\{out}-\{s}\n"
+        DiffOp::Insert(s) => out = "\{out}+\{s}\n"
+      }
+      j += 1
+    }
+    i += 1
+  }
+  out
+}
