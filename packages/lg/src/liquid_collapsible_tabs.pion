@@ -1,14 +1,21 @@
 // Apple iOS 26 TabBarMinimizeBehavior scroll-collapsing floating liquid glass bottom tab bar.
+// Expanded state uses the exact same unified single-gesture engine (200ms hold refraction loupe,
+// drag-follow with lean=0.25, speed_stretch, bar_flung, and 4-layer zero-relayout ground_drawn)
+// as `liquid_bottom_tabs_node`, with icon + label per tab.
+// Minimized state smoothly springs the tab bar into a 46x46 orb and slides the trailing action
+// orb tightly alongside it at `x = lerp(bar_w + gap, h + gap, t)`.
 
 import "headless"
 import "motion"
 import "signals"
+import "ui"
 import "view"
 
-let ctab_h : Double = 50.0
-let ctab_r : Double = 25.0
+let ctab_h : Double = 46.0
+let ctab_r : Double = 23.0
 let ctab_gap : Double = 10.0
 let ctab_pad : Double = 4.0
+let ctab_lens_h : Double = 38.0
 
 fn ctab_smoothstep(lo : Double, hi : Double, x : Double) -> Double {
   if hi <= lo {
@@ -43,7 +50,7 @@ pub fn liquid_collapsible_tabs_node(
   faces? : Array[(view::View, () -> Int64) -> Unit],
   compact_icons? : Array[(view::View, () -> Int64) -> Unit],
   label~ : String = "Navigation",
-  expanded_width~ : Double = 320.0,
+  expanded_width~ : Double = 300.0,
   loc~ : String = "",
 ) -> view::View {
   let n = tabs.length()
@@ -52,9 +59,78 @@ pub fn liquid_collapsible_tabs_node(
   let min_way = motion::NodeWay::new(if signals::untracked(minimized) { 1.0 } else { 0.0 })
   let action_press = motion::NodeWay::new(0.0)
   let compact_press = motion::NodeWay::new(0.0)
+
+  // Unified tab bar gesture & spring state (matching liquid_bottom_tabs_node)
+  let held_way = motion::NodeWay::new(0.0)
+  let ball_x = motion::NodeWay::new(tab_bar_centre(bar_w, n, signals::untracked(chosen)))
+  let last_tension = fref(300.0)
+  let current = ui::ref_new(signals::untracked(chosen))
+  let held_flag = ui::ref_new(false)
+  let drag_x = fref(-1.0)
+  let felt_idx = ui::ref_new(signals::untracked(chosen))
+  let active_under = signals::signal(-1)
+
   parent.box(loc=loc, fn(wrap : view::View) -> Unit {
     wrap.reacts(at_start=false, minimized, fn(m : Bool) -> Unit {
+      if m {
+        held_flag.v = false
+        drag_x.v = -1.0
+        active_under.set(-1)
+        held_way.go(wrap, 0.0, motion::spring(ratio=1.0, stiffness=1000.0, threshold=0.001))
+      }
       min_way.go(wrap, if m { 1.0 } else { 0.0 }, motion::snappy_damped)
+    })
+    let slide_ball_to = fn(idx : Int) -> Unit {
+      let goal_x = tab_bar_centre(bar_w, n, idx)
+      if ui::reduced_motion() {
+        ball_x.put(goal_x)
+        return
+      }
+      let now = wrap.cause_at()
+      let cur_x = ball_x.value_at(now)
+      let mut trip = dmax(8.0, (goal_x - cur_x).abs())
+      if ball_x.goes_at(now) && last_tension.v > 0.0 {
+        trip = dmax(trip, 300.0 * tab_bar_slot_px / last_tension.v)
+      }
+      let tension = clamp(300.0 * tab_bar_slot_px / trip, 210.0, 620.0)
+      last_tension.v = tension
+      ball_x.go(wrap, goal_x, motion::spring(ratio=tab_bar_ball_ratio, stiffness=tension, threshold=tab_bar_ball_rest))
+    }
+    let sync_drag = fn(px : Double) -> Unit {
+      let j = tab_bar_nearest(bar_w, n, px)
+      let target_x = tab_bar_centre(bar_w, n, j)
+      let goal_x = target_x + (px - target_x) * tab_bar_lean
+      last_tension.v = 300.0
+      if ui::reduced_motion() {
+        ball_x.put(goal_x)
+        held_way.put(1.0)
+      } else {
+        ball_x.go(wrap, goal_x, motion::spring(ratio=tab_bar_ball_ratio, stiffness=300.0, threshold=tab_bar_ball_rest))
+        held_way.go(wrap, 1.0, motion::spring(ratio=1.0, stiffness=1000.0, threshold=0.001))
+      }
+    }
+    let finish_drag = fn(idx : Int, commit : Bool) -> Unit {
+      let clamped_i = clamp_int(idx, 0, if n > 0 { n - 1 } else { 0 })
+      held_flag.v = false
+      drag_x.v = -1.0
+      active_under.set(-1)
+      if ui::reduced_motion() {
+        held_way.put(0.0)
+      } else {
+        held_way.go(wrap, 0.0, motion::spring(ratio=1.0, stiffness=1000.0, threshold=0.001))
+      }
+      let target_i = if commit { clamped_i } else { signals::untracked(chosen) }
+      current.v = target_i
+      slide_ball_to(target_i)
+      if commit && target_i != signals::untracked(chosen) {
+        choose(target_i)
+      }
+    }
+    wrap.reacts(at_start=false, chosen, fn(i : Int) -> Unit {
+      if i != current.v && drag_x.v < 0.0 {
+        current.v = i
+        slide_ball_to(i)
+      }
     })
     let _ = wrap.width(view::Live::Is(Some(total_w))).height(view::Live::Is(Some(ctab_h))).shrink(view::Live::Is(0.0))
     let capsule_shape = fn(node : view::View) -> view::GroundShape {
@@ -67,6 +143,29 @@ pub fn liquid_collapsible_tabs_node(
         view::GroundShape::{ dx: 0.0, dy: 0.0, dw, dh: 0.0, corners: Some((ctab_r, ctab_r, ctab_r, ctab_r)) }
       }
     }
+    let action_x = fn(node : view::View) -> Double {
+      let t = clamp(min_way.shown(node), 0.0, 1.0)
+      lerp(bar_w + ctab_gap, ctab_h + ctab_gap, t)
+    }
+    let ball_shape = fn(node : view::View, lens : Bool) -> view::GroundShape {
+      let (x, xv) = ball_x.motion(node)
+      let v = xv / 60.0
+      let (raw_stretch, lower) = motion::speed_stretch(v)
+      let iw = tab_bar_item_w(bar_w, n)
+      let stretch = dmin(raw_stretch, iw * 0.45)
+      let cx = x + (if v < 0.0 { -stretch } else { stretch }) / 2.0
+      let h_val = held_way.shown(node)
+      let (sw, sh) = tab_bar_ball_size(bar_w, n, h_val, stretch, lower, lens, bar_h=ctab_h)
+      let r = dmin(sw, sh) / 2.0
+      view::GroundShape::{
+        dx: cx - sw / 2.0,
+        dy: (ctab_h - sh) / 2.0,
+        dw: sw - tab_bar_ball_box_w,
+        dh: sh - tab_bar_ball_box_h,
+        corners: Some((r, r, r, r)),
+      }
+    }
+    // Layer 0: Outside shadows
     let _ = wrap.box(fn(shadows : view::View) -> Unit {
       let _ = shadows.over(view::Live::Is(true)).points(view::Live::Is(false))
       let _ = shadows.box(fn(tab_sh : view::View) -> Unit {
@@ -75,7 +174,7 @@ pub fn liquid_collapsible_tabs_node(
         .width(view::Live::Is(Some(bar_w)))
         .height(view::Live::Is(Some(ctab_h)))
         .radius(view::Live::Is(ctab_r))
-        .shadow(view::Live::Is(shadow_default))
+        .shadow(view::Live::By(glass_control_shadow))
         .shadow_outside(view::Live::Is(true))
         .ground_drawn(view::Live::By(fn() { capsule_shape(tab_sh) }))
       })
@@ -84,12 +183,13 @@ pub fn liquid_collapsible_tabs_node(
         .over(view::Live::Is(true))
         .width(view::Live::Is(Some(ctab_h)))
         .height(view::Live::Is(Some(ctab_h)))
-        .offset(view::Live::Is((bar_w + ctab_gap, 0.0)))
+        .offset(view::Live::By(fn() { (action_x(act_sh), 0.0) }))
         .radius(view::Live::Is(ctab_r))
-        .shadow(view::Live::Is(shadow_default))
+        .shadow(view::Live::By(glass_control_shadow))
         .shadow_outside(view::Live::Is(true))
       })
     })
+    // Layer 1: Tab capsule & sliding trailing action orb Liquid Glass surfaces
     let _ = wrap.box(fn(tab_glass : view::View) -> Unit {
       let _ = tab_glass
       .over(view::Live::Is(true))
@@ -97,7 +197,8 @@ pub fn liquid_collapsible_tabs_node(
       .width(view::Live::Is(Some(bar_w)))
       .height(view::Live::Is(Some(ctab_h)))
       .radius(view::Live::Is(ctab_r))
-      .glass(view::Live::By(fn() { Some(lg_capsule_glass(bezel=20.0, refraction=28.0)) }))
+      .glass(view::Live::By(fn() { Some(liquid_tab_bar_glass()) }))
+      .edge(view::Live::By(fn() { if tab_glass.glass_solid() || ui::glass_solid() { liquid_solid_edge() } else { (0.0, clear) } }))
       .ground_drawn(view::Live::By(fn() { capsule_shape(tab_glass) }))
     })
     let _ = wrap.box(fn(act_glass : view::View) -> Unit {
@@ -106,19 +207,15 @@ pub fn liquid_collapsible_tabs_node(
       .points(view::Live::Is(false))
       .width(view::Live::Is(Some(ctab_h)))
       .height(view::Live::Is(Some(ctab_h)))
-      .offset(view::Live::Is((bar_w + ctab_gap, 0.0)))
+      .offset(view::Live::By(fn() { (action_x(act_glass), 0.0) }))
       .radius(view::Live::Is(ctab_r))
-      .glass(view::Live::By(fn() { Some(lg_capsule_glass(bezel=20.0, refraction=28.0)) }))
-      .scale(view::Live::By(fn() { 1.0 - 0.05 * clamp(action_press.shown(act_glass), 0.0, 1.0) }))
+      .glass(view::Live::By(fn() { Some(liquid_tab_bar_glass()) }))
+      .edge(view::Live::By(fn() { if act_glass.glass_solid() || ui::glass_solid() { liquid_solid_edge() } else { (0.0, clear) } }))
+      .scale(view::Live::By(fn() { 1.0 - 0.03 * clamp(action_press.shown(act_glass), 0.0, 1.0) }), about=view::Pivot::At(0.5, 0.5))
     })
+    // Layer 2-4: Interactive foreground (expanded tabs with sliding ball + loupe, collapsed orb, sliding action orb)
     let _ = wrap.box(fn(fg : view::View) -> Unit {
       let _ = fg.over(view::Live::Is(true))
-      let tab_indices : Array[Int] = []
-      let mut k = 0
-      while k < n {
-        tab_indices.push(k)
-        k += 1
-      }
       fg.show(
         fn() { !minimized() },
         fn(exp_host : view::View) -> Unit {
@@ -126,9 +223,24 @@ pub fn liquid_collapsible_tabs_node(
           .over(view::Live::Is(true))
           .width(view::Live::Is(Some(bar_w)))
           .height(view::Live::Is(Some(ctab_h)))
-          .padding(view::Live::Is((ctab_pad, ctab_pad, ctab_pad, ctab_pad)))
           .points(view::Live::By(fn() { !minimized() }))
           .alpha(view::Live::By(fn() { 1.0 - ctab_smoothstep(0.0, 0.45, min_way.shown(exp_host)) }))
+          // Resting sliding selection pill (under icons/labels, zero-relayout ground_drawn)
+          let _ = exp_host.box(fn(ball : view::View) -> Unit {
+            let _ = ball
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .width(view::Live::Is(Some(tab_bar_ball_box_w)))
+            .height(view::Live::Is(Some(tab_bar_ball_box_h)))
+            .radius(view::Live::Is(ctab_lens_h / 2.0))
+            .ground(view::Live::By(tab_bar_selection_fill))
+            .alpha(view::Live::By(fn() {
+              let lensed = if ball.glass_solid() { 0.0 } else { dmin(1.0, held_way.shown(ball)) }
+              clamp(1.0 - lensed, 0.0, 1.0)
+            }))
+            .ground_drawn(view::Live::By(fn() { ball_shape(ball, false) }))
+          })
+          // Tab icons & labels row
           let _ = headless::radio_group(
             exp_host,
             fn() { label },
@@ -136,72 +248,151 @@ pub fn liquid_collapsible_tabs_node(
             choose,
             kind=headless::GroupKind::Tab,
             fn(g : view::View, rg : headless::RadioGroup[Int]) -> Unit {
-              let _ = g.row(view::Live::Is(true)).grow(view::Live::Is(1.0)).fills_across(view::Live::Is(true))
-              g.each_of(fn() { tab_indices }, at_once=true, fn(row_box : view::View, i : Int) -> Unit {
-                let _ = row_box.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).fills_across(view::Live::Is(true))
-                let name = tabs[i]
+              let _ = g
+              .row(view::Live::Is(true))
+              .width(view::Live::Is(Some(bar_w)))
+              .height(view::Live::Is(Some(ctab_h)))
+              .padding(view::Live::Is((tab_bar_edge, 0.0, tab_bar_edge, 0.0)))
+              let mut i = 0
+              while i < n {
+                let idx = i
+                let name = tabs[idx]
                 let face = match faces {
-                  Some(fs) => if i < fs.length() { Some(fs[i]) } else { None }
-                  None => None
-                }
-                let _ = rg.item(row_box, fn() { i }, fn() { name }, fn(t : view::View, it : headless::RadioItem) -> Unit {
-                  let pill_r = (ctab_h - ctab_pad * 2.0) / 2.0
-                  let hover_t = motion::hover_fade(t, fn() { !it.chosen() && (it.hovered() || it.focus_shown()) })
-                  let press_t = motion::hover_fade(t, fn() { !it.chosen() && it.pressed() }, duration_ms=motion::pointer_tap_ms)
-                  let _ = t
-                  .grow(view::Live::Is(1.0))
-                  .fills_across(view::Live::Is(true))
-                  .radius(view::Live::Is(pill_r))
-                  .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                  .lies_along(view::Live::Is(view::Lies::Middle))
-                  .ground(
-                    view::Live::By(fn() {
-                      if it.chosen() {
-                        if is_dark() { 0xFFFFFF22L } else { 0xFFFFFFF2L }
-                      } else {
-                        let h = hover_t()
-                        let p = press_t()
-                        let with_hover = if h > 0.001 { over(clear, alpha(ovl_row_hover(), h)) } else { clear }
-                        if p > 0.001 {
-                          over(with_hover, alpha(ovl_row_press(), p))
-                        } else {
-                          with_hover
-                        }
+                  Some(fs) => if idx < fs.length() { fs[idx] } else { tab_face(name) }
+                  None =>
+                  match compact_icons {
+                    Some(icons) =>
+                    if idx < icons.length() {
+                      let draw_ic = icons[idx]
+                      fn(f : view::View, ink : () -> Int64) -> Unit {
+                        draw_ic(f, ink)
+                        let _ = f.box(fn(w : view::View) -> Unit {
+                          let _ = w.words(view::Live::Is(name), look=words_at(type_tab)).ink(view::Live::By(ink))
+                        })
                       }
-                    }),
-                  )
-                  .shadow(
-                    view::Live::By(fn() {
-                      if it.chosen() {
-                        if is_dark() { (4.0, 1.0, 0x00000033L) } else { (4.0, 1.0, 0x00000014L) }
-                      } else {
-                        shadow_none
-                      }
-                    }),
-                  )
-                  .shadow_outside(view::Live::Is(true))
-                  let ink = fn() -> Int64 {
-                    if it.chosen() { ctab_active_ink() } else { colors().content }
-                  }
-                  match face {
-                    Some(draw) => draw(t, ink)
-                    None => {
-                      let _ = t.box(fn(w : view::View) -> Unit {
-                        let _ = w.words(view::Live::Is(name), look=words_at(type_tab, weight=weight_medium)).ink(view::Live::By(ink))
-                      })
+                    } else {
+                      tab_face(name)
                     }
+                    None => tab_face(name)
                   }
-                  t.show(fn() { it.focus_shown() }, fn(ring : view::View) -> Unit {
-                    let _ = ring
-                    .over(view::Live::Is(true))
-                    .points(view::Live::Is(false))
-                    .radius(view::Live::Is(pill_r))
-                    .edge(view::Live::By(fn() { (2.0, colors().accent) }))
-                  })
-                })
-              })
+                }
+                let _ = liquid_bottom_tab_node(
+                  g,
+                  rg,
+                  idx,
+                  name,
+                  face,
+                  fn(_n : view::View) -> Double {
+                    let under = active_under.get()
+                    let lit_now = if under >= 0 { under == idx } else { chosen() == idx }
+                    if lit_now { 1.0 } else { 0.0 }
+                  },
+                  fn(_n : view::View) -> Double { 1.0 },
+                  height=ctab_h,
+                )
+                i += 1
+              }
             },
           )
+          // Clear lifted liquid glass loupe over icons/labels
+          let _ = exp_host.box(fn(lens : view::View) -> Unit {
+            let _ = lens
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .width(view::Live::Is(Some(tab_bar_ball_box_w)))
+            .height(view::Live::Is(Some(tab_bar_ball_box_h)))
+            .radius(view::Live::Is(ctab_lens_h / 2.0))
+            .glass(view::Live::By(fn() {
+              if lens.glass_solid() {
+                None
+              } else {
+                let h = held_way.shown(lens)
+                if h > 0.01 {
+                  Some(liquid_tab_lens_glass(h))
+                } else {
+                  None
+                }
+              }
+            }))
+            .shadow(view::Live::By(fn() {
+              let h = held_way.shown(lens)
+              if h > 0.01 && !lens.glass_solid() {
+                let (s, dy, ink) = tab_bar_lens_shadow
+                (s, dy, alpha(ink, dmin(1.0, h)))
+              } else {
+                (0.0, 0.0, clear)
+              }
+            }))
+            .shadow_outside(view::Live::Is(true))
+            .alpha(view::Live::By(fn() {
+              if lens.glass_solid() {
+                0.0
+              } else {
+                let h = held_way.shown(lens)
+                if h > 0.01 { dmin(1.0, h) } else { 0.0 }
+              }
+            }))
+            .ground_drawn(view::Live::By(fn() { ball_shape(lens, true) }))
+          })
+          // Unified bar-level gesture overlay
+          let _ = exp_host.box(fn(bar_hit : view::View) -> Unit {
+            let _ = bar_hit.over(view::Live::Is(true)).gesture(
+              ui::touch_slop(),
+              press=fn(_d : view::Drag) -> Unit {
+                held_flag.v = false
+                felt_idx.v = signals::untracked(chosen)
+              },
+              hold=(
+                tab_bar_hold_ms,
+                fn(d : view::Drag) -> Unit {
+                  held_flag.v = true
+                  drag_x.v = d.x
+                  let j = tab_bar_nearest(bar_w, n, d.x)
+                  felt_idx.v = j
+                  active_under.set(j)
+                  ui::haptic(ui::Haptic::LongPress)
+                  sync_drag(d.x)
+                },
+              ),
+              tap=fn(d : view::Drag) -> Unit {
+                held_flag.v = false
+                drag_x.v = -1.0
+                active_under.set(-1)
+                let j = tab_bar_nearest(bar_w, n, d.x)
+                current.v = j
+                slide_ball_to(j)
+                if j != signals::untracked(chosen) {
+                  ui::haptic(ui::Haptic::TextHandleMove)
+                  choose(j)
+                }
+              },
+              drag=fn(d : view::Drag) -> Unit {
+                match d.kind {
+                  Down | Moved => {
+                    held_flag.v = false
+                    drag_x.v = d.x
+                    let j = tab_bar_nearest(bar_w, n, d.x)
+                    if j != felt_idx.v {
+                      ui::haptic(ui::Haptic::TextHandleMove)
+                      felt_idx.v = j
+                    }
+                    active_under.set(j)
+                    sync_drag(d.x)
+                  }
+                  Up => {
+                    let target_px = if held_flag.v {
+                      d.x
+                    } else {
+                      tab_bar_flung(d.x, d.vx(), bar_w, n)
+                    }
+                    let j = tab_bar_nearest(bar_w, n, target_px)
+                    finish_drag(j, true)
+                  }
+                  Off => finish_drag(signals::untracked(chosen), false)
+                }
+              },
+            )
+          })
         },
         leave=220.0,
       )
@@ -224,7 +415,7 @@ pub fn liquid_collapsible_tabs_node(
             fn(_e) -> Unit { on_expand() },
             fn(b : view::View, btn : headless::Button) -> Unit {
               b.reacts(at_start=false, fn() { btn.pressed() }, fn(p : Bool) -> Unit {
-                compact_press.go(b, if p { 1.0 } else { 0.0 }, motion::snappy_damped)
+                compact_press.go(b, if p { 1.0 } else { 0.0 }, motion::backdrop_press_spring)
               })
               let _ = b
               .width(view::Live::Is(Some(ctab_h)))
@@ -232,7 +423,7 @@ pub fn liquid_collapsible_tabs_node(
               .radius(view::Live::Is(ctab_r))
               .lines_up(view::Live::Is(Some(view::Along::Middle)))
               .lies_along(view::Live::Is(view::Lies::Middle))
-              .scale(view::Live::By(fn() { 1.0 - 0.06 * clamp(compact_press.shown(b), 0.0, 1.0) }))
+              .scale(view::Live::By(fn() { 1.0 - 0.03 * clamp(compact_press.shown(b), 0.0, 1.0) }), about=view::Pivot::At(0.5, 0.5))
               let active_ink = fn() -> Int64 { ctab_active_ink() }
               b.pick(fn() { clamp_int(chosen(), 0, if n > 0 { n - 1 } else { 0 }) }, at_once=true, fn(slot : view::View, idx : Int) -> Unit {
                 let _ = slot.lines_up(view::Live::Is(Some(view::Along::Middle))).lies_along(view::Live::Is(view::Lies::Middle))
@@ -249,7 +440,7 @@ pub fn liquid_collapsible_tabs_node(
                 if !drew {
                   let _ = slot.box(fn(w : view::View) -> Unit {
                     let glyph = if idx < n { ctab_initial(tabs[idx]) } else { "•" }
-                    let _ = w.words(view::Live::Is(glyph), look=words_at(18.0, weight=weight_medium)).ink(view::Live::By(active_ink))
+                    let _ = w.words(view::Live::Is(glyph), look=words_at(16.0, weight=weight_medium)).ink(view::Live::By(active_ink))
                   })
                 }
               })
@@ -265,19 +456,20 @@ pub fn liquid_collapsible_tabs_node(
         },
         leave=220.0,
       )
+      // Trailing action/search orb: slides smoothly alongside the tab bar as it collapses
       let _ = fg.box(fn(act_host : view::View) -> Unit {
         let _ = act_host
         .over(view::Live::Is(true))
         .width(view::Live::Is(Some(ctab_h)))
         .height(view::Live::Is(Some(ctab_h)))
-        .offset(view::Live::Is((bar_w + ctab_gap, 0.0)))
+        .offset(view::Live::By(fn() { (action_x(act_host), 0.0) }))
         let _ = headless::button(
           act_host,
           action_label,
           fn(_e) -> Unit { on_action() },
           fn(b : view::View, btn : headless::Button) -> Unit {
             b.reacts(at_start=false, fn() { btn.pressed() }, fn(p : Bool) -> Unit {
-              action_press.go(b, if p { 1.0 } else { 0.0 }, motion::snappy_damped)
+              action_press.go(b, if p { 1.0 } else { 0.0 }, motion::backdrop_press_spring)
             })
             let _ = b
             .width(view::Live::Is(Some(ctab_h)))
@@ -285,17 +477,17 @@ pub fn liquid_collapsible_tabs_node(
             .radius(view::Live::Is(ctab_r))
             .lines_up(view::Live::Is(Some(view::Along::Middle)))
             .lies_along(view::Live::Is(view::Lies::Middle))
-            .scale(view::Live::By(fn() { 1.0 - 0.05 * clamp(action_press.shown(b), 0.0, 1.0) }))
+            .scale(view::Live::By(fn() { 1.0 - 0.03 * clamp(action_press.shown(b), 0.0, 1.0) }), about=view::Pivot::At(0.5, 0.5))
             let ink = fn() -> Int64 { colors().content }
             match action_icon {
               Some(draw) => draw(b, ink)
               None => {
                 let _ = b.box(fn(ic : view::View) -> Unit {
                   let _ = ic
-                  .width(view::Live::Is(Some(18.0)))
-                  .height(view::Live::Is(Some(18.0)))
+                  .width(view::Live::Is(Some(16.0)))
+                  .height(view::Live::Is(Some(16.0)))
                   .shrink(view::Live::Is(0.0))
-                  .shapes(view::Live::By(fn() { ctrl_search_shapes(18.0, ink()) }))
+                  .shapes(view::Live::By(fn() { ctrl_search_shapes(16.0, ink()) }))
                 })
               }
             }
