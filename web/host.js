@@ -864,7 +864,7 @@
   uniform highp sampler2D u_segs;
   out vec4 o;
   ${CORNERS}
-  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 13
+  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 8 || ONE_KIND == 13
   float sd_rr(vec2 p, vec4 r, vec4 rad) {
     vec2 hs = r.zw * 0.5;
     return mb_sd_box(p - r.xy - hs, hs, mb_corner_of(p - r.xy - hs, rad), 1e9);
