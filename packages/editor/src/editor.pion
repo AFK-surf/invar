@@ -1,0 +1,1584 @@
+// Production multi-line rich text editor core state machine:
+// UTF-8 grapheme-aligned caret/selection, UAX #14 soft-wrapping, preferred_x vertical movement,
+// IME marked composition, decorative syntax/mention `look` coloring, clipboard, and UndoStack integration.
+
+import "paint"
+import "signals"
+import "text"
+
+/// Configuration for `EditorState`.
+pub struct EditorConfig {
+  pub mut multiline : Bool
+  pub mut wrap : Bool
+  pub mut paste_limit : Int
+  pub mut max_len : Int
+  pub mut tab_inserts : Bool
+  pub mut enter_sends : Bool
+  pub mut command_sends : Bool
+  pub mut secret : Bool
+}
+
+pub fn EditorConfig::default() -> EditorConfig {
+  EditorConfig::{
+    multiline: true,
+    wrap: true,
+    paste_limit: 0,
+    max_len: 0,
+    tab_inserts: false,
+    enter_sends: false,
+    command_sends: false,
+    secret: false,
+  }
+}
+
+pub fn EditorConfig::single_line() -> EditorConfig {
+  EditorConfig::{
+    multiline: false,
+    wrap: false,
+    paste_limit: 0,
+    max_len: 0,
+    tab_inserts: false,
+    enter_sends: true,
+    command_sends: false,
+    secret: false,
+  }
+}
+
+/// A single laid-out visual line of text (UTF-8 byte offsets into `display_text()`).
+pub struct VisualLine {
+  pub byte_start : Int
+  pub byte_end : Int
+  pub width : Double
+  pub y : Double
+  pub height : Double
+  pub hard_break : Bool
+}
+
+/// Snapshot of editor interaction outcomes.
+pub struct EditorResult {
+  pub submitted : Option[String]
+  pub focused : Bool
+  pub text : String
+  pub pasted : Option[String]
+}
+
+/// Resolved visual position of a caret offset.
+pub struct CaretPos {
+  pub x : Double
+  pub y : Double
+  pub line : Int
+  pub height : Double
+}
+
+/// Multi-line rich text editor state (dual fine-grained `signals` + direct state machine access).
+pub struct EditorState {
+  pub config : EditorConfig
+  text_sig : signals::Signal[String]
+  anchor_sig : signals::Signal[Int]
+  caret_sig : signals::Signal[Int]
+  focused_sig : signals::Signal[Bool]
+  marked_sig : signals::Signal[String]
+  pub mut text : String
+  pub mut anchor : Int
+  pub mut caret : Int
+  pub mut focused : Bool
+  pub mut marked : String
+  pub mut marked_sel_start : Int
+  pub mut marked_sel_end : Int
+  pub mut preferred_x : Double
+  pub mut upstream : Int
+  pub mut submitted : Option[String]
+  pub mut pasted : Option[String]
+  pub undo_stack : UndoStack
+  pub mut lines : Array[VisualLine]
+  pub mut line_height : Double
+  pub mut max_width : Double
+  mut last_measure : Option[(String) -> Double]
+  pub mut look : Option[(String) -> (String, Array[(Int, Int, Int64)])]
+  mut look_cache_in : String
+  mut look_cache_out : String
+  mut look_cache_spans : Array[(Int, Int, Int64)]
+  mut look_cache_valid : Bool
+}
+
+pub fn EditorState::new(
+  text~ : String = "",
+  config~ : EditorConfig = EditorConfig::default(),
+) -> EditorState {
+  let clean = if config.multiline { text } else { strip_newlines(text) }
+  let clamped = if config.max_len > 0 { truncate_grapheme_bytes(clean, config.max_len) } else { clean }
+  let n = clamped.length()
+  EditorState::{
+    config,
+    text_sig: signals::signal(clamped),
+    anchor_sig: signals::signal(n),
+    caret_sig: signals::signal(n),
+    focused_sig: signals::signal(false),
+    marked_sig: signals::signal(""),
+    text: clamped,
+    anchor: n,
+    caret: n,
+    focused: false,
+    marked: "",
+    marked_sel_start: 0,
+    marked_sel_end: 0,
+    preferred_x: -1.0,
+    upstream: -1,
+    submitted: None,
+    pasted: None,
+    undo_stack: UndoStack::new(),
+    lines: [],
+    line_height: 20.0,
+    max_width: 0.0,
+    last_measure: None,
+    look: None,
+    look_cache_in: "",
+    look_cache_out: "",
+    look_cache_spans: [],
+    look_cache_valid: false,
+  }
+}
+
+fn strip_newlines(s : String) -> String {
+  let n = s.length()
+  let mut has_nl = false
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 10 || b == 13 {
+      has_nl = true
+      break
+    }
+    i += 1
+  }
+  if !has_nl {
+    return s
+  }
+  let sb = StringBuilder::new()
+  let mut j = 0
+  while j < n {
+    let b = s.code_unit_at(j)
+    if b != 10 && b != 13 {
+      sb.write_byte(b as Byte)
+    }
+    j += 1
+  }
+  sb.to_string()
+}
+
+fn truncate_grapheme_bytes(s : String, max_bytes : Int) -> String {
+  if max_bytes <= 0 || s.length() <= max_bytes {
+    return s
+  }
+  let cut = snap_to_grapheme(s, max_bytes)
+  str_slice(s, 0, cut)
+}
+
+fn is_nl_byte(b : Int) -> Bool {
+  b == 10 || b == 13
+}
+
+fn EditorState::sync_signals(self : EditorState) -> Unit {
+  if self.text_sig.untracked() != self.text {
+    self.text_sig.set(self.text)
+  }
+  if self.anchor_sig.untracked() != self.anchor {
+    self.anchor_sig.set(self.anchor)
+  }
+  if self.caret_sig.untracked() != self.caret {
+    self.caret_sig.set(self.caret)
+  }
+  if self.focused_sig.untracked() != self.focused {
+    self.focused_sig.set(self.focused)
+  }
+  if self.marked_sig.untracked() != self.marked {
+    self.marked_sig.set(self.marked)
+  }
+}
+
+/// Signal accessors for fine-grained reactive UI binding.
+pub fn EditorState::text_signal(self : EditorState) -> signals::Signal[String] {
+  self.text_sig
+}
+
+pub fn EditorState::anchor_signal(self : EditorState) -> signals::Signal[Int] {
+  self.anchor_sig
+}
+
+pub fn EditorState::caret_signal(self : EditorState) -> signals::Signal[Int] {
+  self.caret_sig
+}
+
+pub fn EditorState::focused_signal(self : EditorState) -> signals::Signal[Bool] {
+  self.focused_sig
+}
+
+pub fn EditorState::marked_signal(self : EditorState) -> signals::Signal[String] {
+  self.marked_sig
+}
+
+/// Focus control.
+pub fn EditorState::focus(self : EditorState) -> Unit {
+  self.focused = true
+  self.sync_signals()
+}
+
+pub fn EditorState::blur(self : EditorState) -> Unit {
+  self.focused = false
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  self.sync_signals()
+}
+
+pub fn EditorState::is_focused(self : EditorState) -> Bool {
+  self.focused
+}
+
+/// Return current `EditorResult` snapshot.
+pub fn EditorState::result(self : EditorState) -> EditorResult {
+  EditorResult::{
+    submitted: self.submitted,
+    focused: self.focused,
+    text: self.text,
+    pasted: self.pasted,
+  }
+}
+
+pub fn EditorState::take_submitted(self : EditorState) -> Option[String] {
+  let out = self.submitted
+  self.submitted = None
+  out
+}
+
+pub fn EditorState::take_pasted(self : EditorState) -> Option[String] {
+  let out = self.pasted
+  self.pasted = None
+  out
+}
+
+/// Programmatic text replacement: clears undo/redo history and active composition.
+pub fn EditorState::set(self : EditorState, new_text : String, caret? : Int) -> Unit {
+  let clean = if self.config.multiline { new_text } else { strip_newlines(new_text) }
+  let clamped = if self.config.max_len > 0 { truncate_grapheme_bytes(clean, self.config.max_len) } else { clean }
+  let c = match caret {
+    Some(p) => snap_to_grapheme(clamped, iclamp(p, 0, clamped.length()))
+    None => clamped.length()
+  }
+  self.text = clamped
+  self.anchor = c
+  self.caret = c
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.undo_stack.clear()
+  self.look_cache_valid = false
+  self.sync_signals()
+}
+
+/// Release optional closures before dropping the state.
+pub fn EditorState::clear_callbacks(self : EditorState) -> Unit {
+  self.last_measure = None
+  self.look = None
+  self.look_cache_valid = false
+}
+
+// ── Selection & Word / Paragraph Queries ─────────────────────────────────────────────────────
+
+pub fn EditorState::has_selection(self : EditorState) -> Bool {
+  self.anchor != self.caret
+}
+
+pub fn EditorState::selection_range(self : EditorState) -> (Int, Int) {
+  if self.anchor <= self.caret {
+    (self.anchor, self.caret)
+  } else {
+    (self.caret, self.anchor)
+  }
+}
+
+pub fn EditorState::selected_text(self : EditorState) -> String {
+  let (lo, hi) = self.selection_range()
+  if lo >= hi {
+    ""
+  } else {
+    str_slice(self.text, lo, hi)
+  }
+}
+
+/// Set selection with both endpoints snapped to valid UTF-8 grapheme boundaries.
+pub fn EditorState::set_selection(self : EditorState, anchor : Int, caret : Int) -> Unit {
+  let a = snap_to_grapheme(self.text, iclamp(anchor, 0, self.text.length()))
+  let c = snap_to_grapheme(self.text, iclamp(caret, 0, self.text.length()))
+  self.anchor = a
+  self.caret = c
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.sync_signals()
+}
+
+pub fn EditorState::select_all(self : EditorState) -> Unit {
+  self.anchor = 0
+  self.caret = self.text.length()
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.sync_signals()
+}
+
+fn word_bounds_at(t : String, off : Int) -> (Int, Int) {
+  let n = t.length()
+  if n == 0 {
+    return (0, 0)
+  }
+  let mut p = snap_to_grapheme(t, iclamp(off, 0, n))
+  if p >= n {
+    p = prev_grapheme_boundary(t, n)
+  }
+  let on_sep = between_words_at(t, p)
+  let mut lo = p
+  while lo > 0 {
+    let prev = prev_grapheme_boundary(t, lo)
+    if between_words_at(t, prev) != on_sep {
+      break
+    }
+    lo = prev
+  }
+  let mut hi = next_grapheme_boundary(t, p)
+  while hi < n && between_words_at(t, hi) == on_sep {
+    hi = next_grapheme_boundary(t, hi)
+  }
+  (lo, hi)
+}
+
+fn word_start_before(t : String, off : Int) -> Int {
+  let mut i = snap_to_grapheme(t, iclamp(off, 0, t.length()))
+  while i > 0 {
+    let p = prev_grapheme_boundary(t, i)
+    if !between_words_at(t, p) {
+      break
+    }
+    i = p
+  }
+  while i > 0 {
+    let p = prev_grapheme_boundary(t, i)
+    if between_words_at(t, p) {
+      break
+    }
+    i = p
+  }
+  i
+}
+
+fn word_end_after(t : String, off : Int) -> Int {
+  let n = t.length()
+  let mut i = snap_to_grapheme(t, iclamp(off, 0, n))
+  while i < n && between_words_at(t, i) {
+    i = next_grapheme_boundary(t, i)
+  }
+  while i < n && !between_words_at(t, i) {
+    i = next_grapheme_boundary(t, i)
+  }
+  i
+}
+
+fn next_word_start(t : String, off : Int) -> Int {
+  let n = t.length()
+  let mut i = snap_to_grapheme(t, iclamp(off, 0, n))
+  while i < n && !between_words_at(t, i) {
+    i = next_grapheme_boundary(t, i)
+  }
+  while i < n && between_words_at(t, i) {
+    i = next_grapheme_boundary(t, i)
+  }
+  i
+}
+
+fn paragraph_start(t : String, off : Int) -> Int {
+  let mut i = iclamp(off, 0, t.length())
+  while i > 0 && !is_nl_byte(t.code_unit_at(i - 1)) {
+    i -= 1
+  }
+  i
+}
+
+fn paragraph_end(t : String, off : Int) -> Int {
+  let n = t.length()
+  let mut i = iclamp(off, 0, n)
+  while i < n && !is_nl_byte(t.code_unit_at(i)) {
+    i += 1
+  }
+  i
+}
+
+/// Select the word at byte offset `pos`. If `pos` sits on whitespace, selects the nearest adjacent word.
+pub fn EditorState::select_word_at(self : EditorState, pos : Int) -> (Int, Int) {
+  let t = self.text
+  let n = t.length()
+  if n == 0 {
+    self.set_selection(0, 0)
+    return (0, 0)
+  }
+  if self.config.secret {
+    self.select_all()
+    return (0, n)
+  }
+  let mut p = snap_to_grapheme(t, iclamp(pos, 0, n))
+  if p >= n {
+    p = prev_grapheme_boundary(t, n)
+  }
+  let (lo, hi) = if !between_words_at(t, p) {
+    word_bounds_at(t, p)
+  } else {
+    // Search left for a non-separator, else right.
+    let mut l = p
+    let mut found_l = -1
+    while l > 0 {
+      let prev = prev_grapheme_boundary(t, l)
+      if !between_words_at(t, prev) {
+        found_l = prev
+        break
+      }
+      l = prev
+    }
+    if found_l >= 0 {
+      word_bounds_at(t, found_l)
+    } else {
+      let mut r = next_grapheme_boundary(t, p)
+      let mut found_r = -1
+      while r < n {
+        if !between_words_at(t, r) {
+          found_r = r
+          break
+        }
+        r = next_grapheme_boundary(t, r)
+      }
+      if found_r >= 0 {
+        word_bounds_at(t, found_r)
+      } else {
+        word_bounds_at(t, p)
+      }
+    }
+  }
+  self.anchor = lo
+  self.caret = hi
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.sync_signals()
+  (lo, hi)
+}
+
+/// Select the paragraph (logical line) containing byte offset `pos`.
+pub fn EditorState::select_line_at(self : EditorState, pos : Int) -> (Int, Int) {
+  let lo = paragraph_start(self.text, pos)
+  let hi = paragraph_end(self.text, pos)
+  self.anchor = lo
+  self.caret = hi
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.sync_signals()
+  (lo, hi)
+}
+
+// ── IME Composition & Decorative Look Coloring ───────────────────────────────────────────────
+
+pub fn EditorState::is_composing(self : EditorState) -> Bool {
+  self.marked.length() > 0
+}
+
+pub fn EditorState::compose_start(self : EditorState) -> Unit {
+  let _ = self.delete_selection_raw()
+  self.undo_stack.break_run()
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  self.upstream = -1
+  self.sync_signals()
+}
+
+pub fn EditorState::compose_update(
+  self : EditorState,
+  marked : String,
+  sel_start~ : Int = 0,
+  sel_end~ : Int = 0,
+) -> Unit {
+  if self.has_selection() {
+    let _ = self.delete_selection_raw()
+  }
+  let ml = marked.length()
+  self.marked = marked
+  self.marked_sel_start = iclamp(sel_start, 0, ml)
+  self.marked_sel_end = iclamp(sel_end, self.marked_sel_start, ml)
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.sync_signals()
+}
+
+/// Commit IME composition text as a standalone undo step.
+pub fn EditorState::compose_commit(self : EditorState, s : String, now~ : Double = 0.0) -> Unit {
+  let before_text = self.text
+  let before_anchor = self.anchor
+  let before_caret = self.caret
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  self.undo_stack.break_run()
+  let commit_str = if self.config.multiline { s } else { strip_newlines(s) }
+  if commit_str.length() > 0 {
+    self.insert_raw(commit_str)
+    self.undo_stack.record(
+      before_text,
+      before_anchor,
+      before_caret,
+      self.text,
+      self.anchor,
+      self.caret,
+      typing=false,
+      now=now,
+      composing=true,
+    )
+  }
+  self.undo_stack.break_run()
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.sync_signals()
+}
+
+/// Cancel active IME composition without modifying `text`.
+pub fn EditorState::compose_cancel(self : EditorState) -> Unit {
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  self.upstream = -1
+  self.sync_signals()
+}
+
+/// Visible text including active IME `marked` composition spliced at `caret`.
+pub fn EditorState::display_text(self : EditorState) -> String {
+  let raw = if self.marked.length() == 0 {
+    self.text
+  } else {
+    str_slice(self.text, 0, self.caret) + self.marked + str_slice(self.text, self.caret, self.text.length())
+  }
+  if !self.config.secret {
+    return raw
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let n = raw.length()
+  while i < n {
+    let next = next_grapheme_boundary(raw, i)
+    // U+2022 bullet: E2 80 A2
+    sb.write_string("\xE2\x80\xA2")
+    i = next
+  }
+  sb.to_string()
+}
+
+/// Caret byte offset within `display_text()`.
+pub fn EditorState::display_caret(self : EditorState) -> Int {
+  if self.marked.length() == 0 {
+    self.caret
+  } else {
+    self.caret + self.marked_sel_end
+  }
+}
+
+/// Set or clear the decorative syntax/mention coloring callback.
+pub fn EditorState::set_look(
+  self : EditorState,
+  f : Option[(String) -> (String, Array[(Int, Int, Int64)])],
+) -> Unit {
+  self.look = f
+  self.look_cache_valid = false
+}
+
+pub fn EditorState::invalidate_look(self : EditorState) -> Unit {
+  self.look_cache_valid = false
+}
+
+fn EditorState::look_of(self : EditorState, d : String) -> (String, Array[(Int, Int, Int64)]) {
+  match self.look {
+    None => (d, [])
+    Some(f) => {
+      if self.look_cache_valid && self.look_cache_in == d {
+        return (self.look_cache_out, self.look_cache_spans)
+      }
+      let (o, spans) = f(d)
+      let shown = if o.length() == d.length() { o } else { d }
+      self.look_cache_in = d
+      self.look_cache_out = shown
+      self.look_cache_spans = spans
+      self.look_cache_valid = true
+      (shown, spans)
+    }
+  }
+}
+
+/// Evaluate `look` on committed `text` (with caching) and shift color spans around active IME `marked` text.
+pub fn EditorState::look_shown(self : EditorState) -> (String, Array[(Int, Int, Int64)]) {
+  let (o, spans) = self.look_of(self.text)
+  let ml = self.marked.length()
+  if ml == 0 {
+    return (o, spans)
+  }
+  let at = self.caret
+  let moved : Array[(Int, Int, Int64)] = []
+  for r in spans {
+    let (a, b, k) = r
+    let na = if a >= at { a + ml } else { a }
+    let nb = if b > at { b + ml } else { b }
+    moved.push((na, nb, k))
+  }
+  (str_slice(o, 0, at) + self.marked + str_slice(o, at, o.length()), moved)
+}
+
+// ── Text Editing Operations ──────────────────────────────────────────────────────────────────
+
+fn EditorState::delete_selection_raw(self : EditorState) -> Bool {
+  let (lo, hi) = self.selection_range()
+  if lo >= hi {
+    return false
+  }
+  self.text = str_slice(self.text, 0, lo) + str_slice(self.text, hi, self.text.length())
+  self.anchor = lo
+  self.caret = lo
+  self.look_cache_valid = false
+  true
+}
+
+fn EditorState::insert_raw(self : EditorState, ins : String) -> Unit {
+  let _ = self.delete_selection_raw()
+  let mut to_insert = if self.config.multiline { ins } else { strip_newlines(ins) }
+  if self.config.max_len > 0 {
+    let room = self.config.max_len - self.text.length()
+    if room <= 0 {
+      to_insert = ""
+    } else if to_insert.length() > room {
+      to_insert = truncate_grapheme_bytes(to_insert, room)
+    }
+  }
+  if to_insert.length() == 0 {
+    return
+  }
+  let head = str_slice(self.text, 0, self.caret)
+  let tail = str_slice(self.text, self.caret, self.text.length())
+  self.text = head + to_insert + tail
+  self.caret = self.caret + to_insert.length()
+  self.anchor = self.caret
+  self.look_cache_valid = false
+}
+
+/// Insert text at current caret/selection with undo coalescing.
+pub fn EditorState::insert_text(self : EditorState, s : String, now~ : Double = 0.0) -> Unit {
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  let before_text = self.text
+  let before_anchor = self.anchor
+  let before_caret = self.caret
+  self.insert_raw(s)
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.undo_stack.record(
+    before_text,
+    before_anchor,
+    before_caret,
+    self.text,
+    self.anchor,
+    self.caret,
+    typing=true,
+    now=now,
+  )
+  self.sync_signals()
+}
+
+/// Delete selection, or backward by grapheme / word / line.
+pub fn EditorState::backspace(
+  self : EditorState,
+  word~ : Bool = false,
+  line~ : Bool = false,
+  now~ : Double = 0.0,
+) -> Unit {
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  let before_text = self.text
+  let before_anchor = self.anchor
+  let before_caret = self.caret
+  if !self.delete_selection_raw() {
+    let target = if line {
+      let ls = self.visual_line_start_at(self.caret, self.caret_is_upstream())
+      if ls != self.caret { ls } else { prev_grapheme_boundary(self.text, self.caret) }
+    } else if word {
+      if self.config.secret { 0 } else { word_start_before(self.text, self.caret) }
+    } else {
+      prev_grapheme_boundary(self.text, self.caret)
+    }
+    if target < self.caret {
+      self.text = str_slice(self.text, 0, target) + str_slice(self.text, self.caret, self.text.length())
+      self.caret = target
+      self.anchor = target
+      self.look_cache_valid = false
+    }
+  }
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.undo_stack.record(
+    before_text,
+    before_anchor,
+    before_caret,
+    self.text,
+    self.anchor,
+    self.caret,
+    typing=true,
+    now=now,
+  )
+  self.sync_signals()
+}
+
+/// Delete selection, or forward by grapheme / word / line.
+pub fn EditorState::delete_forward(
+  self : EditorState,
+  word~ : Bool = false,
+  line~ : Bool = false,
+  now~ : Double = 0.0,
+) -> Unit {
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  let before_text = self.text
+  let before_anchor = self.anchor
+  let before_caret = self.caret
+  if !self.delete_selection_raw() {
+    let target = if line {
+      let le = self.visual_line_end_at(self.caret, self.caret_is_upstream())
+      if le != self.caret { le } else { next_grapheme_boundary(self.text, self.caret) }
+    } else if word {
+      if self.config.secret { self.text.length() } else { word_end_after(self.text, self.caret) }
+    } else {
+      next_grapheme_boundary(self.text, self.caret)
+    }
+    if target > self.caret {
+      self.text = str_slice(self.text, 0, self.caret) + str_slice(self.text, target, self.text.length())
+      self.anchor = self.caret
+      self.look_cache_valid = false
+    }
+  }
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.undo_stack.record(
+    before_text,
+    before_anchor,
+    before_caret,
+    self.text,
+    self.anchor,
+    self.caret,
+    typing=true,
+    now=now,
+  )
+  self.sync_signals()
+}
+
+/// Return selected text for clipboard copy (empty string if secret or no selection).
+pub fn EditorState::copy(self : EditorState) -> String {
+  if self.config.secret || !self.has_selection() {
+    ""
+  } else {
+    self.selected_text()
+  }
+}
+
+/// Cut selection as a standalone undo step and return the cut text.
+pub fn EditorState::cut(self : EditorState, now~ : Double = 0.0) -> String {
+  if self.config.secret || !self.has_selection() {
+    return ""
+  }
+  let sel = self.selected_text()
+  let before_text = self.text
+  let before_anchor = self.anchor
+  let before_caret = self.caret
+  let _ = self.delete_selection_raw()
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.undo_stack.record(
+    before_text,
+    before_anchor,
+    before_caret,
+    self.text,
+    self.anchor,
+    self.caret,
+    typing=false,
+    now=now,
+  )
+  self.sync_signals()
+  sel
+}
+
+/// Paste `s` as a standalone undo step. If `config.paste_limit > 0` and `s.length() >= paste_limit`,
+/// intercepts the paste by storing `self.pasted = Some(s)` and returns `false` without mutating `text`.
+pub fn EditorState::paste(self : EditorState, s : String, now~ : Double = 0.0) -> Bool {
+  if self.config.paste_limit > 0 && s.length() >= self.config.paste_limit {
+    self.pasted = Some(s)
+    return false
+  }
+  self.marked = ""
+  self.marked_sel_start = 0
+  self.marked_sel_end = 0
+  let before_text = self.text
+  let before_anchor = self.anchor
+  let before_caret = self.caret
+  self.insert_raw(s)
+  self.preferred_x = -1.0
+  self.upstream = -1
+  self.undo_stack.record(
+    before_text,
+    before_anchor,
+    before_caret,
+    self.text,
+    self.anchor,
+    self.caret,
+    typing=false,
+    now=now,
+  )
+  self.sync_signals()
+  true
+}
+
+// ── Multi-Line Soft-Wrap Layout, Caret Coordinates, Hit Testing & Selection Rects ───────────
+
+fn measure_with(measure_fn : Option[(String) -> Double], s : String) -> Double {
+  match measure_fn {
+    Some(f) => f(s)
+    None => utf8_cp_count_range(s, 0, s.length()).to_double() * 8.0
+  }
+}
+
+/// Lay out `display_text()` into visual lines with UAX #14 soft-wrapping and grapheme fallback.
+pub fn EditorState::layout_lines(
+  self : EditorState,
+  max_w : Double,
+  measure_fn : (String) -> Double,
+  line_h : Double,
+) -> Array[VisualLine] {
+  let src = self.display_text()
+  let n = src.length()
+  let lh = if line_h > 0.0 { line_h } else { 20.0 }
+  self.line_height = lh
+  self.max_width = max_w
+  self.last_measure = Some(measure_fn)
+
+  let out : Array[VisualLine] = []
+  if n == 0 {
+    out.push(VisualLine::{ byte_start: 0, byte_end: 0, width: 0.0, y: 0.0, height: lh, hard_break: false })
+    self.lines = out
+    return out
+  }
+
+  let wrap_enabled = self.config.wrap && max_w > 0.0
+  let mut y = 0.0
+  let mut para_start = 0
+
+  while para_start <= n {
+    // Find end of current paragraph (before '\n' or '\r\n').
+    let mut para_end = para_start
+    while para_end < n && !is_nl_byte(src.code_unit_at(para_end)) {
+      para_end += 1
+    }
+    let has_hard_break = para_end < n
+    let next_para_start = if para_end < n {
+      if src.code_unit_at(para_end) == 13 && para_end + 1 < n && src.code_unit_at(para_end + 1) == 10 {
+        para_end + 2
+      } else {
+        para_end + 1
+      }
+    } else {
+      n + 1
+    }
+
+    if para_end == para_start {
+      out.push(
+        VisualLine::{
+          byte_start: para_start,
+          byte_end: para_end,
+          width: 0.0,
+          y,
+          height: lh,
+          hard_break: has_hard_break,
+        },
+      )
+      y += lh
+    } else if !wrap_enabled {
+      let seg = str_slice(src, para_start, para_end)
+      let w = measure_fn(seg)
+      out.push(
+        VisualLine::{
+          byte_start: para_start,
+          byte_end: para_end,
+          width: w,
+          y,
+          height: lh,
+          hard_break: has_hard_break,
+        },
+      )
+      y += lh
+    } else {
+      let para_str = str_slice(src, para_start, para_end)
+      let opps = text::break_opportunities(para_str)
+      let mut line_start_rel = 0
+      let mut opp_idx = 0
+      let plen = para_str.length()
+
+      while line_start_rel < plen {
+        let mut best_end_rel = -1
+        let mut best_w = 0.0
+        let mut k = opp_idx
+        while k < opps.length() {
+          let cand_end = opps[k].0
+          if cand_end <= line_start_rel {
+            k += 1
+            continue
+          }
+          let cand_w = measure_fn(str_slice(para_str, line_start_rel, cand_end))
+          if cand_w <= max_w {
+            best_end_rel = cand_end
+            best_w = cand_w
+            k += 1
+          } else {
+            break
+          }
+        }
+
+        if best_end_rel > line_start_rel {
+          let is_last_of_para = best_end_rel >= plen
+          out.push(
+            VisualLine::{
+              byte_start: para_start + line_start_rel,
+              byte_end: para_start + best_end_rel,
+              width: best_w,
+              y,
+              height: lh,
+              hard_break: is_last_of_para && has_hard_break,
+            },
+          )
+          y += lh
+          line_start_rel = best_end_rel
+          while opp_idx < opps.length() && opps[opp_idx].0 <= line_start_rel {
+            opp_idx += 1
+          }
+        } else {
+          // Single unbreakable token exceeds max_w: fall back to grapheme-cluster wrapping.
+          let mut g_end = next_grapheme_boundary(para_str, line_start_rel)
+          let mut g_w = measure_fn(str_slice(para_str, line_start_rel, g_end))
+          while g_end < plen {
+            let next_g = next_grapheme_boundary(para_str, g_end)
+            let next_w = measure_fn(str_slice(para_str, line_start_rel, next_g))
+            if next_w <= max_w {
+              g_end = next_g
+              g_w = next_w
+            } else {
+              break
+            }
+          }
+          let is_last_of_para = g_end >= plen
+          out.push(
+            VisualLine::{
+              byte_start: para_start + line_start_rel,
+              byte_end: para_start + g_end,
+              width: g_w,
+              y,
+              height: lh,
+              hard_break: is_last_of_para && has_hard_break,
+            },
+          )
+          y += lh
+          line_start_rel = g_end
+          while opp_idx < opps.length() && opps[opp_idx].0 <= line_start_rel {
+            opp_idx += 1
+          }
+        }
+      }
+    }
+
+    if !has_hard_break {
+      break
+    }
+    para_start = next_para_start
+  }
+
+  self.lines = out
+  out
+}
+
+fn EditorState::ensure_lines(self : EditorState) -> Unit {
+  if self.lines.length() == 0 {
+    let m = match self.last_measure {
+      Some(f) => f
+      None => fn(s : String) { utf8_cp_count_range(s, 0, s.length()).to_double() * 8.0 }
+    }
+    let _ = self.layout_lines(self.max_width, m, self.line_height)
+  }
+}
+
+fn EditorState::caret_is_upstream(self : EditorState) -> Bool {
+  self.upstream == self.caret && self.marked.length() == 0
+}
+
+fn EditorState::line_index_of(self : EditorState, pos : Int, up : Bool) -> Int {
+  let nlines = self.lines.length()
+  if nlines == 0 {
+    return 0
+  }
+  let mut i = 0
+  while i < nlines {
+    let ln = self.lines[i]
+    if pos >= ln.byte_start && pos <= ln.byte_end {
+      // Soft-wrap boundary: `pos == ln.byte_end == next.byte_start`.
+      if pos == ln.byte_end && !ln.hard_break && i + 1 < nlines && self.lines[i + 1].byte_start == pos {
+        if up {
+          return i
+        } else {
+          return i + 1
+        }
+      }
+      return i
+    }
+    i += 1
+  }
+  nlines - 1
+}
+
+/// Visual position `(x, y, line, height)` of UTF-8 byte offset `pos`.
+pub fn EditorState::caret_pos(self : EditorState, pos : Int) -> CaretPos {
+  self.ensure_lines()
+  let src = self.display_text()
+  let clamped = snap_to_grapheme(src, iclamp(pos, 0, src.length()))
+  let up = clamped == self.caret && self.caret_is_upstream()
+  let idx = self.line_index_of(clamped, up)
+  let ln = self.lines[idx]
+  let prefix = str_slice(src, ln.byte_start, clamped)
+  let x = measure_with(self.last_measure, prefix)
+  CaretPos::{ x, y: ln.y, line: idx, height: ln.height }
+}
+
+/// Caret `(x, y)` coordinates for UTF-8 byte offset `pos`.
+pub fn EditorState::caret_xy(self : EditorState, pos : Int) -> (Double, Double) {
+  let p = self.caret_pos(pos)
+  (p.x, p.y)
+}
+
+fn EditorState::offset_on_line(self : EditorState, line_idx : Int, target_x : Double) -> (Int, Bool) {
+  self.ensure_lines()
+  let nlines = self.lines.length()
+  if nlines == 0 {
+    return (0, false)
+  }
+  let idx = iclamp(line_idx, 0, nlines - 1)
+  let ln = self.lines[idx]
+  let src = self.display_text()
+  if target_x <= 0.0 || ln.byte_start >= ln.byte_end {
+    return (ln.byte_start, false)
+  }
+  let mut cur = ln.byte_start
+  let mut cur_x = 0.0
+  while cur < ln.byte_end {
+    let next = next_grapheme_boundary(src, cur)
+    let clamped_next = imin(next, ln.byte_end)
+    let next_x = measure_with(self.last_measure, str_slice(src, ln.byte_start, clamped_next))
+    let mid = (cur_x + next_x) * 0.5
+    if target_x < mid {
+      return (cur, false)
+    }
+    cur = clamped_next
+    cur_x = next_x
+  }
+  let is_soft_end = !ln.hard_break && idx + 1 < nlines && self.lines[idx + 1].byte_start == ln.byte_end
+  (ln.byte_end, is_soft_end)
+}
+
+/// Hit-test `(x, y)` to a UTF-8 grapheme byte offset and upstream flag.
+pub fn EditorState::hit_test_with_upstream(self : EditorState, x : Double, y : Double) -> (Int, Bool) {
+  self.ensure_lines()
+  let nlines = self.lines.length()
+  if nlines == 0 {
+    return (0, false)
+  }
+  let mut idx = 0
+  if y >= 0.0 {
+    let mut found = nlines - 1
+    let mut i = 0
+    while i < nlines {
+      let ln = self.lines[i]
+      if y < ln.y + ln.height {
+        found = i
+        break
+      }
+      i += 1
+    }
+    idx = found
+  }
+  self.offset_on_line(idx, x)
+}
+
+/// Hit-test `(x, y)` to the nearest UTF-8 grapheme byte offset.
+pub fn EditorState::hit_test(self : EditorState, x : Double, y : Double) -> Int {
+  self.hit_test_with_upstream(x, y).0
+}
+
+/// Compute selection highlight rectangles across all spanned visual lines.
+pub fn EditorState::selection_rects(
+  self : EditorState,
+  color~ : Int64 = paint::color_i64(0x0A84, 0xFF40),
+) -> Array[paint::Rect] {
+  let out : Array[paint::Rect] = []
+  let (lo, hi) = self.selection_range()
+  if lo >= hi {
+    return out
+  }
+  self.ensure_lines()
+  let src = self.display_text()
+  for i in 0..<self.lines.length() {
+    let ln = self.lines[i]
+    let spans_empty_line = ln.byte_start == ln.byte_end && lo <= ln.byte_start && hi > ln.byte_start
+    if hi <= ln.byte_start && !spans_empty_line {
+      continue
+    }
+    if lo > ln.byte_end {
+      continue
+    }
+    if lo == ln.byte_end && !spans_empty_line && !(ln.hard_break && hi > ln.byte_end) {
+      continue
+    }
+    let seg_lo = imax(lo, ln.byte_start)
+    let seg_hi = imin(hi, ln.byte_end)
+    let x0 = measure_with(self.last_measure, str_slice(src, ln.byte_start, seg_lo))
+    let mut x1 = measure_with(self.last_measure, str_slice(src, ln.byte_start, seg_hi))
+    if hi > ln.byte_end && ln.hard_break && x1 - x0 < 4.0 {
+      x1 = x0 + 6.0
+    }
+    if x1 > x0 {
+      out.push(paint::rect(x0, ln.y, x1 - x0, ln.height, color=color))
+    }
+  }
+  out
+}
+
+fn EditorState::visual_line_start_at(self : EditorState, pos : Int, up : Bool) -> Int {
+  if self.lines.length() == 0 {
+    return paragraph_start(self.text, pos)
+  }
+  let idx = self.line_index_of(pos, up)
+  self.lines[idx].byte_start
+}
+
+fn EditorState::visual_line_end_at(self : EditorState, pos : Int, up : Bool) -> Int {
+  if self.lines.length() == 0 {
+    return paragraph_end(self.text, pos)
+  }
+  let idx = self.line_index_of(pos, up)
+  self.lines[idx].byte_end
+}
+
+// ── Caret Movement ───────────────────────────────────────────────────────────────────────────
+
+fn EditorState::move_to(self : EditorState, off : Int, extend : Bool, up : Bool) -> Unit {
+  let clamped = snap_to_grapheme(self.text, iclamp(off, 0, self.text.length()))
+  self.caret = clamped
+  if !extend {
+    self.anchor = clamped
+  }
+  self.upstream = if up { clamped } else { -1 }
+  self.sync_signals()
+}
+
+pub fn EditorState::move_left(self : EditorState, extend~ : Bool = false, word~ : Bool = false) -> Unit {
+  let (lo, hi) = self.selection_range()
+  self.preferred_x = -1.0
+  if !extend && lo < hi && !word {
+    self.move_to(lo, false, false)
+    return
+  }
+  let from = if extend || lo == hi { self.caret } else { lo }
+  let target = if word {
+    if self.config.secret { 0 } else { word_start_before(self.text, from) }
+  } else {
+    prev_grapheme_boundary(self.text, from)
+  }
+  self.move_to(target, extend, false)
+}
+
+pub fn EditorState::move_right(
+  self : EditorState,
+  extend~ : Bool = false,
+  word~ : Bool = false,
+  next_word~ : Bool = false,
+) -> Unit {
+  let (lo, hi) = self.selection_range()
+  self.preferred_x = -1.0
+  if !extend && lo < hi && !word && !next_word {
+    self.move_to(hi, false, false)
+    return
+  }
+  let from = if extend || lo == hi { self.caret } else { hi }
+  let target = if next_word {
+    if self.config.secret { self.text.length() } else { next_word_start(self.text, from) }
+  } else if word {
+    if self.config.secret { self.text.length() } else { word_end_after(self.text, from) }
+  } else {
+    next_grapheme_boundary(self.text, from)
+  }
+  self.move_to(target, extend, false)
+}
+
+fn EditorState::move_vertical(self : EditorState, delta : Int, extend : Bool) -> Unit {
+  self.ensure_lines()
+  let nlines = self.lines.length()
+  if nlines == 0 {
+    return
+  }
+  let (lo, hi) = self.selection_range()
+  let from = if extend || lo == hi {
+    self.caret
+  } else if delta < 0 {
+    lo
+  } else {
+    hi
+  }
+  let cp = self.caret_pos(from)
+  if self.preferred_x < 0.0 {
+    self.preferred_x = cp.x
+  }
+  let target_line = cp.line + delta
+  if target_line < 0 {
+    self.move_to(0, extend, false)
+  } else if target_line >= nlines {
+    self.move_to(self.text.length(), extend, false)
+  } else {
+    let (off, up) = self.offset_on_line(target_line, self.preferred_x)
+    self.move_to(off, extend, up)
+  }
+}
+
+pub fn EditorState::move_up(self : EditorState, extend~ : Bool = false) -> Unit {
+  self.move_vertical(-1, extend)
+}
+
+pub fn EditorState::move_down(self : EditorState, extend~ : Bool = false) -> Unit {
+  self.move_vertical(1, extend)
+}
+
+pub fn EditorState::move_line_start(self : EditorState, extend~ : Bool = false) -> Unit {
+  self.preferred_x = -1.0
+  let target = self.visual_line_start_at(self.caret, self.caret_is_upstream())
+  self.move_to(target, extend, false)
+}
+
+pub fn EditorState::move_line_end(self : EditorState, extend~ : Bool = false) -> Unit {
+  self.preferred_x = -1.0
+  let up = self.caret_is_upstream()
+  if self.lines.length() == 0 {
+    self.move_to(paragraph_end(self.text, self.caret), extend, false)
+    return
+  }
+  let idx = self.line_index_of(self.caret, up)
+  let ln = self.lines[idx]
+  let is_soft = !ln.hard_break && idx + 1 < self.lines.length() && self.lines[idx + 1].byte_start == ln.byte_end
+  self.move_to(ln.byte_end, extend, is_soft)
+}
+
+pub fn EditorState::move_doc_start(self : EditorState, extend~ : Bool = false) -> Unit {
+  self.preferred_x = -1.0
+  self.move_to(0, extend, false)
+}
+
+pub fn EditorState::move_doc_end(self : EditorState, extend~ : Bool = false) -> Unit {
+  self.preferred_x = -1.0
+  self.move_to(self.text.length(), extend, false)
+}
+
+// ── Undo / Redo & Full Keyboard Dispatch ─────────────────────────────────────────────────────
+
+pub fn EditorState::can_undo(self : EditorState) -> Bool {
+  self.undo_stack.can_undo()
+}
+
+pub fn EditorState::can_redo(self : EditorState) -> Bool {
+  self.undo_stack.can_redo()
+}
+
+pub fn EditorState::undo(self : EditorState, now~ : Double = 0.0) -> Bool {
+  let _ = now
+  if self.marked.length() > 0 {
+    return false
+  }
+  match self.undo_stack.undo(self.text, self.anchor, self.caret) {
+    Some(snap) => {
+      self.text = snap.text
+      self.anchor = snap_to_grapheme(snap.text, iclamp(snap.anchor, 0, snap.text.length()))
+      self.caret = snap_to_grapheme(snap.text, iclamp(snap.caret, 0, snap.text.length()))
+      self.preferred_x = -1.0
+      self.upstream = -1
+      self.look_cache_valid = false
+      self.sync_signals()
+      true
+    }
+    None => false
+  }
+}
+
+pub fn EditorState::redo(self : EditorState, now~ : Double = 0.0) -> Bool {
+  let _ = now
+  if self.marked.length() > 0 {
+    return false
+  }
+  match self.undo_stack.redo(self.text, self.anchor, self.caret) {
+    Some(snap) => {
+      self.text = snap.text
+      self.anchor = snap_to_grapheme(snap.text, iclamp(snap.anchor, 0, snap.text.length()))
+      self.caret = snap_to_grapheme(snap.text, iclamp(snap.caret, 0, snap.text.length()))
+      self.preferred_x = -1.0
+      self.upstream = -1
+      self.look_cache_valid = false
+      self.sync_signals()
+      true
+    }
+    None => false
+  }
+}
+
+/// Dispatch a keyboard event on `platform` (0 macOS, 1 iOS, 2 Android, 3 Windows, 4 Web, 5 Linux).
+/// Returns `true` if the key event was handled.
+pub fn EditorState::handle_key(
+  self : EditorState,
+  code : Int,
+  mods : Int,
+  platform : Int,
+  now~ : Double = 0.0,
+) -> Bool {
+  // 1. Platform Undo / Redo shortcuts.
+  match undo_step_of(code, mods, platform) {
+    Some(UndoStep::Undo) => {
+      let _ = self.undo(now=now)
+      return true
+    }
+    Some(UndoStep::Redo) => {
+      let _ = self.redo(now=now)
+      return true
+    }
+    None => ()
+  }
+
+  let is_apple = platform == platform_macos || platform == platform_ios
+  let shift = (mods & mod_shift) != 0
+  let ctrl = (mods & mod_ctrl) != 0
+  let alt = (mods & mod_alt) != 0
+  let cmd_key = (mods & mod_cmd) != 0
+  let primary = if is_apple { cmd_key } else { ctrl }
+  let held_no_shift = mods & (mod_ctrl | mod_alt | mod_cmd)
+
+  // 2. Select all / Copy / Cut.
+  if code == key_select_all || (primary && !alt && !shift && code == key_of_char('a')) {
+    self.select_all()
+    return true
+  }
+  if code == key_copy || (primary && !alt && !shift && code == key_of_char('c')) {
+    let _ = self.copy()
+    return true
+  }
+  if code == key_cut || (primary && !alt && !shift && code == key_of_char('x')) {
+    let _ = self.cut(now=now)
+    return true
+  }
+
+  // 3. Enter / Shift+Enter / Cmd+Enter.
+  if code == key_enter {
+    if self.marked.length() > 0 {
+      let m = self.marked
+      self.compose_commit(m, now=now)
+      return true
+    }
+    let should_submit = !self.config.multiline ||
+    (self.config.enter_sends && !shift) ||
+    (self.config.command_sends && primary)
+    if should_submit {
+      self.submitted = Some(self.text)
+    } else {
+      self.insert_text("\n", now=now)
+    }
+    return true
+  }
+
+  // 4. Tab.
+  if code == key_tab && held_no_shift == 0 {
+    if self.config.tab_inserts {
+      self.insert_text("\t", now=now)
+      return true
+    }
+    return false
+  }
+
+  // 5. Backspace / Delete.
+  if code == key_backspace {
+    if is_apple {
+      if cmd_key {
+        self.backspace(line=true, now=now)
+      } else if alt {
+        self.backspace(word=true, now=now)
+      } else {
+        self.backspace(now=now)
+      }
+    } else {
+      if platform == platform_android && alt {
+        self.backspace(line=true, now=now)
+      } else if ctrl {
+        self.backspace(word=true, now=now)
+      } else {
+        self.backspace(now=now)
+      }
+    }
+    return true
+  }
+  if code == key_delete {
+    if is_apple {
+      self.delete_forward(word=alt, now=now)
+    } else {
+      self.delete_forward(word=ctrl, now=now)
+    }
+    return true
+  }
+
+  // 6. Arrow keys (with Shift, Alt, Ctrl, Cmd).
+  if code == key_left {
+    if is_apple {
+      if cmd_key {
+        self.move_line_start(extend=shift)
+      } else if alt {
+        self.move_left(extend=shift, word=true)
+      } else {
+        self.move_left(extend=shift)
+      }
+    } else if platform == platform_android && alt {
+      self.move_line_start(extend=shift)
+    } else if ctrl {
+      self.move_left(extend=shift, word=true)
+    } else {
+      self.move_left(extend=shift)
+    }
+    return true
+  }
+  if code == key_right {
+    if is_apple {
+      if cmd_key {
+        self.move_line_end(extend=shift)
+      } else if alt {
+        self.move_right(extend=shift, word=true)
+      } else {
+        self.move_right(extend=shift)
+      }
+    } else if platform == platform_android && alt {
+      self.move_line_end(extend=shift)
+    } else if ctrl {
+      let use_next_word = platform != platform_android
+      self.move_right(extend=shift, word=!use_next_word, next_word=use_next_word)
+    } else {
+      self.move_right(extend=shift)
+    }
+    return true
+  }
+  if code == key_up {
+    if is_apple && cmd_key {
+      self.move_doc_start(extend=shift)
+    } else if (is_apple && alt) || (!is_apple && ctrl) {
+      let prev = prev_grapheme_boundary(self.text, self.caret)
+      self.preferred_x = -1.0
+      self.move_to(paragraph_start(self.text, prev), shift, false)
+    } else {
+      self.move_up(extend=shift)
+    }
+    return true
+  }
+  if code == key_down {
+    if is_apple && cmd_key {
+      self.move_doc_end(extend=shift)
+    } else if (is_apple && alt) || (!is_apple && ctrl) {
+      let next = next_grapheme_boundary(self.text, self.caret)
+      self.preferred_x = -1.0
+      self.move_to(paragraph_end(self.text, next), shift, false)
+    } else {
+      self.move_down(extend=shift)
+    }
+    return true
+  }
+
+  // 7. Home / End.
+  if code == key_home {
+    if is_apple || ctrl {
+      self.move_doc_start(extend=shift)
+    } else {
+      self.move_line_start(extend=shift)
+    }
+    return true
+  }
+  if code == key_end {
+    if is_apple || ctrl {
+      self.move_doc_end(extend=shift)
+    } else {
+      self.move_line_end(extend=shift)
+    }
+    return true
+  }
+
+  // 8. Semantic edit keys (Cocoa NSResponder / cross-platform key codes 20..35).
+  if code == key_word_back {
+    self.move_left(extend=shift, word=true)
+    return true
+  }
+  if code == key_word_on {
+    self.move_right(extend=shift, word=true)
+    return true
+  }
+  if code == key_line_start {
+    self.move_line_start(extend=shift)
+    return true
+  }
+  if code == key_line_end {
+    self.move_line_end(extend=shift)
+    return true
+  }
+  if code == key_paragraph_start {
+    self.preferred_x = -1.0
+    self.move_to(paragraph_start(self.text, self.caret), shift, false)
+    return true
+  }
+  if code == key_paragraph_end {
+    self.preferred_x = -1.0
+    self.move_to(paragraph_end(self.text, self.caret), shift, false)
+    return true
+  }
+  if code == key_text_start {
+    self.move_doc_start(extend=shift)
+    return true
+  }
+  if code == key_text_end {
+    self.move_doc_end(extend=shift)
+    return true
+  }
+  if code == key_delete_word_back {
+    self.backspace(word=true, now=now)
+    return true
+  }
+  if code == key_delete_word_on {
+    self.delete_forward(word=true, now=now)
+    return true
+  }
+  if code == key_delete_line_back {
+    self.backspace(line=true, now=now)
+    return true
+  }
+  if code == key_delete_line_on {
+    self.delete_forward(line=true, now=now)
+    return true
+  }
+  false
+}

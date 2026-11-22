@@ -1,0 +1,255 @@
+// Touch selection teardrop/lollipop handles, hit testing, drag with crossover identity flip, and long-press word selection.
+
+import "dmath"
+import "paint"
+
+/// Which endpoint of a selection a handle controls.
+pub enum HandleKind {
+  Start
+  End
+}
+
+pub fn handle_kind_eq(a : HandleKind, b : HandleKind) -> Bool {
+  match (a, b) {
+    (HandleKind::Start, HandleKind::Start) => true
+    (HandleKind::End, HandleKind::End) => true
+    _ => false
+  }
+}
+
+/// Visual handle geometry style (Android hanging teardrop vs iOS top/bottom lollipop).
+pub enum HandleStyle {
+  Android
+  IOS
+}
+
+/// Default teardrop radius (points).
+pub let handle_default_radius : Double = 10.0
+
+/// Half-width of the generous touch hit box around a handle.
+pub let handle_hit_half_w : Double = 18.0
+
+/// Extra vertical hit-target room past the text line for the handle knob/teardrop.
+pub let handle_knob_room : Double = 28.0
+
+/// Positioned selection handle geometry and touch hit target.
+pub struct SelectionHandle {
+  pub kind : HandleKind
+  pub style : HandleStyle
+  pub tip_x : Double
+  pub tip_y : Double
+  pub line_top : Double
+  pub line_height : Double
+  pub knob_cx : Double
+  pub knob_cy : Double
+  pub radius : Double
+  pub hit_rect : paint::Rect
+}
+
+fn make_handle(
+  kind : HandleKind,
+  style : HandleStyle,
+  x : Double,
+  line_top : Double,
+  line_h : Double,
+  radius : Double,
+) -> SelectionHandle {
+  let (tip_y, knob_cx, knob_cy, hit_x, hit_y) = match style {
+    HandleStyle::Android => {
+      let ty = line_top + line_h
+      let cx = match kind {
+        HandleKind::Start => x - radius
+        HandleKind::End => x + radius
+      }
+      let cy = ty + radius
+      (ty, cx, cy, cx - handle_hit_half_w, line_top)
+    }
+    HandleStyle::IOS => {
+      let (ty, cy, hy) = match kind {
+        HandleKind::Start => (line_top, line_top - radius, line_top - handle_knob_room)
+        HandleKind::End => (line_top + line_h, line_top + line_h + radius, line_top)
+      }
+      (ty, x, cy, x - handle_hit_half_w, hy)
+    }
+  }
+  let hit_rect = paint::rect(hit_x, hit_y, handle_hit_half_w * 2.0, line_h + handle_knob_room, color=0L)
+  SelectionHandle::{
+    kind,
+    style,
+    tip_x: x,
+    tip_y,
+    line_top,
+    line_height: line_h,
+    knob_cx,
+    knob_cy,
+    radius,
+    hit_rect,
+  }
+}
+
+/// Build the Start and End selection handles for `ed`, or `None` if there is no active selection.
+pub fn selection_handles_of(
+  ed : EditorState,
+  style~ : HandleStyle = HandleStyle::Android,
+  radius~ : Double = handle_default_radius,
+) -> Option[(SelectionHandle, SelectionHandle)] {
+  if !ed.has_selection() {
+    return None
+  }
+  let (lo, hi) = ed.selection_range()
+  let start_pos = ed.caret_pos(lo)
+  let end_pos = ed.caret_pos(hi)
+  let start_h = make_handle(HandleKind::Start, style, start_pos.x, start_pos.y, start_pos.height, radius)
+  let end_h = make_handle(HandleKind::End, style, end_pos.x, end_pos.y, end_pos.height, radius)
+  Some((start_h, end_h))
+}
+
+/// Whether point `(x, y)` hits this selection handle (rectangular touch room or circular reach around knob).
+pub fn SelectionHandle::hit_test(self : SelectionHandle, x : Double, y : Double) -> Bool {
+  let r = self.hit_rect
+  if x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h {
+    return true
+  }
+  let dx = x - self.knob_cx
+  let dy = y - self.knob_cy
+  dmath::sqrt(dx * dx + dy * dy) <= self.radius + 8.0
+}
+
+/// Hit-test a pair of `(start, end)` handles; checks `End` first when overlapping.
+pub fn hit_test_handles(
+  start : SelectionHandle,
+  end_h : SelectionHandle,
+  x : Double,
+  y : Double,
+) -> Option[HandleKind] {
+  if end_h.hit_test(x, y) {
+    Some(HandleKind::End)
+  } else if start.hit_test(x, y) {
+    Some(HandleKind::Start)
+  } else {
+    None
+  }
+}
+
+/// Stateful touch handle drag session supporting smooth crossover identity flipping.
+pub struct SelectionHandleDrag {
+  pub mut active : Option[HandleKind]
+  pub mut grab_dx : Double
+  pub mut grab_dy : Double
+}
+
+pub fn SelectionHandleDrag::new() -> SelectionHandleDrag {
+  SelectionHandleDrag::{ active: None, grab_dx: 0.0, grab_dy: 0.0 }
+}
+
+pub fn SelectionHandleDrag::is_active(self : SelectionHandleDrag) -> Bool {
+  match self.active {
+    Some(_) => true
+    None => false
+  }
+}
+
+/// Attempt to begin dragging a selection handle at `(x, y)`.
+/// Returns the grabbed `HandleKind` if hit, `None` otherwise.
+pub fn SelectionHandleDrag::begin(
+  self : SelectionHandleDrag,
+  ed : EditorState,
+  x : Double,
+  y : Double,
+  style~ : HandleStyle = HandleStyle::Android,
+  radius~ : Double = handle_default_radius,
+) -> Option[HandleKind] {
+  match selection_handles_of(ed, style=style, radius=radius) {
+    None => {
+      self.active = None
+      None
+    }
+    Some((start_h, end_h)) =>
+    match hit_test_handles(start_h, end_h, x, y) {
+      None => {
+        self.active = None
+        None
+      }
+      Some(kind) => {
+        let h = match kind {
+          HandleKind::Start => start_h
+          HandleKind::End => end_h
+        }
+        self.active = Some(kind)
+        self.grab_dx = h.tip_x - x
+        self.grab_dy = (h.line_top + h.line_height * 0.5) - y
+        Some(kind)
+      }
+    }
+  }
+}
+
+/// Update selection during an active handle drag.
+/// When the dragged handle crosses past the opposite endpoint, smoothly flips handle identity
+/// (`Start` <-> `End`) while keeping the opposite endpoint anchored.
+pub fn SelectionHandleDrag::update(
+  self : SelectionHandleDrag,
+  ed : EditorState,
+  x : Double,
+  y : Double,
+) -> Option[HandleKind] {
+  match self.active {
+    None => None
+    Some(kind) => {
+      let target_x = x + self.grab_dx
+      let target_y = y + self.grab_dy
+      let new_off = ed.hit_test(target_x, target_y)
+      let (lo, hi) = ed.selection_range()
+      match kind {
+        HandleKind::Start => {
+          // Fixed opposite endpoint is `hi`.
+          if new_off < hi {
+            ed.set_selection(hi, new_off)
+            Some(HandleKind::Start)
+          } else if new_off > hi {
+            // Crossed past `hi`: flip identity to End!
+            ed.set_selection(hi, new_off)
+            self.active = Some(HandleKind::End)
+            Some(HandleKind::End)
+          } else {
+            // Exactly at `hi`: keep 1 grapheme on the Start side if possible so selection stays non-empty.
+            let prev = prev_grapheme_boundary(ed.text, hi)
+            ed.set_selection(hi, prev)
+            Some(HandleKind::Start)
+          }
+        }
+        HandleKind::End => {
+          // Fixed opposite endpoint is `lo`.
+          if new_off > lo {
+            ed.set_selection(lo, new_off)
+            Some(HandleKind::End)
+          } else if new_off < lo {
+            // Crossed past `lo`: flip identity to Start!
+            ed.set_selection(lo, new_off)
+            self.active = Some(HandleKind::Start)
+            Some(HandleKind::Start)
+          } else {
+            // Exactly at `lo`: keep 1 grapheme on the End side if possible.
+            let next = next_grapheme_boundary(ed.text, lo)
+            ed.set_selection(lo, next)
+            Some(HandleKind::End)
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Finish the active handle drag session.
+pub fn SelectionHandleDrag::end_drag(self : SelectionHandleDrag) -> Unit {
+  self.active = None
+  self.grab_dx = 0.0
+  self.grab_dy = 0.0
+}
+
+/// Long-press at `(x, y)` to select the word under the finger. Returns `true` if a non-empty word was selected.
+pub fn long_press_select_word(ed : EditorState, x : Double, y : Double) -> Bool {
+  let off = ed.hit_test(x, y)
+  let (lo, hi) = ed.select_word_at(off)
+  hi > lo
+}

@@ -1,0 +1,501 @@
+// Production undo/redo coalescing stack, platform shortcut mapping, and UTF-8 / word-boundary helpers.
+
+import "text"
+
+// Platform constants (matching hostapi::keys_platform).
+pub let platform_macos : Int = 0
+pub let platform_ios : Int = 1
+pub let platform_android : Int = 2
+pub let platform_windows : Int = 3
+pub let platform_web : Int = 4
+pub let platform_linux : Int = 5
+
+// Key code constants (matching ui::keys).
+pub let key_backspace : Int = 1
+pub let key_delete : Int = 2
+pub let key_left : Int = 3
+pub let key_right : Int = 4
+pub let key_up : Int = 5
+pub let key_down : Int = 6
+pub let key_enter : Int = 7
+pub let key_home : Int = 8
+pub let key_end : Int = 9
+pub let key_select_all : Int = 12
+pub let key_copy : Int = 13
+pub let key_cut : Int = 14
+pub let key_page_up : Int = 15
+pub let key_page_down : Int = 16
+pub let key_escape : Int = 17
+pub let key_tab : Int = 18
+
+pub let key_word_back : Int = 20
+pub let key_word_on : Int = 21
+pub let key_line_start : Int = 22
+pub let key_line_end : Int = 23
+pub let key_paragraph_start : Int = 24
+pub let key_paragraph_end : Int = 25
+pub let key_text_start : Int = 26
+pub let key_text_end : Int = 27
+pub let key_paragraph_back : Int = 28
+pub let key_paragraph_on : Int = 29
+pub let key_delete_word_back : Int = 30
+pub let key_delete_word_on : Int = 31
+pub let key_delete_line_back : Int = 32
+pub let key_delete_line_on : Int = 33
+pub let key_delete_paragraph_back : Int = 34
+pub let key_delete_paragraph_on : Int = 35
+
+// Modifier bitmasks (matching ui::keys).
+pub let mod_shift : Int = 1
+pub let mod_ctrl : Int = 2
+pub let mod_alt : Int = 4
+pub let mod_cmd : Int = 8
+
+/// Map an ASCII/Unicode character to its editor key code (1000 + lowercase code point).
+pub fn key_of_char(ch : Char) -> Int {
+  let n = ch.to_int()
+  let lower = if n >= 65 && n <= 90 { n + 32 } else { n }
+  1000 + lower
+}
+
+/// Direction through the edit history.
+pub enum UndoStep {
+  Undo
+  Redo
+}
+
+/// Kind of contiguous typing run for coalescing.
+pub enum TypingKind {
+  Inserting
+  Deleting
+  Composing
+}
+
+pub fn typing_kind_eq(a : TypingKind, b : TypingKind) -> Bool {
+  match (a, b) {
+    (TypingKind::Inserting, TypingKind::Inserting) => true
+    (TypingKind::Deleting, TypingKind::Deleting) => true
+    (TypingKind::Composing, TypingKind::Composing) => true
+    _ => false
+  }
+}
+
+pub fn undo_step_eq(a : UndoStep, b : UndoStep) -> Bool {
+  match (a, b) {
+    (UndoStep::Undo, UndoStep::Undo) => true
+    (UndoStep::Redo, UndoStep::Redo) => true
+    _ => false
+  }
+}
+
+/// Snapshot of text and selection stored in the undo/redo stack.
+pub struct UndoSnapshot {
+  pub text : String
+  pub anchor : Int
+  pub caret : Int
+}
+
+struct TypingRun {
+  text : String
+  anchor : Int
+  caret : Int
+  kind : TypingKind
+  at : Double
+  size : Int
+  between : Bool
+}
+
+/// Maximum number of undo steps retained (Blink kMaximumUndoStackDepth).
+pub let undo_depth : Int = 1000
+
+/// Pause threshold (ms) after which consecutive typing starts a new undo step.
+pub let typing_pause_ms : Double = 1000.0
+
+/// Maximum coalesced unit count per typing burst (one atomic input is never split).
+pub let typing_run_size : Int = 32
+
+fn imin(a : Int, b : Int) -> Int {
+  if a < b { a } else { b }
+}
+
+fn imax(a : Int, b : Int) -> Int {
+  if a > b { a } else { b }
+}
+
+fn iclamp(v : Int, lo : Int, hi : Int) -> Int {
+  if v < lo { lo } else if v > hi { hi } else { v }
+}
+
+fn array_shift_left[T](arr : Array[T]) -> Unit {
+  let n = arr.length()
+  if n == 0 {
+    return
+  }
+  let mut i = 0
+  while i + 1 < n {
+    arr[i] = arr[i + 1]
+    i += 1
+  }
+  let _ = arr.pop()
+}
+
+/// Decode the Unicode scalar value starting at UTF-8 byte offset `i`.
+pub fn utf8_code_point_at(s : String, i : Int) -> Int {
+  let n = s.length()
+  if i < 0 || i >= n {
+    return 0
+  }
+  let b0 = s.code_unit_at(i)
+  if b0 < 0x80 {
+    return b0
+  }
+  if b0 >= 0xC2 && b0 < 0xE0 && i + 1 < n {
+    let b1 = s.code_unit_at(i + 1)
+    if (b1 & 0xC0) == 0x80 {
+      return ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+    }
+  } else if b0 >= 0xE0 && b0 < 0xF0 && i + 2 < n {
+    let b1 = s.code_unit_at(i + 1)
+    let b2 = s.code_unit_at(i + 2)
+    if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 {
+      return ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F)
+    }
+  } else if b0 >= 0xF0 && b0 < 0xF5 && i + 3 < n {
+    let b1 = s.code_unit_at(i + 1)
+    let b2 = s.code_unit_at(i + 2)
+    let b3 = s.code_unit_at(i + 3)
+    if (b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80 {
+      return ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F)
+    }
+  }
+  0xFFFD
+}
+
+/// Byte length of the UTF-8 code point starting at byte offset `i`.
+pub fn utf8_cp_len_at(s : String, i : Int) -> Int {
+  let n = s.length()
+  if i < 0 || i >= n {
+    return 0
+  }
+  let b0 = s.code_unit_at(i)
+  if b0 < 0x80 {
+    1
+  } else if b0 >= 0xC2 && b0 < 0xE0 && i + 1 < n {
+    2
+  } else if b0 >= 0xE0 && b0 < 0xF0 && i + 2 < n {
+    3
+  } else if b0 >= 0xF0 && b0 < 0xF5 && i + 3 < n {
+    4
+  } else {
+    1
+  }
+}
+
+/// Byte offset of the start of the UTF-8 code point ending at byte offset `i`.
+pub fn utf8_cp_before(s : String, i : Int) -> Int {
+  let n = s.length()
+  let clamped = iclamp(i, 0, n)
+  if clamped <= 0 {
+    return 0
+  }
+  let mut p = clamped - 1
+  while p > 0 && (s.code_unit_at(p) & 0xC0) == 0x80 {
+    p -= 1
+  }
+  p
+}
+
+/// Count Unicode code points in UTF-8 byte range `[start, end)`.
+pub fn utf8_cp_count_range(s : String, start : Int, end : Int) -> Int {
+  let n = s.length()
+  let lo = iclamp(start, 0, n)
+  let hi = iclamp(end, lo, n)
+  let mut i = lo
+  let mut count = 0
+  while i < hi {
+    let step = utf8_cp_len_at(s, i)
+    if step <= 0 {
+      break
+    }
+    i += step
+    count += 1
+  }
+  count
+}
+
+/// Slice a UTF-8 string by byte range `[start, end)`.
+pub fn str_slice(s : String, start : Int, end : Int) -> String {
+  let n = s.length()
+  let lo = iclamp(start, 0, n)
+  let hi = iclamp(end, lo, n)
+  if hi <= lo {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  let mut i = lo
+  while i < hi {
+    sb.write_byte(s.code_unit_at(i) as Byte)
+    i += 1
+  }
+  sb.to_string()
+}
+
+/// Snap a UTF-8 byte offset down to a valid grapheme cluster boundary.
+pub fn snap_to_grapheme(s : String, off : Int) -> Int {
+  let n = s.length()
+  if off <= 0 {
+    return 0
+  }
+  if off >= n {
+    return n
+  }
+  let mut p = off
+  while p > 0 && (s.code_unit_at(p) & 0xC0) == 0x80 {
+    p -= 1
+  }
+  let prev = text::prev_grapheme(s, p)
+  let next = text::next_grapheme(s, prev)
+  if next == p {
+    p
+  } else {
+    prev
+  }
+}
+
+/// Grapheme cluster boundary strictly before `off` (UAX #29).
+pub fn prev_grapheme_boundary(s : String, off : Int) -> Int {
+  text::prev_grapheme(s, iclamp(off, 0, s.length()))
+}
+
+/// Grapheme cluster boundary strictly after `off` (UAX #29), safe even if `off` lies inside a cluster.
+pub fn next_grapheme_boundary(s : String, off : Int) -> Int {
+  let n = s.length()
+  if off >= n {
+    return n
+  }
+  if off <= 0 {
+    return text::next_grapheme(s, 0)
+  }
+  let aligned = snap_to_grapheme(s, off)
+  text::next_grapheme(s, aligned)
+}
+
+/// Whether Unicode scalar value `c` lies between words (whitespace, newline, punctuation, symbols).
+pub fn between_words_cp(c : Int) -> Bool {
+  if c < 0x80 {
+    !((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || c == 0x5F)
+  } else {
+    (c >= 0x80 && c <= 0xBF) ||
+    c == 0xD7 ||
+    c == 0xF7 ||
+    (c >= 0x2000 && c <= 0x206F) ||
+    (c >= 0x3000 && c <= 0x303F) ||
+    (c >= 0xFE30 && c <= 0xFE6F) ||
+    (c >= 0xFF00 && c <= 0xFF0F) ||
+    (c >= 0xFF1A && c <= 0xFF20) ||
+    (c >= 0xFF3B && c <= 0xFF40) ||
+    (c >= 0xFF5B && c <= 0xFF65)
+  }
+}
+
+/// Whether the code point at UTF-8 byte offset `i` lies between words.
+pub fn between_words_at(s : String, i : Int) -> Bool {
+  let n = s.length()
+  if i < 0 || i >= n {
+    return true
+  }
+  let mut p = i
+  while p > 0 && (s.code_unit_at(p) & 0xC0) == 0x80 {
+    p -= 1
+  }
+  between_words_cp(utf8_code_point_at(s, p))
+}
+
+/// Compute the minimal UTF-8 byte diff `(start, was_end, now_end)` transforming `was` into `now`,
+/// snapped to valid code point boundaries.
+pub fn words_changed(was : String, now : String) -> (Int, Int, Int) {
+  let wn = was.length()
+  let nn = now.length()
+  let most = imin(wn, nn)
+  let mut start = 0
+  while start < most && was.code_unit_at(start) == now.code_unit_at(start) {
+    start += 1
+  }
+  while start > 0 && start < wn && (was.code_unit_at(start) & 0xC0) == 0x80 {
+    start -= 1
+  }
+  let mut end = 0
+  while end < most - start && was.code_unit_at(wn - 1 - end) == now.code_unit_at(nn - 1 - end) {
+    end += 1
+  }
+  let mut was_end = wn - end
+  let mut now_end = nn - end
+  while was_end < wn && (was.code_unit_at(was_end) & 0xC0) == 0x80 {
+    was_end += 1
+    now_end += 1
+  }
+  (start, was_end, now_end)
+}
+
+/// Resolve platform undo/redo shortcut for key `code` with `mods` on `platform`:
+/// - macOS (0) / iOS (1): Cmd+Z -> Undo, Cmd+Shift+Z -> Redo
+/// - Windows (3) / Linux (5) / Android (2) / Web (4): Ctrl+Z -> Undo, Ctrl+Shift+Z or Ctrl+Y -> Redo
+pub fn undo_step_of(code : Int, mods : Int, platform : Int) -> Option[UndoStep] {
+  let cmd = match platform {
+    0 | 1 => mod_cmd
+    _ => mod_ctrl
+  }
+  let held = mods & (mod_shift | mod_ctrl | mod_alt | mod_cmd)
+  if code == key_of_char('z') && held == cmd {
+    Some(UndoStep::Undo)
+  } else if code == key_of_char('z') && held == (cmd | mod_shift) {
+    Some(UndoStep::Redo)
+  } else if code == key_of_char('y') && held == mod_ctrl && cmd == mod_ctrl {
+    Some(UndoStep::Redo)
+  } else {
+    None
+  }
+}
+
+/// Blink-style bounded undo/redo stack with typing burst coalescing.
+pub struct UndoStack {
+  undos : Array[UndoSnapshot]
+  redos : Array[UndoSnapshot]
+  mut typed : Option[TypingRun]
+  pub mut max_depth : Int
+}
+
+pub fn UndoStack::new(max_depth~ : Int = undo_depth) -> UndoStack {
+  UndoStack::{ undos: [], redos: [], typed: None, max_depth: imax(1, max_depth) }
+}
+
+pub fn UndoStack::can_undo(self : UndoStack) -> Bool {
+  self.undos.length() > 0
+}
+
+pub fn UndoStack::can_redo(self : UndoStack) -> Bool {
+  self.redos.length() > 0
+}
+
+pub fn UndoStack::undo_len(self : UndoStack) -> Int {
+  self.undos.length()
+}
+
+pub fn UndoStack::redo_len(self : UndoStack) -> Int {
+  self.redos.length()
+}
+
+/// Break the active typing burst so the next edit starts a new undo step.
+pub fn UndoStack::break_run(self : UndoStack) -> Unit {
+  self.typed = None
+}
+
+/// Clear all undo and redo history (called on programmatic `set()`).
+pub fn UndoStack::clear(self : UndoStack) -> Unit {
+  self.undos.clear()
+  self.redos.clear()
+  self.typed = None
+}
+
+/// Record a user edit from `(before_text, before_anchor, before_caret)` to
+/// `(after_text, after_anchor, after_caret)` at timestamp `now` (ms).
+/// When `typing` is `true`, consecutive edits of the same `TypingKind` within `typing_pause_ms`,
+/// within `typing_run_size` units, and not crossing from whitespace/punctuation into a new word
+/// are coalesced into a single undo step.
+pub fn UndoStack::record(
+  self : UndoStack,
+  before_text : String,
+  before_anchor : Int,
+  before_caret : Int,
+  after_text : String,
+  after_anchor : Int,
+  after_caret : Int,
+  typing~ : Bool,
+  now~ : Double,
+  composing~ : Bool = false,
+) -> Unit {
+  if after_text == before_text {
+    return
+  }
+  let (start, was_end, now_end) = words_changed(before_text, after_text)
+  let kind = if composing {
+    TypingKind::Composing
+  } else if was_end > start && now_end == start {
+    TypingKind::Deleting
+  } else {
+    TypingKind::Inserting
+  }
+  let (changed, changed_end) = if typing_kind_eq(kind, TypingKind::Deleting) {
+    (before_text, was_end)
+  } else {
+    (after_text, now_end)
+  }
+  let size = utf8_cp_count_range(changed, start, changed_end)
+  let begins_between = changed_end > start && between_words_at(changed, start)
+  let ends_between = changed_end > start && between_words_at(changed, utf8_cp_before(changed, changed_end))
+  let mut prior_size = 0
+  let goes_on = match self.typed {
+    Some(last) =>
+    if typing &&
+    last.text == before_text &&
+    last.anchor == before_anchor &&
+    last.caret == before_caret &&
+    typing_kind_eq(last.kind, kind) {
+      prior_size = last.size
+      typing_kind_eq(kind, TypingKind::Composing) ||
+      (now >= last.at &&
+        now - last.at <= typing_pause_ms &&
+        last.size + size <= typing_run_size &&
+        !(last.between && !begins_between))
+    } else {
+      false
+    }
+    None => false
+  }
+  if !goes_on {
+    self.undos.push(UndoSnapshot::{ text: before_text, anchor: before_anchor, caret: before_caret })
+    while self.undos.length() > self.max_depth {
+      array_shift_left(self.undos)
+    }
+  }
+  self.redos.clear()
+  self.typed = if typing {
+    Some(
+      TypingRun::{
+        text: after_text,
+        anchor: after_anchor,
+        caret: after_caret,
+        kind,
+        at: now,
+        size: if goes_on { prior_size + size } else { size },
+        between: ends_between,
+      },
+    )
+  } else {
+    None
+  }
+}
+
+/// Pop the latest undo snapshot, pushing the current state onto the redo stack.
+pub fn UndoStack::undo(self : UndoStack, cur_text : String, cur_anchor : Int, cur_caret : Int) -> Option[UndoSnapshot] {
+  match self.undos.pop() {
+    Some(snap) => {
+      self.redos.push(UndoSnapshot::{ text: cur_text, anchor: cur_anchor, caret: cur_caret })
+      self.typed = None
+      Some(snap)
+    }
+    None => None
+  }
+}
+
+/// Pop the latest redo snapshot, pushing the current state onto the undo stack.
+pub fn UndoStack::redo(self : UndoStack, cur_text : String, cur_anchor : Int, cur_caret : Int) -> Option[UndoSnapshot] {
+  match self.redos.pop() {
+    Some(snap) => {
+      self.undos.push(UndoSnapshot::{ text: cur_text, anchor: cur_anchor, caret: cur_caret })
+      self.typed = None
+      Some(snap)
+    }
+    None => None
+  }
+}

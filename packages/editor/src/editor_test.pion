@@ -1,0 +1,427 @@
+// Comprehensive unit tests for packages/editor:
+// UTF-8/grapheme safety (CJK + Emoji ZWJ + combining), soft-wrapping + preferred_x vertical movement,
+// word/line selection & selection_rects, UndoStack coalescing (1000ms pause, 32-unit bound,
+// Inserting/Deleting switch, word boundary, programmatic set() clear, platform shortcuts),
+// IME marked composition + look span offset shifting, paste_limit interception,
+// touch selection handle drag + crossover identity flip, and loupe edge clamping.
+
+// Deterministic monospace-like measure function:
+// ASCII = 10px, CJK / multi-byte = 20px per grapheme cluster.
+fn test_measure(s : String) -> Double {
+  let n = s.length()
+  let mut i = 0
+  let mut w = 0.0
+  while i < n {
+    let next = next_grapheme_boundary(s, i)
+    let b0 = s.code_unit_at(i)
+    if b0 < 0x80 {
+      w += 10.0
+    } else {
+      w += 20.0
+    }
+    i = next
+  }
+  w
+}
+
+test "UTF-8 and grapheme cursor movement and deletion never split CJK or Emoji" {
+  // "Hi你好" + family ZWJ emoji (woman+ZWJ+woman+ZWJ+girl = 18 bytes) + "!"
+  let family = "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7"
+  let initial = "Hi你好" + family + "!"
+  let ed = EditorState::new(text=initial)
+  // Lengths: "Hi" (2), "你" (3), "好" (3), family (18), "!" (1) => total 27 bytes
+  debug_assert(ed.caret == 27, "initial caret at end")
+
+  // Move left across '!' -> 26, across family ZWJ -> 8, across '好' -> 5, across '你' -> 2
+  ed.move_left()
+  debug_assert(ed.caret == 26, "left across !")
+  ed.move_left()
+  debug_assert(ed.caret == 8, "left across ZWJ family as 1 grapheme")
+  ed.move_left()
+  debug_assert(ed.caret == 5, "left across 好")
+  ed.move_left()
+  debug_assert(ed.caret == 2, "left across 你")
+
+  // Move right across '你' -> 5, '好' -> 8, family -> 26
+  ed.move_right()
+  debug_assert(ed.caret == 5, "right across 你")
+  ed.move_right()
+  debug_assert(ed.caret == 8, "right across 好")
+  ed.move_right()
+  debug_assert(ed.caret == 26, "right across ZWJ family")
+
+  // Backspace deletes entire ZWJ family cluster cleanly without splitting bytes
+  ed.backspace(now=100.0)
+  debug_assert(ed.text == "Hi你好!", "backspace deleted entire ZWJ emoji")
+  debug_assert(ed.caret == 8, "caret at byte 8 after emoji deletion")
+
+  // Delete forward removes '!' cleanly
+  ed.delete_forward(now=200.0)
+  debug_assert(ed.text == "Hi你好", "delete_forward removed !")
+
+  // Backspace removes '好' (3 bytes) cleanly
+  ed.backspace(now=300.0)
+  debug_assert(ed.text == "Hi你", "backspace removed CJK char")
+  debug_assert(ed.caret == 5, "caret aligned after CJK delete")
+
+  // Snapping an interior byte offset aligns to grapheme boundary
+  ed.set_selection(3, 4)
+  debug_assert(ed.anchor == 2 && ed.caret == 2, "interior UTF-8 offsets snap to grapheme start")
+}
+
+test "multi-line soft wrap and Up/Down preferred_x preservation" {
+  let ed = EditorState::new(text="Hello world\nHi\nLonger third line")
+  // max_w = 80px:
+  // "Hello " (60px) fits, "Hello world" (110px) exceeds -> wraps into "Hello " and "world"
+  // "Hi" (20px) on line 2
+  // "Longer " (70px), "third " (60px), "line" (40px)
+  let lines = ed.layout_lines(80.0, test_measure, 20.0)
+  debug_assert(lines.length() == 6, "expected 6 visual lines with 80px wrap")
+  debug_assert(lines[0].byte_start == 0 && lines[0].byte_end == 6 && !lines[0].hard_break, "line 0 soft wrap")
+  debug_assert(lines[1].byte_start == 6 && lines[1].byte_end == 11 && lines[1].hard_break, "line 1 hard break")
+  debug_assert(lines[2].byte_start == 12 && lines[2].byte_end == 14 && lines[2].hard_break, "line 2 Hi")
+
+  // Place caret at "Hello " col 5 (x=50, byte 5)
+  ed.set_selection(5, 5)
+  let (cx0, cy0) = ed.caret_xy(ed.caret)
+  debug_assert(cx0 == 50.0 && cy0 == 0.0, "caret on line 0 at x=50")
+
+  // Move down to "world" (width 50px -> col 5, byte 11)
+  ed.move_down()
+  debug_assert(ed.caret == 11, "down to line 1 end")
+  debug_assert(ed.preferred_x == 50.0, "preferred_x preserved as 50.0")
+
+  // Move down to short line "Hi" (width 20px -> clamped to byte 14), preferred_x stays 50.0!
+  ed.move_down()
+  debug_assert(ed.caret == 14, "down to short line Hi")
+  debug_assert(ed.preferred_x == 50.0, "preferred_x still 50.0 on short line")
+
+  // Move down to "Longer " (width 70px -> jumps back to x=50, byte 15+5=20!)
+  ed.move_down()
+  let (cx3, cy3) = ed.caret_xy(ed.caret)
+  debug_assert(cx3 == 50.0 && cy3 == 60.0, "down from short line restores preferred_x=50")
+
+  // Move up back through "Hi" -> "world" -> "Hello " still keeping preferred_x=50
+  ed.move_up()
+  debug_assert(ed.caret == 14, "up to Hi")
+  ed.move_up()
+  debug_assert(ed.caret == 11, "up to world end")
+}
+
+test "word and line selection and multi-line selection_rects" {
+  let ed = EditorState::new(text="alpha beta\ngamma delta")
+  let _ = ed.layout_lines(200.0, test_measure, 24.0)
+
+  let (w0, w1) = ed.select_word_at(7)
+  debug_assert(w0 == 6 && w1 == 10 && ed.selected_text() == "beta", "select_word_at beta")
+
+  let (l0, l1) = ed.select_line_at(14)
+  debug_assert(l0 == 11 && l1 == 22 && ed.selected_text() == "gamma delta", "select_line_at second line")
+
+  // Cross-line selection from byte 6 ("beta") to byte 16 ("gamma")
+  ed.set_selection(6, 16)
+  let rects = ed.selection_rects()
+  debug_assert(rects.length() == 2, "cross-line selection yields 2 rects")
+  debug_assert(rects[0].x == 60.0 && rects[0].w == 40.0 && rects[0].y == 0.0 && rects[0].h == 24.0, "line 0 rect")
+  debug_assert(rects[1].x == 0.0 && rects[1].w == 50.0 && rects[1].y == 24.0 && rects[1].h == 24.0, "line 1 rect")
+}
+
+test "UndoStack coalescing: 1000ms pause, 32-unit bound, insert/delete switch, set() clear, platform shortcuts" {
+  // 1. Platform shortcut resolution
+  match undo_step_of(key_of_char('z'), mod_cmd, platform_macos) {
+    Some(UndoStep::Undo) => ()
+    _ => debug_assert(false, "macOS Cmd+Z -> Undo")
+  }
+  match undo_step_of(key_of_char('z'), mod_cmd | mod_shift, platform_macos) {
+    Some(UndoStep::Redo) => ()
+    _ => debug_assert(false, "macOS Cmd+Shift+Z -> Redo")
+  }
+  match undo_step_of(key_of_char('y'), mod_ctrl, platform_macos) {
+    None => ()
+    _ => debug_assert(false, "macOS Ctrl+Y is not Redo")
+  }
+  match undo_step_of(key_of_char('z'), mod_ctrl, platform_windows) {
+    Some(UndoStep::Undo) => ()
+    _ => debug_assert(false, "Windows Ctrl+Z -> Undo")
+  }
+  match undo_step_of(key_of_char('y'), mod_ctrl, platform_windows) {
+    Some(UndoStep::Redo) => ()
+    _ => debug_assert(false, "Windows Ctrl+Y -> Redo")
+  }
+  match undo_step_of(key_of_char('z'), mod_ctrl | mod_shift, platform_linux) {
+    Some(UndoStep::Redo) => ()
+    _ => debug_assert(false, "Linux Ctrl+Shift+Z -> Redo")
+  }
+
+  // 2. Same-word typing within 1000ms coalesces into 1 undo step
+  let ed = EditorState::new()
+  ed.insert_text("h", now=100.0)
+  ed.insert_text("e", now=200.0)
+  ed.insert_text("l", now=300.0)
+  ed.insert_text("l", now=400.0)
+  ed.insert_text("o", now=500.0)
+  debug_assert(ed.undo_stack.undo_len() == 1, "fast typing 'hello' coalesces into 1 step")
+
+  // 3. Pause > 1000ms starts a new undo step
+  ed.insert_text("x", now=2000.0)
+  debug_assert(ed.undo_stack.undo_len() == 2, "pause > 1000ms splits undo step")
+
+  // 4. Switching from Inserting to Deleting starts a new undo step
+  ed.backspace(now=2100.0)
+  debug_assert(ed.undo_stack.undo_len() == 3, "insert -> delete switch splits undo step")
+  ed.backspace(now=2200.0)
+  debug_assert(ed.undo_stack.undo_len() == 3, "consecutive deletes coalesce")
+
+  // 5. Undo & Redo via keyboard shortcuts
+  debug_assert(ed.handle_key(key_of_char('z'), mod_cmd, platform_macos, now=2300.0), "Cmd+Z handled")
+  debug_assert(ed.text == "hellox", "undo restored deleted chars")
+  debug_assert(ed.handle_key(key_of_char('z'), mod_cmd | mod_shift, platform_macos, now=2400.0), "Cmd+Shift+Z handled")
+  debug_assert(ed.text == "hell", "redo re-applied deletes")
+
+  // 6. 32-unit length boundary splits long typing burst
+  let ed2 = EditorState::new()
+  let mut t = 0.0
+  for _ in 0..<35 {
+    ed2.insert_text("a", now=t)
+    t += 10.0
+  }
+  debug_assert(ed2.undo_stack.undo_len() == 2, "35 fast chars split at 32-unit boundary into 2 steps")
+  debug_assert(ed2.undo(), "undo second burst")
+  debug_assert(ed2.text.length() == 32, "first burst had 32 units")
+
+  // 7. Programmatic set() clears undo/redo history
+  ed2.set("reset")
+  debug_assert(!ed2.can_undo() && !ed2.can_redo(), "set() clears undo and redo stacks")
+}
+
+test "IME marked composition, cancel, commit, and look span offset shifting" {
+  let ed = EditorState::new(text="hi @alice!")
+  // Highlight "@alice" at bytes [3, 9)
+  ed.set_look(
+    Some(fn(s : String) {
+      if s == "hi @alice!" {
+        (s, [(3, 9, paint::color_i64(0x0A84, 0xFFFF))])
+      } else {
+        (s, [])
+      }
+    }),
+  )
+
+  // Place caret before "@alice" (byte 3) and start IME composition
+  ed.set_selection(3, 3)
+  ed.compose_start()
+  ed.compose_update("ni", sel_start=0, sel_end=2)
+  debug_assert(ed.is_composing(), "composing active")
+  debug_assert(ed.display_text() == "hi ni@alice!", "display_text splices marked at caret")
+  debug_assert(ed.text == "hi @alice!", "committed text unchanged while composing")
+
+  // look_shown shifts span [3, 9) by marked.length() (2) -> [5, 11)
+  let (shown_txt, spans) = ed.look_shown()
+  debug_assert(shown_txt == "hi ni@alice!", "look_shown includes marked text")
+  debug_assert(spans.length() == 1 && spans[0].0 == 5 && spans[0].1 == 11, "look span shifted past marked")
+
+  // Cancel restores clean display without altering text
+  ed.compose_cancel()
+  debug_assert(!ed.is_composing() && ed.display_text() == "hi @alice!", "compose_cancel clears marked")
+
+  // Commit inserts as standalone undo step
+  ed.compose_start()
+  ed.compose_update("nihao", sel_start=0, sel_end=5)
+  ed.compose_commit("你好 ", now=500.0)
+  debug_assert(!ed.is_composing(), "commit ends composing")
+  debug_assert(ed.text == "hi 你好 @alice!", "commit inserted CJK text")
+  debug_assert(ed.undo(), "IME commit is undoable in 1 step")
+  debug_assert(ed.text == "hi @alice!", "undo reverted entire IME commit")
+}
+
+test "paste_limit interception and max_len grapheme clamping" {
+  let cfg = EditorConfig::default()
+  cfg.paste_limit = 10
+  let ed = EditorState::new(text="ok", config=cfg)
+
+  // Short paste succeeds
+  debug_assert(ed.paste("123", now=100.0), "short paste accepted")
+  debug_assert(ed.text == "ok123" && ed.result().pasted.is_none(), "short paste inserted")
+
+  // Long paste (>= 10 bytes) is intercepted and exposed in result().pasted
+  debug_assert(!ed.paste("0123456789long", now=200.0), "long paste intercepted")
+  debug_assert(ed.text == "ok123", "text unchanged on intercepted paste")
+  match ed.take_pasted() {
+    Some(p) => debug_assert(p == "0123456789long", "intercepted paste payload preserved")
+    None => debug_assert(false, "expected pasted payload")
+  }
+
+  // max_len truncates at grapheme boundary without splitting 3-byte CJK char
+  let cfg2 = EditorConfig::default()
+  cfg2.max_len = 5
+  let ed2 = EditorState::new(config=cfg2)
+  ed2.insert_text("a你好", now=100.0) // 'a' (1) + '你' (3) = 4 bytes; '好' would make 7 > 5
+  debug_assert(ed2.text == "a你", "max_len truncates cleanly at grapheme boundary")
+}
+
+test "touch selection handle drag, crossover identity flip, and long-press word selection" {
+  let ed = EditorState::new(text="one two three")
+  let _ = ed.layout_lines(300.0, test_measure, 20.0)
+
+  // Long-press on "two" (x=55, y=10 -> byte 5..6)
+  debug_assert(long_press_select_word(ed, 55.0, 10.0), "long press selected word")
+  debug_assert(ed.selected_text() == "two", "selected 'two' [4, 7)")
+
+  // Verify handles exist and hit-testing works
+  let handles = selection_handles_of(ed, style=HandleStyle::Android)
+  match handles {
+    Some((sh, eh)) => {
+      debug_assert(sh.tip_x == 40.0 && eh.tip_x == 70.0, "handle tips at 40 and 70")
+      debug_assert(sh.hit_test(sh.knob_cx, sh.knob_cy), "start handle hits its knob")
+      debug_assert(eh.hit_test(eh.knob_cx, eh.knob_cy), "end handle hits its knob")
+
+      // Begin dragging Start handle and drag past End handle (x=70) to x=130 ("three" end)
+      let drag = SelectionHandleDrag::new()
+      match drag.begin(ed, sh.knob_cx, sh.knob_cy, style=HandleStyle::Android) {
+        Some(HandleKind::Start) => ()
+        _ => debug_assert(false, "expected to grab Start handle")
+      }
+
+      // First drag left to byte 0 ("one")
+      let dx_left = sh.knob_cx - 40.0
+      match drag.update(ed, dx_left, sh.knob_cy) {
+        Some(HandleKind::Start) => ()
+        _ => debug_assert(false, "still Start when left of hi")
+      }
+      debug_assert(ed.selected_text() == "one two", "widened start to 'one two'")
+
+      // Now drag right past `hi` (byte 7, x=70) to byte 13 (x=130) -> handle flips to End!
+      let target_finger_x = 130.0 - drag.grab_dx
+      match drag.update(ed, target_finger_x, sh.knob_cy) {
+        Some(HandleKind::End) => ()
+        _ => debug_assert(false, "expected Start handle to flip to End on crossover")
+      }
+      debug_assert(ed.selected_text() == " three", "selection flipped across anchor 7 to [7, 13)")
+      drag.end_drag()
+      debug_assert(!drag.is_active(), "drag ended cleanly")
+    }
+    None => debug_assert(false, "expected selection handles")
+  }
+}
+
+test "optical loupe geometry viewport edge clamping and Glass::clear material" {
+  // Center of viewport: no clamping
+  let g0 = compute_loupe(200.0, 150.0, 400.0, 600.0)
+  debug_assert(g0.visible && !g0.clamped_x && !g0.clamped_y, "center loupe unclamped")
+  debug_assert(g0.center_x == 200.0 && g0.center_y == 150.0 - loupe_default_offset_y, "loupe sits offset_y above focus")
+
+  // Top-left corner: both X and Y clamped inside [margin + half, viewport - margin - half]
+  let g1 = compute_loupe(10.0, 12.0, 400.0, 600.0)
+  debug_assert(g1.clamped_x && g1.clamped_y, "top-left corner clamped")
+  debug_assert(g1.x == loupe_default_margin && g1.y == loupe_default_margin, "clamped to margin")
+
+  // Bottom-right corner: right edge clamped inside viewport - margin
+  let g2 = compute_loupe(395.0, 590.0, 400.0, 600.0)
+  debug_assert(g2.clamped_x, "right edge clamped")
+  debug_assert(g2.x + g2.width <= 400.0 - loupe_default_margin + 0.001, "stays within right margin")
+
+  // Sampling rect matches zoom and Glass::clear carries zoom parameter
+  let glass = g0.to_glass()
+  debug_assert(glass.zoom == loupe_default_zoom, "Glass::clear preserves loupe zoom")
+  debug_assert(g0.sample_w == loupe_default_width / loupe_default_zoom, "sample_w = width / zoom")
+}
+
+test "UndoStack word-boundary split and max_depth eviction" {
+  let ed = EditorState::new()
+  // Typing "foo " then "bar" crosses from whitespace into a new word -> 2 undo steps
+  ed.insert_text("f", now=10.0)
+  ed.insert_text("o", now=20.0)
+  ed.insert_text("o", now=30.0)
+  ed.insert_text(" ", now=40.0)
+  debug_assert(ed.undo_stack.undo_len() == 1, "word + trailing space stay in 1 step")
+  ed.insert_text("b", now=50.0)
+  ed.insert_text("a", now=60.0)
+  ed.insert_text("r", now=70.0)
+  debug_assert(ed.undo_stack.undo_len() == 2, "new word after space starts step 2")
+  debug_assert(ed.undo(), "undo 'bar'")
+  debug_assert(ed.text == "foo ", "reverted to 'foo '")
+  debug_assert(ed.undo(), "undo 'foo '")
+  debug_assert(ed.text == "", "reverted to empty")
+
+  // Bounded depth (e.g. max_depth = 5; default is undo_depth = 1000)
+  debug_assert(undo_depth == 1000, "default undo depth is 1000")
+  let stack = UndoStack::new(max_depth=5)
+  let mut prev = ""
+  for i in 0..<8 {
+    let next = prev + "x"
+    stack.record(prev, prev.length(), prev.length(), next, next.length(), next.length(), typing=false, now=i.to_double() * 100.0)
+    prev = next
+  }
+  debug_assert(stack.undo_len() == 5, "stack evicted oldest entries past max_depth")
+}
+
+test "keyboard dispatch: Enter/Shift+Enter, Tab, word/line navigation, cut/copy/select_all, and signals" {
+  let cfg = EditorConfig::default()
+  cfg.enter_sends = true
+  cfg.tab_inserts = true
+  let ed = EditorState::new(text="hello world", config=cfg)
+  let _ = ed.layout_lines(300.0, test_measure, 20.0)
+
+  // Reactive signals mirror state
+  debug_assert(ed.text_signal().untracked() == "hello world", "text_signal synced")
+  ed.focus()
+  debug_assert(ed.focused_signal().untracked(), "focused_signal true after focus()")
+
+  // Shift+Enter inserts newline even when enter_sends=true
+  debug_assert(ed.handle_key(key_enter, mod_shift, platform_macos, now=100.0), "Shift+Enter handled")
+  debug_assert(ed.text == "hello world\n" && ed.result().submitted.is_none(), "Shift+Enter inserted newline")
+
+  // Tab inserts '\t' when tab_inserts=true
+  debug_assert(ed.handle_key(key_tab, 0, platform_macos, now=150.0), "Tab handled")
+  debug_assert(ed.text == "hello world\n\t", "Tab inserted")
+
+  // Plain Enter submits when enter_sends=true
+  debug_assert(ed.handle_key(key_enter, 0, platform_macos, now=200.0), "Enter handled")
+  match ed.take_submitted() {
+    Some(s) => debug_assert(s == "hello world\n\t", "Enter submitted text")
+    None => debug_assert(false, "expected submitted text")
+  }
+
+  // Cmd+A select all, Cmd+C copy, Cmd+X cut
+  debug_assert(ed.handle_key(key_of_char('a'), mod_cmd, platform_macos, now=300.0), "Cmd+A")
+  debug_assert(ed.copy() == "hello world\n\t", "copy returns full text")
+  debug_assert(ed.handle_key(key_of_char('x'), mod_cmd, platform_macos, now=400.0), "Cmd+X")
+  debug_assert(ed.text == "", "Cmd+X cleared text")
+  debug_assert(ed.undo(), "cut is undoable")
+  debug_assert(ed.text == "hello world\n\t", "undo restored cut text")
+
+  // Alt+Left / Alt+Backspace on macOS
+  ed.set("alpha beta gamma")
+  debug_assert(ed.handle_key(key_left, mod_alt, platform_macos, now=500.0), "Alt+Left")
+  debug_assert(ed.caret == 11, "Alt+Left jumped to 'gamma' start")
+  debug_assert(ed.handle_key(key_backspace, mod_alt, platform_macos, now=600.0), "Alt+Backspace")
+  debug_assert(ed.text == "alpha gamma", "Alt+Backspace deleted 'beta '")
+}
+
+test "End handle crossing left past Start flips to Start, and iOS handle style" {
+  let ed = EditorState::new(text="one two three")
+  let _ = ed.layout_lines(300.0, test_measure, 20.0)
+  ed.set_selection(4, 7) // "two"
+
+  match selection_handles_of(ed, style=HandleStyle::IOS) {
+    Some((sh, eh)) => {
+      debug_assert(sh.knob_cy < sh.line_top, "iOS start handle knob sits above line")
+      debug_assert(eh.knob_cy > eh.line_top + eh.line_height, "iOS end handle knob sits below line")
+
+      let drag = SelectionHandleDrag::new()
+      match drag.begin(ed, eh.knob_cx, eh.knob_cy, style=HandleStyle::IOS) {
+        Some(HandleKind::End) => ()
+        _ => debug_assert(false, "grabbed End handle")
+      }
+      // Drag End handle left past Start (x=40) to x=0 -> flips to Start!
+      let target_finger_x = 0.0 - drag.grab_dx
+      match drag.update(ed, target_finger_x, eh.knob_cy) {
+        Some(HandleKind::Start) => ()
+        _ => debug_assert(false, "End handle flipped to Start on leftward crossover")
+      }
+      debug_assert(ed.selected_text() == "one ", "selection flipped to [0, 4)")
+      drag.end_drag()
+    }
+    None => debug_assert(false, "expected iOS selection handles")
+  }
+}
