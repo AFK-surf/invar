@@ -1,0 +1,113 @@
+// Native parallax navigation stack view (`nav_stack`) with interactive left-edge swipe-back,
+// top-2 active rendering + parked deeper pages, scrim dimming, and leading-edge separation hairline.
+
+import "signals"
+import "view"
+
+/// Build a native-style parallax navigation stack bound to `controller`.
+///
+/// - Only the top page is laid out, painted, and interactive at rest; deeper pages are parked
+///   (preserving widget and signal state without drawing or intercepting clicks).
+/// - During push, pop, or interactive swipe-back, the top two pages are mounted with foreground
+///   `x = width * progress`, background `-30% * width * (1 - progress)` parallax, and a smooth
+///   background scrim (`alpha = 0.14 * (1 - progress)`).
+/// - When `edge_swipe_back` is true, dragging rightward from the left edge (`<= 28pt`) claims
+///   horizontal gestures via `View::claims` + `View::on_drag`, committing pop if `progress >= 0.42`
+///   or `vx >= 500 pt/s`, else springing smoothly back.
+pub fn nav_stack[T](
+  parent : view::View,
+  controller : NavController[T],
+  render_page : (view::View, NavEntry[T]) -> Unit,
+  edge_swipe_back~ : Bool = true,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(fn(stack_v : view::View) {
+    let _ = stack_v.fill(loc=loc).clip(loc=loc)
+    controller.attach(stack_v)
+    let _ = stack_v.owns(fn() { controller.detach() })
+
+    if edge_swipe_back {
+      let edge_w = controller.transition.edge_width
+      let drag_slop = controller.transition.drag_slop
+      let _ = stack_v.claims(
+        fn(dx : Double, dy : Double) -> Bool {
+          controller.can_swipe_back() && claims_horizontal_swipe(dx, dy, slop=drag_slop)
+        },
+        from=fn(x : Double, _y : Double) -> Bool {
+          if controller.can_swipe_back() && is_edge_zone(x, edge_width=edge_w) {
+            controller.drag_origin_x = x
+            true
+          } else {
+            false
+          }
+        },
+      )
+      let _ = stack_v.on_drag(fn(d : view::Drag) {
+        match d.kind {
+          view::DragIs::Down => controller.begin_swipe(d.x, d.w, d.at)
+          view::DragIs::Moved => controller.update_swipe(d.x, d.w, d.at)
+          view::DragIs::Up => controller.end_swipe(d.x, d.w, d.vx(), false, d.at)
+          view::DragIs::Off => controller.end_swipe(d.x, d.w, 0.0, true, d.at)
+        }
+      })
+    }
+
+    stack_v.each(
+      fn() -> Array[Int] { controller.visible_serials() },
+      fn(serial : Int) -> Int { serial },
+      fn(page_box : view::View, serial_sig : signals::Signal[Int]) {
+        let serial = serial_sig.untracked()
+        let _ = page_box
+        .over(view::Live::Is(true), loc=loc)
+        .clip(loc=loc)
+        .presses(view::Live::By(fn() { controller.page_takes_presses(serial) }))
+        .shift(
+          view::Live::By(fn() { controller.page_shift_on(serial, page_box) }),
+          ends=fn() { controller.motion_ends_at() },
+          loc=loc,
+        )
+        match controller.find_entry(serial) {
+          Some(entry) => {
+            let _ = page_box.box(fn(content : view::View) {
+              let _ = content.fill(loc=loc)
+              render_page(content, entry)
+            })
+          }
+          None => ()
+        }
+        // Background scrim overlay (visible only while this page is covered during a transition).
+        let _ = page_box.box(fn(scrim_v : view::View) {
+          let _ = scrim_v
+          .over(view::Live::Is(true), loc=loc)
+          .presses(view::Live::Is(false))
+          .laid_nowhere(view::Live::By(fn() { !controller.is_background(serial) }), loc=loc)
+          .ground(view::Live::By(fn() { controller.scrim_ink_on(serial, scrim_v) }), loc=loc)
+        })
+        // Foreground leading-edge 1pt hairline separation while sliding.
+        if controller.transition.edge_shadow {
+          let _ = page_box.box(fn(edge_v : view::View) {
+            let _ = edge_v
+            .over(
+              view::Live::Is(true),
+              edges=(Some(0.0), Some(0.0), None, Some(0.0)),
+              loc=loc,
+            )
+            .width(view::Live::Is(Some(1.0)), loc=loc)
+            .presses(view::Live::Is(false))
+            .laid_nowhere(
+              view::Live::By(fn() { !controller.is_foreground_moving(serial) }),
+              loc=loc,
+            )
+            .ground(
+              view::Live::By(fn() { controller.edge_hairline_ink_on(serial, edge_v) }),
+              loc=loc,
+            )
+          })
+        }
+      },
+      at_once=true,
+      keeps=fn() -> Array[Int] { controller.parked_serials() },
+      loc=loc,
+    )
+  })
+}

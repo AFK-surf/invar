@@ -1,0 +1,166 @@
+// Native iOS-style parallax navigation transition math, edge-swipe gesture predicates,
+// and critically damped spring configuration.
+
+import "motion"
+
+/// Default parallax shift ratio for the covered background page (-30% of viewport width).
+pub let nav_parallax_ratio : Double = 0.30
+
+/// Default maximum black scrim opacity over the covered background page.
+pub let nav_scrim_max_alpha : Double = 0.14
+
+/// Default left-edge swipe-back trigger zone width in points.
+pub let nav_edge_zone_pt : Double = 28.0
+
+/// Default horizontal drag slop in points before locking the swipe-back axis.
+pub let nav_drag_slop_pt : Double = 6.0
+
+/// Default progress threshold (fraction of viewport width) to commit an interactive pop.
+pub let nav_commit_progress : Double = 0.42
+
+/// Default horizontal flick velocity threshold (points/second) to commit an interactive pop.
+pub let nav_commit_velocity_pt_s : Double = 500.0
+
+/// Default critically damped spring curve driving push, pop, and cancel-bounce transitions.
+/// Uses critical damping (`ratio = 1.0`) so pages settle smoothly with zero overshoot.
+pub let nav_spring : motion::Spec = motion::motion_spring(0.32, bounce=0.0, threshold=0.001)
+
+/// Declarative configuration for a navigation stack's parallax and interactive swipe transitions.
+pub struct NavTransition {
+  /// Background page horizontal parallax ratio (0.30 for iOS-style -30% offset).
+  pub parallax : Double
+  /// Maximum scrim alpha painted over the covered background page (0.14 by default).
+  pub scrim_max : Double
+  /// Left-edge swipe-back activation zone width in points (28.0 by default).
+  pub edge_width : Double
+  /// Minimum drag slop in points before claiming a horizontal swipe-back gesture.
+  pub drag_slop : Double
+  /// Progress threshold in [0, 1] above which releasing commits a pop (0.42 by default).
+  pub commit_progress : Double
+  /// Horizontal velocity threshold in pt/s above which a flick commits a pop (500.0 by default).
+  pub commit_velocity : Double
+  /// Draw a 1pt leading-edge separation hairline on the foreground page while moving.
+  pub edge_shadow : Bool
+  /// Spring spec driving push, pop, and cancel-snap-back animations.
+  pub spring : motion::Spec
+}
+
+/// Standard iOS-style layered parallax transition preset.
+pub fn NavTransition::ios() -> NavTransition {
+  NavTransition::{
+    parallax: nav_parallax_ratio,
+    scrim_max: nav_scrim_max_alpha,
+    edge_width: nav_edge_zone_pt,
+    drag_slop: nav_drag_slop_pt,
+    commit_progress: nav_commit_progress,
+    commit_velocity: nav_commit_velocity_pt_s,
+    edge_shadow: true,
+    spring: nav_spring,
+  }
+}
+
+/// Instant cut transition preset (no animation, no parallax).
+pub fn NavTransition::instant() -> NavTransition {
+  NavTransition::{
+    parallax: 0.0,
+    scrim_max: 0.0,
+    edge_width: nav_edge_zone_pt,
+    drag_slop: nav_drag_slop_pt,
+    commit_progress: nav_commit_progress,
+    commit_velocity: nav_commit_velocity_pt_s,
+    edge_shadow: false,
+    spring: motion::Spec::Snap(0.0),
+  }
+}
+
+/// Clamp `v` to `[lo, hi]`.
+pub fn clamp_unit(v : Double) -> Double {
+  if v < 0.0 {
+    0.0
+  } else if v > 1.0 {
+    1.0
+  } else {
+    v
+  }
+}
+
+/// Foreground page normalized horizontal shift (`progress` in [0, 1]: 0 = resting on screen, 1 = off right edge).
+/// Push animates `1.0 -> 0.0`; pop animates `0.0 -> 1.0`.
+pub fn foreground_shift_x(progress : Double) -> Double {
+  clamp_unit(progress)
+}
+
+/// Foreground page horizontal pixel/point offset (`x = width * progress`).
+pub fn foreground_offset_x(width : Double, progress : Double) -> Double {
+  width * foreground_shift_x(progress)
+}
+
+/// Background page normalized horizontal parallax shift (`-parallax * (1 - progress)`).
+/// At `progress = 0` (fully covered), sits at `-0.30`; at `progress = 1` (fully revealed), sits at `0.0`.
+pub fn background_shift_x(progress : Double, parallax~ : Double = nav_parallax_ratio) -> Double {
+  let p = clamp_unit(progress)
+  -parallax * (1.0 - p)
+}
+
+/// Background page horizontal pixel/point offset (`-0.30 * width * (1 - progress)`).
+pub fn background_offset_x(
+  width : Double,
+  progress : Double,
+  parallax~ : Double = nav_parallax_ratio,
+) -> Double {
+  width * background_shift_x(progress, parallax=parallax)
+}
+
+/// Background scrim alpha (`0.14 * (1 - progress)`).
+pub fn scrim_alpha(progress : Double, max_alpha~ : Double = nav_scrim_max_alpha) -> Double {
+  let p = clamp_unit(progress)
+  let a = max_alpha * (1.0 - p)
+  if a <= 0.0 { 0.0 } else if a >= 1.0 { 1.0 } else { a }
+}
+
+/// Convert a scrim opacity in `[0, 1]` to a black RGBA `Int64` ink (`0x000000AA`); `0L` when invisible.
+pub fn scrim_ink(alpha : Double) -> Int64 {
+  let a = clamp_unit(alpha)
+  if a <= 0.001 {
+    0L
+  } else {
+    (a * 255.0).round().to_int().to_int64() & 0xFFL
+  }
+}
+
+/// Leading-edge hairline ink (`0x000000AA`) scaled by foreground visibility during motion.
+pub fn edge_hairline_ink(progress : Double) -> Int64 {
+  let p = clamp_unit(progress)
+  let vis = 1.0 - p
+  if vis <= 0.01 {
+    0L
+  } else {
+    scrim_ink(0.12 * vis)
+  }
+}
+
+/// Whether a pointer down at local `x` falls inside the left-edge swipe-back trigger zone (`[0, edge_width]`).
+pub fn is_edge_zone(x : Double, edge_width~ : Double = nav_edge_zone_pt) -> Bool {
+  x >= 0.0 && x <= edge_width
+}
+
+/// Whether a pointer displacement `(dx, dy)` should lock onto the horizontal swipe-back axis.
+/// Requires positive rightward travel beyond `slop` and horizontal dominance over vertical motion.
+pub fn claims_horizontal_swipe(
+  dx : Double,
+  dy : Double,
+  slop~ : Double = nav_drag_slop_pt,
+) -> Bool {
+  dx > slop && dx >= dy.abs() * 1.2
+}
+
+/// Whether releasing an interactive swipe-back at `progress` with horizontal velocity `vx_pt_s` (pt/s)
+/// should commit the pop (`progress >= 0.42 || vx >= 500 pt/s`); otherwise spring back to cancel.
+pub fn should_commit_pop(
+  progress : Double,
+  vx_pt_s : Double,
+  threshold~ : Double = nav_commit_progress,
+  velocity~ : Double = nav_commit_velocity_pt_s,
+) -> Bool {
+  progress >= threshold || vx_pt_s >= velocity
+}

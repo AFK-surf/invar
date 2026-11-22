@@ -1,0 +1,656 @@
+// Navigation stack state machine (`NavEntry[T]`, `NavController[T]`) with fine-grained Signals,
+// top-2 active / deeper-parked page visibility, interruptible spring transitions, and zero RC cycles.
+
+import "motion"
+import "signals"
+import "ui"
+import "view"
+
+let nav_serial_counter : ui::Ref[Int] = ui::ref_new(0)
+
+fn next_nav_serial() -> Int {
+  nav_serial_counter.v = nav_serial_counter.v + 1
+  nav_serial_counter.v
+}
+
+/// A single entry on the navigation stack carrying a string key and typed route payload.
+pub struct NavEntry[T] {
+  pub key : String
+  pub route : T
+}
+
+/// Internal stack slot pairing a unique monotonic serial (for retained view identity) with its `NavEntry`.
+struct NavItem[T] {
+  serial : Int
+  entry : NavEntry[T]
+}
+
+/// Active transition mode of a `NavController`.
+#derive(Eq)
+pub enum NavMode {
+  /// At rest: only the top page is visible; deeper pages are parked.
+  Idle
+  /// A newly pushed page is animating in (`progress: 1 -> 0`).
+  Pushing
+  /// A popped page (`leaving`) is animating out (`progress: 0 -> 1`).
+  Popping
+  /// User is interactively dragging the top page from the left edge (`progress: 0 -> 1`).
+  Dragging
+  /// An interactive swipe-back was cancelled and is springing back to rest (`progress -> 0`).
+  Cancelling
+}
+
+/// Fine-grained reactive navigation stack controller.
+pub struct NavController[T] {
+  pub transition : NavTransition
+  mut items : Array[NavItem[T]]
+  mut leaving : Option[NavItem[T]]
+  mut mode : NavMode
+  way : motion::Way
+  entries_ver : signals::Signal[Int]
+  ver : signals::Signal[Int]
+  drag_progress : signals::Signal[Double]
+  mut drag_origin_x : Double
+  mut drag_last_x : Double
+  mut drag_last_t : Double
+  mut drag_vel_pt_ms : Double
+  mut drag_active : Bool
+  mut last_width : Double
+  mut host_now : Option[() -> Double]
+  mut host_schedule : Option[(Double, () -> Unit) -> () -> Unit]
+  mut stop_settle : () -> Unit
+}
+
+/// Create a new `NavController` initialized with a root route entry.
+pub fn NavController::new[T](
+  root_key : String,
+  root_route : T,
+  transition~ : NavTransition = NavTransition::ios(),
+) -> NavController[T] {
+  let root_entry = NavEntry::{ key: root_key, route: root_route }
+  let root_item = NavItem::{ serial: next_nav_serial(), entry: root_entry }
+  NavController::{
+    transition,
+    items: [root_item],
+    leaving: None,
+    mode: NavMode::Idle,
+    way: motion::Way::new(0.0),
+    entries_ver: signals::signal(0),
+    ver: signals::signal(0),
+    drag_progress: signals::signal(0.0),
+    drag_origin_x: 0.0,
+    drag_last_x: 0.0,
+    drag_last_t: -1.0,
+    drag_vel_pt_ms: 0.0,
+    drag_active: false,
+    last_width: 0.0,
+    host_now: None,
+    host_schedule: None,
+    stop_settle: fn() -> Unit {},
+  }
+}
+
+fn NavController::bump[T](self : NavController[T]) -> Unit {
+  self.ver.set(self.ver.untracked() + 1)
+}
+
+fn NavController::sync_entries[T](self : NavController[T]) -> Unit {
+  self.entries_ver.set(self.entries_ver.untracked() + 1)
+}
+
+fn NavController::cancel_settle[T](self : NavController[T]) -> Unit {
+  (self.stop_settle)()
+  self.stop_settle = fn() -> Unit {}
+}
+
+fn NavController::now[T](self : NavController[T]) -> Double {
+  match self.host_now {
+    Some(f) => f()
+    None => 0.0
+  }
+}
+
+fn NavController::schedule_settle[T](self : NavController[T], at : Double) -> Unit {
+  self.cancel_settle()
+  match self.host_schedule {
+    Some(sched) => {
+      self.stop_settle = sched(at, fn() { self.settle() })
+    }
+    None => {
+      // Not mounted to a view tree yet: settle immediately so headless unit logic stays consistent.
+      self.settle()
+    }
+  }
+}
+
+/// Attach this controller to a mounted `nav_stack` container view.
+fn NavController::attach[T](self : NavController[T], host : view::View) -> Unit {
+  self.detach()
+  self.host_now = Some(fn() {
+    let c = host.cause_at()
+    let w = ui::work_clock_now()
+    if w > c {
+      w
+    } else {
+      c
+    }
+  })
+  self.host_schedule = Some(fn(when : Double, cb : () -> Unit) -> () -> Unit {
+    host.at_moment(when, cb, loc="nav_stack.settle")
+  })
+}
+
+/// Detach this controller from its host view and break all closures to keep RC cycles at zero.
+fn NavController::detach[T](self : NavController[T]) -> Unit {
+  self.cancel_settle()
+  self.host_now = None
+  self.host_schedule = None
+  self.drag_active = false
+}
+
+/// Finalize any in-flight transition and return the stack to `NavMode::Idle`.
+fn NavController::settle[T](self : NavController[T]) -> Unit {
+  self.cancel_settle()
+  self.leaving = None
+  self.mode = NavMode::Idle
+  self.drag_active = false
+  self.way.put(0.0)
+  self.drag_progress.set(0.0)
+  self.bump()
+}
+
+/// Reactive array of all logical entries currently on the stack (root first, top last).
+pub fn NavController::entries[T](self : NavController[T]) -> Array[NavEntry[T]] {
+  let _ = self.entries_ver.get()
+  let out : Array[NavEntry[T]] = []
+  for it in self.items {
+    out.push(it.entry)
+  }
+  out
+}
+
+/// Reactive stack depth (always >= 1).
+pub fn NavController::depth[T](self : NavController[T]) -> Int {
+  let _ = self.entries_ver.get()
+  self.items.length()
+}
+
+/// Reactive flag indicating whether a pop is possible (`depth() > 1`).
+pub fn NavController::can_pop[T](self : NavController[T]) -> Bool {
+  let _ = self.entries_ver.get()
+  self.items.length() > 1
+}
+
+/// Reactive current top entry of the stack.
+pub fn NavController::current[T](self : NavController[T]) -> Option[NavEntry[T]] {
+  let _ = self.entries_ver.get()
+  let n = self.items.length()
+  if n == 0 {
+    None
+  } else {
+    Some(self.items[n - 1].entry)
+  }
+}
+
+/// Reactive current transition mode.
+pub fn NavController::mode[T](self : NavController[T]) -> NavMode {
+  let _ = self.ver.get()
+  self.mode
+}
+
+/// Reactive flag indicating whether a transition or interactive drag is currently active.
+pub fn NavController::is_transitioning[T](self : NavController[T]) -> Bool {
+  let _ = self.ver.get()
+  self.mode != NavMode::Idle
+}
+
+/// Sample the current transition progress `[0, 1]` at timestamp `now` (0 = settled, 1 = off-screen right).
+pub fn NavController::progress_at[T](self : NavController[T], now : Double) -> Double {
+  let _ = self.ver.get()
+  match self.mode {
+    NavMode::Idle => 0.0
+    NavMode::Dragging => clamp_unit(self.drag_progress.get())
+    NavMode::Pushing | NavMode::Popping | NavMode::Cancelling => clamp_unit(self.way.value_at(now))
+  }
+}
+
+/// Sample the current scrim alpha over the background page at timestamp `now`.
+pub fn NavController::scrim_alpha_at[T](self : NavController[T], now : Double) -> Double {
+  let _ = self.ver.get()
+  if self.mode == NavMode::Idle {
+    0.0
+  } else {
+    scrim_alpha(self.progress_at(now), max_alpha=self.transition.scrim_max)
+  }
+}
+
+/// Push a new page onto the stack with a parallax slide-in transition (instant if `reduced_motion()`).
+pub fn NavController::push[T](self : NavController[T], key : String, route : T) -> Unit {
+  self.cancel_settle()
+  self.leaving = None
+  self.drag_active = false
+  let item = NavItem::{ serial: next_nav_serial(), entry: NavEntry::{ key, route } }
+  self.items.push(item)
+  self.sync_entries()
+  let can_animate = self.host_schedule.is_some() && !ui::reduced_motion()
+  if !can_animate {
+    self.mode = NavMode::Idle
+    self.way.put(0.0)
+    self.bump()
+    return
+  }
+  let t = self.now()
+  self.mode = NavMode::Pushing
+  self.way.put(1.0)
+  self.way.go(0.0, self.transition.spring, at=t)
+  if !self.way.goes_at(t) {
+    self.mode = NavMode::Idle
+    self.way.put(0.0)
+    self.bump()
+    return
+  }
+  self.schedule_settle(self.way.end())
+  self.bump()
+}
+
+/// Pop the top page off the stack with a parallax slide-out transition.
+/// Returns `false` if already at root (`depth() <= 1`).
+pub fn NavController::pop[T](self : NavController[T]) -> Bool {
+  if self.items.length() <= 1 {
+    return false
+  }
+  let t = self.now()
+  let (start_p, start_v) = match self.mode {
+    NavMode::Pushing | NavMode::Cancelling => self.way.at(t)
+    NavMode::Dragging => (clamp_unit(self.drag_progress.untracked()), 0.0)
+    NavMode::Idle | NavMode::Popping => (0.0, 0.0)
+  }
+  self.cancel_settle()
+  self.leaving = None
+  self.drag_active = false
+  let popped = match self.items.pop() {
+    Some(it) => it
+    None => return false
+  }
+  self.sync_entries()
+  let can_animate = self.host_schedule.is_some() && !ui::reduced_motion()
+  if !can_animate {
+    self.mode = NavMode::Idle
+    self.way.put(0.0)
+    self.bump()
+    return true
+  }
+  self.leaving = Some(popped)
+  self.mode = NavMode::Popping
+  self.way.put(clamp_unit(start_p))
+  self.way.go(1.0, self.transition.spring, at=t, velocity=start_v)
+  if !self.way.goes_at(t) {
+    self.leaving = None
+    self.mode = NavMode::Idle
+    self.way.put(0.0)
+    self.bump()
+    return true
+  }
+  self.schedule_settle(self.way.end())
+  self.bump()
+  true
+}
+
+/// Pop all pages above the root entry, animating the former top page out directly over root.
+pub fn NavController::pop_to_root[T](self : NavController[T]) -> Unit {
+  let n = self.items.length()
+  if n <= 1 {
+    if self.leaving.is_some() || self.mode != NavMode::Idle {
+      self.settle()
+    }
+    return
+  }
+  self.cancel_settle()
+  self.leaving = None
+  self.drag_active = false
+  let root = self.items[0]
+  let top = self.items[n - 1]
+  self.items = [root]
+  self.sync_entries()
+  let can_animate = self.host_schedule.is_some() && !ui::reduced_motion()
+  if !can_animate {
+    self.mode = NavMode::Idle
+    self.way.put(0.0)
+    self.bump()
+    return
+  }
+  let t = self.now()
+  self.leaving = Some(top)
+  self.mode = NavMode::Popping
+  self.way.put(0.0)
+  self.way.go(1.0, self.transition.spring, at=t)
+  if !self.way.goes_at(t) {
+    self.leaving = None
+    self.mode = NavMode::Idle
+    self.way.put(0.0)
+    self.bump()
+    return
+  }
+  self.schedule_settle(self.way.end())
+  self.bump()
+}
+
+/// Replace the current top entry cleanly in place without leaving dangling nodes.
+pub fn NavController::replace[T](self : NavController[T], key : String, route : T) -> Unit {
+  self.cancel_settle()
+  self.leaving = None
+  self.drag_active = false
+  let item = NavItem::{ serial: next_nav_serial(), entry: NavEntry::{ key, route } }
+  let n = self.items.length()
+  if n == 0 {
+    self.items = [item]
+  } else {
+    self.items[n - 1] = item
+  }
+  self.mode = NavMode::Idle
+  self.way.put(0.0)
+  self.drag_progress.set(0.0)
+  self.sync_entries()
+  self.bump()
+}
+
+// --- Interactive edge swipe-back hooks (called by nav_view) ---
+
+fn NavController::can_swipe_back[T](self : NavController[T]) -> Bool {
+  self.items.length() > 1 && self.leaving.is_none() && (self.mode == NavMode::Idle || self.mode == NavMode::Dragging)
+}
+
+fn NavController::begin_swipe[T](
+  self : NavController[T],
+  x : Double,
+  width : Double,
+  at : Double,
+) -> Unit {
+  if !self.can_swipe_back() {
+    return
+  }
+  self.cancel_settle()
+  self.drag_active = true
+  self.drag_last_x = x
+  self.drag_last_t = at
+  self.drag_vel_pt_ms = 0.0
+  if width > 1.0 {
+    self.last_width = width
+  }
+  let w = if self.last_width > 1.0 { self.last_width } else { 1.0 }
+  let p = clamp_unit((x - self.drag_origin_x) / w)
+  self.mode = NavMode::Dragging
+  self.drag_progress.set(p)
+  self.bump()
+}
+
+fn NavController::update_swipe[T](
+  self : NavController[T],
+  x : Double,
+  width : Double,
+  at : Double,
+) -> Unit {
+  if !self.drag_active || self.mode != NavMode::Dragging {
+    return
+  }
+  if width > 1.0 {
+    self.last_width = width
+  }
+  if at > self.drag_last_t + 0.5 {
+    let dt = at - self.drag_last_t
+    self.drag_vel_pt_ms = (x - self.drag_last_x) / dt
+    self.drag_last_x = x
+    self.drag_last_t = at
+  } else {
+    self.drag_last_x = x
+  }
+  let w = if self.last_width > 1.0 { self.last_width } else { 1.0 }
+  let p = clamp_unit((x - self.drag_origin_x) / w)
+  self.drag_progress.set(p)
+}
+
+fn NavController::end_swipe[T](
+  self : NavController[T],
+  x : Double,
+  width : Double,
+  vx_pt_ms : Double,
+  cancelled : Bool,
+  at : Double,
+) -> Unit {
+  if !self.drag_active || self.mode != NavMode::Dragging {
+    self.drag_active = false
+    return
+  }
+  self.drag_active = false
+  if width > 1.0 {
+    self.last_width = width
+  }
+  let w = if self.last_width > 1.0 { self.last_width } else { 1.0 }
+  let p = clamp_unit((x - self.drag_origin_x) / w)
+  let eff_vx_pt_ms = if self.drag_last_t >= 0.0 && at - self.drag_last_t > 40.0 {
+    0.0
+  } else if vx_pt_ms.abs() > 1.0e-6 {
+    vx_pt_ms
+  } else {
+    self.drag_vel_pt_ms
+  }
+  let vx_pt_s = eff_vx_pt_ms * 1000.0
+  let v_norm = vx_pt_s / w
+  let commit = !cancelled &&
+  self.items.length() > 1 &&
+  should_commit_pop(
+    p,
+    vx_pt_s,
+    threshold=self.transition.commit_progress,
+    velocity=self.transition.commit_velocity,
+  )
+  if commit {
+    let popped = match self.items.pop() {
+      Some(it) => it
+      None => {
+        self.settle()
+        return
+      }
+    }
+    self.sync_entries()
+    if ui::reduced_motion() || p >= 0.999 {
+      self.leaving = None
+      self.mode = NavMode::Idle
+      self.way.put(0.0)
+      self.drag_progress.set(0.0)
+      self.bump()
+      return
+    }
+    self.leaving = Some(popped)
+    self.mode = NavMode::Popping
+    self.way.put(p)
+    self.way.go(1.0, self.transition.spring, at=at, velocity=v_norm)
+    if !self.way.goes_at(at) {
+      self.leaving = None
+      self.mode = NavMode::Idle
+      self.way.put(0.0)
+      self.drag_progress.set(0.0)
+      self.bump()
+      return
+    }
+    self.schedule_settle(self.way.end())
+    self.bump()
+  } else {
+    if ui::reduced_motion() || p <= 0.001 {
+      self.settle()
+      return
+    }
+    self.mode = NavMode::Cancelling
+    self.way.put(p)
+    self.way.go(0.0, self.transition.spring, at=at, velocity=v_norm)
+    if !self.way.goes_at(at) {
+      self.settle()
+      return
+    }
+    self.schedule_settle(self.way.end())
+    self.bump()
+  }
+}
+
+// --- Visibility, parking, and motion helpers used by nav_view ---
+
+fn NavController::find_entry[T](self : NavController[T], serial : Int) -> Option[NavEntry[T]] {
+  match self.leaving {
+    Some(l) if l.serial == serial => return Some(l.entry)
+    _ => ()
+  }
+  for it in self.items {
+    if it.serial == serial {
+      return Some(it.entry)
+    }
+  }
+  None
+}
+
+/// Top (foreground) and optional covered (background) serials during the current state.
+fn NavController::active_pair[T](self : NavController[T]) -> (Int, Option[Int]) {
+  let n = self.items.length()
+  match self.leaving {
+    Some(l) => (l.serial, if n > 0 { Some(self.items[n - 1].serial) } else { None })
+    None =>
+    if n == 0 {
+      (-1, None)
+    } else if self.mode != NavMode::Idle && n > 1 {
+      (self.items[n - 1].serial, Some(self.items[n - 2].serial))
+    } else {
+      (self.items[n - 1].serial, None)
+    }
+  }
+}
+
+/// Serials currently mounted in paint order (background first, foreground second).
+/// At rest, only the top page is visible; during transitions/drags, top-2 pages are visible.
+fn NavController::visible_serials[T](self : NavController[T]) -> Array[Int] {
+  let _ = self.ver.get()
+  let (fg, bg) = self.active_pair()
+  let out : Array[Int] = []
+  match bg {
+    Some(b) if b >= 0 && b != fg => out.push(b)
+    _ => ()
+  }
+  if fg >= 0 {
+    out.push(fg)
+  }
+  out
+}
+
+/// Serials kept parked (detached from layout/paint/input, preserving subtree state) while deeper in the stack.
+fn NavController::parked_serials[T](self : NavController[T]) -> Array[Int] {
+  let _ = self.ver.get()
+  let (fg, bg) = self.active_pair()
+  let out : Array[Int] = []
+  for it in self.items {
+    let s = it.serial
+    let is_bg = match bg {
+      Some(b) => b == s
+      None => false
+    }
+    if s != fg && !is_bg {
+      out.push(s)
+    }
+  }
+  out
+}
+
+fn NavController::is_background[T](self : NavController[T], serial : Int) -> Bool {
+  let _ = self.ver.get()
+  if self.mode == NavMode::Idle {
+    return false
+  }
+  let (_, bg) = self.active_pair()
+  match bg {
+    Some(b) => b == serial
+    None => false
+  }
+}
+
+fn NavController::is_foreground_moving[T](self : NavController[T], serial : Int) -> Bool {
+  let _ = self.ver.get()
+  if self.mode == NavMode::Idle {
+    return false
+  }
+  let (fg, _) = self.active_pair()
+  fg == serial
+}
+
+fn NavController::page_takes_presses[T](self : NavController[T], serial : Int) -> Bool {
+  let _ = self.ver.get()
+  if self.mode == NavMode::Dragging {
+    return false
+  }
+  match self.leaving {
+    Some(l) if l.serial == serial => return false
+    _ => ()
+  }
+  let n = self.items.length()
+  if n == 0 {
+    return false
+  }
+  self.items[n - 1].serial == serial
+}
+
+fn NavController::live_progress_on[T](self : NavController[T], v : view::View) -> Double {
+  let _ = self.ver.get()
+  match self.mode {
+    NavMode::Idle => 0.0
+    NavMode::Dragging => clamp_unit(self.drag_progress.get())
+    NavMode::Pushing | NavMode::Popping | NavMode::Cancelling => clamp_unit(self.way.shown_on(v))
+  }
+}
+
+fn NavController::page_shift_on[T](
+  self : NavController[T],
+  serial : Int,
+  v : view::View,
+) -> (Double, Double) {
+  let _ = self.ver.get()
+  if self.mode == NavMode::Idle {
+    return (0.0, 0.0)
+  }
+  let (fg, bg) = self.active_pair()
+  if serial == fg {
+    let p = self.live_progress_on(v)
+    (foreground_shift_x(p), 0.0)
+  } else {
+    match bg {
+      Some(b) if b == serial => {
+        let p = self.live_progress_on(v)
+        (background_shift_x(p, parallax=self.transition.parallax), 0.0)
+      }
+      _ => (0.0, 0.0)
+    }
+  }
+}
+
+fn NavController::scrim_ink_on[T](self : NavController[T], serial : Int, v : view::View) -> Int64 {
+  if !self.is_background(serial) {
+    return 0L
+  }
+  let p = self.live_progress_on(v)
+  scrim_ink(scrim_alpha(p, max_alpha=self.transition.scrim_max))
+}
+
+fn NavController::edge_hairline_ink_on[T](
+  self : NavController[T],
+  serial : Int,
+  v : view::View,
+) -> Int64 {
+  if !self.is_foreground_moving(serial) {
+    return 0L
+  }
+  let p = self.live_progress_on(v)
+  edge_hairline_ink(p)
+}
+
+fn NavController::motion_ends_at[T](self : NavController[T]) -> Double {
+  let _ = self.ver.get()
+  match self.mode {
+    NavMode::Pushing | NavMode::Popping | NavMode::Cancelling => self.way.ends_at()
+    NavMode::Idle | NavMode::Dragging => -1.0
+  }
+}

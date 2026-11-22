@@ -1,0 +1,321 @@
+// End-to-end tests for `packages/nav`:
+// - Parallax transition math & gesture predicates
+// - Push animation frame-by-frame parallax & scrim continuity, post-settle click isolation, 0 unasked_faults
+// - Interactive left-edge swipe-back commit (> 42%), cancel bounce (< 42% slow), and high-velocity flick (>= 500 pt/s)
+// - pop_to_root, replace, rapid push/pop stress, reduced_motion instant cut, and JSX <NavStack> shell.
+
+import "signals"
+import "ui"
+import "view"
+
+fn nav_approx(a : Double, b : Double, eps : Double) -> Bool {
+  (a - b).abs() <= eps
+}
+
+fn find_word_x(t : ui::Tester, text : String) -> Option[Double] {
+  for d in t.drawn() {
+    if d.words == text {
+      return Some(d.x)
+    }
+  }
+  None
+}
+
+fn has_word(t : ui::Tester, text : String) -> Bool {
+  find_word_x(t, text).is_some()
+}
+
+test "transition_math_and_predicates" {
+  // Foreground x = width * progress
+  debug_assert(nav_approx(foreground_offset_x(400.0, 0.0), 0.0, 1.0e-9), "fg at 0")
+  debug_assert(nav_approx(foreground_offset_x(400.0, 0.5), 200.0, 1.0e-9), "fg at 0.5")
+  debug_assert(nav_approx(foreground_offset_x(400.0, 1.0), 400.0, 1.0e-9), "fg at 1")
+
+  // Background -30% parallax = -0.30 * width * (1 - progress)
+  debug_assert(nav_approx(background_offset_x(400.0, 0.0), -120.0, 1.0e-9), "bg at 0")
+  debug_assert(nav_approx(background_offset_x(400.0, 0.5), -60.0, 1.0e-9), "bg at 0.5")
+  debug_assert(nav_approx(background_offset_x(400.0, 1.0), 0.0, 1.0e-9), "bg at 1")
+
+  // Scrim alpha = 0.14 * (1 - progress)
+  debug_assert(nav_approx(scrim_alpha(0.0), 0.14, 1.0e-9), "scrim at 0")
+  debug_assert(nav_approx(scrim_alpha(0.5), 0.07, 1.0e-9), "scrim at 0.5")
+  debug_assert(nav_approx(scrim_alpha(1.0), 0.0, 1.0e-9), "scrim at 1")
+  debug_assert(scrim_ink(0.0) == 0L, "scrim ink invisible at 0")
+  debug_assert(scrim_ink(0.14) == 36L, "scrim ink 0.14 * 255 = 36")
+
+  // Edge zone & horizontal lock & commit decision
+  debug_assert(is_edge_zone(0.0), "x=0 in edge zone")
+  debug_assert(is_edge_zone(28.0), "x=28 in edge zone")
+  debug_assert(!is_edge_zone(28.5), "x=28.5 outside edge zone")
+  debug_assert(!is_edge_zone(-1.0), "negative x outside edge zone")
+  debug_assert(claims_horizontal_swipe(12.0, 2.0), "horizontal right claims")
+  debug_assert(!claims_horizontal_swipe(4.0, 0.0), "below slop does not claim")
+  debug_assert(!claims_horizontal_swipe(12.0, 14.0), "vertical drag does not claim")
+  debug_assert(!claims_horizontal_swipe(-20.0, 0.0), "leftward drag does not claim")
+  debug_assert(should_commit_pop(0.42, 0.0), "progress >= 0.42 commits")
+  debug_assert(should_commit_pop(0.15, 520.0), "velocity >= 500 commits")
+  debug_assert(!should_commit_pop(0.30, 100.0), "slow shallow drag cancels")
+}
+
+test "push_parallax_scrim_continuity_and_click_isolation" {
+  ui::set_reduced_motion(Some(false))
+  let ctrl = NavController::new("home", "Home")
+  let home_clicks = ui::ref_new(0)
+  let detail_clicks = ui::ref_new(0)
+  let t = ui::Tester::tree(
+    fn(root : view::View) {
+      let _ = nav_stack(root, ctrl, fn(page : view::View, entry : NavEntry[String]) {
+        let _ = page.ground(view::Live::Is(0xFFFFFFFFL))
+        let _ = page.box(fn(btn : view::View) {
+          let _ = btn
+          .width(view::Live::Is(Some(200.0)))
+          .height(view::Live::Is(Some(60.0)))
+          .on_press(fn() {
+            if entry.key == "home" {
+              home_clicks.v = home_clicks.v + 1
+            } else {
+              detail_clicks.v = detail_clicks.v + 1
+            }
+          })
+          let _ = btn.words(view::Live::Is(entry.route), look=view::words_plain)
+        })
+      })
+    },
+    width=400.0,
+    height=600.0,
+  )
+
+  debug_assert(ctrl.depth() == 1 && !ctrl.can_pop(), "initial depth 1")
+  debug_assert(has_word(t, "Home"), "Home visible initially")
+  t.click(50.0, 20.0)
+  debug_assert(home_clicks.v == 1, "Home receives click at rest")
+
+  // Push Detail and sample mid-animation frames
+  ctrl.push("detail", "Detail")
+  debug_assert(ctrl.depth() == 2 && ctrl.can_pop(), "depth 2 after push")
+  debug_assert(ctrl.mode() == NavMode::Pushing, "mode is Pushing")
+  t.frame(ms=16.0)
+
+  let fg_x_1 = find_word_x(t, "Detail").unwrap_or(-999.0)
+  let bg_x_1 = find_word_x(t, "Home").unwrap_or(999.0)
+  let scrim_1 = ctrl.scrim_alpha_at(t.time())
+  debug_assert(fg_x_1 > 0.0 && fg_x_1 < 400.0, "Detail slides in from right at t=16ms")
+  debug_assert(bg_x_1 < 0.0 && bg_x_1 > -120.0, "Home shifts left with -30% parallax at t=16ms")
+  debug_assert(scrim_1 > 0.0 && scrim_1 < 0.14, "scrim alpha is strictly between 0 and 0.14 mid-push")
+
+  t.frame(ms=64.0)
+  let fg_x_2 = find_word_x(t, "Detail").unwrap_or(-999.0)
+  let bg_x_2 = find_word_x(t, "Home").unwrap_or(999.0)
+  let scrim_2 = ctrl.scrim_alpha_at(t.time())
+  debug_assert(fg_x_2 < fg_x_1, "Detail advances monotonically toward x=0")
+  debug_assert(bg_x_2 < bg_x_1, "Home parallax advances monotonically toward -120")
+  debug_assert(scrim_2 > scrim_1, "scrim opacity deepens monotonically during push")
+
+  // Run to rest
+  t.run_shown(1200.0)
+  debug_assert(ctrl.mode() == NavMode::Idle, "settled to Idle")
+  debug_assert(nav_approx(find_word_x(t, "Detail").unwrap_or(-1.0), 0.0, 0.5), "Detail rests at x=0")
+  debug_assert(!has_word(t, "Home"), "Home is parked and not drawn after push settles")
+  debug_assert(t.idle_said().is_none(), "tree is completely idle after settle")
+
+  // Click at (50, 20) hits ONLY Detail, never underlying Home
+  t.click(50.0, 20.0)
+  debug_assert(detail_clicks.v == 1, "Detail receives click after settle")
+  debug_assert(home_clicks.v == 1, "parked Home does NOT receive click")
+  debug_assert(t.unasked_faults().length() == 0, "0 unasked_faults during push and settle")
+  t.dispose()
+}
+
+test "interactive_edge_swipe_commit_cancel_and_flick" {
+  ui::set_reduced_motion(Some(false))
+  let ctrl = NavController::new("home", "Home")
+  let t = ui::Tester::tree(
+    fn(root : view::View) {
+      let _ = nav_stack(root, ctrl, fn(page : view::View, entry : NavEntry[String]) {
+        let _ = page.ground(view::Live::Is(0xFFFFFFFFL))
+        let _ = page.words(view::Live::Is(entry.route), look=view::words_plain)
+      })
+    },
+    width=400.0,
+    height=600.0,
+  )
+
+  // 1) Push Detail and settle
+  ctrl.push("detail", "Detail")
+  t.run_shown(1200.0)
+  debug_assert(ctrl.depth() == 2, "at Detail")
+
+  // 2) Drag starting outside edge zone (x=100 -> x=340) must NOT swipe back
+  t.drag(100.0, 200.0, 340.0, 200.0, steps=6)
+  t.run_shown(800.0)
+  debug_assert(ctrl.depth() == 2, "drag outside left 28pt edge zone does not pop")
+
+  // 3) Shallow slow drag from edge (x=10 -> x=110 over 10 slow steps -> progress 0.25, low vx) cancels & bounces back
+  t.press_at(10.0, 200.0)
+  let mut i = 1
+  while i <= 10 {
+    t.frame(ms=40.0)
+    t.move_to(10.0 + i.to_double() * 10.0, 200.0)
+    i += 1
+  }
+  debug_assert(ctrl.mode() == NavMode::Dragging, "in Dragging mode during edge swipe")
+  debug_assert(has_word(t, "Home") && has_word(t, "Detail"), "both pages visible while dragging")
+  let drag_fg = find_word_x(t, "Detail").unwrap_or(-1.0)
+  let drag_bg = find_word_x(t, "Home").unwrap_or(1.0)
+  debug_assert(drag_fg > 80.0 && drag_fg < 120.0, "Detail tracks finger at ~100pt")
+  debug_assert(drag_bg < 0.0 && drag_bg > -120.0, "Home tracks parallax while dragging")
+  // Pause slightly so velocity settles near 0, then release
+  t.frame(ms=100.0)
+  t.release(110.0, 200.0)
+  debug_assert(ctrl.mode() == NavMode::Cancelling, "shallow slow release enters Cancelling bounce")
+  t.run_shown(1200.0)
+  debug_assert(ctrl.depth() == 2 && ctrl.mode() == NavMode::Idle, "cancel bounce keeps Detail")
+  debug_assert(nav_approx(find_word_x(t, "Detail").unwrap_or(-1.0), 0.0, 0.5), "Detail returned to x=0")
+
+  // 4) Edge drag past 42% threshold (x=10 -> x=230 -> progress = 0.55) commits pop
+  t.press_at(10.0, 200.0)
+  let mut j = 1
+  while j <= 8 {
+    t.frame(ms=30.0)
+    t.move_to(10.0 + j.to_double() * 27.5, 200.0)
+    j += 1
+  }
+  t.frame(ms=80.0)
+  t.release(230.0, 200.0)
+  debug_assert(ctrl.depth() == 1, "progress >= 0.42 commits pop immediately")
+  t.run_shown(1200.0)
+  debug_assert(ctrl.mode() == NavMode::Idle, "pop settled to Idle")
+  debug_assert(has_word(t, "Home") && !has_word(t, "Detail"), "Home visible, Detail disposed")
+
+  // 5) High-velocity shallow flick (x=10 -> x=110 in 2 fast 16ms frames -> ~3100 pt/s, progress 0.25 < 0.42) commits pop
+  ctrl.push("flick", "Flick")
+  t.run_shown(1200.0)
+  debug_assert(ctrl.depth() == 2, "at Flick")
+  t.drag(10.0, 200.0, 110.0, 200.0, steps=2)
+  debug_assert(ctrl.depth() == 1, "high-velocity flick commits pop even below 0.42")
+  t.run_shown(1200.0)
+  debug_assert(has_word(t, "Home") && !has_word(t, "Flick"), "Flick disposed after settle")
+  debug_assert(t.unasked_faults().length() == 0, "0 unasked_faults across swipe tests")
+  t.dispose()
+}
+
+test "pop_to_root_replace_rapid_ops_and_reduced_motion" {
+  ui::set_reduced_motion(Some(false))
+  let ctrl = NavController::new("r0", "Root")
+  let t = ui::Tester::tree(
+    fn(root : view::View) {
+      let _ = NavStack(
+        root,
+        controller=ctrl,
+        render_page=fn(page : view::View, entry : NavEntry[String]) {
+          let _ = page.ground(view::Live::Is(0xFFFFFFFFL))
+          let _ = page.words(view::Live::Is(entry.route), look=view::words_plain)
+        },
+      )
+    },
+    width=400.0,
+    height=600.0,
+  )
+
+  // Rapid push/pop/push without waiting for settles
+  ctrl.push("p1", "Page1")
+  t.frame(ms=16.0)
+  ctrl.push("p2", "Page2")
+  t.frame(ms=16.0)
+  let popped = ctrl.pop()
+  debug_assert(popped, "pop mid-flight succeeds")
+  t.frame(ms=16.0)
+  ctrl.push("p3", "Page3")
+  ctrl.push("p4", "Page4")
+  debug_assert(ctrl.depth() == 4, "depth is 4 after rapid ops")
+  t.run_shown(1200.0)
+  debug_assert(has_word(t, "Page4") && !has_word(t, "Page3") && !has_word(t, "Root"), "only top Page4 drawn at rest")
+
+  // Replace top page cleanly
+  ctrl.replace("p4b", "Page4Replaced")
+  t.frame(ms=16.0)
+  debug_assert(ctrl.depth() == 4, "replace preserves depth")
+  debug_assert(has_word(t, "Page4Replaced") && !has_word(t, "Page4"), "old top disposed, replacement shown")
+
+  // pop_to_root drops intermediate pages and animates back to Root
+  ctrl.pop_to_root()
+  debug_assert(ctrl.depth() == 1 && !ctrl.can_pop(), "depth is 1 after pop_to_root")
+  t.run_shown(1200.0)
+  debug_assert(has_word(t, "Root") && !has_word(t, "Page4Replaced"), "Root restored and no dangling nodes")
+  debug_assert(!ctrl.pop(), "pop at root returns false")
+
+  // reduced_motion instant cut
+  ui::set_reduced_motion(Some(true))
+  ctrl.push("instant", "InstantPage")
+  t.frame(ms=0.0)
+  debug_assert(ctrl.mode() == NavMode::Idle, "reduced_motion push settles immediately")
+  debug_assert(has_word(t, "InstantPage") && !has_word(t, "Root"), "InstantPage visible immediately")
+  let _ = ctrl.pop()
+  t.frame(ms=0.0)
+  debug_assert(ctrl.mode() == NavMode::Idle, "reduced_motion pop settles immediately")
+  debug_assert(has_word(t, "Root") && !has_word(t, "InstantPage"), "Root restored immediately")
+  ui::set_reduced_motion(Some(false))
+
+  debug_assert(t.unasked_faults().length() == 0, "0 unasked_faults across rapid ops and reduced_motion")
+  t.dispose()
+}
+
+test "parking_state_preservation_and_disposal" {
+  ui::set_reduced_motion(Some(false))
+  let ctrl = NavController::new("p0", "P0")
+  let root_counter = signals::signal(0)
+  let disposed_keys : Array[String] = []
+  let t = ui::Tester::tree(
+    fn(root : view::View) {
+      let _ = <NavStack
+        in={root}
+        controller={ctrl}
+        render_page={fn(page : view::View, entry : NavEntry[String]) {
+          let k = entry.key
+          let _ = page.owns(fn() { disposed_keys.push(k) })
+          let _ = page.ground(view::Live::Is(0xFFFFFFFFL))
+          if k == "p0" {
+            let _ = page.words(
+              view::Live::By(fn() { "P0:\{root_counter.get()}" }),
+              look=view::words_plain,
+            )
+          } else {
+            let _ = page.words(view::Live::Is(entry.route), look=view::words_plain)
+          }
+        }}
+      />
+    },
+    width=400.0,
+    height=600.0,
+  )
+
+  root_counter.set(42)
+  t.frame(ms=16.0)
+  debug_assert(has_word(t, "P0:42"), "root shows live signal state")
+
+  // Push P1, P2, P3 (depth 4)
+  ctrl.push("p1", "P1")
+  t.run_shown(1200.0)
+  ctrl.push("p2", "P2")
+  t.run_shown(1200.0)
+  ctrl.push("p3", "P3")
+  t.frame(ms=16.0)
+  // During P3 push, only top-2 (P2 and P3) are drawn; P0 and P1 are parked
+  debug_assert(has_word(t, "P3") && has_word(t, "P2"), "top-2 visible during push")
+  debug_assert(!has_word(t, "P1") && !has_word(t, "P0:42"), "deeper pages parked during push")
+  t.run_shown(1200.0)
+  debug_assert(disposed_keys.length() == 0, "parked pages are not disposed while on stack")
+
+  // Pop P3 -> P3 disposed after settle
+  let _ = ctrl.pop()
+  t.run_shown(1200.0)
+  debug_assert(disposed_keys.length() == 1 && disposed_keys[0] == "p3", "popped P3 disposed")
+
+  // pop_to_root drops P1 immediately and disposes P2 after settle, restoring parked P0 with state intact
+  ctrl.pop_to_root()
+  t.run_shown(1200.0)
+  debug_assert(has_word(t, "P0:42"), "parked root page restored with signal state intact")
+  debug_assert(disposed_keys.length() == 3, "P1, P2, P3 all disposed after pop_to_root")
+  debug_assert(t.unasked_faults().length() == 0, "0 unasked_faults across parking and disposal")
+  t.dispose()
+}
