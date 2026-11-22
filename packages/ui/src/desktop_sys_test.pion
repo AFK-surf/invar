@@ -1,0 +1,205 @@
+// End-to-end tests for desktop & system integration:
+// window_zoom, drop (words/paths/files), files (FilePick/FileKeep/GalleryRead/update_*), and gamepads.
+
+import "hostapi"
+import "view"
+
+test "desktop_sys: window_zoom clamping, coordinate conversion, and Cmd/Ctrl +/-/0 shortcuts" {
+  let fake = FakeHost::new(platform=0)
+  let prev = fake.install()
+  let host_zoom = ref_new(1.0)
+  let h = hostapi::host()
+  h.platform = fn() { 0 }
+  h.keys_platform = fn() { 0 }
+  h.set_window_zoom = fn(z : Double) { host_zoom.v = z }
+
+  let _ = zoom_reset()
+  debug_assert(window_zoom_supported(), "macOS supports window zoom")
+  debug_assert((window_zoom() - 1.0).abs() < 1.0e-6, "reset sets 1.0")
+
+  set_window_zoom(0.1)
+  debug_assert((window_zoom() - 0.5).abs() < 1.0e-6 && (host_zoom.v - 0.5).abs() < 1.0e-6, "clamps low to 0.5")
+  set_window_zoom(9.0)
+  debug_assert((window_zoom() - 3.0).abs() < 1.0e-6 && (host_zoom.v - 3.0).abs() < 1.0e-6, "clamps high to 3.0")
+
+  set_window_zoom(2.0)
+  debug_assert((window_points_to_content(100.0) - 50.0).abs() < 1.0e-6, "points_to_content divides by zoom")
+
+  // Cmd + '+' zooms in, Cmd + '-' zooms out, Cmd + '0' resets
+  debug_assert(handle_zoom_shortcut(key_of_char('+'), mod_cmd), "Cmd++ handled")
+  debug_assert((window_zoom() - 2.1).abs() < 1.0e-6, "zoomed in to 2.1")
+  debug_assert(handle_zoom_shortcut(key_of_char('-'), mod_cmd), "Cmd+- handled")
+  debug_assert((window_zoom() - 2.0).abs() < 1.0e-6, "zoomed out to 2.0")
+  debug_assert(handle_zoom_shortcut(key_of_char('0'), mod_cmd), "Cmd+0 handled")
+  debug_assert((window_zoom() - 1.0).abs() < 1.0e-6, "reset to 1.0")
+  debug_assert(!handle_zoom_shortcut(key_of_char('+'), 0), "plain + without Cmd ignored")
+
+  let _ = hostapi::set_host(prev)
+}
+
+test "desktop_sys: pure-node drop targets for words_into, paths_into, and files_into" {
+  let fld = Field::new(text="Hi ")
+  let got_paths : Ref[Array[DroppedPath]] = ref_new([])
+  let got_files : Ref[Array[hostapi::Picked]] = ref_new([])
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(w : view::View) {
+        let _ = words_into(w.over_xy(0.0, 0.0).size(100.0, 40.0), fld)
+      })
+      let _ = root.box(fn(p : view::View) {
+        let _ = paths_into(p.over_xy(0.0, 50.0).size(100.0, 40.0), fn(ps : Array[DroppedPath]) {
+          got_paths.v = ps
+        })
+      })
+      let _ = root.box(fn(f : view::View) {
+        let _ = files_into(f.over_xy(0.0, 100.0).size(100.0, 40.0), fn(fs : Array[hostapi::Picked]) {
+          got_files.v = fs
+        })
+      })
+    },
+    width=200.0,
+    height=200.0,
+  )
+
+  debug_assert(takes_drops(), "desktop FakeHost takes_drops")
+  debug_assert(t.drop_words("there", x=20.0, y=20.0), "drop_words hits words_into target")
+  debug_assert(fld.text() == "Hi there", "Field received dropped words")
+
+  let p0 = DroppedPath::{ path: "/tmp/a.txt", name: "a.txt", is_dir: false }
+  debug_assert(t.drop_paths([p0], x=20.0, y=70.0), "drop_paths hits paths_into target")
+  debug_assert(got_paths.v.length() == 1 && got_paths.v[0].name == "a.txt", "paths_into received DroppedPath")
+
+  let f0 = hostapi::Picked::{ name: "pic.png", bytes: "png".to_bytes(), held: 0, size: 3.0, src: "" }
+  debug_assert(t.hold_files([f0], x=20.0, y=120.0), "hold_files hits files_into target")
+  debug_assert(got_files.v.length() == 1 && got_files.v[0].name == "pic.png", "files_into received Picked file")
+
+  t.dispose()
+}
+
+test "desktop_sys: FilePick, FileKeep, keep_bytes, GalleryRead, and update_* bridge" {
+  let fake = FakeHost::new(platform=0)
+  let prev = fake.install()
+  let h = hostapi::host()
+  let kept_bytes = ref_new(0)
+  let kept_done = ref_new(false)
+  let upd_state = ref_new("idle")
+
+  h.pk_start = fn(_k : Int) { 7 }
+  h.pk_state = fn(_id : Int) { 1 }
+  h.pk_count = fn(_id : Int) { 1 }
+  h.pk_name = fn(_id : Int, _i : Int) { "report.pdf" }
+  h.pk_bytes = fn(_id : Int, _i : Int) { "PDFDATA".to_bytes() }
+  h.pk_info = fn(_id : Int, _i : Int) { "0\t7\t" }
+  h.pk_end = fn(_id : Int) { () }
+
+  h.kp_begin = fn(_name : String, _mime : String, _w : Int) { 9 }
+  h.kp_append = fn(_id : Int, data : Bytes) {
+    kept_bytes.v = kept_bytes.v + data.length()
+    1
+  }
+  h.kp_finish = fn(_id : Int) { kept_done.v = true }
+  h.kp_state = fn(_id : Int) { if kept_done.v { 1 } else { 0 } }
+  h.kp_where = fn(_id : Int) { "/Downloads/out.bin" }
+  h.kp_end = fn(_id : Int) { () }
+
+  h.ga_read = fn() { 11 }
+  h.ga_read_state = fn(_id : Int) { 1 }
+  h.ga_read_rows = fn(_id : Int) { "42\tphoto://42\t100\t100\t100\t0" }
+  h.ga_read_end = fn(_id : Int) { () }
+
+  h.update_fetch = fn(_url : String, _sha : String, _sz : Double, name : String, _now : Bool, _d : String) {
+    upd_state.v = "fetched:" + name
+  }
+  h.update_apply = fn(said : String) { upd_state.v = "applied:" + said }
+  h.update_state = fn() { upd_state.v }
+
+  // FilePick
+  match FilePick::start(hostapi::PickKind::Files) {
+    Some(fp) => {
+      debug_assert(fp.id() == 7, "FilePick id")
+      match fp.files() {
+        Some(fs) => debug_assert(fs.length() == 1 && fs[0].name == "report.pdf", "FilePick read report.pdf")
+        None => debug_assert(false, "expected picked files")
+      }
+    }
+    None => debug_assert(false, "expected FilePick::start Some")
+  }
+
+  // FileKeep + keep_bytes
+  match keep_bytes("out.bin", "application/octet-stream", "hello".to_bytes(), hostapi::KeepWay::Downloads) {
+    Some(fk) => {
+      debug_assert(kept_bytes.v == 5 && kept_done.v, "keep_bytes wrote 5 bytes and finished")
+      match fk.kept() {
+        hostapi::Kept::KeptAt(where) => debug_assert(where == "/Downloads/out.bin", "KeptAt path")
+        _ => debug_assert(false, "expected KeptAt")
+      }
+      fk.end()
+    }
+    None => debug_assert(false, "expected keep_bytes Some")
+  }
+
+  // GalleryRead
+  match GalleryRead::start() {
+    Some(gr) => {
+      debug_assert(gr.id() == 11, "GalleryRead id")
+      match gr.photos() {
+        Some(ps) => debug_assert(ps.length() == 1 && ps[0].src == "photo://42", "GalleryRead parsed photo")
+        None => debug_assert(false, "expected gallery photos")
+      }
+    }
+    None => debug_assert(false, "expected GalleryRead::start Some")
+  }
+
+  // Update bridge
+  update_fetch("https://example.invalid/app.dmg", "abc", 1024.0, "v2.0")
+  debug_assert(update_state() == "fetched:v2.0", "update_fetch forwarded")
+  update_apply("v2.0")
+  debug_assert(update_state() == "applied:v2.0", "update_apply forwarded")
+
+  let _ = hostapi::set_host(prev)
+}
+
+test "desktop_sys: gamepad_normalize_axis dead-zone and gamepads_follow polling" {
+  // Inside dead zone -> 0.0
+  debug_assert(gamepad_normalize_axis(0.05).abs() < 1.0e-6, "inside dead zone -> 0")
+  debug_assert(gamepad_normalize_axis(-0.06).abs() < 1.0e-6, "boundary dead zone -> 0")
+  // NaN -> 0.0
+  debug_assert(gamepad_normalize_axis(0.0 / 0.0).abs() < 1.0e-6, "NaN -> 0")
+  // Full deflection -> +/-1.0
+  debug_assert((gamepad_normalize_axis(1.0) - 1.0).abs() < 1.0e-6, "+1.0 stays +1.0")
+  debug_assert((gamepad_normalize_axis(-1.5) - (-1.0)).abs() < 1.0e-6, "clamps to -1.0")
+  // Midpoint rescaled smoothly above dead zone
+  let mid = gamepad_normalize_axis(0.53, dead_zone=0.06)
+  debug_assert((mid - 0.5).abs() < 1.0e-5, "rescaled midpoint (0.53-0.06)/(1-0.06) == 0.5")
+
+  // gamepads_follow via Tester
+  let seen_count = ref_new(0)
+  let last_buttons = ref_new(0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) { let _ = b.size(40.0, 40.0) })
+  })
+  let h = hostapi::host()
+  h.gamepads = fn(out : Array[Double]) -> Int {
+    out[0] = 0.0
+    out[1] = 1.0
+    out[2] = 5.0
+    out[3] = 0.53
+    out[4] = 0.0
+    out[5] = 0.0
+    out[6] = 0.0
+    out[7] = 0.5
+    out[8] = 0.0
+    1
+  }
+  let stop = gamepads_follow(fn(snap : GamepadSnapshot) {
+    seen_count.v = seen_count.v + 1
+    if snap.pads.length() > 0 {
+      last_buttons.v = snap.pads[0].buttons
+    }
+  })
+  t.fake.frame_requested = true
+  t.frame(ms=20.0)
+  debug_assert(seen_count.v == 1 && last_buttons.v == 5, "gamepads_follow emitted initial gamepad snapshot")
+  stop()
+  t.dispose()
+}

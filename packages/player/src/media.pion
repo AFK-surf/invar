@@ -1,0 +1,518 @@
+// Reactive audio/video player state machine and subtitle timeline engine.
+// Pure fine-grained signals with zero retained-context coupling.
+
+import "codec"
+import "dmath"
+import "signals"
+
+/// Idle delay (ms) before playback controls auto-hide while playing.
+pub let media_rest_ms : Double = 2500.0
+
+/// Duration (ms) a transient HUD note (volume/speed/seek/subtitle/fit) stays visible.
+pub let media_note_ms : Double = 800.0
+
+/// Timeout (ms) while loading before reporting a decode failure.
+pub let media_decode_wait_ms : Double = 10000.0
+
+/// Stepped playback rate presets.
+pub let media_speeds : Array[Double] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+
+fn media_clamp(x : Double, lo : Double, hi : Double) -> Double {
+  if x != x || x < lo {
+    lo
+  } else if x > hi {
+    hi
+  } else {
+    x
+  }
+}
+
+/// Descriptor for a playable audio or video source.
+pub struct MediaTrack {
+  pub url : String
+  pub title : String
+  pub duration_ms : Double
+  pub has_video : Bool
+  pub has_audio : Bool
+}
+
+/// Playback lifecycle phase.
+pub enum MediaPhase {
+  Idle
+  Loading
+  Playing
+  Paused
+  Ended
+  Failed(String)
+}
+
+pub fn media_phase_eq(a : MediaPhase, b : MediaPhase) -> Bool {
+  match (a, b) {
+    (MediaPhase::Idle, MediaPhase::Idle) => true
+    (MediaPhase::Loading, MediaPhase::Loading) => true
+    (MediaPhase::Playing, MediaPhase::Playing) => true
+    (MediaPhase::Paused, MediaPhase::Paused) => true
+    (MediaPhase::Ended, MediaPhase::Ended) => true
+    (MediaPhase::Failed(x), MediaPhase::Failed(y)) => x == y
+    _ => false
+  }
+}
+
+/// Snapshot pushed by a native or web media backend into `Media::on_status`.
+pub struct MediaStatus {
+  pub phase : MediaPhase
+  pub position_ms : Double
+  pub duration_ms : Double
+  pub buffered_ms : Double
+  pub muted : Bool
+  pub volume : Double
+  pub speed : Double
+  pub error : String
+}
+
+/// Transient HUD overlay feedback emitted on user playback actions.
+pub enum MediaNote {
+  Volume(Double)
+  Speed(Double)
+  Seek(Double)
+  PlayPause(Bool)
+  Subtitle(Bool)
+  Fit(Bool)
+}
+
+pub fn MediaNote::eq(self : MediaNote, other : MediaNote) -> Bool {
+  match (self, other) {
+    (MediaNote::Volume(a), MediaNote::Volume(b)) => (a - b).abs() < 1.0e-6
+    (MediaNote::Speed(a), MediaNote::Speed(b)) => (a - b).abs() < 1.0e-6
+    (MediaNote::Seek(a), MediaNote::Seek(b)) => (a - b).abs() < 1.0e-6
+    (MediaNote::PlayPause(a), MediaNote::PlayPause(b)) => a == b
+    (MediaNote::Subtitle(a), MediaNote::Subtitle(b)) => a == b
+    (MediaNote::Fit(a), MediaNote::Fit(b)) => a == b
+    _ => false
+  }
+}
+
+/// Fine-grained reactive media player state machine.
+pub struct Media {
+  track_sig : signals::Signal[Option[MediaTrack]]
+  phase_sig : signals::Signal[MediaPhase]
+  position_sig : signals::Signal[Double]
+  duration_sig : signals::Signal[Double]
+  buffered_sig : signals::Signal[Double]
+  volume_sig : signals::Signal[Double]
+  muted_sig : signals::Signal[Bool]
+  speed_sig : signals::Signal[Double]
+  fill_sig : signals::Signal[Bool]
+  sub_on_sig : signals::Signal[Bool]
+  sub_cues_sig : signals::Signal[Array[codec::Cue]]
+  controls_sig : signals::Signal[Bool]
+  note_sig : signals::Signal[Option[MediaNote]]
+  scrubbing_sig : signals::Signal[Bool]
+  scrub_ms_sig : signals::Signal[Double]
+  mut last_clock_ms : Double
+  mut controls_since_ms : Double
+  mut note_since_ms : Double
+  mut loading_since_ms : Double
+  mut loading_tracked : Bool
+  mut scrub_was_playing : Bool
+  mut start_pos_ms : Double
+  mut auto_play : Bool
+}
+
+pub fn Media::new() -> Media {
+  Media::{
+    track_sig: signals::signal_by(None, fn(_a, _b) { false }),
+    phase_sig: signals::signal_by(MediaPhase::Idle, fn(a, b) { media_phase_eq(a, b) }),
+    position_sig: signals::signal(0.0),
+    duration_sig: signals::signal(0.0),
+    buffered_sig: signals::signal(0.0),
+    volume_sig: signals::signal(1.0),
+    muted_sig: signals::signal(false),
+    speed_sig: signals::signal(1.0),
+    fill_sig: signals::signal(false),
+    sub_on_sig: signals::signal(false),
+    sub_cues_sig: signals::signal_by([], fn(_a, _b) { false }),
+    controls_sig: signals::signal(true),
+    note_sig: signals::signal_by(None, fn(_a, _b) { false }),
+    scrubbing_sig: signals::signal(false),
+    scrub_ms_sig: signals::signal(0.0),
+    last_clock_ms: 0.0,
+    controls_since_ms: 0.0,
+    note_since_ms: 0.0,
+    loading_since_ms: 0.0,
+    loading_tracked: false,
+    scrub_was_playing: false,
+    start_pos_ms: 0.0,
+    auto_play: true,
+  }
+}
+
+pub fn Media::track(self : Media) -> Option[MediaTrack] {
+  self.track_sig.get()
+}
+
+pub fn Media::phase(self : Media) -> MediaPhase {
+  self.phase_sig.get()
+}
+
+pub fn Media::position_ms(self : Media) -> Double {
+  if self.scrubbing_sig.get() {
+    self.scrub_ms_sig.get()
+  } else {
+    self.position_sig.get()
+  }
+}
+
+pub fn Media::duration_ms(self : Media) -> Double {
+  self.duration_sig.get()
+}
+
+pub fn Media::buffered_ms(self : Media) -> Double {
+  self.buffered_sig.get()
+}
+
+pub fn Media::volume(self : Media) -> Double {
+  self.volume_sig.get()
+}
+
+pub fn Media::muted(self : Media) -> Bool {
+  self.muted_sig.get()
+}
+
+pub fn Media::speed(self : Media) -> Double {
+  self.speed_sig.get()
+}
+
+pub fn Media::fill(self : Media) -> Bool {
+  self.fill_sig.get()
+}
+
+pub fn Media::subtitles_on(self : Media) -> Bool {
+  self.sub_on_sig.get()
+}
+
+pub fn Media::controls_shown(self : Media) -> Bool {
+  self.controls_sig.get()
+}
+
+pub fn Media::note(self : Media) -> Option[MediaNote] {
+  self.note_sig.get()
+}
+
+pub fn Media::scrubbing(self : Media) -> Bool {
+  self.scrubbing_sig.get()
+}
+
+fn Media::push_note(self : Media, n : MediaNote) -> Unit {
+  self.note_sig.set(Some(n))
+  self.note_since_ms = self.last_clock_ms
+  self.controls_sig.set(true)
+  self.controls_since_ms = self.last_clock_ms
+}
+
+fn Media::clamp_pos(self : Media, ms : Double) -> Double {
+  let dur = self.duration_sig.untracked()
+  if dur > 0.0 {
+    media_clamp(ms, 0.0, dur)
+  } else if ms < 0.0 || ms != ms {
+    0.0
+  } else {
+    ms
+  }
+}
+
+/// Open a track at optional `start` offset (ms) and desired initial `play` state.
+pub fn Media::open(self : Media, track : MediaTrack, start~ : Double = 0.0, play~ : Bool = true) -> Unit {
+  let dur = if track.duration_ms > 0.0 { track.duration_ms } else { 0.0 }
+  let init_pos = if dur > 0.0 { media_clamp(start, 0.0, dur) } else { dmath::max(0.0, start) }
+  self.start_pos_ms = init_pos
+  self.auto_play = play
+  self.loading_tracked = true
+  self.loading_since_ms = self.last_clock_ms
+  self.controls_since_ms = self.last_clock_ms
+  self.scrub_was_playing = false
+  signals::batch(fn() {
+    self.track_sig.set(Some(track))
+    self.duration_sig.set(dur)
+    self.position_sig.set(init_pos)
+    self.buffered_sig.set(0.0)
+    self.scrubbing_sig.set(false)
+    self.scrub_ms_sig.set(init_pos)
+    self.controls_sig.set(true)
+    self.note_sig.set(None)
+    self.phase_sig.set(MediaPhase::Loading)
+  })
+}
+
+/// Retry opening the current track from its last known position after failure or end.
+pub fn Media::retry(self : Media) -> Unit {
+  match self.track_sig.untracked() {
+    Some(tr) => {
+      let pos = self.position_sig.untracked()
+      self.open(tr, start=pos, play=true)
+    }
+    None => ()
+  }
+}
+
+/// Stop playback and reset to `MediaPhase::Idle`.
+pub fn Media::close(self : Media) -> Unit {
+  self.loading_tracked = false
+  self.scrub_was_playing = false
+  signals::batch(fn() {
+    self.track_sig.set(None)
+    self.phase_sig.set(MediaPhase::Idle)
+    self.position_sig.set(0.0)
+    self.duration_sig.set(0.0)
+    self.buffered_sig.set(0.0)
+    self.scrubbing_sig.set(false)
+    self.scrub_ms_sig.set(0.0)
+    self.note_sig.set(None)
+    self.controls_sig.set(true)
+  })
+}
+
+/// Toggle between `Playing` and `Paused` (restarting from 0 if `Ended`).
+pub fn Media::play_pause(self : Media) -> Unit {
+  match self.phase_sig.untracked() {
+    MediaPhase::Playing => {
+      self.phase_sig.set(MediaPhase::Paused)
+      self.push_note(MediaNote::PlayPause(false))
+    }
+    MediaPhase::Paused => {
+      self.phase_sig.set(MediaPhase::Playing)
+      self.push_note(MediaNote::PlayPause(true))
+    }
+    MediaPhase::Ended => {
+      self.position_sig.set(0.0)
+      self.phase_sig.set(MediaPhase::Playing)
+      self.push_note(MediaNote::PlayPause(true))
+    }
+    MediaPhase::Loading => {
+      self.auto_play = !self.auto_play
+      self.push_note(MediaNote::PlayPause(self.auto_play))
+    }
+    MediaPhase::Failed(_) => self.retry()
+    MediaPhase::Idle => ()
+  }
+}
+
+/// Explicitly pause playback if currently playing.
+pub fn Media::pause(self : Media) -> Unit {
+  match self.phase_sig.untracked() {
+    MediaPhase::Playing => {
+      self.phase_sig.set(MediaPhase::Paused)
+      self.controls_sig.set(true)
+      self.controls_since_ms = self.last_clock_ms
+    }
+    MediaPhase::Loading => self.auto_play = false
+    _ => ()
+  }
+}
+
+/// Seek to an exact timestamp in milliseconds.
+pub fn Media::seek(self : Media, ms : Double) -> Unit {
+  let target = self.clamp_pos(ms)
+  self.position_sig.set(target)
+  if media_phase_eq(self.phase_sig.untracked(), MediaPhase::Ended) && target < self.duration_sig.untracked() {
+    self.phase_sig.set(MediaPhase::Paused)
+  }
+  self.push_note(MediaNote::Seek(target))
+}
+
+/// Keyframe-friendly seek rounded to the nearest 100ms grid for fast scrubbing/preview.
+pub fn Media::seek_near(self : Media, ms : Double) -> Unit {
+  let snapped = dmath::round(ms / 100.0) * 100.0
+  self.seek(snapped)
+}
+
+/// Relative seek by `delta` milliseconds (positive forward, negative backward).
+pub fn Media::seek_by(self : Media, delta : Double) -> Unit {
+  self.seek(self.position_sig.untracked() + delta)
+}
+
+/// Step playback speed through `[0.5, 0.75, 1.0, 1.25, 1.5, 2.0]` cyclically.
+pub fn Media::step_speed(self : Media) -> Double {
+  let cur = self.speed_sig.untracked()
+  let mut next = media_speeds[0]
+  let mut i = 0
+  while i < media_speeds.length() {
+    if media_speeds[i] > cur + 0.01 {
+      next = media_speeds[i]
+      break
+    }
+    i += 1
+  }
+  self.speed_sig.set(next)
+  self.push_note(MediaNote::Speed(next))
+  next
+}
+
+/// Set linear volume in `[0.0, 1.0]`.
+pub fn Media::set_volume(self : Media, vol : Double) -> Unit {
+  let clamped = media_clamp(vol, 0.0, 1.0)
+  self.volume_sig.set(clamped)
+  self.muted_sig.set(clamped <= 0.001)
+  self.push_note(MediaNote::Volume(clamped))
+}
+
+/// Configure subtitle visibility and cue list (sorted by `cue.from`).
+pub fn Media::set_subtitle(self : Media, there : Bool, cues : Array[codec::Cue]) -> Unit {
+  signals::batch(fn() {
+    self.sub_on_sig.set(there)
+    self.sub_cues_sig.set(cues)
+  })
+  self.push_note(MediaNote::Subtitle(there))
+}
+
+/// Active subtitle cue at the current playback position, or `None` when disabled or outside any cue window.
+pub fn Media::cue_now(self : Media) -> Option[codec::Cue] {
+  if !self.sub_on_sig.get() {
+    return None
+  }
+  let cues = self.sub_cues_sig.get()
+  let n = cues.length()
+  if n == 0 {
+    return None
+  }
+  let pos = self.position_ms()
+  let mut lo = 0
+  let mut hi = n - 1
+  let mut best = -1
+  while lo <= hi {
+    let mid = (lo + hi) / 2
+    if cues[mid].from <= pos {
+      best = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  // Walk backward slightly to handle overlapping cues whose earlier cue still spans `pos`.
+  let mut idx = best
+  while idx >= 0 {
+    let c = cues[idx]
+    if pos >= c.from && pos < c.to {
+      return Some(c)
+    }
+    if pos - c.from > 60000.0 {
+      break
+    }
+    idx -= 1
+  }
+  None
+}
+
+/// Toggle video aspect fit vs fill mode.
+pub fn Media::toggle_fill(self : Media) -> Bool {
+  let next = !self.fill_sig.untracked()
+  self.fill_sig.set(next)
+  self.push_note(MediaNote::Fit(next))
+  next
+}
+
+/// Begin interactive timeline scrubbing at `ms`, temporarily holding playback.
+pub fn Media::begin_scrub(self : Media, ms : Double) -> Unit {
+  let target = self.clamp_pos(ms)
+  self.scrub_was_playing = media_phase_eq(self.phase_sig.untracked(), MediaPhase::Playing)
+  signals::batch(fn() {
+    self.scrubbing_sig.set(true)
+    self.scrub_ms_sig.set(target)
+    self.controls_sig.set(true)
+    if self.scrub_was_playing {
+      self.phase_sig.set(MediaPhase::Paused)
+    }
+  })
+  self.controls_since_ms = self.last_clock_ms
+}
+
+/// Update timeline scrub preview position.
+pub fn Media::update_scrub(self : Media, ms : Double) -> Unit {
+  if !self.scrubbing_sig.untracked() {
+    return
+  }
+  let target = self.clamp_pos(ms)
+  self.scrub_ms_sig.set(target)
+  self.controls_since_ms = self.last_clock_ms
+}
+
+/// Commit scrubbed position and resume playback if it was playing prior to scrubbing.
+pub fn Media::end_scrub(self : Media) -> Unit {
+  if !self.scrubbing_sig.untracked() {
+    return
+  }
+  let target = self.scrub_ms_sig.untracked()
+  let resume = self.scrub_was_playing
+  self.scrub_was_playing = false
+  signals::batch(fn() {
+    self.scrubbing_sig.set(false)
+    self.position_sig.set(target)
+    if resume {
+      self.phase_sig.set(MediaPhase::Playing)
+    }
+  })
+  self.push_note(MediaNote::Seek(target))
+}
+
+/// Ingest a backend status snapshot (from native AVPlayer/MediaCodec/HTMLVideoElement).
+pub fn Media::on_status(self : Media, s : MediaStatus) -> Unit {
+  let next_phase = if s.error.length() > 0 {
+    MediaPhase::Failed(s.error)
+  } else {
+    s.phase
+  }
+  match next_phase {
+    MediaPhase::Loading => {
+      if !self.loading_tracked {
+        self.loading_tracked = true
+        self.loading_since_ms = self.last_clock_ms
+      }
+    }
+    _ => self.loading_tracked = false
+  }
+  signals::batch(fn() {
+    self.phase_sig.set(next_phase)
+    if s.duration_ms > 0.0 {
+      self.duration_sig.set(s.duration_ms)
+    }
+    if !self.scrubbing_sig.untracked() {
+      self.position_sig.set(self.clamp_pos(s.position_ms))
+    }
+    self.buffered_sig.set(dmath::max(0.0, s.buffered_ms))
+    self.muted_sig.set(s.muted)
+    self.volume_sig.set(media_clamp(s.volume, 0.0, 1.0))
+    if s.speed > 0.0 {
+      self.speed_sig.set(s.speed)
+    }
+  })
+}
+
+/// Mark user interaction to reveal controls and reset the auto-hide timer.
+pub fn Media::touch(self : Media, now : Double) -> Unit {
+  self.last_clock_ms = now
+  self.controls_since_ms = now
+  self.controls_sig.set(true)
+}
+
+/// Advance internal timers at wall-clock timestamp `now` (ms):
+/// - Auto-hides controls after `media_rest_ms` (2500ms) while playing and not scrubbing.
+/// - Fades out transient HUD notes after `media_note_ms` (800ms).
+/// - Fails with `"decode timeout"` if stuck in `Loading` past `media_decode_wait_ms` (10000ms).
+pub fn Media::tick(self : Media, now : Double) -> Unit {
+  self.last_clock_ms = now
+  if self.note_sig.untracked().is_some() && now - self.note_since_ms >= media_note_ms {
+    self.note_sig.set(None)
+  }
+  let phase = self.phase_sig.untracked()
+  if media_phase_eq(phase, MediaPhase::Playing) &&
+  !self.scrubbing_sig.untracked() &&
+  self.controls_sig.untracked() &&
+  now - self.controls_since_ms >= media_rest_ms {
+    self.controls_sig.set(false)
+  }
+  if media_phase_eq(phase, MediaPhase::Loading) && self.loading_tracked && now - self.loading_since_ms >= media_decode_wait_ms {
+    self.loading_tracked = false
+    self.phase_sig.set(MediaPhase::Failed("decode timeout"))
+    self.controls_sig.set(true)
+  }
+}

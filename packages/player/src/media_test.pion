@@ -1,0 +1,173 @@
+// Unit tests for packages/player: Media state machine, subtitle cues, speed stepping,
+// scrubbing, auto-hide & HUD note timers, and decode timeout + retry.
+
+import "codec"
+
+fn sample_track() -> MediaTrack {
+  MediaTrack::{
+    url: "https://example.invalid/demo.mp4",
+    title: "Demo Clip",
+    duration_ms: 120000.0,
+    has_video: true,
+    has_audio: true,
+  }
+}
+
+test "player: open, on_status, play_pause, pause, ended restart, and close" {
+  let m = Media::new()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Idle), "starts Idle")
+  m.open(sample_track(), start=5000.0, play=true)
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Loading), "open enters Loading")
+  debug_assert((m.position_ms() - 5000.0).abs() < 0.01, "start offset applied")
+  debug_assert((m.duration_ms() - 120000.0).abs() < 0.01, "duration initialized")
+
+  m.on_status(MediaStatus::{
+    phase: MediaPhase::Playing,
+    position_ms: 6200.0,
+    duration_ms: 120000.0,
+    buffered_ms: 30000.0,
+    muted: false,
+    volume: 0.8,
+    speed: 1.0,
+    error: "",
+  })
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing), "on_status transitions to Playing")
+  debug_assert((m.position_ms() - 6200.0).abs() < 0.01, "position updated")
+  debug_assert((m.buffered_ms() - 30000.0).abs() < 0.01, "buffered updated")
+
+  m.play_pause()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Paused), "play_pause pauses Playing")
+  m.play_pause()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing), "play_pause resumes Paused")
+  m.pause()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Paused), "explicit pause")
+
+  m.on_status(MediaStatus::{
+    phase: MediaPhase::Ended,
+    position_ms: 120000.0,
+    duration_ms: 120000.0,
+    buffered_ms: 120000.0,
+    muted: false,
+    volume: 0.8,
+    speed: 1.0,
+    error: "",
+  })
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Ended), "Ended phase")
+  m.play_pause()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing) && m.position_ms().abs() < 0.01, "play_pause from Ended restarts at 0")
+
+  m.close()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Idle) && m.track().is_none(), "close resets to Idle")
+}
+
+test "player: seek, seek_near, seek_by, step_speed, volume, and toggle_fill" {
+  let m = Media::new()
+  m.open(sample_track(), start=0.0, play=true)
+  m.seek(15000.0)
+  debug_assert((m.position_ms() - 15000.0).abs() < 0.01, "seek sets exact position")
+  m.seek_by(-5000.0)
+  debug_assert((m.position_ms() - 10000.0).abs() < 0.01, "seek_by relative backward")
+  m.seek_by(999999.0)
+  debug_assert((m.position_ms() - 120000.0).abs() < 0.01, "seek clamps to duration")
+  m.seek_near(12340.0)
+  debug_assert((m.position_ms() - 12300.0).abs() < 0.01, "seek_near snaps to 100ms")
+
+  // Speed cycles 1.0 -> 1.25 -> 1.5 -> 2.0 -> 0.5 -> 0.75 -> 1.0
+  debug_assert((m.step_speed() - 1.25).abs() < 0.001, "1.0 -> 1.25")
+  debug_assert((m.step_speed() - 1.5).abs() < 0.001, "1.25 -> 1.5")
+  debug_assert((m.step_speed() - 2.0).abs() < 0.001, "1.5 -> 2.0")
+  debug_assert((m.step_speed() - 0.5).abs() < 0.001, "2.0 -> 0.5 wrap")
+  debug_assert((m.step_speed() - 0.75).abs() < 0.001, "0.5 -> 0.75")
+  debug_assert((m.step_speed() - 1.0).abs() < 0.001, "0.75 -> 1.0")
+
+  m.set_volume(0.0)
+  debug_assert(m.muted() && m.volume().abs() < 0.001, "volume 0 mutes")
+  m.set_volume(1.5)
+  debug_assert(!m.muted() && (m.volume() - 1.0).abs() < 0.001, "volume clamps to 1.0")
+
+  debug_assert(!m.fill(), "fill defaults false")
+  debug_assert(m.toggle_fill() && m.fill(), "toggle_fill turns on")
+  debug_assert(!m.toggle_fill() && !m.fill(), "toggle_fill turns off")
+}
+
+test "player: subtitle timeline lookup via codec::parse_subtitles and cue_now" {
+  let m = Media::new()
+  m.open(sample_track(), start=0.0, play=true)
+  let srt = "1\n00:00:01,000 --> 00:00:03,500\nHello world\n\n2\n00:00:05,000 --> 00:00:08,000\nSecond cue\n"
+  let cues = codec::parse_subtitles("demo.srt", srt.to_bytes())
+  debug_assert(cues.length() == 2, "parsed 2 SRT cues")
+  m.set_subtitle(true, cues)
+  debug_assert(m.subtitles_on(), "subtitles enabled")
+
+  m.seek(500.0)
+  debug_assert(m.cue_now().is_none(), "before first cue -> None")
+  m.seek(2000.0)
+  match m.cue_now() {
+    Some(c) => debug_assert(c.text == "Hello world", "cue 1 matched at 2000ms")
+    None => debug_assert(false, "expected cue 1")
+  }
+  m.seek(4000.0)
+  debug_assert(m.cue_now().is_none(), "gap between cues -> None")
+  m.seek(6500.0)
+  match m.cue_now() {
+    Some(c) => debug_assert(c.text == "Second cue", "cue 2 matched at 6500ms")
+    None => debug_assert(false, "expected cue 2")
+  }
+
+  m.set_subtitle(false, cues)
+  debug_assert(m.cue_now().is_none(), "disabled subtitles returns None")
+}
+
+test "player: scrubbing holds playback, previews position, and resumes on end_scrub" {
+  let m = Media::new()
+  m.open(sample_track(), start=1000.0, play=true)
+  m.on_status(MediaStatus::{
+    phase: MediaPhase::Playing,
+    position_ms: 1000.0,
+    duration_ms: 120000.0,
+    buffered_ms: 50000.0,
+    muted: false,
+    volume: 1.0,
+    speed: 1.0,
+    error: "",
+  })
+  m.begin_scrub(1000.0)
+  debug_assert(m.scrubbing() && media_phase_eq(m.phase(), MediaPhase::Paused), "begin_scrub pauses Playing")
+  m.update_scrub(45000.0)
+  debug_assert((m.position_ms() - 45000.0).abs() < 0.01, "position_ms previews scrub target")
+  m.end_scrub()
+  debug_assert(!m.scrubbing() && media_phase_eq(m.phase(), MediaPhase::Playing), "end_scrub resumes Playing")
+  debug_assert((m.position_ms() - 45000.0).abs() < 0.01, "end_scrub commits position")
+}
+
+test "player: controls auto-hide (2500ms), HUD note fade (800ms), decode timeout (10000ms), and retry" {
+  let m = Media::new()
+  m.tick(1000.0)
+  m.open(sample_track(), start=0.0, play=true)
+  // Decode timeout after media_decode_wait_ms (10000ms)
+  m.tick(1000.0 + media_decode_wait_ms)
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Failed("decode timeout")), "decode timeout transitions to Failed")
+
+  // Retry returns to Loading, then Playing
+  m.retry()
+  debug_assert(media_phase_eq(m.phase(), MediaPhase::Loading), "retry re-enters Loading")
+  m.on_status(MediaStatus::{
+    phase: MediaPhase::Playing,
+    position_ms: 500.0,
+    duration_ms: 120000.0,
+    buffered_ms: 20000.0,
+    muted: false,
+    volume: 1.0,
+    speed: 1.0,
+    error: "",
+  })
+  m.touch(20000.0)
+  let _ = m.step_speed()
+  debug_assert(m.note().is_some() && m.controls_shown(), "note and controls visible after action")
+  // After 800ms: HUD note fades, controls remain visible
+  m.tick(20000.0 + media_note_ms)
+  debug_assert(m.note().is_none() && m.controls_shown(), "note clears at 800ms while controls stay shown")
+  // After 2500ms: controls auto-hide while Playing
+  m.tick(20000.0 + media_rest_ms)
+  debug_assert(!m.controls_shown(), "controls auto-hide at 2500ms while Playing")
+}

@@ -1,0 +1,98 @@
+// Gamepad polling and rescaled dead-zone normalization over `packages/hostapi`.
+
+import "hostapi"
+
+/// Active polling cadence (60 Hz) when at least one gamepad is connected.
+pub let gamepad_ms : Double = 1000.0 / 60.0
+
+/// Idle discovery cadence (1 Hz) when no gamepad is currently connected.
+pub let gamepads_looked_ms : Double = 1000.0
+
+/// Snapshot of connected controllers at `polled_at` (ms).
+pub struct GamepadSnapshot {
+  pub pads : Array[hostapi::Gamepad]
+  pub polled_at : Double
+}
+
+/// Rescaled dead-zone normalization: values within `[-dead_zone, dead_zone]` (or NaN) map to `0.0`,
+/// and values outside rescale smoothly to `[-1.0, 1.0]`.
+pub fn gamepad_normalize_axis(v : Double, dead_zone~ : Double = hostapi::gamepad_dead_zone) -> Double {
+  if v != v {
+    return 0.0
+  }
+  let dz = if dead_zone < 0.0 {
+    0.0
+  } else if dead_zone >= 0.99 {
+    0.99
+  } else {
+    dead_zone
+  }
+  let mag = v.abs()
+  if mag <= dz {
+    return 0.0
+  }
+  let scaled = (mag - dz) / (1.0 - dz)
+  let clamped = if scaled > 1.0 { 1.0 } else { scaled }
+  if v < 0.0 { -clamped } else { clamped }
+}
+
+/// Capture an immediate snapshot of all connected gamepads with normalized stick axes.
+pub fn gamepad_snapshot_now(now~ : Double = 0.0) -> GamepadSnapshot {
+  let raw = hostapi::gamepads()
+  let pads : Array[hostapi::Gamepad] = []
+  for g in raw {
+    pads.push(hostapi::Gamepad::{
+      index: g.index,
+      buttons: g.buttons,
+      lx: gamepad_normalize_axis(g.lx),
+      ly: gamepad_normalize_axis(g.ly),
+      rx: gamepad_normalize_axis(g.rx),
+      ry: gamepad_normalize_axis(g.ry),
+      lt: g.lt,
+      rt: g.rt,
+    })
+  }
+  GamepadSnapshot::{ pads, polled_at: now }
+}
+
+fn gamepads_equal(a : Array[hostapi::Gamepad], b : Array[hostapi::Gamepad]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if !a[i].eq(b[i]) {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+/// Follow connected gamepads via `on_before_frame`, throttling at `gamepad_ms` when connected
+/// or `gamepads_looked_ms` when idle, and invoking `on_state` whenever the snapshot changes.
+/// Returns a dispose function to stop polling.
+pub fn gamepads_follow(on_state : (GamepadSnapshot) -> Unit) -> () -> Unit {
+  let active = ref_new(true)
+  let last_poll = ref_new(-1.0e9)
+  let last_pads : Ref[Array[hostapi::Gamepad]] = ref_new([])
+  let has_emitted = ref_new(false)
+  let _ = on_before_frame(fn() {
+    if !active.v {
+      return
+    }
+    let now = hostapi::now()
+    let cadence = if last_pads.v.length() > 0 { gamepad_ms } else { gamepads_looked_ms }
+    if has_emitted.v && now - last_poll.v < cadence {
+      return
+    }
+    last_poll.v = now
+    let snap = gamepad_snapshot_now(now=now)
+    if !has_emitted.v || !gamepads_equal(last_pads.v, snap.pads) {
+      has_emitted.v = true
+      last_pads.v = snap.pads
+      on_state(snap)
+    }
+  })
+  fn() { active.v = false }
+}
