@@ -66,7 +66,7 @@ static int flip_chain;
 // capture yet, the glass and the blur's margin round it, not of the target: a composer's strip, not the window; [4] a
 // Gaussian's first half), the glass's own constants, the blurred copy in view
 static ID3D11VertexShader *pvs;
-static ID3D11PixelShader *pps, *edge_ps;
+static ID3D11PixelShader *pps, *edge_ps, *prog_ps;
 static ID3D11Buffer *pbuf, *gbuf;
 struct level { ID3D11Texture2D *t; ID3D11RenderTargetView *rt; ID3D11ShaderResourceView *srv; int w, h; };
 static level lv[5];
@@ -238,6 +238,22 @@ static const char *shader_src =
     "  return bd.SampleLevel(samp, clamp(p * gmap.xy + gmap.zw, guvc.xy, guvc.zw), 0).rgb;\n"
     "}\n"
     "float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
+    "float mb_backdrop_luma(float2 c, float r) {\n"
+    "  return (luma(backdrop(c)) + luma(backdrop(c + float2(r, 0.0))) + luma(backdrop(c - float2(r, 0.0))) +\n"
+    "          luma(backdrop(c + float2(0.0, r))) + luma(backdrop(c - float2(0.0, r)))) / 5.0;\n"
+    "}\n"
+    "float3 mb_adaptive_ink(float3 rgb, float bgL) {\n"
+    "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
+    "  if (ch <= 0.08) {\n"
+    "    float origL = luma(rgb);\n"
+    "    if (origL < 0.5) {\n"
+    "      float lightT = smoothstep(0.29, 0.31, bgL);\n"
+    "      float lightL = clamp(1.06 - origL, 0.68, 0.98);\n"
+    "      rgb = lerp(float3(lightL, lightL, lightL), rgb, lightT);\n"
+    "    }\n"
+    "  }\n"
+    "  return rgb;\n"
+    "}\n"
     "// how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth\n"
     "// each is), its edge covered as a box's own (0.5 - d * scale), so what it cuts meets the ground of the box that cuts\n"
     "// it\n"
@@ -280,13 +296,19 @@ static const char *shader_src =
     "    cover *= clip_cover(cp, I.oclip, I.orc, I.ors, scale);\n"
     "    if (cover <= 0.0) discard;\n"
     "  }\n"
+    "  int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(I.prm.y + 0.5));\n"
+    "  bool prog_glass = (kind == 5 && I.pd.z < -0.5);\n"
     "  // and faded out towards a cut, each pixel by where it is (scene.mbt 52-59)\n"
-    "  if (I.fade.y > 0.0) cover *= saturate((cp.y - I.fade.x) / I.fade.y);\n"
-    "  if (I.fade.w > 0.0) cover *= saturate((I.fade.z - cp.y) / I.fade.w);\n"
-    "  if (I.fadex.y > 0.0) cover *= saturate((cp.x - I.fadex.x) / I.fadex.y);\n"
-    "  if (I.fadex.w > 0.0) cover *= saturate((I.fadex.z - cp.x) / I.fadex.w);\n"
-    "  if (cover <= 0.0) discard;\n"
-    "  int kind = ONE_KIND >= 0 ? ONE_KIND : int(I.prm.y + 0.5);\n"
+    "  float fade_r = 1.0;\n"
+    "  if (I.fade.y > 0.0) fade_r *= saturate((cp.y - I.fade.x) / I.fade.y);\n"
+    "  if (I.fade.w > 0.0) fade_r *= saturate((I.fade.z - cp.y) / I.fade.w);\n"
+    "  if (I.fadex.y > 0.0) fade_r *= saturate((cp.x - I.fadex.x) / I.fadex.y);\n"
+    "  if (I.fadex.w > 0.0) fade_r *= saturate((I.fadex.z - cp.x) / I.fadex.w);\n"
+    "  if (fade_r <= 0.0) discard;\n"
+    "  if (!prog_glass) {\n"
+    "    cover *= fade_r;\n"
+    "    if (cover <= 0.0) discard;\n"
+    "  }\n"
     "  if (kind == 9) { float2 hh = I.rect.zw * 0.5; float rr = min(mb_corner_of(p - I.rect.xy - hh, I.rr), min(hh.x, hh.y)); float2 q = abs(p - I.rect.xy - hh) - hh + rr; if (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr > 0.0) discard; return (float4(0.0, 0.0, 0.0, 0.0)) * cover; }\n"
     "  float4 col = I.color;\n"
     "  if (kind == 11) {\n"
@@ -303,6 +325,7 @@ static const char *shader_src =
     "      for (int i = first; i < first + n; i++) w += mb_path_rows(segs.Load((i / 6) * 15 + mb_seg_slot(i)), I.rect, p, scale);\n"
     "      a = mb_path_cover(w, I.c2.z);\n"
     "    }\n"
+    "    [branch] if (I.pd.w > 0.0) col.rgb = mb_adaptive_ink(col.rgb, mb_backdrop_luma(I.pd.yz, I.pd.w * 0.5));\n"
     "    return (float4(col.rgb, 1.0) * col.a * a) * cover;\n"
     "  }\n"
     "  if (kind == 10) {\n"
@@ -310,6 +333,7 @@ static const char *shader_src =
     "    float2 a = I.rect.xy + I.c2.xy * I.rect.zw, ab = I.rect.xy + I.c2.zw * I.rect.zw - a;\n"
     "    float h = saturate(dot(p - a, ab) / max(dot(ab, ab), 1e-8));\n"
     "    float d = length(p - a - ab * h) - I.prm.x;\n"
+    "    [branch] if (I.pd.w > 0.0) col.rgb = mb_adaptive_ink(col.rgb, mb_backdrop_luma(I.pd.yz, I.pd.w * 0.5));\n"
     "    return (float4(col.rgb, 1.0) * col.a * saturate(0.5 - d * scale)) * cover;\n"
     "  }\n"
     "  if (kind == 1 || kind == 3 || kind == 7) {\n"
@@ -336,10 +360,8 @@ static const char *shader_src =
     "    }\n"
     "    if (kind == 7) {\n"
     "      // inked by how light what is under its glass is, looked at round the glass's middle\n"
-    "      float2 c = I.pd.yz; float r = I.pd.w * 0.5;\n"
-    "      float l = (luma(backdrop(c)) + luma(backdrop(c + float2(r, 0.0))) + luma(backdrop(c - float2(r, 0.0))) +\n"
-    "                 luma(backdrop(c + float2(0.0, r))) + luma(backdrop(c - float2(0.0, r)))) / 5.0;\n"
-    "      float3 ink = lerp(float3(1.0, 1.0, 1.0), float3(0.11, 0.11, 0.12), smoothstep(0.42, 0.6, l));\n"
+    "      float l = mb_backdrop_luma(I.pd.yz, I.pd.w * 0.5);\n"
+    "      float3 ink = mb_adaptive_ink(col.rgb, l);\n"
     "      return (float4(ink, 1.0) * (t.a * col.a)) * cover;\n"
     "    }\n"
     "    return (t * col.a) * cover;\n"
@@ -351,7 +373,11 @@ static const char *shader_src =
     "    float4 s_rr = max(max(I.rr.x, I.rr.y), max(I.rr.z, I.rr.w)) > 0.0 ? I.rr : float4(I.prm.x, I.prm.x, I.prm.x, I.prm.x);\n"
     "    float d;\n"
     "    float halfMinor = 1e9;\n"
-    "    if (k <= 0.0) {\n"
+    "#if ONE_KIND == 13\n"
+    "    d = sd_rr(p, I.rect, s_rr);\n"
+    "    halfMinor = min(I.rect.z, I.rect.w) * 0.5;\n"
+    "#else\n"
+    "    [branch] if (k <= 0.0) {\n"
     "      d = sd_rr(p, I.rect, s_rr);\n"
     "      halfMinor = min(I.rect.z, I.rect.w) * 0.5;\n"
     "    } else {\n"
@@ -372,6 +398,7 @@ static const char *shader_src =
     "        }\n"
     "      }\n"
     "    }\n"
+    "#endif\n"
     "    halfMinor = max(halfMinor, 1.0);\n"
     "    float sd_px = -d * scale;\n"
     "    float materialAlpha = saturate(sd_px + 0.5);\n"
@@ -380,20 +407,9 @@ static const char *shader_src =
     "    float ext_cov = mb_contour_int(max(outward + 0.5, 0.0), edgeW)\n"
     "                  - mb_contour_int(max(outward - 0.5, 0.0), edgeW);\n"
     "    if (materialAlpha < 0.01 && ext_cov < 0.01) discard;\n"
-    "    float e = 0.5;\n"
-    "    float2 sdfGrad = k <= 0.0\n"
-    "      ? float2(\n"
-    "          sd_rr(p + float2(e, 0.0), I.rect, s_rr) - sd_rr(p - float2(e, 0.0), I.rect, s_rr),\n"
-    "          sd_rr(p + float2(0.0, e), I.rect, s_rr) - sd_rr(p - float2(0.0, e), I.rect, s_rr)\n"
-    "        ) / (2.0 * e)\n"
-    "      : float2(\n"
-    "          sd_group(p + float2(e, 0.0), k) - sd_group(p - float2(e, 0.0), k),\n"
-    "          sd_group(p + float2(0.0, e), k) - sd_group(p - float2(0.0, e), k)\n"
-    "        ) / (2.0 * e);\n"
-    "    float gradLen = length(sdfGrad);\n"
-    "    float2 surfaceNormal = gradLen > 0.0001 ? sdfGrad / gradLen : float2(0.0, 0.0);\n"
-    "    float shortening = sqrt(saturate(gradLen));\n"
     "    bool is_clear = (I.prm.w <= 0.1 && col.a < 0.12);\n"
+    "    bool is_adaptive = I.c2.z < -0.5;\n"
+    "    float spot_raw = is_adaptive ? (-I.c2.z - 1.0) : I.c2.z;\n"
     "    bool is_dark = (!is_clear && col.a >= 0.05 && luma(col.rgb) < 0.35);\n"
     "    float inward = max(-d, 0.0);\n"
     "    float rawBevel = max(I.c2.y, 0.0);\n"
@@ -410,20 +426,52 @@ static const char *shader_src =
     "      bevel = rawBevel * lensScale;\n"
     "      amount = rawAmount * lensScale;\n"
     "    }\n"
+    "    float2 surfaceNormal = float2(0.0, 0.0);\n"
+    "    float shortening = 0.0;\n"
     "    float2 disp = float2(0.0, 0.0);\n"
-    "    if (inward < bevel && bevel > 0.001 && amount > 0.0) {\n"
-    "      float bevelX = 1.0 - saturate(inward / bevel);\n"
-    "      float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
-    "      disp = surfaceNormal * (-mag);\n"
+    "    bool need_grad = (inward < max(bevel, 23.0)) || (ext_cov > 0.0);\n"
+    "    [branch] if (need_grad) {\n"
+    "      float e = 0.5;\n"
+    "#if ONE_KIND == 13\n"
+    "      float2 sdfGrad = float2(\n"
+    "          sd_rr(p + float2(e, 0.0), I.rect, s_rr) - sd_rr(p - float2(e, 0.0), I.rect, s_rr),\n"
+    "          sd_rr(p + float2(0.0, e), I.rect, s_rr) - sd_rr(p - float2(0.0, e), I.rect, s_rr)\n"
+    "        ) / (2.0 * e);\n"
+    "#else\n"
+    "      float2 sdfGrad;\n"
+    "      [branch] if (k <= 0.0) {\n"
+    "        sdfGrad = float2(\n"
+    "          sd_rr(p + float2(e, 0.0), I.rect, s_rr) - sd_rr(p - float2(e, 0.0), I.rect, s_rr),\n"
+    "          sd_rr(p + float2(0.0, e), I.rect, s_rr) - sd_rr(p - float2(0.0, e), I.rect, s_rr)\n"
+    "        ) / (2.0 * e);\n"
+    "      } else {\n"
+    "        sdfGrad = float2(\n"
+    "          sd_group(p + float2(e, 0.0), k) - sd_group(p - float2(e, 0.0), k),\n"
+    "          sd_group(p + float2(0.0, e), k) - sd_group(p - float2(0.0, e), k)\n"
+    "        ) / (2.0 * e);\n"
+    "      }\n"
+    "#endif\n"
+    "      float gradLen = length(sdfGrad);\n"
+    "      surfaceNormal = gradLen > 0.0001 ? sdfGrad / gradLen : float2(0.0, 0.0);\n"
+    "      shortening = sqrt(saturate(gradLen));\n"
+    "      if (inward < bevel && bevel > 0.001 && amount > 0.0) {\n"
+    "        float bevelX = 1.0 - saturate(inward / bevel);\n"
+    "        float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
+    "        disp = surfaceNormal * (-mag);\n"
+    "      }\n"
     "    }\n"
     "    float lensZoom = (I.prm.w < 0.0) ? clamp(1.0 - I.prm.w, 1.0, 3.0) : 1.0;\n"
     "    float2 sampleBase = p;\n"
     "    if (lensZoom > 1.0001) {\n"
+    "#if ONE_KIND == 13\n"
+    "      float2 zoomC = I.rect.xy + I.rect.zw * 0.5;\n"
+    "#else\n"
     "      float2 zoomC = (k <= 0.0) ? (I.rect.xy + I.rect.zw * 0.5) : ((ggb.xy + ggb.zw) * 0.5);\n"
+    "#endif\n"
     "      sampleBase = zoomC + (p - zoomC) / lensZoom;\n"
     "    }\n"
     "    float3 refractColor;\n"
-    "    if (abs(I.pd.z) * amount * scale <= 0.25) {\n"
+    "    if (inward >= bevel || abs(I.pd.z) * amount * scale <= 0.25) {\n"
     "      refractColor = backdrop(sampleBase + disp);\n"
     "    } else {\n"
     "      float ds = I.pd.z * 0.5;\n"
@@ -443,6 +491,7 @@ static const char *shader_src =
     "    float glintLum;\n"
     "    float glintFaceGain;\n"
     "    float glintVib;\n"
+    "    float fogT = 0.0;\n"
     "    if (is_clear) {\n"
     "      // iOS 27 clear liquid glass: col.a == 0.0 keeps crystal-clear zero-veil optical lens\n"
     "      // (lifted tab-bar / toggle / slider thumb & loupe), while Glass::clear() (col.a ~ 0.102)\n"
@@ -458,24 +507,75 @@ static const char *shader_src =
     "      glintLum = lerp(1.6, 1.2, clearVeil);\n"
     "      glintFaceGain = lerp(0.0, 0.25, clearVeil);\n"
     "      glintVib = lerp(2.85, 1.5, clearVeil);\n"
-    "    } else if (is_dark) {\n"
-    "      float darkDens = (col.a > 0.41) ? col.a : 0.30;\n"
-    "      float extra = saturate((darkDens - 0.30) / (1.0 - 0.30));\n"
-    "      emission = lerp(float3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), float3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);\n"
-    "      transmittance = lerp(0.54, 0.0, extra);\n"
-    "      lift = lerp(0.36, 0.0, extra);\n"
-    "      chromaGain = lerp(0.92, 0.0, extra);\n"
-    "      contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
-    "      glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
     "    } else {\n"
-    "      float lightDens = (col.a > 0.41) ? col.a : 0.30;\n"
-    "      float extra = saturate((lightDens - 0.30) / (1.0 - 0.30));\n"
-    "      emission = float3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * lightDens;\n"
-    "      transmittance = lerp(0.70, 0.0, extra);\n"
-    "      lift = lerp(0.16, 0.0, extra);\n"
-    "      chromaGain = lerp(1.18, 0.0, extra);\n"
-    "      contourStr = 0.43; contourDirAmt = 0.77; bevelShadowStr = 0.036;\n"
-    "      glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "      [branch] if (is_adaptive) {\n"
+    "#if ONE_KIND == 13\n"
+    "        float2 ac = I.rect.xy + I.rect.zw * 0.5;\n"
+    "        float ar = max(min(I.rect.z, I.rect.w) * 0.5, 1.0) * 0.5;\n"
+    "#else\n"
+    "        float2 ac = (k <= 0.0) ? (I.rect.xy + I.rect.zw * 0.5) : ((ggb.xy + ggb.zw) * 0.5);\n"
+    "        float ar = ((k <= 0.0) ? max(min(I.rect.z, I.rect.w) * 0.5, 1.0) : max(min(ggb.z - ggb.x, ggb.w - ggb.y) * 0.5, 1.0)) * 0.5;\n"
+    "#endif\n"
+    "        float bgL = mb_backdrop_luma(ac, ar);\n"
+    "        float baseDens = (col.a > 0.41) ? col.a : 0.30;\n"
+    "        if (is_dark) {\n"
+    "          float brightT = smoothstep(0.35, 0.85, bgL);\n"
+    "          fogT = brightT;\n"
+    "          float dens = max(baseDens, lerp(baseDens, 0.64, brightT));\n"
+    "          float extra = saturate((dens - 0.30) / (1.0 - 0.30));\n"
+    "          emission = lerp(float3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), float3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);\n"
+    "          transmittance = lerp(0.54, 0.0, extra);\n"
+    "          lift = lerp(0.36, 0.0, extra);\n"
+    "          chromaGain = lerp(0.92, 0.0, extra);\n"
+    "          contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
+    "          glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "        } else {\n"
+    "          float darkMix = 1.0 - smoothstep(0.24, 0.36, bgL);\n"
+    "          fogT = darkMix;\n"
+    "          float extra = saturate((baseDens - 0.30) / (1.0 - 0.30));\n"
+    "          float darkDens = max(baseDens, lerp(baseDens, 0.52, darkMix));\n"
+    "          float darkExtra = saturate((darkDens - 0.30) / (1.0 - 0.30));\n"
+    "          float3 lightEm = float3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * baseDens;\n"
+    "          float3 darkEm = lerp(float3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), float3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), darkExtra);\n"
+    "          emission = lerp(lightEm, darkEm, darkMix);\n"
+    "          transmittance = lerp(lerp(0.70, 0.0, extra), lerp(0.54, 0.0, darkExtra), darkMix);\n"
+    "          lift = lerp(lerp(0.16, 0.0, extra), lerp(0.36, 0.0, darkExtra), darkMix);\n"
+    "          chromaGain = lerp(lerp(1.18, 0.0, extra), lerp(0.92, 0.0, darkExtra), darkMix);\n"
+    "          contourStr = lerp(0.43, 0.88, darkMix);\n"
+    "          contourDirAmt = lerp(0.77, 1.0, darkMix);\n"
+    "          bevelShadowStr = 0.036;\n"
+    "          glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "        }\n"
+    "      } else if (is_dark) {\n"
+    "        float darkDens = (col.a > 0.41) ? col.a : 0.30;\n"
+    "        float extra = saturate((darkDens - 0.30) / (1.0 - 0.30));\n"
+    "        emission = lerp(float3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), float3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);\n"
+    "        transmittance = lerp(0.54, 0.0, extra);\n"
+    "        lift = lerp(0.36, 0.0, extra);\n"
+    "        chromaGain = lerp(0.92, 0.0, extra);\n"
+    "        contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
+    "        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "      } else {\n"
+    "        float lightDens = (col.a > 0.41) ? col.a : 0.30;\n"
+    "        float extra = saturate((lightDens - 0.30) / (1.0 - 0.30));\n"
+    "        emission = float3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * lightDens;\n"
+    "        transmittance = lerp(0.70, 0.0, extra);\n"
+    "        lift = lerp(0.16, 0.0, extra);\n"
+    "        chromaGain = lerp(1.18, 0.0, extra);\n"
+    "        contourStr = 0.43; contourDirAmt = 0.77; bevelShadowStr = 0.036;\n"
+    "        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "      }\n"
+    "    }\n"
+    "    [branch] if (fogT > 0.001) {\n"
+    "      float r1 = fogT * 2.6;\n"
+    "      float r2 = fogT * 3.6;\n"
+    "      float2 fc = sampleBase + disp;\n"
+    "      float3 fBlur = (refractColor * 2.0\n"
+    "        + (backdrop(fc + float2(r1, 0.0)) + backdrop(fc - float2(r1, 0.0))\n"
+    "         + backdrop(fc + float2(0.0, r1)) + backdrop(fc - float2(0.0, r1))) * 1.5\n"
+    "        + (backdrop(fc + float2(r2, r2)) + backdrop(fc + float2(-r2, r2))\n"
+    "         + backdrop(fc + float2(r2, -r2)) + backdrop(fc + float2(-r2, -r2)))) * (1.0 / 12.0);\n"
+    "      refractColor = lerp(refractColor, fBlur, fogT);\n"
     "    }\n"
     "    float Y = luma(refractColor);\n"
     "    float transLum = saturate(Y * (1.0 + lift * (1.0 - Y)));\n"
@@ -487,8 +587,8 @@ static const char *shader_src =
     "      baseColor = lerp(baseColor, col.rgb, col.a * 0.5);\n"
     "    }\n"
     "    float spot = 0.0;\n"
-    "    if (I.c2.z > 0.5) {\n"
-    "      float q = I.c2.z - 1.0;\n"
+    "    if (spot_raw > 0.5) {\n"
+    "      float q = spot_raw - 1.0;\n"
     "      float qx = floor(q * 0.000244140625);\n"
     "      float qy = q - qx * 4096.0;\n"
     "      float2 gp = I.rect.xy + float2(qx * 0.5 - 256.0, qy * 0.5 - 256.0);\n"
@@ -496,12 +596,16 @@ static const char *shader_src =
     "      spot = 1.0 - smoothstep(gr * 0.1, gr, length(p - gp));\n"
     "      baseColor = saturate(baseColor + (0.08 * spot).xxx);\n"
     "    }\n"
-    "    float2 la = gmisc.zw;\n"
-    "    float2 rn = float2(\n"
-    "      surfaceNormal.x * la.x + surfaceNormal.y * la.y,\n"
-    "      -surfaceNormal.x * la.y + surfaceNormal.y * la.x\n"
-    "    );\n"
-    "    float tangency = abs(rn.x);\n"
+    "    float2 rn = float2(0.0, 0.0);\n"
+    "    float tangency = 0.0;\n"
+    "    [branch] if (need_grad) {\n"
+    "      float2 la = gmisc.zw;\n"
+    "      rn = float2(\n"
+    "        surfaceNormal.x * la.x + surfaceNormal.y * la.y,\n"
+    "        -surfaceNormal.x * la.y + surfaceNormal.y * la.x\n"
+    "      );\n"
+    "      tangency = abs(rn.x);\n"
+    "    }\n"
     "    float3 result = baseColor;\n"
     "    // (a) Inner bevel shadow (subtracts only transmittedColor; lightFacing = -rn.y)\n"
     "    if (bevelShadowStr >= 0.001 && inward < 23.0) {\n"
@@ -577,10 +681,14 @@ static const char *shader_src =
     "  if (kind == 5) {\n"
     "    // frosted: the blurred copy, saturated, the tint over it; the rim (a hairline inside the edge, the top left lit,\n"
     "    // the foot and right less), 0.5 wide\n"
+    "    float ps = prog_glass ? smoothstep(0.0, 1.0, fade_r) : 1.0;\n"
+    "    float ts = prog_glass ? (fade_r * fade_r) : 1.0;\n"
+    "    float sat = prog_glass ? lerp(1.0, I.prm.z, ps) : I.prm.z;\n"
+    "    float ta = prog_glass ? (col.a * ts) : col.a;\n"
     "    float3 g3 = backdrop(p);\n"
     "    float lg = luma(g3);\n"
-    "    g3 = max(lerp(float3(lg, lg, lg), g3, I.prm.z), 0.0);\n"
-    "    g3 = g3 * (1.0 - col.a) + col.rgb * col.a;\n"
+    "    g3 = max(lerp(float3(lg, lg, lg), g3, sat), 0.0);\n"
+    "    g3 = g3 * (1.0 - ta) + col.rgb * ta;\n"
     "    if (I.c2.x + I.c2.y + I.c2.z > 0.0) {\n"
     "      float edge = saturate(0.5 + (d + 0.5) * scale);\n"
     "      float lit = saturate(0.5 + notch_cut(sd_rr(p - 0.5, I.rect, I.rr), p - 0.5, I.rect, I.pd) * scale);\n"
@@ -590,8 +698,9 @@ static const char *shader_src =
     "      g3 = lerp(g3, float3(1.0, 1.0, 1.0), I.c2.z * back);\n"
     "    }\n"
     "    // dithered as it is written to 8 bits, so its slopes do not band (corner.sl mb_dither)\n"
-    "    g3 += mb_dither(p * scale) / 255.0;\n"
-    "    return (float4(g3, 1.0) * (a * I.c2.w)) * cover;\n"
+    "    g3 += mb_dither(p * scale) * ps / 255.0;\n"
+    "    float edge_a = prog_glass ? smoothstep(0.0, 0.04, fade_r) : 1.0;\n"
+    "    return (float4(g3, 1.0) * (a * I.c2.w * edge_a)) * cover;\n"
     "  }\n"
     "  float4 fill = float4(col.rgb, 1.0) * col.a;\n"
     "  float bw = I.prm.z;\n"
@@ -664,6 +773,47 @@ static const char *edge_src =
     "  float2 p = pc[0].xy + pos.xy * pc[0].zw;\n"
     "  p = mb_contained_point(p, pc[1], pc[2], pc[3], pc[4], pc[5], pc[6], pc[7], pc[8], pc[0].z);\n"
     "  return src.SampleLevel(samp, clamp((p - pc[0].xy) / pc[0].zw * ts, lo, hi), 0);\n"
+    "}\n";
+
+static const char *prog_src =
+    "cbuffer PU : register(b0) { float4 pa; float4 pb; float4 pc[9]; };\n"
+    "Texture2D lv0 : register(t0); Texture2D lv1 : register(t1); Texture2D lv2 : register(t2); Texture2D lv3 : register(t3);\n"
+    "SamplerState samp : register(s0);\n"
+    "float4 fprog(float4 pos : SV_Position) : SV_Target {\n"
+    "  float2 p = pc[0].xy + pos.xy * pc[0].zw;\n"
+    "  float ramp = 1.0;\n"
+    "  if (pc[1].y > 0.0) ramp *= saturate((p.y - pc[1].x) / pc[1].y);\n"
+    "  if (pc[1].w > 0.0) ramp *= saturate((pc[1].z - p.y) / pc[1].w);\n"
+    "  if (pc[2].y > 0.0) ramp *= saturate((p.x - pc[2].x) / pc[2].y);\n"
+    "  if (pc[2].w > 0.0) ramp *= saturate((pc[2].z - p.x) / pc[2].w);\n"
+    "  float sp = max(pc[3].x, 1.0);\n"
+    "  float kf = pc[3].y;\n"
+    "  float4 m0 = pc[4], m1 = pc[5], m2 = pc[6], m3 = pc[7];\n"
+    "  if (kf < 0.5) return lv0.SampleLevel(samp, clamp(pos.xy * m0.xy, m0.xy * 0.5, m0.zw), 0);\n"
+    "  float sig1 = pow(sp, 1.0 / kf);\n"
+    "  float r = saturate(ramp);\n"
+    "  float target_px = r <= 0.0 ? 0.0 : sp * pow(r, 1.35);\n"
+    "  float lv_u;\n"
+    "  if (target_px <= sig1 || kf <= 1.05) {\n"
+    "    lv_u = clamp(target_px / max(sig1, 1e-4), 0.0, kf);\n"
+    "  } else {\n"
+    "    lv_u = clamp(1.0 + (kf - 1.0) * log(target_px / sig1) / max(log(sp / sig1), 1e-4), 0.0, kf);\n"
+    "  }\n"
+    "  int idx = min(int(floor(lv_u)), int(kf + 0.5) - 1);\n"
+    "  if (idx < 0) idx = 0;\n"
+    "  float f = lv_u - float(idx);\n"
+    "  float4 c0, c1;\n"
+    "  if (idx == 0) {\n"
+    "    c0 = lv0.SampleLevel(samp, clamp(pos.xy * m0.xy, m0.xy * 0.5, m0.zw), 0);\n"
+    "    c1 = lv1.SampleLevel(samp, clamp(pos.xy * m1.xy, m1.xy * 1.0, m1.zw), 0);\n"
+    "  } else if (idx == 1) {\n"
+    "    c0 = lv1.SampleLevel(samp, clamp(pos.xy * m1.xy, m1.xy * 1.0, m1.zw), 0);\n"
+    "    c1 = lv2.SampleLevel(samp, clamp(pos.xy * m2.xy, m2.xy * 2.0, m2.zw), 0);\n"
+    "  } else {\n"
+    "    c0 = lv2.SampleLevel(samp, clamp(pos.xy * m2.xy, m2.xy * 2.0, m2.zw), 0);\n"
+    "    c1 = lv3.SampleLevel(samp, clamp(pos.xy * m3.xy, m3.xy * 4.0, m3.zw), 0);\n"
+    "  }\n"
+    "  return lerp(c0, c1, f);\n"
     "}\n";
 
 // Separate HLSL source for the lossless axis-aligned rect fast path (kept outside shader_src so baked shader keys stay intact).
@@ -1055,8 +1205,11 @@ void *mb_render_views_visual_of(int wid) {
 // (as Metal's: apple_render.m kind_pipe says what it saved there), what it draws the same to the byte. Compiled after
 // the rest, on a thread of their own (kinds_thread), the device's own to make them on: until they are, the one for
 // any kind draws every kind, the same pixels.
-#define MB_KINDS 12
-static int has_own_ps(int kind) { return (kind >= 0 && kind <= 4) || kind == 10 || kind == 11; }
+#define MB_KIND_LIQUID_SINGLE 13
+#define MB_KINDS 14
+static int has_own_ps(int kind) {
+  return (kind >= 0 && kind <= 6) || kind == 10 || kind == 11 || kind == MB_KIND_LIQUID_SINGLE;
+}
 static ID3D11PixelShader *kps[MB_KINDS];
 static HANDLE kinds_thread;
 static volatile LONG kinds_ready;
@@ -1105,6 +1258,10 @@ static void make_pipeline(void) {
     rect_ps->Release();
     rect_ps = NULL;
   }
+  if (prog_ps) {
+    prog_ps->Release();
+    prog_ps = NULL;
+  }
   if (kinds_thread) {
     WaitForSingleObject(kinds_thread, INFINITE);
     CloseHandle(kinds_thread);
@@ -1133,9 +1290,15 @@ static void make_pipeline(void) {
   kinds_thread = CreateThread(NULL, 0, make_kinds, dev, 0, NULL);
   ID3DBlob *pv = compile("vpost", "vs_4_0", post_src), *pp = compile("fpost", "ps_4_0", post_src);
   ID3DBlob *ep = compile("fedge", "ps_4_0", edge_src);
+  ID3DBlob *gp = compile("fprog", "ps_4_0", prog_src);
   dev->CreateVertexShader(pv->GetBufferPointer(), pv->GetBufferSize(), NULL, &pvs);
   dev->CreatePixelShader(pp->GetBufferPointer(), pp->GetBufferSize(), NULL, &pps);
   dev->CreatePixelShader(ep->GetBufferPointer(), ep->GetBufferSize(), NULL, &edge_ps);
+  if (gp) {
+    if (FAILED(dev->CreatePixelShader(gp->GetBufferPointer(), gp->GetBufferSize(), NULL, &prog_ps)))
+      prog_ps = NULL;
+    gp->Release();
+  }
   pv->Release();
   pp->Release();
   ep->Release();
@@ -1575,6 +1738,7 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   // For frosted glass (kind 5), negative slot 7 is contained; for liquid glass (kind 6), negative slot 7 encodes clear-lens zoom.
   int kind = (int)(a[5] + 0.5f);
   int is_contained = (kind == 5 && a[7] < 0.0f);
+  int is_progressive = (kind == 5 && a[22] < -0.5f);
   float blur = (kind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
   int merged_liquid = (kind == 6 && a[23] > 0.0f);
   int unmerged_liquid = (kind == 6 && !merged_liquid);
@@ -1656,38 +1820,82 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   // (the passes over the levels whole, not cut to the part)
   ctx->RSSetState(raster);
   int contained = is_contained ? mb_contained_make(&post_edge, a, px0 / sc, py0 / sc, 1.0f / sc, 1.0f / sc) : 0;
-  if (contained) {
-    ctx->PSSetShader(edge_ps, NULL, 0);
-    post_pass(&lv[0], w, h, &lv[4], w, h, 3, 0, 0, 0);
-    ctx->PSSetShader(pps, NULL, 0);
-  }
   float sp = blur * sc;
   int k = 0;
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
+  if (is_progressive && k == 0 && sp > 0.5f) k = 1;
   int lw[4] = {w}, lh[4] = {h};
-  for (int j = 1; j <= k; j++) {
+  for (int j = 1; j <= 3; j++) {
     lw[j] = (lw[j - 1] + 1) / 2;
     lh[j] = (lh[j - 1] + 1) / 2;
-    post_pass(j == 1 && contained ? &lv[4] : &lv[j - 1], lw[j - 1], lh[j - 1], &lv[j], lw[j], lh[j], 1, 0, 0, 0);
   }
-  // what is left of the deviation once the halvings' and the last look's (bilinear) spread are taken out
-  float sk = sp / (float)(1 << k);
-  float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
-  float sg = sqrtf(sk * sk - pre > 0 ? sk * sk - pre : 0);
-  if (sg > 0.3f) {
-    level *from = contained && k == 0 ? &lv[4] : &lv[k];
-    level *tmp = contained && k == 0 ? &lv[0] : &lv[4];
-    post_pass(from, lw[k], lh[k], tmp, lw[k], lh[k], 2, sg, 1, 0);
-    post_pass(tmp, lw[k], lh[k], from, lw[k], lh[k], 2, sg, 0, 1);
+  if (is_progressive && prog_ps) {
+    float prev_var = 0.0f;
+    for (int j = 1; j <= k; j++) {
+      post_pass(&lv[j - 1], lw[j - 1], lh[j - 1], &lv[j], lw[j], lh[j], 1, 0, 0, 0);
+      float target_px = powf(fmaxf(sp, 1.0f), (float)j / (float)k);
+      float have_var = prev_var + 0.75f * (float)(1 << (2 * j - 2));
+      float need_var = fmaxf(target_px * target_px - have_var, 0.0f);
+      float sg_j = sqrtf(need_var) / (float)(1 << j);
+      if (sg_j > 0.3f) {
+        post_pass(&lv[j], lw[j], lh[j], &lv[4], lw[j], lh[j], 2, sg_j, 1, 0);
+        post_pass(&lv[4], lw[j], lh[j], &lv[j], lw[j], lh[j], 2, sg_j, 0, 1);
+      }
+      prev_var = fmaxf(have_var, target_px * target_px);
+    }
+    memset(&post_edge, 0, sizeof post_edge);
+    post_edge.map[0] = (float)px0 / sc; post_edge.map[1] = (float)py0 / sc;
+    post_edge.map[2] = 1.0f / sc; post_edge.map[3] = 1.0f / sc;
+    for (int i = 0; i < 4; i++) { post_edge.box[i] = a[52 + i]; post_edge.rr[i] = a[56 + i]; }
+    post_edge.clip[0] = sp; post_edge.clip[1] = (float)k;
+    float *ms[4] = {post_edge.rc, post_edge.rs, post_edge.outer, post_edge.orc};
+    for (int j = 0; j < 4; j++) {
+      float dj = (float)(1 << j), tw = (float)lv[j].w, th = (float)lv[j].h;
+      ms[j][0] = 1.0f / (dj * tw); ms[j][1] = 1.0f / (dj * th);
+      ms[j][2] = ((float)lw[j] - 0.5f) / tw; ms[j][3] = ((float)lh[j] - 0.5f) / th;
+    }
+    ID3D11ShaderResourceView *none4[4] = {NULL, NULL, NULL, NULL};
+    ctx->PSSetShaderResources(0, 4, none4);
+    ctx->PSSetShader(prog_ps, NULL, 0);
+    ctx->OMSetRenderTargets(1, &lv[4].rt, NULL);
+    D3D11_VIEWPORT vp = {0, 0, (float)w, (float)h, 0, 1};
+    ctx->RSSetViewports(1, &vp);
+    struct { float a[4], b[4]; MBContained edge; } u = {
+      {1.0f / lv[0].w, 1.0f / lv[0].h, 4.0f, 0.0f}, {(w - 0.5f) / lv[0].w, (h - 0.5f) / lv[0].h, 0.0f, 0.0f}, post_edge};
+    ctx->UpdateSubresource(pbuf, 0, NULL, &u, 0, 0);
+    ctx->PSSetConstantBuffers(0, 1, &pbuf);
+    ID3D11ShaderResourceView *srvs[4] = {lv[0].srv, lv[1].srv, lv[2].srv, lv[3].srv};
+    ctx->PSSetShaderResources(0, 4, srvs);
+    ctx->Draw(3, 0);
+    ctx->PSSetShaderResources(0, 4, none4);
+  } else {
+    if (contained) {
+      ctx->PSSetShader(edge_ps, NULL, 0);
+      post_pass(&lv[0], w, h, &lv[4], w, h, 3, 0, 0, 0);
+      ctx->PSSetShader(pps, NULL, 0);
+    }
+    for (int j = 1; j <= k; j++)
+      post_pass(j == 1 && contained ? &lv[4] : &lv[j - 1], lw[j - 1], lh[j - 1], &lv[j], lw[j], lh[j], 1, 0, 0, 0);
+    // what is left of the deviation once the halvings' and the last look's (bilinear) spread are taken out
+    float sk = sp / (float)(1 << k);
+    float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
+    float sg = sqrtf(sk * sk - pre > 0 ? sk * sk - pre : 0);
+    if (sg > 0.3f) {
+      level *from = contained && k == 0 ? &lv[4] : &lv[k];
+      level *tmp = contained && k == 0 ? &lv[0] : &lv[4];
+      post_pass(from, lw[k], lh[k], tmp, lw[k], lh[k], 2, sg, 1, 0);
+      post_pass(tmp, lw[k], lh[k], from, lw[k], lh[k], 2, sg, 0, 1);
+    }
+    ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
+    ctx->PSSetShaderResources(0, 3, none);
   }
-  ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
-  ctx->PSSetShaderResources(0, 3, none);
-  level *L = contained && k == 0 ? &lv[4] : &lv[k];
-  float d = (float)(1 << k);
+  level *L = ((is_progressive && prog_ps) || (contained && k == 0)) ? &lv[4] : &lv[k];
+  int sk = (is_progressive && prog_ps) ? 0 : k;
+  float d = (float)(1 << sk);
   gsrv = L->srv;
   gu.map[0] = sc / d / L->w; gu.map[1] = sc / d / L->h;
   gu.map[2] = -(float)px0 / d / L->w; gu.map[3] = -(float)py0 / d / L->h;
-  gu.uvc[0] = 0.5f / L->w; gu.uvc[1] = 0.5f / L->h; gu.uvc[2] = (lw[k] - 0.5f) / L->w; gu.uvc[3] = (lh[k] - 0.5f) / L->h;
+  gu.uvc[0] = 0.5f / L->w; gu.uvc[1] = 0.5f / L->h; gu.uvc[2] = (lw[sk] - 0.5f) / L->w; gu.uvc[3] = (lh[sk] - 0.5f) / L->h;
   return 1;
 }
 
@@ -1983,9 +2191,11 @@ static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count
         bound = tid;
         main_state(cur_rtv, pw, ph);
       }
-      ctx->PSSetShader(ps, NULL, 0);
       // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
-      int merged_liquid = (int)(f[start * MB_INST + 5] + 0.5f) == 6 && f[start * MB_INST + 23] > 0.0f;
+      int gkind_raw = (int)(f[start * MB_INST + 5] + 0.5f);
+      int merged_liquid = gkind_raw == 6 && f[start * MB_INST + 23] > 0.0f;
+      int gkind = gkind_raw == 5 ? 5 : (gkind_raw == 6 ? (merged_liquid ? 6 : MB_KIND_LIQUID_SINGLE) : -1);
+      ctx->PSSetShader(kind_ps(gkind), NULL, 0);
       if (shows) ctx->DrawInstanced(6, merged_liquid ? 1 : (UINT)(end - start), 0, (UINT)start);
       start = end;
       continue;
@@ -2271,6 +2481,10 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
     if (rect_ps) {
       rect_ps->Release();
       rect_ps = NULL;
+    }
+    if (prog_ps) {
+      prog_ps->Release();
+      prog_ps = NULL;
     }
     ctx->Release();
     dev->Release();

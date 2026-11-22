@@ -159,6 +159,22 @@ static const char *FS =
     "  return texture(u_bd, clamp(p * u_map.xy + u_map.zw, u_uvc.xy, u_uvc.zw)).rgb;\n"
     "}\n"
     "float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }\n"
+    "float mb_backdrop_luma(vec2 c, float r) {\n"
+    "  return (luma(backdrop(c)) + luma(backdrop(c + vec2(r, 0.0))) + luma(backdrop(c - vec2(r, 0.0))) +\n"
+    "          luma(backdrop(c + vec2(0.0, r))) + luma(backdrop(c - vec2(0.0, r)))) / 5.0;\n"
+    "}\n"
+    "vec3 mb_adaptive_ink(vec3 rgb, float bgL) {\n"
+    "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
+    "  if (ch <= 0.08) {\n"
+    "    float origL = luma(rgb);\n"
+    "    if (origL < 0.5) {\n"
+    "      float lightT = smoothstep(0.29, 0.31, bgL);\n"
+    "      float lightL = clamp(1.06 - origL, 0.68, 0.98);\n"
+    "      rgb = mix(vec3(lightL), rgb, lightT);\n"
+    "    }\n"
+    "  }\n"
+    "  return rgb;\n"
+    "}\n"
     "// how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth\n"
     "// each is), its edge covered as a box's own (0.5 - d * scale), so what it cuts meets the ground of the box that cuts it\n"
     "float clip_cover(vec2 p, vec4 c, vec4 r, vec4 s, float scale) {\n"
@@ -166,8 +182,8 @@ static const char *FS =
     "  return clamp(0.5 - d * scale, 0.0, 1.0);\n"
     "}\n"
     "// what it shows at p, as if uncut\n"
-    "void shade(vec2 p) {\n"
-    "  int kind = ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5);\n"
+    "void shade(vec2 p, float fade_r) {\n"
+    "  int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5));\n"
     "  // where a native view shows: its picture (NativeViews.Picture), the part of it c2 says, cut to its corners\n"
     "  if (kind == 9) { vec2 hh = v_rect.zw * 0.5; float rr = min(mb_corner_of(p - v_rect.xy - hh, v_rr), min(hh.x, hh.y)); vec2 q = abs(p - v_rect.xy - hh) - hh + rr; float a = clamp(0.5 - (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr) * u_scale, 0.0, 1.0); if (a <= 0.0) discard; vec2 uv = v_c2.xy + clamp((p - v_rect.xy) / v_rect.zw, 0.0, 1.0) * v_c2.zw; if (uv.y < 0.0 || uv.y > 1.0) discard; o = texture(u_img, uv) * a; return; }\n"
     "  vec4 col = v_color;\n"
@@ -185,6 +201,7 @@ static const char *FS =
     "      for (int i = first; i < first + n; i++) { int t = (i / 6) * 15 + mb_seg_slot(i); w += mb_path_rows(texelFetch(u_segs, ivec2(t % 2040, t / 2040), 0), v_rect, p, u_scale); }\n"
     "      a = mb_path_cover(w, v_c2.z);\n"
     "    }\n"
+    "    if (v_pad.w > 0.0) col.rgb = mb_adaptive_ink(col.rgb, mb_backdrop_luma(v_pad.yz, v_pad.w * 0.5));\n"
     "    o = vec4(col.rgb, 1.0) * col.a * a;\n"
     "    return;\n"
     "  }\n"
@@ -193,6 +210,7 @@ static const char *FS =
     "    vec2 a = v_rect.xy + v_c2.xy * v_rect.zw, ab = v_rect.xy + v_c2.zw * v_rect.zw - a;\n"
     "    float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);\n"
     "    float d = length(p - a - ab * h) - v_p.x;\n"
+    "    if (v_pad.w > 0.0) col.rgb = mb_adaptive_ink(col.rgb, mb_backdrop_luma(v_pad.yz, v_pad.w * 0.5));\n"
     "    o = vec4(col.rgb, 1.0) * col.a * clamp(0.5 - d * u_scale, 0.0, 1.0);\n"
     "    return;\n"
     "  }\n"
@@ -215,10 +233,8 @@ static const char *FS =
     "                    : vec4(textureLod(u_atlas, uv / vec2(textureSize(u_atlas, 0)), 0.0).r);\n"
     "    if (kind == 7) {\n"
     "      // inked by how light what is under its glass is, looked at round the glass's middle\n"
-    "      vec2 c = v_pad.yz; float r = v_pad.w * 0.5;\n"
-    "      float l = (luma(backdrop(c)) + luma(backdrop(c + vec2(r, 0.0))) + luma(backdrop(c - vec2(r, 0.0))) +\n"
-    "                 luma(backdrop(c + vec2(0.0, r))) + luma(backdrop(c - vec2(0.0, r)))) / 5.0;\n"
-    "      vec3 ink = mix(vec3(1.0), vec3(0.11, 0.11, 0.12), smoothstep(0.42, 0.6, l));\n"
+    "      float l = mb_backdrop_luma(v_pad.yz, v_pad.w * 0.5);\n"
+    "      vec3 ink = mb_adaptive_ink(col.rgb, l);\n"
     "      o = vec4(ink, 1.0) * (t.a * col.a);\n"
     "      return;\n"
     "    }\n"
@@ -232,6 +248,10 @@ static const char *FS =
     "    vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);\n"
     "    float d;\n"
     "    float halfMinor = 1e9;\n"
+    "#if ONE_KIND == 13\n"
+    "    d = sd_rr(p, v_rect, s_rr);\n"
+    "    halfMinor = min(v_rect.z, v_rect.w) * 0.5;\n"
+    "#else\n"
     "    if (k <= 0.0) {\n"
     "      d = sd_rr(p, v_rect, s_rr);\n"
     "      halfMinor = min(v_rect.z, v_rect.w) * 0.5;\n"
@@ -252,6 +272,7 @@ static const char *FS =
     "        }\n"
     "      }\n"
     "    }\n"
+    "#endif\n"
     "    halfMinor = max(halfMinor, 1.0);\n"
     "    float sd_px = -d * u_scale;\n"
     "    float materialAlpha = clamp(sd_px + 0.5, 0.0, 1.0);\n"
@@ -260,20 +281,9 @@ static const char *FS =
     "    float ext_cov = mb_contour_int(max(outward + 0.5, 0.0), edgeW)\n"
     "                  - mb_contour_int(max(outward - 0.5, 0.0), edgeW);\n"
     "    if (materialAlpha < 0.01 && ext_cov < 0.01) discard;\n"
-    "    float e = 0.5;\n"
-    "    vec2 grad = k <= 0.0\n"
-    "      ? vec2(\n"
-    "          sd_rr(p + vec2(e, 0.0), v_rect, s_rr) - sd_rr(p - vec2(e, 0.0), v_rect, s_rr),\n"
-    "          sd_rr(p + vec2(0.0, e), v_rect, s_rr) - sd_rr(p - vec2(0.0, e), v_rect, s_rr)\n"
-    "        ) / (2.0 * e)\n"
-    "      : vec2(\n"
-    "          sd_group(p + vec2(e, 0.0), k) - sd_group(p - vec2(e, 0.0), k),\n"
-    "          sd_group(p + vec2(0.0, e), k) - sd_group(p - vec2(0.0, e), k)\n"
-    "        ) / (2.0 * e);\n"
-    "    float gradLen = length(grad);\n"
-    "    vec2 surfaceNormal = gradLen > 0.0001 ? grad / gradLen : vec2(0.0, 0.0);\n"
-    "    float shortening = sqrt(clamp(gradLen, 0.0, 1.0));\n"
     "    bool is_clear = (v_p.w <= 0.1 && col.a < 0.12);\n"
+    "    bool is_adaptive = v_c2.z < -0.5;\n"
+    "    float spot_raw = is_adaptive ? (-v_c2.z - 1.0) : v_c2.z;\n"
     "    bool is_dark = (!is_clear && col.a >= 0.05 && luma(col.rgb) < 0.35);\n"
     "    float inward = max(-d, 0.0);\n"
     "    float rawBevel = max(v_c2.y, 0.0);\n"
@@ -290,20 +300,49 @@ static const char *FS =
     "      bevel = rawBevel * lensScale;\n"
     "      amount = rawAmount * lensScale;\n"
     "    }\n"
+    "    vec2 surfaceNormal = vec2(0.0, 0.0);\n"
+    "    float shortening = 0.0;\n"
     "    vec2 disp = vec2(0.0, 0.0);\n"
-    "    if (inward < bevel && bevel > 0.001 && amount > 0.0) {\n"
-    "      float bevelX = 1.0 - clamp(inward / bevel, 0.0, 1.0);\n"
-    "      float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
-    "      disp = surfaceNormal * (-mag);\n"
+    "    bool need_grad = (inward < max(bevel, 23.0)) || (ext_cov > 0.0);\n"
+    "    if (need_grad) {\n"
+    "      float e = 0.5;\n"
+    "#if ONE_KIND == 13\n"
+    "      vec2 grad = vec2(\n"
+    "          sd_rr(p + vec2(e, 0.0), v_rect, s_rr) - sd_rr(p - vec2(e, 0.0), v_rect, s_rr),\n"
+    "          sd_rr(p + vec2(0.0, e), v_rect, s_rr) - sd_rr(p - vec2(0.0, e), v_rect, s_rr)\n"
+    "        ) / (2.0 * e);\n"
+    "#else\n"
+    "      vec2 grad = k <= 0.0\n"
+    "        ? vec2(\n"
+    "            sd_rr(p + vec2(e, 0.0), v_rect, s_rr) - sd_rr(p - vec2(e, 0.0), v_rect, s_rr),\n"
+    "            sd_rr(p + vec2(0.0, e), v_rect, s_rr) - sd_rr(p - vec2(0.0, e), v_rect, s_rr)\n"
+    "          ) / (2.0 * e)\n"
+    "        : vec2(\n"
+    "            sd_group(p + vec2(e, 0.0), k) - sd_group(p - vec2(e, 0.0), k),\n"
+    "            sd_group(p + vec2(0.0, e), k) - sd_group(p - vec2(0.0, e), k)\n"
+    "          ) / (2.0 * e);\n"
+    "#endif\n"
+    "      float gradLen = length(grad);\n"
+    "      surfaceNormal = gradLen > 0.0001 ? grad / gradLen : vec2(0.0, 0.0);\n"
+    "      shortening = sqrt(clamp(gradLen, 0.0, 1.0));\n"
+    "      if (inward < bevel && bevel > 0.001 && amount > 0.0) {\n"
+    "        float bevelX = 1.0 - clamp(inward / bevel, 0.0, 1.0);\n"
+    "        float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
+    "        disp = surfaceNormal * (-mag);\n"
+    "      }\n"
     "    }\n"
     "    float lensZoom = (v_p.w < 0.0) ? clamp(1.0 - v_p.w, 1.0, 3.0) : 1.0;\n"
     "    vec2 sampleBase = p;\n"
     "    if (lensZoom > 1.0001) {\n"
+    "#if ONE_KIND == 13\n"
+    "      vec2 zoomC = v_rect.xy + v_rect.zw * 0.5;\n"
+    "#else\n"
     "      vec2 zoomC = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);\n"
+    "#endif\n"
     "      sampleBase = zoomC + (p - zoomC) / lensZoom;\n"
     "    }\n"
     "    vec3 refractColor;\n"
-    "    if (abs(v_pad.z) * amount * u_scale <= 0.25) {\n"
+    "    if (inward >= bevel || abs(v_pad.z) * amount * u_scale <= 0.25) {\n"
     "      refractColor = backdrop(sampleBase + disp);\n"
     "    } else {\n"
     "      float ds = v_pad.z * 0.5;\n"
@@ -323,6 +362,7 @@ static const char *FS =
     "    float glintLum;\n"
     "    float glintFaceGain;\n"
     "    float glintVib;\n"
+    "    float fogT = 0.0;\n"
     "    if (is_clear) {\n"
     "      // iOS 27 clear liquid glass: col.a == 0.0 keeps crystal-clear zero-veil optical lens\n"
     "      // (lifted tab-bar / toggle / slider thumb & loupe), while Glass::clear() (col.a ~ 0.102)\n"
@@ -338,6 +378,44 @@ static const char *FS =
     "      glintLum = mix(1.6, 1.2, clearVeil);\n"
     "      glintFaceGain = mix(0.0, 0.25, clearVeil);\n"
     "      glintVib = mix(2.85, 1.5, clearVeil);\n"
+    "    } else if (is_adaptive) {\n"
+    "#if ONE_KIND == 13\n"
+    "      vec2 ac = v_rect.xy + v_rect.zw * 0.5;\n"
+    "      float ar = max(min(v_rect.z, v_rect.w) * 0.5, 1.0) * 0.5;\n"
+    "#else\n"
+    "      vec2 ac = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);\n"
+    "      float ar = ((k <= 0.0) ? max(min(v_rect.z, v_rect.w) * 0.5, 1.0) : max(min(u_gb.z - u_gb.x, u_gb.w - u_gb.y) * 0.5, 1.0)) * 0.5;\n"
+    "#endif\n"
+    "      float bgL = mb_backdrop_luma(ac, ar);\n"
+    "      float baseDens = (col.a > 0.41) ? col.a : 0.30;\n"
+    "      if (is_dark) {\n"
+    "        float brightT = smoothstep(0.35, 0.85, bgL);\n"
+    "        fogT = brightT;\n"
+    "        float dens = max(baseDens, mix(baseDens, 0.64, brightT));\n"
+    "        float extra = clamp((dens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
+    "        emission = mix(vec3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), vec3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);\n"
+    "        transmittance = mix(0.54, 0.0, extra);\n"
+    "        lift = mix(0.36, 0.0, extra);\n"
+    "        chromaGain = mix(0.92, 0.0, extra);\n"
+    "        contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
+    "        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "      } else {\n"
+    "        float darkMix = 1.0 - smoothstep(0.24, 0.36, bgL);\n"
+    "        fogT = darkMix;\n"
+    "        float extra = clamp((baseDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
+    "        float darkDens = max(baseDens, mix(baseDens, 0.52, darkMix));\n"
+    "        float darkExtra = clamp((darkDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
+    "        vec3 lightEm = vec3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * baseDens;\n"
+    "        vec3 darkEm = mix(vec3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), vec3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), darkExtra);\n"
+    "        emission = mix(lightEm, darkEm, darkMix);\n"
+    "        transmittance = mix(mix(0.70, 0.0, extra), mix(0.54, 0.0, darkExtra), darkMix);\n"
+    "        lift = mix(mix(0.16, 0.0, extra), mix(0.36, 0.0, darkExtra), darkMix);\n"
+    "        chromaGain = mix(mix(1.18, 0.0, extra), mix(0.92, 0.0, darkExtra), darkMix);\n"
+    "        contourStr = mix(0.43, 0.88, darkMix);\n"
+    "        contourDirAmt = mix(0.77, 1.0, darkMix);\n"
+    "        bevelShadowStr = 0.036;\n"
+    "        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+    "      }\n"
     "    } else if (is_dark) {\n"
     "      float darkDens = (col.a > 0.41) ? col.a : 0.30;\n"
     "      float extra = clamp((darkDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
@@ -357,6 +435,17 @@ static const char *FS =
     "      contourStr = 0.43; contourDirAmt = 0.77; bevelShadowStr = 0.036;\n"
     "      glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
     "    }\n"
+    "    if (fogT > 0.001) {\n"
+    "      float r1 = fogT * 2.6;\n"
+    "      float r2 = fogT * 3.6;\n"
+    "      vec2 fc = sampleBase + disp;\n"
+    "      vec3 fBlur = (refractColor * 2.0\n"
+    "        + (backdrop(fc + vec2(r1, 0.0)) + backdrop(fc - vec2(r1, 0.0))\n"
+    "         + backdrop(fc + vec2(0.0, r1)) + backdrop(fc - vec2(0.0, r1))) * 1.5\n"
+    "        + (backdrop(fc + vec2(r2, r2)) + backdrop(fc + vec2(-r2, r2))\n"
+    "         + backdrop(fc + vec2(r2, -r2)) + backdrop(fc + vec2(-r2, -r2)))) * (1.0 / 12.0);\n"
+    "      refractColor = mix(refractColor, fBlur, fogT);\n"
+    "    }\n"
     "    float Y = luma(refractColor);\n"
     "    float transLum = clamp(Y * (1.0 + lift * (1.0 - Y)), 0.0, 1.0);\n"
     "    vec3 transmittedColor = vec3(transLum * transmittance) + (refractColor - vec3(Y)) * (chromaGain * v_p.z);\n"
@@ -367,8 +456,8 @@ static const char *FS =
     "      baseColor = mix(baseColor, col.rgb, col.a * 0.5);\n"
     "    }\n"
     "    float spot = 0.0;\n"
-    "    if (v_c2.z > 0.5) {\n"
-    "      float q = v_c2.z - 1.0;\n"
+    "    if (spot_raw > 0.5) {\n"
+    "      float q = spot_raw - 1.0;\n"
     "      float qx = floor(q * 0.000244140625);\n"
     "      float qy = q - qx * 4096.0;\n"
     "      vec2 gp = v_rect.xy + vec2(qx * 0.5 - 256.0, qy * 0.5 - 256.0);\n"
@@ -376,12 +465,16 @@ static const char *FS =
     "      spot = 1.0 - smoothstep(gr * 0.1, gr, length(p - gp));\n"
     "      baseColor = clamp(baseColor + vec3(0.08 * spot), 0.0, 1.0);\n"
     "    }\n"
-    "    vec2 la = u_glight;\n"
-    "    vec2 rn = vec2(\n"
-    "      surfaceNormal.x * la.x + surfaceNormal.y * la.y,\n"
-    "      -surfaceNormal.x * la.y + surfaceNormal.y * la.x\n"
-    "    );\n"
-    "    float tangency = abs(rn.x);\n"
+    "    vec2 rn = vec2(0.0, 0.0);\n"
+    "    float tangency = 0.0;\n"
+    "    if (need_grad) {\n"
+    "      vec2 la = u_glight;\n"
+    "      rn = vec2(\n"
+    "        surfaceNormal.x * la.x + surfaceNormal.y * la.y,\n"
+    "        -surfaceNormal.x * la.y + surfaceNormal.y * la.x\n"
+    "      );\n"
+    "      tangency = abs(rn.x);\n"
+    "    }\n"
     "    vec3 result = baseColor;\n"
     "    // (a) Inner bevel shadow (subtracts only transmittedColor; lightFacing = -rn.y)\n"
     "    if (bevelShadowStr >= 0.001 && inward < 23.0) {\n"
@@ -458,9 +551,14 @@ static const char *FS =
     "  if (kind == 5) {\n"
     "    // frosted: the blurred copy, saturated, the tint over it; the rim (a hairline inside the edge, the top left lit,\n"
     "    // the foot and right less), 0.5 wide\n"
+    "    bool prog_glass = (v_pad.z < -0.5);\n"
+    "    float ps = prog_glass ? smoothstep(0.0, 1.0, fade_r) : 1.0;\n"
+    "    float ts = prog_glass ? (fade_r * fade_r) : 1.0;\n"
+    "    float sat = prog_glass ? mix(1.0, v_p.z, ps) : v_p.z;\n"
+    "    float ta = prog_glass ? (col.a * ts) : col.a;\n"
     "    vec3 g3 = backdrop(p);\n"
-    "    g3 = max(mix(vec3(luma(g3)), g3, v_p.z), 0.0);\n"
-    "    g3 = g3 * (1.0 - col.a) + col.rgb * col.a;\n"
+    "    g3 = max(mix(vec3(luma(g3)), g3, sat), 0.0);\n"
+    "    g3 = g3 * (1.0 - ta) + col.rgb * ta;\n"
     "    if (v_c2.x + v_c2.y + v_c2.z > 0.0) {\n"
     "      float edge = clamp(0.5 + (d + 0.5) * u_scale, 0.0, 1.0);\n"
     "      float lit = clamp(0.5 + notch_cut(sd_rr(p - 0.5, v_rect, v_rr), p - 0.5, v_rect, v_pad) * u_scale, 0.0, 1.0);\n"
@@ -470,8 +568,9 @@ static const char *FS =
     "      g3 = mix(g3, vec3(1.0), v_c2.z * back);\n"
     "    }\n"
     "    // dithered as it is written to 8 bits, so its slopes do not band (corner.sl mb_dither)\n"
-    "    g3 += mb_dither(p * u_scale) / 255.0;\n"
-    "    o = vec4(g3, 1.0) * (a * v_c2.w);\n"
+    "    g3 += mb_dither(p * u_scale) * ps / 255.0;\n"
+    "    float edge_a = prog_glass ? smoothstep(0.0, 0.04, fade_r) : 1.0;\n"
+    "    o = vec4(g3, 1.0) * (a * v_c2.w * edge_a);\n"
     "    return;\n"
     "  }\n"
     "  vec4 fill = vec4(col.rgb, 1.0) * col.a;\n"
@@ -504,10 +603,16 @@ static const char *FS =
     "    if (cover <= 0.0) discard;\n"
     "  }\n"
     "  // and faded out towards a cut, each pixel by where it is (scene.mbt 52-59)\n"
+    "  int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5));\n"
+    "  bool prog_glass = (kind == 5 && v_pad.z < -0.5);\n"
     "  vec4 ramp = clamp(v_ramp, 0.0, 1.0);\n"
-    "  cover *= ramp.x * ramp.y * ramp.z * ramp.w;\n"
-    "  if (cover <= 0.0) discard;\n"
-    "  shade(p);\n"
+    "  float fade_r = ramp.x * ramp.y * ramp.z * ramp.w;\n"
+    "  if (fade_r <= 0.0) discard;\n"
+    "  if (!prog_glass) {\n"
+    "    cover *= fade_r;\n"
+    "    if (cover <= 0.0) discard;\n"
+    "  }\n"
+    "  shade(p, fade_r);\n"
     "  o *= cover;\n"
     "}\n";
 
@@ -559,6 +664,9 @@ static const char *PFS =
     "// The backdrop's passes: u_a.xy the source's texel, u_a.z 1 halving (dual Kawase's down), 2 a Gaussian along u_b.zw\n"
     "// of deviation u_a.w (texels); u_b.xy the last texel's centre of what the source holds\n"
     "uniform highp sampler2D u_src;\n"
+    "uniform highp sampler2D u_lv1;\n"
+    "uniform highp sampler2D u_lv2;\n"
+    "uniform highp sampler2D u_lv3;\n"
     "uniform vec4 u_a;\n"
     "uniform vec4 u_b;\n"
     "uniform vec4 u_c[9];\n"
@@ -566,6 +674,43 @@ static const char *PFS =
     "void main() {\n"
     "  vec2 ts = u_a.xy;\n"
     "  vec2 lo = ts * 0.5, hi = u_b.xy;\n"
+    "  if (u_a.z > 3.5) {\n"
+    "    vec2 p = u_c[0].xy + gl_FragCoord.xy * u_c[0].zw;\n"
+    "    float ramp = 1.0;\n"
+    "    if (u_c[1].y > 0.0) ramp *= clamp((p.y - u_c[1].x) / u_c[1].y, 0.0, 1.0);\n"
+    "    if (u_c[1].w > 0.0) ramp *= clamp((u_c[1].z - p.y) / u_c[1].w, 0.0, 1.0);\n"
+    "    if (u_c[2].y > 0.0) ramp *= clamp((p.x - u_c[2].x) / u_c[2].y, 0.0, 1.0);\n"
+    "    if (u_c[2].w > 0.0) ramp *= clamp((u_c[2].z - p.x) / u_c[2].w, 0.0, 1.0);\n"
+    "    float sp = max(u_c[3].x, 1.0);\n"
+    "    float kf = u_c[3].y;\n"
+    "    vec4 m0 = u_c[4], m1 = u_c[5], m2 = u_c[6], m3 = u_c[7];\n"
+    "    if (kf < 0.5) { o = texture(u_src, clamp(gl_FragCoord.xy * m0.xy, m0.xy * 0.5, m0.zw)); return; }\n"
+    "    float sig1 = pow(sp, 1.0 / kf);\n"
+    "    float r = clamp(ramp, 0.0, 1.0);\n"
+    "    float target_px = r <= 0.0 ? 0.0 : sp * pow(r, 1.35);\n"
+    "    float lv_u;\n"
+    "    if (target_px <= sig1 || kf <= 1.05) {\n"
+    "      lv_u = clamp(target_px / max(sig1, 1e-4), 0.0, kf);\n"
+    "    } else {\n"
+    "      lv_u = clamp(1.0 + (kf - 1.0) * log(target_px / sig1) / max(log(sp / sig1), 1e-4), 0.0, kf);\n"
+    "    }\n"
+    "    int idx = min(int(floor(lv_u)), int(kf + 0.5) - 1);\n"
+    "    if (idx < 0) idx = 0;\n"
+    "    float f = lv_u - float(idx);\n"
+    "    vec4 c0, c1;\n"
+    "    if (idx == 0) {\n"
+    "      c0 = texture(u_src, clamp(gl_FragCoord.xy * m0.xy, m0.xy * 0.5, m0.zw));\n"
+    "      c1 = texture(u_lv1, clamp(gl_FragCoord.xy * m1.xy, m1.xy * 1.0, m1.zw));\n"
+    "    } else if (idx == 1) {\n"
+    "      c0 = texture(u_lv1, clamp(gl_FragCoord.xy * m1.xy, m1.xy * 1.0, m1.zw));\n"
+    "      c1 = texture(u_lv2, clamp(gl_FragCoord.xy * m2.xy, m2.xy * 2.0, m2.zw));\n"
+    "    } else {\n"
+    "      c0 = texture(u_lv2, clamp(gl_FragCoord.xy * m2.xy, m2.xy * 2.0, m2.zw));\n"
+    "      c1 = texture(u_lv3, clamp(gl_FragCoord.xy * m3.xy, m3.xy * 4.0, m3.zw));\n"
+    "    }\n"
+    "    o = mix(c0, c1, f);\n"
+    "    return;\n"
+    "  }\n"
     "  if (u_a.z > 2.5) {\n"
     "    vec2 p = u_c[0].xy + gl_FragCoord.xy * u_c[0].zw;\n"
     "    p = mb_contained_point(p, u_c[1], u_c[2], u_c[3], u_c[4], u_c[5], u_c[6], u_c[7], u_c[8], u_c[0].z);\n"
@@ -606,7 +751,7 @@ static GLuint prog_flat;
 static GLint uf_vp;
 static GLuint prog_rect;
 static GLint ur_vp = -1, ur_scale = -1, ur_top = -1;
-static GLint pu_src, pu_a, pu_b, pu_c;
+static GLint pu_src, pu_lv1, pu_lv2, pu_lv3, pu_a, pu_b, pu_c;
 
 static int fast_rect_enabled(void) {
   static int enabled = -1;
@@ -633,8 +778,11 @@ static int is_simple_rect(const float *f, int32_t i) {
 // glyphs, shadows, colour glyphs, images, lines, shapes' bands; what else there is (glass, a native view's picture)
 // the program for any kind (progs[MB_KINDS]) draws. Each program's uniforms set as it is first used after they
 // change (prog_gen); prog_now the one in use.
-#define MB_KINDS 12
-static int has_own_prog(int kind) { return (kind >= 0 && kind <= 4) || kind == 10 || kind == 11; }
+#define MB_KIND_LIQUID_SINGLE 13
+#define MB_KINDS 14
+static int has_own_prog(int kind) {
+  return (kind >= 0 && kind <= 6) || kind == 10 || kind == 11 || kind == MB_KIND_LIQUID_SINGLE;
+}
 typedef struct {
   GLuint p;
   GLint vp, scale, top, map, uvc, gb, shape, rad, n, glight;
@@ -715,11 +863,12 @@ static kprog make_prog(GLuint vs, int kind) {
   k.n = glGetUniformLocation(k.p, "u_n");
   k.glight = glGetUniformLocation(k.p, "u_glight");
   glUseProgram(k.p);
-  glUniform1i(glGetUniformLocation(k.p, "u_atlas"), 0);
-  glUniform1i(glGetUniformLocation(k.p, "u_img"), 1);
-  glUniform1i(glGetUniformLocation(k.p, "u_bd"), 2);
-  glUniform1i(glGetUniformLocation(k.p, "u_segs"), 3);
-  glUniform1i(glGetUniformLocation(k.p, "u_catlas"), 4);
+  GLint loc;
+  if ((loc = glGetUniformLocation(k.p, "u_atlas")) >= 0) glUniform1i(loc, 0);
+  if ((loc = glGetUniformLocation(k.p, "u_img")) >= 0) glUniform1i(loc, 1);
+  if ((loc = glGetUniformLocation(k.p, "u_bd")) >= 0) glUniform1i(loc, 2);
+  if ((loc = glGetUniformLocation(k.p, "u_segs")) >= 0) glUniform1i(loc, 3);
+  if ((loc = glGetUniformLocation(k.p, "u_catlas")) >= 0) glUniform1i(loc, 4);
   return k;
 }
 
@@ -761,6 +910,9 @@ static void gl_setup(void) {
   glAttachShader(post, compile(GL_FRAGMENT_SHADER, PFS));
   glLinkProgram(post);
   pu_src = glGetUniformLocation(post, "u_src");
+  pu_lv1 = glGetUniformLocation(post, "u_lv1");
+  pu_lv2 = glGetUniformLocation(post, "u_lv2");
+  pu_lv3 = glGetUniformLocation(post, "u_lv3");
   pu_a = glGetUniformLocation(post, "u_a");
   pu_b = glGetUniformLocation(post, "u_b");
   pu_c = glGetUniformLocation(post, "u_c");
@@ -804,6 +956,7 @@ static void gl_setup(void) {
 typedef struct { GLuint t, fb; int w, h; GLenum format; } level;
 static level lv[5];
 static int lv_w, lv_h;
+static int levels_rebuilt;
 static GLuint bd_tex;
 static float gmap[4], guvc[4], ggb[4], gshape[32], grad[32];
 static int gn;
@@ -836,8 +989,15 @@ static void ensure_levels(int w, int h) {
       glDeleteTextures(1, &lv[j].t);
       glDeleteFramebuffers(1, &lv[j].fb);
     }
-  lv_w = w > lv_w ? w : lv_w;
-  lv_h = h > lv_h ? h : lv_h;
+  int nw = (w + 255) & ~255;
+  int nh = (h + 255) & ~255;
+  if (fb_w > 0 && nw > fb_w) nw = fb_w;
+  if (fb_h > 0 && nh > fb_h) nh = fb_h;
+  if (nw < w) nw = w;
+  if (nh < h) nh = h;
+  lv_w = nw > lv_w ? nw : lv_w;
+  lv_h = nh > lv_h ? nh : lv_h;
+  levels_rebuilt++;
   // (the blurs kept were shown by where they lie in levels of the old size: one made now would be shown by the new)
   glass_forget();
   for (int j = 0; j < 4; j++)
@@ -848,6 +1008,12 @@ static void ensure_levels(int w, int h) {
 
 static void post_pass(level *src, int sw, int sh, level *dst, int w, int h, int mode, float sg, float dx, float dy) {
   glBindFramebuffer(GL_FRAMEBUFFER, dst->fb);
+#ifdef GL_ES_VERSION_3_0
+  {
+    const GLenum att = GL_COLOR_ATTACHMENT0;
+    glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, &att);
+  }
+#endif
   glViewport(0, 0, w, h);
   glActiveTexture(GL_TEXTURE0);
   glBindTexture(GL_TEXTURE_2D, src->t);
@@ -1063,8 +1229,9 @@ static void ensure_canvas(void) {
 // (sg), whether its edge is contained, and the glass's own numbers (its bounds, liquid's shapes). Zeroed whole first,
 // so two of the same compare the same (as Metal's: apple_render.m Grab).
 typedef struct {
-  int px0, pb0, w, h, top, k, contained, n;
-  float sg;
+  int px0, pb0, w, h, top, k, contained, progressive, n;
+  float sg, sp;
+  float fade[4], fadex[4];
   float gb[4], shape[32], rad[32];
   MBContained edge;
 } Grab;
@@ -1077,6 +1244,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   // For frosted glass (kind 5), negative slot 7 is contained; for liquid glass (kind 6), negative slot 7 encodes clear-lens zoom.
   int kind = (int)(a[5] + 0.5f);
   int is_contained = (kind == 5 && a[7] < 0.0f);
+  int is_progressive = (kind == 5 && a[22] < -0.5f);
   float blur = (kind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
   int merged_liquid = (kind == 6 && a[23] > 0.0f);
   int unmerged_liquid = (kind == 6 && !merged_liquid);
@@ -1143,9 +1311,18 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   if (cut_on && (px1 <= cut[0] || cut[0] + cut[2] <= px0 || pb1 <= cut[1] || cut[1] + cut[3] <= pb0)) return 0;
   m->px0 = px0; m->pb0 = pb0; m->w = px1 - px0; m->h = pb1 - pb0; m->top = top;
   m->contained = is_contained ? mb_contained_make(&m->edge, a, px0 / sc, (top - pb0) / sc, 1.0f / sc, -1.0f / sc) : 0;
+  m->progressive = is_progressive;
+  if (is_progressive) {
+    for (int i = 0; i < 4; i++) {
+      m->fade[i] = a[52 + i];
+      m->fadex[i] = a[56 + i];
+    }
+  }
   float sp = blur * sc;
   int k = 0;
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
+  m->sp = sp;
+  if (is_progressive && k == 0 && sp > 0.5f) k = 1;
   // what is left of the deviation once the halvings' and the last look's (bilinear) spread are taken out
   float sk = sp / (float)(1 << k);
   float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
@@ -1168,21 +1345,21 @@ static void grab_levels(const Grab *m, int lw[4], int lh[4]) {
 static void show_blur(const Grab *m, GLuint bt, int bw, int bh) {
   int lw[4], lh[4];
   grab_levels(m, lw, lh);
-  int k = m->k, px0 = m->px0, pb0 = m->pb0, top = m->top;
+  int sk = m->progressive ? 0 : m->k, px0 = m->px0, pb0 = m->pb0, top = m->top;
   float sc = (float)cur_scale;
   memcpy(ggb, m->gb, sizeof ggb);
   memcpy(gshape, m->shape, sizeof gshape);
   memcpy(grad, m->rad, sizeof grad);
   gn = m->n;
-  float d = (float)(1 << k);
+  float d = (float)(1 << sk);
   bd_tex = bt;
   gmap[0] = sc / d / bw; gmap[1] = -sc / d / bh;
   gmap[2] = -(float)px0 / d / bw; gmap[3] = (float)(top - pb0) / d / bh;
-  guvc[0] = 0.5f / bw; guvc[1] = 0.5f / bh; guvc[2] = (lw[k] - 0.5f) / bw; guvc[3] = (lh[k] - 0.5f) / bh;
+  guvc[0] = 0.5f / bw; guvc[1] = 0.5f / bh; guvc[2] = (lw[sk] - 0.5f) / bw; guvc[3] = (lh[sk] - 0.5f) / bh;
 }
 
 // The level a grab's blur is left in.
-static level *grab_blurred(const Grab *m) { return m->contained && m->k == 0 ? &lv[4] : &lv[m->k]; }
+static level *grab_blurred(const Grab *m) { return (m->progressive || (m->contained && m->k == 0)) ? &lv[4] : &lv[m->k]; }
 
 // A grab of target_fb blurred into the levels: what is drawn so far in its rectangle copied out, halved k times, the
 // Gaussian left (grab_blurred). The levels are shared by every capture: what is shown is the copy a slot keeps (below).
@@ -1198,14 +1375,55 @@ static void blur(const Grab *m) {
   glDisable(GL_SCISSOR_TEST);
   glBindFramebuffer(GL_READ_FRAMEBUFFER, target_fb);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, lv[0].fb);
+#ifdef GL_ES_VERSION_3_0
+  {
+    const GLenum att = GL_COLOR_ATTACHMENT0;
+    glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, &att);
+  }
+#endif
   glBlitFramebuffer(m->px0, m->pb0, m->px0 + w, m->pb0 + h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
   glUseProgram(post);
+  int lw[4], lh[4];
+  grab_levels(m, lw, lh);
+  if (m->progressive) {
+    float prev_var = 0.0f;
+    for (int j = 1; j <= k; j++) {
+      post_pass(&lv[j - 1], lw[j - 1], lh[j - 1], &lv[j], lw[j], lh[j], 1, 0, 0, 0);
+      float target_px = powf(fmaxf(m->sp, 1.0f), (float)j / (float)k);
+      float have_var = prev_var + 0.75f * (float)(1 << (2 * j - 2));
+      float need_var = fmaxf(target_px * target_px - have_var, 0.0f);
+      float sg_j = sqrtf(need_var) / (float)(1 << j);
+      if (sg_j > 0.3f) {
+        post_pass(&lv[j], lw[j], lh[j], &lv[4], lw[j], lh[j], 2, sg_j, 1, 0);
+        post_pass(&lv[4], lw[j], lh[j], &lv[j], lw[j], lh[j], 2, sg_j, 0, 1);
+      }
+      prev_var = fmaxf(have_var, target_px * target_px);
+    }
+    float sc = (float)cur_scale;
+    float prog[36] = {0};
+    prog[0] = (float)m->px0 / sc; prog[1] = (float)(m->top - m->pb0) / sc;
+    prog[2] = 1.0f / sc; prog[3] = -1.0f / sc;
+    for (int i = 0; i < 4; i++) { prog[4 + i] = m->fade[i]; prog[8 + i] = m->fadex[i]; }
+    prog[12] = m->sp; prog[13] = (float)k;
+    for (int j = 0; j < 4; j++) {
+      float dj = (float)(1 << j), tw = (float)lv[j].w, th = (float)lv[j].h;
+      prog[16 + j * 4 + 0] = 1.0f / (dj * tw);
+      prog[16 + j * 4 + 1] = 1.0f / (dj * th);
+      prog[16 + j * 4 + 2] = ((float)lw[j] - 0.5f) / tw;
+      prog[16 + j * 4 + 3] = ((float)lh[j] - 0.5f) / th;
+    }
+    glUniform4fv(pu_c, 9, prog);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, lv[1].t); glUniform1i(pu_lv1, 1);
+    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, lv[2].t); glUniform1i(pu_lv2, 2);
+    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, lv[3].t); glUniform1i(pu_lv3, 3);
+    post_pass(&lv[0], w, h, &lv[4], w, h, 4, 0, 0, 0);
+    glActiveTexture(GL_TEXTURE0);
+    return;
+  }
   if (contained) {
     glUniform4fv(pu_c, 9, (const float *)&m->edge);
     post_pass(&lv[0], w, h, &lv[4], w, h, 3, 0, 0, 0);
   }
-  int lw[4], lh[4];
-  grab_levels(m, lw, lh);
   for (int j = 1; j <= k; j++)
     post_pass(j == 1 && contained ? &lv[4] : &lv[j - 1], lw[j - 1], lh[j - 1], &lv[j], lw[j], lh[j], 1, 0, 0, 0);
   if (m->sg > 0.3f) {
@@ -1342,8 +1560,9 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
   for (int32_t i = 0; i < start; i++) {
     float tid = f[(size_t)i * MB_INST + 20];
     if (i > 0 && tid != f[(size_t)(i - 1) * MB_INST + 20]) run = i;
-    // (glass, and what is drawn by what a glass's blur shows: adaptive words over it, kind 7, light or dark by it)
-    int sees = tid < 0.0f || (int)(f[(size_t)i * MB_INST + 5] + 0.5f) == 7;
+    // (glass, and what is drawn by what a glass's blur shows: adaptive words/icons/lines over it)
+    int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
+    int sees = tid < 0.0f || k == 7 || ((k == 10 || k == 11) && f[(size_t)i * MB_INST + 23] > 0.0f);
     if (sees && reaches(f, i, run, g)) whole = i + 1;
   }
   size_t need_base = (size_t)start * MB_INST;
@@ -1447,27 +1666,8 @@ static glass_slot *slot_same(const Grab *m, const double key[9]) {
   return NULL;
 }
 
-// A texture of the slot's (made again at another size or format) holding level `l`'s w × h foot left.
-static void slot_copy(GLuint *t, GLuint *fb, int *tw, int *th, GLenum *tf, const level *l, int w, int h) {
-  if (!*t || *tw != l->w || *th != l->h || *tf != l->format) {
-    if (*t) {
-      glDeleteFramebuffers(1, fb);
-      glDeleteTextures(1, t);
-    }
-    level made = level_tex(l->format, l->w, l->h);
-    *t = made.t;
-    *fb = made.fb;
-    *tw = made.w;
-    *th = made.h;
-    *tf = l->format;
-  }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER, l->fb);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, *fb);
-  glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-}
-
-// The blur just made (blur) kept in the slot least lately shown: copied out of the levels.
-// Not yet said to be of anything (valid).
+// The blur just made (blur) kept in the slot least lately shown by swapping texture/FBO handles with the level
+// (zero GPU blit). Not yet said to be of anything (valid).
 static glass_slot *slot_fill(const Grab *m, unsigned frame_clock) {
   level *L = grab_blurred(m);
   int t0 = -1, t1 = -1, t2 = -1, t3 = -1, t4 = -1, fallback = 0;
@@ -1493,9 +1693,24 @@ static glass_slot *slot_fill(const Grab *m, unsigned frame_clock) {
   int idx = t0 >= 0 ? t0 : t1 >= 0 ? t1 : t2 >= 0 ? t2 : t3 >= 0 ? t3 : t4 >= 0 ? t4 : fallback;
   glass_slot *s = &slots[idx];
   s->valid = 0;
-  int lw[4], lh[4];
-  grab_levels(m, lw, lh);
-  slot_copy(&s->bt, &s->bfb, &s->bw, &s->bh, &s->bf, L, lw[m->k], lh[m->k]);
+  if (s->bt != 0 && s->bw == L->w && s->bh == L->h && s->bf == L->format) {
+    GLuint tmp_t = s->bt, tmp_fb = s->bfb;
+    s->bt = L->t;
+    s->bfb = L->fb;
+    L->t = tmp_t;
+    L->fb = tmp_fb;
+  } else {
+    if (s->bt) {
+      glDeleteFramebuffers(1, &s->bfb);
+      glDeleteTextures(1, &s->bt);
+    }
+    s->bt = L->t;
+    s->bfb = L->fb;
+    s->bw = L->w;
+    s->bh = L->h;
+    s->bf = L->format;
+    *L = level_tex(s->bf, s->bw, s->bh);
+  }
   return s;
 }
 
@@ -1526,7 +1741,9 @@ static int capture(const float *f, int32_t start, int32_t end, int32_t count, in
                    double b, unsigned frame_clock) {
   Grab m;
   int shows = grab_of(&m, f, start, end, count);
-  double key[9] = {fb_w, fb_h, cur_scale, cur_w, cur_h, r, g, b, over_other};
+  double stretch_w = ((int)(cur_w * cur_scale + 0.5) != fb_w) ? cur_w : 0.0;
+  double stretch_h = (vhp == fb_h && (int)(cur_h * cur_scale + 0.5) != fb_h) ? cur_h : 0.0;
+  double key[9] = {fb_w, fb_h, cur_scale, r, g, b, over_other, stretch_w, stretch_h};
   if (shows) {
     int known = under_take(f, start, count, pieces, &m);
     glass_slot *s = known ? slot_same(&m, key) : NULL;
@@ -1551,15 +1768,15 @@ static void use_prog(int kind) {
   glUseProgram(k->p);
   if (k->gen == prog_gen) return;
   k->gen = prog_gen;
-  glUniform2f(k->vp, (float)cur_w, (float)cur_h);
-  glUniform1f(k->scale, (float)cur_scale);
-  glUniform1f(k->top, (float)(vy0 + vhp));
-  glUniform4fv(k->map, 1, gmap);
-  glUniform4fv(k->uvc, 1, guvc);
-  glUniform4fv(k->gb, 1, ggb);
-  glUniform4fv(k->shape, 8, gshape);
-  glUniform4fv(k->rad, 8, grad);
-  glUniform1i(k->n, gn);
+  if (k->vp >= 0) glUniform2f(k->vp, (float)cur_w, (float)cur_h);
+  if (k->scale >= 0) glUniform1f(k->scale, (float)cur_scale);
+  if (k->top >= 0) glUniform1f(k->top, (float)(vy0 + vhp));
+  if (k->map >= 0) glUniform4fv(k->map, 1, gmap);
+  if (k->uvc >= 0) glUniform4fv(k->uvc, 1, guvc);
+  if (k->gb >= 0) glUniform4fv(k->gb, 1, ggb);
+  if (k->shape >= 0) glUniform4fv(k->shape, 8, gshape);
+  if (k->rad >= 0) glUniform4fv(k->rad, 8, grad);
+  if (k->n >= 0) glUniform1i(k->n, gn);
   if (k->glight >= 0) {
     float a = g_light_angle;
     glUniform2f(k->glight, cosf(a), sinf(a));
@@ -2245,17 +2462,6 @@ static void draw_into(GLuint fb, int part) {
       if (tid == 0 && kind == 0 && prog_rect && fast_rect_enabled() && is_simple_rect(fbuf, end) != fast_rect) break;
       end++;
     }
-    if (fast_rect) {
-      if (prog_now != prog_rect) {
-        prog_now = prog_rect;
-        glUseProgram(prog_rect);
-      }
-      glUniform2f(ur_vp, (float)cur_w, (float)cur_h);
-      glUniform1f(ur_scale, (float)cur_scale);
-      glUniform1f(ur_top, (float)(vy0 + vhp));
-    } else {
-      use_prog(own ? kind : -1);
-    }
     if (tid < 0) {
       glass_drawn = 1;
       if (!levels_sized) {
@@ -2284,14 +2490,27 @@ static void draw_into(GLuint fb, int part) {
         bound = tid;
       }
       if (shows) {
+        // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
+        int merged_liquid = kind == 6 && fbuf[start * MB_INST + 23] > 0.0f;
+        int gkind = kind == 5 ? 5 : (kind == 6 ? (merged_liquid ? 6 : MB_KIND_LIQUID_SINGLE) : -1);
+        use_prog(gkind);
         for (int i = 0; i < MB_INST / 4; i++)
           glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, MB_INST * 4, (void *)(intptr_t)(start * MB_INST * 4 + i * 16));
-        // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
-        int merged_liquid = (int)(fbuf[start * MB_INST + 5] + 0.5f) == 6 && fbuf[start * MB_INST + 23] > 0.0f;
         glDrawArraysInstanced(GL_TRIANGLES, 0, 6, merged_liquid ? 1 : end - start);
       }
       start = end;
       continue;
+    }
+    if (fast_rect) {
+      if (prog_now != prog_rect) {
+        prog_now = prog_rect;
+        glUseProgram(prog_rect);
+      }
+      glUniform2f(ur_vp, (float)cur_w, (float)cur_h);
+      glUniform1f(ur_scale, (float)cur_scale);
+      glUniform1f(ur_top, (float)(vy0 + vhp));
+    } else {
+      use_prog(own ? kind : -1);
     }
     GLuint t = tid ? image_tex(tid) : atlas;
     if (!t && tid > 0 && tid <= MB_STREAM_TEX) encode_missing = 1;
