@@ -361,6 +361,12 @@ JNIEXPORT void JNICALL Java_dev_invar_Native_draw(JNIEnv *env, jclass c) {
   gl_present_kept(kept_count, kept_r, kept_g, kept_b);
 }
 
+JNIEXPORT jboolean JNICALL Java_dev_invar_Native_adaptiveSettling(JNIEnv *env, jclass c) {
+  (void)env;
+  (void)c;
+  return gl_adaptive_settling() ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT void JNICALL Java_dev_invar_Native_trim(JNIEnv *env, jclass c) {
   (void)env;
   (void)c;
@@ -375,6 +381,10 @@ JNIEXPORT void JNICALL Java_dev_invar_Native_redraw(JNIEnv *env, jclass c) {
     glDisable(GL_SCISSOR_TEST);
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
+    return;
+  }
+  if (gl_adaptive_settling()) {
+    gl_adaptive_step();
     return;
   }
   draw_kept();

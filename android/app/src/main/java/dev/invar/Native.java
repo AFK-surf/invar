@@ -23,6 +23,8 @@ final class Native {
     static native boolean take(boolean shown);
     static native void dropPending();
     static native void draw();
+    /** Whether adaptive liquid glass is still settling temporally on the GL thread. */
+    static native boolean adaptiveSettling();
     static native void trim();
     static native void glSync();
     static native void glDrawn(double ms, int dropped);

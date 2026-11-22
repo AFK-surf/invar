@@ -425,6 +425,7 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
         } else {
             Native.redraw();
         }
+        if (Native.adaptiveSettling()) requestRender();
         mail.runAll(t.retire);
         showAt(t.shows);
         if (t.ref != null) MBText.frameDrawn(t.ref);
