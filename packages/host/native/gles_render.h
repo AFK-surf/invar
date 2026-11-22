@@ -55,6 +55,7 @@ static const char *VS =
     "layout(location=13) in vec4 a_fade;\n"
     "layout(location=14) in vec4 a_fadex;\n"
     "uniform vec2 u_vp;\n"
+    "uniform vec2 u_origin;\n"
     "uniform vec4 u_gb;\n"
     "flat out vec4 v_rot;\n"
     "flat out vec4 v_rect; flat out vec4 v_p; flat out vec4 v_color; flat out vec4 v_c2; flat out vec4 v_clip; flat out vec4 v_pad;\n"
@@ -67,7 +68,7 @@ static const char *VS =
     "  vec2 corner = vec2((vid == 1 || vid == 4 || vid == 5) ? 1.0 : 0.0, (vid == 2 || vid == 3 || vid == 5) ? 1.0 : 0.0);\n"
     "  int kind = int(a_p.y + 0.5);\n"
     "  bool merged_liquid = kind == 6 && a_pad.w > 0.0;\n"
-    "  float grow = kind == 2 ? a_p.w * 3.0 + 2.0 : (kind == 6 && a_pad.w <= 0.0) ? 2.0 : ((kind == 0 || kind == 4 || kind == 5) ? 1.0 : 0.0);\n"
+    "  float grow = kind == 2 ? a_p.w * 3.0 + 2.0 : (kind == 6 && a_pad.w <= 0.0) ? 2.0 : ((kind == 0 || kind == 4 || kind == 5 || kind == 8) ? 1.0 : 0.0);\n"
     "  vec2 pos = a_rect.xy - grow + corner * (a_rect.zw + 2.0 * grow);\n"
     "  if (merged_liquid) pos = mix(u_gb.xy, u_gb.zw, corner);\n"
     "  // the pieces of shapes (kind 12): nothing drawn\n"
@@ -83,7 +84,8 @@ static const char *VS =
     "    float k = a_rot.w > 0.5 ? 2.0 : 1.0;\n"
     "    vrot = vec4(c * k, s * k, a_rot.yz);\n"
     "  }\n"
-    "  gl_Position = vec4(at.x / u_vp.x * 2.0 - 1.0, 1.0 - at.y / u_vp.y * 2.0, 0.0, 1.0);\n"
+    "  vec2 rel = at - u_origin;\n"
+    "  gl_Position = vec4(rel.x / u_vp.x * 2.0 - 1.0, 1.0 - rel.y / u_vp.y * 2.0, 0.0, 1.0);\n"
     "  v_rot = vrot; v_rect = a_rect; v_p = a_p; v_color = a_color; v_c2 = a_c2; v_clip = a_clip; v_pad = a_pad; v_rc = a_rc; v_rs = a_rs; v_rr = a_rr;\n"
     "  if (kind == 4 && a_pad.z > 0.5) v_pad.x = a_rot.w;\n"
     "  // (a glyph's p.x, which it has no use for: how it is turned, for its texels taken whole where it is not)\n"
@@ -105,6 +107,7 @@ static const char *FS =
     "in vec4 v_ramp;\n"
     "uniform float u_scale;\n"
     "uniform float u_top;\n"
+    "uniform vec2 u_origin;\n"
     "uniform sampler2D u_atlas;\n"
     "uniform sampler2D u_catlas;\n"
     "uniform sampler2D u_img;\n"
@@ -565,6 +568,40 @@ static const char *FS =
     "    o = vec4(result * visA, clamp(visA + extA, 0.0, 1.0));\n"
     "    return;\n"
     "  }\n"
+    "  if (kind == 8) {\n"
+    "    vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);\n"
+    "    float d = sd_rr(p, v_rect, s_rr);\n"
+    "    float materialAlpha = clamp(0.5 - d * u_scale, 0.0, 1.0);\n"
+    "    if (materialAlpha < 0.005) discard;\n"
+    "    float halfMinor = max(min(v_rect.z, v_rect.w) * 0.5, 1.0);\n"
+    "    float inward = max(-d, 0.0);\n"
+    "    float rawBevel = max(v_c2.y, 0.0);\n"
+    "    float rawAmount = max(v_c2.z, 0.0);\n"
+    "    float lensScale = min(1.0, halfMinor / max(rawBevel, 0.001));\n"
+    "    float bevel = rawBevel * lensScale;\n"
+    "    float amount = rawAmount * lensScale;\n"
+    "    vec2 disp = vec2(0.0, 0.0);\n"
+    "    if (inward < bevel && bevel > 0.001 && amount > 0.001) {\n"
+    "      float e = 0.5;\n"
+    "      vec2 grad = vec2(\n"
+    "        sd_rr(p + vec2(e, 0.0), v_rect, s_rr) - sd_rr(p - vec2(e, 0.0), v_rect, s_rr),\n"
+    "        sd_rr(p + vec2(0.0, e), v_rect, s_rr) - sd_rr(p - vec2(0.0, e), v_rect, s_rr)\n"
+    "      ) / (2.0 * e);\n"
+    "      float gradLen = length(grad);\n"
+    "      vec2 surfaceNormal = gradLen > 0.0001 ? grad / gradLen : vec2(0.0, 0.0);\n"
+    "      float shortening = sqrt(clamp(gradLen, 0.0, 1.0));\n"
+    "      float bevelX = 1.0 - clamp(inward / bevel, 0.0, 1.0);\n"
+    "      float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
+    "      disp = surfaceNormal * (-mag);\n"
+    "    }\n"
+    "    vec2 uv = (p + disp) * u_map.xy + u_map.zw;\n"
+    "    vec4 fg = vec4(0.0);\n"
+    "    if (uv.x >= u_uvc.x && uv.x <= u_uvc.z && uv.y >= u_uvc.y && uv.y <= u_uvc.w) {\n"
+    "      fg = texture(u_bd, uv);\n"
+    "    }\n"
+    "    o = fg * (materialAlpha * col.a);\n"
+    "    return;\n"
+    "  }\n"
     "  vec2 hs = v_rect.zw * 0.5;\n"
     "  vec2 c = v_rect.xy + hs;\n"
     "  // worked out as near the curve as its cover, its edge or its blur reaches\n"
@@ -644,7 +681,7 @@ static const char *FS =
     "}\n"
     "// cut to its clip: a rect's, hard; a rounded one's, covered as edges are\n"
     "void main() {\n"
-    "  vec2 at_p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale;\n"
+    "  vec2 at_p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale + u_origin;\n"
     "  vec2 p = at_p, cp = at_p;\n"
     "  float rl = dot(v_rot.xy, v_rot.xy);\n"
     "  if (rl > 0.5) {\n"
@@ -698,6 +735,7 @@ static const char *FS_RECT =
     "flat in vec4 v_clip;\n"
     "uniform float u_scale;\n"
     "uniform float u_top;\n"
+    "uniform vec2 u_origin;\n"
     "out vec4 o;\n"
     "void main() {\n"
     "  vec2 p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale;\n"
@@ -962,11 +1000,11 @@ static int is_simple_rect(const float *f, int32_t i) {
 #define MB_KIND_LIQUID_SINGLE 13
 #define MB_KINDS 14
 static int has_own_prog(int kind) {
-  return (kind >= 0 && kind <= 6) || kind == 10 || kind == 11 || kind == MB_KIND_LIQUID_SINGLE;
+  return (kind >= 0 && kind <= 8) || kind == 10 || kind == 11 || kind == MB_KIND_LIQUID_SINGLE;
 }
 typedef struct {
   GLuint p;
-  GLint vp, scale, top, map, uvc, gb, shape, rad, n, glight, ad_box, ad_n;
+  GLint vp, origin, scale, top, map, uvc, gb, shape, rad, n, glight, ad_box, ad_n;
   unsigned gen;
 } kprog;
 static kprog progs[MB_KINDS + 1];
@@ -1034,6 +1072,7 @@ static kprog make_prog(GLuint vs, int kind) {
   glLinkProgram(k.p);
   glDeleteShader(fs);
   k.vp = glGetUniformLocation(k.p, "u_vp");
+  k.origin = glGetUniformLocation(k.p, "u_origin");
   k.scale = glGetUniformLocation(k.p, "u_scale");
   k.top = glGetUniformLocation(k.p, "u_top");
   k.map = glGetUniformLocation(k.p, "u_map");
@@ -1152,6 +1191,9 @@ static void gl_setup(void) {
 typedef struct { GLuint t, fb; int w, h; GLenum format; } level;
 static level lv[5];
 static int lv_w, lv_h;
+static level lens_lv[2];
+static int lens_w, lens_h, cur_lens_ph;
+static float cur_ox, cur_oy, cur_vpw, cur_vph;
 static int lv_shrink_frames, lv_win_max_w, lv_win_max_h;
 static int lv_frame_max_w, lv_frame_max_h;
 static int levels_rebuilt;
@@ -1209,6 +1251,19 @@ static void ensure_levels(int w, int h) {
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+static void ensure_lens_levels(int w, int h) {
+  if (lens_lv[0].t && lens_w >= w && lens_h >= h) return;
+  for (int j = 0; j < 2; j++)
+    if (lens_lv[j].t) {
+      glDeleteTextures(1, &lens_lv[j].t);
+      glDeleteFramebuffers(1, &lens_lv[j].fb);
+    }
+  lens_w = w > lens_w ? w : lens_w;
+  lens_h = h > lens_h ? h : lens_h;
+  for (int j = 0; j < 2; j++) lens_lv[j] = level_tex(GL_RGBA8, lens_w, lens_h);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
 static void post_pass(level *src, int sw, int sh, level *dst, int w, int h, int mode, float sg, float dx, float dy) {
   glBindFramebuffer(GL_FRAMEBUFFER, dst->fb);
 #ifdef GL_ES_VERSION_3_0
@@ -1224,6 +1279,15 @@ static void post_pass(level *src, int sw, int sh, level *dst, int w, int h, int 
   glUniform4f(pu_a, 1.0f / src->w, 1.0f / src->h, (float)mode, sg);
   glUniform4f(pu_b, (sw - 0.5f) / src->w, (sh - 0.5f) / src->h, dx, dy);
   glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+// The post program's other units (u_lv1..3) let go of the levels: a level still bound to an active sampler while a
+// later pass draws into it is a feedback loop (GL_INVALID_OPERATION on WebGL2 and strict GLES 3, the draw dropped).
+static void unbind_post_extra(void) {
+  glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, 0);
+  glActiveTexture(GL_TEXTURE0);
 }
 
 // Partial redraw: the surface's frame is drawn into a canvas of its own (canvas_fb), kept
@@ -1608,10 +1672,7 @@ static void blur(const Grab *m) {
 #endif
   glBlitFramebuffer(m->px0, m->pb0, m->px0 + w, m->pb0 + h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
   glUseProgram(post);
-  glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
-  glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
-  glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, 0);
-  glActiveTexture(GL_TEXTURE0);
+  unbind_post_extra();
   int lw[4], lh[4];
   grab_levels(m, lw, lh);
   if (m->progressive) {
@@ -1649,10 +1710,7 @@ static void blur(const Grab *m) {
     glScissor(m->vis_x, m->vis_y, m->vis_w, m->vis_h);
     post_pass(&lv[0], w, h, &lv[4], w, h, 4, 0, 0, 0);
     glDisable(GL_SCISSOR_TEST);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE0);
+    unbind_post_extra();
     return;
   }
   if (contained) {
@@ -2118,6 +2176,8 @@ static void glass_forget(void) {
 static void glass_lost(void) {
   memset(lv, 0, sizeof lv);
   lv_w = lv_h = 0;
+  memset(lens_lv, 0, sizeof lens_lv);
+  lens_w = lens_h = 0;
   lv_shrink_frames = lv_win_max_w = lv_win_max_h = 0;
   lv_frame_max_w = lv_frame_max_h = 0;
   for (int i = 0; i < MB_GLASS_SLOTS; i++) {
@@ -2169,6 +2229,11 @@ static void glass_free(void) {
     if (lv[j].t) {
       glDeleteTextures(1, &lv[j].t);
       glDeleteFramebuffers(1, &lv[j].fb);
+    }
+  for (int j = 0; j < 2; j++)
+    if (lens_lv[j].t) {
+      glDeleteTextures(1, &lens_lv[j].t);
+      glDeleteFramebuffers(1, &lens_lv[j].fb);
     }
   for (int i = 0; i < MB_GLASS_SLOTS; i++) {
     glass_slot *s = &slots[i];
@@ -2626,9 +2691,10 @@ static void use_prog(int kind) {
   glUseProgram(k->p);
   if (k->gen == prog_gen) return;
   k->gen = prog_gen;
-  if (k->vp >= 0) glUniform2f(k->vp, (float)cur_w, (float)cur_h);
+  if (k->vp >= 0) glUniform2f(k->vp, cur_vpw > 0.0f ? cur_vpw : (float)cur_w, cur_vph > 0.0f ? cur_vph : (float)cur_h);
+  if (k->origin >= 0) glUniform2f(k->origin, cur_ox, cur_oy);
   if (k->scale >= 0) glUniform1f(k->scale, (float)cur_scale);
-  if (k->top >= 0) glUniform1f(k->top, (float)(vy0 + vhp));
+  if (k->top >= 0) glUniform1f(k->top, cur_lens_ph > 0 ? (float)cur_lens_ph : (float)(vy0 + vhp));
   if (k->map >= 0) glUniform4fv(k->map, 1, gmap);
   if (k->uvc >= 0) glUniform4fv(k->uvc, 1, guvc);
   if (k->gb >= 0) glUniform4fv(k->gb, 1, ggb);
@@ -3467,13 +3533,113 @@ static void draw_into(GLuint fb, int part) {
       start++;
       continue;
     }
+    if (kind == 8) {
+      int32_t child_n = (int32_t)(fbuf[start * MB_INST + 12] + 0.5f);
+      if (child_n < 0) child_n = 0;
+      if (start + 1 + child_n > count) child_n = count - start - 1;
+      const float *hb = fbuf + (size_t)start * MB_INST;
+      if (child_n <= 0 || hb[11] <= 0.001f || hb[2] <= 0.0f || hb[3] <= 0.0f) {
+        start += 1 + child_n;
+        continue;
+      }
+      glass_drawn = 1;
+      float sc_f = (float)cur_scale;
+      float blur_pt = fmaxf(hb[7], 0.0f);
+      float refr_pt = fmaxf(hb[14], 0.0f);
+      float margin = blur_pt * 3.0f + refr_pt + 4.0f;
+      float x0 = hb[0], y0 = hb[1], x1 = hb[0] + hb[2], y1 = hb[1] + hb[3];
+      for (int32_t ci = start + 1; ci < start + 1 + child_n; ci++) {
+        const float *cb_f = fbuf + (size_t)ci * MB_INST;
+        int ck = (int)(cb_f[5] + 0.5f);
+        if (ck == 12 || cb_f[2] <= 0.0f || cb_f[3] <= 0.0f) continue;
+        if (cb_f[0] < x0) x0 = cb_f[0];
+        if (cb_f[1] < y0) y0 = cb_f[1];
+        if (cb_f[0] + cb_f[2] > x1) x1 = cb_f[0] + cb_f[2];
+        if (cb_f[1] + cb_f[3] > y1) y1 = cb_f[1] + cb_f[3];
+      }
+      float ox = floorf((x0 - margin) * sc_f) / sc_f;
+      float oy = floorf((y0 - margin) * sc_f) / sc_f;
+      int pw = (int)ceilf(((x1 + margin) - ox) * sc_f);
+      int ph = (int)ceilf(((y1 + margin) - oy) * sc_f);
+      int max_w = fb_w > 2048 ? fb_w : 2048;
+      int max_h = fb_h > 2048 ? fb_h : 2048;
+      if (pw < 1) pw = 1;
+      if (ph < 1) ph = 1;
+      if (pw > max_w) pw = max_w;
+      if (ph > max_h) ph = max_h;
+      ensure_lens_levels(pw, ph);
+      GLuint prev_bd = bd_tex;
+      // Pass 1: render children into lens_lv[0]
+      glBindFramebuffer(GL_FRAMEBUFFER, lens_lv[0].fb);
+      // (u_bd off any lens level: one bound there by a lens before is drawn into now)
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, atlas);
+      glViewport(0, 0, pw, ph);
+      glDisable(GL_SCISSOR_TEST);
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glEnable(GL_BLEND);
+      cur_ox = ox; cur_oy = oy; cur_vpw = (float)pw / sc_f; cur_vph = (float)ph / sc_f; cur_lens_ph = ph;
+      prog_gen++;
+      int32_t cs = start + 1, cend_all = start + 1 + child_n;
+      while (cs < cend_all) {
+        int ctid = (int)fbuf[cs * MB_INST + 20];
+        int ck = (int)(fbuf[cs * MB_INST + 5] + 0.5f);
+        if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ctid < 0) {
+          cs++;
+          continue;
+        }
+        int cown = has_own_prog(ck);
+        int32_t ce = cs + 1;
+        while (ce < cend_all && (int)fbuf[ce * MB_INST + 20] == ctid) {
+          int kk = (int)(fbuf[ce * MB_INST + 5] + 0.5f);
+          if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15) break;
+          if (cown ? kk != ck : has_own_prog(kk)) break;
+          ce++;
+        }
+        GLuint ct = ctid ? image_tex(ctid) : atlas;
+        if (ctid > MB_STREAM_TEX && !ct) { cs = ce; continue; }
+        if (ctid > 0 && ctid <= MB_STREAM_TEX && !ct) encode_missing = 1;
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, ct ? ct : atlas);
+        use_prog(cown ? ck : -1);
+        draw_run(cs, ce - cs);
+        cs = ce;
+      }
+      // Pass 2: separable Gaussian blur in RGBA8
+      float sp = blur_pt * sc_f;
+      if (sp > 0.25f) {
+        glDisable(GL_BLEND);
+        glUseProgram(post);
+        unbind_post_extra();
+        post_pass(&lens_lv[0], pw, ph, &lens_lv[1], pw, ph, 2, sp, 1.0f, 0.0f);
+        post_pass(&lens_lv[1], pw, ph, &lens_lv[0], pw, ph, 2, sp, 0.0f, 1.0f);
+      }
+      // Pass 3: composite refracted & SDF-clipped foreground lens onto target
+      cur_ox = 0.0f; cur_oy = 0.0f; cur_vpw = 0.0f; cur_vph = 0.0f; cur_lens_ph = 0;
+      bd_tex = lens_lv[0].t;
+      float W = (float)lens_lv[0].w, H = (float)lens_lv[0].h;
+      gmap[0] = sc_f / W; gmap[1] = -sc_f / H;
+      gmap[2] = -(ox * sc_f) / W; gmap[3] = ((float)ph + oy * sc_f) / H;
+      guvc[0] = 0.5f / W; guvc[1] = 0.5f / H;
+      guvc[2] = ((float)pw - 0.5f) / W; guvc[3] = ((float)ph - 0.5f) / H;
+      main_state();
+      use_prog(8);
+      draw_run(start, 1);
+      bd_tex = prev_bd;
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : atlas);
+      bound = 0;
+      start += 1 + child_n;
+      continue;
+    }
     // (kinds without their own program one run, as before)
     int own = tid >= 0 && has_own_prog(kind);
     int fast_rect = tid == 0 && kind == 0 && prog_rect && fast_rect_enabled() && is_simple_rect(fbuf, start);
     int32_t end = start + 1;
     while (end < count && (int)fbuf[end * MB_INST + 20] == tid) {
       int k = (int)(fbuf[end * MB_INST + 5] + 0.5f);
-      if (k == 14 || k == 15) break;
+      if (k == 8 || k == 14 || k == 15) break;
       if (own ? k != kind : tid >= 0 && has_own_prog(k)) break;
       if (tid == 0 && kind == 0 && prog_rect && fast_rect_enabled() && is_simple_rect(fbuf, end) != fast_rect) break;
       end++;

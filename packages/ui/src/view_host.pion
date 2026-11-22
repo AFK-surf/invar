@@ -1006,7 +1006,7 @@ fn encode_glass(
   if base + 23 < scene.inst.length() {
     scene.inst[base + 21] = gl.refraction
     scene.inst[base + 22] = if gl.liquid { gl.chroma } else if gl.progressive { -1.0 } else { 0.0 }
-    scene.inst[base + 23] = gl.merge
+    scene.inst[base + 23] = if gl.liquid && gl.layer > 0 { 0.0 } else { gl.merge }
   }
   scene.glass_capture(idx, gl.liquid, gl.shares_capture)
   apply_node_corners(scene, idx, d)
@@ -1664,7 +1664,7 @@ fn encode_drawn_node_direct(
   }
   let is_glass = eff_glass.is_some() && !glass_solid()
   let is_merged_liquid = match eff_glass {
-    Some(gl) => gl.liquid && gl.merge > 0.0 && !glass_solid()
+    Some(gl) => gl.liquid && gl.merge > 0.0 && gl.layer <= 0 && !glass_solid()
     None => false
   }
   if !is_merged_liquid {
@@ -2236,12 +2236,16 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
   let scales : Array[Double] = []
   let held = tree.drawn_held(scales=scales)
   let n = held.length()
+  let n0 = scene.ninst
   let eff_clip : Array[(Double, Double, Double, Double)] = []
   let eff_rc : Array[(Double, Double, Double, Double)] = []
   let deferred_shadows : Array[DeferredGlassShadow] = []
   let fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
   let blur_stack : Array[BlurFrame] = []
   let ink_stack : Array[(view::NodeId, Double, Double, Double)] = []
+  let glass_slots : Array[GlassSlot] = []
+  let glass_open : Array[Int] = []
+  let lens_open : Array[(view::NodeId, Int)] = []
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
@@ -2250,6 +2254,26 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     }
     while blur_stack.length() > 0 && !tree.holds_in_order(blur_stack[blur_stack.length() - 1].id, d.id) {
       pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
+    }
+    while lens_open.length() > 0 && !tree.holds_in_order(lens_open[lens_open.length() - 1].0, d.id) {
+      match lens_open.pop() {
+        Some((_, hdr_idx)) => {
+          let child_n = scene.ninst - hdr_idx - 1
+          if child_n > 0 {
+            scene.inst[hdr_idx * inst_size + 12] = child_n.to_double()
+          } else {
+            scene.inst[hdr_idx * inst_size + 12] = 0.0
+            scene.inst[hdr_idx * inst_size + 11] = 0.0
+          }
+        }
+        None => ()
+      }
+    }
+    while glass_open.length() > 0 && !tree.holds_in_order(glass_slots[glass_open[glass_open.length() - 1]].id, d.id) {
+      match glass_open.pop() {
+        Some(idx) => glass_slots[idx].sub_end = scene.ninst
+        None => ()
+      }
     }
     while ink_stack.length() > 0 && !tree.holds_in_order(ink_stack[ink_stack.length() - 1].0, d.id) {
       match ink_stack.pop() {
@@ -2320,6 +2344,46 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     let mag = tree.magnifies_of(d.id)
     let k0 = scene.ninst
     encode_drawn_node(scene, d, gd, node_scale, frame_no, now, scale, draw_clip, draw_rc, deferred_shadows, mag, k0)
+    if !glass_solid() {
+      match d.glass {
+        Some(gl) if gl.liquid && gl.layer > 0 && gl.strength > 0.001 => {
+          if k0 < scene.ninst && scene.inst[k0 * inst_size + 5] == 6.0 && scene.inst[k0 * inst_size + 15] > 0.001 {
+            let si = if k0 + 1 < scene.ninst && scene.inst[(k0 + 1) * inst_size + 5] == 2.0 { k0 + 1 } else { -1 }
+            let off = k0 * inst_size
+            let gx = scene.inst[off]
+            let gy = scene.inst[off + 1]
+            let gw = scene.inst[off + 2]
+            let gh = scene.inst[off + 3]
+            let (cx0, cy0, cx1, cy1) = draw_clip
+            if gw > 0.0 && gh > 0.0 && gx < cx1 && gx + gw > cx0 && gy < cy1 && gy + gh > cy0 {
+              let bg = if gl.break_gap > 0.0 { gl.break_gap } else { gl.merge * 0.25 }
+              let slot_idx = glass_slots.length()
+              glass_slots.push(GlassSlot::{
+                layer: gl.layer,
+                nav_scope: 0,
+                id: d.id,
+                glass_idx: k0,
+                shadow_idx: si,
+                sub_start: k0,
+                sub_end: scene.ninst,
+                x0: gx,
+                y0: gy,
+                x1: gx + gw,
+                y1: gy + gh,
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                merge_max: gl.merge,
+                break_gap: bg,
+              })
+              glass_open.push(slot_idx)
+            }
+          }
+        }
+        _ => ()
+      }
+    }
     expand_blur_stack(scene, blur_stack, k0, scene.ninst)
     for f in fading {
       let (by, fbox, fsoft) = f
@@ -2338,6 +2402,63 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
         inst_fade_across(scene.inst, b, fx0, fstart, fx1, fend)
         k += 1
       }
+    }
+    // Foreground optical lens (kind == 8): offscreen Gaussian defocus + spherical bevel refraction + SDF clip
+    // over children; zero overhead when resting (blur <= 0.05 && refraction <= 0.05).
+    let lens = tree.content_lens_of(d.id)
+    let lens_active = (lens.blur > 0.05 || lens.refraction > 0.05) && d.alpha > 0.001
+    if lens_active {
+      let (lgx, lgy, lgw, lgh) = if gd.reshaped() {
+        (
+          d.x + gd.dx * node_scale,
+          d.y + gd.dy * node_scale,
+          dmax(0.0, d.w + gd.dw * node_scale),
+          dmax(0.0, d.h + gd.dh * node_scale),
+        )
+      } else {
+        (d.x, d.y, d.w, d.h)
+      }
+      let (r0, r1, r2, r3) = match gd.corners {
+        Some((tl, tr, br, bl)) => (tl * node_scale, tr * node_scale, br * node_scale, bl * node_scale)
+        None =>
+        match d.corners {
+          Some((tl, tr, br, bl)) => (tl, tr, br, bl)
+          None => (d.radius, d.radius, d.radius, d.radius)
+        }
+      }
+      let hdr_idx = scene.push_inst(
+        lgx,
+        lgy,
+        lgw,
+        lgh,
+        r0,
+        8.0,
+        0.0,
+        lens.blur * node_scale,
+        c64(0xFFFF, 0xFFFF),
+        dclamp(lens.alpha * d.alpha, 0.0, 1.0),
+        0.0,
+        lens.bezel * node_scale,
+        lens.refraction * node_scale,
+        1.0,
+        clip_x=draw_clip.0,
+        clip_y=draw_clip.1,
+        clip_x1=draw_clip.2,
+        clip_y1=draw_clip.3,
+      )
+      let hoff = hdr_idx * inst_size
+      scene.inst[hoff + 12] = 0.0
+      scene.inst[hoff + 20] = 0.0
+      scene.inst[hoff + 36] = r0
+      scene.inst[hoff + 37] = r1
+      scene.inst[hoff + 38] = r2
+      scene.inst[hoff + 39] = r3
+      let has_rc = draw_rc.0 > 0.0 || draw_rc.1 > 0.0 || draw_rc.2 > 0.0 || draw_rc.3 > 0.0
+      if has_rc {
+        scene.set_clip_corners(hdr_idx, draw_rc.0, draw_rc.1, draw_rc.2, draw_rc.3)
+      }
+      expand_blur_stack(scene, blur_stack, hdr_idx, hdr_idx + 1)
+      lens_open.push((d.id, hdr_idx))
     }
     let (fstart, ftop, fend, ffoot) = match tree.cut_soft_of(d.id) {
       Some((over_top, over_foot, ch)) => (0.0, cut_soft(over_top, ch / 2.0), 0.0, cut_soft(over_foot, ch / 2.0))
@@ -2370,6 +2491,29 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
   }
   flush_deferred_shadows(scene, deferred_shadows)
+  while lens_open.length() > 0 {
+    match lens_open.pop() {
+      Some((_, hdr_idx)) => {
+        let child_n = scene.ninst - hdr_idx - 1
+        if child_n > 0 {
+          scene.inst[hdr_idx * inst_size + 12] = child_n.to_double()
+        } else {
+          scene.inst[hdr_idx * inst_size + 12] = 0.0
+          scene.inst[hdr_idx * inst_size + 11] = 0.0
+        }
+      }
+      None => ()
+    }
+  }
+  while glass_open.length() > 0 {
+    match glass_open.pop() {
+      Some(idx) => glass_slots[idx].sub_end = scene.ninst
+      None => ()
+    }
+  }
+  if glass_slots.length() >= 2 {
+    scene.merge_liquid_layers(n0, glass_slots)
+  }
 }
 
 /// Encode `tree.drawn_held()` into a standalone 60-Double `Scene` using the currently active `hostapi`
