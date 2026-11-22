@@ -2,7 +2,7 @@
 // same instances as the Metal renderer, canvas-2D text rasterized into an
 // atlas, and a hidden textarea that receives the system input method.
 (() => {
-  const FAMILY = 'system-ui, -apple-system, "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif';
+  const FAMILY = '-apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "PingFang SC", "Noto Sans CJK SC", "Segoe UI", sans-serif';
   // the code face (style bit 2), its Han from the system's sans
   // the serif face (style bit 4): a reader's 宋体
   const SERIF = '"Songti SC", "Noto Serif CJK SC", "Source Han Serif SC", SimSun, serif';
@@ -38,6 +38,7 @@
     }));
   }
   let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta;
+  let extParallel = null, bootProgs = null, bootPvs = null, bootReady = true;
   let curW = 0, curH = 0, curScale = 1;
   const rtW = () => curW || canvas.width;
   const rtH = () => curH || canvas.height;
@@ -79,6 +80,17 @@
   function tick(rafTs) {
     pending = false;
     pendingRaf = 0;
+    if (!bootReady && bootProgs) {
+      if (shotAt < 0 && extParallel) {
+        for (let i = 0; i < bootProgs.length; i++) {
+          if (!gl.getProgramParameter(bootProgs[i].p, extParallel.COMPLETION_STATUS_KHR)) {
+            H.requestFrame();
+            return;
+          }
+        }
+      }
+      finalizeBootProgs();
+    }
     if (typeof rafTs === 'number' && rafTs >= 0) {
       if (lastRafTs >= 0) {
         const dt = rafTs - lastRafTs;
@@ -648,6 +660,93 @@
     float rr = min(r, room);
     return mb_sd_corner(p, hs, rr, mb_smoothness(rr, room), band);
   }
+  #if defined(ONE_KIND) && (ONE_KIND < 0 || ONE_KIND == 2)
+  // A shadow as Core Animation draws one (CALayer shadowRadius: a Gaussian blur of the shape, sigma its radius): the box
+  // of half sides hs about p, its corners r, blurred by sigma; how much of it covers p, 0 … 1. The blur across worked
+  // out whole (erf); along, four samples of the Gaussian over where it is not nothing (Evan Wallace's rounded box shadow).
+  float mb_erf(float x) {
+    float s = sign(x);
+    float a = abs(x);
+    float t = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
+    t = t * t;
+    return s - s / (t * t);
+  }
+  float mb_shadow_row(float x, float y, float sigma, float r, float2 hs) {
+    float delta = min(hs.y - r - abs(y), 0.0);
+    float curved = hs.x - r + sqrt(max(0.0, r * r - delta * delta));
+    float k = 0.7071067811865476 / sigma;
+    return 0.5 * (mb_erf((x + curved) * k) - mb_erf((x - curved) * k));
+  }
+  float mb_shadow(float2 p, float2 hs, float r, float sigma) {
+    float rr = min(r, min(hs.x, hs.y));
+    float lo = clamp(-3.0 * sigma, p.y - hs.y, p.y + hs.y);
+    float hi = clamp(3.0 * sigma, p.y - hs.y, p.y + hs.y);
+    float st = (hi - lo) / 4.0;
+    float y = lo + st * 0.5;
+    float v = 0.0;
+    for (int i = 0; i < 4; i++) {
+      float g = exp(-(y * y) / (2.0 * sigma * sigma)) / (2.5066282746310002 * sigma);
+      v += mb_shadow_row(p.x, p.y - y, sigma, rr, hs) * g * st;
+      y += st;
+    }
+    return v;
+  }
+  #endif
+  #if defined(ONE_KIND) && (ONE_KIND < 0 || ONE_KIND == 10 || ONE_KIND == 11)
+  // A shape (src/ui/shape.mbt, scene.mbt's kind 11): its pieces s (x0 y0 x1 y1 as shares of its band's rect r) worked
+  // into the pixel about p, scale its pixels a point. A fill's: each piece's crossings of 4 rows across the pixel, each
+  // counted by how much of the row lies left of it (+ going down, - going up); their sums over every piece, the rows'
+  // winding numbers across the pixel, make its cover (even_odd 1: by the even-odd rule, else the nonzero one).
+  // (mb4: v in all four; Direct3D's float4 takes no single number)
+  float4 mb4(float v) {
+    return float4(v, v, v, v);
+  }
+  float4 mb_path_rows(float4 s, float4 r, float2 p, float scale) {
+    float2 a = r.xy + s.xy * r.zw;
+    float2 b = r.xy + s.zw * r.zw;
+    if (a.y == b.y) return mb4(0.0);
+    float dir = b.y > a.y ? 1.0 : -1.0;
+    float4 ys = mb4(p.y) + float4(-0.375, -0.125, 0.125, 0.375) / scale;
+    float4 in_ = step(mb4(min(a.y, b.y)), ys) * (mb4(1.0) - step(mb4(max(a.y, b.y)), ys));
+    float4 xs = mb4(a.x) + (ys - mb4(a.y)) * ((b.x - a.x) / (b.y - a.y));
+    return in_ * dir * clamp((xs - mb4(p.x)) * scale + mb4(0.5), mb4(0.0), mb4(1.0));
+  }
+  float mb_path_cover(float4 w, float even_odd) {
+    float4 a = abs(w);
+    float4 f = a - floor(a * 0.5) * 2.0;
+    float4 c = even_odd > 0.5 ? mb4(1.0) - abs(mb4(1.0) - f) : min(a, mb4(1.0));
+    return dot(c, mb4(0.25));
+  }
+  // A stroke's: how far p is from a piece (its ends round).
+  float mb_seg_dist(float4 s, float4 r, float2 p) {
+    float2 a = r.xy + s.xy * r.zw;
+    float2 ab = r.xy + s.zw * r.zw - a;
+    float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
+    return length(p - a - ab * h);
+  }
+  // Which of a data instance's (kind 12) fours piece i is in: 0, 2, 3, 4, 6, 7 (shape.mbt seg_slots), six to an instance.
+  int mb_seg_slot(int i) {
+    int s = i - (i / 6) * 6;
+    return s + (s >= 1 ? 1 : 0) + (s >= 4 ? 1 : 0);
+  }
+  #endif
+  #if defined(ONE_KIND) && (ONE_KIND < 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 13)
+  // How far to move a smooth ground (glass's frost) at the pixel px (in pixels) before it is written to 8 bits a
+  // channel, in steps of 1/255: Skia's ordered dither (GrDitherEffect, an 8x8 Bayer matrix by the pixel's place), never
+  // half a step either way. Without it a slope of a few steps across a wide frost is written as flat bands, an edge where
+  // each step is (contour lines); with it each pixel is the step above or below as often as the slope is near it, and
+  // a value already on a step stays it.
+  float mb_dither(float2 px) {
+    int x = int(floor(px.x)) & 7;
+    int y = (int(floor(px.y)) & 7) ^ x;
+    int m = ((y & 1) << 5) | ((x & 1) << 4) | ((y & 2) << 2) | ((x & 2) << 1) | ((y & 4) >> 1) | ((x & 4) >> 2);
+    return float(m) / 64.0 - 63.0 / 128.0;
+  }
+  #endif
+  #endif
+  // corner.sl end
+  `;
+  const CONTAINED_GLSL = `
   // A contained blur extends the picture at its actual curved boundary, rather than cropping all four straight edges
   // to a corner's inset. Points already in the picture stay where they are. Near a curve, keep a little inside its
   // antialiased edge so the bilinear sample itself cannot bring in the background outside the clip.
@@ -728,89 +827,13 @@
     }
     return inside;
   }
-  // A shadow as Core Animation draws one (CALayer shadowRadius: a Gaussian blur of the shape, sigma its radius): the box
-  // of half sides hs about p, its corners r, blurred by sigma; how much of it covers p, 0 … 1. The blur across worked
-  // out whole (erf); along, four samples of the Gaussian over where it is not nothing (Evan Wallace's rounded box shadow).
-  float mb_erf(float x) {
-    float s = sign(x);
-    float a = abs(x);
-    float t = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
-    t = t * t;
-    return s - s / (t * t);
-  }
-  float mb_shadow_row(float x, float y, float sigma, float r, float2 hs) {
-    float delta = min(hs.y - r - abs(y), 0.0);
-    float curved = hs.x - r + sqrt(max(0.0, r * r - delta * delta));
-    float k = 0.7071067811865476 / sigma;
-    return 0.5 * (mb_erf((x + curved) * k) - mb_erf((x - curved) * k));
-  }
-  float mb_shadow(float2 p, float2 hs, float r, float sigma) {
-    float rr = min(r, min(hs.x, hs.y));
-    float lo = clamp(-3.0 * sigma, p.y - hs.y, p.y + hs.y);
-    float hi = clamp(3.0 * sigma, p.y - hs.y, p.y + hs.y);
-    float st = (hi - lo) / 4.0;
-    float y = lo + st * 0.5;
-    float v = 0.0;
-    for (int i = 0; i < 4; i++) {
-      float g = exp(-(y * y) / (2.0 * sigma * sigma)) / (2.5066282746310002 * sigma);
-      v += mb_shadow_row(p.x, p.y - y, sigma, rr, hs) * g * st;
-      y += st;
-    }
-    return v;
-  }
-  // A shape (src/ui/shape.mbt, scene.mbt's kind 11): its pieces s (x0 y0 x1 y1 as shares of its band's rect r) worked
-  // into the pixel about p, scale its pixels a point. A fill's: each piece's crossings of 4 rows across the pixel, each
-  // counted by how much of the row lies left of it (+ going down, - going up); their sums over every piece, the rows'
-  // winding numbers across the pixel, make its cover (even_odd 1: by the even-odd rule, else the nonzero one).
-  // (mb4: v in all four; Direct3D's float4 takes no single number)
-  float4 mb4(float v) {
-    return float4(v, v, v, v);
-  }
-  float4 mb_path_rows(float4 s, float4 r, float2 p, float scale) {
-    float2 a = r.xy + s.xy * r.zw;
-    float2 b = r.xy + s.zw * r.zw;
-    if (a.y == b.y) return mb4(0.0);
-    float dir = b.y > a.y ? 1.0 : -1.0;
-    float4 ys = mb4(p.y) + float4(-0.375, -0.125, 0.125, 0.375) / scale;
-    float4 in_ = step(mb4(min(a.y, b.y)), ys) * (mb4(1.0) - step(mb4(max(a.y, b.y)), ys));
-    float4 xs = mb4(a.x) + (ys - mb4(a.y)) * ((b.x - a.x) / (b.y - a.y));
-    return in_ * dir * clamp((xs - mb4(p.x)) * scale + mb4(0.5), mb4(0.0), mb4(1.0));
-  }
-  float mb_path_cover(float4 w, float even_odd) {
-    float4 a = abs(w);
-    float4 f = a - floor(a * 0.5) * 2.0;
-    float4 c = even_odd > 0.5 ? mb4(1.0) - abs(mb4(1.0) - f) : min(a, mb4(1.0));
-    return dot(c, mb4(0.25));
-  }
-  // A stroke's: how far p is from a piece (its ends round).
-  float mb_seg_dist(float4 s, float4 r, float2 p) {
-    float2 a = r.xy + s.xy * r.zw;
-    float2 ab = r.xy + s.zw * r.zw - a;
-    float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
-    return length(p - a - ab * h);
-  }
-  // Which of a data instance's (kind 12) fours piece i is in: 0, 2, 3, 4, 6, 7 (shape.mbt seg_slots), six to an instance.
-  int mb_seg_slot(int i) {
-    int s = i - (i / 6) * 6;
-    return s + (s >= 1 ? 1 : 0) + (s >= 4 ? 1 : 0);
-  }
-  // How far to move a smooth ground (glass's frost) at the pixel px (in pixels) before it is written to 8 bits a
-  // channel, in steps of 1/255: Skia's ordered dither (GrDitherEffect, an 8x8 Bayer matrix by the pixel's place), never
-  // half a step either way. Without it a slope of a few steps across a wide frost is written as flat bands, an edge where
-  // each step is (contour lines); with it each pixel is the step above or below as often as the slope is near it, and
-  // a value already on a step stays it.
-  float mb_dither(float2 px) {
-    int x = int(floor(px.x)) & 7;
-    int y = (int(floor(px.y)) & 7) ^ x;
-    int m = ((y & 1) << 5) | ((x & 1) << 4) | ((y & 2) << 2) | ((x & 2) << 1) | ((y & 4) >> 1) | ((x & 4) >> 2);
-    return float(m) / 64.0 - 63.0 / 128.0;
-  }
-  #endif
-  // corner.sl end
   `;
   const FS = `#version 300 es
   precision highp float;
   precision highp int;
+  #ifndef ONE_KIND
+  #define ONE_KIND -1
+  #endif
   flat in vec4 v_rot;
   flat in vec4 v_rect; flat in vec4 v_p; flat in vec4 v_color; flat in vec4 v_c2; flat in vec4 v_clip; flat in vec4 v_pad;
   flat in vec4 v_rc; flat in vec4 v_rs; flat in vec4 v_rr; flat in vec4 v_oclip; flat in vec4 v_orc; flat in vec4 v_ors;
@@ -838,10 +861,13 @@
   uniform highp sampler2D u_segs;
   out vec4 o;
   ${CORNERS}
+  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 13
   float sd_rr(vec2 p, vec4 r, vec4 rad) {
     vec2 hs = r.zw * 0.5;
     return mb_sd_box(p - r.xy - hs, hs, mb_corner_of(p - r.xy - hs, rad), 1e9);
   }
+  #endif
+  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5
   // a notch cut into the top edge (scene.mbt 21-23): a circle about the top's middle (pad.y below it, pad.z its
   // radius), met by the edge through fillets (pad.w): the rounded intersection with what is outside the circle
   float notch_cut(float d, vec2 p, vec4 r, vec4 pad) {
@@ -851,6 +877,8 @@
     vec2 u = max(vec2(f + d, f + b), 0.0);
     return min(-f, max(d, b)) + length(u);
   }
+  #endif
+  #if ONE_KIND < 0 || ONE_KIND == 6
   float smin_k(float a, float b, float k) {
     if (k <= 0.0) return min(a, b);
     float h = max(k - abs(a - b), 0.0) / k;
@@ -864,15 +892,21 @@
     }
     return d;
   }
+  #endif
+  #if ONE_KIND < 0 || ONE_KIND == 6 || ONE_KIND == 13
   // Integral of linear ramp from 0 to w (contourOffset = 0, width w in device px)
   float mb_contour_int(float t, float w) {
     float u = clamp(t, 0.0, w);
     return u - u * u / (2.0 * w);
   }
+  #endif
+  #if ONE_KIND < 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
   vec3 backdrop(vec2 p) {
     return texture(u_bd, clamp(p * u_map.xy + u_map.zw, u_uvc.xy, u_uvc.zw)).rgb;
   }
   float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+  #endif
+  #if ONE_KIND < 0 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
   float mb_backdrop_luma_rect(vec2 c, vec2 h) {
     float sum = 0.0;
     float mx1 = -1.0, mx2 = -1.0;
@@ -921,6 +955,8 @@
     float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));
     return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.30, 0.42, bgL));
   }
+  #endif
+  #if ONE_KIND < 0 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11
   vec3 mb_adaptive_ink(vec3 rgb, float darkT) {
     float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
     if (ch <= 0.08) {
@@ -933,6 +969,7 @@
     }
     return rgb;
   }
+  #endif
   // how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth
   // each is), its edge covered as a box's own (0.5 - d * scale), so what it cuts meets the ground of the box that cuts it
   float clip_cover(vec2 p, vec4 c, vec4 r, vec4 s, float scale) {
@@ -941,9 +978,6 @@
   }
   // what it shows at p, as if uncut
   void shade(vec2 p, float fade_r) {
-    #ifndef ONE_KIND
-    #define ONE_KIND -1
-    #endif
     int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5));
     #if ONE_KIND < 0
     if (kind == 9) { vec2 hh = v_rect.zw * 0.5; float rr = min(mb_corner_of(p - v_rect.xy - hh, v_rr), min(hh.x, hh.y)); vec2 q = abs(p - v_rect.xy - hh) - hh + rr; if (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr > 0.0) discard; o = vec4(0.0); return; }
@@ -980,7 +1014,7 @@
       return;
     }
     #endif
-    #if ONE_KIND < 0 || ONE_KIND == 1 || ONE_KIND == 3
+    #if ONE_KIND < 0 || ONE_KIND == 1 || ONE_KIND == 3 || ONE_KIND == 7
     if (kind == 1 || kind == 3 || kind == 7) {
       // within its own cell (c2: where in the atlas, in texels), however its rect is stretched or turned: a sample
       // past the cell's edge texels would blend in what lies beside it (another glyph, one left from before the
@@ -993,7 +1027,7 @@
       vec2 tex = exact ? floor(p * u_scale - r0i) + 0.5 : (p - v_rect.xy) / v_rect.zw * v_c2.zw;
       vec2 uv = clamp(v_c2.xy + tex, v_c2.xy + 0.5, v_c2.xy + v_c2.zw - 0.5) / ${ATLAS}.0;
       vec4 t = texture(u_atlas, uv);
-      #if ONE_KIND < 0
+      #if ONE_KIND < 0 || ONE_KIND == 7
       if (kind == 7) {
         // inked by how light what is under its glass is, looked at round the glass's middle
         float darkT = ad_sample(v_pad.yz, v_pad.w * 0.5, false);
@@ -1432,6 +1466,7 @@
   precision highp float;
   precision highp int;
   ${CORNERS}
+  ${CONTAINED_GLSL}
   // The backdrop's passes: u_a.xy the source's texel, u_a.z 1 halving (dual Kawase's down), 2 a Gaussian along u_b.zw
   // of deviation u_a.w (texels); u_b.xy the last texel's centre of what the source holds
   uniform highp sampler2D u_src;
@@ -1466,7 +1501,7 @@
         if (target_px <= 0.01) {
           g_small = texture(u_src, clamp(c_uv, uv0_min, uv0_max));
         } else {
-          float r_tap = target_px * 1.5;
+          float r_tap = min(target_px * 0.75, 1.25);
           vec2 d0 = vec2(r_tap, 0.0) * m0.xy;
           vec2 d1 = vec2(0.0, r_tap) * m0.xy;
           vec2 dd = vec2(r_tap * 0.70710678, r_tap * 0.70710678) * m0.xy;
@@ -1480,7 +1515,7 @@
                       texture(u_src, clamp(c_uv + vec2(dd.x, -dd.y), uv0_min, uv0_max)) +
                       texture(u_src, clamp(c_uv + vec2(-dd.x, dd.y), uv0_min, uv0_max))) * 0.0625;
         }
-        float blend1 = smoothstep(sig1 * 0.65, sig1, target_px);
+        float blend1 = smoothstep(sig1 * 0.15, sig1, target_px);
         if (blend1 > 0.0) {
           vec4 c_lv1 = texture(u_lv1, clamp(gl_FragCoord.xy * m1.xy, m1.xy * 1.0, m1.zw));
           o = mix(g_small, c_lv1, blend1);
@@ -1602,25 +1637,28 @@
     o = vec4(mb_pack16(nextT), latch, clamp(bgL, 0.0, 1.0));
   }`;
 
-  function compile(type, src) {
+  function compileAsync(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
     return s;
   }
 
-  const hasOwnProg = (kind) => (kind >= 0 && kind <= 6) || kind === 10 || kind === 11 || kind === MB_KIND_LIQUID_SINGLE;
+  function checkLink(p, vsShader, fsShader) {
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      const plog = gl.getProgramInfoLog(p) || '';
+      const vlog = vsShader && !gl.getShaderParameter(vsShader, gl.COMPILE_STATUS) ? ('VS: ' + gl.getShaderInfoLog(vsShader) + '\n') : '';
+      const flog = fsShader && !gl.getShaderParameter(fsShader, gl.COMPILE_STATUS) ? ('FS: ' + gl.getShaderInfoLog(fsShader) + '\n') : '';
+      throw new Error(vlog + flog + plog);
+    }
+  }
 
-  function makeProg(vsShader, kind) {
-    const src = `#version 300 es\n#define ONE_KIND ${kind}\n` + FS.slice('#version 300 es\n'.length);
-    const fs = compile(gl.FRAGMENT_SHADER, src);
-    const p = gl.createProgram();
-    gl.attachShader(p, vsShader);
-    gl.attachShader(p, fs);
-    gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-    gl.deleteShader(fs);
+  const hasOwnProg = (kind) => (kind >= 0 && kind <= 7) || kind === 10 || kind === 11 || kind === MB_KIND_LIQUID_SINGLE;
+  const BOOT_KINDS = [0, 1, 2, 7, 11, 13];
+
+  function finalizeKindProg(p, vsShader, fsShader) {
+    checkLink(p, vsShader, fsShader);
+    gl.deleteShader(fsShader);
     const u = {};
     for (const n of ['u_vp', 'u_scale', 'u_top', 'u_atlas', 'u_img', 'u_bd', 'u_map', 'u_uvc', 'u_gb', 'u_shape', 'u_rad', 'u_n', 'u_glight', 'u_segs', 'u_ad', 'u_ad_box', 'u_ad_n']) {
       u[n] = gl.getUniformLocation(p, n);
@@ -1632,6 +1670,53 @@
     if (u.u_segs) gl.uniform1i(u.u_segs, 3);
     if (u.u_ad) gl.uniform1i(u.u_ad, 4);
     return { p, u, gen: 0 };
+  }
+
+  function makeProg(vsShader, kind) {
+    const src = `#version 300 es\n#define ONE_KIND ${kind}\n` + FS.slice('#version 300 es\n'.length);
+    const fs = compileAsync(gl.FRAGMENT_SHADER, src);
+    const p = gl.createProgram();
+    gl.attachShader(p, vsShader);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    return finalizeKindProg(p, vsShader, fs);
+  }
+
+  function finalizeBootProgs() {
+    if (!bootProgs) { bootReady = true; return; }
+    const list = bootProgs;
+    const pvs = bootPvs;
+    bootProgs = null;
+    bootPvs = null;
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      if (it.role === 'flat') {
+        checkLink(it.p, vs, it.fs);
+        gl.deleteShader(it.fs);
+        ufVp = gl.getUniformLocation(it.p, 'u_vp');
+      } else if (it.role === 'rect') {
+        checkLink(it.p, vs, it.fs);
+        gl.deleteShader(it.fs);
+        urVp = gl.getUniformLocation(it.p, 'u_vp');
+        urScale = gl.getUniformLocation(it.p, 'u_scale');
+        urTop = gl.getUniformLocation(it.p, 'u_top');
+      } else if (it.role === 'post') {
+        checkLink(it.p, pvs, it.fs);
+        gl.deleteShader(it.fs);
+        for (const n of ['u_src', 'u_lv1', 'u_lv2', 'u_lv3', 'u_a', 'u_b', 'u_c']) PU[n] = gl.getUniformLocation(it.p, n);
+      } else if (it.role === 'ad') {
+        checkLink(it.p, pvs, it.fs);
+        gl.deleteShader(it.fs);
+        ADU = {};
+        for (const n of ['u_bd', 'u_prev', 'u_map', 'u_uvc', 'u_box', 'u_param']) ADU[n] = gl.getUniformLocation(it.p, n);
+      } else if (it.role === 'kind') {
+        progs[it.kind] = finalizeKindProg(it.p, vs, it.fs);
+      }
+    }
+    if (pvs) gl.deleteShader(pvs);
+    bootReady = true;
+    progGen++;
+    progNow = null;
   }
 
   function getProg(kind) {
@@ -1668,47 +1753,56 @@
   function setupGL() {
     // with alpha: native views (below) show through the holes the app paints (kind 9), and default-FB glass blits to RGBA8
     gl = canvas.getContext('webgl2', { premultipliedAlpha: true, antialias: false, alpha: true });
+    extParallel = gl.getExtension('KHR_parallel_shader_compile');
     cv = null;
     cvOk = false;
-    vs = compile(gl.VERTEX_SHADER, VS);
     progs = new Array(MB_KINDS + 1).fill(null);
-    progs[MB_KINDS] = makeProg(vs, -1);
-    prog = progs[MB_KINDS].p;
-    U = progs[MB_KINDS].u;
-    const fsFlat = compile(gl.FRAGMENT_SHADER, FS_FLAT);
+    prog = null;
+    U = {};
+    PU = {};
+    ADU = {};
+    vs = compileAsync(gl.VERTEX_SHADER, VS);
+    const pvs = compileAsync(gl.VERTEX_SHADER, PVS);
+    bootPvs = pvs;
+    const batch = [];
+    const fsFlat = compileAsync(gl.FRAGMENT_SHADER, FS_FLAT);
     progFlat = gl.createProgram();
     gl.attachShader(progFlat, vs);
     gl.attachShader(progFlat, fsFlat);
     gl.linkProgram(progFlat);
-    if (!gl.getProgramParameter(progFlat, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(progFlat));
-    gl.deleteShader(fsFlat);
-    ufVp = gl.getUniformLocation(progFlat, 'u_vp');
-    const fsRect = compile(gl.FRAGMENT_SHADER, FS_RECT);
+    batch.push({ role: 'flat', p: progFlat, fs: fsFlat });
+    const fsRect = compileAsync(gl.FRAGMENT_SHADER, FS_RECT);
     progRect = gl.createProgram();
     gl.attachShader(progRect, vs);
     gl.attachShader(progRect, fsRect);
     gl.linkProgram(progRect);
-    if (!gl.getProgramParameter(progRect, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(progRect));
-    gl.deleteShader(fsRect);
-    urVp = gl.getUniformLocation(progRect, 'u_vp');
-    urScale = gl.getUniformLocation(progRect, 'u_scale');
-    urTop = gl.getUniformLocation(progRect, 'u_top');
-    progGen++;
-    progNow = null;
-    const pvs = compile(gl.VERTEX_SHADER, PVS);
+    batch.push({ role: 'rect', p: progRect, fs: fsRect });
+    const pfs = compileAsync(gl.FRAGMENT_SHADER, PFS);
     post = gl.createProgram();
     gl.attachShader(post, pvs);
-    gl.attachShader(post, compile(gl.FRAGMENT_SHADER, PFS));
+    gl.attachShader(post, pfs);
     gl.linkProgram(post);
-    if (!gl.getProgramParameter(post, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(post));
-    for (const n of ['u_src', 'u_lv1', 'u_lv2', 'u_lv3', 'u_a', 'u_b', 'u_c']) PU[n] = gl.getUniformLocation(post, n);
+    batch.push({ role: 'post', p: post, fs: pfs });
+    const adfs = compileAsync(gl.FRAGMENT_SHADER, AD_FS);
     adProg = gl.createProgram();
     gl.attachShader(adProg, pvs);
-    gl.attachShader(adProg, compile(gl.FRAGMENT_SHADER, AD_FS));
+    gl.attachShader(adProg, adfs);
     gl.linkProgram(adProg);
-    if (!gl.getProgramParameter(adProg, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(adProg));
-    ADU = {};
-    for (const n of ['u_bd', 'u_prev', 'u_map', 'u_uvc', 'u_box', 'u_param']) ADU[n] = gl.getUniformLocation(adProg, n);
+    batch.push({ role: 'ad', p: adProg, fs: adfs });
+    const fsTail = FS.slice('#version 300 es\n'.length);
+    for (let i = 0; i < BOOT_KINDS.length; i++) {
+      const kind = BOOT_KINDS[i];
+      const fs = compileAsync(gl.FRAGMENT_SHADER, `#version 300 es\n#define ONE_KIND ${kind}\n` + fsTail);
+      const p = gl.createProgram();
+      gl.attachShader(p, vs);
+      gl.attachShader(p, fs);
+      gl.linkProgram(p);
+      batch.push({ role: 'kind', kind, p, fs });
+    }
+    bootProgs = batch;
+    bootReady = false;
+    progGen++;
+    progNow = null;
     glassLost();
     vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -1759,7 +1853,8 @@
   function ensureBlurPy(w, h) {
     if (blPy && blPyW >= w && blPyH >= h) return;
     if (blPy && gl) for (const l of blPy) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
-    blPyW = Math.max(w, blPyW); blPyH = Math.max(h, blPyH);
+    blPyW = Math.min(Math.max(rtW(), w), Math.ceil(Math.max(w, blPyW) / 256) * 256);
+    blPyH = Math.min(Math.max(rtH(), h), Math.ceil(Math.max(h, blPyH) / 256) * 256);
     blPy = [];
     for (let j = 0; j < 4; j++) blPy.push(levelTex(gl.RGBA8, (blPyW + (1 << j) - 1) >> j, (blPyH + (1 << j) - 1) >> j));
     blPy.push(levelTex(gl.RGBA8, blPyW, blPyH));
@@ -2071,8 +2166,8 @@
   function ensureLevels(w, h) {
     if (lv && lvW >= w && lvH >= h) return;
     if (lv) for (const l of lv) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
-    lvW = Math.max(w, lvW); lvH = Math.max(h, lvH);
-    slotsInvalidate();
+    lvW = Math.min(Math.max(rtW(), w), Math.ceil(Math.max(w, lvW) / 256) * 256);
+    lvH = Math.min(Math.max(rtH(), h), Math.ceil(Math.max(h, lvH) / 256) * 256);
     lv = [];
     for (let j = 0; j < 4; j++) lv.push(levelTex(j === 0 ? gl.RGBA8 : gl.RGB10_A2, (lvW + (1 << j) - 1) >> j, (lvH + (1 << j) - 1) >> j));
     lv.push(levelTex(gl.RGB10_A2, lvW, lvH));
@@ -2220,7 +2315,10 @@
     const sp = blur * sc;
     let k = 0;
     while (k < 3 && sp / (1 << (k + 1)) >= 2) k++;
-    if (isProgressive && k === 0 && sp > 0.5) k = 1;
+    if (isProgressive) {
+      if (sp >= 2.5 && k < 2) k = 2;
+      else if (k === 0 && sp > 0.5) k = 1;
+    }
     const sk = sp / (1 << k);
     const pre = k > 0 ? 0.75 * (1 - Math.pow(0.25, k)) / 3 + 1 / 6 : 0;
     const sg = Math.sqrt(Math.max(sk * sk - pre, 0));
@@ -2617,7 +2715,7 @@
     gl.activeTexture(gl.TEXTURE4);
     gl.bindTexture(gl.TEXTURE_2D, adTex[adCur] || atlasTex);
     progGen++;
-    useProg(-1);
+    progNow = null;
   }
 
   // The pieces of the frame's shapes (src/ui/shape.mbt: the instances of kind 12 after every one drawn), for the
@@ -3146,6 +3244,7 @@
   // A frame presented: whole-screen frames straight onto the default framebuffer (null); once the app reports partial
   // dirty rects, into cv (building a baseline if !cvOk, then scissor-updating dirty rects) and blitted onto null.
   H.present = (buf, n, r, g, b) => {
+    if (!bootReady && bootProgs) finalizeBootProgs();
     const len = n * INST;
     // (and the frame's ground after it: a rect over all the window, opaque, a part drawn again first)
     if (f32.length < len + INST) f32 = new Float32Array(len * 2 + INST);
@@ -3241,6 +3340,7 @@
     while (start < n) {
       const tid = f32[start * INST + 20] | 0;
       const kind = Math.round(f32[start * INST + 5]);
+      if (kind === 12) { start++; continue; }
       if (kind === 14) {
         if (bstack.length >= BLUR_LAYERS) {
           bover++;
@@ -3375,7 +3475,7 @@
         const k = Math.round(f32[end * INST + 5]);
         if (k === 14 || k === 15) break;
         if ((k === 9) !== h) break;
-        if (own ? k !== kind : (tid >= 0 && !h && hasOwnProg(k))) break;
+        if (tid < 0 ? k !== kind : (own ? k !== kind : (!h && hasOwnProg(k)))) break;
         if (tid === 0 && kind === 0 && progRect && isSimpleRect(end) !== simple) break;
         end++;
       }
@@ -3392,7 +3492,7 @@
         if (shows) {
           // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
           const mergedLiquid = kind === 6 && f32[start * INST + 23] > 0;
-          const gkind = kind === 5 ? 5 : (kind === 6 ? (mergedLiquid ? 6 : MB_KIND_LIQUID_SINGLE) : -1);
+          const gkind = kind === 6 ? (mergedLiquid ? 6 : MB_KIND_LIQUID_SINGLE) : (hasOwnProg(kind) ? kind : -1);
           useProg(gkind);
           drawRun(start, mergedLiquid ? 1 : end - start);
         }
@@ -4456,6 +4556,20 @@
       H.requestFrame();
     }, () => {});
     return true;
+  };
+  // awaitable font registration (URL or bytes) so pages can preload fonts before x.main() with zero FOUT
+  H.faceAddAsync = (face, srcOrData, weight) => {
+    if (!(face > 0 && face < 16) || typeof FontFace !== 'function') return Promise.resolve(false);
+    const src = typeof srcOrData === 'string' ? `url(${JSON.stringify(srcOrData)})` : srcOrData;
+    const ff = new FontFace(`mbface${face}`, src, faceDescriptors(face, weight));
+    faceFile(face, src, weight);
+    return ff.load().then(() => {
+      document.fonts.add(ff);
+      faces.add(face);
+      textChanged();
+      H.requestFrame();
+      return true;
+    }, () => false);
   };
   // A face's CJK companion (@webpage.set_cjk_face): the system's CJK faces drawn, within the face's family, for the
   // CJK marks alone (its unicode-range: Han, kana, bopomofo, CJK punctuation, full-width forms; the Latin quotes and
@@ -5891,6 +6005,7 @@
   function winSave(s) {
     Object.assign(s, {
       canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU, ADU,
+      extParallel, bootProgs, bootPvs, bootReady,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
       cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
@@ -5901,6 +6016,7 @@
   function winLoad(s) {
     ({
       canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU, ADU,
+      extParallel, bootProgs, bootPvs, bootReady,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
       cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
@@ -6052,6 +6168,7 @@
     }
     Object.assign(s, {
       gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null,
+      extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
       progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       adProg: null, ADU: {}, adTex: [null, null], adFb: [null, null], adCur: 0, adSlots: makeAdSlots(),
@@ -6169,6 +6286,7 @@
       wid, win: child, role, minW, minH, closed: false, closing: false, pending: false, raf: 0, wake: { at: -1 },
       texs: new Map(),
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
+      extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
       ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
