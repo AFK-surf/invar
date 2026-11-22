@@ -1,0 +1,788 @@
+// Pure-Pion cross-platform VT100/ANSI terminal emulator engine (zero native dependencies):
+// 16-color + xterm 256-color + 24-bit RGB truecolor SGR, CSI cursor/erase/scroll-region,
+// OSC title, alternate screen (?1049h/?1049l), scrollback history, selection extraction, and VT key encoder.
+
+import "signals"
+import "ui"
+
+/// One character cell in the terminal grid.
+pub struct Cell {
+  pub ch : String
+  pub fg : Int64
+  pub bg : Int64
+  pub bold : Bool
+  pub italic : Bool
+  pub underline : Bool
+  pub dim : Bool
+  pub inverse : Bool
+}
+
+pub fn Cell::blank(fg : Int64, bg : Int64) -> Cell {
+  Cell::{ ch: " ", fg, bg, bold: false, italic: false, underline: false, dim: false, inverse: false }
+}
+
+/// Terminal color palette (default bg/fg, cursor, selection, and 16 ANSI colors).
+pub struct TermPalette {
+  pub bg : Int64
+  pub fg : Int64
+  pub cursor : Int64
+  pub selection : Int64
+  pub ansi : Array[Int64]
+}
+
+pub fn TermPalette::dark() -> TermPalette {
+  TermPalette::{
+    bg: ui::c64(0x0F12, 0x18FF),
+    fg: ui::c64(0xE2E8, 0xF0FF),
+    cursor: ui::c64(0x38BD, 0xF8FF),
+    selection: ui::c64(0x2563, 0xEB55),
+    ansi: [
+      ui::c64(0x1E29, 0x3BFF), // 0 black
+      ui::c64(0xF871, 0x71FF), // 1 red
+      ui::c64(0x4ADE, 0x80FF), // 2 green
+      ui::c64(0xFACC, 0x15FF), // 3 yellow
+      ui::c64(0x60A5, 0xFAFF), // 4 blue
+      ui::c64(0xC084, 0xFCFF), // 5 magenta
+      ui::c64(0x22D3, 0xEEFF), // 6 cyan
+      ui::c64(0xCBD5, 0xE1FF), // 7 white
+      ui::c64(0x6474, 0x8BFF), // 8 bright black
+      ui::c64(0xFCA5, 0xA5FF), // 9 bright red
+      ui::c64(0x86EF, 0xACFF), // 10 bright green
+      ui::c64(0xFDE0, 0x47FF), // 11 bright yellow
+      ui::c64(0x93C5, 0xFDFF), // 12 bright blue
+      ui::c64(0xD8B4, 0xFEFF), // 13 bright magenta
+      ui::c64(0x67E8, 0xF9FF), // 14 bright cyan
+      ui::c64(0xF8FA, 0xFCFF), // 15 bright white
+    ],
+  }
+}
+
+/// Resolve an xterm 256-color index (`0..255`) to 0xRRGGBBAA `Int64`.
+pub fn xterm_256_color(idx : Int, palette : TermPalette) -> Int64 {
+  if idx < 0 {
+    return palette.fg
+  }
+  if idx < 16 {
+    return palette.ansi[idx]
+  }
+  if idx < 232 {
+    let n = idx - 16
+    let r_i = n / 36
+    let g_i = (n % 36) / 6
+    let b_i = n % 6
+    let level = fn(k : Int) -> Int { if k == 0 { 0 } else { 55 + k * 40 } }
+    return ui::rgba(level(r_i), level(g_i), level(b_i), 255)
+  }
+  let gray = 8 + (idx - 232) * 10
+  ui::rgba(gray, gray, gray, 255)
+}
+
+/// 2D character cell grid (`rows * cols`).
+pub struct TermGrid {
+  pub cols : Int
+  pub rows : Int
+  pub cells : Array[Cell]
+}
+
+pub fn TermGrid::new(cols : Int, rows : Int, fg : Int64, bg : Int64) -> TermGrid {
+  let c = if cols > 0 { cols } else { 1 }
+  let r = if rows > 0 { rows } else { 1 }
+  let cells : Array[Cell] = []
+  let total = c * r
+  let blank = Cell::blank(fg, bg)
+  for _ in 0..<total {
+    cells.push(blank)
+  }
+  TermGrid::{ cols: c, rows: r, cells }
+}
+
+pub fn TermGrid::get(self : TermGrid, col : Int, row : Int) -> Cell {
+  if col < 0 || col >= self.cols || row < 0 || row >= self.rows {
+    return Cell::blank(ui::c64(0xE2E8, 0xF0FF), ui::c64(0x0F12, 0x18FF))
+  }
+  self.cells[row * self.cols + col]
+}
+
+pub fn TermGrid::set(self : TermGrid, col : Int, row : Int, cell : Cell) -> Unit {
+  if col < 0 || col >= self.cols || row < 0 || row >= self.rows {
+    return
+  }
+  self.cells[row * self.cols + col] = cell
+}
+
+pub fn TermGrid::clear_row(self : TermGrid, row : Int, fg : Int64, bg : Int64) -> Unit {
+  if row < 0 || row >= self.rows {
+    return
+  }
+  let blank = Cell::blank(fg, bg)
+  let base = row * self.cols
+  for c in 0..<self.cols {
+    self.cells[base + c] = blank
+  }
+}
+
+pub fn TermGrid::clear_all(self : TermGrid, fg : Int64, bg : Int64) -> Unit {
+  let blank = Cell::blank(fg, bg)
+  for i in 0..<self.cells.length() {
+    self.cells[i] = blank
+  }
+}
+
+pub fn TermGrid::copy_row(self : TermGrid, row : Int) -> Array[Cell] {
+  let out : Array[Cell] = []
+  if row < 0 || row >= self.rows {
+    return out
+  }
+  let base = row * self.cols
+  for c in 0..<self.cols {
+    out.push(self.cells[base + c])
+  }
+  out
+}
+
+/// Complete VT100/ANSI terminal model with scrollback, alternate screen, and reactive revision signal.
+pub struct TerminalModel {
+  pub mut cols : Int
+  pub mut rows : Int
+  pub mut grid : TermGrid
+  mut alt_grid : Option[TermGrid]
+  mut saved_main_col : Int
+  mut saved_main_row : Int
+  pub mut alt_screen : Bool
+  pub mut cursor_col : Int
+  pub mut cursor_row : Int
+  pub mut cursor_visible : Bool
+  mut saved_col : Int
+  mut saved_row : Int
+  mut scroll_top : Int
+  mut scroll_bottom : Int
+  pub mut scrollback : Array[Array[Cell]]
+  pub mut max_scrollback : Int
+  pub mut scroll_offset : Int
+  pub mut title : String
+  pub palette : TermPalette
+  mut cur_fg : Int64
+  mut cur_bg : Int64
+  mut cur_bold : Bool
+  mut cur_italic : Bool
+  mut cur_underline : Bool
+  mut cur_dim : Bool
+  mut cur_inverse : Bool
+  mut parse_state : Int
+  mut csi_buf : String
+  mut osc_buf : String
+  pub mut sel_start : Option[(Int, Int)]
+  pub mut sel_end : Option[(Int, Int)]
+  pub rev_sig : signals::Signal[Int]
+}
+
+pub fn TerminalModel::new(
+  cols~ : Int = 80,
+  rows~ : Int = 24,
+  palette~ : TermPalette = TermPalette::dark(),
+) -> TerminalModel {
+  let c = if cols > 0 { cols } else { 80 }
+  let r = if rows > 0 { rows } else { 24 }
+  TerminalModel::{
+    cols: c,
+    rows: r,
+    grid: TermGrid::new(c, r, palette.fg, palette.bg),
+    alt_grid: None,
+    saved_main_col: 0,
+    saved_main_row: 0,
+    alt_screen: false,
+    cursor_col: 0,
+    cursor_row: 0,
+    cursor_visible: true,
+    saved_col: 0,
+    saved_row: 0,
+    scroll_top: 0,
+    scroll_bottom: r - 1,
+    scrollback: [],
+    max_scrollback: 1000,
+    scroll_offset: 0,
+    title: "",
+    palette,
+    cur_fg: palette.fg,
+    cur_bg: palette.bg,
+    cur_bold: false,
+    cur_italic: false,
+    cur_underline: false,
+    cur_dim: false,
+    cur_inverse: false,
+    parse_state: 0,
+    csi_buf: "",
+    osc_buf: "",
+    sel_start: None,
+    sel_end: None,
+    rev_sig: signals::signal(0),
+  }
+}
+
+fn iclamp(v : Int, lo : Int, hi : Int) -> Int {
+  if v < lo { lo } else if v > hi { hi } else { v }
+}
+
+fn byte_to_str(b : Int) -> String {
+  let sb = StringBuilder::new()
+  sb.write_byte(b as Byte)
+  sb.to_string()
+}
+
+fn utf8_slice(s : String, start : Int, end : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < end {
+    sb.write_byte(s.code_unit_at(i) as Byte)
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn utf8_char_len(s : String, i : Int) -> Int {
+  let n = s.length()
+  let b0 = s.code_unit_at(i)
+  if b0 < 0x80 {
+    1
+  } else if b0 >= 0xC2 && b0 < 0xE0 && i + 1 < n {
+    2
+  } else if b0 >= 0xE0 && b0 < 0xF0 && i + 2 < n {
+    3
+  } else if b0 >= 0xF0 && b0 < 0xF5 && i + 3 < n {
+    4
+  } else {
+    1
+  }
+}
+
+fn TerminalModel::reset_sgr(self : TerminalModel) -> Unit {
+  self.cur_fg = self.palette.fg
+  self.cur_bg = self.palette.bg
+  self.cur_bold = false
+  self.cur_italic = false
+  self.cur_underline = false
+  self.cur_dim = false
+  self.cur_inverse = false
+}
+
+fn TerminalModel::scroll_up_region(self : TerminalModel) -> Unit {
+  let top = iclamp(self.scroll_top, 0, self.rows - 1)
+  let bot = iclamp(self.scroll_bottom, top, self.rows - 1)
+  if !self.alt_screen && top == 0 && bot == self.rows - 1 {
+    self.scrollback.push(self.grid.copy_row(0))
+    if self.scrollback.length() > self.max_scrollback {
+      ui::array_remove_at(self.scrollback, 0)
+    }
+  }
+  let mut r = top
+  while r < bot {
+    let dst = r * self.cols
+    let src = (r + 1) * self.cols
+    for c in 0..<self.cols {
+      self.grid.cells[dst + c] = self.grid.cells[src + c]
+    }
+    r += 1
+  }
+  self.grid.clear_row(bot, self.palette.fg, self.palette.bg)
+}
+
+fn TerminalModel::line_feed(self : TerminalModel) -> Unit {
+  if self.cursor_row == self.scroll_bottom {
+    self.scroll_up_region()
+  } else if self.cursor_row + 1 < self.rows {
+    self.cursor_row += 1
+  }
+}
+
+fn TerminalModel::put_glyph(self : TerminalModel, ch : String) -> Unit {
+  if self.cursor_col >= self.cols {
+    self.cursor_col = 0
+    self.line_feed()
+  }
+  let cell = Cell::{
+    ch,
+    fg: self.cur_fg,
+    bg: self.cur_bg,
+    bold: self.cur_bold,
+    italic: self.cur_italic,
+    underline: self.cur_underline,
+    dim: self.cur_dim,
+    inverse: self.cur_inverse,
+  }
+  self.grid.set(self.cursor_col, self.cursor_row, cell)
+  self.cursor_col += 1
+}
+
+fn parse_csi_params(s : String) -> Array[Int] {
+  let out : Array[Int] = []
+  let n = s.length()
+  if n == 0 {
+    return out
+  }
+  let mut i = 0
+  let mut cur = 0
+  let mut has_digit = false
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b >= 48 && b <= 57 {
+      cur = cur * 10 + (b - 48)
+      has_digit = true
+    } else if b == 59 {
+      out.push(if has_digit { cur } else { 0 })
+      cur = 0
+      has_digit = false
+    }
+    i += 1
+  }
+  if has_digit || out.length() > 0 {
+    out.push(if has_digit { cur } else { 0 })
+  }
+  out
+}
+
+fn TerminalModel::apply_sgr(self : TerminalModel, params : Array[Int]) -> Unit {
+  if params.length() == 0 {
+    self.reset_sgr()
+    return
+  }
+  let mut i = 0
+  while i < params.length() {
+    let p = params[i]
+    if p == 0 {
+      self.reset_sgr()
+    } else if p == 1 {
+      self.cur_bold = true
+    } else if p == 2 {
+      self.cur_dim = true
+    } else if p == 3 {
+      self.cur_italic = true
+    } else if p == 4 {
+      self.cur_underline = true
+    } else if p == 7 {
+      self.cur_inverse = true
+    } else if p == 22 {
+      self.cur_bold = false
+      self.cur_dim = false
+    } else if p == 23 {
+      self.cur_italic = false
+    } else if p == 24 {
+      self.cur_underline = false
+    } else if p == 27 {
+      self.cur_inverse = false
+    } else if p >= 30 && p <= 37 {
+      self.cur_fg = self.palette.ansi[p - 30]
+    } else if p == 39 {
+      self.cur_fg = self.palette.fg
+    } else if p >= 40 && p <= 47 {
+      self.cur_bg = self.palette.ansi[p - 40]
+    } else if p == 49 {
+      self.cur_bg = self.palette.bg
+    } else if p >= 90 && p <= 97 {
+      self.cur_fg = self.palette.ansi[8 + (p - 90)]
+    } else if p >= 100 && p <= 107 {
+      self.cur_bg = self.palette.ansi[8 + (p - 100)]
+    } else if (p == 38 || p == 48) && i + 1 < params.length() {
+      let is_fg = p == 38
+      let mode = params[i + 1]
+      if mode == 5 && i + 2 < params.length() {
+        let col = xterm_256_color(params[i + 2], self.palette)
+        if is_fg { self.cur_fg = col } else { self.cur_bg = col }
+        i += 2
+      } else if mode == 2 && i + 4 < params.length() {
+        let col = ui::rgba(
+          iclamp(params[i + 2], 0, 255),
+          iclamp(params[i + 3], 0, 255),
+          iclamp(params[i + 4], 0, 255),
+          255,
+        )
+        if is_fg { self.cur_fg = col } else { self.cur_bg = col }
+        i += 4
+      }
+    }
+    i += 1
+  }
+}
+
+fn TerminalModel::enter_alt_screen(self : TerminalModel) -> Unit {
+  if self.alt_screen {
+    return
+  }
+  self.alt_grid = Some(self.grid)
+  self.saved_main_col = self.cursor_col
+  self.saved_main_row = self.cursor_row
+  self.grid = TermGrid::new(self.cols, self.rows, self.palette.fg, self.palette.bg)
+  self.cursor_col = 0
+  self.cursor_row = 0
+  self.alt_screen = true
+  self.scroll_offset = 0
+}
+
+fn TerminalModel::leave_alt_screen(self : TerminalModel) -> Unit {
+  if !self.alt_screen {
+    return
+  }
+  match self.alt_grid {
+    Some(main_g) => {
+      self.grid = main_g
+      self.alt_grid = None
+    }
+    None => ()
+  }
+  self.cursor_col = iclamp(self.saved_main_col, 0, self.cols - 1)
+  self.cursor_row = iclamp(self.saved_main_row, 0, self.rows - 1)
+  self.alt_screen = false
+}
+
+fn TerminalModel::dispatch_csi(self : TerminalModel, final_byte : Int) -> Unit {
+  let raw = self.csi_buf
+  let is_private = raw.length() > 0 && raw.code_unit_at(0) == 63
+  let body = if is_private { utf8_slice(raw, 1, raw.length()) } else { raw }
+  let params = parse_csi_params(body)
+  let p0 = if params.length() > 0 { params[0] } else { 0 }
+  let p1 = if params.length() > 1 { params[1] } else { 0 }
+
+  if is_private {
+    if final_byte == 104 { // 'h'
+      if p0 == 1049 || p0 == 47 || p0 == 1047 {
+        self.enter_alt_screen()
+      } else if p0 == 25 {
+        self.cursor_visible = true
+      }
+    } else if final_byte == 108 { // 'l'
+      if p0 == 1049 || p0 == 47 || p0 == 1047 {
+        self.leave_alt_screen()
+      } else if p0 == 25 {
+        self.cursor_visible = false
+      }
+    }
+    return
+  }
+
+  if final_byte == 109 { // 'm' SGR
+    self.apply_sgr(params)
+  } else if final_byte == 65 { // 'A' CUU
+    let n = if p0 > 0 { p0 } else { 1 }
+    self.cursor_row = iclamp(self.cursor_row - n, 0, self.rows - 1)
+  } else if final_byte == 66 { // 'B' CUD
+    let n = if p0 > 0 { p0 } else { 1 }
+    self.cursor_row = iclamp(self.cursor_row + n, 0, self.rows - 1)
+  } else if final_byte == 67 { // 'C' CUF
+    let n = if p0 > 0 { p0 } else { 1 }
+    self.cursor_col = iclamp(self.cursor_col + n, 0, self.cols - 1)
+  } else if final_byte == 68 { // 'D' CUB
+    let n = if p0 > 0 { p0 } else { 1 }
+    self.cursor_col = iclamp(self.cursor_col - n, 0, self.cols - 1)
+  } else if final_byte == 72 || final_byte == 102 { // 'H' / 'f' CUP
+    let r = if p0 > 0 { p0 - 1 } else { 0 }
+    let c = if p1 > 0 { p1 - 1 } else { 0 }
+    self.cursor_row = iclamp(r, 0, self.rows - 1)
+    self.cursor_col = iclamp(c, 0, self.cols - 1)
+  } else if final_byte == 71 { // 'G' CHA
+    let c = if p0 > 0 { p0 - 1 } else { 0 }
+    self.cursor_col = iclamp(c, 0, self.cols - 1)
+  } else if final_byte == 74 { // 'J' ED
+    let blank = Cell::blank(self.palette.fg, self.palette.bg)
+    if p0 == 2 || p0 == 3 {
+      self.grid.clear_all(self.palette.fg, self.palette.bg)
+    } else if p0 == 0 {
+      for c in self.cursor_col..<self.cols {
+        self.grid.set(c, self.cursor_row, blank)
+      }
+      for r in (self.cursor_row + 1)..<self.rows {
+        self.grid.clear_row(r, self.palette.fg, self.palette.bg)
+      }
+    } else if p0 == 1 {
+      for r in 0..<self.cursor_row {
+        self.grid.clear_row(r, self.palette.fg, self.palette.bg)
+      }
+      for c in 0..=iclamp(self.cursor_col, 0, self.cols - 1) {
+        self.grid.set(c, self.cursor_row, blank)
+      }
+    }
+  } else if final_byte == 75 { // 'K' EL
+    let blank = Cell::blank(self.palette.fg, self.palette.bg)
+    if p0 == 2 {
+      self.grid.clear_row(self.cursor_row, self.palette.fg, self.palette.bg)
+    } else if p0 == 0 {
+      for c in self.cursor_col..<self.cols {
+        self.grid.set(c, self.cursor_row, blank)
+      }
+    } else if p0 == 1 {
+      for c in 0..=iclamp(self.cursor_col, 0, self.cols - 1) {
+        self.grid.set(c, self.cursor_row, blank)
+      }
+    }
+  } else if final_byte == 115 { // 's' SCP
+    self.saved_col = self.cursor_col
+    self.saved_row = self.cursor_row
+  } else if final_byte == 117 { // 'u' RCP
+    self.cursor_col = iclamp(self.saved_col, 0, self.cols - 1)
+    self.cursor_row = iclamp(self.saved_row, 0, self.rows - 1)
+  } else if final_byte == 114 { // 'r' DECSTBM
+    let top = if p0 > 0 { p0 - 1 } else { 0 }
+    let bot = if p1 > 0 { p1 - 1 } else { self.rows - 1 }
+    if top < bot && bot < self.rows {
+      self.scroll_top = top
+      self.scroll_bottom = bot
+    } else {
+      self.scroll_top = 0
+      self.scroll_bottom = self.rows - 1
+    }
+    self.cursor_col = 0
+    self.cursor_row = 0
+  }
+}
+
+fn TerminalModel::dispatch_osc(self : TerminalModel) -> Unit {
+  let s = self.osc_buf
+  let n = s.length()
+  let mut semi = -1
+  for i in 0..<n {
+    if s.code_unit_at(i) == 59 {
+      semi = i
+      break
+    }
+  }
+  if semi > 0 {
+    let code = utf8_slice(s, 0, semi)
+    if code == "0" || code == "2" {
+      self.title = utf8_slice(s, semi + 1, n)
+    }
+  }
+}
+
+/// Feed raw VT100/ANSI UTF-8 output bytes into the terminal state machine.
+pub fn TerminalModel::feed(self : TerminalModel, data : String) -> Unit {
+  let n = data.length()
+  let mut i = 0
+  while i < n {
+    let b = data.code_unit_at(i)
+    if self.parse_state == 0 {
+      if b == 27 { // ESC
+        self.parse_state = 1
+        i += 1
+      } else if b == 13 { // \r
+        self.cursor_col = 0
+        i += 1
+      } else if b == 10 { // \n
+        self.line_feed()
+        i += 1
+      } else if b == 8 { // \b
+        if self.cursor_col > 0 {
+          self.cursor_col -= 1
+        }
+        i += 1
+      } else if b == 9 { // \t
+        let next_tab = ((self.cursor_col / 8) + 1) * 8
+        self.cursor_col = iclamp(next_tab, 0, self.cols - 1)
+        i += 1
+      } else if b < 32 {
+        i += 1
+      } else {
+        let clen = utf8_char_len(data, i)
+        self.put_glyph(utf8_slice(data, i, i + clen))
+        i += clen
+      }
+    } else if self.parse_state == 1 {
+      // After ESC
+      if b == 91 { // '[' -> CSI
+        self.csi_buf = ""
+        self.parse_state = 2
+      } else if b == 93 { // ']' -> OSC
+        self.osc_buf = ""
+        self.parse_state = 3
+      } else {
+        self.parse_state = 0
+      }
+      i += 1
+    } else if self.parse_state == 2 {
+      // Inside CSI
+      if b >= 64 && b <= 126 {
+        self.dispatch_csi(b)
+        self.parse_state = 0
+      } else {
+        self.csi_buf = self.csi_buf + byte_to_str(b)
+      }
+      i += 1
+    } else if self.parse_state == 3 {
+      // Inside OSC
+      if b == 7 { // BEL
+        self.dispatch_osc()
+        self.parse_state = 0
+      } else if b == 27 { // possible ST (\x1b\\)
+        self.parse_state = 4
+      } else {
+        self.osc_buf = self.osc_buf + byte_to_str(b)
+      }
+      i += 1
+    } else {
+      // OSC ESC (expect '\\')
+      if b == 92 {
+        self.dispatch_osc()
+      }
+      self.parse_state = 0
+      i += 1
+    }
+  }
+  self.rev_sig.set(self.rev_sig.untracked() + 1)
+}
+
+/// Return cells for visible screen row `row` (accounting for `scroll_offset` into `scrollback`).
+pub fn TerminalModel::visible_row(self : TerminalModel, row : Int) -> Array[Cell] {
+  let sb_len = self.scrollback.length()
+  let off = iclamp(self.scroll_offset, 0, sb_len)
+  let total_idx = sb_len - off + row
+  if total_idx < 0 {
+    let blank_row : Array[Cell] = []
+    let blank = Cell::blank(self.palette.fg, self.palette.bg)
+    for _ in 0..<self.cols {
+      blank_row.push(blank)
+    }
+    return blank_row
+  }
+  if total_idx < sb_len {
+    return self.scrollback[total_idx]
+  }
+  let grid_row = total_idx - sb_len
+  if grid_row >= 0 && grid_row < self.rows {
+    self.grid.copy_row(grid_row)
+  } else {
+    let blank_row : Array[Cell] = []
+    let blank = Cell::blank(self.palette.fg, self.palette.bg)
+    for _ in 0..<self.cols {
+      blank_row.push(blank)
+    }
+    blank_row
+  }
+}
+
+/// Scroll viewport by `delta_lines` (positive scrolls up into scrollback history, negative toward live bottom).
+pub fn TerminalModel::scroll_by(self : TerminalModel, delta_lines : Int) -> Unit {
+  if self.alt_screen {
+    return
+  }
+  self.scroll_offset = iclamp(self.scroll_offset + delta_lines, 0, self.scrollback.length())
+  self.rev_sig.set(self.rev_sig.untracked() + 1)
+}
+
+/// Return the trimmed text of visible row `row`.
+pub fn TerminalModel::line_text(self : TerminalModel, row : Int) -> String {
+  let cells = self.visible_row(row)
+  let mut last = cells.length() - 1
+  while last >= 0 && cells[last].ch == " " {
+    last -= 1
+  }
+  if last < 0 {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  for c in 0..=last {
+    sb.write_string(cells[c].ch)
+  }
+  sb.to_string()
+}
+
+pub fn TerminalModel::set_selection(
+  self : TerminalModel,
+  start : Option[(Int, Int)],
+  end_pt : Option[(Int, Int)],
+) -> Unit {
+  self.sel_start = start
+  self.sel_end = end_pt
+  self.rev_sig.set(self.rev_sig.untracked() + 1)
+}
+
+/// Extract selected text from the visible terminal grid.
+pub fn TerminalModel::selected_text(self : TerminalModel) -> String {
+  match (self.sel_start, self.sel_end) {
+    (Some((c0, r0)), Some((c1, r1))) => {
+      let (sc, sr, ec, er) = if r0 < r1 || (r0 == r1 && c0 <= c1) {
+        (c0, r0, c1, r1)
+      } else {
+        (c1, r1, c0, r0)
+      }
+      let sb = StringBuilder::new()
+      let mut r = iclamp(sr, 0, self.rows - 1)
+      let last_r = iclamp(er, 0, self.rows - 1)
+      while r <= last_r {
+        if r > sr {
+          sb.write_byte(10 as Byte)
+        }
+        let cells = self.visible_row(r)
+        let col_a = if r == sr { iclamp(sc, 0, self.cols - 1) } else { 0 }
+        let col_b = if r == last_r { iclamp(ec, 0, self.cols - 1) } else { self.cols - 1 }
+        let mut last_non_sp = col_b
+        if r < last_r {
+          while last_non_sp >= col_a && cells[last_non_sp].ch == " " {
+            last_non_sp -= 1
+          }
+        }
+        let mut c = col_a
+        while c <= last_non_sp && c < cells.length() {
+          sb.write_string(cells[c].ch)
+          c += 1
+        }
+        r += 1
+      }
+      sb.to_string()
+    }
+    _ => ""
+  }
+}
+
+/// Encode an Invar keyboard event `(code, mods)` into a VT100/ANSI input byte sequence.
+pub fn encode_key(code : Int, mods : Int) -> String {
+  let ctrl = (mods & ui::mod_ctrl) != 0
+  let shift = (mods & ui::mod_shift_key) != 0
+  if code == ui::key_enter {
+    return "\r"
+  }
+  if code == ui::key_code_backspace {
+    return "\x7f"
+  }
+  if code == ui::key_tab {
+    return "\t"
+  }
+  if code == ui::key_escape {
+    return "\x1b"
+  }
+  if code == ui::key_code_up {
+    return "\x1b[A"
+  }
+  if code == ui::key_code_down {
+    return "\x1b[B"
+  }
+  if code == ui::key_code_right {
+    return "\x1b[C"
+  }
+  if code == ui::key_code_left {
+    return "\x1b[D"
+  }
+  if code == ui::key_code_home {
+    return "\x1b[H"
+  }
+  if code == ui::key_code_end {
+    return "\x1b[F"
+  }
+  if code == ui::key_code_delete {
+    return "\x1b[3~"
+  }
+  if code == ui::key_code_page_up {
+    return "\x1b[5~"
+  }
+  if code == ui::key_code_page_down {
+    return "\x1b[6~"
+  }
+  // Printable character key codes (`1000 + codepoint`)
+  if code >= 1032 && code < 1127 {
+    let ch = code - 1000
+    if ctrl && ch >= 97 && ch <= 122 {
+      return byte_to_str(ch - 96)
+    }
+    if shift && ch >= 97 && ch <= 122 {
+      return byte_to_str(ch - 32)
+    }
+    return byte_to_str(ch)
+  }
+  ""
+}

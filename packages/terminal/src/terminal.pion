@@ -1,0 +1,180 @@
+// Pure-tree cross-platform terminal view (`terminal_view` and `<terminal::TerminalView>`).
+// Batches adjacent same-style cells per row into `text::Run`s to avoid per-character node explosion,
+// renders an inverse cursor block, supports scrollback wheel navigation, and dispatches VT key sequences.
+
+import "text"
+import "ui"
+import "view"
+
+fn cell_style_same(a : Cell, b : Cell) -> Bool {
+  a.fg == b.fg &&
+  a.bg == b.bg &&
+  a.bold == b.bold &&
+  a.italic == b.italic &&
+  a.underline == b.underline &&
+  a.dim == b.dim &&
+  a.inverse == b.inverse
+}
+
+fn dim_color(col : Int64) -> Int64 {
+  let r = (((col >> 24) & 0xFFL).to_int() * 65) / 100
+  let g = (((col >> 16) & 0xFFL).to_int() * 65) / 100
+  let b = (((col >> 8) & 0xFFL).to_int() * 65) / 100
+  let a = (col & 0xFFL).to_int()
+  ui::rgba(r, g, b, a)
+}
+
+/// Batch a row of terminal `Cell`s into minimal same-style monospace `text::Run`s.
+pub fn terminal_row_runs(cells : Array[Cell], default_bg : Int64) -> Array[text::Run] {
+  let n = cells.length()
+  if n == 0 {
+    return []
+  }
+  // Trim trailing default-background blank cells to keep runs compact.
+  let mut last = n - 1
+  while last >= 0 && cells[last].ch == " " && cells[last].bg == default_bg && !cells[last].inverse && !cells[last].underline {
+    last -= 1
+  }
+  if last < 0 {
+    return [text::Run::{ ..text::plain(" "), mono: true, color: cells[0].fg }]
+  }
+  let runs : Array[text::Run] = []
+  let mut i = 0
+  while i <= last {
+    let head = cells[i]
+    let sb = StringBuilder::new()
+    sb.write_string(head.ch)
+    let mut j = i + 1
+    while j <= last && cell_style_same(head, cells[j]) {
+      sb.write_string(cells[j].ch)
+      j += 1
+    }
+    let raw_fg = if head.inverse { head.bg } else { head.fg }
+    let raw_bg = if head.inverse { head.fg } else { head.bg }
+    let fg = if head.dim { dim_color(raw_fg) } else { raw_fg }
+    let bg = if raw_bg != default_bg { raw_bg } else { 0L }
+    runs.push(
+      text::Run::{
+        ..text::plain(sb.to_string()),
+        mono: true,
+        weight: if head.bold { 700 } else { 400 },
+        italic: head.italic,
+        underline: head.underline,
+        color: fg,
+        bg,
+      },
+    )
+    i = j
+  }
+  runs
+}
+
+/// Mount a pure-tree VT100/ANSI terminal view bound to `term : TerminalModel`.
+pub fn terminal_view(
+  parent : view::View,
+  term : TerminalModel,
+  font_size~ : Double = 12.5,
+  line~ : Double = 18.0,
+  cursor_blink~ : Bool = true,
+  on_input~ : (String) -> Unit = fn(_s : String) { () },
+  label~ : String = "Terminal",
+) -> view::View {
+  let _ = cursor_blink
+  let line_h = if line > 0.0 { line } else { font_size * 1.45 }
+  let look = view::WordsLook::of(font_size, line=line_h, wrap=false)
+
+  parent.box(fn(root : view::View) {
+    let _ = root
+    .ground(view::Live::Is(term.palette.bg))
+    .padding(view::Live::Is((12.0, 10.0, 12.0, 10.0)))
+    .clips(view::Live::Is(true))
+    .focusable(view::Live::Is(true), keys=0)
+    .cursor(view::Live::Is(Some(view::Cursor::IBeam)))
+    .says(view::Live::By(fn() { Some(view::said(view::Role::Group, label=label)) }))
+    .on_key(fn(k : view::Key) -> Bool {
+      let seq = encode_key(k.code, k.mods)
+      if seq.length() > 0 {
+        on_input(seq)
+        true
+      } else {
+        false
+      }
+    })
+
+    root.each_of(
+      fn() {
+        let _ = term.rev_sig.get()
+        let idxs : Array[Int] = []
+        for r in 0..<term.rows {
+          idxs.push(r)
+        }
+        idxs
+      },
+      fn(row_v : view::View, row_idx : Int) {
+        let _ = row_v
+        .height(view::Live::Is(Some(line_h)))
+        .words_runs(
+          view::Live::By(fn() {
+            let _ = term.rev_sig.get()
+            let cells = term.visible_row(row_idx)
+            terminal_row_runs(cells, term.palette.bg)
+          }),
+          ink=term.palette.fg,
+          look=look,
+        )
+
+        // Inverse block cursor on the active live cursor row
+        let _ = row_v.show(
+          fn() {
+            let _ = term.rev_sig.get()
+            term.cursor_visible && term.scroll_offset == 0 && term.cursor_row == row_idx
+          },
+          fn(cur : view::View) {
+            let _ = cur
+            .over_at(
+              view::Live::By(fn() {
+                let _ = term.rev_sig.get()
+                let cells = term.visible_row(row_idx)
+                let sb = StringBuilder::new()
+                let limit = if term.cursor_col < cells.length() { term.cursor_col } else { cells.length() }
+                for c in 0..<limit {
+                  sb.write_string(cells[c].ch)
+                }
+                let x = ui::measure_text_width(sb.to_string(), font_size)
+                (Some(x), Some(2.0), None, None)
+              }),
+            )
+            .width(view::Live::Is(Some(font_size * 0.6)))
+            .height(view::Live::Is(Some(line_h - 4.0)))
+            .ground(view::Live::Is(term.palette.cursor))
+            .radius(view::Live::Is(1.5))
+            .presses(view::Live::Is(false))
+          },
+          at_once=true,
+        )
+      },
+      at_once=true,
+    )
+  })
+}
+
+/// Pion-JSX PascalCase wrapper `<terminal::TerminalView>` delegating to `terminal_view`.
+pub fn TerminalView(
+  parent : view::View,
+  term : TerminalModel,
+  font_size~ : Double = 12.5,
+  line~ : Double = 18.0,
+  cursor_blink~ : Bool = true,
+  on_input~ : (String) -> Unit = fn(_s : String) { () },
+  label~ : String = "Terminal",
+) -> view::View {
+  terminal_view(
+    parent,
+    term,
+    font_size=font_size,
+    line=line,
+    cursor_blink=cursor_blink,
+    on_input=on_input,
+    label=label,
+  )
+}

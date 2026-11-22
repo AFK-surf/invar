@@ -1,0 +1,679 @@
+// Code editor state, WCAG-compliant syntax palettes, zero-dependency multi-language lexer,
+// matching bracket finder, auto-indent, and selection indent/dedent.
+
+import "editor"
+import "signals"
+import "text"
+import "ui"
+
+/// Syntax token classification for code highlighting.
+pub enum TokenKind {
+  Plain
+  Keyword
+  TypeName
+  StringLit
+  NumberLit
+  Comment
+  Operator
+  Function
+  Punct
+}
+
+pub fn token_kind_eq(a : TokenKind, b : TokenKind) -> Bool {
+  match (a, b) {
+    (TokenKind::Plain, TokenKind::Plain) => true
+    (TokenKind::Keyword, TokenKind::Keyword) => true
+    (TokenKind::TypeName, TokenKind::TypeName) => true
+    (TokenKind::StringLit, TokenKind::StringLit) => true
+    (TokenKind::NumberLit, TokenKind::NumberLit) => true
+    (TokenKind::Comment, TokenKind::Comment) => true
+    (TokenKind::Operator, TokenKind::Operator) => true
+    (TokenKind::Function, TokenKind::Function) => true
+    (TokenKind::Punct, TokenKind::Punct) => true
+    _ => false
+  }
+}
+
+/// Half-open UTF-8 byte range `[start, end)` tagged with a `TokenKind`.
+pub struct CodeSpan {
+  pub start : Int
+  pub end : Int
+  pub kind : TokenKind
+}
+
+/// High-contrast syntax highlighting palette (WCAG 2.1 AA+ on dark and light surfaces).
+pub struct CodePalette {
+  pub bg : Int64
+  pub gutter_bg : Int64
+  pub gutter_fg : Int64
+  pub gutter_divider : Int64
+  pub active_line_bg : Int64
+  pub bracket_bg : Int64
+  pub selection_bg : Int64
+  pub caret : Int64
+  pub plain : Int64
+  pub keyword : Int64
+  pub type_name : Int64
+  pub string_lit : Int64
+  pub number_lit : Int64
+  pub comment : Int64
+  pub operator : Int64
+  pub function : Int64
+  pub punct : Int64
+}
+
+pub fn CodePalette::dark() -> CodePalette {
+  CodePalette::{
+    bg: ui::c64(0x1417, 0x1FFF),
+    gutter_bg: ui::c64(0x1013, 0x1AFF),
+    gutter_fg: ui::c64(0x636D, 0x83FF),
+    gutter_divider: ui::c64(0x252B, 0x3BFF),
+    active_line_bg: ui::c64(0x1D22, 0x30FF),
+    bracket_bg: ui::c64(0x3B82, 0xF648),
+    selection_bg: ui::c64(0x2563, 0xEB55),
+    caret: ui::c64(0x60A5, 0xFAFF),
+    plain: ui::c64(0xE2E8, 0xF0FF),
+    keyword: ui::c64(0xC084, 0xFCFF),
+    type_name: ui::c64(0x38BD, 0xF8FF),
+    string_lit: ui::c64(0x86EF, 0xACFF),
+    number_lit: ui::c64(0xFB92, 0x3CFF),
+    comment: ui::c64(0x7480, 0x99FF),
+    operator: ui::c64(0x67E8, 0xF9FF),
+    function: ui::c64(0x60A5, 0xFAFF),
+    punct: ui::c64(0x94A3, 0xB8FF),
+  }
+}
+
+pub fn CodePalette::light() -> CodePalette {
+  CodePalette::{
+    bg: ui::c64(0xFFFF, 0xFFFF),
+    gutter_bg: ui::c64(0xF8FA, 0xFCFF),
+    gutter_fg: ui::c64(0x6474, 0x8BFF),
+    gutter_divider: ui::c64(0xE2E8, 0xF0FF),
+    active_line_bg: ui::c64(0xF1F5, 0xF9FF),
+    bracket_bg: ui::c64(0x0A84, 0xFF33),
+    selection_bg: ui::c64(0x0A84, 0xFF38),
+    caret: ui::c64(0x0066, 0xCCFF),
+    plain: ui::c64(0x1E29, 0x3BFF),
+    keyword: ui::c64(0x7C3A, 0xEDFF),
+    type_name: ui::c64(0x0369, 0xA1FF),
+    string_lit: ui::c64(0x1580, 0x3DFF),
+    number_lit: ui::c64(0xC241, 0x0CFF),
+    comment: ui::c64(0x6474, 0x8BFF),
+    operator: ui::c64(0x0F76, 0x6EFF),
+    function: ui::c64(0x1D4E, 0xD8FF),
+    punct: ui::c64(0x4755, 0x69FF),
+  }
+}
+
+pub fn CodePalette::color_for(self : CodePalette, kind : TokenKind) -> Int64 {
+  match kind {
+    TokenKind::Plain => self.plain
+    TokenKind::Keyword => self.keyword
+    TokenKind::TypeName => self.type_name
+    TokenKind::StringLit => self.string_lit
+    TokenKind::NumberLit => self.number_lit
+    TokenKind::Comment => self.comment
+    TokenKind::Operator => self.operator
+    TokenKind::Function => self.function
+    TokenKind::Punct => self.punct
+  }
+}
+
+fn is_ascii_digit(b : Int) -> Bool {
+  b >= 48 && b <= 57
+}
+
+fn is_ident_start(b : Int) -> Bool {
+  (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+}
+
+fn is_ident_cont(b : Int) -> Bool {
+  is_ident_start(b) || is_ascii_digit(b)
+}
+
+fn is_hex_digit(b : Int) -> Bool {
+  is_ascii_digit(b) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+}
+
+fn is_punct_byte(b : Int) -> Bool {
+  b == 40 || b == 41 || b == 91 || b == 93 || b == 123 || b == 125 || b == 44 || b == 59 || b == 46
+}
+
+fn is_op_byte(b : Int) -> Bool {
+  b == 43 || b == 45 || b == 42 || b == 47 || b == 37 || b == 61 || b == 60 || b == 62 ||
+  b == 33 || b == 38 || b == 124 || b == 94 || b == 126 || b == 63 || b == 58
+}
+
+fn is_keyword(lang : String, w : String) -> Bool {
+  if lang == "json" {
+    return w == "true" || w == "false" || w == "null"
+  }
+  if lang == "js" || lang == "ts" {
+    return w == "function" || w == "const" || w == "let" || w == "var" || w == "return" ||
+    w == "if" || w == "else" || w == "for" || w == "while" || w == "switch" || w == "case" ||
+    w == "break" || w == "continue" || w == "class" || w == "new" || w == "import" ||
+    w == "export" || w == "from" || w == "async" || w == "await" || w == "true" ||
+    w == "false" || w == "null" || w == "undefined" || w == "typeof"
+  }
+  if lang == "c" {
+    return w == "int" || w == "char" || w == "double" || w == "float" || w == "void" ||
+    w == "bool" || w == "const" || w == "static" || w == "struct" || w == "enum" ||
+    w == "typedef" || w == "return" || w == "if" || w == "else" || w == "for" ||
+    w == "while" || w == "switch" || w == "case" || w == "break" || w == "continue" ||
+    w == "sizeof" || w == "true" || w == "false" || w == "NULL"
+  }
+  // Default: Pion & Rust keyword set
+  w == "fn" || w == "pub" || w == "let" || w == "mut" || w == "if" || w == "else" ||
+  w == "match" || w == "while" || w == "for" || w == "in" || w == "return" ||
+  w == "break" || w == "continue" || w == "struct" || w == "enum" || w == "import" ||
+  w == "trait" || w == "impl" || w == "true" || w == "false" || w == "test" ||
+  w == "as" || w == "use" || w == "mod" || w == "const" || w == "type" || w == "where" ||
+  w == "guard" || w == "self" || w == "Self"
+}
+
+/// Zero-dependency lexical syntax highlighter for `"pion"`, `"rust"`, `"js"`, `"json"`, and `"c"`.
+pub fn tokenize_code(lang : String, src : String) -> Array[CodeSpan] {
+  let out : Array[CodeSpan] = []
+  let n = src.length()
+  let mut i = 0
+  let is_json = lang == "json"
+
+  while i < n {
+    let b = src.code_unit_at(i)
+
+    // Whitespace -> Plain
+    if b == 32 || b == 9 || b == 10 || b == 13 {
+      let s = i
+      while i < n {
+        let c = src.code_unit_at(i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+          i += 1
+        } else {
+          break
+        }
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind: TokenKind::Plain })
+      continue
+    }
+
+    // Line comment `// ...`
+    if !is_json && b == 47 && i + 1 < n && src.code_unit_at(i + 1) == 47 {
+      let s = i
+      i += 2
+      while i < n && src.code_unit_at(i) != 10 {
+        i += 1
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind: TokenKind::Comment })
+      continue
+    }
+
+    // Block comment `/* ... */`
+    if !is_json && b == 47 && i + 1 < n && src.code_unit_at(i + 1) == 42 {
+      let s = i
+      i += 2
+      while i + 1 < n && !(src.code_unit_at(i) == 42 && src.code_unit_at(i + 1) == 47) {
+        i += 1
+      }
+      if i + 1 < n {
+        i += 2
+      } else {
+        i = n
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind: TokenKind::Comment })
+      continue
+    }
+
+    // String literal `"..."` or `'...'`
+    if b == 34 || (!is_json && b == 39) {
+      let quote = b
+      let s = i
+      i += 1
+      while i < n {
+        let c = src.code_unit_at(i)
+        if c == 92 && i + 1 < n {
+          i += 2
+        } else if c == quote {
+          i += 1
+          break
+        } else if c == 10 {
+          break
+        } else {
+          i += 1
+        }
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind: TokenKind::StringLit })
+      continue
+    }
+
+    // Number literal
+    if is_ascii_digit(b) {
+      let s = i
+      if b == 48 && i + 1 < n && (src.code_unit_at(i + 1) == 120 || src.code_unit_at(i + 1) == 88) {
+        i += 2
+        while i < n && (is_hex_digit(src.code_unit_at(i)) || src.code_unit_at(i) == 95) {
+          i += 1
+        }
+      } else {
+        while i < n && (is_ascii_digit(src.code_unit_at(i)) || src.code_unit_at(i) == 95) {
+          i += 1
+        }
+        if i + 1 < n && src.code_unit_at(i) == 46 && is_ascii_digit(src.code_unit_at(i + 1)) {
+          i += 1
+          while i < n && (is_ascii_digit(src.code_unit_at(i)) || src.code_unit_at(i) == 95) {
+            i += 1
+          }
+        }
+      }
+      // Optional integer suffix like `L`
+      if i < n && (src.code_unit_at(i) == 76 || src.code_unit_at(i) == 108) {
+        i += 1
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind: TokenKind::NumberLit })
+      continue
+    }
+
+    // Identifier / Keyword / TypeName / Function
+    if is_ident_start(b) {
+      let s = i
+      while i < n && is_ident_cont(src.code_unit_at(i)) {
+        i += 1
+      }
+      let word = editor::str_slice(src, s, i)
+      let kind = if is_keyword(lang, word) {
+        TokenKind::Keyword
+      } else if b >= 65 && b <= 90 {
+        TokenKind::TypeName
+      } else {
+        // Peek ahead for `(` to highlight function calls/defs
+        let mut k = i
+        while k < n && src.code_unit_at(k) == 32 {
+          k += 1
+        }
+        if k < n && src.code_unit_at(k) == 40 {
+          TokenKind::Function
+        } else {
+          TokenKind::Plain
+        }
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind })
+      continue
+    }
+
+    // Punctuation
+    if is_punct_byte(b) {
+      out.push(CodeSpan::{ start: i, end: i + 1, kind: TokenKind::Punct })
+      i += 1
+      continue
+    }
+
+    // Operator
+    if is_op_byte(b) {
+      let s = i
+      i += 1
+      while i < n && is_op_byte(src.code_unit_at(i)) {
+        // Don't swallow start of `//` or `/*` comment
+        if src.code_unit_at(i) == 47 && i + 1 < n && (src.code_unit_at(i + 1) == 47 || src.code_unit_at(i + 1) == 42) {
+          break
+        }
+        i += 1
+      }
+      out.push(CodeSpan::{ start: s, end: i, kind: TokenKind::Operator })
+      continue
+    }
+
+    // Non-ASCII UTF-8 grapheme -> Plain
+    let next = editor::next_grapheme_boundary(src, i)
+    out.push(CodeSpan::{ start: i, end: next, kind: TokenKind::Plain })
+    i = next
+  }
+  out
+}
+
+fn make_spaces(n : Int) -> String {
+  let sb = StringBuilder::new()
+  for _ in 0..<n {
+    sb.write_byte(32 as Byte)
+  }
+  sb.to_string()
+}
+
+/// Split `src` into logical lines with `(byte_start, byte_end, line_text)`.
+pub fn code_logical_lines(src : String) -> Array[(Int, Int, String)] {
+  let out : Array[(Int, Int, String)] = []
+  let n = src.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if src.code_unit_at(i) == 10 {
+      out.push((start, i, editor::str_slice(src, start, i)))
+      start = i + 1
+    }
+    i += 1
+  }
+  out.push((start, n, editor::str_slice(src, start, n)))
+  out
+}
+
+/// Convert a single line of code into styled monospace `text::Run`s with optional matching-bracket highlights.
+pub fn code_runs_for_line(
+  lang : String,
+  line_text : String,
+  palette : CodePalette,
+  bracket_a~ : Int = -1,
+  bracket_b~ : Int = -1,
+  line_byte_start~ : Int = 0,
+) -> Array[text::Run] {
+  if line_text.length() == 0 {
+    return [text::Run::{ ..text::plain(" "), mono: true, color: palette.plain }]
+  }
+  let spans = tokenize_code(lang, line_text)
+  let runs : Array[text::Run] = []
+  for sp in spans {
+    let fg = palette.color_for(sp.kind)
+    let w = if token_kind_eq(sp.kind, TokenKind::Keyword) { 600 } else { 400 }
+    let it = token_kind_eq(sp.kind, TokenKind::Comment)
+    let abs_start = line_byte_start + sp.start
+    let abs_end = line_byte_start + sp.end
+    let has_ba = bracket_a >= abs_start && bracket_a < abs_end
+    let has_bb = bracket_b >= abs_start && bracket_b < abs_end
+    if !has_ba && !has_bb {
+      runs.push(
+        text::Run::{
+          ..text::plain(editor::str_slice(line_text, sp.start, sp.end)),
+          mono: true,
+          weight: w,
+          italic: it,
+          color: fg,
+        },
+      )
+    } else {
+      // Split single-byte bracket positions so they get `palette.bracket_bg`.
+      let mut pos = sp.start
+      while pos < sp.end {
+        let abs_p = line_byte_start + pos
+        let is_brk = abs_p == bracket_a || abs_p == bracket_b
+        let next_p = editor::next_grapheme_boundary(line_text, pos)
+        runs.push(
+          text::Run::{
+            ..text::plain(editor::str_slice(line_text, pos, next_p)),
+            mono: true,
+            weight: if is_brk { 700 } else { w },
+            italic: it,
+            color: fg,
+            bg: if is_brk { palette.bracket_bg } else { 0L },
+          },
+        )
+        pos = next_p
+      }
+    }
+  }
+  runs
+}
+
+/// Code editor state wrapping `ui::Field` with syntax highlighting, bracket matching, and indentation helpers.
+pub struct CodeField {
+  pub field : ui::Field
+  pub mut lang : String
+  pub mut tab_size : Int
+  pub mut show_gutter : Bool
+  pub mut highlight_active_line : Bool
+  pub mut auto_indent_enter : Bool
+  pub rev_sig : signals::Signal[Int]
+}
+
+pub fn CodeField::new(
+  text~ : String = "",
+  lang~ : String = "pion",
+  tab_size~ : Int = 2,
+) -> CodeField {
+  let fld = ui::Field::new(text=text)
+  fld.enter_sends = false
+  fld.editor.config.multiline = true
+  fld.editor.config.wrap = false
+  fld.editor.config.enter_sends = false
+  CodeField::{
+    field: fld,
+    lang,
+    tab_size: if tab_size > 0 { tab_size } else { 2 },
+    show_gutter: true,
+    highlight_active_line: true,
+    auto_indent_enter: true,
+    rev_sig: signals::signal(0),
+  }
+}
+
+fn CodeField::bump(self : CodeField) -> Unit {
+  self.rev_sig.set(self.rev_sig.untracked() + 1)
+}
+
+pub fn CodeField::text(self : CodeField) -> String {
+  self.field.text()
+}
+
+pub fn CodeField::set(self : CodeField, s : String) -> Unit {
+  self.field.set(s)
+  self.bump()
+}
+
+pub fn CodeField::line_count(self : CodeField) -> Int {
+  code_logical_lines(self.field.editor.text).length()
+}
+
+/// 0-based logical line index containing the current caret.
+pub fn CodeField::active_line(self : CodeField) -> Int {
+  let src = self.field.editor.text
+  let c = self.field.editor.caret
+  let n = src.length()
+  let limit = if c < n { c } else { n }
+  let mut line = 0
+  let mut i = 0
+  while i < limit {
+    if src.code_unit_at(i) == 10 {
+      line += 1
+    }
+    i += 1
+  }
+  line
+}
+
+fn bracket_pair_forward(b : Int) -> Int {
+  if b == 40 { 41 } else if b == 91 { 93 } else if b == 123 { 125 } else { 0 }
+}
+
+fn bracket_pair_backward(b : Int) -> Int {
+  if b == 41 { 40 } else if b == 93 { 91 } else if b == 125 { 123 } else { 0 }
+}
+
+/// Find the matching `()[]{}` bracket pair adjacent to the caret (checking byte at caret, then byte before caret).
+pub fn CodeField::matching_bracket(self : CodeField) -> Option[(Int, Int)] {
+  let src = self.field.editor.text
+  let n = src.length()
+  if n == 0 {
+    return None
+  }
+  let c = self.field.editor.caret
+  let candidates : Array[Int] = []
+  if c < n {
+    candidates.push(c)
+  }
+  if c > 0 {
+    candidates.push(c - 1)
+  }
+  for pos in candidates {
+    let b = src.code_unit_at(pos)
+    let close = bracket_pair_forward(b)
+    if close != 0 {
+      let mut depth = 1
+      let mut j = pos + 1
+      while j < n {
+        let ch = src.code_unit_at(j)
+        if ch == b {
+          depth += 1
+        } else if ch == close {
+          depth -= 1
+          if depth == 0 {
+            return Some((pos, j))
+          }
+        }
+        j += 1
+      }
+    }
+    let open = bracket_pair_backward(b)
+    if open != 0 {
+      let mut depth = 1
+      let mut j = pos - 1
+      while j >= 0 {
+        let ch = src.code_unit_at(j)
+        if ch == b {
+          depth += 1
+        } else if ch == open {
+          depth -= 1
+          if depth == 0 {
+            return Some((j, pos))
+          }
+        }
+        j -= 1
+      }
+    }
+  }
+  None
+}
+
+/// Insert newline preserving current line indentation, adding an extra `tab_size` indent after `{`, `[`, or `(`.
+pub fn CodeField::insert_newline_auto_indent(self : CodeField) -> Unit {
+  let src = self.field.editor.text
+  let caret = self.field.editor.caret
+  let mut ls = caret
+  while ls > 0 && src.code_unit_at(ls - 1) != 10 {
+    ls -= 1
+  }
+  let mut indent_end = ls
+  while indent_end < caret && (src.code_unit_at(indent_end) == 32 || src.code_unit_at(indent_end) == 9) {
+    indent_end += 1
+  }
+  let base_indent = editor::str_slice(src, ls, indent_end)
+  // Check last non-space char before caret on this line
+  let mut p = caret - 1
+  while p >= ls && (src.code_unit_at(p) == 32 || src.code_unit_at(p) == 9) {
+    p -= 1
+  }
+  let extra = if p >= ls {
+    let last_b = src.code_unit_at(p)
+    if last_b == 123 || last_b == 91 || last_b == 40 {
+      make_spaces(self.tab_size)
+    } else {
+      ""
+    }
+  } else {
+    ""
+  }
+  self.field.insert("\n" + base_indent + extra)
+  self.bump()
+}
+
+/// Indent all lines overlapping the current selection (or current line) by `tab_size` spaces.
+pub fn CodeField::indent_selection(self : CodeField) -> Unit {
+  let src = self.field.editor.text
+  let (lo, hi) = self.field.editor.selection_range()
+  let pad = make_spaces(self.tab_size)
+  let lines = code_logical_lines(src)
+  let sb = StringBuilder::new()
+  let mut new_lo = lo
+  let mut new_hi = hi
+  let mut added_before_lo = 0
+  let mut added_before_hi = 0
+  for i in 0..<lines.length() {
+    let (ls, le, txt) = lines[i]
+    if i > 0 {
+      sb.write_byte(10 as Byte)
+    }
+    let overlaps = (le >= lo && ls <= hi) && !(hi > lo && ls == hi)
+    if overlaps {
+      sb.write_string(pad)
+      if ls <= lo {
+        added_before_lo += self.tab_size
+      }
+      if ls <= hi {
+        added_before_hi += self.tab_size
+      }
+    }
+    sb.write_string(txt)
+  }
+  new_lo = lo + added_before_lo
+  new_hi = hi + added_before_hi
+  self.field.editor.set_selection(0, src.length())
+  self.field.insert(sb.to_string())
+  self.field.pick(new_lo, new_hi)
+  self.bump()
+}
+
+/// Dedent all lines overlapping the current selection (or current line) by up to `tab_size` leading spaces.
+pub fn CodeField::dedent_selection(self : CodeField) -> Unit {
+  let src = self.field.editor.text
+  let (lo, hi) = self.field.editor.selection_range()
+  let lines = code_logical_lines(src)
+  let sb = StringBuilder::new()
+  let mut removed_before_lo = 0
+  let mut removed_before_hi = 0
+  for i in 0..<lines.length() {
+    let (ls, le, txt) = lines[i]
+    if i > 0 {
+      sb.write_byte(10 as Byte)
+    }
+    let overlaps = (le >= lo && ls <= hi) && !(hi > lo && ls == hi)
+    if overlaps && txt.length() > 0 {
+      let mut drop = 0
+      if txt.code_unit_at(0) == 9 {
+        drop = 1
+      } else {
+        while drop < self.tab_size && drop < txt.length() && txt.code_unit_at(drop) == 32 {
+          drop += 1
+        }
+      }
+      if ls < lo {
+        let d = if lo - ls < drop { lo - ls } else { drop }
+        removed_before_lo += d
+      }
+      if ls < hi {
+        let d = if hi - ls < drop { hi - ls } else { drop }
+        removed_before_hi += d
+      }
+      sb.write_string(editor::str_slice(txt, drop, txt.length()))
+    } else {
+      sb.write_string(txt)
+    }
+  }
+  let new_lo = if lo >= removed_before_lo { lo - removed_before_lo } else { 0 }
+  let new_hi = if hi >= removed_before_hi { hi - removed_before_hi } else { 0 }
+  self.field.editor.set_selection(0, src.length())
+  self.field.insert(sb.to_string())
+  self.field.pick(new_lo, new_hi)
+  self.bump()
+}
+
+/// Handle code editor keyboard shortcuts (auto-indent Enter, Tab/Shift+Tab indent/dedent, plus all `ui::Field` keys).
+pub fn CodeField::handle_key(self : CodeField, code : Int, mods : Int) -> Bool {
+  let shift = (mods & ui::mod_shift_key) != 0
+  let has_mod = (mods & (ui::mod_ctrl | ui::mod_alt | ui::mod_cmd)) != 0
+  if code == ui::key_enter && !has_mod && self.auto_indent_enter {
+    self.insert_newline_auto_indent()
+    return true
+  }
+  if code == ui::key_tab && !has_mod {
+    if shift {
+      self.dedent_selection()
+    } else if self.field.editor.has_selection() {
+      self.indent_selection()
+    } else {
+      self.field.insert(make_spaces(self.tab_size))
+      self.bump()
+    }
+    return true
+  }
+  let handled = self.field.handle_key(code, mods)
+  if handled {
+    self.bump()
+  }
+  handled
+}

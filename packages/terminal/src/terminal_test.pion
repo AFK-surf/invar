@@ -1,0 +1,82 @@
+// End-to-end unit tests for packages/terminal:
+// ANSI 16/256/24-bit RGB SGR, CSI cursor & erase, OSC title, alternate screen (?1049h/l),
+// scrollback history, selection extraction, VT key encoding, and Tester::tree rendering + input callback.
+
+import "ui"
+import "view"
+
+test "terminal 01: ANSI 16-color, xterm 256-color, and 24-bit RGB truecolor SGR" {
+  let term = TerminalModel::new(cols=40, rows=5)
+  term.feed("\x1b[1;32mOK\x1b[0m \x1b[38;5;196mR\x1b[38;2;10;20;30mX\x1b[0m")
+  debug_assert(term.line_text(0) == "OK RX", "rendered text matches")
+
+  let c0 = term.grid.get(0, 0)
+  debug_assert(c0.ch == "O" && c0.bold && c0.fg == term.palette.ansi[2], "bold green SGR")
+  let c3 = term.grid.get(3, 0)
+  debug_assert(c3.ch == "R" && c3.fg == xterm_256_color(196, term.palette), "256-color SGR")
+  let c4 = term.grid.get(4, 0)
+  debug_assert(c4.ch == "X" && c4.fg == ui::rgba(10, 20, 30, 255), "24-bit truecolor RGB SGR")
+
+  // Batched runs merge adjacent same-style cells ("OK" -> 1 run)
+  let runs = terminal_row_runs(term.visible_row(0), term.palette.bg)
+  debug_assert(runs.length() == 4 && runs[0].text == "OK" && runs[0].weight == 700, "same-style cells batched into runs")
+}
+
+test "terminal 02: CSI cursor positioning, erase line/screen, save/restore, and OSC title" {
+  let term = TerminalModel::new(cols=20, rows=4)
+  term.feed("\x1b]0;Build Runner\x07")
+  debug_assert(term.title == "Build Runner", "OSC 0 set terminal title")
+
+  term.feed("Hello World")
+  term.feed("\x1b[1;7H\x1b[K") // Move to row 1 col 7 and erase to end of line
+  debug_assert(term.line_text(0) == "Hello", "CSI H + K erased from col 6 to end")
+
+  term.feed("\x1b[2;3HXY\x1b[s\x1b[1;1HZ\x1b[u!")
+  debug_assert(term.grid.get(0, 0).ch == "Z", "wrote Z at (0,0)")
+  debug_assert(term.grid.get(4, 1).ch == "!", "restored cursor via CSI u")
+
+  term.feed("\x1b[2J\x1b[H")
+  debug_assert(term.line_text(0) == "" && term.line_text(1) == "", "CSI 2J cleared screen")
+}
+
+test "terminal 03: alternate screen (?1049h / ?1049l), scrollback, and selection extraction" {
+  let term = TerminalModel::new(cols=20, rows=3)
+  term.feed("line1\r\nline2\r\nline3\r\nline4\r\nline5")
+  debug_assert(term.scrollback.length() == 2, "2 lines pushed into scrollback")
+  debug_assert(term.line_text(0) == "line3" && term.line_text(2) == "line5", "live viewport shows last 3 lines")
+
+  // Scroll up 2 lines into scrollback history
+  term.scroll_by(2)
+  debug_assert(term.line_text(0) == "line1" && term.line_text(1) == "line2", "scrollback history visible")
+  term.scroll_by(-2)
+
+  // Selection extraction across rows
+  term.set_selection(Some((0, 0)), Some((4, 1)))
+  debug_assert(term.selected_text() == "line3\nline4", "selected_text extracts multi-line range")
+
+  // Alternate screen preserves main grid & restores cleanly
+  term.feed("\x1b[?1049hALT SCREEN")
+  debug_assert(term.alt_screen && term.line_text(0) == "ALT SCREEN", "entered alt screen")
+  term.feed("\x1b[?1049l")
+  debug_assert(!term.alt_screen && term.line_text(0) == "line3", "restored main screen after ?1049l")
+}
+
+test "terminal 04: VT key encoding and Tester::tree TerminalView rendering + on_input" {
+  debug_assert(encode_key(ui::key_enter, 0) == "\r", "Enter -> CR")
+  debug_assert(encode_key(ui::key_code_up, 0) == "\x1b[A", "Up -> ESC[A")
+  debug_assert(encode_key(ui::key_of_char('c'), ui::mod_ctrl) == "\x03", "Ctrl+C -> ETX")
+  debug_assert(encode_key(ui::key_of_char('a'), ui::mod_shift_key) == "A", "Shift+a -> A")
+
+  let term = TerminalModel::new(cols=32, rows=6)
+  term.feed("\x1b[32m$\x1b[0m invar test\r\n\x1b[36mOK\x1b[0m 42 passed")
+  let sent = ui::ref_new("")
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(320.0))).height(view::Live::Is(Some(140.0)))
+      let _ = TerminalView(b, term, on_input=fn(s : String) { sent.v = sent.v + s }, label="TermPane")
+    })
+  })
+  t.frame(ms=16.0)
+  debug_assert(term.line_text(0) == "$ invar test", "terminal content ready in tree")
+  t.dispose()
+}
