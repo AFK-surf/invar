@@ -1,4 +1,5 @@
-// Ported from Kyant0/AndroidLiquidGlass (Apache-2.0): catalog/components/LiquidBottomTabs.kt and LiquidBottomTab.kt.
+// Liquid Glass bottom tab bar with unified bar-level gesture, distance-adaptive spring,
+// speed-stretch capsule physics, and lifted clear refraction loupe.
 
 import "headless"
 import "motion"
@@ -6,11 +7,74 @@ import "signals"
 import "ui"
 import "view"
 
-let tab_lens_max_grow_x : Double = 8.0
+let tab_bar_edge : Double = 8.0
+let tab_bar_lens_lift_h : Double = 1.17
+let tab_bar_lens_aspect : Double = 1.45
+let tab_bar_hold_ms : Double = 200.0
+let tab_bar_fling_ms : Double = 100.0
+let tab_bar_lean : Double = 0.25
+let tab_bar_slot_px : Double = 90.0
+let tab_bar_ball_ratio : Double = 0.635
+let tab_bar_ball_rest : Double = 0.01
+let tab_bar_ball_box_w : Double = 100.0
+let tab_bar_ball_box_h : Double = 50.0
+let tab_bar_lens_shadow : (Double, Double, Int64) = (12.0, 4.0, 0x0000001AL)
 
-fn ease_out(x : Double) -> Double {
-  let f = motion::cubic_bezier(0.0, 0.0, 0.58, 1.0)
-  f(x)
+fn tab_bar_selection_fill() -> Int64 {
+  if is_dark() { 0xFFFFFF1FL } else { 0x00000012L }
+}
+
+fn tab_bar_item_w(w : Double, count : Int) -> Double {
+  let n = if count < 1 { 1 } else { count }
+  dmax(0.0, w - 2.0 * tab_bar_edge) / n.to_double()
+}
+
+fn tab_bar_centre(w : Double, count : Int, idx : Int) -> Double {
+  let n = if count < 1 { 1 } else { count }
+  let clamped = if idx < 0 { 0 } else if idx >= n { n - 1 } else { idx }
+  tab_bar_edge + (clamped.to_double() + 0.5) * tab_bar_item_w(w, n)
+}
+
+fn tab_bar_nearest(w : Double, count : Int, px : Double) -> Int {
+  let n = if count < 1 { 1 } else { count }
+  let mut best = 0
+  let mut best_d = (tab_bar_centre(w, n, 0) - px).abs()
+  let mut j = 1
+  while j < n {
+    let d = (tab_bar_centre(w, n, j) - px).abs()
+    if d < best_d {
+      best = j
+      best_d = d
+    }
+    j += 1
+  }
+  best
+}
+
+fn tab_bar_flung(px : Double, vx : Double, w : Double, count : Int) -> Double {
+  let iw = tab_bar_item_w(w, count)
+  px + clamp(vx * tab_bar_fling_ms, -iw, iw)
+}
+
+fn tab_bar_ball_size(
+  w : Double,
+  count : Int,
+  held : Double,
+  stretch : Double,
+  lower : Double,
+  lens : Bool,
+) -> (Double, Double) {
+  let iw = tab_bar_item_w(w, count)
+  let pw = iw + 2.0 * (tab_bar_edge - tabs_pad)
+  let (bw, bh) = if lens {
+    let lh = tabs_h * tab_bar_lens_lift_h
+    let lw = dmin(lh * tab_bar_lens_aspect, iw * tab_bar_lens_aspect)
+    let up = clamp(held, 0.0, 1.2)
+    (pw + (lw - pw) * up, tab_lens_h + (lh - tab_lens_h) * up)
+  } else {
+    (pw, tab_lens_h)
+  }
+  (dmax(8.0, bw + stretch), dmax(8.0, bh - lower))
 }
 
 pub fn liquid_bottom_tab_node(
@@ -23,6 +87,7 @@ pub fn liquid_bottom_tab_node(
   scale : (view::View) -> Double,
   press? : (view::Drag) -> Unit,
   tap? : (view::Drag) -> Unit,
+  hold? : (Double, (view::Drag) -> Unit),
   drag? : (view::Drag) -> Unit,
   loc~ : String = "",
 ) -> view::View {
@@ -30,6 +95,7 @@ pub fn liquid_bottom_tab_node(
     let _ = t
     .grow(view::Live::Is(1.0))
     .basis(view::Live::Is(Some(0.0)))
+    .height(view::Live::Is(Some(tabs_h)))
     .radius(view::Live::Is(tab_lens_h / 2.0))
     .lines_up(view::Live::Is(Some(view::Along::Middle)))
     .lies_along(view::Live::Is(view::Lies::Middle))
@@ -40,28 +106,20 @@ pub fn liquid_bottom_tab_node(
         lerp_color(c.content, c.accent, clamp(lit(f), 0.0, 1.0))
       })
     })
-    let has_g = match press {
-      Some(_) => true
-      None => match tap {
-        Some(_) => true
-        None => match drag {
-          Some(_) => true
-          None => false
-        }
-      }
-    }
+    let has_g = press.is_some() || tap.is_some() || hold.is_some() || drag.is_some()
     if has_g {
       let _ = t.box(fn(hit : view::View) -> Unit {
         let _ = hit.over(view::Live::Is(true)).gesture(
           ui::touch_slop(),
           press=fn(d : view::Drag) -> Unit { match press { Some(f) => f(d); None => () } },
           tap=fn(d : view::Drag) -> Unit { match tap { Some(f) => f(d); None => () } },
+          hold?=hold,
           drag=fn(d : view::Drag) -> Unit { match drag { Some(f) => f(d); None => () } },
         )
       })
     }
     t.show(fn() { it.focus_shown() }, fn(ring : view::View) -> Unit {
-      let _ = ring.over(view::Live::Is(true)).radius(view::Live::Is(tab_lens_h / 2.0)).edge(view::Live::By(fn() { (2.0, colors().accent) }))
+      let _ = ring.over(view::Live::Is(true)).points(view::Live::Is(false)).radius(view::Live::Is(tab_lens_h / 2.0)).edge(view::Live::By(fn() { (2.0, colors().accent) }))
     })
   })
 }
@@ -97,109 +155,176 @@ pub fn liquid_bottom_tabs_node(
     Some(l) => l
     None => InteractiveHighlight::new()
   }
+  let held_way = motion::NodeWay::new(0.0)
+  let ball_x = motion::NodeWay::new(0.0)
+  let placed = ui::ref_new(false)
+  let last_w = fref(0.0)
+  let last_tension = fref(300.0)
   let current = ui::ref_new(signals::untracked(selected))
-  let dragging = ui::ref_new(false)
-  let pressed_idx = ui::ref_new(signals::untracked(selected))
-  let pulled = motion::NodeWay::new(0.0)
-  let pulled_by = fref(0.0)
-  let last_x = fref(0.0)
+  let held_flag = ui::ref_new(false)
+  let dd_lifted = ui::ref_new(false)
+  let drag_x = fref(-1.0)
+  let felt_idx = ui::ref_new(signals::untracked(selected))
+  let active_under = signals::signal(-1)
   headless::radio_group(loc=loc, parent, fn() { label }, selected, select, kind=headless::GroupKind::Tab, fn(g : view::View, rg : headless::RadioGroup[Int]) -> Unit {
     dd.attach(g)
     ih.attach(g)
-    let _ = g.height(view::Live::Is(Some(tabs_h))).padding(view::Live::Is((tabs_pad, tabs_pad, tabs_pad, tabs_pad)))
-    g.reacts(at_start=false, selected, fn(i : Int) -> Unit {
-      if i != current.v {
-        current.v = i
-        dd.slide_to(i.to_double())
-      }
-    })
+    let _ = g.height(view::Live::Is(Some(tabs_h)))
     let _ = g.by_room(fn(inner : view::View, room : view::Room) -> Unit {
-      let w = fn() -> Double { room.width() + 2.0 * tabs_pad }
-      let tab_w = fn() -> Double { (w() - 2.0 * tabs_pad) / count.to_double() }
-      let panel = fn(n : view::View) -> Double {
-        let ww = w()
-        if ww <= 0.0 {
-          return 0.0
+      let w = fn() -> Double { room.width() }
+      let pos_from_x = fn(ww : Double, px : Double) -> Double {
+        let iw = tab_bar_item_w(ww, count)
+        if iw <= 0.0 {
+          0.0
+        } else {
+          clamp((px - tab_bar_edge) / iw - 0.5, 0.0, last)
         }
-        let f = clamp(pulled.shown(n) / ww, -1.0, 1.0)
-        let s = if f < 0.0 { -1.0 } else if f > 0.0 { 1.0 } else { 0.0 }
-        4.0 * s * ease_out(f.abs())
       }
-      let lit = fn(n : view::View, i : Int) -> Double { clamp(1.0 - (dd.value(n) - i.to_double()).abs(), 0.0, 1.0) }
-      let grown = fn(n : view::View) -> Double { lerp(1.0, tab_held_scale, dd.pressed(n)) }
+      let slide_ball_to = fn(ww : Double, idx : Int) -> Unit {
+        if ww <= 0.0 {
+          return
+        }
+        let goal_x = tab_bar_centre(ww, count, idx)
+        if !placed.v || ui::reduced_motion() {
+          placed.v = true
+          last_w.v = ww
+          ball_x.put(goal_x)
+          return
+        }
+        let now = g.cause_at()
+        let cur_x = ball_x.value_at(now)
+        let mut trip = dmax(8.0, (goal_x - cur_x).abs())
+        if ball_x.goes_at(now) && last_tension.v > 0.0 {
+          trip = dmax(trip, 300.0 * tab_bar_slot_px / last_tension.v)
+        }
+        let tension = clamp(300.0 * tab_bar_slot_px / trip, 90.0, 700.0)
+        last_tension.v = tension
+        ball_x.go(g, goal_x, motion::spring(ratio=tab_bar_ball_ratio, stiffness=tension, threshold=tab_bar_ball_rest))
+      }
+      let sync_drag = fn(ww : Double, px : Double) -> Unit {
+        if ww <= 0.0 {
+          return
+        }
+        if !placed.v {
+          placed.v = true
+          last_w.v = ww
+          ball_x.put(tab_bar_centre(ww, count, signals::untracked(selected)))
+        }
+        let j = tab_bar_nearest(ww, count, px)
+        let target_x = tab_bar_centre(ww, count, j)
+        let goal_x = target_x + (px - target_x) * tab_bar_lean
+        last_tension.v = 300.0
+        if ui::reduced_motion() {
+          ball_x.put(goal_x)
+          held_way.put(1.0)
+        } else {
+          ball_x.go(g, goal_x, motion::spring(ratio=tab_bar_ball_ratio, stiffness=300.0, threshold=tab_bar_ball_rest))
+          held_way.go(g, 1.0, motion::spring(ratio=1.0, stiffness=1000.0, threshold=0.001))
+        }
+        if !dd_lifted.v {
+          dd_lifted.v = true
+          dd.press()
+        }
+        dd.update_value(pos_from_x(ww, px))
+      }
+      let finish_drag = fn(ww : Double, idx : Int, commit : Bool) -> Unit {
+        let clamped_i = if idx < 0 { 0 } else if idx >= count { if count > 0 { count - 1 } else { 0 } } else { idx }
+        held_flag.v = false
+        drag_x.v = -1.0
+        active_under.set(-1)
+        if ui::reduced_motion() {
+          held_way.put(0.0)
+        } else {
+          held_way.go(g, 0.0, motion::spring(ratio=1.0, stiffness=1000.0, threshold=0.001))
+        }
+        let target_i = if commit { clamped_i } else { signals::untracked(selected) }
+        current.v = target_i
+        slide_ball_to(ww, target_i)
+        if dd_lifted.v {
+          dd_lifted.v = false
+          dd.update_value(target_i.to_double())
+          dd.release()
+        } else {
+          dd.slide_to(target_i.to_double())
+        }
+        if commit && target_i != signals::untracked(selected) {
+          select(target_i)
+        }
+        ih.up()
+      }
+      g.reacts(at_start=true, w, fn(ww : Double) -> Unit {
+        if ww > 0.0 && (!placed.v || (ww - last_w.v).abs() > 0.5) {
+          placed.v = true
+          last_w.v = ww
+          let idx = if drag_x.v >= 0.0 {
+            tab_bar_nearest(ww, count, drag_x.v)
+          } else {
+            signals::untracked(selected)
+          }
+          ball_x.put(tab_bar_centre(ww, count, idx))
+        }
+      })
+      g.reacts(at_start=false, selected, fn(i : Int) -> Unit {
+        if i != current.v && drag_x.v < 0.0 {
+          current.v = i
+          slide_ball_to(w(), i)
+          dd.slide_to(i.to_double())
+        }
+      })
+      let ball_shape = fn(n : view::View, lens : Bool) -> view::GroundShape {
+        let ww = w()
+        let (x, xv) = if placed.v {
+          ball_x.motion(n)
+        } else {
+          (tab_bar_centre(ww, count, signals::untracked(selected)), 0.0)
+        }
+        let v = xv / 60.0
+        let (stretch, lower) = motion::speed_stretch(v)
+        let cx = x + (if v < 0.0 { -stretch } else { stretch }) / 2.0
+        let h_val = held_way.shown(n)
+        let (sw, sh) = tab_bar_ball_size(ww, count, h_val, stretch, lower, lens)
+        let r = dmin(sw, sh) / 2.0
+        view::GroundShape::{
+          dx: cx - sw / 2.0,
+          dy: (tabs_h - sh) / 2.0,
+          dw: sw - tab_bar_ball_box_w,
+          dh: sh - tab_bar_ball_box_h,
+          corners: Some((r, r, r, r)),
+        }
+      }
+      // Layer 1: Bottom bar glass capsule (fixed geometry, never inflates or deforms)
       let _ = inner.box(fn(bar : view::View) -> Unit {
         let _ = bar
         .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
         .width(view::Live::By(fn() { Some(w()) }))
         .height(view::Live::Is(Some(tabs_h)))
-        .margin(view::Live::Is((-tabs_pad, -tabs_pad, 0.0, 0.0)))
         .radius(view::Live::Is(tabs_h / 2.0))
-        .ground_drawn(view::Live::By(fn() {
-          let ww = w()
-          let s = lerp(1.0, 1.0 + 4.0 / ww, dd.pressed(bar))
-          stretched(ww, tabs_h, panel(bar), 0.0, s, s)
-        }))
-        lg_apply_glass_surface(bar, fn() { lg_capsule_glass(bezel=20.0, refraction=28.0) })
-        let _ = bar.box(fn(ov : view::View) -> Unit {
-          let _ = ov
-          .over(view::Live::Is(true))
-          .points(view::Live::Is(false))
-          .radius(view::Live::Is(tabs_h / 2.0))
-          .ground(view::Live::Is(white))
-          .alpha(view::Live::By(fn() { clamp(ih.pressed(ov), 0.0, 1.0) * 0.14 }))
-          .ground_drawn(view::Live::By(fn() {
-            let ww = w()
-            let s = lerp(1.0, 1.0 + 4.0 / ww, dd.pressed(ov))
-            stretched(ww, tabs_h, panel(ov), 0.0, s, s)
-          }))
-        })
+        .shadow(view::Live::By(glass_control_shadow))
+        .shadow_outside(view::Live::Is(true))
+        lg_apply_glass_surface(bar, fn() { liquid_tab_bar_glass() })
       })
-      let stopped = fn() -> Unit {
-        let to = clamp(dd.target().round(), 0.0, last)
-        let i = to.to_int()
-        current.v = i
-        dd.update_value(to)
-        dd.release()
-        if i != signals::untracked(selected) {
-          select(i)
-        }
-        pulled_by.v = 0.0
-        pulled.go(g, 0.0, motion::spring(ratio=1.0, stiffness=300.0, threshold=0.5))
-        ih.up()
-        dragging.v = false
-      }
-      let on_drag = fn(d : view::Drag) -> Unit {
-        match d.kind {
-          Down => {
-            if !dragging.v {
-              dragging.v = true
-              dd.press()
-            }
-            let dx = d.wx - last_x.v
-            last_x.v = d.wx
-            let tw = tab_w()
-            if tw > 0.0 {
-              dd.update_value(clamp(dd.target() + dx / tw, 0.0, last))
-            }
-            pulled_by.v = pulled_by.v + dx
-            pulled.put(pulled_by.v)
-          }
-          Moved => {
-            let dx = d.wx - last_x.v
-            last_x.v = d.wx
-            let tw = tab_w()
-            if tw > 0.0 {
-              dd.update_value(clamp(dd.target() + dx / tw, 0.0, last))
-            }
-            pulled_by.v = pulled_by.v + dx
-            pulled.put(pulled_by.v)
-          }
-          Up => stopped()
-          Off => stopped()
-        }
-      }
+      // Layer 2: Resting selection pill (under icons/labels, zero-relayout ground_drawn)
+      let _ = inner.box(fn(ball : view::View) -> Unit {
+        let _ = ball
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(tab_bar_ball_box_w)))
+        .height(view::Live::Is(Some(tab_bar_ball_box_h)))
+        .radius(view::Live::Is(tab_lens_h / 2.0))
+        .ground(view::Live::By(tab_bar_selection_fill))
+        .alpha(view::Live::By(fn() {
+          let lensed = if ball.glass_solid() { 0.0 } else { dmin(1.0, held_way.shown(ball)) }
+          clamp(1.0 - lensed, 0.0, 1.0)
+        }))
+        .ground_drawn(view::Live::By(fn() { ball_shape(ball, false) }))
+      })
+      // Layer 3: Tab icons and labels row (never scales text, highlights selected or hovered-under-finger tab)
       let _ = inner.box(fn(row : view::View) -> Unit {
-        let _ = row.row(view::Live::Is(true)).height(view::Live::Is(Some(tab_lens_h))).offset(view::Live::By(fn() { (panel(row), 0.0) }))
+        let _ = row
+        .row(view::Live::Is(true))
+        .height(view::Live::Is(Some(tabs_h)))
+        .padding(view::Live::Is((tab_bar_edge, 0.0, tab_bar_edge, 0.0)))
         let mut i = 0
         while i < labels.length() {
           let idx = i
@@ -208,136 +333,126 @@ pub fn liquid_bottom_tabs_node(
             Some(fs) => if idx < fs.length() { fs[idx] } else { tab_face(name) }
             None => tab_face(name)
           }
-          let hit = idx.to_double()
           let _ = liquid_bottom_tab_node(
             row,
             rg,
             idx,
             name,
             face,
-            fn(n : view::View) -> Double {
-              let l = lit(n, idx)
-              if n.glass_solid() {
-                l
-              } else {
-                l * (1.0 - clamp(dd.pressed(n) / 0.25, 0.0, 1.0))
-              }
+            fn(_n : view::View) -> Double {
+              let under = active_under.get()
+              let lit_now = if under >= 0 { under == idx } else { selected() == idx }
+              if lit_now { 1.0 } else { 0.0 }
             },
-            grown,
-            press=fn(d : view::Drag) -> Unit {
-              last_x.v = d.wx
-              pulled_by.v = 0.0
-              dragging.v = false
-              pressed_idx.v = idx
-              ih.down(hit * tab_w() + d.x + tabs_pad, d.y + tabs_pad, w(), tabs_h)
-            },
-            tap=fn(_d : view::Drag) -> Unit {
-              let i = pressed_idx.v
-              current.v = i
-              dd.slide_to(i.to_double())
-              if i != signals::untracked(selected) {
-                select(i)
-              }
-              ih.up()
-            },
-            drag=on_drag,
+            fn(_n : view::View) -> Double { 1.0 },
           )
           i += 1
         }
       })
+      // Layer 4: Clear lifted liquid glass loupe over icons/labels (zero-relayout ground_drawn)
       let _ = inner.box(fn(lens : view::View) -> Unit {
-        let size = fn() -> (Double, Double) {
-          let (sx, sy) = dd.jelly(lens, 10.0)
-          let tw = tab_w()
-          let lw = dmax(0.0, tw + dmin(tw * (sx - 1.0), tab_lens_max_grow_x))
-          (lw, tab_lens_h * sy)
-        }
         let _ = lens
         .over(view::Live::Is(true))
-        .width(view::Live::By(fn() { Some(size().0) }))
-        .height(view::Live::By(fn() { Some(size().1) }))
-        .radius(view::Live::By(fn() { size().1 / 2.0 }))
-        .offset(view::Live::By(fn() {
-          let (lw, lh) = size()
-          (dd.value(lens) * tab_w() + panel(lens) + (tab_w() - lw) / 2.0, (tab_lens_h - lh) / 2.0)
-        }))
-        .shadow(view::Live::By(fn() {
-          let (s, dy, ink) = shadow_default
-          (s, dy, alpha(ink, dd.pressed(lens)))
-        }))
-        .shadow_outside(view::Live::Is(true))
-        let _ = lens.box(fn(pill : view::View) -> Unit {
-          let _ = pill
-          .over(view::Live::Is(true))
-          .radius(view::Live::By(fn() { size().1 / 2.0 }))
-          .ground(view::Live::By(fn() { colors().lens_idle }))
-          .alpha(view::Live::By(fn() { 1.0 - clamp(dd.pressed(pill), 0.0, 1.0) }))
-        })
-        let _ = lens.box(fn(accent_clip : view::View) -> Unit {
-          let _ = accent_clip
-          .over(view::Live::Is(true))
-          .points(view::Live::Is(false))
-          .clips(view::Live::Is(true))
-          .width(view::Live::By(fn() { Some(size().0) }))
-          .height(view::Live::By(fn() { Some(size().1) }))
-          .radius(view::Live::By(fn() { size().1 / 2.0 }))
-          .alpha(view::Live::By(fn() {
-            if accent_clip.glass_solid() {
-              0.0
-            } else {
-              let p = dd.pressed(accent_clip)
-              if p > 0.01 { clamp(p / 0.25, 0.0, 1.0) } else { 0.0 }
-            }
-          }))
-          let _ = accent_clip.box(fn(accent_row : view::View) -> Unit {
-            let _ = accent_row
-            .over(view::Live::Is(true))
-            .points(view::Live::Is(false))
-            .row(view::Live::Is(true))
-            .width(view::Live::By(fn() { Some(tab_w() * count.to_double()) }))
-            .height(view::Live::Is(Some(tab_lens_h)))
-            .offset(view::Live::By(fn() {
-              let (lw, lh) = size()
-              (-(dd.value(accent_row) * tab_w() + (tab_w() - lw) / 2.0), -(tab_lens_h - lh) / 2.0)
-            }))
-            let mut j = 0
-            while j < labels.length() {
-              let idx = j
-              let name = labels[idx]
-              let face = match faces {
-                Some(fs) => if idx < fs.length() { fs[idx] } else { tab_face(name) }
-                None => tab_face(name)
-              }
-              let _ = accent_row.box(fn(atab : view::View) -> Unit {
-                let _ = atab
-                .width(view::Live::By(fn() { Some(tab_w()) }))
-                .height(view::Live::Is(Some(tab_lens_h)))
-                .shrink(view::Live::Is(0.0))
-                .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                .lies_along(view::Live::Is(view::Lies::Middle))
-                let _ = atab.box(fn(af : view::View) -> Unit {
-                  let _ = af.lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(2.0)).scale(view::Live::By(fn() { grown(af) }))
-                  face(af, fn() { colors().accent })
-                })
-              })
-              j += 1
-            }
-          })
-        })
-        let _ = lens.box(fn(gl : view::View) -> Unit {
-          let _ = gl
-          .over(view::Live::Is(true))
-          .radius(view::Live::By(fn() { size().1 / 2.0 }))
-          .glass(view::Live::By(fn() {
-            let p = dd.pressed(gl)
-            if p > 0.001 {
-              Some(lg_clear_lens_glass(p, bezel=7.0, refraction=8.5, zoom_add=0.08, rim_max=1.0, solid=alpha(colors().container, 1.0 / 0.4)))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(tab_bar_ball_box_w)))
+        .height(view::Live::Is(Some(tab_bar_ball_box_h)))
+        .radius(view::Live::Is(tab_lens_h / 2.0))
+        .glass(view::Live::By(fn() {
+          if lens.glass_solid() {
+            None
+          } else {
+            let h = held_way.shown(lens)
+            if h > 0.01 {
+              Some(liquid_tab_lens_glass(h))
             } else {
               None
             }
-          }))
-          .alpha(view::Live::By(fn() { clamp(dd.pressed(gl), 0.0, 1.0) }))
-        })
+          }
+        }))
+        .shadow(view::Live::By(fn() {
+          let h = held_way.shown(lens)
+          if h > 0.01 && !lens.glass_solid() {
+            let (s, dy, ink) = tab_bar_lens_shadow
+            (s, dy, alpha(ink, dmin(1.0, h)))
+          } else {
+            (0.0, 0.0, clear)
+          }
+        }))
+        .shadow_outside(view::Live::Is(true))
+        .alpha(view::Live::By(fn() {
+          if lens.glass_solid() {
+            0.0
+          } else {
+            let h = held_way.shown(lens)
+            if h > 0.01 { dmin(1.0, h) } else { 0.0 }
+          }
+        }))
+        .ground_drawn(view::Live::By(fn() { ball_shape(lens, true) }))
+      })
+      // Unified bar-level gesture overlay
+      let _ = inner.box(fn(bar_hit : view::View) -> Unit {
+        let _ = bar_hit.over(view::Live::Is(true)).gesture(
+          ui::touch_slop(),
+          press=fn(d : view::Drag) -> Unit {
+            held_flag.v = false
+            felt_idx.v = signals::untracked(selected)
+            ih.down(d.x, d.y, w(), tabs_h)
+          },
+          hold=(
+            tab_bar_hold_ms,
+            fn(d : view::Drag) -> Unit {
+              let ww = w()
+              held_flag.v = true
+              drag_x.v = d.x
+              let j = tab_bar_nearest(ww, count, d.x)
+              felt_idx.v = j
+              active_under.set(j)
+              ui::haptic(ui::Haptic::LongPress)
+              sync_drag(ww, d.x)
+            },
+          ),
+          tap=fn(d : view::Drag) -> Unit {
+            let ww = w()
+            held_flag.v = false
+            drag_x.v = -1.0
+            active_under.set(-1)
+            let j = tab_bar_nearest(ww, count, d.x)
+            current.v = j
+            slide_ball_to(ww, j)
+            dd.slide_to(j.to_double())
+            if j != signals::untracked(selected) {
+              ui::haptic(ui::Haptic::TextHandleMove)
+              select(j)
+            }
+            ih.up()
+          },
+          drag=fn(d : view::Drag) -> Unit {
+            let ww = w()
+            match d.kind {
+              Down | Moved => {
+                held_flag.v = false
+                drag_x.v = d.x
+                let j = tab_bar_nearest(ww, count, d.x)
+                if j != felt_idx.v {
+                  ui::haptic(ui::Haptic::TextHandleMove)
+                  felt_idx.v = j
+                }
+                active_under.set(j)
+                sync_drag(ww, d.x)
+              }
+              Up => {
+                let target_px = if held_flag.v {
+                  d.x
+                } else {
+                  tab_bar_flung(d.x, d.vx(), ww, count)
+                }
+                let j = tab_bar_nearest(ww, count, target_px)
+                finish_drag(ww, j, true)
+              }
+              Off => finish_drag(ww, signals::untracked(selected), false)
+            }
+          },
+        )
       })
     })
   })
