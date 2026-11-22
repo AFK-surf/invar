@@ -417,7 +417,8 @@ export function createPionRuntime(opts = {}) {
   }
   function pion_arr_get(a, i) {
     const p = pNum(a); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n);
-    const v = g64(Number(g64(p + 24)) + Number(i) * 8); if (g32(p + 16) && v) pion_rc_inc(v); return v;
+    // Match pion_rt.c: caller emits pion_rc_inc for borrowed element loads.
+    return g64(Number(g64(p + 24)) + Number(i) * 8);
   }
   function pion_arr_set(a, i, v) {
     const p = pNum(a); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n);
@@ -510,13 +511,15 @@ export function createPionRuntime(opts = {}) {
   const pion_map_has = (m, k) => (mapSlot(pNum(m), k) >= 0 ? 1 : 0);
   function pion_map_get(m, k) {
     const p = pNum(m), sl = mapSlot(p, k); if (sl < 0) return 0n; sync();
-    const v = g64(Number(g64(p + 24)) + sl * 32 + 16); if (g32(p + 16) && v) pion_rc_inc(v); return v;
+    // Match pion_rt.c: caller emits pion_rc_inc for borrowed map values.
+    return g64(Number(g64(p + 24)) + sl * 32 + 16);
   }
   function pion_map_try_get(m, k, outP) {
     const p = pNum(m), sl = mapSlot(p, k), op = pNum(outP);
     if (sl < 0) { if (op) { sync(); s64(op, 0); } return 0; }
+    // Match pion_rt.c: caller emits pion_rc_inc for borrowed map values.
     sync(); const v = g64(Number(g64(p + 24)) + sl * 32 + 16);
-    if (g32(p + 16) && v) pion_rc_inc(v); sync(); if (op) s64(op, v); return 1;
+    if (op) s64(op, v); return 1;
   }
   function pion_map_remove(m, k) {
     const p = pNum(m), sl = mapSlot(p, k); if (sl < 0) return; sync();
