@@ -627,6 +627,7 @@ fn view_forget_inner(clear_hooks : Bool) -> Unit {
   streams_and_natives_reset()
   reset_glyph_atlas()
   reset_glass_light_angle()
+  view_blocks_reset()
 }
 
 fn view_forget() -> Unit {
@@ -757,11 +758,11 @@ fn Scene::glass_capture(self : Scene, k : Int, liquid : Bool, shares : Bool) -> 
     return
   }
   if shares &&
-    is_single_liquid &&
-    eff_blur >= 0.0 &&
-    self.liquid_run != 0 &&
-    self.liquid_blur == eff_blur &&
-    self.liquid_first >= 0 {
+  is_single_liquid &&
+  eff_blur >= 0.0 &&
+  self.liquid_run != 0 &&
+  self.liquid_blur == eff_blur &&
+  self.liquid_first >= 0 {
     let ky0 = a[b + 1]
     let ky1 = ky0 + a[b + 3]
     let dy_gap = dmax(0.0, dmax(ky0 - self.liquid_y1, self.liquid_y0 - ky1))
@@ -773,11 +774,11 @@ fn Scene::glass_capture(self : Scene, k : Int, liquid : Bool, shares : Bool) -> 
         let pj = j * inst_size
         let jk = a[pj + 5]
         if jk != 2.0 &&
-          jk != 12.0 &&
-          a[pj + 20] != run_tag &&
-          a[pj + 2] > 0.0 &&
-          a[pj + 3] > 0.0 &&
-          rects_meet_by(j, k, a, 0.0) {
+        jk != 12.0 &&
+        a[pj + 20] != run_tag &&
+        a[pj + 2] > 0.0 &&
+        a[pj + 3] > 0.0 &&
+        rects_meet_by(j, k, a, 0.0) {
           blocked = true
           break
         }
@@ -801,15 +802,15 @@ fn Scene::glass_capture(self : Scene, k : Int, liquid : Bool, shares : Bool) -> 
     0.0
   }
   let mut same = self.glass_run != 0 &&
-    prev == k &&
-    !is_progressive &&
-    !prev_is_progressive &&
-    eff_blur >= 0.0 &&
-    a[(k - 1) * inst_size + 5] == kind &&
-    prev_eff_blur == eff_blur &&
-    (!liquid ||
-      (is_single_liquid && prev_is_single) ||
-      (!is_single_liquid && !prev_is_single && self.glass_run_len < 8))
+  prev == k &&
+  !is_progressive &&
+  !prev_is_progressive &&
+  eff_blur >= 0.0 &&
+  a[(k - 1) * inst_size + 5] == kind &&
+  prev_eff_blur == eff_blur &&
+  (!liquid ||
+    (is_single_liquid && prev_is_single) ||
+    (!is_single_liquid && !prev_is_single && self.glass_run_len < 8))
   if same && (!liquid || is_single_liquid) {
     let pad = if is_single_liquid { 2.0 } else { 0.0 }
     if is_single_liquid && self.liquid_run == self.glass_run && self.liquid_first >= 0 {
@@ -961,7 +962,303 @@ fn flush_deferred_shadows(scene : Scene, pending : Array[DeferredGlassShadow]) -
   pending.clear()
 }
 
-fn encode_drawn_node(
+/// Per-frame node-level `ViewBlock` cache accounting (`made`: encoded fresh, `copied`: reused from cache, `handed`: total instances emitted).
+pub struct ViewPaintWork {
+  pub mut made : Int
+  pub mut copied : Int
+  pub mut handed : Int
+}
+
+struct ViewBlock {
+  gen : Int
+  w : Double
+  h : Double
+  radius : Double
+  corners : Option[(Double, Double, Double, Double)]
+  ground : Int64
+  edge_w : Double
+  edge_col : Int64
+  alpha : Double
+  words : String
+  words_size : Double
+  words_weight : Int
+  words_line : Double
+  words_wrap : Bool
+  words_tracking : view::Spacing
+  words_balance : Bool
+  words_max_lines : Int
+  words_center : Bool
+  words_optical : Bool
+  ink : Int64
+  ellipsis_past : Bool
+  clips_self : Bool
+  image : Option[(String, String, Int)]
+  image_in : Option[((Double, Double, Double, Double), Int64)]
+  ring_w : Double
+  ring_gap : Double
+  ring_col : Int64
+  shadow_blur : Double
+  shadow_y : Double
+  shadow_col : Int64
+  gd_dx : Double
+  gd_dy : Double
+  gd_dw : Double
+  gd_dh : Double
+  gd_corners : Option[(Double, Double, Double, Double)]
+  rects : Array[paint::Rect]
+  node_scale : Double
+  scale : Double
+  atlas_gen : Int
+  ninst : Int
+  after_ground_n : Int
+  words_start : Int
+  words_end : Int
+  words_square_clip : Bool
+  inst : Array[Double]
+}
+
+struct ViewBlocksState {
+  mut enabled : Bool
+  mut atlas_gen : Int
+  mut solid : Bool
+  blocks : Array[Option[ViewBlock]]
+  work : ViewPaintWork
+  scratch : Scene
+}
+
+let view_blocks_state : ViewBlocksState = ViewBlocksState::{
+  enabled: true,
+  atlas_gen: -1,
+  solid: false,
+  blocks: [],
+  work: ViewPaintWork::{ made: 0, copied: 0, handed: 0 },
+  scratch: Scene::new(),
+}
+
+pub fn view_paint_work_now() -> ViewPaintWork {
+  ViewPaintWork::{
+    made: view_blocks_state.work.made,
+    copied: view_blocks_state.work.copied,
+    handed: view_blocks_state.work.handed,
+  }
+}
+
+pub fn view_paint_work_reset() -> Unit {
+  view_blocks_state.work.made = 0
+  view_blocks_state.work.copied = 0
+  view_blocks_state.work.handed = 0
+}
+
+pub fn set_view_blocks_enabled(on : Bool) -> Unit {
+  view_blocks_state.enabled = on
+  if !on {
+    view_blocks_state.blocks.clear()
+  }
+}
+
+fn view_blocks_reset() -> Unit {
+  view_blocks_state.blocks.clear()
+  view_blocks_state.atlas_gen = -1
+  view_blocks_state.solid = false
+}
+
+fn view_blocks_sync_frame() -> Unit {
+  let gen = glyph_state.gen
+  let solid = glass_solid()
+  if view_blocks_state.atlas_gen != gen || view_blocks_state.solid != solid {
+    view_blocks_state.blocks.clear()
+    view_blocks_state.atlas_gen = gen
+    view_blocks_state.solid = solid
+  }
+}
+
+fn opt_quad_eq(
+  a : Option[(Double, Double, Double, Double)],
+  b : Option[(Double, Double, Double, Double)],
+) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((a0, a1, a2, a3)), Some((b0, b1, b2, b3))) =>
+    a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3
+    _ => false
+  }
+}
+
+fn opt_image_eq(
+  a : Option[(String, String, Int)],
+  b : Option[(String, String, Int)],
+) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((a0, a1, a2)), Some((b0, b1, b2))) => a0 == b0 && a1 == b1 && a2 == b2
+    _ => false
+  }
+}
+
+fn opt_image_in_eq(
+  a : Option[((Double, Double, Double, Double), Int64)],
+  b : Option[((Double, Double, Double, Double), Int64)],
+) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(((a0, a1, a2, a3), am)), Some(((b0, b1, b2, b3), bm))) =>
+    a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && am == bm
+    _ => false
+  }
+}
+
+fn spacing_eq(a : view::Spacing, b : view::Spacing) -> Bool {
+  match (a, b) {
+    (view::Spacing::Ems(x), view::Spacing::Ems(y)) => x == y
+    (view::Spacing::Points(x), view::Spacing::Points(y)) => x == y
+    (view::Spacing::ScaledPoints(x), view::Spacing::ScaledPoints(y)) => x == y
+    _ => false
+  }
+}
+
+fn rects_eq(a : Array[paint::Rect], b : Array[paint::Rect]) -> Bool {
+  let n = a.length()
+  if n != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    let ra = a[i]
+    let rb = b[i]
+    if ra.x != rb.x ||
+    ra.y != rb.y ||
+    ra.w != rb.w ||
+    ra.h != rb.h ||
+    ra.color != rb.color ||
+    ra.corners.0 != rb.corners.0 ||
+    ra.corners.1 != rb.corners.1 ||
+    ra.corners.2 != rb.corners.2 ||
+    ra.corners.3 != rb.corners.3 {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn view_block_matches(
+  blk : ViewBlock,
+  d : view::Drawn,
+  gd : view::GroundShape,
+  eff_font_size : Double,
+  node_scale : Double,
+  scale : Double,
+  atlas_gen : Int,
+) -> Bool {
+  blk.gen == d.id.gen &&
+  blk.atlas_gen == atlas_gen &&
+  blk.w == d.w &&
+  blk.h == d.h &&
+  blk.radius == d.radius &&
+  blk.ground == d.ground &&
+  blk.edge_w == d.edge.0 &&
+  blk.edge_col == d.edge.1 &&
+  blk.alpha == d.alpha &&
+  blk.ink == d.ink &&
+  blk.ellipsis_past == d.ellipsis_past &&
+  blk.clips_self == d.clips_self &&
+  blk.words_size == eff_font_size &&
+  blk.words_weight == d.words_look.weight &&
+  blk.words_line == d.words_look.line &&
+  blk.words_wrap == d.words_look.wrap &&
+  blk.words_balance == d.words_look.balance &&
+  blk.words_max_lines == d.words_look.max_lines &&
+  blk.words_center == d.words_center &&
+  blk.words_optical == d.words_optical &&
+  blk.ring_w == d.ring.0 &&
+  blk.ring_gap == d.ring.1 &&
+  blk.ring_col == d.ring.2 &&
+  blk.shadow_blur == d.shadow.0 &&
+  blk.shadow_y == d.shadow.1 &&
+  blk.shadow_col == d.shadow.2 &&
+  blk.gd_dx == gd.dx &&
+  blk.gd_dy == gd.dy &&
+  blk.gd_dw == gd.dw &&
+  blk.gd_dh == gd.dh &&
+  blk.node_scale == node_scale &&
+  blk.scale == scale &&
+  blk.words == d.words &&
+  spacing_eq(blk.words_tracking, d.words_look.tracking) &&
+  opt_quad_eq(blk.corners, d.corners) &&
+  opt_quad_eq(blk.gd_corners, gd.corners) &&
+  opt_image_eq(blk.image, d.image) &&
+  opt_image_in_eq(blk.image_in, d.image_in) &&
+  rects_eq(blk.rects, d.rects)
+}
+
+fn compose_view_block(
+  scene : Scene,
+  blk : ViewBlock,
+  d : view::Drawn,
+  gd : view::GroundShape,
+  node_scale : Double,
+  clip : (Double, Double, Double, Double),
+  rc : (Double, Double, Double, Double),
+) -> Unit {
+  let cnt = blk.ninst
+  if cnt <= 0 {
+    return
+  }
+  let (clip_x, clip_y, clip_x1, clip_y1) = clip
+  let has_rc = rc.0 > 0.0 || rc.1 > 0.0 || rc.2 > 0.0 || rc.3 > 0.0
+  let has_rot = d.turn != 0.0
+  let dx = d.x
+  let dy = d.y
+  let gox = dx + gd.dx * node_scale + (d.w + gd.dw * node_scale) * 0.5
+  let goy = dy + gd.dy * node_scale + (d.h + gd.dh * node_scale) * 0.5
+  let ox = dx + d.w * 0.5
+  let oy = dy + d.h * 0.5
+  let src = blk.inst
+  let dst = scene.inst
+  let base_inst = scene.ninst
+  let mut j = 0
+  while j < cnt {
+    let sb = j * inst_size
+    let db = (base_inst + j) * inst_size
+    let mut k = 0
+    while k < inst_size {
+      dst.push(src[sb + k])
+      k += 1
+    }
+    dst[db] = dst[db] + dx
+    dst[db + 1] = dst[db + 1] + dy
+    let is_sq_words = blk.words_square_clip && j >= blk.words_start && j < blk.words_end
+    if is_sq_words {
+      dst[db + 16] = dmax(clip_x, src[sb + 16] + dx)
+      dst[db + 17] = dmax(clip_y, src[sb + 17] + dy)
+      dst[db + 18] = dmin(clip_x1, src[sb + 18] + dx)
+      dst[db + 19] = if src[sb + 19] < 5.0e8 { dmin(clip_y1, src[sb + 19] + dy) } else { clip_y1 }
+    } else {
+      dst[db + 16] = clip_x
+      dst[db + 17] = clip_y
+      dst[db + 18] = clip_x1
+      dst[db + 19] = clip_y1
+    }
+    if has_rc && !is_sq_words {
+      dst[db + 24] = rc.0
+      dst[db + 25] = rc.1
+      dst[db + 26] = rc.2
+      dst[db + 27] = rc.3
+    }
+    if has_rot {
+      dst[db + 32] = d.turn
+      dst[db + 33] = if j < blk.after_ground_n { gox } else { ox }
+      dst[db + 34] = if j < blk.after_ground_n { goy } else { oy }
+      dst[db + 35] = 1.0
+    }
+    j += 1
+  }
+  scene.ninst = base_inst + cnt
+  scene.glass_run_start = -1
+  scene.glass_run_len = 0
+}
+
+fn encode_drawn_node_direct(
   scene : Scene,
   d : view::Drawn,
   gd : view::GroundShape,
@@ -972,10 +1269,7 @@ fn encode_drawn_node(
   clip : (Double, Double, Double, Double),
   rc : (Double, Double, Double, Double),
   deferred_shadows : Array[DeferredGlassShadow],
-) -> Unit {
-  if d.alpha <= 0.0 || (d.w <= 0.0 && gd.dw <= 0.0) || (d.h <= 0.0 && gd.dh <= 0.0) {
-    return
-  }
+) -> (Int, Int, Int, Bool, Bool) {
   let (clip_x, clip_y, clip_x1, clip_y1) = clip
   let gx = d.x + gd.dx * node_scale
   let gy = d.y + gd.dy * node_scale
@@ -1048,6 +1342,7 @@ fn encode_drawn_node(
   let after_ground_idx = scene.ninst
 
   // 4. Image (kind 4) — clamp req_px to actual physical drawn size (libs/mbui/src/ui/image.mbt:768)
+  let mut image_settled = true
   match d.image {
     Some((src, ph, max_px)) => {
       let drawn_px = (dmax(d.w, d.h) * dmax(scale, 1.0)).ceil().to_int()
@@ -1061,7 +1356,16 @@ fn encode_drawn_node(
       let primary = if src != "" { image_resolve(src, px, frame_no, now) } else { None }
       let resolved = match primary {
         Some(_) => primary
-        None => if ph != "" && ph != src { image_resolve(ph, px, frame_no, now) } else { None }
+        None => {
+          if src != "" {
+            image_settled = false
+          }
+          if ph != "" && ph != src {
+            image_resolve(ph, px, frame_no, now)
+          } else {
+            None
+          }
+        }
       }
       match resolved {
         Some((hid, _iw, _ih)) => {
@@ -1073,7 +1377,7 @@ fn encode_drawn_node(
           )
           apply_node_corners(scene, idx, d)
         }
-        None => ()
+        None => image_settled = false
       }
     }
     None => ()
@@ -1247,6 +1551,131 @@ fn encode_drawn_node(
       idx += 1
     }
   }
+  (after_ground_idx - start_idx, words_start_idx - start_idx, words_end_idx - start_idx, words_square_clip, image_settled)
+}
+
+fn encode_drawn_node(
+  scene : Scene,
+  d : view::Drawn,
+  gd : view::GroundShape,
+  node_scale : Double,
+  frame_no : Int,
+  now : Double,
+  scale : Double,
+  clip : (Double, Double, Double, Double),
+  rc : (Double, Double, Double, Double),
+  deferred_shadows : Array[DeferredGlassShadow],
+) -> Unit {
+  if d.alpha <= 0.0 || (d.w <= 0.0 && gd.dw <= 0.0) || (d.h <= 0.0 && gd.dh <= 0.0) {
+    return
+  }
+  let cacheable = view_blocks_state.enabled &&
+  d.id.at >= 0 &&
+  d.glass.is_none() &&
+  d.lines.length() == 0 &&
+  d.shapes.length() == 0 &&
+  d.runs.length() == 0 &&
+  d.blur <= 0.0 &&
+  scene.ink_r <= 0.0 &&
+  find_tree_field(d.id).is_none() &&
+  find_tree_stream(d.id).is_none() &&
+  find_tree_native(d.id).is_none()
+  if !cacheable {
+    let before = scene.ninst
+    let _ = encode_drawn_node_direct(scene, d, gd, node_scale, frame_no, now, scale, clip, rc, deferred_shadows)
+    view_blocks_state.work.made = view_blocks_state.work.made + 1
+    view_blocks_state.work.handed = view_blocks_state.work.handed + (scene.ninst - before)
+    return
+  }
+  flush_deferred_shadows(scene, deferred_shadows)
+  let slot = d.id.at
+  let blocks = view_blocks_state.blocks
+  while blocks.length() <= slot {
+    blocks.push(None)
+  }
+  let eff_font_size = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
+  let atlas_gen = glyph_state.gen
+  match blocks[slot] {
+    Some(blk) if view_block_matches(blk, d, gd, eff_font_size, node_scale, scale, atlas_gen) => {
+      compose_view_block(scene, blk, d, gd, node_scale, clip, rc)
+      view_blocks_state.work.copied = view_blocks_state.work.copied + 1
+      view_blocks_state.work.handed = view_blocks_state.work.handed + blk.ninst
+      return
+    }
+    _ => ()
+  }
+  let scratch = view_blocks_state.scratch
+  scratch.clear(scene.width, scene.height, scale)
+  let d_local = view::Drawn::{ ..d, x: 0.0, y: 0.0, turn: 0.0 }
+  let empty_deferred : Array[DeferredGlassShadow] = []
+  let (after_ground_n, words_start, words_end, words_square_clip, image_settled) = encode_drawn_node_direct(
+    scratch,
+    d_local,
+    gd,
+    node_scale,
+    frame_no,
+    now,
+    scale,
+    (-1.0e9, -1.0e9, 1.0e9, 1.0e9),
+    (0.0, 0.0, 0.0, 0.0),
+    empty_deferred,
+  )
+  let blk = ViewBlock::{
+    gen: d.id.gen,
+    w: d.w,
+    h: d.h,
+    radius: d.radius,
+    corners: d.corners,
+    ground: d.ground,
+    edge_w: d.edge.0,
+    edge_col: d.edge.1,
+    alpha: d.alpha,
+    words: d.words,
+    words_size: eff_font_size,
+    words_weight: d.words_look.weight,
+    words_line: d.words_look.line,
+    words_wrap: d.words_look.wrap,
+    words_tracking: d.words_look.tracking,
+    words_balance: d.words_look.balance,
+    words_max_lines: d.words_look.max_lines,
+    words_center: d.words_center,
+    words_optical: d.words_optical,
+    ink: d.ink,
+    ellipsis_past: d.ellipsis_past,
+    clips_self: d.clips_self,
+    image: d.image,
+    image_in: d.image_in,
+    ring_w: d.ring.0,
+    ring_gap: d.ring.1,
+    ring_col: d.ring.2,
+    shadow_blur: d.shadow.0,
+    shadow_y: d.shadow.1,
+    shadow_col: d.shadow.2,
+    gd_dx: gd.dx,
+    gd_dy: gd.dy,
+    gd_dw: gd.dw,
+    gd_dh: gd.dh,
+    gd_corners: gd.corners,
+    rects: d.rects.copy(),
+    node_scale,
+    scale,
+    atlas_gen: glyph_state.gen,
+    ninst: scratch.ninst,
+    after_ground_n,
+    words_start,
+    words_end,
+    words_square_clip,
+    inst: scratch.inst.copy(),
+  }
+  // Do not cache a pending (not-yet-decoded) image block so the next frame retries primary decode.
+  if image_settled {
+    blocks[slot] = Some(blk)
+  } else {
+    blocks[slot] = None
+  }
+  compose_view_block(scene, blk, d, gd, node_scale, clip, rc)
+  view_blocks_state.work.made = view_blocks_state.work.made + 1
+  view_blocks_state.work.handed = view_blocks_state.work.handed + blk.ninst
 }
 
 let cut_soft_most : Double = 24.0
@@ -1374,6 +1803,7 @@ fn pop_blur_frame(
 
 fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Double, scale : Double) -> Unit {
   ensure_glyph_atlas(scale)
+  view_blocks_sync_frame()
   let scales : Array[Double] = []
   let held = tree.drawn_held(scales=scales)
   let n = held.length()
@@ -1416,10 +1846,10 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
         scene.ink_r = dmax(dmin(gw, gh) * 0.5, 1.0)
       }
       _ =>
-        if scene.ink_r > 0.0 && d.ground != 0L && (d.ground & 0xFFL) >= 0xC0L {
-          ink_stack.push((d.id, scene.ink_x, scene.ink_y, scene.ink_r))
-          scene.ink_r = 0.0
-        }
+      if scene.ink_r > 0.0 && d.ground != 0L && (d.ground & 0xFFL) >= 0xC0L {
+        ink_stack.push((d.id, scene.ink_x, scene.ink_y, scene.ink_r))
+        scene.ink_r = 0.0
+      }
     }
     let (in_clip, in_rc) = if holder >= 0 && holder < i {
       let p = held[holder].0
@@ -1943,14 +2373,14 @@ pub fn run(
 fn frames_asked_after(now : Double) -> Unit {
   match view_app.tree {
     Some(tree) =>
-      if tree.clock_read() {
-        hostapi::request_frame_on()
-      } else {
-        match tree.wake() {
-          Some(at) => hostapi::wake_after(dmax(at - now, 0.0))
-          None => ()
-        }
+    if tree.clock_read() {
+      hostapi::request_frame_on()
+    } else {
+      match tree.wake() {
+        Some(at) => hostapi::wake_after(dmax(at - now, 0.0))
+        None => ()
       }
+    }
     None => ()
   }
 }

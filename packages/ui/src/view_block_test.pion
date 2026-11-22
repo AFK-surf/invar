@@ -1,0 +1,268 @@
+// ViewBlock node-level 60-Double instance cache tests:
+// 1. 100% bit-exact parity (`< 1e-6`) vs uncached direct encoding across complex mixed pages
+//    (200-row list, rounded clip, scroll fading, rotated node, CJK truncation #8083, shadows,
+//    images, and adaptive liquid glass #8094) over initial + 3 scroll frames + 1 badge-update frame.
+// 2. High reuse rate (>95% copied) on scroll and single-badge invalidation.
+// 3. CPU A/B benchmark helper (`blocks=false` vs `blocks=true` over 100 scroll frames).
+
+import "paint"
+import "signals"
+import "view"
+
+fn scenes_bit_exact(a : Scene, b : Scene, label : String) -> Unit {
+  debug_assert(a.ninst == b.ninst, "\{label}: ninst mismatch (\{a.ninst} vs \{b.ninst})")
+  debug_assert(a.inst.length() == b.inst.length(), "\{label}: inst len mismatch")
+  let n = a.inst.length()
+  let mut i = 0
+  while i < n {
+    let diff = (a.inst[i] - b.inst[i]).abs()
+    if diff >= 1.0e-6 {
+      let inst_idx = i / inst_size
+      let slot = i % inst_size
+      debug_assert(false, "\{label}: inst[\{inst_idx}][\{slot}] diff=\{diff} (\{a.inst[i]} vs \{b.inst[i]})")
+    }
+    i += 1
+  }
+}
+
+fn make_mixed_200_page(
+  root : view::View,
+  scroll : view::Scroll,
+  badge_sig : signals::Signal[String],
+) -> Unit {
+  add_image("mem:vb_icon", "view-block-test-icon-bytes".to_bytes())
+  let pill = Glass::liquid(blur=2.0, adaptive=true).to_paint()
+  let _ = root.box(fn(shell : view::View) {
+    let _ = shell
+    .width_share(view::Live::Is(1.0))
+    .height_share(view::Live::Is(1.0))
+    .r(18.0)
+    .clip()
+    .fades(view::Live::Is((0.0, 24.0, 0.0, 24.0)))
+    let _ = shell.scroll_box(fn(body : view::View) {
+      let mut i = 0
+      while i < 200 {
+        let row_idx = i
+        let _ = body.box(fn(row : view::View) {
+          let bg_col = if row_idx % 2 == 0 { 0xF4F6FAFFL } else { 0xFFFFFFFFL }
+          let _ = row
+          .row(view::Live::Is(true))
+          .width(view::Live::Is(Some(360.0)))
+          .height(view::Live::Is(Some(36.0)))
+          .bg(bg_col)
+          .r(8.0)
+          .edge(view::Live::Is((1.0, 0xE2E6EEFFL)))
+          .shadow(view::Live::Is(if row_idx % 10 == 0 { (4.0, 2.0, 0x00000022L) } else { (0.0, 0.0, 0L) }))
+          .pad_xy(8.0, 6.0)
+          // Thumbnail image on every 5th row
+          if row_idx % 5 == 0 {
+            let _ = row.box(fn(img : view::View) {
+              let _ = img
+              .size(20.0, 20.0)
+              .r(4.0)
+              .image(view::Live::Is(Some(("mem:vb_icon", "", 64))))
+            })
+          }
+          // Rotated indicator on every 7th row
+          if row_idx % 7 == 0 {
+            let _ = row.box(fn(rot : view::View) {
+              let _ = rot
+              .size(12.0, 12.0)
+              .bg(0x3B82F6FFL)
+              .r(2.0)
+              .turn(view::Live::Is(0.78539816339))
+            })
+          }
+          // CJK truncated text (#8083) on narrow box
+          let _ = row.box(fn(title : view::View) {
+            let _ = title
+            .width(view::Live::Is(Some(96.0)))
+            .words(
+              view::Live::Is("测试（内容），后续文字 Row #\{row_idx}"),
+              look=view::WordsLook::{
+                size: 13.0,
+                weight: 400,
+                line: 18.0,
+                wrap: false,
+                tracking: view::Spacing::Points(0.0),
+                balance: false,
+                max_lines: 0,
+              },
+            )
+          })
+          // Dynamic badge on row 3
+          if row_idx == 3 {
+            let _ = row.box(fn(badge : view::View) {
+              let _ = badge
+              .bg(0xEF4444FFL)
+              .r(6.0)
+              .ring(view::Live::Is((1.5, 2.0, 0x3B82F688L)))
+              .words(view::Live::By(fn() { badge_sig.get() }))
+            })
+          }
+        })
+        i += 1
+      }
+    }, scroll=scroll)
+  })
+  // Floating adaptive liquid glass overlay (#8094)
+  let _ = root.box(fn(bar : view::View) {
+    let _ = bar
+    .over_xy(20.0, 12.0)
+    .size(160.0, 36.0)
+    .r(18.0)
+    .glass(view::Live::Is(Some(pill)))
+    let _ = bar.box(fn(lbl : view::View) {
+      let _ = lbl.words(view::Live::Is("Floating Glass"))
+    })
+  })
+}
+
+fn capture_mixed_frames(blocks_on : Bool) -> Array[Scene] {
+  set_view_blocks_enabled(blocks_on)
+  let scroll = view::Scroll::new()
+  let badge = signals::signal("9")
+  let t = Tester::tree(
+    fn(root : view::View) { make_mixed_200_page(root, scroll, badge) },
+    width=400.0,
+    height=320.0,
+    scale=2.0,
+  )
+  let out : Array[Scene] = []
+  out.push(t.scene())
+  // 3 scroll frames
+  let mut s = 1
+  while s <= 3 {
+    scroll.put(s.to_double() * 24.0)
+    t.fake.frame_requested = true
+    t.frame(ms=16.0)
+    out.push(t.scene())
+    s += 1
+  }
+  // 1 local badge update frame
+  badge.set("42")
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  out.push(t.scene())
+  forget_image("mem:vb_icon")
+  t.dispose()
+  set_view_blocks_enabled(true)
+  out
+}
+
+test "view_block: 100% bit-exact parity across 200-row mixed page, 3 scroll frames, and badge update" {
+  let ref_frames = capture_mixed_frames(false)
+  let cached_frames = capture_mixed_frames(true)
+  debug_assert(ref_frames.length() == 5 && cached_frames.length() == 5, "5 captured frames")
+  let labels = ["init", "scroll_1", "scroll_2", "scroll_3", "badge_update"]
+  let mut i = 0
+  while i < 5 {
+    scenes_bit_exact(ref_frames[i], cached_frames[i], labels[i])
+    i += 1
+  }
+}
+
+test "view_block: >95% reuse on 200-row scroll and single-node rebuild on badge update" {
+  set_view_blocks_enabled(true)
+  let scroll = view::Scroll::new()
+  let row_sig = signals::signal("Row-10-Init")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.scroll_box(fn(body : view::View) {
+        let mut i = 0
+        while i < 200 {
+          let idx = i
+          let _ = body.box(fn(row : view::View) {
+            let _ = row
+            .width(view::Live::Is(Some(360.0)))
+            .height(view::Live::Is(Some(32.0)))
+            .bg(if idx % 2 == 0 { 0xF5F5F7FFL } else { 0xFFFFFFFFL })
+            .r(6.0)
+            if idx == 10 {
+              let _ = row.box(fn(lbl : view::View) {
+                let _ = lbl.words(view::Live::By(fn() { row_sig.get() }))
+              })
+            } else {
+              let _ = row.box(fn(lbl : view::View) {
+                let _ = lbl.words(view::Live::Is("Item #\{idx} static text"))
+              })
+            }
+          })
+          i += 1
+        }
+      }, scroll=scroll)
+    },
+    width=400.0,
+    height=640.0,
+    scale=2.0,
+  )
+
+  // Scroll by 16px: all 200 rows are in the tree and should be reused from ViewBlock cache (>95% copied)
+  view_paint_work_reset()
+  scroll.put(16.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let scroll_work = view_paint_work_now()
+  debug_assert(scroll_work.copied >= 190, "scroll copied >= 190 (got \{scroll_work.copied})")
+  debug_assert(scroll_work.made <= 5, "scroll made <= 5 (got \{scroll_work.made})")
+  debug_assert(scroll_work.handed > 0, "scroll handed > 0")
+
+  // Update a single row's text: only that 1 node should be re-encoded (`made == 1`), all others `copied`
+  view_paint_work_reset()
+  row_sig.set("Row-10-Updated")
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let badge_work = view_paint_work_now()
+  debug_assert(badge_work.made == 1, "local text update rebuilds exactly 1 node (got \{badge_work.made})")
+  debug_assert(badge_work.copied >= 190, "local text update copies all remaining nodes (got \{badge_work.copied})")
+  t.dispose()
+}
+
+test "view_block: 200-row 100-frame scroll CPU benchmark (blocks=false vs blocks=true)" {
+  let run_bench = fn(enabled : Bool) -> (Double, Int, Int) {
+    set_view_blocks_enabled(enabled)
+    let scroll = view::Scroll::new()
+    let t = Tester::tree(
+      fn(root : view::View) {
+        let _ = root.scroll_box(fn(body : view::View) {
+          let mut i = 0
+          while i < 200 {
+            let idx = i
+            let _ = body.box(fn(row : view::View) {
+              let _ = row
+              .width(view::Live::Is(Some(360.0)))
+              .height(view::Live::Is(Some(32.0)))
+              .bg(if idx % 2 == 0 { 0xF5F5F7FFL } else { 0xFFFFFFFFL })
+              .r(6.0)
+              let _ = row.box(fn(lbl : view::View) {
+                let _ = lbl.words(view::Live::Is("Benchmark row #\{idx} with steady label"))
+              })
+            })
+            i += 1
+          }
+        }, scroll=scroll)
+      },
+      width=400.0,
+      height=640.0,
+      scale=2.0,
+    )
+    view_paint_work_reset()
+    let t0 = work_clock_now()
+    let mut f = 1
+    while f <= 100 {
+      scroll.put(f.to_double() * 8.0)
+      t.fake.frame_requested = true
+      t.frame(ms=16.0)
+      f += 1
+    }
+    let dt = work_clock_now() - t0
+    let w = view_paint_work_now()
+    t.dispose()
+    set_view_blocks_enabled(true)
+    (dt, w.made, w.copied)
+  }
+  let (_ms_off, made_off, copied_off) = run_bench(false)
+  let (_ms_on, made_on, copied_on) = run_bench(true)
+  debug_assert(copied_off == 0 && made_off > 0, "disabled blocks never copy")
+  debug_assert(copied_on >= 19000 && made_on <= 500, "enabled blocks reuse >= 95% across 100 frames")
+}
