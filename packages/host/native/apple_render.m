@@ -335,6 +335,23 @@ MB_CORNER_SL
 "}\n"
 "static float3 backdrop(texture2d<float> bd, constant G& g, float2 p) { return backdrop4(bd, g, p).rgb; }\n"
 "static float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
+"static float mb_backdrop_luma(texture2d<float> bd, constant G& g, float2 c, float r) {\n"
+"  return (luma(backdrop(bd, g, c)) + luma(backdrop(bd, g, c + float2(r, 0.0))) +\n"
+"          luma(backdrop(bd, g, c - float2(r, 0.0))) + luma(backdrop(bd, g, c + float2(0.0, r))) +\n"
+"          luma(backdrop(bd, g, c - float2(0.0, r)))) / 5.0;\n"
+"}\n"
+"static float3 mb_adaptive_ink(float3 rgb, float bgL) {\n"
+"  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
+"  if (ch <= 0.08) {\n"
+"    float origL = luma(rgb);\n"
+"    if (origL < 0.5) {\n"
+"      float lightT = smoothstep(0.29, 0.31, bgL);\n"
+"      float lightL = clamp(1.06 - origL, 0.68, 0.98);\n"
+"      rgb = mix(float3(lightL), rgb, lightT);\n"
+"    }\n"
+"  }\n"
+"  return rgb;\n"
+"}\n"
 "// how much of the pixel at p its rounded clip keeps (r: the corners' radii, top left, then clockwise; s: how smooth\n"
 "// each is), its edge covered as a box's own (0.5 - d * scale), so what it cuts meets the ground of the box that cuts it\n"
 "static float clip_cover(float2 p, float4 c, float4 r, float4 s, float scale) {\n"
@@ -363,13 +380,19 @@ MB_CORNER_SL
 "    cover *= clip_cover(cp, I.oclip, I.orc, I.ors, u.scale);\n"
 "    if (cover <= 0.0) discard_fragment();\n"
 "  }\n"
+"  int kind = one_kind == 13 ? 6 : (one_kind >= 0 ? one_kind : int(I.p.y + 0.5));\n"
+"  bool prog_glass = (kind == 5 && I.pad.z < -0.5);\n"
 "  // and faded out towards a cut, each pixel by where it is (scene.mbt 52-59)\n"
-"  if (I.fade.y > 0.0) cover *= clamp((cp.y - I.fade.x) / I.fade.y, 0.0, 1.0);\n"
-"  if (I.fade.w > 0.0) cover *= clamp((I.fade.z - cp.y) / I.fade.w, 0.0, 1.0);\n"
-"  if (I.fadex.y > 0.0) cover *= clamp((cp.x - I.fadex.x) / I.fadex.y, 0.0, 1.0);\n"
-"  if (I.fadex.w > 0.0) cover *= clamp((I.fadex.z - cp.x) / I.fadex.w, 0.0, 1.0);\n"
-"  if (cover <= 0.0) discard_fragment();\n"
-"  int kind = one_kind >= 0 ? one_kind : int(I.p.y + 0.5);\n"
+"  float fade_r = 1.0;\n"
+"  if (I.fade.y > 0.0) fade_r *= clamp((cp.y - I.fade.x) / I.fade.y, 0.0, 1.0);\n"
+"  if (I.fade.w > 0.0) fade_r *= clamp((I.fade.z - cp.y) / I.fade.w, 0.0, 1.0);\n"
+"  if (I.fadex.y > 0.0) fade_r *= clamp((cp.x - I.fadex.x) / I.fadex.y, 0.0, 1.0);\n"
+"  if (I.fadex.w > 0.0) fade_r *= clamp((I.fadex.z - cp.x) / I.fadex.w, 0.0, 1.0);\n"
+"  if (fade_r <= 0.0) discard_fragment();\n"
+"  if (!prog_glass) {\n"
+"    cover *= fade_r;\n"
+"    if (cover <= 0.0) discard_fragment();\n"
+"  }\n"
 "  float4 col = I.color;\n"
 "  if (kind == 1 || kind == 3 || kind == 7) {\n"
 "    constexpr sampler s(filter::linear, coord::pixel);\n"
@@ -391,11 +414,8 @@ MB_CORNER_SL
 "    if (kind == 1) return (float4(col.rgb, 1.0) * (t.a * col.a)) * cover;\n"
 "    if (kind == 7) {\n"
 "      // inked by how light what is under its glass is, looked at round the glass's middle\n"
-"      float2 c = I.pad.yz; float r = I.pad.w * 0.5;\n"
-"      float l = (luma(backdrop(bd, g, c)) + luma(backdrop(bd, g, c + float2(r, 0.0))) +\n"
-"                 luma(backdrop(bd, g, c - float2(r, 0.0))) + luma(backdrop(bd, g, c + float2(0.0, r))) +\n"
-"                 luma(backdrop(bd, g, c - float2(0.0, r)))) / 5.0;\n"
-"      float3 ink = mix(float3(1.0), float3(0.11, 0.11, 0.12), smoothstep(0.42, 0.6, l));\n"
+"      float l = mb_backdrop_luma(bd, g, I.pad.yz, I.pad.w * 0.5);\n"
+"      float3 ink = mb_adaptive_ink(col.rgb, l);\n"
 "      return (float4(ink, 1.0) * (t.a * col.a)) * cover;\n"
 "    }\n"
 "    return (t * col.a) * cover;\n"
@@ -407,7 +427,8 @@ MB_CORNER_SL
 "    float4 s_rr = max(max(I.rr.x, I.rr.y), max(I.rr.z, I.rr.w)) > 0.0 ? I.rr : float4(I.p.x);\n"
 "    float d;\n"
 "    float halfMinor = 1e9;\n"
-"    if (k <= 0.0) {\n"
+"    bool single_liquid = (one_kind == 13) || (k <= 0.0);\n"
+"    if (single_liquid) {\n"
 "      d = sd_rr(p, I.rect, s_rr);\n"
 "      halfMinor = min(I.rect.z, I.rect.w) * 0.5;\n"
 "    } else {\n"
@@ -436,20 +457,9 @@ MB_CORNER_SL
 "    float ext_cov = mb_contour_int(max(outward + 0.5, 0.0), edgeW)\n"
 "                  - mb_contour_int(max(outward - 0.5, 0.0), edgeW);\n"
 "    if (materialAlpha < 0.01 && ext_cov < 0.01) discard_fragment();\n"
-"    float e = 0.5;\n"
-"    float2 grad = k <= 0.0\n"
-"      ? float2(\n"
-"          sd_rr(p + float2(e, 0.0), I.rect, s_rr) - sd_rr(p - float2(e, 0.0), I.rect, s_rr),\n"
-"          sd_rr(p + float2(0.0, e), I.rect, s_rr) - sd_rr(p - float2(0.0, e), I.rect, s_rr)\n"
-"        ) / (2.0 * e)\n"
-"      : float2(\n"
-"          sd_group(p + float2(e, 0.0), g, k) - sd_group(p - float2(e, 0.0), g, k),\n"
-"          sd_group(p + float2(0.0, e), g, k) - sd_group(p - float2(0.0, e), g, k)\n"
-"        ) / (2.0 * e);\n"
-"    float gradLen = length(grad);\n"
-"    float2 surfaceNormal = gradLen > 0.0001 ? grad / gradLen : float2(0.0, 0.0);\n"
-"    float shortening = sqrt(clamp(gradLen, 0.0, 1.0));\n"
 "    bool is_clear = (I.p.w <= 0.1 && col.a < 0.12);\n"
+"    bool is_adaptive = I.c2.z < -0.5;\n"
+"    float spot_raw = is_adaptive ? (-I.c2.z - 1.0) : I.c2.z;\n"
 "    bool is_dark = (!is_clear && col.a >= 0.05 && luma(col.rgb) < 0.35);\n"
 "    float inward = max(-d, 0.0);\n"
 "    float rawBevel = max(I.c2.y, 0.0);\n"
@@ -466,20 +476,38 @@ MB_CORNER_SL
 "      bevel = rawBevel * lensScale;\n"
 "      amount = rawAmount * lensScale;\n"
 "    }\n"
+"    float2 surfaceNormal = float2(0.0, 0.0);\n"
+"    float shortening = 0.0;\n"
 "    float2 disp = float2(0.0, 0.0);\n"
-"    if (inward < bevel && bevel > 0.001 && amount > 0.0) {\n"
-"      float bevelX = 1.0 - clamp(inward / bevel, 0.0, 1.0);\n"
-"      float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
-"      disp = surfaceNormal * (-mag);\n"
+"    bool need_grad = (inward < max(bevel, 23.0)) || (ext_cov > 0.0);\n"
+"    if (need_grad) {\n"
+"      float e = 0.5;\n"
+"      float2 grad = single_liquid\n"
+"        ? float2(\n"
+"            sd_rr(p + float2(e, 0.0), I.rect, s_rr) - sd_rr(p - float2(e, 0.0), I.rect, s_rr),\n"
+"            sd_rr(p + float2(0.0, e), I.rect, s_rr) - sd_rr(p - float2(0.0, e), I.rect, s_rr)\n"
+"          ) / (2.0 * e)\n"
+"        : float2(\n"
+"            sd_group(p + float2(e, 0.0), g, k) - sd_group(p - float2(e, 0.0), g, k),\n"
+"            sd_group(p + float2(0.0, e), g, k) - sd_group(p - float2(0.0, e), g, k)\n"
+"          ) / (2.0 * e);\n"
+"      float gradLen = length(grad);\n"
+"      surfaceNormal = gradLen > 0.0001 ? grad / gradLen : float2(0.0, 0.0);\n"
+"      shortening = sqrt(clamp(gradLen, 0.0, 1.0));\n"
+"      if (inward < bevel && bevel > 0.001 && amount > 0.0) {\n"
+"        float bevelX = 1.0 - clamp(inward / bevel, 0.0, 1.0);\n"
+"        float mag = amount * (1.0 - sqrt(max(1.0 - bevelX * bevelX, 0.0))) * shortening;\n"
+"        disp = surfaceNormal * (-mag);\n"
+"      }\n"
 "    }\n"
 "    float lensZoom = (I.p.w < 0.0) ? clamp(1.0 - I.p.w, 1.0, 3.0) : 1.0;\n"
 "    float2 sampleBase = p;\n"
 "    if (lensZoom > 1.0001) {\n"
-"      float2 zoomC = (k <= 0.0) ? (I.rect.xy + I.rect.zw * 0.5) : ((g.gb.xy + g.gb.zw) * 0.5);\n"
+"      float2 zoomC = single_liquid ? (I.rect.xy + I.rect.zw * 0.5) : ((g.gb.xy + g.gb.zw) * 0.5);\n"
 "      sampleBase = zoomC + (p - zoomC) / lensZoom;\n"
 "    }\n"
 "    float3 refractColor;\n"
-"    if (abs(I.pad.z) * amount * u.scale <= 0.25) {\n"
+"    if (inward >= bevel || abs(I.pad.z) * amount * u.scale <= 0.25) {\n"
 "      refractColor = backdrop(bd, g, sampleBase + disp);\n"
 "    } else {\n"
 "      float ds = I.pad.z * 0.5;\n"
@@ -499,6 +527,7 @@ MB_CORNER_SL
 "    float glintLum;\n"
 "    float glintFaceGain;\n"
 "    float glintVib;\n"
+"    float fogT = 0.0;\n"
 "    if (is_clear) {\n"
 "      // iOS 27 clear liquid glass: col.a == 0.0 keeps crystal-clear zero-veil optical lens\n"
 "      // (lifted tab-bar / toggle / slider thumb & loupe), while Glass::clear() (col.a ~ 0.102)\n"
@@ -514,6 +543,39 @@ MB_CORNER_SL
 "      glintLum = mix(1.6, 1.2, clearVeil);\n"
 "      glintFaceGain = mix(0.0, 0.25, clearVeil);\n"
 "      glintVib = mix(2.85, 1.5, clearVeil);\n"
+"    } else if (is_adaptive) {\n"
+"      float2 ac = single_liquid ? (I.rect.xy + I.rect.zw * 0.5) : ((g.gb.xy + g.gb.zw) * 0.5);\n"
+"      float ar = (single_liquid ? max(min(I.rect.z, I.rect.w) * 0.5, 1.0) : max(min(g.gb.z - g.gb.x, g.gb.w - g.gb.y) * 0.5, 1.0)) * 0.5;\n"
+"      float bgL = mb_backdrop_luma(bd, g, ac, ar);\n"
+"      float baseDens = (col.a > 0.41) ? col.a : 0.30;\n"
+"      if (is_dark) {\n"
+"        float brightT = smoothstep(0.35, 0.85, bgL);\n"
+"        fogT = brightT;\n"
+"        float dens = max(baseDens, mix(baseDens, 0.64, brightT));\n"
+"        float extra = clamp((dens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
+"        emission = mix(float3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), float3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);\n"
+"        transmittance = mix(0.54, 0.0, extra);\n"
+"        lift = mix(0.36, 0.0, extra);\n"
+"        chromaGain = mix(0.92, 0.0, extra);\n"
+"        contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;\n"
+"        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+"      } else {\n"
+"        float darkMix = 1.0 - smoothstep(0.24, 0.36, bgL);\n"
+"        fogT = darkMix;\n"
+"        float extra = clamp((baseDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
+"        float darkDens = max(baseDens, mix(baseDens, 0.52, darkMix));\n"
+"        float darkExtra = clamp((darkDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
+"        float3 lightEm = float3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * baseDens;\n"
+"        float3 darkEm = mix(float3(28.0 / 255.0, 28.0 / 255.0, 28.0 / 255.0), float3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), darkExtra);\n"
+"        emission = mix(lightEm, darkEm, darkMix);\n"
+"        transmittance = mix(mix(0.70, 0.0, extra), mix(0.54, 0.0, darkExtra), darkMix);\n"
+"        lift = mix(mix(0.16, 0.0, extra), mix(0.36, 0.0, darkExtra), darkMix);\n"
+"        chromaGain = mix(mix(1.18, 0.0, extra), mix(0.92, 0.0, darkExtra), darkMix);\n"
+"        contourStr = mix(0.43, 0.88, darkMix);\n"
+"        contourDirAmt = mix(0.77, 1.0, darkMix);\n"
+"        bevelShadowStr = 0.036;\n"
+"        glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
+"      }\n"
 "    } else if (is_dark) {\n"
 "      float darkDens = (col.a > 0.41) ? col.a : 0.30;\n"
 "      float extra = clamp((darkDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);\n"
@@ -533,6 +595,17 @@ MB_CORNER_SL
 "      contourStr = 0.43; contourDirAmt = 0.77; bevelShadowStr = 0.036;\n"
 "      glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;\n"
 "    }\n"
+"    if (fogT > 0.001) {\n"
+"      float r1 = fogT * 2.6;\n"
+"      float r2 = fogT * 3.6;\n"
+"      float2 fc = sampleBase + disp;\n"
+"      float3 fBlur = (refractColor * 2.0\n"
+"        + (backdrop(bd, g, fc + float2(r1, 0.0)) + backdrop(bd, g, fc - float2(r1, 0.0))\n"
+"         + backdrop(bd, g, fc + float2(0.0, r1)) + backdrop(bd, g, fc - float2(0.0, r1))) * 1.5\n"
+"        + (backdrop(bd, g, fc + float2(r2, r2)) + backdrop(bd, g, fc + float2(-r2, r2))\n"
+"         + backdrop(bd, g, fc + float2(r2, -r2)) + backdrop(bd, g, fc + float2(-r2, -r2)))) * (1.0 / 12.0);\n"
+"      refractColor = mix(refractColor, fBlur, fogT);\n"
+"    }\n"
 "    float Y = luma(refractColor);\n"
 "    float transLum = clamp(Y * (1.0 + lift * (1.0 - Y)), 0.0, 1.0);\n"
 "    float3 transmittedColor = float3(transLum * transmittance) + (refractColor - float3(Y)) * (chromaGain * I.p.z);\n"
@@ -543,8 +616,8 @@ MB_CORNER_SL
 "      baseColor = mix(baseColor, col.rgb, col.a * 0.5);\n"
 "    }\n"
 "    float spot = 0.0;\n"
-"    if (I.c2.z > 0.5) {\n"
-"      float q = I.c2.z - 1.0;\n"
+"    if (spot_raw > 0.5) {\n"
+"      float q = spot_raw - 1.0;\n"
 "      float qx = floor(q * 0.000244140625);\n"
 "      float qy = q - qx * 4096.0;\n"
 "      float2 gp = I.rect.xy + float2(qx * 0.5 - 256.0, qy * 0.5 - 256.0);\n"
@@ -552,12 +625,16 @@ MB_CORNER_SL
 "      spot = 1.0 - smoothstep(gr * 0.1, gr, length(p - gp));\n"
 "      baseColor = clamp(baseColor + float3(0.08 * spot), 0.0, 1.0);\n"
 "    }\n"
-"    float2 la = g.misc.zw;\n"
-"    float2 rn = float2(\n"
-"      surfaceNormal.x * la.x + surfaceNormal.y * la.y,\n"
-"      -surfaceNormal.x * la.y + surfaceNormal.y * la.x\n"
-"    );\n"
-"    float tangency = abs(rn.x);\n"
+"    float2 rn = float2(0.0, 0.0);\n"
+"    float tangency = 0.0;\n"
+"    if (need_grad) {\n"
+"      float2 la = g.misc.zw;\n"
+"      rn = float2(\n"
+"        surfaceNormal.x * la.x + surfaceNormal.y * la.y,\n"
+"        -surfaceNormal.x * la.y + surfaceNormal.y * la.x\n"
+"      );\n"
+"      tangency = abs(rn.x);\n"
+"    }\n"
 "    float3 result = baseColor;\n"
 "    // (a) Inner bevel shadow (subtracts only transmittedColor; lightFacing = -rn.y)\n"
 "    if (bevelShadowStr >= 0.001 && inward < 23.0) {\n"
@@ -593,6 +670,7 @@ MB_CORNER_SL
 "    float2 a = I.rect.xy + I.c2.xy * I.rect.zw, ab = I.rect.xy + I.c2.zw * I.rect.zw - a;\n"
 "    float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);\n"
 "    float d = length(p - a - ab * h) - I.p.x;\n"
+"    if (I.pad.w > 0.0) col.rgb = mb_adaptive_ink(col.rgb, mb_backdrop_luma(bd, g, I.pad.yz, I.pad.w * 0.5));\n"
 "    return (float4(col.rgb, 1.0) * col.a * clamp(0.5 - d * u.scale, 0.0, 1.0)) * cover;\n"
 "  }\n"
 "  if (kind == 11) {\n"
@@ -610,6 +688,7 @@ MB_CORNER_SL
 "      for (int i = first; i < first + n; i++) w += mb_path_rows(sg[(base + i / 6) * 15 + mb_seg_slot(i)], I.rect, p, u.scale);\n"
 "      a = mb_path_cover(w, I.c2.z);\n"
 "    }\n"
+"    if (I.pad.w > 0.0) col.rgb = mb_adaptive_ink(col.rgb, mb_backdrop_luma(bd, g, I.pad.yz, I.pad.w * 0.5));\n"
 "    return (float4(col.rgb, 1.0) * col.a * a) * cover;\n"
 "  }\n"
 "  float2 hs = I.rect.zw * 0.5;\n"
@@ -659,10 +738,14 @@ MB_CORNER_SL
 "    // the foot and right less), 0.5 wide. Through (misc.y): as much of it as was a native view's hole left out (its\n"
 "    // alpha), for the view's own frost under the canvas to show there\n"
 "    float4 b4 = backdrop4(bd, g, p);\n"
-"    float3 g3 = max(mix(float3(luma(b4.rgb)), b4.rgb, I.p.z), 0.0);\n"
+"    float ps = prog_glass ? smoothstep(0.0, 1.0, fade_r) : 1.0;\n"
+"    float ts = prog_glass ? (fade_r * fade_r) : 1.0;\n"
+"    float sat = prog_glass ? mix(1.0, I.p.z, ps) : I.p.z;\n"
+"    float ta = prog_glass ? (col.a * ts) : col.a;\n"
+"    float3 g3 = max(mix(float3(luma(b4.rgb)), b4.rgb, sat), 0.0);\n"
 "    float ga = g.misc.y > 0.5 ? b4.a : 1.0;\n"
-"    g3 = g3 * (1.0 - col.a) + col.rgb * col.a;\n"
-"    ga = ga * (1.0 - col.a) + col.a;\n"
+"    g3 = g3 * (1.0 - ta) + col.rgb * ta;\n"
+"    ga = ga * (1.0 - ta) + ta;\n"
 "    if (I.c2.x + I.c2.y + I.c2.z > 0.0) {\n"
 "      float edge = clamp(0.5 + (d + 0.5) * u.scale, 0.0, 1.0);\n"
 "      float lit = clamp(0.5 + notch_cut(sd_rr(p - 0.5, I.rect, I.rr), p - 0.5, I.rect, I.pad) * u.scale, 0.0, 1.0);\n"
@@ -673,8 +756,9 @@ MB_CORNER_SL
 "      g3 = w4.rgb; ga = w4.a;\n"
 "    }\n"
 "    // dithered as it is written to 8 bits, so its slopes do not band (corner.sl mb_dither)\n"
-"    g3 += mb_dither(p * u.scale) / 255.0;\n"
-"    return (float4(g3, ga) * (a * I.c2.w)) * cover;\n"
+"    g3 += mb_dither(p * u.scale) * ps / 255.0;\n"
+"    float edge_a = prog_glass ? smoothstep(0.0, 0.04, fade_r) : 1.0;\n"
+"    return (float4(g3, ga) * (a * I.c2.w * edge_a)) * cover;\n"
 "  }\n"
 "  float4 fill = float4(col.rgb, 1.0) * col.a;\n"
 "  float bw = I.p.z;\n"
@@ -711,10 +795,48 @@ MB_CORNER_SL
 "fragment float4 fcopy(float4 pos [[position]], texture2d<float, access::read> src [[texture(0)]]) {\n"
 "  return src.read(uint2(pos.xy));\n"
 "}\n"
-"fragment float4 fpost(float4 pos [[position]], texture2d<float> src [[texture(0)]], constant PU& u [[buffer(0)]]) {\n"
+"fragment float4 fpost(float4 pos [[position]], texture2d<float> src [[texture(0)]],\n"
+"    texture2d<float> lv1 [[texture(1)]], texture2d<float> lv2 [[texture(2)]], texture2d<float> lv3 [[texture(3)]],\n"
+"    constant PU& u [[buffer(0)]]) {\n"
 "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
 "  float2 ts = u.a.xy;\n"
 "  float2 lo = ts * 0.5, hi = u.b.xy;\n"
+"  if (u.a.z > 3.5) {\n"
+"    float2 p = u.map.xy + pos.xy * u.map.zw;\n"
+"    float ramp = 1.0;\n"
+"    if (u.box.y > 0.0) ramp *= clamp((p.y - u.box.x) / u.box.y, 0.0, 1.0);\n"
+"    if (u.box.w > 0.0) ramp *= clamp((u.box.z - p.y) / u.box.w, 0.0, 1.0);\n"
+"    if (u.rr.y > 0.0) ramp *= clamp((p.x - u.rr.x) / u.rr.y, 0.0, 1.0);\n"
+"    if (u.rr.w > 0.0) ramp *= clamp((u.rr.z - p.x) / u.rr.w, 0.0, 1.0);\n"
+"    float sp = max(u.clip.x, 1.0);\n"
+"    float kf = u.clip.y;\n"
+"    float4 m0 = u.rc, m1 = u.rs, m2 = u.outer, m3 = u.orc;\n"
+"    if (kf < 0.5) return src.sample(s, clamp(pos.xy * m0.xy, m0.xy * 0.5, m0.zw));\n"
+"    float sig1 = pow(sp, 1.0 / kf);\n"
+"    float r = clamp(ramp, 0.0, 1.0);\n"
+"    float target_px = r <= 0.0 ? 0.0 : sp * pow(r, 1.35);\n"
+"    float lv_u;\n"
+"    if (target_px <= sig1 || kf <= 1.05) {\n"
+"      lv_u = clamp(target_px / max(sig1, 1e-4), 0.0, kf);\n"
+"    } else {\n"
+"      lv_u = clamp(1.0 + (kf - 1.0) * log(target_px / sig1) / max(log(sp / sig1), 1e-4), 0.0, kf);\n"
+"    }\n"
+"    int idx = min(int(floor(lv_u)), int(kf + 0.5) - 1);\n"
+"    if (idx < 0) idx = 0;\n"
+"    float f = lv_u - float(idx);\n"
+"    float4 c0, c1;\n"
+"    if (idx == 0) {\n"
+"      c0 = src.sample(s, clamp(pos.xy * m0.xy, m0.xy * 0.5, m0.zw));\n"
+"      c1 = lv1.sample(s, clamp(pos.xy * m1.xy, m1.xy * 1.0, m1.zw));\n"
+"    } else if (idx == 1) {\n"
+"      c0 = lv1.sample(s, clamp(pos.xy * m1.xy, m1.xy * 1.0, m1.zw));\n"
+"      c1 = lv2.sample(s, clamp(pos.xy * m2.xy, m2.xy * 2.0, m2.zw));\n"
+"    } else {\n"
+"      c0 = lv2.sample(s, clamp(pos.xy * m2.xy, m2.xy * 2.0, m2.zw));\n"
+"      c1 = lv3.sample(s, clamp(pos.xy * m3.xy, m3.xy * 4.0, m3.zw));\n"
+"    }\n"
+"    return mix(c0, c1, f);\n"
+"  }\n"
 "  if (u.a.z > 2.5) {\n"
 "    float2 p = u.map.xy + pos.xy * u.map.zw;\n"
 "    p = mb_contained_point(p, u.box, u.rr, u.clip, u.rc, u.rs, u.outer, u.orc, u.ors, u.map.z);\n"
@@ -778,8 +900,11 @@ static id<MTLRenderPipelineState> make_pipe(id<MTLLibrary> lib, MTLPixelFormat f
 // shadows, colour glyphs, images, lines, shapes' bands: what else there is (glass, a native view's hole) the pipeline
 // for any kind draws. Made after the rest, on their own (kinds_made): until they are, that one draws every kind, the
 // same pixels.
-#define MB_KINDS 12
-static int has_own_pipe(int kind) { return (kind >= 0 && kind <= 4) || kind == 10 || kind == 11; }
+#define MB_KIND_LIQUID_SINGLE 13
+#define MB_KINDS 14
+static int has_own_pipe(int kind) {
+  return (kind >= 0 && kind <= 6) || kind == 10 || kind == 11 || kind == MB_KIND_LIQUID_SINGLE;
+}
 static id<MTLRenderPipelineState> kpipe[MB_KINDS];
 static dispatch_group_t kinds_made;
 static int kinds_ready;
@@ -1000,6 +1125,9 @@ static void post_pass_ex(id<MTLCommandBuffer> cb, id<MTLTexture> src, int sw, in
   if (edge) u.edge = *edge;
   [e setFragmentBytes:&u length:sizeof u atIndex:0];
   [e setFragmentTexture:src atIndex:0];
+  [e setFragmentTexture:(mode == 4 ? lv[1] : src) atIndex:1];
+  [e setFragmentTexture:(mode == 4 ? lv[2] : src) atIndex:2];
+  [e setFragmentTexture:(mode == 4 ? lv[3] : src) atIndex:3];
   [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
   [e endEncoding];
 }
@@ -1063,7 +1191,7 @@ static int glass_through(const float *f, int32_t count) {
       }
       continue;
     }
-    if (kind != 5 || b[20] >= 0 || !nh || through_n >= MB_THROUGH || is_through(b[20]) || !shows_of(b, r))
+    if (kind != 5 || b[22] < -0.5f || b[20] >= 0 || !nh || through_n >= MB_THROUGH || is_through(b[20]) || !shows_of(b, r))
       continue;
     // (its blur reaches a hole near it too)
     float m = 3.0f * fabsf(b[7]);
@@ -1081,7 +1209,7 @@ static int glass_through(const float *f, int32_t count) {
     int kind = (int)(b[5] + 0.5f);
     if (kind == 9) under = (int32_t)(b[20] + 0.5f) - MB_VIEW_TEX;
     float r[4];
-    if (kind != 5 || !is_through(b[20]) || under <= 0 || n >= MB_FROSTS || !shows_of(b, r)) continue;
+    if (kind != 5 || b[22] < -0.5f || !is_through(b[20]) || under <= 0 || n >= MB_FROSTS || !shows_of(b, r)) continue;
     double *e = frosts + n++ * MB_FROST_N;
     for (int k = 0; k < 4; k++) {
       e[k] = r[k] * zoom;
@@ -1100,7 +1228,13 @@ static int glass_through(const float *f, int32_t count) {
 // What a capture of glass is of, worked out before any of the GPU's work: its rectangle in the target's pixels, how
 // many times it is halved (k, at most 3) and the Gaussian left after (sg), and the glass's own numbers (gu's but map
 // and uvc, which follow from these and the level's size). Zeroed whole first, so two of the same compare the same.
-typedef struct { int px0, py0, w, h, k, contained; float sg; GU g; MBContained edge; } Grab;
+typedef struct {
+  int px0, py0, w, h, k, contained, progressive;
+  float sg, sp;
+  float fade[4], fadex[4];
+  GU g;
+  MBContained edge;
+} Grab;
 
 // The capture the run [start, end) of glass makes, of a target tw × th pixels; 0 when none of it shows.
 // Frosted glass of the same capture further on (glass.mbt shares_capture) is under it too.
@@ -1110,6 +1244,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   // For frosted glass (kind 5), negative slot 7 is contained; for liquid glass (kind 6), negative slot 7 encodes clear-lens zoom.
   int kind = (int)(a[5] + 0.5f);
   int is_contained = (kind == 5 && a[7] < 0.0f);
+  int is_progressive = (kind == 5 && a[22] < -0.5f);
   float blur = (kind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
   int merged_liquid = (kind == 6 && a[23] > 0.0f);
   int unmerged_liquid = (kind == 6 && !merged_liquid);
@@ -1171,10 +1306,19 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   if (px1 <= px0 || py1 <= py0 || x1 <= x0 || y1 <= y0) return 0;
   m->px0 = px0; m->py0 = py0; m->w = px1 - px0; m->h = py1 - py0;
   m->contained = is_contained ? mb_contained_make(&m->edge, a, px0 / sc, py0 / sc, 1.0f / sc, 1.0f / sc) : 0;
+  m->progressive = is_progressive;
+  if (is_progressive) {
+    for (int i = 0; i < 4; i++) {
+      m->fade[i] = a[52 + i];
+      m->fadex[i] = a[56 + i];
+    }
+  }
   // down to where the deviation is 2 texels or more, at most 1/8
   float sp = blur * sc;
   int k = 0;
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
+  m->sp = sp;
+  if (is_progressive && k == 0 && sp > 0.5f) k = 1;
   // what is left of the deviation once the halvings' and the last look's (bilinear) spread are taken out
   float sk = sp / (float)(1 << k);
   float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
@@ -1203,16 +1347,17 @@ static void show_blur(const Grab *m, id<MTLTexture> bt) {
   gu.misc[2] = cosf(g_light_angle);
   gu.misc[3] = sinf(g_light_angle);
   gtex = bt;
+  int sk = m->progressive ? 0 : m->k;
   float sc = (float)at_scale;
-  float W = (float)gtex.width, H = (float)gtex.height, d = (float)(1 << m->k);
+  float W = (float)gtex.width, H = (float)gtex.height, d = (float)(1 << sk);
   gu.map[0] = sc / d / W; gu.map[1] = sc / d / H;
   gu.map[2] = -(float)m->px0 / d / W; gu.map[3] = -(float)m->py0 / d / H;
   gu.uvc[0] = 0.5f / W; gu.uvc[1] = 0.5f / H;
-  gu.uvc[2] = ((float)lw[m->k] - 0.5f) / W; gu.uvc[3] = ((float)lh[m->k] - 0.5f) / H;
+  gu.uvc[2] = ((float)lw[sk] - 0.5f) / W; gu.uvc[3] = ((float)lh[sk] - 0.5f) / H;
 }
 
 // The level a grab's blur is left in.
-static id<MTLTexture> grab_blurred(const Grab *m) { return m->contained && m->k == 0 ? ltmp : lv[m->k]; }
+static id<MTLTexture> grab_blurred(const Grab *m) { return (m->progressive || (m->contained && m->k == 0)) ? ltmp : lv[m->k]; }
 
 // A grab of target blurred into the levels: what is drawn so far in its rectangle copied out, halved k times, the
 // Gaussian left (passes of their own, the target's pass ended before; grab_blurred). The levels are shared by every
@@ -1231,6 +1376,36 @@ static void blur(id<MTLCommandBuffer> cb, id<MTLTexture> target, const Grab *m) 
   int lw[4], lh[4];
   grab_levels(m, lw, lh);
   int k = m->k;
+  if (m->progressive) {
+    float prev_var = 0.0f;
+    for (int j = 1; j <= k; j++) {
+      post_pass(cb, lv[j - 1], lw[j - 1], lh[j - 1], lv[j], lw[j], lh[j], 1, 0, 0, 0, NULL);
+      float target_px = powf(fmaxf(m->sp, 1.0f), (float)j / (float)k);
+      float have_var = prev_var + 0.75f * (float)(1 << (2 * j - 2));
+      float need_var = fmaxf(target_px * target_px - have_var, 0.0f);
+      float sg_j = sqrtf(need_var) / (float)(1 << j);
+      if (sg_j > 0.3f) {
+        post_pass(cb, lv[j], lw[j], lh[j], ltmp, lw[j], lh[j], 2, sg_j, 1, 0, NULL);
+        post_pass(cb, ltmp, lw[j], lh[j], lv[j], lw[j], lh[j], 2, sg_j, 0, 1, NULL);
+      }
+      prev_var = fmaxf(have_var, target_px * target_px);
+    }
+    float sc = (float)at_scale;
+    MBContained prog;
+    memset(&prog, 0, sizeof prog);
+    prog.map[0] = (float)m->px0 / sc; prog.map[1] = (float)m->py0 / sc;
+    prog.map[2] = 1.0f / sc; prog.map[3] = 1.0f / sc;
+    for (int i = 0; i < 4; i++) { prog.box[i] = m->fade[i]; prog.rr[i] = m->fadex[i]; }
+    prog.clip[0] = m->sp; prog.clip[1] = (float)k;
+    float *ms[4] = {prog.rc, prog.rs, prog.outer, prog.orc};
+    for (int j = 0; j < 4; j++) {
+      float dj = (float)(1 << j), tw = (float)lv[j].width, th = (float)lv[j].height;
+      ms[j][0] = 1.0f / (dj * tw); ms[j][1] = 1.0f / (dj * th);
+      ms[j][2] = ((float)lw[j] - 0.5f) / tw; ms[j][3] = ((float)lh[j] - 0.5f) / th;
+    }
+    post_pass(cb, lv[0], lw[0], lh[0], ltmp, lw[0], lh[0], 4, 0, 0, 0, &prog);
+    return;
+  }
   if (m->contained) post_pass(cb, lv[0], lw[0], lh[0], ltmp, lw[0], lh[0], 3, 0, 0, 0, &m->edge);
   for (int j = 1; j <= k; j++) post_pass(cb, j == 1 && m->contained ? ltmp : lv[j - 1], lw[j - 1], lh[j - 1], lv[j], lw[j], lh[j], 1, 0, 0, 0, NULL);
   if (m->sg > 0.3f) {
@@ -1348,8 +1523,9 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
   for (int32_t i = 0; i < start; i++) {
     float tid = f[(size_t)i * MB_INST + 20];
     if (i > 0 && tid != f[(size_t)(i - 1) * MB_INST + 20]) run = i;
-    // (glass, and what is drawn by what a glass's blur shows: adaptive words over it, kind 7, light or dark by it)
-    int sees = tid < 0.0f || (int)(f[(size_t)i * MB_INST + 5] + 0.5f) == 7;
+    // (glass, and what is drawn by what a glass's blur shows: adaptive words/icons/lines over it)
+    int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
+    int sees = tid < 0.0f || k == 7 || ((k == 10 || k == 11) && f[(size_t)i * MB_INST + 23] > 0.0f);
     if (sees && reaches(f, i, run, g)) whole = i + 1;
   }
   size_t base_need = (size_t)start * MB_INST;
@@ -1440,19 +1616,11 @@ static int slot_same(const Grab *m, const double key[7]) {
   return -1;
 }
 
-// `l`'s w × h top left copied into *t (made again at another size or format than l's).
-static void slot_copy(id<MTLBlitCommandEncoder> bl, id<MTLTexture> __strong *t, id<MTLTexture> l, int w, int h) {
-  if (!*t || (*t).width != l.width || (*t).height != l.height || (*t).pixelFormat != l.pixelFormat)
-    *t = level_tex(l.pixelFormat, (int)l.width, (int)l.height);
-  [bl copyFromTexture:l sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-           sourceSize:MTLSizeMake(w, h, 1) toTexture:*t destinationSlice:0 destinationLevel:0
-    destinationOrigin:MTLOriginMake(0, 0, 0)];
-}
-
-// The blur just made (blur) kept in the slot least lately shown: copied out of the levels.
-// Not yet said to be of anything (valid).
-static int slot_fill(id<MTLCommandBuffer> cb, const Grab *m, unsigned frame_clock) {
-  id<MTLTexture> L = grab_blurred(m);
+// The blur just made (blur) kept in the slot least lately shown by swapping texture handles with the level
+// (zero GPU blit). Not yet said to be of anything (valid).
+static int slot_fill(const Grab *m, unsigned frame_clock) {
+  id<MTLTexture> __strong *Lp = (m->progressive || (m->contained && m->k == 0)) ? &ltmp : &lv[m->k];
+  id<MTLTexture> L = *Lp;
   int t0 = -1, t1 = -1, t2 = -1, t3 = -1, t4 = -1, fallback = 0;
   for (int j = 0; j < MB_GLASS_SLOTS; j++) {
     if (slots[j].used < slots[fallback].used) fallback = j;
@@ -1475,11 +1643,15 @@ static int slot_fill(id<MTLCommandBuffer> cb, const Grab *m, unsigned frame_cloc
   }
   int i = t0 >= 0 ? t0 : t1 >= 0 ? t1 : t2 >= 0 ? t2 : t3 >= 0 ? t3 : t4 >= 0 ? t4 : fallback;
   slots[i].valid = 0;
-  int lw[4], lh[4];
-  grab_levels(m, lw, lh);
-  id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-  slot_copy(bl, &slot_bt[i], L, lw[m->k], lh[m->k]);
-  [bl endEncoding];
+  if (slot_bt[i] != nil && slot_bt[i].width == L.width && slot_bt[i].height == L.height &&
+      slot_bt[i].pixelFormat == L.pixelFormat) {
+    id<MTLTexture> old = slot_bt[i];
+    slot_bt[i] = L;
+    *Lp = old;
+  } else {
+    slot_bt[i] = L;
+    *Lp = level_tex(L.pixelFormat, (int)L.width, (int)L.height);
+  }
   return i;
 }
 
@@ -1883,7 +2055,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
         } else if (shows) {
           [enc endEncoding];
           blur(cb, cur_target, &m);
-          slot = slot_fill(cb, &m, frame_clock);
+          slot = slot_fill(&m, frame_clock);
           // (an image drawn under it that had no texture yet: it comes under the same instances, so this blur is not
           // kept to be shown again as theirs)
           if (known && !encode_missing) slot_keep(slot, &m, key);
@@ -1893,10 +2065,11 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
         }
         bound = tid;
       }
-      [enc setRenderPipelineState:p];
       // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
       if (shows) {
-        int merged_liquid = (int)(f[start * MB_INST + 5] + 0.5f) == 6 && f[start * MB_INST + 23] > 0.0f;
+        int merged_liquid = kind == 6 && f[start * MB_INST + 23] > 0.0f;
+        int gkind = kind == 5 ? 5 : (kind == 6 ? (merged_liquid ? 6 : MB_KIND_LIQUID_SINGLE) : -1);
+        [enc setRenderPipelineState:kind_pipe(p, gkind)];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6
                 instanceCount:merged_liquid ? 1 : end - start baseInstance:start];
       }
