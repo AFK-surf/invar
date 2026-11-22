@@ -1372,6 +1372,18 @@
       gl.vertexAttribPointer(loc, 4, gl.FLOAT, false, INST * 4, i * 16);
       gl.vertexAttribDivisor(loc, 1);
     }
+    blCompVao = gl.createVertexArray();
+    gl.bindVertexArray(blCompVao);
+    blCompBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, blCompBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, INST * 4, gl.STREAM_DRAW);
+    for (let i = 0; i < INST / 4; i++) {
+      gl.enableVertexAttribArray(i);
+      gl.vertexAttribPointer(i, 4, gl.FLOAT, false, INST * 4, i * 16);
+      gl.vertexAttribDivisor(i, 1);
+    }
+    gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
     atlasTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, atlasTex);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, ATLAS, ATLAS);
@@ -1389,6 +1401,48 @@
   // few texels wide (dual Kawase's downsample, at most 1/8), blurred there by a Gaussian of what deviation is left,
   // and kept in an LRU slot (GLASS_SLOTS) so frames with unchanged content under the glass reuse the blur with zero passes.
   let lv = null, lvW = 0, lvH = 0, bdTex = null;
+  const BLUR_LAYERS = 4;
+  let blTex = [null, null, null, null], blFb = [null, null, null, null], blW = 0, blH = 0;
+  let blPy = null, blPyW = 0, blPyH = 0;
+  let blCompVao = null, blCompBuf = null;
+  const blComp = new Float32Array(INST);
+  function ensureBlurPy(w, h) {
+    if (blPy && blPyW >= w && blPyH >= h) return;
+    if (blPy && gl) for (const l of blPy) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
+    blPyW = Math.max(w, blPyW); blPyH = Math.max(h, blPyH);
+    blPy = [];
+    for (let j = 0; j < 4; j++) blPy.push(levelTex(gl.RGBA8, (blPyW + (1 << j) - 1) >> j, (blPyH + (1 << j) - 1) >> j));
+    blPy.push(levelTex(gl.RGBA8, blPyW, blPyH));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  function ensureBlurLayer(depth, tw, th) {
+    if (blW !== tw || blH !== th) {
+      if (gl) {
+        for (let j = 0; j < BLUR_LAYERS; j++) {
+          if (blTex[j]) { gl.deleteTexture(blTex[j]); blTex[j] = null; }
+          if (blFb[j]) { gl.deleteFramebuffer(blFb[j]); blFb[j] = null; }
+        }
+      } else {
+        blTex = [null, null, null, null];
+        blFb = [null, null, null, null];
+      }
+      blW = tw; blH = th;
+    }
+    if (!blTex[depth]) {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, Math.max(1, tw), Math.max(1, th));
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      blTex[depth] = t;
+      blFb[depth] = fb;
+    }
+  }
   let glassSlots = makeGlassSlots(), glassSlotsClock = 0;
   let underNow = new Float32Array(INST * 256), underNowN = 0, underWhole = 0, underPicked = 0;
   const gmap = new Float32Array(4), guvc = new Float32Array(4), ggb = new Float32Array(4);
@@ -1414,6 +1468,8 @@
   }
   function glassLost() {
     lv = null; lvW = 0; lvH = 0; bdTex = null;
+    blTex = [null, null, null, null]; blFb = [null, null, null, null]; blW = 0; blH = 0;
+    blPy = null; blPyW = 0; blPyH = 0;
     for (let i = 0; i < GLASS_SLOTS; i++) {
       const s = glassSlots[i];
       s.bt = null; s.bfb = null; s.bw = 0; s.bh = 0; s.bf = 0; s.valid = false;
@@ -1421,7 +1477,12 @@
   }
   function glassFree() {
     if (lv && gl) for (const l of lv) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
+    if (blPy && gl) for (const l of blPy) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
     if (gl) {
+      for (let j = 0; j < BLUR_LAYERS; j++) {
+        if (blTex[j]) gl.deleteTexture(blTex[j]);
+        if (blFb[j]) gl.deleteFramebuffer(blFb[j]);
+      }
       for (let i = 0; i < GLASS_SLOTS; i++) {
         const s = glassSlots[i];
         if (s.bt) { gl.deleteFramebuffer(s.bfb); gl.deleteTexture(s.bt); }
@@ -1459,8 +1520,12 @@
     lv.push(levelTex(gl.RGB10_A2, lvW, lvH));
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
-  function postPass(src, sw, sh, dst, w, h, mode, sg, dx, dy) {
+  function postPass(src, sw, sh, dst, w, h, mode, sg, dx, dy, clear) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb);
+    if (clear) {
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
     gl.viewport(0, 0, w, h);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, src.t);
@@ -1659,7 +1724,7 @@
   function reaches(i, run, g) {
     const b = i * INST;
     const kind = Math.round(f32[b + 5]);
-    let e = kind === 2 ? Math.abs(f32[b + 7]) * 3 + 2 : 1;
+    let e = (kind === 2 || kind === 14 || kind === 15) ? Math.abs(f32[b + 7]) * 3 + 2 : 1;
     if (kind === 6) e = Math.max(f32[b + 23], f32[run * INST + 23], 0) + 2;
     e += 1;
     const rx0 = Math.min(f32[b], f32[b] + f32[b + 2]) - e;
@@ -1706,12 +1771,31 @@
     }
     const maxNeed = (start + (count - pieces)) * INST;
     if (underNow.length < maxNeed) underNow = new Float32Array(Math.max(maxNeed, underNow.length * 2));
-    for (let i = 0; i < whole; i++) if (unstableUnder(i)) return false;
+    let inBlur = 0, blurHit = false;
+    for (let i = 0; i < whole; i++) {
+      if (unstableUnder(i)) return false;
+      const k = Math.round(f32[i * INST + 5]);
+      if (k === 14) {
+        if (inBlur === 0) blurHit = reaches(i, i, g);
+        inBlur++;
+      } else if (k === 15 && inBlur > 0) {
+        if (--inBlur === 0) blurHit = false;
+      }
+    }
     let off = whole * INST;
     if (off > 0) underNow.set(f32.subarray(0, off), 0);
     let picked = 0;
     for (let i = whole; i < start; i++) {
-      if (!reaches(i, i, g)) continue;
+      const k = Math.round(f32[i * INST + 5]);
+      if (k === 14) {
+        if (inBlur === 0) blurHit = reaches(i, i, g);
+        inBlur++;
+      }
+      const hit = blurHit || reaches(i, i, g);
+      if (k === 15 && inBlur > 0) {
+        if (--inBlur === 0) blurHit = false;
+      }
+      if (!hit) continue;
       if (unstableUnder(i)) return false;
       underNow.set(f32.subarray(i * INST, (i + 1) * INST), off);
       off += INST;
@@ -2266,14 +2350,42 @@
     uploadedFor = n;
   }
 
+  function sizeLevelsOnce(from, n) {
+    let maxW = 0, maxH = 0, scanBound = 0;
+    for (let s0 = from; s0 < n; ) {
+      const stid = f32[s0 * INST + 20] | 0;
+      let e0 = s0 + 1;
+      if (stid < 0) {
+        while (e0 < n && (f32[e0 * INST + 20] | 0) === stid) e0++;
+        if (stid !== scanBound) {
+          scanBound = stid;
+          const gm = grabOf(s0, e0, n);
+          if (gm) {
+            if (gm.w > maxW) maxW = gm.w;
+            if (gm.h > maxH) maxH = gm.h;
+          }
+        }
+      }
+      s0 = e0;
+    }
+    if (maxW > lvW || maxH > lvH) {
+      ensureLevels(maxW, maxH);
+      mainState();
+    }
+  }
+
   // The frame's `n` instances (in f32, its ground after them) drawn into `target`: `part`, only into `cut` over what
   // it holds, else all of it, cleared to the ground.
   function drawFrame(n, r, g, b, part) {
     const len = n * INST;
     drewMissing = false;
     cutOn = part;
+    const origTarget = target;
+    const origCutOn = cutOn;
+    const origCut0 = cut[0], origCut1 = cut[1], origCut2 = cut[2], origCut3 = cut[3];
+    const tw = canvas.width, th = canvas.height, sc = dpr;
     gl.bindFramebuffer(gl.FRAMEBUFFER, target);
-    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.viewport(0, 0, tw, th);
     if (!part) {
       gl.disable(gl.SCISSOR_TEST);
       gl.clearColor(r, g, b, 1);
@@ -2297,15 +2409,144 @@
     // one capture of glass (negative); WebGL has no base instance, so the attributes start at the run instead
     // (and per run of holes, kind 9: written transparent with no blending, where a native view shows)
     let start = 0, bound = 0, shows = false, levelsSized = false;
+    const bstack = [];
+    let bover = 0;
     const frameGlassClock = glassSlotsClock;
     while (start < n) {
       const tid = f32[start * INST + 20] | 0;
       const kind = Math.round(f32[start * INST + 5]);
+      if (kind === 14) {
+        if (bstack.length >= BLUR_LAYERS) {
+          bover++;
+          start++;
+          continue;
+        }
+        const bi = start * INST;
+        const sigma = Math.max(f32[bi + 7], 0);
+        const margin = sigma > 0 ? Math.ceil(3 * sigma) + 2 : 0;
+        const px0 = Math.max(0, Math.floor((f32[bi] - margin) * sc));
+        const py0 = Math.max(0, Math.floor((f32[bi + 1] - margin) * sc));
+        const px1 = Math.min(tw, Math.ceil((f32[bi] + f32[bi + 2] + margin) * sc));
+        const py1 = Math.min(th, Math.ceil((f32[bi + 1] + f32[bi + 3] + margin) * sc));
+        const bw = px1 - px0, bh = py1 - py0;
+        const pb0 = th - (py0 + bh);
+        if (bw <= 0 || bh <= 0 || sigma <= 0) {
+          bstack.push({ px0, py0, pb0, w: bw, h: bh, sigma, active: false });
+          start++;
+          continue;
+        }
+        const depth = bstack.length;
+        ensureBlurLayer(depth, tw, th);
+        bstack.push({ px0, py0, pb0, w: bw, h: bh, sigma, active: true });
+        target = blFb[depth];
+        cutOn = true;
+        cut[0] = px0; cut[1] = pb0; cut[2] = bw; cut[3] = bh;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+        gl.disable(gl.SCISSOR_TEST);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        mainState();
+        bound = 0;
+        start++;
+        continue;
+      }
+      if (kind === 15) {
+        if (bover > 0) {
+          bover--;
+          start++;
+          continue;
+        }
+        if (bstack.length === 0) {
+          start++;
+          continue;
+        }
+        const L = bstack.pop();
+        if (!L.active) {
+          start++;
+          continue;
+        }
+        const depth = bstack.length;
+        ensureBlurPy(L.w, L.h);
+        const sp = L.sigma * sc;
+        let k = 0;
+        while (k < 3 && sp / (1 << (k + 1)) >= 2) k++;
+        const sk = sp / (1 << k);
+        const pre = k > 0 ? 0.75 * (1 - Math.pow(0.25, k)) / 3 + 1 / 6 : 0;
+        const sg = Math.sqrt(Math.max(sk * sk - pre, 0));
+        const lw = [L.w, 0, 0, 0], lh = [L.h, 0, 0, 0];
+        for (let j = 1; j <= 3; j++) {
+          lw[j] = (lw[j - 1] + 1) >> 1;
+          lh[j] = (lh[j - 1] + 1) >> 1;
+        }
+        gl.disable(gl.BLEND);
+        gl.disable(gl.SCISSOR_TEST);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, blPy[0].fb);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, blFb[depth]);
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, blPy[0].fb);
+        gl.blitFramebuffer(L.px0, L.pb0, L.px0 + L.w, L.pb0 + L.h, 0, 0, L.w, L.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+        gl.useProgram(post);
+        for (let j = 1; j <= k; j++) {
+          postPass(blPy[j - 1], lw[j - 1], lh[j - 1], blPy[j], lw[j], lh[j], 1, 0, 0, 0, true);
+        }
+        if (sg > 0.3) {
+          postPass(blPy[k], lw[k], lh[k], blPy[4], lw[k], lh[k], 2, sg, 1, 0, true);
+          postPass(blPy[4], lw[k], lh[k], blPy[k], lw[k], lh[k], 2, sg, 0, 1, true);
+        }
+        let parent = bstack.length - 1;
+        while (parent >= 0 && !bstack[parent].active) parent--;
+        if (parent >= 0) {
+          const P = bstack[parent];
+          target = blFb[parent];
+          cutOn = true;
+          cut[0] = P.px0; cut[1] = P.pb0; cut[2] = P.w; cut[3] = P.h;
+        } else {
+          target = origTarget;
+          cutOn = origCutOn;
+          cut[0] = origCut0; cut[1] = origCut1; cut[2] = origCut2; cut[3] = origCut3;
+        }
+        mainState();
+        bound = 0;
+        blComp.set(f32.subarray(start * INST, (start + 1) * INST));
+        blComp[0] = L.px0 / sc;
+        blComp[1] = L.py0 / sc;
+        blComp[2] = L.w / sc;
+        blComp[3] = L.h / sc;
+        blComp[4] = 0;
+        blComp[5] = 4;
+        blComp[6] = 0;
+        blComp[7] = 0;
+        blComp[8] = 1;
+        blComp[9] = 1;
+        blComp[10] = 1;
+        const d = 1 << k, W = blPy[k].w, Hh = blPy[k].h;
+        blComp[12] = 0;
+        blComp[13] = L.h / (d * Hh);
+        blComp[14] = L.w / (d * W);
+        blComp[15] = -L.h / (d * Hh);
+        blComp[20] = blComp[21] = blComp[22] = blComp[23] = 0;
+        blComp.fill(0, 32, 40);
+        useProg(hasOwnProg(4) ? 4 : -1);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, blPy[k].t);
+        gl.bindVertexArray(blCompVao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, blCompBuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, blComp);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+        start++;
+        continue;
+      }
       const h = kind === 9;
       const own = tid >= 0 && !h && hasOwnProg(kind);
       let end = start + 1;
       while (end < n && (f32[end * INST + 20] | 0) === tid) {
         const k = Math.round(f32[end * INST + 5]);
+        if (k === 14 || k === 15) break;
         if ((k === 9) !== h) break;
         if (own ? k !== kind : (tid >= 0 && !h && hasOwnProg(k))) break;
         end++;
@@ -2315,27 +2556,7 @@
         glassDrawn = true;
         if (!levelsSized) {
           levelsSized = true;
-          let maxW = 0, maxH = 0, scanBound = 0;
-          for (let s0 = start; s0 < n; ) {
-            const stid = f32[s0 * INST + 20] | 0;
-            let e0 = s0 + 1;
-            if (stid < 0) {
-              while (e0 < n && (f32[e0 * INST + 20] | 0) === stid) e0++;
-              if (stid !== scanBound) {
-                scanBound = stid;
-                const gm = grabOf(s0, e0, n);
-                if (gm) {
-                  if (gm.w > maxW) maxW = gm.w;
-                  if (gm.h > maxH) maxH = gm.h;
-                }
-              }
-            }
-            s0 = e0;
-          }
-          if (maxW > lvW || maxH > lvH) {
-            ensureLevels(maxW, maxH);
-            mainState();
-          }
+          sizeLevelsOnce(start, n);
         }
         if (tid !== bound) {
           shows = capture(start, end, n, pieces, r, g, b, frameGlassClock);
@@ -2372,7 +2593,13 @@
       }
       start = end;
     }
-    if (part) gl.disable(gl.SCISSOR_TEST);
+    if (bstack.length > 0) {
+      target = origTarget;
+      cutOn = origCutOn;
+      cut[0] = origCut0; cut[1] = origCut1; cut[2] = origCut2; cut[3] = origCut3;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+    }
+    if (part || bstack.length > 0) gl.disable(gl.SCISSOR_TEST);
     cutOn = false;
   }
 
@@ -4824,18 +5051,18 @@
   const rolesKept = new Map();
   function winSave(s) {
     Object.assign(s, {
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progGen, progNow, post, vao, instBuf, atlasTex, ta, U, PU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
       cssW, cssH, dpr, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
-      lv, lvW, lvH, bdTex, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
+      lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
       segsTex, segsRows, segsHad, segsHadRows, uploadedFor, imeActive, composing, taHad, imeKind, viewLayer,
       under, coverBoxes, takePresses, doc, hostWin, glassIdle,
     });
   }
   function winLoad(s) {
     ({
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progGen, progNow, post, vao, instBuf, atlasTex, ta, U, PU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
       cssW, cssH, dpr, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
-      lv, lvW, lvH, bdTex, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
+      lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
       segsTex, segsRows, segsHad, segsHadRows, uploadedFor, imeActive, composing, taHad, imeKind, viewLayer,
       under, coverBoxes, takePresses, doc, hostWin, glassIdle,
     } = s);
@@ -4959,12 +5186,17 @@
       try {
         for (const t of [s.atlasTex, s.segsTex]) if (t) sg.deleteTexture(t);
         for (const l of s.lv || []) { sg.deleteTexture(l.t); sg.deleteFramebuffer(l.fb); }
+        for (const l of s.blPy || []) { sg.deleteTexture(l.t); sg.deleteFramebuffer(l.fb); }
+        for (const t of s.blTex || []) if (t) sg.deleteTexture(t);
+        for (const fb of s.blFb || []) if (fb) sg.deleteFramebuffer(fb);
         for (const gs of s.glassSlots || []) {
           if (gs.bt) { sg.deleteFramebuffer(gs.bfb); sg.deleteTexture(gs.bt); }
         }
         if (s.cv) { sg.deleteTexture(s.cv.t); sg.deleteFramebuffer(s.cv.fb); }
         if (s.instBuf) sg.deleteBuffer(s.instBuf);
         if (s.vao) sg.deleteVertexArray(s.vao);
+        if (s.blCompBuf) sg.deleteBuffer(s.blCompBuf);
+        if (s.blCompVao) sg.deleteVertexArray(s.blCompVao);
         for (const kp of s.progs || []) if (kp && kp.p) sg.deleteProgram(kp.p);
         if (s.progFlat) sg.deleteProgram(s.progFlat);
         if (s.post) sg.deleteProgram(s.post);
@@ -4975,8 +5207,8 @@
     }
     Object.assign(s, {
       gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null,
-      progGen: 0, progNow: null, post: null, vao: null, instBuf: null, atlasTex: null, segsTex: null, segsHad: null,
-      lv: null, lvW: 0, lvH: 0, bdTex: null, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
+      progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
+      lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       cv: null, cvOk: false, target: null,
     });
     // (the views it showed, the app's still where it keeps them: out of its document, placed again where it next shows
@@ -5090,10 +5322,10 @@
       wid, win: child, role, minW, minH, closed: false, closing: false, pending: false, raf: 0, wake: { at: -1 },
       texs: new Map(),
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
-      ufVp: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, atlasTex: null, ta: cta,
+      ufVp: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
-      lv: null, lvW: 0, lvH: 0, bdTex: null, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
+      lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       cv: null, cvOk: false, target: null, dirty: [],
       dirtyWhole: false, dirtyTold: false, missing: false, drewMissing: false, cutOn: false, segsTex: null,
       segsRows: 0, segsHad: null, segsHadRows: 0, uploadedFor: -1, imeActive: false, composing: false, taHad: '',
