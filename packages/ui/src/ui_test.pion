@@ -738,8 +738,9 @@ test "33 Glass::clear + zoom encodes negative slot 7 and glass_spot packs into s
       // zoom=1.5 with blur=0.0 -> slot 7 = -(1.5 - 1.0) = -0.5
       debug_assert((sc.inst[b + 7] - (-0.5)).abs() < 0.001, "clear lens zoom=1.5 encodes -0.5 in slot 7")
       // spot=(20, 10) -> qx=(20+256)*2=552, qy=(10+256)*2=532 -> 552*4096 + 532 + 1 = 2261525.0
-      let exp_spot = 552.0 * 4096.0 + 532.0 + 1.0
-      debug_assert((sc.inst[b + 14] - exp_spot).abs() < 0.5, "glass_spot packed into slot 14")
+      // Glass::clear defaults to adaptive=true -> slot 14 = -(spot_v + 1.0)
+      let exp_spot = -(552.0 * 4096.0 + 532.0 + 1.0 + 1.0)
+      debug_assert((sc.inst[b + 14] - exp_spot).abs() < 0.5, "glass_spot packed into slot 14 (adaptive negative)")
     }
     i += 1
   }
@@ -2008,4 +2009,261 @@ test "52 Scene::emit_layer encodes exact physical-pixel coords, kind=4, UV (0,0,
   let b2 = idx2 * inst_size
   debug_assert((sc.inst[b2] - 10.0).abs() < 1.0e-6 && (sc.inst[b2 + 2] - 30.0).abs() < 1.0e-6, "scale <= 0 falls back to 1.0")
   debug_assert((sc.inst[b2 + 20] - 12582915.0).abs() < 1.0e-6, "tex_id == 12582912 + 3")
+}
+
+test "53 same-band unmerged liquid glass sharing, occluder split, >64pt gap split, and frosted break (#8077)" {
+  let pill = Glass::liquid(blur=2.0, merge=0.0, adaptive=false).sharing().to_paint()
+  let frost = Glass::frosted(blur=8.0, tint=0xFFFFFF80L, solid=0xFFFFFFFFL).to_paint()
+  let t = Tester::tree(fn(root : view::View) {
+    // 1) Two same-band pills (y=10..50) separated by non-overlapping content -> share 1 capture id
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.over_xy(10.0, 10.0).size(80.0, 40.0).glass(view::Live::Is(Some(pill)))
+      let _ = a.box(fn(lbl : view::View) { let _ = lbl.words(view::Live::Is("A")) })
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.over_xy(110.0, 10.0).size(80.0, 40.0).glass(view::Live::Is(Some(pill)))
+    })
+    // 2) An occluder overlapping pill C at (210, 10) -> pill C must split to a new capture id
+    let _ = root.box(fn(occ : view::View) {
+      let _ = occ.over_xy(215.0, 15.0).size(40.0, 20.0).bg(0xFF0000FFL)
+    })
+    let _ = root.box(fn(c : view::View) {
+      let _ = c.over_xy(210.0, 10.0).size(80.0, 40.0).glass(view::Live::Is(Some(pill)))
+    })
+    // 3) Pill D at y=130 (> 64pt vertical gap below y1=50: 130 - 50 = 80 > 64) -> new capture id
+    let _ = root.box(fn(d : view::View) {
+      let _ = d.over_xy(10.0, 130.0).size(80.0, 40.0).glass(view::Live::Is(Some(pill)))
+    })
+    // 4) Frosted glass interrupts liquid_run -> pill E at same band y=130 gets new capture id
+    let _ = root.box(fn(f : view::View) {
+      let _ = f.over_xy(300.0, 130.0).size(40.0, 40.0).glass(view::Live::Is(Some(frost)))
+    })
+    let _ = root.box(fn(e : view::View) {
+      let _ = e.over_xy(110.0, 130.0).size(80.0, 40.0).glass(view::Live::Is(Some(pill)))
+    })
+  }, width=400.0, height=300.0)
+  let gs = t.drawn_glass()
+  debug_assert(gs.length() == 6, "5 liquid pills + 1 frosted glass")
+  // Pill A & B share capture id
+  debug_assert(gs[0].5 == gs[1].5, "same-band unmerged liquid pills share 1 capture id")
+  // Pill C split by occluder
+  debug_assert(gs[2].5 != gs[1].5, "occluder between pills splits capture id")
+  // Pill D split by > 64pt vertical gap
+  debug_assert(gs[3].5 != gs[2].5, "> 64pt vertical gap splits capture id")
+  // Frosted breaks liquid_run -> Pill E has new capture id
+  debug_assert(gs[4].4 == 5, "frosted glass between D and E")
+  debug_assert(gs[5].5 != gs[3].5 && gs[5].5 != gs[4].5, "frosted glass breaks liquid_run")
+  t.dispose()
+}
+
+test "54 progressive frosted glass slot 22 == -1.0, isolated capture, fades 52..55, and solid degrade (#8090)" {
+  let regular = Glass::frosted(blur=14.0, tint=0xFFFFFFCCL, solid=0xFFFFFFFFL).to_paint()
+  let prog = Glass::frosted(blur=14.0, tint=0xFFFFFFE0L, solid=0xFFFFFFFFL, saturation=1.08, progressive=true).to_paint()
+  let shared = Glass::frosted(blur=14.0, tint=0xFFFFFFCCL, solid=0xFFFFFFFFL, shares_capture=true).to_paint()
+  let make_app = fn(root : view::View) {
+    let _ = root.box(fn(n : view::View) {
+      let _ = n.over_xy(0.0, 0.0).size(100.0, 40.0).glass(view::Live::Is(Some(regular)))
+    })
+    let _ = root.box(fn(host : view::View) {
+      let _ = host.over_xy(0.0, 50.0).size(200.0, 60.0).fades(view::Live::Is((0.0, 0.0, 0.0, 24.0)))
+      let _ = host.box(fn(fill : view::View) {
+        let _ = fill.width_share(view::Live::Is(1.0)).height_share(view::Live::Is(1.0)).glass(view::Live::Is(Some(prog)))
+      })
+    })
+    let _ = root.box(fn(n : view::View) {
+      let _ = n.over_xy(0.0, 120.0).size(100.0, 30.0).glass(view::Live::Is(Some(regular)))
+    })
+    let _ = root.box(fn(n : view::View) {
+      let _ = n.over_xy(120.0, 120.0).size(80.0, 30.0).glass(view::Live::Is(Some(shared)))
+    })
+  }
+  set_glass_solid(None)
+  let t = Tester::tree(make_app, width=300.0, height=200.0)
+  let insts = t.drawn_instances()
+  let frosted : Array[Array[Double]] = []
+  for row in insts {
+    if row.length() >= 60 && (row[5] - 5.0).abs() < 1.0e-5 {
+      frosted.push(row)
+    }
+  }
+  debug_assert(frosted.length() == 4, "expected 4 frosted instances")
+  debug_assert(frosted[0][22].abs() < 1.0e-5, "regular frosted slot 22 == 0.0")
+  debug_assert((frosted[1][22] - (-1.0)).abs() < 1.0e-5, "progressive frosted slot 22 == -1.0")
+  debug_assert(frosted[2][22].abs() < 1.0e-5 && frosted[3][22].abs() < 1.0e-5, "following frosted slot 22 == 0.0")
+  // Progressive capture id is isolated from both neighbors and not reused by shares_capture
+  debug_assert(frosted[1][20] != frosted[0][20], "progressive does not merge with preceding regular")
+  debug_assert(frosted[2][20] != frosted[1][20], "following regular does not merge with progressive")
+  debug_assert(frosted[3][20] == frosted[2][20] && frosted[3][20] != frosted[1][20], "shares_capture reuses regular, not progressive")
+  // Fade slots 54..55 preserved on progressive frosted (bottom=110, soft=24)
+  debug_assert((frosted[1][54] - 110.0).abs() < 0.5 && (frosted[1][55] - 24.0).abs() < 0.5, "progressive frosted preserves fade slots 54..55")
+  t.dispose()
+
+  // Under set_glass_solid(Some(true)), progressive degrades to kind 0 preserving fade slots
+  set_glass_solid(Some(true))
+  let t2 = Tester::tree(make_app, width=300.0, height=200.0)
+  let insts2 = t2.drawn_instances()
+  let mut kind5_count = 0
+  let mut solid_faded = false
+  for row in insts2 {
+    if row.length() >= 60 {
+      if (row[5] - 5.0).abs() < 1.0e-5 {
+        kind5_count += 1
+      }
+      if row[5].abs() < 1.0e-5 && (row[54] - 110.0).abs() < 0.5 && (row[55] - 24.0).abs() < 0.5 {
+        solid_faded = true
+      }
+    }
+  }
+  debug_assert(kind5_count == 0, "solid mode emits zero kind 5 glass")
+  debug_assert(solid_faded, "solid fallback preserves fade slots 54..55")
+  t2.dispose()
+  set_glass_solid(None)
+}
+
+test "55 adaptive liquid glass slot 14, kind 7 glyphs, kind 10 lines, kind 11 shapes, and opaque suspension (#8094)" {
+  let adapt_no_spot = Glass::liquid(blur=2.0, adaptive=true).to_paint()
+  let adapt_spot = Glass::liquid(blur=2.0, adaptive=true, spot=(10.0, 12.0)).to_paint()
+  let t = Tester::tree(fn(root : view::View) {
+    // 1) Adaptive liquid glass with no spot: (20, 20, 120, 40) -> ink=(80, 40, 20)
+    let _ = root.box(fn(pill : view::View) {
+      let _ = pill.over_xy(20.0, 20.0).size(120.0, 40.0).glass(view::Live::Is(Some(adapt_no_spot)))
+      let _ = pill.box(fn(lbl : view::View) {
+        let _ = lbl.words(view::Live::Is("Hi"))
+      })
+      let _ = pill.box(fn(ln : view::View) {
+        let _ = ln.size(20.0, 20.0).lines(view::Live::Is([paint::Line::{ points: [(2.0, 2.0), (18.0, 18.0)], width: 2.0, color: 0x000000FFL, upto: 1.0 }]))
+      })
+      let _ = pill.box(fn(sh : view::View) {
+        let _ = sh.size(20.0, 20.0).shapes(view::Live::Is([paint::Shape::{ outlines: [([2.0, 2.0, 18.0, 2.0, 18.0, 18.0, 2.0, 18.0], true)], fill: 0x000000FFL, stroke: 0L, width: 0.0, even_odd: false }]))
+      })
+      // Opaque child (alpha 0xFF >= 0xC0) suspends adaptive ink inheritance -> emits kind 1 glyph
+      let _ = pill.box(fn(badge : view::View) {
+        let _ = badge.bg(0xFF0000FFL)
+        let _ = badge.box(fn(blbl : view::View) {
+          let _ = blbl.words(view::Live::Is("X"))
+        })
+      })
+    })
+    // 2) Adaptive liquid glass with spot=(10, 12)
+    let _ = root.box(fn(pill2 : view::View) {
+      let _ = pill2.over_xy(20.0, 80.0).size(120.0, 40.0).glass(view::Live::Is(Some(adapt_spot)))
+    })
+  }, width=300.0, height=200.0)
+
+  debug_assert(t.adaptive_glyphs() == 2, "expected 2 adaptive kind=7 glyphs for 'Hi'")
+  let insts = t.drawn_instances()
+  let mut k6_count = 0
+  let mut k1_count = 0
+  let mut k7_ok = 0
+  let mut k10_ok = 0
+  let mut k11_ok = 0
+  for row in insts {
+    let kind = (row[5] + 0.5).to_int()
+    if kind == 6 {
+      if k6_count == 0 {
+        debug_assert((row[14] - (-1.0)).abs() < 1.0e-5, "adaptive liquid without spot encodes slot 14 == -1.0")
+      } else {
+        let exp = -(((10.0 + 256.0) * 2.0) * 4096.0 + ((12.0 + 256.0) * 2.0) + 1.0 + 1.0)
+        debug_assert((row[14] - exp).abs() < 0.5, "adaptive liquid with spot encodes -(spot_v + 1.0)")
+      }
+      k6_count += 1
+    } else if kind == 1 {
+      k1_count += 1
+    } else if kind == 7 {
+      if (row[21] - 80.0).abs() < 0.5 && (row[22] - 40.0).abs() < 0.5 && (row[23] - 20.0).abs() < 0.5 {
+        k7_ok += 1
+      }
+    } else if kind == 10 {
+      if (row[21] - 80.0).abs() < 0.5 && (row[22] - 40.0).abs() < 0.5 && (row[23] - 20.0).abs() < 0.5 {
+        k10_ok += 1
+      }
+    } else if kind == 11 {
+      if (row[21] - 80.0).abs() < 0.5 && (row[22] - 40.0).abs() < 0.5 && (row[23] - 20.0).abs() < 0.5 {
+        k11_ok += 1
+      }
+    }
+  }
+  debug_assert(k6_count == 2, "2 liquid glass instances")
+  debug_assert(k7_ok == 2, "kind=7 glyphs carry adaptive ink (80, 40, 20)")
+  debug_assert(k10_ok >= 1, "kind=10 line carries adaptive ink (80, 40, 20)")
+  debug_assert(k11_ok >= 1, "kind=11 shape carries adaptive ink (80, 40, 20)")
+  debug_assert(k1_count == 1, "opaque badge child suspends adaptive ink and emits kind=1 glyph for 'X'")
+  t.dispose()
+}
+
+test "56 ellipsize_text re-measures CJK full-width punctuation pairs and truncated words keep square clip (#8083)" {
+  let t = Tester::tree(fn(root : view::View) {
+    // 1) Install a shaper that narrows "）" to 8pt before "，" and widens it to 16pt before "…"
+    let h = hostapi::host()
+    let orig_shape = h.shape
+    h.shape = fn(s : String, size : Double, weight : Int, style : Int, out : Array[Double]) -> Int {
+      if str_contains(s, "测试") {
+        let mut idx = 0
+        let mut count = 0
+        let n = s.length()
+        while idx < n {
+          let b0 = s.code_unit_at(idx)
+          let step = if b0 < 0x80 { 1 } else if (b0 & 0xE0) == 0xC0 { 2 } else if (b0 & 0xF0) == 0xE0 { 3 } else if (b0 & 0xF8) == 0xF0 { 4 } else { 1 }
+          let ch = s.slice(idx, idx + step)
+          let next_ch = if idx + step < n {
+            let nb0 = s.code_unit_at(idx + step)
+            let nstep = if nb0 < 0x80 { 1 } else if (nb0 & 0xE0) == 0xC0 { 2 } else if (nb0 & 0xF0) == 0xE0 { 3 } else if (nb0 & 0xF8) == 0xF0 { 4 } else { 1 }
+            s.slice(idx + step, idx + step + nstep)
+          } else {
+            ""
+          }
+          // "）" followed by "，" is half-width (8pt); otherwise full-width (16pt)
+          let adv = if ch == "）" && next_ch == "，" { 8.0 } else if step == 1 { 8.0 } else { 16.0 }
+          out[count * 4] = idx.to_double()
+          out[count * 4 + 1] = step.to_double()
+          out[count * 4 + 2] = adv
+          out[count * 4 + 3] = (1000 + count).to_double()
+          count += 1
+          idx += step
+        }
+        count
+      } else {
+        orig_shape(s, size, weight, style, out)
+      }
+    }
+    // Rounded clipping card (r=18) containing a narrow unwrapped text box (w=40) that truncates
+    let _ = root.box(fn(card : view::View) {
+      let _ = card.over_xy(20.0, 20.0).size(200.0, 60.0).r(18.0).clip().pad_xy(10.0, 8.0)
+      let _ = card.box(fn(v : view::View) {
+        let _ = v
+          .width(view::Live::Is(Some(40.0)))
+          .words(
+            view::Live::Is("abcdefghijklmnopqrstuvwxyz"),
+            look=view::WordsLook::{ size: 13.0, weight: 400, line: 18.0, wrap: false, tracking: view::Spacing::Points(0.0), balance: false, max_lines: 0 },
+          )
+      })
+    })
+  }, width=300.0, height=200.0)
+
+  // Verify ellipsize_text re-measures "测试（内容），后续文字" when max_w fits "测试（内容）" (with narrowed ）=8) + "…"=16 -> 5*16 + 8 + 16 = 104
+  // Once "，" is dropped, "）" widens to 16 -> "测试（内容）…" measures 112 > 104, so ellipsize_text MUST step back to "测试（内容…" (<= 104)
+  let s = "测试（内容），后续文字"
+  let max_w = 104.0
+  let cut = ellipsize_text(s, max_w, 16.0)
+  debug_assert(cut == "测试（内容…", "ellipsize_text steps back when dropping following punctuation widens closing mark")
+  debug_assert(measure_text_width(cut, 16.0) <= max_w + 0.01, "re-measured ellipsized width <= max_w + 0.01")
+
+  // Long ASCII string also obeys <= max_w + 0.01
+  let long_cut = ellipsize_text("abcdefghijklmnopqrstuvwxyz", 50.0, 14.0)
+  debug_assert(long_cut.length() > 0 && measure_text_width(long_cut, 14.0) <= 50.0 + 0.01, "long ASCII ellipsized width <= max_w + 0.01")
+
+  // Truncated glyphs inside rounded clipping card must have square clip (slots 24..27 == 0.0)
+  let insts = t.drawn_instances()
+  let mut glyph_count = 0
+  for row in insts {
+    if (row[5] - 1.0).abs() < 1.0e-5 {
+      glyph_count += 1
+      debug_assert(
+        row[24].abs() < 1.0e-5 && row[25].abs() < 1.0e-5 && row[26].abs() < 1.0e-5 && row[27].abs() < 1.0e-5,
+        "truncated words keep square clip corners (rc == 0)",
+      )
+    }
+  }
+  debug_assert(glyph_count > 0, "expected truncated glyph instances")
+  t.dispose()
 }

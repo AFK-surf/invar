@@ -26,8 +26,14 @@ pub struct Scene {
   pub mut frost_run : Int
   pub mut liquid_run : Int
   pub mut liquid_blur : Double
+  pub mut liquid_first : Int
+  pub mut liquid_y0 : Double
+  pub mut liquid_y1 : Double
   pub mut glass_run_start : Int
   pub mut glass_run_len : Int
+  pub mut ink_x : Double
+  pub mut ink_y : Double
+  pub mut ink_r : Double
   pub perf : FramePerf
 }
 
@@ -44,8 +50,14 @@ pub fn Scene::new() -> Scene {
     frost_run: 0,
     liquid_run: 0,
     liquid_blur: 0.0,
+    liquid_first: -1,
+    liquid_y0: 0.0,
+    liquid_y1: 0.0,
     glass_run_start: -1,
     glass_run_len: 0,
+    ink_x: 0.0,
+    ink_y: 0.0,
+    ink_r: 0.0,
     perf: FramePerf::zero(),
   }
 }
@@ -62,8 +74,14 @@ pub fn Scene::clear(self : Scene, w : Double, h : Double, scale : Double) -> Uni
   self.frost_run = 0
   self.liquid_run = 0
   self.liquid_blur = 0.0
+  self.liquid_first = -1
+  self.liquid_y0 = 0.0
+  self.liquid_y1 = 0.0
   self.glass_run_start = -1
   self.glass_run_len = 0
+  self.ink_x = 0.0
+  self.ink_y = 0.0
+  self.ink_r = 0.0
 }
 
 /// Push a 60-Double instance aligned with apple_render.m:259 `struct Inst`:
@@ -207,8 +225,19 @@ fn Scene::push_glyph_inst(
   inst.push(clip_y)
   inst.push(clip_x1)
   inst.push(clip_y1)
-  // 20..59: 40 zeros (tex_id=0, pad=0, rc=0, rs=0, rot=0, rr=0, oclip..fadex=0)
-  let mut z = 20
+  // 20..23: pad (tex_id=0, ink_x/y/r when adaptive kind==7.0)
+  inst.push(0.0)
+  if kind == 7.0 {
+    inst.push(self.ink_x)
+    inst.push(self.ink_y)
+    inst.push(self.ink_r)
+  } else {
+    inst.push(0.0)
+    inst.push(0.0)
+    inst.push(0.0)
+  }
+  // 24..59: 36 zeros (rc=0, rs=0, rot=0, rr=0, oclip..fadex=0)
+  let mut z = 24
   while z < 60 {
     inst.push(0.0)
     z += 1
@@ -394,8 +423,14 @@ pub fn Scene::copy(self : Scene) -> Scene {
     frost_run: self.frost_run,
     liquid_run: self.liquid_run,
     liquid_blur: self.liquid_blur,
+    liquid_first: self.liquid_first,
+    liquid_y0: self.liquid_y0,
+    liquid_y1: self.liquid_y1,
     glass_run_start: self.glass_run_start,
     glass_run_len: self.glass_run_len,
+    ink_x: self.ink_x,
+    ink_y: self.ink_y,
+    ink_r: self.ink_r,
     perf: FramePerf::{
       frame_ms: self.perf.frame_ms,
       layout_ms: self.perf.layout_ms,
@@ -716,16 +751,49 @@ fn Scene::glass_capture(self : Scene, k : Int, liquid : Bool, shares : Bool) -> 
   let blur = a[b + 7]
   let eff_blur = if liquid && blur < 0.0 { 0.0 } else { blur }
   let is_single_liquid = liquid && a[b + 23] <= 0.0
-  if shares && !liquid && self.frost_run != 0 {
+  let is_progressive = !liquid && a[b + 22] < -0.5
+  if shares && !liquid && !is_progressive && self.frost_run != 0 {
     a[b + 20] = -self.frost_run.to_double()
     return
   }
-  if shares && is_single_liquid && eff_blur >= 0.0 && self.liquid_run != 0 && self.liquid_blur == eff_blur {
-    a[b + 20] = -self.liquid_run.to_double()
-    return
+  if shares &&
+    is_single_liquid &&
+    eff_blur >= 0.0 &&
+    self.liquid_run != 0 &&
+    self.liquid_blur == eff_blur &&
+    self.liquid_first >= 0 {
+    let ky0 = a[b + 1]
+    let ky1 = ky0 + a[b + 3]
+    let dy_gap = dmax(0.0, dmax(ky0 - self.liquid_y1, self.liquid_y0 - ky1))
+    if dy_gap <= 64.0 {
+      let run_tag = -self.liquid_run.to_double()
+      let mut blocked = false
+      let mut j = self.liquid_first
+      while j < k {
+        let pj = j * inst_size
+        let jk = a[pj + 5]
+        if jk != 2.0 &&
+          jk != 12.0 &&
+          a[pj + 20] != run_tag &&
+          a[pj + 2] > 0.0 &&
+          a[pj + 3] > 0.0 &&
+          rects_meet_by(j, k, a, 0.0) {
+          blocked = true
+          break
+        }
+        j += 1
+      }
+      if !blocked {
+        a[b + 20] = run_tag
+        self.liquid_y0 = dmin(self.liquid_y0, ky0)
+        self.liquid_y1 = dmax(self.liquid_y1, ky1)
+        return
+      }
+    }
   }
   let prev = self.glass_run_start + self.glass_run_len
   let prev_is_single = liquid && k > 0 && a[(k - 1) * inst_size + 23] <= 0.0
+  let prev_is_progressive = !liquid && k > 0 && a[(k - 1) * inst_size + 22] < -0.5
   let prev_eff_blur = if k > 0 {
     let pb = a[(k - 1) * inst_size + 7]
     if liquid && pb < 0.0 { 0.0 } else { pb }
@@ -734,6 +802,8 @@ fn Scene::glass_capture(self : Scene, k : Int, liquid : Bool, shares : Bool) -> 
   }
   let mut same = self.glass_run != 0 &&
     prev == k &&
+    !is_progressive &&
+    !prev_is_progressive &&
     eff_blur >= 0.0 &&
     a[(k - 1) * inst_size + 5] == kind &&
     prev_eff_blur == eff_blur &&
@@ -742,26 +812,48 @@ fn Scene::glass_capture(self : Scene, k : Int, liquid : Bool, shares : Bool) -> 
       (!is_single_liquid && !prev_is_single && self.glass_run_len < 8))
   if same && (!liquid || is_single_liquid) {
     let pad = if is_single_liquid { 2.0 } else { 0.0 }
-    let mut j = self.glass_run_start
-    while j < k {
-      if rects_meet_by(j, k, a, pad) {
+    if is_single_liquid && self.liquid_run == self.glass_run && self.liquid_first >= 0 {
+      let ky0 = a[b + 1]
+      let ky1 = ky0 + a[b + 3]
+      let dy_gap = dmax(0.0, dmax(ky0 - self.liquid_y1, self.liquid_y0 - ky1))
+      if dy_gap > 64.0 {
         same = false
-        break
       }
-      j += 1
+    }
+    if same {
+      let mut j = self.glass_run_start
+      while j < k {
+        if rects_meet_by(j, k, a, pad) {
+          same = false
+          break
+        }
+        j += 1
+      }
     }
   }
   if same {
     self.glass_run_len = self.glass_run_len + 1
+    if is_single_liquid && self.liquid_run == self.glass_run {
+      self.liquid_y0 = dmin(self.liquid_y0, a[b + 1])
+      self.liquid_y1 = dmax(self.liquid_y1, a[b + 1] + a[b + 3])
+    }
   } else {
     self.glass_run = self.glass_run + 1
     self.glass_run_start = k
     self.glass_run_len = 1
-    if !liquid {
+    if !liquid && !is_progressive {
       self.frost_run = self.glass_run
+      self.liquid_run = 0
+      self.liquid_first = -1
     } else if is_single_liquid && eff_blur >= 0.0 {
       self.liquid_run = self.glass_run
       self.liquid_blur = eff_blur
+      self.liquid_first = k
+      self.liquid_y0 = a[b + 1]
+      self.liquid_y1 = a[b + 1] + a[b + 3]
+    } else {
+      self.liquid_run = 0
+      self.liquid_first = -1
     }
   }
   a[b + 20] = -self.glass_run.to_double()
@@ -797,18 +889,24 @@ fn encode_glass(
   } else {
     dmax(gl.blur, 0.0)
   }
+  let p14 = if gl.liquid {
+    let spot_v = glass_spot(gl.spot)
+    if gl.adaptive { -(spot_v + 1.0) } else { spot_v }
+  } else {
+    gl.rim_back
+  }
   let idx = scene.push_inst(
     d.x, d.y, d.w, d.h, d.radius, kind, gl.saturation, blur_slot, gl.tint, 1.0,
     if gl.liquid { gl.rim } else { gl.rim_edge },
     if gl.liquid { gl.bezel } else { gl.rim_lit },
-    if gl.liquid { glass_spot(gl.spot) } else { gl.rim_back },
+    p14,
     eff_alpha,
     clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
   )
   let base = idx * inst_size
   if base + 23 < scene.inst.length() {
     scene.inst[base + 21] = gl.refraction
-    scene.inst[base + 22] = gl.chroma
+    scene.inst[base + 22] = if gl.liquid { gl.chroma } else if gl.progressive { -1.0 } else { 0.0 }
     scene.inst[base + 23] = gl.merge
   }
   scene.glass_capture(idx, gl.liquid, gl.shares_capture)
@@ -1058,23 +1156,43 @@ fn encode_drawn_node(
           p1x = line_ox + line_tc * bdx - line_ts * bdy
           p1y = line_oy + line_ts * bdx + line_tc * bdy
         }
-        scene.emit_line(
-          p0x, p0y, p1x, p1y,
-          ln.width, ln.color, alpha=d.alpha,
-          clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
-        )
+        if scene.ink_r > 0.0 {
+          let hw = ln.width * 0.5
+          let bx = dmin(p0x, p1x) - hw - 1.0
+          let by = dmin(p0y, p1y) - hw - 1.0
+          let bw = dmax(p0x, p1x) - dmin(p0x, p1x) + 2.0 * (hw + 1.0)
+          let bh = dmax(p0y, p1y) - dmin(p0y, p1y) + 2.0 * (hw + 1.0)
+          let lidx = scene.push_inst(
+            bx, by, bw, bh, hw, 10.0, 0.0, 0.0, ln.color, d.alpha,
+            (p0x - bx) / bw, (p0y - by) / bh, (p1x - bx) / bw, (p1y - by) / bh,
+            clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+          )
+          let lb = lidx * inst_size
+          scene.inst[lb + 21] = scene.ink_x
+          scene.inst[lb + 22] = scene.ink_y
+          scene.inst[lb + 23] = scene.ink_r
+        } else {
+          scene.emit_line(
+            p0x, p0y, p1x, p1y,
+            ln.width, ln.color, alpha=d.alpha,
+            clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+          )
+        }
         pi += 1
       }
     }
   }
   let lines_end_idx = scene.ninst
 
-  // 9. Text glyphs via real CoreText/hostapi shaping + atlas (kind=1.0 mono / 3.0 color)
+  // 9. Text glyphs via real CoreText/hostapi shaping + atlas (kind=1.0 mono / 3.0 color / 7.0 adaptive)
+  let words_start_idx = scene.ninst
+  let mut words_square_clip = false
   if d.runs.length() > 0 {
     encode_runs(scene, d, scale, clip_x, clip_y, clip_x1, clip_y1)
   } else if d.words.length() > 0 {
-    encode_words(scene, d, scale, clip_x, clip_y, clip_x1, clip_y1)
+    words_square_clip = encode_words(scene, d, scale, clip_x, clip_y, clip_x1, clip_y1)
   }
+  let words_end_idx = scene.ninst
 
   // 10. Focused field caret indicator
   match find_tree_field(d.id) {
@@ -1116,7 +1234,7 @@ fn encode_drawn_node(
     let oy = d.y + d.h * 0.5
     let mut idx = start_idx
     while idx < scene.ninst {
-      if has_rc {
+      if has_rc && !(words_square_clip && idx >= words_start_idx && idx < words_end_idx) {
         scene.set_clip_corners(idx, rc.0, rc.1, rc.2, rc.3)
       }
       if has_rot && (idx < lines_start_idx || idx >= lines_end_idx) {
@@ -1264,6 +1382,7 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
   let deferred_shadows : Array[DeferredGlassShadow] = []
   let fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
   let blur_stack : Array[BlurFrame] = []
+  let ink_stack : Array[(view::NodeId, Double, Double, Double)] = []
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
@@ -1273,8 +1392,35 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     while blur_stack.length() > 0 && !tree.holds_in_order(blur_stack[blur_stack.length() - 1].id, d.id) {
       pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
     }
+    while ink_stack.length() > 0 && !tree.holds_in_order(ink_stack[ink_stack.length() - 1].0, d.id) {
+      match ink_stack.pop() {
+        Some((_, px, py, pr)) => {
+          scene.ink_x = px
+          scene.ink_y = py
+          scene.ink_r = pr
+        }
+        None => ()
+      }
+    }
     let node_scale = if i < scales.length() { scales[i] } else { 1.0 }
     let gd = tree.ground_drawn_of(d.id)
+    match d.glass {
+      Some(gl) if gl.liquid && gl.adaptive && gl.strength > 0.001 && !glass_solid() => {
+        ink_stack.push((d.id, scene.ink_x, scene.ink_y, scene.ink_r))
+        let gx = d.x + gd.dx * node_scale
+        let gy = d.y + gd.dy * node_scale
+        let gw = dmax(0.0, d.w + gd.dw * node_scale)
+        let gh = dmax(0.0, d.h + gd.dh * node_scale)
+        scene.ink_x = gx + gw * 0.5
+        scene.ink_y = gy + gh * 0.5
+        scene.ink_r = dmax(dmin(gw, gh) * 0.5, 1.0)
+      }
+      _ =>
+        if scene.ink_r > 0.0 && d.ground != 0L && (d.ground & 0xFFL) >= 0xC0L {
+          ink_stack.push((d.id, scene.ink_x, scene.ink_y, scene.ink_r))
+          scene.ink_r = 0.0
+        }
+    }
     let (in_clip, in_rc) = if holder >= 0 && holder < i {
       let p = held[holder].0
       if p.clips {
@@ -1349,6 +1495,16 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
       )
     }
     i += 1
+  }
+  while ink_stack.length() > 0 {
+    match ink_stack.pop() {
+      Some((_, px, py, pr)) => {
+        scene.ink_x = px
+        scene.ink_y = py
+        scene.ink_r = pr
+      }
+      None => ()
+    }
   }
   while blur_stack.length() > 0 {
     pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)

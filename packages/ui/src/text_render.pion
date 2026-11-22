@@ -410,11 +410,11 @@ fn emit_glyph_quad(
   clip_x1 : Double,
   clip_y1 : Double,
 ) -> Unit {
-  let kind = if slot.color { 3.0 } else { 1.0 }
+  let kind = if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 }
   // apple_text.m:697: e->oy = -(b.origin.y + b.size.height) (negative above baseline)
   let gx = pen_x + slot.ox
   let gy = baseline_y + slot.oy
-  let _ = scene.push_inst(
+  let idx = scene.push_inst(
     gx,
     gy,
     slot.gw,
@@ -434,9 +434,69 @@ fn emit_glyph_quad(
     clip_x1=clip_x1,
     clip_y1=clip_y1,
   )
+  if !slot.color && scene.ink_r > 0.0 {
+    let b = idx * inst_size
+    scene.inst[b + 21] = scene.ink_x
+    scene.inst[b + 22] = scene.ink_y
+    scene.inst[b + 23] = scene.ink_r
+  }
 }
 
-/// Shape and emit real glyph quads (kind=1.0 mono / 3.0 color) for `d.words`.
+/// Truncate `s` with a trailing `"…"` so its full re-measured width is `<= max_w + 0.01`.
+/// Re-measures `prefix + "…"` on every step so CJK/full-width punctuation pairs (e.g. `），`)
+/// that widen when the following punctuation is dropped never overflow `max_w`.
+pub fn ellipsize_text(
+  s : String,
+  max_w : Double,
+  size : Double,
+  weight~ : Int = 400,
+  style_bits~ : Int = 0,
+  tracking~ : Double = 0.0,
+) -> String {
+  if s.length() == 0 || max_w <= 0.0 {
+    return ""
+  }
+  if measure_text_width(s, size, weight=weight, style_bits=style_bits, tracking=tracking) <= max_w + 0.01 {
+    return s
+  }
+  let starts : Array[Int] = []
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    starts.push(i)
+    let b0 = s.code_unit_at(i)
+    if b0 < 0x80 {
+      i += 1
+    } else if (b0 & 0xE0) == 0xC0 {
+      i += 2
+    } else if (b0 & 0xF0) == 0xE0 {
+      i += 3
+    } else if (b0 & 0xF8) == 0xF0 {
+      i += 4
+    } else {
+      i += 1
+    }
+  }
+  let mut idx = starts.length() - 1
+  while idx > 0 {
+    let mut end_b = starts[idx]
+    while end_b > 0 && s.code_unit_at(end_b - 1) == 32 {
+      end_b -= 1
+    }
+    let cand = s.slice(0, end_b) + "…"
+    if measure_text_width(cand, size, weight=weight, style_bits=style_bits, tracking=tracking) <= max_w + 0.01 {
+      return cand
+    }
+    idx -= 1
+  }
+  if measure_text_width("…", size, weight=weight, style_bits=style_bits, tracking=tracking) <= max_w + 0.01 {
+    return "…"
+  }
+  ""
+}
+
+/// Shape and emit real glyph quads (kind=1.0 mono / 3.0 color / 7.0 adaptive) for `d.words`.
+/// Returns true when words were clipped to their own box with square corners (`rc = 0`).
 fn encode_words(
   scene : Scene,
   d : view::Drawn,
@@ -445,9 +505,9 @@ fn encode_words(
   clip_y : Double,
   clip_x1 : Double,
   clip_y1 : Double,
-) -> Unit {
+) -> Bool {
   if d.words.length() == 0 || (d.ink & 0xFFL) == 0L {
-    return
+    return false
   }
   let sz = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
   let weight = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
@@ -464,16 +524,37 @@ fn encode_words(
   let max_lines = d.words_look.max_lines
   let wrap = d.words_look.wrap && d.w > 0.0
   let mut line_idx = 0
+  let mut square_clip = false
+  let mut max_lines_overflow = max_lines > 0 && raw_lines.length() > max_lines
 
   for raw in raw_lines {
     if max_lines > 0 && line_idx >= max_lines {
+      max_lines_overflow = true
       break
     }
     if raw.length() == 0 {
       line_idx += 1
       continue
     }
-    let sl = shape_line_cached(raw, sz, weight, style_bits)
+    let mut sl = shape_line_cached(raw, sz, weight, style_bits)
+    let mut line_overflow = false
+    if !wrap && d.w > 0.0 && sl.n > 0 {
+      let mut raw_w = 0.0
+      let mut rk = 0
+      while rk < sl.n {
+        raw_w = raw_w + sl.advs[rk] + spacing
+        rk += 1
+      }
+      if raw_w > d.w + 0.5 {
+        line_overflow = true
+        if !d.ellipsis_past {
+          let ell = ellipsize_text(raw, d.w, sz, weight=weight, style_bits=style_bits, tracking=spacing)
+          if ell.length() > 0 {
+            sl = shape_line_cached(ell, sz, weight, style_bits)
+          }
+        }
+      }
+    }
     let n = sl.n
     if n <= 0 {
       line_idx += 1
@@ -482,10 +563,19 @@ fn encode_words(
     let locs = sl.locs
     let advs = sl.advs
     let gkeys = sl.gkeys
+    let use_box_clip = !d.clips_self && d.w > 0.0 && (line_overflow || max_lines_overflow)
+    if use_box_clip {
+      square_clip = true
+    }
+    let eff_clip_x = if use_box_clip { dmax(clip_x, d.x) } else { clip_x }
+    let eff_clip_y = if use_box_clip { dmax(clip_y, d.y) } else { clip_y }
+    let eff_clip_x1 = if use_box_clip { dmin(clip_x1, d.x + d.w) } else { clip_x1 }
+    let eff_clip_y1 = if use_box_clip && d.h > 0.0 { dmin(clip_y1, d.y + d.h) } else { clip_y1 }
     // Partition shaped clusters into visual lines (word-boundary wrapping by d.w if wrap=true)
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
+        max_lines_overflow = true
         break
       }
       let mut end = start
@@ -543,7 +633,7 @@ fn encode_words(
               baseline_y + slot.oy,
               slot.gw,
               slot.gh,
-              if slot.color { 3.0 } else { 1.0 },
+              if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
               ink_r,
               ink_g,
               ink_b,
@@ -552,10 +642,10 @@ fn encode_words(
               slot.v,
               slot.gw * scale,
               slot.gh * scale,
-              clip_x,
-              clip_y,
-              clip_x1,
-              clip_y1,
+              eff_clip_x,
+              eff_clip_y,
+              eff_clip_x1,
+              eff_clip_y1,
             )
           None => ()
         }
@@ -577,6 +667,7 @@ fn encode_words(
       }
     }
   }
+  square_clip
 }
 
 /// Shape and emit real glyph quads (and inline run backgrounds) for `d.runs`.

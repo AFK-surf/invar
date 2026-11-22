@@ -409,3 +409,160 @@ test "Tree::scroll_faults catches unbounded ancestor and sibling-polluted scroll
   debug_assert(faults_b.length() >= 1, "scrolls on container with siblings must report fault")
   tree_b.dispose()
 }
+
+test "View::fades transparent tail (< 0.2) passes hit-tests through while body (>= 0.2) blocks (#8090)" {
+  let btn_id : Ref[Option[NodeId]] = ref_new(None)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.box(fn(btn : View) {
+      btn_id.v = Some(btn.id())
+      let _ = btn
+        .over(Is(true))
+        .offset(Is((0.0, 0.0)))
+        .width(Is(Some(200.0)))
+        .height(Is(Some(100.0)))
+        .on_press(fn() { () })
+    })
+    // Top-anchored fading overlay (y=0..100, bottom fade 40pt):
+    // at y=50 -> ramp=1.0 (>= 0.2, blocks); at y=95 -> ramp=(100-95)/40=0.125 (< 0.2, passes through)
+    let _ = root.box(fn(host : View) {
+      let _ = host
+        .over(Is(true))
+        .offset(Is((0.0, 0.0)))
+        .width(Is(Some(200.0)))
+        .height(Is(Some(100.0)))
+        .fades(Is((0.0, 0.0, 0.0, 40.0)))
+      let _ = host.box(fn(cover : View) {
+        let _ = cover
+          .width_share(Is(1.0))
+          .height_share(Is(1.0))
+          .points(Is(false))
+          .glass(Is(Some(paint::Glass::frosted(blur=8.0, tint=0xFFFFFF80L, solid=0xFFFFFFFFL, progressive=true))))
+        let _ = cover.pointed()
+      })
+    })
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  let bid = match btn_id.v {
+    Some(id) => id
+    None => { debug_assert(false, "btn id"); tree.dispose(); return }
+  }
+  // In the opaque body (y=50), overlay blocks the button underneath
+  debug_assert(tree.target_at(100.0, 50.0) == Target::Nothing, "opaque body (>=0.2) blocks press")
+  // In the transparent fade tail (y=95, ramp=0.125 < 0.2), press passes through to button
+  debug_assert(tree.target_at(100.0, 95.0) == Target::Pressed(bid), "transparent fade tail (<0.2) passes press through")
+  tree.dispose()
+}
+
+test "shared flight scales nested slot/box filling children and image_in, container=true does not (#8084)" {
+  let linear = Flight::{ phys_id: 1, way: fn(_far : Double) -> (Double, (Double) -> Double) {
+    (200.0, fn(t : Double) -> Double { dclamp(t / 200.0, 0.0, 1.0) })
+  } }
+  let open = signals::signal(false)
+  let inner_id : Ref[Option[NodeId]] = ref_new(None)
+  let letter_id : Ref[Option[NodeId]] = ref_new(None)
+  let tree = Tree::new(fn(root : View) {
+    // Source thumbnail (stays=true): 60x60 at (10, 10)
+    let _ = root.box(fn(thumb : View) {
+      let _ = thumb
+        .over(Is(true))
+        .offset(Is((10.0, 10.0)))
+        .width(Is(Some(60.0)))
+        .height(Is(Some(60.0)))
+        .shared(Is("pic"), linear, stays=true)
+    })
+    // Destination viewer (with_stays=true): 200x100 at (50, 50) containing nested show(slot) -> wrapper -> filler with image_in
+    root.show(fn() { open.get() }, fn(v : View) {
+      let _ = v
+        .over(Is(true))
+        .offset(Is((50.0, 50.0)))
+        .width(Is(Some(200.0)))
+        .height(Is(Some(100.0)))
+        .shared(Is("pic"), linear, with_stays=true)
+      v.show(fn() { true }, fn(wrap : View) {
+        let _ = wrap.width_share(Is(1.0)).height_share(Is(1.0))
+        let _ = wrap.box(fn(pic : View) {
+          inner_id.v = Some(pic.id())
+          let _ = pic
+            .width_share(Is(1.0))
+            .height_share(Is(1.0))
+            .image(Is(Some(("a.png", "", 0))))
+            .image_in(Is(Some(((0.0, 0.0, 200.0, 100.0), 0x000000FFL))))
+        })
+      })
+      let _ = v.box(fn(letter : View) {
+        letter_id.v = Some(letter.id())
+        let _ = letter
+          .over(Is(true))
+          .width_share(Is(1.0))
+          .height_share(Is(1.0))
+          .image(Is(Some(("b.png", "", 0))))
+          .image_in(Is(Some(((50.0, 0.0, 100.0, 100.0), 0x000000FFL))))
+      })
+    })
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  open.set(true)
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  // Halfway through flight (t=100ms): rect is 130x80 (scale s=130/200=0.65, local filler fw=200, fh=80/0.65=123.077)
+  let _ = tree.frame(400.0, 300.0, now=100.0)
+  let exp_fw = 200.0
+  let exp_fh = 80.0 / (130.0 / 200.0)
+  // Full-box nested filler adapts to flight aspect (w/h == 130/80 = 1.625) and image_in fills local (fw, fh)
+  match inner_id.v {
+    Some(id) => match tree.drawn_of(id) {
+      Some(d) => {
+        debug_assert((d.w - 130.0).abs() < 1.0 && (d.h - 80.0).abs() < 1.0, "nested filler follows flight rect 130x80")
+        match d.image_in {
+          Some(((ix, iy, iw, ih), _)) =>
+            debug_assert(ix.abs() < 0.5 && iy.abs() < 0.5 && (iw - exp_fw).abs() < 1.0 && (ih - exp_fh).abs() < 1.0, "full-box image_in scales to filler local size")
+          None => debug_assert(false, "expected full-box image_in")
+        }
+      }
+      None => debug_assert(false, "expected nested filler drawn")
+    }
+    None => debug_assert(false, "expected inner_id")
+  }
+  // Letterbox filler preserves 1:1 aspect centered in local (200, exp_fh) -> (exp_fh x exp_fh) at x=(200 - exp_fh)/2
+  match letter_id.v {
+    Some(id) => match tree.drawn_of(id) {
+      Some(d) => match d.image_in {
+        Some(((ix, iy, iw, ih), _)) =>
+          debug_assert((iw - exp_fh).abs() < 1.0 && (ih - exp_fh).abs() < 1.0 && (ix - (exp_fw - exp_fh) * 0.5).abs() < 1.0 && iy.abs() < 0.5, "letterbox image_in fits centered")
+        None => debug_assert(false, "expected letterbox image_in")
+      }
+      None => debug_assert(false, "expected letterbox drawn")
+    }
+    None => debug_assert(false, "expected letter_id")
+  }
+  tree.dispose()
+
+  // Container flight (container=true) must NOT stretch filling child
+  let swapped = signals::signal(false)
+  let child_id : Ref[Option[NodeId]] = ref_new(None)
+  let tree2 = Tree::new(fn(root : View) {
+    root.show(fn() { !swapped.get() }, fn(a : View) {
+      let _ = a.over(Is(true)).offset(Is((0.0, 0.0))).width(Is(Some(60.0))).height(Is(Some(60.0)))
+        .shared(Is("card"), linear, container=true)
+    })
+    root.show(fn() { swapped.get() }, fn(b : View) {
+      let _ = b.over(Is(true)).offset(Is((20.0, 20.0))).width(Is(Some(200.0))).height(Is(Some(100.0)))
+        .shared(Is("card"), linear, container=true)
+      let _ = b.box(fn(ch : View) {
+        child_id.v = Some(ch.id())
+        let _ = ch.width_share(Is(1.0)).height_share(Is(1.0))
+      })
+    })
+  })
+  let _ = tree2.frame(400.0, 300.0, now=0.0)
+  swapped.set(true)
+  let _ = tree2.frame(400.0, 300.0, now=0.0)
+  let _ = tree2.frame(400.0, 300.0, now=100.0)
+  match child_id.v {
+    Some(id) => match tree2.drawn_of(id) {
+      Some(d) => debug_assert((d.w - 200.0).abs() < 1.0 && (d.h - 100.0).abs() < 1.0, "container=true keeps child at its own laid-out 200x100 size")
+      None => debug_assert(false, "expected container child drawn")
+    }
+    None => debug_assert(false, "expected child_id")
+  }
+  tree2.dispose()
+}
