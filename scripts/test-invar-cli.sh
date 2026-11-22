@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# End-to-end regression test suite for the unified `invar` CLI (`scripts/invar`) and `scripts/install.sh`.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INVAR="$ROOT/scripts/invar"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/invar_cli_test.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+assert_py() {
+  local code="$1"
+  shift
+  python3 -c "$code" "$@"
+}
+
+echo "=== 1. invar --help ==="
+"$INVAR" --help >/dev/null
+echo "OK: --help"
+
+echo "=== 2. invar doctor --json ==="
+DOC_JSON="$("$INVAR" doctor --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'doctor not ok: {d}'
+assert d['pionc']['found'] is True
+assert d['web']['available'] is True
+print('OK: doctor (os=%s, pionc=%s)' % (d['os'], d['pionc']['path']))
+" "$DOC_JSON"
+
+echo "=== 3. invar audit --json ==="
+AUD_JSON="$("$INVAR" audit --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'audit failed: {d}'
+assert d['error_count'] == 0, f'audit errors: {d}'
+print('OK: audit (0 errors, %d warnings)' % d['warning_count'])
+" "$AUD_JSON"
+
+echo "=== 4. invar check --pkg view --json ==="
+CHK_JSON="$("$INVAR" check --pkg view --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'check view failed: {d}'
+assert d['fmt_checked'] is False, f'expected fmt_checked=False by default: {d}'
+assert len(d['packages']) == 1 and d['packages'][0]['ok'] is True
+print('OK: check view (%d ms)' % d['elapsed_ms'])
+" "$CHK_JSON"
+
+echo "=== 5. invar test --pkg damage --json ==="
+TST_JSON="$("$INVAR" test --pkg damage --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'test damage failed: {d}'
+assert d['total_passed'] > 0 and d['total_failed'] == 0
+print('OK: test damage (%d passed, %d ms)' % (d['total_passed'], d['elapsed_ms']))
+" "$TST_JSON"
+
+echo "=== 6. invar new jsx-app + check + test + audit + no-overwrite ==="
+JSX_DIR="$TMP/my_jsx_app"
+NEW_JSX="$("$INVAR" new --template jsx-app --json "$JSX_DIR")"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['template'] == 'jsx-app', f'new jsx-app failed: {d}'
+print('OK: new jsx-app (%d files)' % len(d['files']))
+" "$NEW_JSX"
+
+# Refuse overwrite on second call
+if "$INVAR" new --template jsx-app --json "$JSX_DIR" >/dev/null 2>&1; then
+  echo "FAIL: invar new should refuse to overwrite existing files" >&2
+  exit 1
+fi
+echo "OK: new refuses overwrite"
+
+JSX_CHK="$("$INVAR" check --pkg "$JSX_DIR" --fmt --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['fmt_checked'] is True, f'jsx-app check --fmt failed: {d}'
+print('OK: jsx-app check --fmt')
+" "$JSX_CHK"
+
+JSX_TST="$("$INVAR" test --pkg "$JSX_DIR" --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['total_passed'] >= 1, f'jsx-app test failed: {d}'
+print('OK: jsx-app test (%d passed)' % d['total_passed'])
+" "$JSX_TST"
+
+JSX_AUD="$("$INVAR" audit --json "$JSX_DIR")"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['error_count'] == 0 and d['warning_count'] == 0, f'jsx-app audit failed: {d}'
+print('OK: jsx-app audit (0 errors, 0 warnings)')
+" "$JSX_AUD"
+
+echo "=== 7. invar new web-app + invar web build ==="
+WEB_DIR="$TMP/my_web_app"
+WEB_OUT="$TMP/web_dist"
+"$INVAR" new --template web-app --json "$WEB_DIR" >/dev/null
+WEB_BLD="$("$INVAR" web build --pkg "$WEB_DIR" --out "$WEB_OUT" --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'web-app build failed: {d}'
+assert d['raw_bytes'] > 0 and d['gzip_bytes'] > 0
+assert d['imports_missing'] == [], f'missing imports: {d}'
+assert os.path.isfile(os.path.join(d['out_dir'], 'index.html'))
+print('OK: web-app build (%d B raw, %d B gzip, %d imports, 0 missing)' % (d['raw_bytes'], d['gzip_bytes'], d['imports_total']))
+" "$WEB_BLD"
+
+echo "=== 8. invar web check --json (packages/lg_web) ==="
+WEB_CHK="$("$INVAR" web check --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'web check lg_web failed: {d}'
+assert d['imports_total'] > 100 and d['imports_missing'] == []
+print('OK: web check lg_web (%d B raw, %d imports, 0 missing)' % (d['raw_bytes'], d['imports_total']))
+" "$WEB_CHK"
+
+echo "=== 9. invar diff --json --out --sbs (synthetic PNGs) ==="
+python3 - "$TMP" << 'PYEOF'
+import os, struct, sys, zlib
+
+def write_png(path, w, h, rgba):
+    def chunk(ct, body):
+        crc = zlib.crc32(body, zlib.crc32(ct)) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + ct + body + struct.pack(">I", crc)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw.extend(rgba[y*w*4:(y+1)*w*4])
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+
+tmp = sys.argv[1]
+w, h = 16, 16
+b1 = bytearray([40, 60, 80, 255] * (w * h))
+b2 = bytearray(b1)
+# Change 4 pixels at x in [4,5], y in [6,7] with R +100
+for y in (6, 7):
+    for x in (4, 5):
+        o = (y * w + x) * 4
+        b2[o] = 140
+write_png(os.path.join(tmp, "before.png"), w, h, b1)
+write_png(os.path.join(tmp, "after.png"), w, h, b2)
+PYEOF
+
+DIFF_JSON="$("$INVAR" diff "$TMP/before.png" "$TMP/after.png" --out "$TMP/diff.png" --sbs "$TMP/sbs.png" --json)"
+assert_py "
+import json, os, struct, sys
+d = json.loads(sys.argv[1])
+tmp = sys.argv[2]
+assert d['ok'] is True and d['same_size'] is True
+assert d['width'] == 16 and d['height'] == 16
+assert d['changed_pixels'] == 4, f'changed_pixels={d}'
+assert d['max_delta'] == 100, f'max_delta={d}'
+assert d['changed_bbox'] == [4, 6, 2, 2], f'bbox={d}'
+assert d['identical'] is False
+with open(os.path.join(tmp, 'sbs.png'), 'rb') as f:
+    hdr = f.read(24)
+sw, sh = struct.unpack('>II', hdr[16:24])
+assert sw == 16 * 3 + 8 and sh == 16, f'sbs size={sw}x{sh}'
+assert os.path.isfile(os.path.join(tmp, 'diff.png'))
+print('OK: diff changed=4, max_delta=100, bbox=[4,6,2,2], sbs=%dx%d' % (sw, sh))
+" "$DIFF_JSON" "$TMP"
+
+IDENT_JSON="$("$INVAR" diff "$TMP/before.png" "$TMP/before.png" --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['identical'] is True and d['changed_pixels'] == 0 and d['max_delta'] == 0
+print('OK: diff identical=True')
+" "$IDENT_JSON"
+
+echo "=== 10. scripts/install.sh symlink verification ==="
+INST_BIN="$TMP/bin"
+INVAR_BIN_DIR="$INST_BIN" bash "$ROOT/scripts/install.sh" >/dev/null
+SYM_JSON="$("$INST_BIN/invar" doctor --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True
+print('OK: installed symlink invar doctor passed')
+" "$SYM_JSON"
+
+echo "=== ALL 10 INVAR CLI E2E TESTS PASSED! ==="

@@ -1,0 +1,1910 @@
+#!/usr/bin/env python3
+"""
+Unified `invar` CLI toolchain (Agent-First, zero third-party dependencies).
+Subcommands: doctor, check, test, audit, new, web, shot, diff, host-check, bench.
+"""
+
+import argparse
+import functools
+import gzip
+import http.server
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import socketserver
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import zlib
+
+INVAR_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+DEFAULT_CHECK_PKGS = [
+    "hostapi", "host", "host_web", "film", "view", "damage", "headless",
+    "ui", "kit", "lg", "lg_pages", "lg_shots", "lg_web", "bench", "site",
+    "examples/worker_app",
+]
+
+DEFAULT_TEST_PKGS = [
+    "layer0_check", "layer1a_check", "layer1b_check", "view", "damage",
+    "headless", "hostapi", "ui", "kit", "lg", "bench", "site",
+    "examples/worker_app",
+]
+
+WEB_RUNTIME_FILES = [
+    "host.js",
+    "pion_host_bridge.mjs",
+    "pion_wasm_rt_web.mjs",
+    "pion_wasm_rt_web.min.mjs",
+]
+
+
+def emit_json(obj):
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+
+
+def run_cmd(cmd, cwd=None, env=None, capture=True):
+    t0 = time.monotonic()
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            text=True,
+        )
+        ms = int((time.monotonic() - t0) * 1000)
+        return p.returncode, (p.stdout or ""), (p.stderr or ""), ms
+    except FileNotFoundError as e:
+        ms = int((time.monotonic() - t0) * 1000)
+        return 127, "", str(e), ms
+
+
+def resolve_pionc():
+    candidates = []
+    env_p = os.environ.get("PIONC", "").strip()
+    if env_p:
+        candidates.append(env_p)
+    for name in ("pionc", "pionc2"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    rel = os.path.join(os.path.dirname(INVAR_ROOT), "pion", "out", "pionc2")
+    candidates.append(rel)
+
+    pionc_path = None
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            pionc_path = os.path.realpath(c)
+            break
+
+    info = {
+        "found": pionc_path is not None,
+        "path": pionc_path,
+        "qbe": None,
+        "libpionrt": None,
+        "wasm_rt": None,
+        "subcommands": [],
+    }
+    if not pionc_path:
+        return info
+
+    d = os.path.dirname(pionc_path)
+    qbe = os.environ.get("PION_QBE", "").strip() or os.path.join(d, "qbe")
+    if os.path.isfile(qbe):
+        info["qbe"] = qbe
+    for rt_cand in (
+        os.environ.get("PION_RT_LIB", "").strip(),
+        os.path.join(d, "libpionrt.a"),
+        os.path.normpath(os.path.join(d, "..", "lib", "libpionrt.a")),
+    ):
+        if rt_cand and os.path.isfile(rt_cand):
+            info["libpionrt"] = rt_cand
+            break
+    for wr_cand in (
+        os.environ.get("PION_WASM_RT", "").strip(),
+        os.path.normpath(os.path.join(d, "..", "runtime", "pion_wasm_rt.mjs")),
+        os.path.normpath(os.path.join(d, "..", "share", "pion", "pion_wasm_rt.mjs")),
+    ):
+        if wr_cand and os.path.isfile(wr_cand):
+            info["wasm_rt"] = wr_cand
+            break
+
+    rc, out, err, _ = run_cmd([pionc_path, "--help"])
+    help_text = out + "\n" + err
+    subs = []
+    for sub in ("check", "build", "test", "fmt", "query", "doc", "run"):
+        if re.search(rf"\b{sub}\b", help_text):
+            subs.append(sub)
+    info["subcommands"] = subs
+    return info
+
+
+def build_pion_env(pion_info):
+    env = os.environ.copy()
+    if pion_info.get("path"):
+        pdir = os.path.dirname(pion_info["path"])
+        env["PATH"] = pdir + os.pathsep + env.get("PATH", "")
+    if pion_info.get("qbe"):
+        env["PION_QBE"] = pion_info["qbe"]
+    if pion_info.get("libpionrt"):
+        env["PION_RT_LIB"] = pion_info["libpionrt"]
+    if pion_info.get("wasm_rt"):
+        env["PION_WASM_RT"] = pion_info["wasm_rt"]
+    return env
+
+
+def resolve_pkg_dir(spec):
+    if os.path.isdir(spec) and os.path.isfile(os.path.join(spec, "pion.toml")):
+        return os.path.realpath(spec)
+    p1 = os.path.join(INVAR_ROOT, spec)
+    if os.path.isdir(p1) and os.path.isfile(os.path.join(p1, "pion.toml")):
+        return p1
+    p2 = os.path.join(INVAR_ROOT, "packages", spec)
+    if os.path.isdir(p2) and os.path.isfile(os.path.join(p2, "pion.toml")):
+        return p2
+    return os.path.realpath(spec)
+
+
+def default_pkg_list(base_list):
+    pkgs = list(base_list)
+    jsx_app = os.path.join(INVAR_ROOT, "examples", "jsx_app", "pion.toml")
+    if os.path.isfile(jsx_app) and "examples/jsx_app" not in pkgs:
+        pkgs.append("examples/jsx_app")
+    return pkgs
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python WASM Import Section (ID 2) Parser & JS Export Extractor
+# ---------------------------------------------------------------------------
+
+def _read_u32_leb(data, pos):
+    val = 0
+    shift = 0
+    while True:
+        if pos >= len(data):
+            raise ValueError("Truncated LEB128 in WASM")
+        b = data[pos]
+        pos += 1
+        val |= (b & 0x7F) << shift
+        if (b & 0x80) == 0:
+            return val, pos
+        shift += 7
+        if shift > 35:
+            raise ValueError("LEB128 overflow in WASM")
+
+
+def parse_wasm_imports(wasm_path):
+    with open(wasm_path, "rb") as f:
+        data = f.read()
+    if len(data) < 8 or data[:4] != b"\x00asm":
+        raise ValueError("Invalid WASM magic header")
+    pos = 8
+    imports = []
+    while pos < len(data):
+        sec_id = data[pos]
+        pos += 1
+        sec_len, pos = _read_u32_leb(data, pos)
+        sec_end = pos + sec_len
+        if sec_id == 2:  # Import section
+            count, pos = _read_u32_leb(data, pos)
+            for _ in range(count):
+                mlen, pos = _read_u32_leb(data, pos)
+                mod = data[pos:pos + mlen].decode("utf-8", errors="replace")
+                pos += mlen
+                nlen, pos = _read_u32_leb(data, pos)
+                name = data[pos:pos + nlen].decode("utf-8", errors="replace")
+                pos += nlen
+                kind = data[pos]
+                pos += 1
+                if kind == 0x00:  # func
+                    _, pos = _read_u32_leb(data, pos)
+                elif kind == 0x01:  # table
+                    pos += 1  # elemtype
+                    flags, pos = _read_u32_leb(data, pos)
+                    _, pos = _read_u32_leb(data, pos)
+                    if flags & 1:
+                        _, pos = _read_u32_leb(data, pos)
+                elif kind == 0x02:  # mem
+                    flags, pos = _read_u32_leb(data, pos)
+                    _, pos = _read_u32_leb(data, pos)
+                    if flags & 1:
+                        _, pos = _read_u32_leb(data, pos)
+                elif kind == 0x03:  # global
+                    pos += 2  # valtype + mutability
+                elif kind == 0x04:  # tag
+                    pos += 1
+                    _, pos = _read_u32_leb(data, pos)
+                imports.append((mod, name, kind))
+            break
+        pos = sec_end
+    return imports
+
+
+def extract_web_provided_pion_rt():
+    provided = set()
+    rt_path = os.path.join(INVAR_ROOT, "web", "pion_wasm_rt_web.mjs")
+    bridge_path = os.path.join(INVAR_ROOT, "web", "pion_host_bridge.mjs")
+
+    # Parse `pion_rt: { ... }` inside pion_wasm_rt_web.mjs
+    if os.path.isfile(rt_path):
+        src = open(rt_path, "r", encoding="utf-8").read()
+        m = re.search(r"pion_rt\s*:\s*\{", src)
+        if m:
+            i = m.end()
+            depth = 1
+            while i < len(src) and depth > 0:
+                ch = src[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                i += 1
+            body = src[m.end():i - 1]
+            # Strip nested braces/parens so we only see top-level keys of pion_rt object
+            top = []
+            d_brace = 0
+            d_paren = 0
+            in_str = None
+            esc = False
+            for ch in body:
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == in_str:
+                        in_str = None
+                    continue
+                if ch in ("'", '"', "`"):
+                    in_str = ch
+                    continue
+                if ch == "{":
+                    d_brace += 1
+                    continue
+                if ch == "}":
+                    d_brace -= 1
+                    continue
+                if ch == "(":
+                    d_paren += 1
+                    continue
+                if ch == ")":
+                    d_paren -= 1
+                    continue
+                if d_brace == 0 and d_paren == 0:
+                    top.append(ch)
+            flat = "".join(top)
+            for item in flat.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                key = item.split(":", 1)[0].strip()
+                if re.match(r"^[A-Za-z_$][A-Za-z0-9_$]*$", key):
+                    provided.add(key)
+
+    # Parse bridge exports in pion_host_bridge.mjs
+    if os.path.isfile(bridge_path):
+        bsrc = open(bridge_path, "r", encoding="utf-8").read()
+        # Object.assign(rt.imports.pion_rt, { ... }) or const hostImports = { ... }
+        for m in re.finditer(r"Object\.assign\(\s*rt\.imports\.pion_rt\s*,\s*\{", bsrc):
+            i = m.end()
+            depth = 1
+            while i < len(bsrc) and depth > 0:
+                if bsrc[i] == "{":
+                    depth += 1
+                elif bsrc[i] == "}":
+                    depth -= 1
+                i += 1
+            body = bsrc[m.end():i - 1]
+            # Strip comments
+            body = re.sub(r"//[^\n]*", "", body)
+            for km in re.finditer(r"(?:^|[,{\s])([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::|\()", body):
+                name = km.group(1)
+                if name.startswith("mb_web_") or name.startswith("invar_") or name.startswith("pion_"):
+                    provided.add(name)
+        for m in re.finditer(r"(?:rt\.imports\.pion_rt|pion_rt)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=", bsrc):
+            provided.add(m.group(1))
+        for m in re.finditer(r"\b(mb_web_[A-Za-z0-9_]+|invar_hostapi_[A-Za-z0-9_]+)\s*(?::|\()", bsrc):
+            provided.add(m.group(1))
+
+    return provided
+
+
+def verify_wasm_imports(wasm_path):
+    imps = parse_wasm_imports(wasm_path)
+    provided = extract_web_provided_pion_rt()
+    pion_rt_imps = [name for (mod, name, _k) in imps if mod == "pion_rt"]
+    other_imps = [f"{mod}.{name}" for (mod, name, _k) in imps if mod != "pion_rt"]
+    missing = [name for name in pion_rt_imps if name not in provided]
+    return {
+        "total": len(imps),
+        "pion_rt_total": len(pion_rt_imps),
+        "missing": missing,
+        "other_modules": other_imps,
+        "ok": len(missing) == 0 and len(other_imps) == 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python PNG Decoder / Encoder (stdlib only: struct + zlib)
+# ---------------------------------------------------------------------------
+
+def _paeth(a, b, c):
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def decode_png_rgba(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"Not a PNG file: {path}")
+    pos = 8
+    w = h = bit_depth = color_type = 0
+    idat = bytearray()
+    while pos + 8 <= len(data):
+        length, ctype = struct.unpack(">I4s", data[pos:pos + 8])
+        chunk = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if ctype == b"IHDR":
+            w, h, bit_depth, color_type, comp, filt, interlace = struct.unpack(">IIBBBBB", chunk)
+            if bit_depth != 8 or interlace != 0:
+                raise ValueError(f"Unsupported PNG format (bit_depth={bit_depth}, interlace={interlace})")
+        elif ctype == b"IDAT":
+            idat.extend(chunk)
+        elif ctype == b"IEND":
+            break
+
+    bpp_map = {0: 1, 2: 3, 4: 2, 6: 4}
+    if color_type not in bpp_map:
+        raise ValueError(f"Unsupported PNG color_type={color_type}")
+    bpp = bpp_map[color_type]
+    raw = zlib.decompress(bytes(idat))
+    stride = w * bpp
+    recon = bytearray(h * stride)
+
+    for y in range(h):
+        row_start = y * (stride + 1)
+        ftype = raw[row_start]
+        src_off = row_start + 1
+        dst_off = y * stride
+        prev_off = (y - 1) * stride
+        for i in range(stride):
+            x = raw[src_off + i]
+            a = recon[dst_off + i - bpp] if i >= bpp else 0
+            b = recon[prev_off + i] if y > 0 else 0
+            c = recon[prev_off + i - bpp] if (y > 0 and i >= bpp) else 0
+            if ftype == 0:
+                v = x
+            elif ftype == 1:
+                v = (x + a) & 0xFF
+            elif ftype == 2:
+                v = (x + b) & 0xFF
+            elif ftype == 3:
+                v = (x + ((a + b) >> 1)) & 0xFF
+            elif ftype == 4:
+                v = (x + _paeth(a, b, c)) & 0xFF
+            else:
+                raise ValueError(f"Unknown PNG filter type {ftype}")
+            recon[dst_off + i] = v
+
+    if color_type == 6:
+        return w, h, recon
+
+    rgba = bytearray(w * h * 4)
+    if color_type == 2:  # RGB
+        for p in range(w * h):
+            si = p * 3
+            di = p * 4
+            rgba[di] = recon[si]
+            rgba[di + 1] = recon[si + 1]
+            rgba[di + 2] = recon[si + 2]
+            rgba[di + 3] = 255
+    elif color_type == 0:  # Gray
+        for p in range(w * h):
+            g = recon[p]
+            di = p * 4
+            rgba[di] = g
+            rgba[di + 1] = g
+            rgba[di + 2] = g
+            rgba[di + 3] = 255
+    elif color_type == 4:  # GrayA
+        for p in range(w * h):
+            g = recon[p * 2]
+            a = recon[p * 2 + 1]
+            di = p * 4
+            rgba[di] = g
+            rgba[di + 1] = g
+            rgba[di + 2] = g
+            rgba[di + 3] = a
+    return w, h, rgba
+
+
+def encode_png_rgba(path, w, h, rgba):
+    def _chunk(ctype, body):
+        crc = zlib.crc32(ctype)
+        crc = zlib.crc32(body, crc) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + ctype + body + struct.pack(">I", crc)
+
+    raw = bytearray()
+    row_bytes = w * 4
+    for y in range(h):
+        raw.append(0)  # Filter None
+        off = y * row_bytes
+        raw.extend(rgba[off:off + row_bytes])
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
+    out = bytearray(b"\x89PNG\r\n\x1a\n")
+    out.extend(_chunk(b"IHDR", ihdr))
+    out.extend(_chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
+    out.extend(_chunk(b"IEND", b""))
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(out)
+
+
+def read_png_ihdr(path):
+    with open(path, "rb") as f:
+        hdr = f.read(24)
+    if len(hdr) < 24 or hdr[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    w, h = struct.unpack(">II", hdr[16:24])
+    return w, h
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 1: doctor
+# ---------------------------------------------------------------------------
+
+def cmd_doctor(args):
+    sys_os = platform.system().lower()
+    arch = platform.machine()
+    pionc = resolve_pionc()
+    issues = []
+
+    if not pionc["found"]:
+        issues.append("pionc compiler not found (set PIONC or add pionc/pionc2 to PATH)")
+    else:
+        if not pionc["qbe"]:
+            issues.append("qbe binary not found beside pionc (set PION_QBE)")
+        if not pionc["libpionrt"]:
+            issues.append("libpionrt.a not found beside pionc (set PION_RT_LIB)")
+
+    hosts = {}
+    # macOS & iOS
+    if sys_os == "darwin":
+        clang = shutil.which("clang")
+        xcrun = shutil.which("xcrun")
+        mac_sdk = None
+        ios_sdk = None
+        if xcrun:
+            rc, out, _, _ = run_cmd(["xcrun", "--show-sdk-path"])
+            if rc == 0:
+                mac_sdk = out.strip()
+            rc, out, _, _ = run_cmd(["xcrun", "--sdk", "iphonesimulator", "--show-sdk-path"])
+            if rc == 0:
+                ios_sdk = out.strip()
+        hosts["macos"] = {"available": bool(clang and mac_sdk), "clang": clang, "xcrun": xcrun, "sdk": mac_sdk}
+        hosts["ios"] = {"available": bool(xcrun and ios_sdk), "iphonesimulator_sdk": ios_sdk}
+    else:
+        hosts["macos"] = {"available": False}
+        hosts["ios"] = {"available": False}
+
+    # Linux
+    if sys_os == "linux":
+        cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+        pkg_cfg = shutil.which("pkg-config")
+        req_libs = ["gtk4", "epoxy", "pangocairo", "pangoft2", "fontconfig", "gdk-pixbuf-2.0", "libsoup-3.0", "zlib"]
+        missing_libs = []
+        if pkg_cfg:
+            for lib in req_libs:
+                rc, _, _, _ = run_cmd([pkg_cfg, "--exists", lib])
+                if rc != 0:
+                    missing_libs.append(lib)
+        else:
+            missing_libs = req_libs
+        ffmpeg = shutil.which("ffmpeg")
+        mesa = os.path.exists("/usr/lib/x86_64-linux-gnu/dri/swrast_dri.so") or os.path.exists("/usr/lib/aarch64-linux-gnu/dri/swrast_dri.so")
+        hosts["linux"] = {
+            "available": bool(cc and not missing_libs),
+            "cc": cc,
+            "pkg_config": pkg_cfg,
+            "missing_libs": missing_libs,
+            "ffmpeg": ffmpeg,
+            "mesa_llvmpipe": mesa,
+        }
+    else:
+        hosts["linux"] = {"available": False}
+
+    # Windows
+    wv2_candidates = []
+    wv2_root = os.path.join(INVAR_ROOT, "packages", "host", "native", "webview2")
+    if os.path.isdir(wv2_root):
+        for root_d, _dirs, files in os.walk(wv2_root):
+            if "WebView2.h" in files:
+                wv2_candidates.append(os.path.join(root_d, "WebView2.h"))
+    baked_shaders = os.path.join(INVAR_ROOT, "packages", "host", "native", "win_shaders_baked.h")
+    hosts["windows"] = {
+        "available": sys_os == "windows" and bool(shutil.which("clang")) and bool(wv2_candidates),
+        "clang": shutil.which("clang"),
+        "lld": shutil.which("lld-link") or shutil.which("lld"),
+        "llvm_rc": shutil.which("llvm-rc"),
+        "webview2_header": wv2_candidates[0] if wv2_candidates else None,
+        "baked_shaders": os.path.isfile(baked_shaders),
+    }
+
+    # Web
+    node = shutil.which("node")
+    wasm_opt = shutil.which("wasm-opt")
+    brotli_bin = shutil.which("brotli")
+    web_files = {f: os.path.isfile(os.path.join(INVAR_ROOT, "web", f)) for f in WEB_RUNTIME_FILES}
+    if not node:
+        issues.append("node not found on PATH (needed for web syntax checks)")
+    for wf, exists in web_files.items():
+        if not exists:
+            issues.append(f"missing web/{wf}")
+    web_info = {
+        "available": bool(node) and all(web_files.values()),
+        "node": node,
+        "wasm_opt": wasm_opt,
+        "brotli": brotli_bin,
+        "files": web_files,
+    }
+
+    ok = pionc["found"] and bool(pionc["qbe"]) and bool(pionc["libpionrt"]) and web_info["available"]
+    res = {
+        "ok": ok,
+        "invar_root": INVAR_ROOT,
+        "os": sys_os,
+        "arch": arch,
+        "pionc": pionc,
+        "hosts": hosts,
+        "web": web_info,
+        "issues": issues,
+    }
+    if args.json:
+        emit_json(res)
+    else:
+        print(f"Invar Doctor ({sys_os}/{arch}) — {'OK' if ok else 'ISSUES FOUND'}")
+        print(f"  root : {INVAR_ROOT}")
+        print(f"  pionc: {pionc['path'] or 'NOT FOUND'}")
+        print(f"  qbe  : {pionc['qbe'] or 'NOT FOUND'}")
+        print(f"  rt   : {pionc['libpionrt'] or 'NOT FOUND'}")
+        print(f"  web  : node={node or 'missing'}, wasm-opt={wasm_opt or 'optional'}, brotli={brotli_bin or 'optional'}")
+        for iss in issues:
+            print(f"  [!] {iss}")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 2: check
+# ---------------------------------------------------------------------------
+
+def cmd_check(args):
+    pionc = resolve_pionc()
+    if not pionc["found"]:
+        err = {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+        emit_json(err) if args.json else print(err["error"], file=sys.stderr)
+        return 1
+    env = build_pion_env(pionc)
+    pkgs = args.pkg if args.pkg else default_pkg_list(DEFAULT_CHECK_PKGS)
+    t_all = time.monotonic()
+    results = []
+    all_ok = True
+
+    do_fmt = bool(args.fmt) and not bool(args.no_fmt)
+    for spec in pkgs:
+        pdir = resolve_pkg_dir(spec)
+        t0 = time.monotonic()
+        fmt_ok = True
+        check_ok = True
+        err_msg = ""
+
+        if not os.path.isdir(pdir):
+            all_ok = False
+            results.append({"pkg": spec, "ok": False, "fmt_ok": False, "check_ok": False, "elapsed_ms": 0, "error": f"package directory not found: {pdir}"})
+            continue
+
+        if do_fmt:
+            pion_files = []
+            src_dir = os.path.join(pdir, "src")
+            if os.path.isdir(src_dir):
+                for r_d, _ds, fs in os.walk(src_dir):
+                    for fn in sorted(fs):
+                        if fn.endswith(".pion"):
+                            pion_files.append(os.path.join(r_d, fn))
+            if pion_files:
+                rc, out, err, _ = run_cmd([pionc["path"], "fmt", "--check"] + pion_files, cwd=INVAR_ROOT, env=env)
+                if rc != 0:
+                    fmt_ok = False
+                    err_msg = (out + err).strip()
+
+        rc, out, err, _ = run_cmd([pionc["path"], "check", pdir], cwd=INVAR_ROOT, env=env)
+        if rc != 0:
+            check_ok = False
+            err_msg = (err_msg + "\n" + (out + err).strip()).strip()
+
+        pkg_ok = fmt_ok and check_ok
+        if not pkg_ok:
+            all_ok = False
+        ms = int((time.monotonic() - t0) * 1000)
+        results.append({
+            "pkg": spec,
+            "ok": pkg_ok,
+            "fmt_ok": fmt_ok,
+            "check_ok": check_ok,
+            "elapsed_ms": ms,
+            "error": err_msg,
+        })
+
+    total_ms = int((time.monotonic() - t_all) * 1000)
+    res = {
+        "ok": all_ok,
+        "elapsed_ms": total_ms,
+        "fmt_checked": do_fmt,
+        "packages": results,
+    }
+    if args.json:
+        emit_json(res)
+    else:
+        for r in results:
+            status = "PASS" if r["ok"] else "FAIL"
+            print(f"[{status}] {r['pkg']} ({r['elapsed_ms']} ms)")
+            if r["error"]:
+                print("  " + r["error"].replace("\n", "\n  "))
+        print(f"invar check: {'OK' if all_ok else 'FAILED'} ({len(results)} packages, {total_ms} ms)")
+    return 0 if all_ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 3: test
+# ---------------------------------------------------------------------------
+
+def cmd_test(args):
+    pionc = resolve_pionc()
+    if not pionc["found"]:
+        err = {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+        emit_json(err) if args.json else print(err["error"], file=sys.stderr)
+        return 1
+    env = build_pion_env(pionc)
+    pkgs = args.pkg if args.pkg else default_pkg_list(DEFAULT_TEST_PKGS)
+    t_all = time.monotonic()
+    results = []
+    total_passed = 0
+    total_failed = 0
+    all_ok = True
+
+    for spec in pkgs:
+        pdir = resolve_pkg_dir(spec)
+        t0 = time.monotonic()
+        cmd = [pionc["path"], "test", pdir]
+        if args.filter:
+            cmd += ["--filter", args.filter]
+        rc, out, err, _ = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
+        ms = int((time.monotonic() - t0) * 1000)
+        combined = out + "\n" + err
+        m = re.search(r"test result:\s*\w+\.\s*(\d+)\s+passed;\s*(\d+)\s+failed", combined)
+        passed = int(m.group(1)) if m else 0
+        failed = int(m.group(2)) if m else (0 if rc == 0 else 1)
+        total_passed += passed
+        total_failed += failed
+        pkg_ok = (rc == 0 and failed == 0)
+        if not pkg_ok:
+            all_ok = False
+        results.append({
+            "pkg": spec,
+            "ok": pkg_ok,
+            "passed": passed,
+            "failed": failed,
+            "elapsed_ms": ms,
+            "error": "" if pkg_ok else combined.strip()[-1200:],
+        })
+
+    total_ms = int((time.monotonic() - t_all) * 1000)
+    res = {
+        "ok": all_ok,
+        "elapsed_ms": total_ms,
+        "total_passed": total_passed,
+        "total_failed": total_failed,
+        "packages": results,
+    }
+    if args.json:
+        emit_json(res)
+    else:
+        for r in results:
+            status = "PASS" if r["ok"] else "FAIL"
+            print(f"[{status}] {r['pkg']}: {r['passed']} passed, {r['failed']} failed ({r['elapsed_ms']} ms)")
+            if r["error"]:
+                print(r["error"])
+        print(f"invar test: {'OK' if all_ok else 'FAILED'} ({total_passed} passed, {total_failed} failed, {total_ms} ms)")
+    return 0 if all_ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 4: audit
+# ---------------------------------------------------------------------------
+
+def cmd_audit(args):
+    diags = []
+
+    def add_diag(code, severity, file_path, line, message, fixit):
+        diags.append({
+            "code": code,
+            "severity": severity,
+            "file": file_path,
+            "line": line,
+            "message": message,
+            "fixit": fixit,
+        })
+
+    target_dir = os.path.realpath(args.target_dir) if args.target_dir else None
+    is_external_app = False
+    if target_dir:
+        in_invar_pkgs = target_dir.startswith(os.path.join(INVAR_ROOT, "packages") + os.sep) or target_dir == os.path.join(INVAR_ROOT, "packages")
+        if os.path.isfile(os.path.join(target_dir, "pion.toml")) and not in_invar_pkgs:
+            is_external_app = True
+
+    # E001: Hand-rolled Glass::liquid outside packages/lg/
+    lg_dir = os.path.realpath(os.path.join(INVAR_ROOT, "packages", "lg"))
+    scan_roots = [target_dir] if target_dir else [os.path.join(INVAR_ROOT, "packages"), os.path.join(INVAR_ROOT, "examples")]
+    for sr in scan_roots:
+        if not os.path.isdir(sr):
+            continue
+        for r_d, _ds, fs in os.walk(sr):
+            real_rd = os.path.realpath(r_d)
+            if real_rd == lg_dir or real_rd.startswith(lg_dir + os.sep):
+                continue
+            for fn in sorted(fs):
+                if not fn.endswith(".pion"):
+                    continue
+                fp = os.path.join(r_d, fn)
+                with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                    for ln, text in enumerate(f, 1):
+                        if "Glass::liquid" in text:
+                            # Ignore pure comments explaining the rule
+                            stripped = text.lstrip()
+                            if stripped.startswith("//"):
+                                continue
+                            # Allow inside Invar's own primitive/encoder/optical-showcase/microbench packages
+                            rel = os.path.relpath(fp, INVAR_ROOT) if fp.startswith(INVAR_ROOT) else fp
+                            if rel.startswith((
+                                "packages/paint/",
+                                "packages/ui/",
+                                "packages/view/",
+                                "packages/lg_pages/",
+                                "packages/bench_gpu/",
+                                "packages/layer1a_check/",
+                            )):
+                                continue
+                            add_diag(
+                                "INVAR_E001_HAND_ROLLED_GLASS",
+                                "error",
+                                rel,
+                                ln,
+                                "Direct `Glass::liquid` call outside `packages/lg`",
+                                "Use a component from `packages/lg` (`lg::Panel`, `lg::Button`, `lg::liquid_*_node`) instead.",
+                            )
+
+    # E002: 4-backend renderer lockstep + Windows manifest sources + baked shaders
+    renderers = [
+        ("packages/host/native/apple_render.m", False),
+        ("packages/host/native/gles_render.h", False),
+        ("packages/host/native/win_render.cpp", False),
+        ("web/host.js", True),
+    ]
+    for rel, is_js in renderers:
+        fp = os.path.join(INVAR_ROOT, rel)
+        if not os.path.isfile(fp):
+            add_diag("INVAR_E002_RENDERER_LOCKSTEP", "error", rel, 1, f"Missing renderer file {rel}", "Restore all 4 GPU renderer backends.")
+            continue
+        src = open(fp, "r", encoding="utf-8", errors="replace").read()
+        has_blur_buf = ("MB_BLUR_LAYERS" in src) or ("blPy" in src)
+        has_k14 = ("kind === 14" in src) if is_js else ("kind == 14" in src)
+        has_k15 = ("kind === 15" in src) if is_js else ("kind == 15" in src)
+        has_stride60 = ("INST = 60" in src) if is_js else ("60" in src and "MB_INST" in src)
+        missing = []
+        if not has_blur_buf:
+            missing.append("MB_BLUR_LAYERS/blPy")
+        if not has_k14:
+            missing.append("kind==14")
+        if not has_k15:
+            missing.append("kind==15")
+        if not has_stride60:
+            missing.append("stride=60")
+        if missing:
+            add_diag(
+                "INVAR_E002_RENDERER_LOCKSTEP",
+                "error",
+                rel,
+                1,
+                f"Renderer out of lockstep; missing markers: {', '.join(missing)}",
+                "Keep all 4 GPU renderers synchronized with blur layers (kind 14/15) and 60-float instance stride.",
+            )
+
+    host_toml = os.path.join(INVAR_ROOT, "packages", "host", "pion.toml")
+    if os.path.isfile(host_toml):
+        tsrc = open(host_toml, "r", encoding="utf-8").read()
+        m_win = re.search(r"\[link\.windows\](.*)", tsrc, re.S)
+        if m_win:
+            m_cs = re.search(r"c_sources\s*=\s*\[(.*?)\]", m_win.group(1), re.S)
+            if m_cs:
+                for sm in re.finditer(r'"([^"]+)"', m_cs.group(1)):
+                    csrc = sm.group(1)
+                    full = os.path.join(INVAR_ROOT, "packages", "host", csrc)
+                    if not os.path.isfile(full):
+                        add_diag(
+                            "INVAR_E002_RENDERER_LOCKSTEP",
+                            "error",
+                            "packages/host/pion.toml",
+                            1,
+                            f"[link.windows] c_source missing on disk: {csrc}",
+                            f"Create or fix path for packages/host/{csrc}.",
+                        )
+    baked_h = os.path.join(INVAR_ROOT, "packages", "host", "native", "win_shaders_baked.h")
+    if not os.path.isfile(baked_h):
+        add_diag(
+            "INVAR_E002_RENDERER_LOCKSTEP",
+            "error",
+            "packages/host/native/win_shaders_baked.h",
+            1,
+            "Missing baked Windows shaders header win_shaders_baked.h",
+            "Rebake shaders with packages/host/tools/bake_win_shaders.c.",
+        )
+
+    # E003: JS syntax check via node --check
+    node = shutil.which("node")
+    if node:
+        for wf in WEB_RUNTIME_FILES:
+            fp = os.path.join(INVAR_ROOT, "web", wf)
+            if not os.path.isfile(fp):
+                add_diag("INVAR_E003_JS_SYNTAX", "error", f"web/{wf}", 1, f"Missing web/{wf}", "Restore web runtime asset.")
+                continue
+            rc, out, err, _ = run_cmd([node, "--check", fp])
+            if rc != 0:
+                add_diag("INVAR_E003_JS_SYNTAX", "error", f"web/{wf}", 1, (out + err).strip(), f"Fix JS syntax errors in web/{wf}.")
+    else:
+        add_diag("INVAR_E003_JS_SYNTAX", "warning", "web/", 1, "node not found; skipped JS syntax check", "Install Node.js to validate web/*.js.")
+
+    # E004: WASM imports check
+    wasm_imports_report = None
+    tmp_wasm = None
+    wasm_path = args.wasm
+    if args.build_wasm and not wasm_path:
+        pionc = resolve_pionc()
+        if not pionc["found"]:
+            add_diag("INVAR_E004_WASM_IMPORTS", "error", "packages/lg_web", 1, "pionc not found for --build-wasm", "Set PIONC or install pionc2.")
+        else:
+            env = build_pion_env(pionc)
+            fd, tmp_wasm = tempfile.mkstemp(prefix="invar_audit_", suffix=".wasm")
+            os.close(fd)
+            rc, out, err, _ = run_cmd([pionc["path"], "build", "--release", "--target", "wasm32", os.path.join(INVAR_ROOT, "packages", "lg_web"), "-o", tmp_wasm], cwd=INVAR_ROOT, env=env)
+            if rc != 0:
+                add_diag("INVAR_E004_WASM_IMPORTS", "error", "packages/lg_web", 1, f"wasm32 build failed: {(out + err).strip()}", "Fix wasm32 build errors.")
+            else:
+                wasm_path = tmp_wasm
+
+    if wasm_path:
+        try:
+            wasm_imports_report = verify_wasm_imports(wasm_path)
+            if not wasm_imports_report["ok"]:
+                if wasm_imports_report["missing"]:
+                    add_diag(
+                        "INVAR_E004_WASM_IMPORTS",
+                        "error",
+                        wasm_path,
+                        1,
+                        f"Missing pion_rt WASM imports: {', '.join(wasm_imports_report['missing'])}",
+                        "Add the missing imports to web/pion_wasm_rt_web.mjs or web/pion_host_bridge.mjs.",
+                    )
+                if wasm_imports_report["other_modules"]:
+                    add_diag(
+                        "INVAR_E004_WASM_IMPORTS",
+                        "error",
+                        wasm_path,
+                        1,
+                        f"Unexpected non-pion_rt WASM imports: {', '.join(wasm_imports_report['other_modules'])}",
+                        "Ensure all WASM imports come from pion_rt.",
+                    )
+        except Exception as e:
+            add_diag("INVAR_E004_WASM_IMPORTS", "error", wasm_path, 1, f"Failed to parse WASM imports: {e}", "Verify WASM binary integrity.")
+    if tmp_wasm and os.path.exists(tmp_wasm):
+        os.unlink(tmp_wasm)
+
+    # W005: Stale brand leak check (error severity to prevent leaks)
+    brand_files = [
+        "web/index.html",
+        "README.md",
+        "AGENTS.md",
+        "packages/lg/CATALOG.md",
+        "packages/lg/DESIGN.md",
+    ]
+    stale_pat = re.compile(r"ui\.monoid|still\.fail", re.IGNORECASE)
+    for rel in brand_files:
+        fp = os.path.join(INVAR_ROOT, rel)
+        if not os.path.isfile(fp):
+            continue
+        with open(fp, "r", encoding="utf-8", errors="replace") as f:
+            for ln, text in enumerate(f, 1):
+                m = stale_pat.search(text)
+                if m:
+                    add_diag(
+                        "INVAR_W005_STALE_BRAND",
+                        "error",
+                        rel,
+                        ln,
+                        f"Stale brand reference `{m.group(0)}` in public file",
+                        f"Replace `{m.group(0)}` with `Invar`.",
+                    )
+
+    # W006: External app gates
+    if is_external_app:
+        src_dir = os.path.join(target_dir, "src")
+        has_glass_audit = False
+        has_scroll_audit = False
+        if os.path.isdir(src_dir):
+            for r_d, _ds, fs in os.walk(src_dir):
+                for fn in sorted(fs):
+                    if not fn.endswith(".pion"):
+                        continue
+                    fp = os.path.join(r_d, fn)
+                    txt = open(fp, "r", encoding="utf-8", errors="replace").read()
+                    if "view" in fn.lower() and not fn.endswith("_test.pion"):
+                        for ln, line in enumerate(txt.splitlines(), 1):
+                            if re.search(r"\bWorld\b", line) and not line.lstrip().startswith("//"):
+                                add_diag(
+                                    "INVAR_W006_APP_GATES",
+                                    "error",
+                                    fp,
+                                    ln,
+                                    "View file references `World` capability (render thread must stay IO-free)",
+                                    "Move IO to `ui::Worker` and remove `World` from view files.",
+                                )
+                    if fn.endswith("_test.pion"):
+                        if "assert_no_nested_glass" in txt:
+                            has_glass_audit = True
+                        if "scroll_faults" in txt or "assert_scrollable" in txt:
+                            has_scroll_audit = True
+        if not has_glass_audit:
+            add_diag(
+                "INVAR_W006_APP_GATES",
+                "warning",
+                target_dir,
+                1,
+                "App tests missing `lg::assert_no_nested_glass` audit gate",
+                "Call `lg::assert_no_nested_glass(t, label=\"...\")` in `src/*_test.pion`.",
+            )
+        if not has_scroll_audit:
+            add_diag(
+                "INVAR_W006_APP_GATES",
+                "warning",
+                target_dir,
+                1,
+                "App tests missing `scroll_faults` / `assert_scrollable` audit gate",
+                "Assert `t.scroll_faults().length() == 0` in `src/*_test.pion`.",
+            )
+
+    err_cnt = sum(1 for d in diags if d["severity"] == "error")
+    warn_cnt = sum(1 for d in diags if d["severity"] == "warning")
+    ok = err_cnt == 0
+    res = {
+        "ok": ok,
+        "error_count": err_cnt,
+        "warning_count": warn_cnt,
+        "diagnostics": diags,
+    }
+    if wasm_imports_report is not None:
+        res["wasm_imports"] = wasm_imports_report
+
+    if args.json:
+        emit_json(res)
+    else:
+        for d in diags:
+            print(f"[{d['severity'].upper()}] {d['code']} {d['file']}:{d['line']}: {d['message']}")
+            print(f"  fixit: {d['fixit']}")
+        if wasm_imports_report is not None:
+            print(f"WASM imports: {wasm_imports_report['total']} total ({wasm_imports_report['pion_rt_total']} pion_rt), {len(wasm_imports_report['missing'])} missing")
+        print(f"invar audit: {'OK' if ok else 'FAILED'} ({err_cnt} errors, {warn_cnt} warnings)")
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 5: new
+# ---------------------------------------------------------------------------
+
+MACOS_FRAMEWORKS_TOML = """[link.macos]
+frameworks = [
+  "Foundation",
+  "Cocoa",
+  "Metal",
+  "QuartzCore",
+  "CoreText",
+  "CoreGraphics",
+  "ImageIO",
+  "AVFoundation",
+  "CoreMedia",
+  "CoreVideo",
+  "WebKit",
+]
+"""
+
+
+def cmd_new(args):
+    out_dir = os.path.abspath(args.dir)
+    pkg_name = args.name or os.path.basename(out_dir).replace("-", "_")
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", pkg_name):
+        msg = f"Invalid package identifier `{pkg_name}` (must match ^[a-zA-Z_][a-zA-Z0-9_]*$)"
+        emit_json({"ok": False, "error": msg}) if args.json else print(msg, file=sys.stderr)
+        return 1
+
+    invar_path = os.path.realpath(args.invar) if args.invar else INVAR_ROOT
+    pkgs_path = os.path.join(invar_path, "packages")
+    tpl = args.template
+
+    files = {}
+    if tpl == "jsx-app":
+        files["pion.toml"] = (
+            f'[package]\nname = "{pkg_name}"\nversion = "0.1.0"\n\n'
+            f'[dependencies]\n'
+            f'host = {{ path = "{pkgs_path}/host" }}\n'
+            f'signals = {{ path = "{pkgs_path}/signals" }}\n'
+            f'view = {{ path = "{pkgs_path}/view" }}\n'
+            f'ui = {{ path = "{pkgs_path}/ui" }}\n'
+            f'kit = {{ path = "{pkgs_path}/kit" }}\n'
+            f'lg = {{ path = "{pkgs_path}/lg" }}\n\n'
+            + MACOS_FRAMEWORKS_TOML
+        )
+        files["src/view.pion"] = """// Render-thread view built with Pion-JSX (zero blocking IO, zero World).
+import "kit"
+import "lg"
+import "signals"
+import "ui"
+import "view"
+
+pub enum Cmd {
+  Refresh
+}
+
+pub enum Ev {
+  Refreshed(String)
+}
+
+pub fn build_view(root : view::View, worker : ui::Worker[Cmd, Ev]) -> Unit {
+  let status = signals::signal("Ready")
+  let count = signals::signal(0)
+  worker.bind(fn(ev : Ev) -> Unit {
+    match ev {
+      Ev::Refreshed(msg) => {
+        count.set(count.get() + 1)
+        status.set(msg)
+      }
+    }
+  })
+  <ui::Col in={root} fill pad={16.0} gap={12.0}>
+    <ui::Row rigid gap={10.0} align={.Middle}>
+      <kit::IconView kind={.Refresh} size={18.0} color={0x0A84FFFFL} />
+      <ui::Text text="Invar JSX App" size={18.0} weight={700} />
+      <ui::Spacer />
+      <lg::Badge label_by=>{ status.get() } tone={.Success} dot />
+    </ui::Row>
+    <ui::Scroll>
+      <ui::Col pad={4.0} gap={12.0}>
+        <lg::Panel gap={10.0} label="Actions">
+          <ui::Text text_by=>{ "Refreshes: \{count.get()}" } size={14.0} />
+          <lg::Button label="Refresh" flat on_press=>{ let _ = worker.send(Cmd::Refresh) } />
+        </lg::Panel>
+      </ui::Col>
+    </ui::Scroll>
+  </ui::Col>
+}
+"""
+        files["src/main.pion"] = """import "host"
+import "lg"
+import "ui"
+import "view"
+
+pub fn handle_cmd(_world : World, cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+  match cmd {
+    Cmd::Refresh => emit(Ev::Refreshed("Synced"))
+  }
+}
+
+pub fn main(world : World) -> Int {
+  host::install()
+  ui::set_tree_theme(lg::ui_theme)
+  let (worker, ctx) : (ui::Worker[Cmd, Ev], ui::WorkerCtx[Cmd, Ev]) = ui::Worker::pair()
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      ctx.run_loop(fn(cmd : Cmd, emit : (Ev) -> Unit) { handle_cmd(world, cmd, emit) })
+    })
+    ui::run("Invar JSX App", fn(root : view::View) { build_view(root, worker) })
+    worker.close()
+  })
+  0
+}
+"""
+        files["src/app_test.pion"] = """import "lg"
+import "ui"
+import "view"
+
+test "jsx app builds cleanly with zero nested glass and zero scroll faults" {
+  let worker = ui::Worker::inline(fn(cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+    match cmd {
+      Cmd::Refresh => emit(Ev::Refreshed("Synced"))
+    }
+  })
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit { build_view(root, worker) },
+    width=640.0,
+    height=480.0,
+    scale=2.0,
+    theme=lg::ui_theme,
+  )
+  t.frame()
+  lg::assert_no_nested_glass(t, label="jsx_app_initial")
+  debug_assert(t.scroll_faults().length() == 0, "expected 0 scroll faults")
+  let _ = worker.send(Cmd::Refresh)
+  t.frame()
+  lg::assert_no_nested_glass(t, label="jsx_app_refreshed")
+  t.dispose()
+}
+"""
+    elif tpl == "worker-app":
+        files["pion.toml"] = (
+            f'[package]\nname = "{pkg_name}"\nversion = "0.1.0"\n\n'
+            f'[dependencies]\n'
+            f'host = {{ path = "{pkgs_path}/host" }}\n'
+            f'signals = {{ path = "{pkgs_path}/signals" }}\n'
+            f'view = {{ path = "{pkgs_path}/view" }}\n'
+            f'ui = {{ path = "{pkgs_path}/ui" }}\n'
+            f'lg = {{ path = "{pkgs_path}/lg" }}\n\n'
+            + MACOS_FRAMEWORKS_TOML
+        )
+        files["src/view.pion"] = """import "lg"
+import "signals"
+import "ui"
+import "view"
+
+pub enum Cmd {
+  Ping
+}
+
+pub enum Ev {
+  Pong(String)
+}
+
+pub fn build_view(root : view::View, worker : ui::Worker[Cmd, Ev]) -> Unit {
+  let status = signals::signal("Idle")
+  worker.bind(fn(ev : Ev) -> Unit {
+    match ev {
+      Ev::Pong(msg) => status.set(msg)
+    }
+  })
+  let _ = root.pad_all(16.0).gap_px(12.0)
+  let _ = ui::scroll_box(root, fn(body : view::View) -> Unit {
+    let _ = lg::liquid_panel_node(
+      body,
+      fn(p : view::View) -> Unit {
+        let _ = p.box(fn(w : view::View) -> Unit {
+          let _ = w.words(view::Live::By(fn() { status.get() }), look=lg::words_at(15.0))
+        })
+        let _ = lg::liquid_button_node(
+          p,
+          fn() { "Ping Worker" },
+          fn() { let _ = worker.send(Cmd::Ping) },
+          flat=true,
+        )
+      },
+      gap=10.0,
+      label=fn() { "Worker" },
+    )
+  })
+}
+"""
+        files["src/main.pion"] = """import "host"
+import "lg"
+import "ui"
+import "view"
+
+pub fn handle_cmd(_world : World, cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+  match cmd {
+    Cmd::Ping => emit(Ev::Pong("Pong!"))
+  }
+}
+
+pub fn main(world : World) -> Int {
+  host::install()
+  ui::set_tree_theme(lg::ui_theme)
+  let (worker, ctx) : (ui::Worker[Cmd, Ev], ui::WorkerCtx[Cmd, Ev]) = ui::Worker::pair()
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      ctx.run_loop(fn(cmd : Cmd, emit : (Ev) -> Unit) { handle_cmd(world, cmd, emit) })
+    })
+    ui::run("Invar Worker App", fn(root : view::View) { build_view(root, worker) })
+    worker.close()
+  })
+  0
+}
+"""
+        files["src/app_test.pion"] = """import "lg"
+import "ui"
+import "view"
+
+test "worker app renders with zero nested glass and zero scroll faults" {
+  let worker = ui::Worker::inline(fn(cmd : Cmd, emit : (Ev) -> Unit) -> Unit {
+    match cmd {
+      Cmd::Ping => emit(Ev::Pong("Pong!"))
+    }
+  })
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit { build_view(root, worker) },
+    width=640.0,
+    height=480.0,
+    scale=2.0,
+    theme=lg::ui_theme,
+  )
+  t.frame()
+  lg::assert_no_nested_glass(t, label="worker_app")
+  debug_assert(t.scroll_faults().length() == 0, "expected 0 scroll faults")
+  t.dispose()
+}
+"""
+    else:  # web-app
+        files["pion.toml"] = (
+            f'[package]\nname = "{pkg_name}"\nversion = "0.1.0"\n\n'
+            f'[dependencies]\n'
+            f'host_web = {{ path = "{pkgs_path}/host_web" }}\n'
+            f'hostapi = {{ path = "{pkgs_path}/hostapi" }}\n'
+            f'signals = {{ path = "{pkgs_path}/signals" }}\n'
+            f'view = {{ path = "{pkgs_path}/view" }}\n'
+            f'ui = {{ path = "{pkgs_path}/ui" }}\n'
+            f'lg = {{ path = "{pkgs_path}/lg" }}\n'
+        )
+        files["src/view.pion"] = """import "lg"
+import "signals"
+import "ui"
+import "view"
+
+pub fn build_web_view(root : view::View) -> Unit {
+  let clicks = signals::signal(0)
+  <ui::Col in={root} fill pad={24.0} gap={14.0}>
+    <ui::Text text="Invar Web App (WASM)" size={20.0} weight={700} />
+    <ui::Scroll>
+      <ui::Col pad={4.0} gap={12.0}>
+        <lg::Panel gap={10.0} label="Counter">
+          <lg::Badge label_by=>{ "Clicks: \{clicks.get()}" } tone={.Success} dot />
+          <lg::Button label="Increment" flat on_press=>{ clicks.set(clicks.get() + 1) } />
+        </lg::Panel>
+      </ui::Col>
+    </ui::Scroll>
+  </ui::Col>
+}
+"""
+        files["src/main.pion"] = """import "host_web"
+import "hostapi"
+import "lg"
+import "ui"
+import "view"
+
+fn main() -> Unit {
+  host_web::install()
+  lg::set_dark(Some(true))
+  view::faults_stop.v = false
+  ui::set_view_app(
+    fn(root : view::View) {
+      let _ = root.transitions_only()
+      build_web_view(root)
+    },
+    theme=lg::ui_theme,
+  )
+  hostapi::run(
+    "Invar Web App",
+    fn(w, h, scale, now) {
+      if ui::view_frame(w, h, scale, now) {
+        hostapi::request_frame()
+      }
+    },
+    fn(host_kind, x, y, btn) {
+      let vp_kind = if host_kind == 0 {
+        1
+      } else if host_kind == 1 {
+        0
+      } else {
+        host_kind
+      }
+      let vp_btn = if btn == 2 { 2 } else { 1 }
+      ui::view_pointer(vp_kind, x, y, hostapi::now(), button=vp_btn)
+    },
+    fn(x, y, dx, dy, _phase) { ui::view_wheel(x, y, dx, dy, hostapi::now()) },
+    fn(code, mods) { let _ = ui::view_key(code, mods, hostapi::now()) },
+    fn(kind, s, _a, _b) { ui::view_text(kind, s) },
+  )
+}
+"""
+        files["src/app_test.pion"] = """import "lg"
+import "ui"
+import "view"
+
+test "web app view mounts with zero nested glass and zero scroll faults" {
+  let t = ui::Tester::tree(
+    fn(root : view::View) -> Unit { build_web_view(root) },
+    width=640.0,
+    height=480.0,
+    scale=2.0,
+    theme=lg::ui_theme,
+  )
+  t.frame()
+  lg::assert_no_nested_glass(t, label="web_app")
+  debug_assert(t.scroll_faults().length() == 0, "expected 0 scroll faults")
+  t.dispose()
+}
+"""
+
+    # Refuse to overwrite existing files
+    for rel in files:
+        dest = os.path.join(out_dir, rel)
+        if os.path.exists(dest):
+            msg = f"Refusing to overwrite existing file: {dest}"
+            emit_json({"ok": False, "error": msg}) if args.json else print(msg, file=sys.stderr)
+            return 1
+
+    created = []
+    for rel, content in files.items():
+        dest = os.path.join(out_dir, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(content)
+        created.append(rel)
+
+    res = {
+        "ok": True,
+        "dir": out_dir,
+        "name": pkg_name,
+        "template": tpl,
+        "invar": invar_path,
+        "files": created,
+    }
+    if args.json:
+        emit_json(res)
+    else:
+        print(f"Created Invar {tpl} `{pkg_name}` in {out_dir}")
+        for rel in created:
+            print(f"  + {rel}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 6: web (build | dev | check)
+# ---------------------------------------------------------------------------
+
+def _pkg_name_from_toml(pkg_dir):
+    tp = os.path.join(pkg_dir, "pion.toml")
+    if os.path.isfile(tp):
+        m = re.search(r'^\s*name\s*=\s*"([^"]+)"', open(tp, "r", encoding="utf-8").read(), re.M)
+        if m:
+            return m.group(1)
+    return os.path.basename(pkg_dir)
+
+
+def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
+    pionc = resolve_pionc()
+    if not pionc["found"]:
+        return {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+    env = build_pion_env(pionc)
+    pkg_name = _pkg_name_from_toml(pkg_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    wasm_name = f"{pkg_name}.wasm"
+    wasm_file = os.path.join(out_dir, wasm_name)
+
+    cmd = [pionc["path"], "build"]
+    if release:
+        cmd.append("--release")
+    cmd += ["--target", "wasm32", pkg_dir, "-o", wasm_file]
+    rc, out, err, build_ms = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
+    if rc != 0:
+        return {"ok": False, "error": (out + err).strip(), "elapsed_ms": build_ms}
+
+    if do_opt:
+        wasm_opt = shutil.which("wasm-opt")
+        if wasm_opt:
+            rc2, out2, err2, _ = run_cmd([wasm_opt, "-Oz", wasm_file, "-o", wasm_file])
+            if rc2 != 0:
+                return {"ok": False, "error": f"wasm-opt failed: {(out2 + err2).strip()}"}
+
+    for wf in WEB_RUNTIME_FILES:
+        src = os.path.join(INVAR_ROOT, "web", wf)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(out_dir, wf))
+
+    # Write clean index.html tailored to wasm_name & title
+    tpl_html = open(os.path.join(INVAR_ROOT, "web", "index.html"), "r", encoding="utf-8").read()
+    tpl_html = re.sub(r"<title>.*?</title>", f"<title>{title}</title>", tpl_html, count=1, flags=re.S)
+    tpl_html = tpl_html.replace('"lg_web.wasm"', f'"{wasm_name}"')
+    with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
+        f.write(tpl_html)
+
+    # Verify WASM imports
+    imp_res = verify_wasm_imports(wasm_file)
+    raw_bytes = os.path.getsize(wasm_file)
+    with open(wasm_file, "rb") as f:
+        raw_data = f.read()
+    gzip_bytes = len(gzip.compress(raw_data, compresslevel=9))
+
+    brotli_bytes = None
+    brotli_bin = shutil.which("brotli")
+    if brotli_bin:
+        rc_b, _, _, _ = run_cmd([brotli_bin, "-f", "-q", "11", wasm_file, "-o", wasm_file + ".br"])
+        if rc_b == 0 and os.path.isfile(wasm_file + ".br"):
+            brotli_bytes = os.path.getsize(wasm_file + ".br")
+            os.unlink(wasm_file + ".br")
+
+    return {
+        "ok": imp_res["ok"],
+        "out_dir": out_dir,
+        "wasm_file": wasm_file,
+        "raw_bytes": raw_bytes,
+        "gzip_bytes": gzip_bytes,
+        "brotli_bytes": brotli_bytes,
+        "imports_total": imp_res["total"],
+        "imports_missing": imp_res["missing"],
+        "elapsed_ms": build_ms,
+    }
+
+
+def cmd_web(args):
+    pkg_dir = resolve_pkg_dir(args.pkg) if args.pkg else os.path.join(INVAR_ROOT, "packages", "lg_web")
+    title = args.title or f"Invar · {_pkg_name_from_toml(pkg_dir)} (Pion WASM)"
+
+    if args.web_action == "build":
+        out_dir = os.path.abspath(args.out) if args.out else os.path.join(INVAR_ROOT, "target", "web-dist")
+        res = _web_build_impl(pkg_dir, out_dir, title, True if args.release or not args.debug else False, args.opt)
+        if args.json:
+            emit_json(res)
+        else:
+            if res["ok"]:
+                print(f"Built {res['wasm_file']} ({res['raw_bytes']} B raw, {res['gzip_bytes']} B gzip, {res['imports_total']} imports, 0 missing)")
+            else:
+                print(f"invar web build FAILED: {res.get('error') or res.get('imports_missing')}", file=sys.stderr)
+        return 0 if res["ok"] else 1
+
+    if args.web_action == "check":
+        tmp_dir = tempfile.mkdtemp(prefix="invar_web_check_")
+        try:
+            node = shutil.which("node")
+            js_errors = []
+            if node:
+                for wf in WEB_RUNTIME_FILES:
+                    rc, out, err, _ = run_cmd([node, "--check", os.path.join(INVAR_ROOT, "web", wf)])
+                    if rc != 0:
+                        js_errors.append(f"web/{wf}: {(out + err).strip()}")
+            res = _web_build_impl(pkg_dir, tmp_dir, title, True, args.opt)
+            res["js_errors"] = js_errors
+            if js_errors:
+                res["ok"] = False
+            if args.json:
+                emit_json(res)
+            else:
+                if res["ok"]:
+                    print(f"invar web check OK ({res['raw_bytes']} B, {res['imports_total']} imports, 0 missing)")
+                else:
+                    print(f"invar web check FAILED: {res.get('error') or res.get('imports_missing') or js_errors}", file=sys.stderr)
+            return 0 if res["ok"] else 1
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # dev server
+    out_dir = os.path.abspath(args.out) if args.out else os.path.join(INVAR_ROOT, "target", "web-dev")
+    res = _web_build_impl(pkg_dir, out_dir, title, True, args.opt)
+    if not res["ok"]:
+        emit_json(res) if args.json else print(f"Build failed: {res.get('error')}", file=sys.stderr)
+        return 1
+
+    class WasmHandler(http.server.SimpleHTTPRequestHandler):
+        extensions_map = {
+            **http.server.SimpleHTTPRequestHandler.extensions_map,
+            ".wasm": "application/wasm",
+            ".mjs": "text/javascript",
+            ".js": "text/javascript",
+        }
+
+    handler = functools.partial(WasmHandler, directory=out_dir)
+    socketserver.TCPServer.allow_reuse_address = True
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"Serving {out_dir} at {url} (Ctrl-C to stop)")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 7: shot
+# ---------------------------------------------------------------------------
+
+def cmd_shot(args):
+    pionc = resolve_pionc()
+    if not pionc["found"]:
+        err = {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+        emit_json(err) if args.json else print(err["error"], file=sys.stderr)
+        return 1
+    env = build_pion_env(pionc)
+    pkg_dir = resolve_pkg_dir(args.pkg) if args.pkg else os.path.join(INVAR_ROOT, "packages", "lg_shots")
+    out_dir = os.path.abspath(args.out) if args.out else os.path.join(INVAR_ROOT, "target", "shots")
+    os.makedirs(out_dir, exist_ok=True)
+
+    env["MBUI_LG_OUT"] = out_dir
+    if args.only:
+        env["MBUI_LG_ONLY"] = args.only
+    if args.w:
+        env["MBUI_LG_W"] = str(args.w)
+    if args.h:
+        env["MBUI_LG_H"] = str(args.h)
+    if args.scale:
+        env["MBUI_LG_SCALE"] = str(args.scale)
+    if platform.system().lower() == "linux" and not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+        env.setdefault("GALLIUM_DRIVER", "llvmpipe")
+
+    fd, bin_path = tempfile.mkstemp(prefix="invar_shot_")
+    os.close(fd)
+    try:
+        rc, out, err, build_ms = run_cmd([pionc["path"], "build", "--release", pkg_dir, "-o", bin_path], cwd=INVAR_ROOT, env=env)
+        if rc != 0:
+            res = {"ok": False, "error": f"build failed: {(out + err).strip()}", "build_ms": build_ms}
+            emit_json(res) if args.json else print(res["error"], file=sys.stderr)
+            return 1
+        rc2, out2, err2, run_ms = run_cmd([bin_path], cwd=INVAR_ROOT, env=env)
+        pngs = []
+        for fn in sorted(os.listdir(out_dir)):
+            if fn.endswith(".png"):
+                fp = os.path.join(out_dir, fn)
+                dims = read_png_ihdr(fp)
+                pngs.append({
+                    "file": fp,
+                    "width": dims[0] if dims else 0,
+                    "height": dims[1] if dims else 0,
+                    "bytes": os.path.getsize(fp),
+                })
+        ok = rc2 == 0 and len(pngs) > 0
+        res = {
+            "ok": ok,
+            "out_dir": out_dir,
+            "build_ms": build_ms,
+            "run_ms": run_ms,
+            "pngs": pngs,
+            "error": "" if ok else (out2 + err2).strip(),
+        }
+        if args.json:
+            emit_json(res)
+        else:
+            for p in pngs:
+                print(f"  {p['file']} ({p['width']}x{p['height']}, {p['bytes']} B)")
+            print(f"invar shot: {'OK' if ok else 'FAILED'} ({len(pngs)} PNGs)")
+        return 0 if ok else 1
+    finally:
+        if os.path.exists(bin_path):
+            os.unlink(bin_path)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 8: diff
+# ---------------------------------------------------------------------------
+
+def cmd_diff(args):
+    try:
+        w1, h1, b1 = decode_png_rgba(args.before)
+        w2, h2, b2 = decode_png_rgba(args.after)
+    except Exception as e:
+        res = {"ok": False, "error": str(e)}
+        emit_json(res) if args.json else print(res["error"], file=sys.stderr)
+        return 1
+
+    same_size = (w1 == w2 and h1 == h2)
+    if not same_size:
+        res = {
+            "ok": True,
+            "same_size": False,
+            "before_size": [w1, h1],
+            "after_size": [w2, h2],
+            "identical": False,
+        }
+        emit_json(res) if args.json else print(f"Size mismatch: {w1}x{h1} vs {w2}x{h2}")
+        return 0
+
+    w, h = w1, h1
+    total_pixels = w * h
+    thresh = max(0, min(255, args.threshold))
+    changed_pixels = 0
+    max_delta = 0
+    sum_abs = 0
+    sum_sq = 0
+    min_x, min_y, max_x, max_y = w, h, -1, -1
+
+    need_diff_img = bool(args.out or args.sbs)
+    diff_rgba = bytearray(total_pixels * 4) if need_diff_img else None
+
+    for y in range(h):
+        row_off = y * w * 4
+        for x in range(w):
+            o = row_off + x * 4
+            dr = abs(b1[o] - b2[o])
+            dg = abs(b1[o + 1] - b2[o + 1])
+            db = abs(b1[o + 2] - b2[o + 2])
+            da = abs(b1[o + 3] - b2[o + 3])
+            dmax = max(dr, dg, db, da)
+            sum_abs += dr + dg + db + da
+            sum_sq += dr * dr + dg * dg + db * db + da * da
+            if dmax > max_delta:
+                max_delta = dmax
+            if dmax > thresh:
+                changed_pixels += 1
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+                if y < min_y:
+                    min_y = y
+                if y > max_y:
+                    max_y = y
+                if diff_rgba is not None:
+                    boost = min(255, 160 + (dmax * 95) // 255)
+                    diff_rgba[o] = 255
+                    diff_rgba[o + 1] = 24
+                    diff_rgba[o + 2] = boost
+                    diff_rgba[o + 3] = 255
+            elif diff_rgba is not None:
+                diff_rgba[o] = b1[o] // 3
+                diff_rgba[o + 1] = b1[o + 1] // 3
+                diff_rgba[o + 2] = b1[o + 2] // 3
+                diff_rgba[o + 3] = 255
+
+    mae = sum_abs / (total_pixels * 4) if total_pixels else 0.0
+    mse = sum_sq / (total_pixels * 4) if total_pixels else 0.0
+    psnr = None if mse == 0.0 else round(10.0 * math.log10((255.0 * 255.0) / mse), 3)
+    changed_ratio = (changed_pixels / total_pixels) if total_pixels else 0.0
+    bbox = [min_x, min_y, max_x - min_x + 1, max_y - min_y + 1] if changed_pixels > 0 else None
+    identical = (max_delta == 0)
+
+    if args.out and diff_rgba is not None:
+        encode_png_rgba(args.out, w, h, diff_rgba)
+
+    if args.sbs and diff_rgba is not None:
+        sep = 4
+        sbs_w = w * 3 + sep * 2
+        sbs = bytearray(sbs_w * h * 4)
+        for y in range(h):
+            s_off = y * w * 4
+            d_off = y * sbs_w * 4
+            sbs[d_off:d_off + w * 4] = b1[s_off:s_off + w * 4]
+            for sx in range(sep):
+                p = d_off + (w + sx) * 4
+                sbs[p:p + 4] = b"\x30\x34\x40\xff"
+            o2 = d_off + (w + sep) * 4
+            sbs[o2:o2 + w * 4] = b2[s_off:s_off + w * 4]
+            for sx in range(sep):
+                p = d_off + (2 * w + sep + sx) * 4
+                sbs[p:p + 4] = b"\x30\x34\x40\xff"
+            o3 = d_off + (2 * w + 2 * sep) * 4
+            sbs[o3:o3 + w * 4] = diff_rgba[s_off:s_off + w * 4]
+        encode_png_rgba(args.sbs, sbs_w, h, sbs)
+
+    res = {
+        "ok": True,
+        "same_size": True,
+        "width": w,
+        "height": h,
+        "total_pixels": total_pixels,
+        "changed_pixels": changed_pixels,
+        "changed_ratio": round(changed_ratio, 6),
+        "max_delta": max_delta,
+        "mae": round(mae, 6),
+        "psnr": psnr,
+        "changed_bbox": bbox,
+        "identical": identical,
+    }
+    if args.out:
+        res["diff_out"] = args.out
+    if args.sbs:
+        res["sbs_out"] = args.sbs
+
+    if args.json:
+        emit_json(res)
+    else:
+        print(f"diff {w}x{h}: changed={changed_pixels}/{total_pixels} ({changed_ratio*100:.2f}%), max_delta={max_delta}, mae={mae:.4f}, psnr={psnr}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand 9: host-check & bench
+# ---------------------------------------------------------------------------
+
+def cmd_host_check(args):
+    sys_os = platform.system().lower()
+    plat = args.platform
+    if plat == "auto":
+        if sys_os == "darwin":
+            targets = ["macos", "ios"]
+        elif sys_os == "linux":
+            targets = ["linux"]
+        elif sys_os == "windows":
+            targets = ["windows"]
+        else:
+            targets = []
+    elif plat == "all":
+        targets = ["macos", "ios", "linux", "windows"]
+    else:
+        targets = [plat]
+
+    pionc = resolve_pionc()
+    env = build_pion_env(pionc)
+    checks = []
+    all_ok = True
+
+    for t in targets:
+        if t == "ios":
+            rc, out, err, ms = run_cmd(["bash", os.path.join(INVAR_ROOT, "scripts", "check-ios-host.sh")], cwd=INVAR_ROOT, env=env)
+            ok = rc == 0
+            checks.append({"platform": "ios", "ok": ok, "elapsed_ms": ms, "error": "" if ok else (out + err).strip()[-800:]})
+        elif t == "macos":
+            if not pionc["found"]:
+                ok, ms, em = False, 0, "pionc not found"
+            else:
+                fd, tmp_bin = tempfile.mkstemp(prefix="invar_mac_host_")
+                os.close(fd)
+                rc, out, err, ms = run_cmd([pionc["path"], "build", os.path.join(INVAR_ROOT, "examples", "worker_app"), "-o", tmp_bin], cwd=INVAR_ROOT, env=env)
+                if os.path.exists(tmp_bin):
+                    os.unlink(tmp_bin)
+                ok = rc == 0
+                em = "" if ok else (out + err).strip()[-800:]
+            checks.append({"platform": "macos", "ok": ok, "elapsed_ms": ms, "error": em})
+        elif t == "linux":
+            rc, out, err, ms = run_cmd(["bash", os.path.join(INVAR_ROOT, "scripts", "check-linux-host.sh")], cwd=INVAR_ROOT, env=env)
+            ok = rc == 0
+            checks.append({"platform": "linux", "ok": ok, "elapsed_ms": ms, "error": "" if ok else (out + err).strip()[-800:]})
+        elif t == "windows":
+            baked = os.path.isfile(os.path.join(INVAR_ROOT, "packages", "host", "native", "win_shaders_baked.h"))
+            ok = baked
+            checks.append({"platform": "windows", "ok": ok, "elapsed_ms": 0, "error": "" if ok else "missing win_shaders_baked.h"})
+        if not checks[-1]["ok"]:
+            all_ok = False
+
+    res = {"ok": all_ok, "checks": checks}
+    if args.json:
+        emit_json(res)
+    else:
+        for c in checks:
+            print(f"[{'PASS' if c['ok'] else 'FAIL'}] host-check:{c['platform']} ({c['elapsed_ms']} ms)")
+            if c["error"]:
+                print(c["error"])
+    return 0 if all_ok else 1
+
+
+def cmd_bench(args):
+    pionc = resolve_pionc()
+    env = build_pion_env(pionc)
+    if pionc["found"]:
+        env["PIONC"] = pionc["path"]
+    cmd = ["bash", os.path.join(INVAR_ROOT, "scripts", "bench.sh")] + args.bench_args
+    p = subprocess.run(cmd, cwd=INVAR_ROOT, env=env)
+    return p.returncode
+
+
+# ---------------------------------------------------------------------------
+# Argument Parser
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="invar", description="Invar GPU UI Framework CLI (Agent-First)")
+    sub = p.add_subparsers(dest="command")
+
+    # doctor
+    sp = sub.add_parser("doctor", help="Inspect pionc, host toolchains, and web assets")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.set_defaults(func=cmd_doctor)
+
+    # check
+    sp = sub.add_parser("check", help="Run pionc check (and optionally pionc fmt --check with --fmt) on packages")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.add_argument("--pkg", action="append", default=[], help="Package name or path (repeatable)")
+    sp.add_argument("--fmt", action="store_true", help="Also run pionc fmt --check on package .pion files")
+    sp.add_argument("--no-fmt", action="store_true", help="Compatibility no-op (fmt check is off by default)")
+    sp.set_defaults(func=cmd_check)
+
+    # test
+    sp = sub.add_parser("test", help="Run pionc test across packages")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.add_argument("--pkg", action="append", default=[], help="Package name or path (repeatable)")
+    sp.add_argument("--filter", default="", help="Forward --filter <substr> to pionc test")
+    sp.set_defaults(func=cmd_test)
+
+    # audit
+    sp = sub.add_parser("audit", help="Run Invar architectural, lockstep, JS, and WASM import audits")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.add_argument("--build-wasm", action="store_true", help="Build lg_web wasm32 and verify all imports")
+    sp.add_argument("--wasm", default="", help="Path to an existing .wasm file to verify imports")
+    sp.add_argument("target_dir", nargs="?", default="", help="Optional target directory to audit")
+    sp.set_defaults(func=cmd_audit)
+
+    # new
+    sp = sub.add_parser("new", help="Scaffold a new Invar app (jsx-app, worker-app, web-app)")
+    sp.add_argument("--template", choices=["jsx-app", "worker-app", "web-app"], default="jsx-app")
+    sp.add_argument("--invar", default="", help="Path to Invar repository root")
+    sp.add_argument("--name", default="", help="Package name (defaults to directory basename)")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.add_argument("dir", help="Target directory for new app")
+    sp.set_defaults(func=cmd_new)
+
+    # web
+    sp = sub.add_parser("web", help="Build, check, or serve WebGL2/WASM apps")
+    sp.add_argument("web_action", choices=["build", "dev", "check"])
+    sp.add_argument("--pkg", default="", help="Package directory (default: packages/lg_web)")
+    sp.add_argument("--out", default="", help="Output directory")
+    sp.add_argument("--port", type=int, default=8080, help="Dev server port (default: 8080)")
+    sp.add_argument("--title", default="", help="HTML document title")
+    sp.add_argument("--release", action="store_true", help="Build in release mode (default)")
+    sp.add_argument("--debug", action="store_true", help="Build in debug mode")
+    sp.add_argument("--opt", action="store_true", help="Run wasm-opt -Oz if available")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.set_defaults(func=cmd_web)
+
+    # shot
+    sp = sub.add_parser("shot", help="Render offscreen GPU screenshots via Metal / GLES3")
+    sp.add_argument("--pkg", default="", help="Package directory (default: packages/lg_shots)")
+    sp.add_argument("--only", default="", help="Shot preset filter (MBUI_LG_ONLY)")
+    sp.add_argument("--out", default="", help="Output directory for PNGs")
+    sp.add_argument("--w", default="", help="Override width in pt")
+    sp.add_argument("--h", default="", help="Override height in pt")
+    sp.add_argument("--scale", default="", help="Override display scale")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.set_defaults(func=cmd_shot)
+
+    # diff
+    sp = sub.add_parser("diff", help="Pixel-diff two PNG images (pure Python stdlib)")
+    sp.add_argument("before", help="Before PNG path")
+    sp.add_argument("after", help="After PNG path")
+    sp.add_argument("--out", default="", help="Write diff heatmap PNG")
+    sp.add_argument("--sbs", default="", help="Write side-by-side [before|after|diff] PNG")
+    sp.add_argument("--threshold", type=int, default=0, help="Per-channel delta threshold (0..255)")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.set_defaults(func=cmd_diff)
+
+    # host-check
+    sp = sub.add_parser("host-check", help="Compile & verify native host backends")
+    sp.add_argument("--platform", choices=["auto", "macos", "ios", "linux", "windows", "all"], default="auto")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.set_defaults(func=cmd_host_check)
+
+    # bench
+    sp = sub.add_parser("bench", help="Forward to scripts/bench.sh")
+    sp.add_argument("bench_args", nargs=argparse.REMAINDER)
+    sp.set_defaults(func=cmd_bench)
+
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
