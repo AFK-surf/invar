@@ -1081,25 +1081,21 @@
       float ext_cov = mb_contour_int(max(outward + 0.5, 0.0), edgeW)
                     - mb_contour_int(max(outward - 0.5, 0.0), edgeW);
       if (materialAlpha < 0.01 && ext_cov < 0.01) discard;
-      bool is_clear = (v_p.w <= 0.1 && col.a < 0.12);
+      float regMix = smoothstep(0.105, 0.305, col.a);
+      bool is_clear = (regMix <= 0.0);
       bool is_adaptive = v_c2.z < -0.5;
       float spot_raw = is_adaptive ? (-v_c2.z - 1.0) : v_c2.z;
-      bool is_dark = (!is_clear && col.a >= 0.05 && luma(col.rgb) < 0.35);
+      bool is_dark = (!is_clear && luma(col.rgb) < 0.35);
       float inward = max(-d, 0.0);
       float rawBevel = max(v_c2.y, 0.0);
       float rawAmount = max(v_pad.y, 0.0);
-      float bevel;
-      float amount;
-      if (!is_clear) {
-        // refractionFitsShape = true (iOS 27 regular)
-        bevel = min(rawBevel, 0.5 * halfMinor);
-        amount = min(rawAmount, halfMinor);
-      } else {
-        // refractionFitsShape = false (iOS 27 clear)
-        float lensScale = min(1.0, halfMinor / max(rawBevel, 0.001));
-        bevel = rawBevel * lensScale;
-        amount = rawAmount * lensScale;
-      }
+      float lensScale = min(1.0, halfMinor / max(rawBevel, 0.001));
+      float clearBevel = rawBevel * lensScale;
+      float clearAmount = rawAmount * lensScale;
+      float regBevel = min(rawBevel, 0.5 * halfMinor);
+      float regAmount = min(rawAmount, halfMinor);
+      float bevel = mix(clearBevel, regBevel, regMix);
+      float amount = mix(clearAmount, regAmount, regMix);
       vec2 surfaceNormal = vec2(0.0, 0.0);
       float shortening = 0.0;
       vec2 disp = vec2(0.0, 0.0);
@@ -1168,15 +1164,15 @@
         // (lifted tab-bar / toggle / slider thumb & loupe), while Glass::clear() (col.a ~ 0.102)
         // blends smoothly into the +0.126 translucent micro-veil over media.
         float clearVeil = smoothstep(0.005, 0.102, col.a);
-        emission = vec3(1.0, 1.0, 1.0) * (0.126 * clearVeil);
+        emission = mix(vec3(0.055), vec3(0.126), clearVeil);
         transmittance = mix(1.0, 0.90, clearVeil);
         lift = mix(0.0, 0.10, clearVeil);
         chromaGain = mix(1.06, 1.0, clearVeil);
-        contourStr = mix(0.24, 0.25, clearVeil);
+        contourStr = mix(0.18, 0.25, clearVeil);
         contourDirAmt = mix(0.85, 0.77, clearVeil);
         bevelShadowStr = mix(0.045, 0.04, clearVeil);
-        glintLum = mix(1.6, 1.2, clearVeil);
-        glintFaceGain = mix(0.0, 0.25, clearVeil);
+        glintLum = mix(1.85, 1.35, clearVeil);
+        glintFaceGain = mix(0.18, 0.25, clearVeil);
         glintVib = mix(2.85, 1.5, clearVeil);
       } else if (is_adaptive) {
         #if ONE_KIND == 13
@@ -1235,6 +1231,18 @@
         contourStr = 0.43; contourDirAmt = 0.77; bevelShadowStr = 0.036;
         glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;
       }
+      if (regMix > 0.0 && regMix < 1.0) {
+        emission = mix(vec3(0.126, 0.126, 0.126), emission, regMix);
+        transmittance = mix(0.90, transmittance, regMix);
+        lift = mix(0.10, lift, regMix);
+        chromaGain = mix(1.0, chromaGain, regMix);
+        contourStr = mix(0.25, contourStr, regMix);
+        contourDirAmt = mix(0.77, contourDirAmt, regMix);
+        bevelShadowStr = mix(0.04, bevelShadowStr, regMix);
+        glintLum = mix(1.35, glintLum, regMix);
+        glintFaceGain = mix(0.25, glintFaceGain, regMix);
+        glintVib = mix(1.5, glintVib, regMix);
+      }
       if (fogT > 0.001) {
         float r1 = fogT * 2.6;
         float r2 = fogT * 3.6;
@@ -1292,8 +1300,10 @@
       if (v_c2.x > 0.01 && inward < 4.8) {
         float glintProfile = clamp(1.0 - inward / 1.2, 0.0, 1.0)
                            + 0.21 * clamp(1.0 - inward / 4.8, 0.0, 1.0);
-        float lobe = max(1.0 - tangency, 0.0);
-        float glint = clamp(v_c2.x * 0.252 * lobe * glintProfile + spot * 0.08 * glintProfile, 0.0, 1.0);
+        float dirLobe = pow(max(1.0 - tangency, 0.0), 0.85);
+        float lobe = mix(is_clear ? 0.28 : 0.18, 1.0, dirLobe);
+        float glintGain = is_clear ? 0.40 : 0.29;
+        float glint = clamp(v_c2.x * glintGain * lobe * glintProfile + spot * 0.08 * glintProfile, 0.0, 1.0);
         float resLum = luma(result);
         vec3 glintTarget = vec3(glintLum) + result * glintFaceGain + (result - vec3(resLum)) * glintVib;
         result = clamp(mix(result, glintTarget, glint), 0.0, 1.0);
@@ -1491,31 +1501,63 @@
       float kf = u_c[3].y;
       vec4 m0 = u_c[4], m1 = u_c[5], m2 = u_c[6], m3 = u_c[7];
       if (kf < 0.5) { o = texture(u_src, clamp(gl_FragCoord.xy * m0.xy, m0.xy * 0.5, m0.zw)); return; }
-      float sig1 = pow(sp, 1.0 / kf);
       float r = clamp(ramp, 0.0, 1.0);
-      float target_px = r <= 0.0 ? 0.0 : sp * pow(r, 1.15);
+      if (r <= 0.0) { o = texture(u_src, clamp(gl_FragCoord.xy * m0.xy, m0.xy * 0.5, m0.zw)); return; }
+      if (r >= 1.0) {
+        int ki = int(kf + 0.5);
+        if (ki <= 1) o = texture(u_lv1, clamp(gl_FragCoord.xy * m1.xy, m1.xy * 1.0, m1.zw));
+        else if (ki == 2) o = texture(u_lv2, clamp(gl_FragCoord.xy * m2.xy, m2.xy * 2.0, m2.zw));
+        else o = texture(u_lv3, clamp(gl_FragCoord.xy * m3.xy, m3.xy * 4.0, m3.zw));
+        return;
+      }
+      float sig1 = pow(sp, 1.0 / kf);
+      float target_px = sp * pow(r, 1.15);
       if (target_px <= sig1 || kf <= 1.05) {
         vec2 uv0_min = m0.xy * 0.5, uv0_max = m0.zw;
         vec2 c_uv = gl_FragCoord.xy * m0.xy;
         vec4 g_small;
         if (target_px <= 0.01) {
           g_small = texture(u_src, clamp(c_uv, uv0_min, uv0_max));
+        } else if (target_px <= 0.55) {
+          // Exact separable 3x3 Gaussian via 2x2 bilinear taps (center weight 0.5 split across +-o1)
+          float inv2 = -0.5 / (target_px * target_px);
+          float w1 = exp(inv2);
+          float o1 = w1 / (0.5 + w1);
+          vec2 ox = vec2(o1, 0.0) * m0.xy;
+          vec2 oy = vec2(0.0, o1) * m0.xy;
+          g_small = (texture(u_src, clamp(c_uv - ox - oy, uv0_min, uv0_max)) +
+                     texture(u_src, clamp(c_uv + ox - oy, uv0_min, uv0_max)) +
+                     texture(u_src, clamp(c_uv - ox + oy, uv0_min, uv0_max)) +
+                     texture(u_src, clamp(c_uv + ox + oy, uv0_min, uv0_max))) * 0.25;
         } else {
-          float r_tap = min(target_px * 0.75, 1.25);
-          vec2 d0 = vec2(r_tap, 0.0) * m0.xy;
-          vec2 d1 = vec2(0.0, r_tap) * m0.xy;
-          vec2 dd = vec2(r_tap * 0.70710678, r_tap * 0.70710678) * m0.xy;
-          g_small  = texture(u_src, clamp(c_uv, uv0_min, uv0_max)) * 0.25;
-          g_small += (texture(u_src, clamp(c_uv + d0, uv0_min, uv0_max)) +
-                      texture(u_src, clamp(c_uv - d0, uv0_min, uv0_max)) +
-                      texture(u_src, clamp(c_uv + d1, uv0_min, uv0_max)) +
-                      texture(u_src, clamp(c_uv - d1, uv0_min, uv0_max))) * 0.125;
-          g_small += (texture(u_src, clamp(c_uv + dd, uv0_min, uv0_max)) +
-                      texture(u_src, clamp(c_uv - dd, uv0_min, uv0_max)) +
-                      texture(u_src, clamp(c_uv + vec2(dd.x, -dd.y), uv0_min, uv0_max)) +
-                      texture(u_src, clamp(c_uv + vec2(-dd.x, dd.y), uv0_min, uv0_max))) * 0.0625;
+          // Exact separable 7x7 Gaussian via 4x4 bilinear taps (zero gaps, zero comb ghosting)
+          float inv2 = -0.5 / (target_px * target_px);
+          float w1 = exp(inv2);
+          float w2 = exp(4.0 * inv2);
+          float w3 = exp(9.0 * inv2);
+          float W1 = 0.5 + w1;
+          float W2 = w2 + w3;
+          float o1 = w1 / W1;
+          float o2 = (2.0 * w2 + 3.0 * w3) / max(W2, 1e-6);
+          float inv_sum = 0.5 / (W1 + W2);
+          float p1 = W1 * inv_sum;
+          float p2 = W2 * inv_sum;
+          float ox[4] = float[4](-o2, -o1, o1, o2);
+          float pw[4] = float[4](p2, p1, p1, p2);
+          g_small = vec4(0.0);
+          for (int iy = 0; iy < 4; iy++) {
+            vec4 row = vec4(0.0);
+            float uy = clamp(c_uv.y + ox[iy] * m0.y, uv0_min.y, uv0_max.y);
+            for (int ix = 0; ix < 4; ix++) {
+              float ux = clamp(c_uv.x + ox[ix] * m0.x, uv0_min.x, uv0_max.x);
+              row += texture(u_src, vec2(ux, uy)) * pw[ix];
+            }
+            g_small += row * pw[iy];
+          }
         }
-        float blend1 = smoothstep(sig1 * 0.15, sig1, target_px);
+        float blend_lo = min(1.1, sig1 * 0.45);
+        float bt = clamp((target_px - blend_lo) / max(sig1 - blend_lo, 1e-4), 0.0, 1.0);
+        float blend1 = bt > 0.0 ? pow(bt, 1.8) : 0.0;
         if (blend1 > 0.0) {
           vec4 c_lv1 = texture(u_lv1, clamp(gl_FragCoord.xy * m1.xy, m1.xy * 1.0, m1.zw));
           o = mix(g_small, c_lv1, blend1);
