@@ -16,8 +16,14 @@
   // The page's query parameter `n` for the program (host_js.mbt's env): the address as it is now, else as it was when
   // this host loaded, so what the page's own start took off the address with history.replaceState before the program's
   // first frame read it (a drive's script, a sign-in's answer) is still given; "" when neither has it.
+  let envSearch = null, envParams = null;
   H.env = (n) => {
-    const cur = typeof location !== 'undefined' && location.search ? new URLSearchParams(location.search).get(n) : null;
+    const search = typeof location !== 'undefined' ? location.search : '';
+    if (search !== envSearch) {
+      envSearch = search;
+      envParams = search ? new URLSearchParams(search) : null;
+    }
+    const cur = envParams ? envParams.get(n) : null;
     return cur ?? params.get(n) ?? '';
   };
   let cb = null;
@@ -1801,9 +1807,10 @@
       const sees = tid < 0 || Math.round(f32[i * INST + 5]) === 7;
       if (sees && reaches(i, run, g)) whole = i + 1;
     }
-    const maxNeed = (start + (count - pieces)) * INST;
-    if (underNow.length < maxNeed) underNow = new Float32Array(Math.max(maxNeed, underNow.length * 2));
+    const baseNeed = start * INST;
+    if (underNow.length < baseNeed) underNow = new Float32Array(Math.max(baseNeed, underNow.length * 2));
     let inBlur = 0, blurHit = false;
+    let hasVec = false, segMin = 0x7fffffff, segMax = 0;
     for (let i = 0; i < whole; i++) {
       if (unstableUnder(i)) return false;
       const k = Math.round(f32[i * INST + 5]);
@@ -1812,6 +1819,14 @@
         inBlur++;
       } else if (k === 15 && inBlur > 0) {
         if (--inBlur === 0) blurHit = false;
+      } else if (k === 11) {
+        const f0 = Math.round(f32[i * INST + 12]);
+        const fn = Math.round(f32[i * INST + 13]);
+        if (fn > 0 && f0 >= 0) {
+          hasVec = true;
+          if (f0 < segMin) segMin = f0;
+          if (f0 + fn > segMax) segMax = f0 + fn;
+        }
       }
     }
     let off = whole * INST;
@@ -1829,14 +1844,33 @@
       }
       if (!hit) continue;
       if (unstableUnder(i)) return false;
+      if (k === 11) {
+        const f0 = Math.round(f32[i * INST + 12]);
+        const fn = Math.round(f32[i * INST + 13]);
+        if (fn > 0 && f0 >= 0) {
+          hasVec = true;
+          if (f0 < segMin) segMin = f0;
+          if (f0 + fn > segMax) segMax = f0 + fn;
+        }
+      }
       underNow.set(f32.subarray(i * INST, (i + 1) * INST), off);
       off += INST;
       picked++;
     }
-    const pLen = (count - pieces) * INST;
-    if (pLen > 0) {
-      underNow.set(f32.subarray(pieces * INST, count * INST), off);
-      off += pLen;
+    if (hasVec && count > pieces) {
+      const totalSeg = (count - pieces) * INST;
+      const s0 = Math.max(0, Math.min(totalSeg, ((segMin / 6) | 0) * INST));
+      const s1 = Math.max(s0, Math.min(totalSeg, (((segMax + 5) / 6) | 0) * INST));
+      const pLen = s1 - s0;
+      if (pLen > 0) {
+        if (underNow.length < off + pLen) {
+          const grown = new Float32Array(Math.max(off + pLen, underNow.length * 2));
+          if (off > 0) grown.set(underNow.subarray(0, off), 0);
+          underNow = grown;
+        }
+        underNow.set(f32.subarray(pieces * INST + s0, pieces * INST + s1), off);
+        off += pLen;
+      }
     }
     underNowN = off;
     underWhole = whole;
@@ -2157,8 +2191,10 @@
     return kind === 0 || kind === 2;
   }
 
+  let stripsOn = true, fastRectOn = true;
+
   function mbBands(i, count, scale, toX0, toY0, toX1, toY1, out) {
-    if (H.env('MBUI_STRIPS') === '0') return -1;
+    if (!stripsOn) return -1;
     const a = i * INST;
     const kind = Math.round(f32[a + 5]);
     if (f32[a + 32] !== 0 || f32[a + 20] !== 0) return -1;
@@ -2270,7 +2306,7 @@
   }
 
   function isSimpleRect(i) {
-    if (H.env('MBUI_FAST_RECT') === '0') return false;
+    if (!fastRectOn) return false;
     const b = i * INST;
     return Math.round(f32[b + 5]) === 0 && f32[b + 6] <= 0 &&
       f32[b + 20] === 0 && f32[b + 21] === 0 && f32[b + 22] === 0 && f32[b + 23] === 0 &&
@@ -2510,6 +2546,8 @@
   // it holds, else all of it, cleared to the ground.
   function drawFrame(n, r, g, b, part, clearA = 1, tw = canvas.width, th = canvas.height, sc = dpr) {
     const len = n * INST;
+    stripsOn = H.env('MBUI_STRIPS') !== '0';
+    fastRectOn = H.env('MBUI_FAST_RECT') !== '0';
     drewMissing = false;
     cutOn = part;
     const origTarget = target;

@@ -1340,12 +1340,14 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     int sees = tid < 0.0f || (int)(f[(size_t)i * MB_INST + 5] + 0.5f) == 7;
     if (sees && reaches(f, i, run, g)) whole = i + 1;
   }
-  size_t most = ((size_t)start + (size_t)(count - pieces)) * MB_INST;
-  if (under_now_cap < most) {
-    under_now_cap = most;
+  size_t base_need = (size_t)start * MB_INST;
+  if (under_now_cap < base_need) {
+    under_now_cap = base_need;
     under_now = realloc(under_now, under_now_cap * sizeof(float));
   }
   int in_blur = 0, blur_hit = 0;
+  int has_vec = 0;
+  int32_t seg_min = INT32_MAX, seg_max = 0;
   for (int32_t i = 0; i < whole; i++) {
     if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
     int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
@@ -1354,11 +1356,18 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
       in_blur++;
     } else if (k == 15 && in_blur > 0) {
       if (--in_blur == 0) blur_hit = 0;
+    } else if (k == 11) {
+      int32_t f0 = (int32_t)lroundf(f[(size_t)i * MB_INST + 12]);
+      int32_t fn = (int32_t)lroundf(f[(size_t)i * MB_INST + 13]);
+      if (fn > 0 && f0 >= 0) {
+        has_vec = 1;
+        if (f0 < seg_min) seg_min = f0;
+        if (f0 + fn > seg_max) seg_max = f0 + fn;
+      }
     }
   }
-  float *o = under_now;
-  memcpy(o, f, (size_t)whole * MB_INST * sizeof(float));
-  o += (size_t)whole * MB_INST;
+  size_t off = (size_t)whole * MB_INST;
+  if (off > 0) memcpy(under_now, f, off * sizeof(float));
   int32_t picked = 0;
   for (int32_t i = whole; i < start; i++) {
     int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
@@ -1372,13 +1381,36 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     }
     if (!hit) continue;
     if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
-    memcpy(o, f + (size_t)i * MB_INST, MB_INST * sizeof(float));
-    o += MB_INST;
+    if (k == 11) {
+      int32_t f0 = (int32_t)lroundf(f[(size_t)i * MB_INST + 12]);
+      int32_t fn = (int32_t)lroundf(f[(size_t)i * MB_INST + 13]);
+      if (fn > 0 && f0 >= 0) {
+        has_vec = 1;
+        if (f0 < seg_min) seg_min = f0;
+        if (f0 + fn > seg_max) seg_max = f0 + fn;
+      }
+    }
+    memcpy(under_now + off, f + (size_t)i * MB_INST, MB_INST * sizeof(float));
+    off += MB_INST;
     picked++;
   }
-  memcpy(o, f + (size_t)pieces * MB_INST, (size_t)(count - pieces) * MB_INST * sizeof(float));
-  o += (size_t)(count - pieces) * MB_INST;
-  under_now_n = (size_t)(o - under_now);
+  if (has_vec && count > pieces) {
+    size_t total_seg = (size_t)(count - pieces) * MB_INST;
+    size_t s0 = (size_t)(seg_min / 6) * MB_INST;
+    size_t s1 = (size_t)((seg_max + 5) / 6) * MB_INST;
+    if (s0 > total_seg) s0 = total_seg;
+    if (s1 > total_seg) s1 = total_seg;
+    if (s1 > s0) {
+      size_t plen = s1 - s0;
+      if (under_now_cap < off + plen) {
+        under_now_cap = off + plen;
+        under_now = realloc(under_now, under_now_cap * sizeof(float));
+      }
+      memcpy(under_now + off, f + (size_t)pieces * MB_INST + s0, plen * sizeof(float));
+      off += plen;
+    }
+  }
+  under_now_n = off;
   under_whole = whole;
   under_picked = picked;
   return 1;
