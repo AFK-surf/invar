@@ -1,0 +1,85 @@
+// High-level auto-updater state model (`UpdatePhase`, `UpdateStatus`) and update decision pipeline.
+
+import "hostapi"
+
+/// Lifecycle phase of an in-progress native app update.
+#derive(Eq)
+pub enum UpdatePhase {
+  Idle
+  Waiting
+  Downloading
+  Retrying
+  Ready
+  Asking
+  Installing
+  Failed
+}
+
+/// Snapshot of the updater's current phase, progress percentage (`-1` if indeterminate), error, and target file.
+#derive(Eq)
+pub struct UpdateStatus {
+  pub phase : UpdatePhase
+  pub percent : Int
+  pub error : String
+  pub file : String
+}
+
+/// Parse the JSON status string emitted by the host updater into `UpdateStatus`.
+pub fn parse_update_state(json_text : String) -> UpdateStatus {
+  let empty = UpdateStatus::{ phase: UpdatePhase::Idle, percent: -1, error: "", file: "" }
+  if json_text.length() == 0 {
+    return empty
+  }
+  let root = match hostapi::json_parse(json_text) {
+    Some(v) => v
+    None => return empty
+  }
+  let obj = match root {
+    hostapi::JsonValue::JObject(m) => m
+    _ => return empty
+  }
+  let phase = match json_str(obj, "phase") {
+    Some("waiting") => UpdatePhase::Waiting
+    Some("downloading") => UpdatePhase::Downloading
+    Some("retrying") => UpdatePhase::Retrying
+    Some("ready") => UpdatePhase::Ready
+    Some("allow") | Some("asking") => UpdatePhase::Asking
+    Some("installing") => UpdatePhase::Installing
+    Some("failed") => UpdatePhase::Failed
+    _ => UpdatePhase::Idle
+  }
+  let percent = match obj.get("percent") {
+    Some(hostapi::JsonValue::JNumber(n)) => n.to_int()
+    _ => -1
+  }
+  let error = json_str(obj, "error").unwrap_or("")
+  let file = json_str(obj, "file").unwrap_or("")
+  UpdateStatus::{ phase, percent, error, file }
+}
+
+/// End-to-end update check decision:
+/// 1. Parses and validates `feed_json`.
+/// 2. Enforces monotonic version check (`feed.version_code > current_version_code`).
+/// 3. If `pinned_pubkeys` is non-empty, verifies the Ed25519 signature envelope against them.
+/// 4. Selects an incremental delta if available for `current_version_code`, otherwise the full artifact.
+pub fn check_for_update(
+  feed_json : String,
+  current_version_code : Int,
+  pinned_pubkeys~ : Array[String] = [],
+  expected_kind~ : String = "",
+) -> Result[Option[SelectedArtifact], String] {
+  let feed = match parse_release_feed(feed_json) {
+    Ok(f) => f
+    Err(e) => return Err(e)
+  }
+  if feed.version_code <= current_version_code {
+    return Ok(None)
+  }
+  if pinned_pubkeys.length() > 0 {
+    match verify_feed_signature(feed, pinned_pubkeys, expected_kind=expected_kind) {
+      Ok(_) => ()
+      Err(e) => return Err(e)
+    }
+  }
+  select_artifact(feed, current_version_code)
+}

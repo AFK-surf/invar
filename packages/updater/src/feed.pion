@@ -1,0 +1,366 @@
+// Release feed parsing, Ed25519 signature verification, anti-downgrade checks, and delta artifact selection.
+
+import "codec"
+import "hostapi"
+
+/// Uncompressed/raw artifact checksum and size metadata.
+#derive(Eq)
+pub struct RawArtifact {
+  pub sha256 : String
+  pub size : Int64
+}
+
+/// Incremental delta update patch from a specific `from` build number.
+#derive(Eq)
+pub struct FeedDelta {
+  pub from : Int
+  pub file : String
+  pub sha256 : String
+  pub size : Int64
+}
+
+/// Detached Ed25519 signature envelope embedded in a release feed.
+#derive(Eq)
+pub struct SignedBlock {
+  pub key : String
+  pub release : String
+  pub signature : String
+}
+
+/// Parsed release feed (`latest.json`) describing a candidate update.
+pub struct ReleaseFeed {
+  pub version : String
+  pub version_code : Int
+  pub file : String
+  pub sha256 : String
+  pub size : Int64
+  pub raw : Option[RawArtifact]
+  pub deltas : Array[FeedDelta]
+  pub signed : Option[SignedBlock]
+}
+
+/// Concrete download artifact selected for a given installed build.
+#derive(Eq)
+pub struct SelectedArtifact {
+  pub file : String
+  pub sha256 : String
+  pub size : Int64
+  pub is_delta : Bool
+  pub from_version : Int
+}
+
+/// Return true if `s` is exactly 64 lowercase hexadecimal characters (`0-9`, `a-f`).
+pub fn is_lower_hex64(s : String) -> Bool {
+  if s.length() != 64 {
+    return false
+  }
+  let mut i = 0
+  while i < 64 {
+    let c = s.code_unit_at(i)
+    let ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+    if !ok {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+/// Return true if `path` is a safe relative artifact path with no leading `/`, `..`, or unsafe characters.
+pub fn is_safe_rel_path(path : String) -> Bool {
+  let n = path.length()
+  if n == 0 || path.code_unit_at(0) == 47 {
+    return false
+  }
+  let mut i = 0
+  let mut seg_start = 0
+  while i <= n {
+    let at_end = i == n
+    let is_slash = !at_end && path.code_unit_at(i) == 47
+    if at_end || is_slash {
+      let seg_len = i - seg_start
+      if seg_len == 0 {
+        return false
+      }
+      if seg_len == 2 && path.code_unit_at(seg_start) == 46 && path.code_unit_at(seg_start + 1) == 46 {
+        return false
+      }
+      seg_start = i + 1
+    } else {
+      let c = path.code_unit_at(i)
+      let ok = (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c == 46 ||
+      c == 95 ||
+      c == 45
+      if !ok {
+        return false
+      }
+    }
+    i += 1
+  }
+  true
+}
+
+fn path_basename(path : String) -> String {
+  let mut last = -1
+  let n = path.length()
+  let mut i = 0
+  while i < n {
+    if path.code_unit_at(i) == 47 {
+      last = i
+    }
+    i += 1
+  }
+  if last >= 0 {
+    path.slice(last + 1, n)
+  } else {
+    path
+  }
+}
+
+fn bytes_to_utf8_string(b : Bytes) -> String {
+  let sb = StringBuilder::new()
+  let n = b.length()
+  let mut i = 0
+  while i < n {
+    sb.write_byte(b[i])
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn json_str(obj : Map[String, hostapi::JsonValue], key : String) -> Option[String] {
+  match obj.get(key) {
+    Some(hostapi::JsonValue::JString(s)) => Some(s)
+    _ => None
+  }
+}
+
+fn json_pos_int64(obj : Map[String, hostapi::JsonValue], key : String) -> Option[Int64] {
+  match obj.get(key) {
+    Some(hostapi::JsonValue::JNumber(n)) => {
+      let i = n.to_int64()
+      if n > 0.0 && i.to_double() == n && i < 9007199254740992L {
+        Some(i)
+      } else {
+        None
+      }
+    }
+    _ => None
+  }
+}
+
+fn json_pos_int(obj : Map[String, hostapi::JsonValue], key : String) -> Option[Int] {
+  match json_pos_int64(obj, key) {
+    Some(i) if i <= 2147483647L => Some(i.to_int())
+    _ => None
+  }
+}
+
+fn parse_raw_artifact(v : hostapi::JsonValue) -> Option[RawArtifact] {
+  match v {
+    hostapi::JsonValue::JObject(obj) =>
+    match (json_str(obj, "sha256"), json_pos_int64(obj, "size")) {
+      (Some(sha), Some(sz)) if is_lower_hex64(sha) => Some(RawArtifact::{ sha256: sha, size: sz })
+      _ => None
+    }
+    _ => None
+  }
+}
+
+fn parse_signed_block(v : hostapi::JsonValue) -> Option[SignedBlock] {
+  match v {
+    hostapi::JsonValue::JObject(obj) =>
+    match (json_str(obj, "key"), json_str(obj, "release"), json_str(obj, "signature")) {
+      (Some(key), Some(release), Some(signature)) if key.length() > 0 &&
+      release.length() > 0 &&
+      signature.length() > 0 => Some(SignedBlock::{ key, release, signature })
+      _ => None
+    }
+    _ => None
+  }
+}
+
+/// Parse and validate a `latest.json` release feed.
+pub fn parse_release_feed(json_text : String) -> Result[ReleaseFeed, String] {
+  let root = match hostapi::json_parse(json_text) {
+    Some(v) => v
+    None => return Err("feed is not valid JSON")
+  }
+  let obj = match root {
+    hostapi::JsonValue::JObject(m) => m
+    _ => return Err("feed must be a JSON object")
+  }
+  let version = match json_str(obj, "version") {
+    Some(s) if s.length() > 0 => s
+    _ => return Err("feed missing valid version")
+  }
+  let version_code = match json_pos_int(obj, "versionCode") {
+    Some(n) => n
+    None => return Err("feed missing positive versionCode")
+  }
+  let file = match json_str(obj, "file") {
+    Some(s) if is_safe_rel_path(s) => s
+    _ => return Err("feed missing safe relative file path")
+  }
+  let sha256 = match json_str(obj, "sha256") {
+    Some(s) if is_lower_hex64(s) => s
+    _ => return Err("feed missing valid 64-hex sha256")
+  }
+  let size = match json_pos_int64(obj, "size") {
+    Some(n) => n
+    None => return Err("feed missing positive size")
+  }
+  let raw = match obj.get("raw") {
+    Some(v) => parse_raw_artifact(v)
+    None => None
+  }
+  let deltas : Array[FeedDelta] = []
+  match obj.get("deltas") {
+    Some(hostapi::JsonValue::JArray(items)) => {
+      for item in items {
+        match item {
+          hostapi::JsonValue::JObject(d) =>
+          match (
+            json_pos_int(d, "from"),
+            json_str(d, "file"),
+            json_str(d, "sha256"),
+            json_pos_int64(d, "size"),
+          ) {
+            (Some(from), Some(dfile), Some(dsha), Some(dsize)) =>
+            deltas.push(FeedDelta::{ from, file: dfile, sha256: dsha, size: dsize })
+            _ => ()
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  let signed = match obj.get("signed") {
+    Some(v) => parse_signed_block(v)
+    None => None
+  }
+  Ok(ReleaseFeed::{ version, version_code, file, sha256, size, raw, deltas, signed })
+}
+
+/// Verify a parsed feed's detached Ed25519 signature against `pinned_pubkeys` (base64-encoded 32-byte keys).
+/// Returns the signed `raw` artifact metadata (if present in the signed payload).
+pub fn verify_feed_signature(
+  feed : ReleaseFeed,
+  pinned_pubkeys : Array[String],
+  expected_kind~ : String = "",
+) -> Result[Option[RawArtifact], String] {
+  let signed = match feed.signed {
+    Some(s) => s
+    None => return Err("release is not signed")
+  }
+  let mut matched_pk : Option[Bytes] = None
+  for k in pinned_pubkeys {
+    match codec::from_base64_exact(k) {
+      Some(raw_pk) if raw_pk.length() == 32 && key_id(raw_pk) == signed.key => {
+        matched_pk = Some(raw_pk)
+        break
+      }
+      _ => ()
+    }
+  }
+  let pk = match matched_pk {
+    Some(p) => p
+    None => return Err("release is signed by an untrusted key (\{signed.key})")
+  }
+  let release_bytes = match codec::from_base64_exact(signed.release) {
+    Some(b) => b
+    None => return Err("signed release payload is not valid base64")
+  }
+  let sig_bytes = match codec::from_base64_exact(signed.signature) {
+    Some(b) => b
+    None => return Err("signed signature is not valid base64")
+  }
+  if !verify_ed25519(pk, release_bytes, sig_bytes) {
+    return Err("release signature verification failed")
+  }
+  let release_text = bytes_to_utf8_string(release_bytes)
+  let r_json = match hostapi::json_parse(release_text) {
+    Some(v) => v
+    None => return Err("signed release payload is not valid JSON")
+  }
+  let r = match r_json {
+    hostapi::JsonValue::JObject(m) => m
+    _ => return Err("signed release payload must be a JSON object")
+  }
+  if expected_kind.length() > 0 {
+    match json_str(r, "kind") {
+      Some(k) if k == expected_kind => ()
+      _ => return Err("signed release kind mismatch")
+    }
+  }
+  match json_pos_int(r, "build") {
+    Some(b) if b == feed.version_code => ()
+    _ => return Err("signed release build does not match feed versionCode")
+  }
+  let base_file = path_basename(feed.file)
+  match json_str(r, "file") {
+    Some(f) if f == base_file => ()
+    _ => return Err("signed release file does not match feed file")
+  }
+  match json_str(r, "sha256") {
+    Some(s) if s == feed.sha256 => ()
+    _ => return Err("signed release sha256 does not match feed sha256")
+  }
+  match json_pos_int64(r, "size") {
+    Some(sz) if sz == feed.size => ()
+    _ => return Err("signed release size does not match feed size")
+  }
+  let signed_raw = match r.get("raw") {
+    Some(v) => parse_raw_artifact(v)
+    None => None
+  }
+  Ok(signed_raw)
+}
+
+/// Select the best artifact to update from `current_version_code` to `feed`.
+/// Enforces monotonic version upgrade (`feed.version_code > current_version_code`),
+/// prefers a valid matching incremental delta (`from == current_version_code`), and falls back to the full package.
+pub fn select_artifact(
+  feed : ReleaseFeed,
+  current_version_code : Int,
+) -> Result[Option[SelectedArtifact], String] {
+  if feed.version_code <= current_version_code {
+    return Ok(None)
+  }
+  if !is_safe_rel_path(feed.file) || !is_lower_hex64(feed.sha256) || feed.size <= 0L {
+    return Err("feed primary artifact failed integrity validation")
+  }
+  for d in feed.deltas {
+    if d.from == current_version_code &&
+    is_safe_rel_path(d.file) &&
+    is_lower_hex64(d.sha256) &&
+    d.size > 0L {
+      return Ok(
+        Some(
+          SelectedArtifact::{
+            file: d.file,
+            sha256: d.sha256,
+            size: d.size,
+            is_delta: true,
+            from_version: d.from,
+          },
+        ),
+      )
+    }
+  }
+  Ok(
+    Some(
+      SelectedArtifact::{
+        file: feed.file,
+        sha256: feed.sha256,
+        size: feed.size,
+        is_delta: false,
+        from_version: current_version_code,
+      },
+    ),
+  )
+}

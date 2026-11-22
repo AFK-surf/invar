@@ -1,0 +1,161 @@
+// Unit tests for `packages/updater`:
+// - NIST FIPS 180-4 SHA-512 test vectors
+// - Official RFC 8032 Section 7.1 Ed25519 test vectors (Test 1 empty, Test 2 0x72, Test 3 0xaf82 + 1-bit tamper)
+// - Release feed parsing, signature rejection, anti-downgrade, delta vs full selection, and UpdateStatus parsing.
+
+import "codec"
+
+fn str_to_bytes(s : String) -> Bytes {
+  s.to_bytes()
+}
+
+test "sha512_nist_fips_180_4_vectors" {
+  // Empty string
+  let empty_h = sha512_hex("".to_bytes())
+  debug_assert(
+    empty_h == "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+    "SHA-512 empty vector",
+  )
+
+  // "abc"
+  let abc_h = sha512_hex(str_to_bytes("abc"))
+  debug_assert(
+    abc_h == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+    "SHA-512 'abc' vector",
+  )
+
+  // 2-block message
+  let long_h = sha512_hex(
+    str_to_bytes(
+      "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+    ),
+  )
+  debug_assert(
+    long_h == "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909",
+    "SHA-512 2-block NIST vector",
+  )
+}
+
+test "ed25519_rfc8032_section_7_1_vectors_and_tamper_rejection" {
+  // RFC 8032 Section 7.1 TEST 1: empty message
+  let pk1 = codec::from_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+  let sig1 = codec::from_hex(
+    "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+  )
+  debug_assert(verify_ed25519(pk1, "".to_bytes(), sig1), "RFC 8032 Test 1 passes")
+
+  // Flip 1 bit in signature -> MUST fail
+  let bad_sb = StringBuilder::new()
+  let mut i = 0
+  while i < 64 {
+    let b = sig1[i].to_int()
+    bad_sb.write_byte((if i == 0 { b ^ 1 } else { b }) as Byte)
+    i += 1
+  }
+  debug_assert(
+    !verify_ed25519(pk1, "".to_bytes(), bad_sb.to_string().to_bytes()),
+    "RFC 8032 Test 1 rejects 1-bit signature flip",
+  )
+  // Non-empty message against Test 1 signature -> MUST fail
+  debug_assert(!verify_ed25519(pk1, codec::from_hex("00"), sig1), "RFC 8032 Test 1 rejects wrong message")
+
+  // RFC 8032 Section 7.1 TEST 2: 1-byte message 0x72
+  let pk2 = codec::from_hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c")
+  let msg2 = codec::from_hex("72")
+  let sig2 = codec::from_hex(
+    "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+  )
+  debug_assert(verify_ed25519(pk2, msg2, sig2), "RFC 8032 Test 2 (0x72) passes")
+  debug_assert(!verify_ed25519(pk2, codec::from_hex("73"), sig2), "RFC 8032 Test 2 rejects 1-bit message flip")
+
+  // RFC 8032 Section 7.1 TEST 3: 2-byte message 0xaf82
+  let pk3 = codec::from_hex("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025")
+  let msg3 = codec::from_hex("af82")
+  let sig3 = codec::from_hex(
+    "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+  )
+  debug_assert(verify_ed25519(pk3, msg3, sig3), "RFC 8032 Test 3 (0xaf82) passes")
+  debug_assert(!verify_ed25519(pk3, codec::from_hex("af83"), sig3), "RFC 8032 Test 3 rejects tampered message")
+}
+
+test "release_feed_parsing_delta_selection_and_antidowngrade" {
+  let full_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  let delta_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  let json =
+  "{\"version\":\"2.4.0\",\"versionCode\":240,\"file\":\"releases/app-2.4.0.dmg\",\"sha256\":\"" +
+  full_sha +
+  "\",\"size\":10485760,\"deltas\":[{\"from\":239,\"file\":\"deltas/239-240.patch\",\"sha256\":\"" +
+  delta_sha +
+  "\",\"size\":512000}]}"
+
+  let feed = match parse_release_feed(json) {
+    Ok(f) => f
+    Err(e) => {
+      debug_assert(false, "expected valid feed: \{e}")
+      return
+    }
+  }
+  debug_assert(feed.version == "2.4.0" && feed.version_code == 240, "parsed version & code")
+
+  // Monotonic anti-downgrade: current >= feed.version_code returns Ok(None)
+  match select_artifact(feed, 240) {
+    Ok(None) => ()
+    _ => debug_assert(false, "same versionCode must return Ok(None)")
+  }
+  match select_artifact(feed, 241) {
+    Ok(None) => ()
+    _ => debug_assert(false, "higher installed versionCode must not downgrade")
+  }
+
+  // Matching delta preferred when updating from build 239 -> 240
+  match select_artifact(feed, 239) {
+    Ok(Some(art)) => {
+      debug_assert(art.is_delta && art.file == "deltas/239-240.patch" && art.sha256 == delta_sha, "delta preferred")
+    }
+    _ => debug_assert(false, "expected delta artifact from 239")
+  }
+
+  // Fallback to full package when no delta exists for build 230
+  match select_artifact(feed, 230) {
+    Ok(Some(art)) => {
+      debug_assert(!art.is_delta && art.file == "releases/app-2.4.0.dmg" && art.sha256 == full_sha, "full fallback")
+    }
+    _ => debug_assert(false, "expected full artifact fallback from 230")
+  }
+
+  // Reject unsafe path traversal and uppercase/short sha256
+  let bad_path_json =
+  "{\"version\":\"2.4.0\",\"versionCode\":240,\"file\":\"../evil.dmg\",\"sha256\":\"" +
+  full_sha +
+  "\",\"size\":100}"
+  debug_assert(parse_release_feed(bad_path_json).is_err(), "path traversal rejected")
+
+  let bad_sha_json = "{\"version\":\"2.4.0\",\"versionCode\":240,\"file\":\"ok.dmg\",\"sha256\":\"ABCD\",\"size\":100}"
+  debug_assert(parse_release_feed(bad_sha_json).is_err(), "invalid sha256 rejected")
+
+  // Unsigned feed rejected when pinned_pubkeys is non-empty
+  let pk1_b64 = codec::base64(
+    codec::from_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+  )
+  debug_assert(
+    check_for_update(json, 239, pinned_pubkeys=[pk1_b64]).is_err(),
+    "unsigned feed rejected when pinned_pubkeys provided",
+  )
+}
+
+test "parse_update_state_all_phases" {
+  let s1 = parse_update_state("{\"phase\":\"downloading\",\"percent\":47,\"file\":\"app.dmg\"}")
+  debug_assert(
+    s1.phase == UpdatePhase::Downloading && s1.percent == 47 && s1.file == "app.dmg",
+    "downloading phase parsed",
+  )
+  let s2 = parse_update_state("{\"phase\":\"failed\",\"error\":\"network timeout\"}")
+  debug_assert(
+    s2.phase == UpdatePhase::Failed && s2.error == "network timeout" && s2.percent == -1,
+    "failed phase parsed",
+  )
+  let s3 = parse_update_state("{\"phase\":\"allow\"}")
+  debug_assert(s3.phase == UpdatePhase::Asking, "allow maps to Asking")
+  let s4 = parse_update_state("")
+  debug_assert(s4.phase == UpdatePhase::Idle, "empty string yields Idle")
+}
