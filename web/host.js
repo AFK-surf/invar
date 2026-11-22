@@ -3949,7 +3949,9 @@
     });
     // with no field focused, the keys are the app's (its shortcuts, Escape, the arrows; a character as 1000 + it)
     on(win, 'keydown', (e) => {
-      if (e.defaultPrevented || e.target === ta || imeActive || e.isComposing || e.keyCode === 229) return;
+      const keptEsc = e === escKept;
+      if (keptEsc) escKept = null;
+      if ((e.defaultPrevented && !keptEsc) || e.target === ta || imeActive || e.isComposing || e.keyCode === 229) return;
       if (e.target?.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName)) return;
       if (!catching && e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey && e.key === 'ArrowLeft') {
         goBack(e);
@@ -5130,7 +5132,10 @@
     }
     win.addEventListener('blur', () => { modsNow = 0; });
     win.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229) e.preventDefault();
+      if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229 && !e.defaultPrevented) {
+        escKept = e;
+        e.preventDefault();
+      }
     }, { capture: true });
     // (no smaller than the app said: a popup the page opened is one it may size)
     if (s.minW || s.minH) {
@@ -5197,6 +5202,7 @@
   // key's own are told), as the last input the window had says them; none once it is left (blurred, hidden), where its
   // keys' going up is never seen.
   let modsNow = 0;
+  let escKept = null;
   H.modsHeld = () => modsNow;
   // How far the system reaches in over the canvas (a phone's notch, its home indicator: the page laid out under them,
   // index.html's viewport-fit=cover), as CSS's env(safe-area-inset-*) says, read off a probe padded by them; said on
@@ -5262,7 +5268,10 @@
     // screen, its focus), but not from an input method composing, whose Escape calls its words off. The app is still
     // told it (setupInput's keydown).
     window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229) e.preventDefault();
+      if (e.key === 'Escape' && !e.isComposing && e.keyCode !== 229 && !e.defaultPrevented) {
+        escKept = e;
+        e.preventDefault();
+      }
     }, { capture: true });
     // (and as the page's size is measured again: resize)
     const barsChanged = () => { barsNow(); };
