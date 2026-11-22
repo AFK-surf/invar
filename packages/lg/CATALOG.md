@@ -82,15 +82,15 @@ let _ = lg::liquid_control_item_node(card, fn() { wifi.get() }, fn(v) { wifi.set
 ## 二、工具栏与导航（Toolbars & Navigation）
 
 ### 5. `lg::liquid_toolbar_node` & `lg::liquid_toolbar_divider`
-- **适用场景**：单层液态玻璃浮动工具栏容器（默认 `height=42.0`、`pad_x=5.0`，内放 `32pt` 按钮严格同心 `21 - 5 = 16`；内部只放 `flat=true` 按钮与 `liquid_toolbar_divider`）。
+- **适用场景**：单层液态玻璃浮动工具栏容器（默认 `height=36.0, r=18.0`、`pad_x=3.0`、`gap=2.0`，上下对称 `3.0pt` 内边距，内放 `30pt` 扁平按钮/图标钮严格同心 `18 - 3 = 15`；内部只放 `flat=true` 按钮与 `liquid_toolbar_divider`）。
 - **签名**：
-  - `pub fn liquid_toolbar_node(parent : view::View, body : (view::View) -> Unit, height~ : Double = 42.0, pad_x~ : Double = ovl_toolbar_px, gap~ : Double = ovl_toolbar_gap, loc~ : String = "") -> view::View`
+  - `pub fn liquid_toolbar_node(parent : view::View, body : (view::View) -> Unit, height~ : Double = 36.0, pad_x~ : Double = ovl_toolbar_px, pad? : Double, gap~ : Double = ovl_toolbar_gap, loc~ : String = "") -> view::View`
   - `pub fn liquid_toolbar_divider(parent : view::View, height~ : Double = 20.0, loc~ : String = "") -> view::View`
 ```pion
 let _ = lg::liquid_toolbar_node(page, fn(bar) {
-  let _ = lg::liquid_button_node(bar, fn() { "Select" }, fn() { () }, flat=true, ghost=true, height=32.0, pad_x=10.0)
-  let _ = lg::liquid_toolbar_divider(bar, height=18.0)
-  let _ = lg::liquid_button_node(bar, fn() { "Note" }, fn() { () }, flat=true, ghost=true, height=32.0, pad_x=10.0)
+  let _ = lg::liquid_button_node(bar, fn() { "Select" }, fn() { () }, flat=true, ghost=true, pad_x=10.0)
+  let _ = lg::liquid_toolbar_divider(bar, height=16.0)
+  let _ = lg::liquid_button_node(bar, fn() { "Note" }, fn() { () }, flat=true, ghost=true, pad_x=10.0)
 })
 ```
 
@@ -180,10 +180,11 @@ let _ = lg::liquid_disclosure_node(page, fn() { "Advanced" }, fn() { open.get() 
 })
 ```
 
-### 14. `lg::liquid_popover_node` & `lg::liquid_tooltip_node`
-- **适用场景**：锚定在触发器旁的液态玻璃气泡弹层与悬浮提示（含完整 `headless::Placement` 定位）。
+### 14. `lg::liquid_popover_node`、`lg::liquid_popover_button_node` & `lg::liquid_tooltip_node`
+- **适用场景**：锚定在触发器旁的液态玻璃气泡弹层（含开箱即用的 `liquid_popover_button_node`，支持 `flat=true, ghost=true` 零嵌套玻璃嵌入工具栏）与悬浮提示（含完整 `headless::Placement` 定位）。
 - **签名**：
-  - `pub fn liquid_popover_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, trigger_label : () -> String, trigger_look : (view::View, headless::Disclosure) -> Unit, content_label : () -> String, content_look : (view::View) -> Unit, placement~ : headless::Placement = headless::Placement::BelowCenter, width~ : Double = 280.0, anchor_size~ : (Double, Double) = (40.0, 40.0), trigger_face? : (view::View) -> Unit, loc~ : String = "") -> view::View`
+  - `pub fn liquid_popover_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, trigger_label : () -> String, trigger_look : (view::View, headless::Disclosure) -> Unit, content_label : () -> String, content_look : (view::View) -> Unit, placement~ : headless::Placement = headless::Placement::BelowCenter, width~ : Double = 280.0, anchor_size~ : (Double, Double) = (36.0, 36.0), trigger_face? : (view::View) -> Unit, loc~ : String = "") -> view::View`
+  - `pub fn liquid_popover_button_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, label : () -> String, content_look : (view::View) -> Unit, icon? : (view::View, () -> Int64) -> Unit, show_label~ : Bool = true, flat~ : Bool = false, ghost~ : Bool = false, active~ : () -> Bool = fn() { false }, height~ : Double = button_h, pad_x~ : Double = 12.0, content_label~ : () -> String = fn() { "Popover" }, placement~ : headless::Placement = headless::Placement::BelowCenter, width~ : Double = 240.0, loc~ : String = "") -> view::View`
   - `pub fn liquid_tooltip_node(parent : view::View, host : view::View, tip : () -> String, trigger_look : (view::View) -> Unit, placement~ : headless::Placement = headless::Placement::AboveCenter, loc~ : String = "") -> view::View`
 ```pion
 let _ = lg::liquid_tooltip_node(page, host_root, fn() { "Reset optical params" }, fn(tr) {
@@ -234,7 +235,7 @@ let _ = lg::liquid_drawer_node(
 - **签名**：
   - `pub struct LiquidMenuEntry` (`LiquidMenuEntry::item`, `LiquidMenuEntry::check`, `LiquidMenuEntry::separator`)
   - `pub fn liquid_menu_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, trigger_label : () -> String, trigger_look : (view::View, headless::Disclosure) -> Unit, entries : () -> Array[LiquidMenuEntry], menu_label~ : () -> String = fn() { "" }, placement~ : headless::Placement = headless::Placement::BelowStart, width~ : Double = 220.0, loc~ : String = "") -> view::View`
-  - `pub fn liquid_menu_button_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, label : () -> String, entries : () -> Array[LiquidMenuEntry], icon? : (view::View, () -> Int64) -> Unit, show_label~ : Bool = true, height~ : Double = 36.0, pad_x~ : Double = 14.0, menu_label~ : () -> String = fn() { "" }, placement~ : headless::Placement = headless::Placement::BelowStart, width~ : Double = 220.0, loc~ : String = "") -> view::View`
+  - `pub fn liquid_menu_button_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, label : () -> String, entries : () -> Array[LiquidMenuEntry], icon? : (view::View, () -> Int64) -> Unit, show_label~ : Bool = true, flat~ : Bool = false, ghost~ : Bool = false, active~ : () -> Bool = fn() { false }, height~ : Double = button_h, pad_x~ : Double = 12.0, menu_label~ : () -> String = fn() { "Menu" }, placement~ : headless::Placement = headless::Placement::BelowStart, min_width~ : Double = 212.0, loc~ : String = "") -> view::View`
   - `pub fn liquid_menu_panel_node(parent : view::View, entries : () -> Array[LiquidMenuEntry], on_close : () -> Unit, header~ : () -> String = fn() { "" }, menu_label~ : () -> String = fn() { "Menu" }, width~ : Double = 240.0, loc~ : String = "") -> view::View`
 ```pion
 let _ = lg::liquid_menu_button_node(row, page, fn() { open.get() }, fn(v) { open.set(v) }, fn() { "Insert" }, fn() {
@@ -258,6 +259,10 @@ let _ = lg::liquid_select_node(page, page, fn() {
 ### 19. `lg::liquid_segmented_node`
 - **适用场景**：分段切换控件（默认 `height=36.0`、内胶囊 `30.0`，`18 - 3 = 15` 精确同心；支持拖拽滑动与按压清透透镜）。
 - **签名**：`pub fn liquid_segmented_node(parent : view::View, labels : () -> Array[String], selected : () -> Int, on_select : (Int) -> Unit, width? : Double, height~ : Double = 36.0, drag? : DampedDrag, loc~ : String = "") -> view::View`
+
+### 19b. `lg::liquid_swatch_grid_node` & `lg::LiquidSwatch`
+- **适用场景**：基于 `headless::radio_group` 的圆形色板单选网格（选中项带 `2pt` 主题色同心外环 + `2pt` 内缝，`transparent=true` 项带浅底与红色对角矢量斜杠，无内部 `Glass::liquid`，可直接嵌入 `liquid_popover_node` / 工具栏弹层）。
+- **签名**：`pub struct LiquidSwatch`（`LiquidSwatch::new(color, label, transparent~=false)`）；`pub fn liquid_swatch_grid_node(parent : view::View, swatches : () -> Array[LiquidSwatch], selected : () -> Int, on_select : (Int) -> Unit, columns~ : Int = 6, swatch_size~ : Double = 24.0, gap~ : Double = 8.0, label~ : () -> String = fn() { "Color Swatches" }, loc~ : String = "") -> view::View`
 ```pion
 let _ = lg::liquid_segmented_node(page, fn() { ["Day", "Week", "Month"] }, fn() { seg.get() }, fn(i) { seg.set(i) }, width=300.0)
 ```

@@ -1,5 +1,5 @@
 // Pion WebAssembly (wasm32) Minimal Browser Runtime (Zero Node.js Dependencies)
-// Synced from AFK-surf/pion@806ef4b runtime/pion_wasm_rt_web.mjs (P35-A pure-Wasm slab allocator) with zero-copy host bridge & concurrency helpers preserved.
+// Synced from AFK-surf/pion@7d50299 runtime/pion_wasm_rt_web.mjs (P35-A pure-Wasm slab allocator) with zero-copy host bridge & concurrency helpers preserved.
 const TAG_STRING = 1, TAG_BYTES = 2, TAG_ARRAY = 3, TAG_MAP = 7, TAG_CHANNEL = 8, TAG_MUTEX = 9, TAG_ATOMIC = 10, TAG_STRBUF = 11, TAG_SCOPE = 12, TAG_WORLD = 13;
 const FLAG_FROZEN = 1, FLAG_IMMORTAL = 2, HDR = 24, PAGE = 65536;
 const FREE_CLASSES = (() => {
@@ -86,6 +86,7 @@ export function createPionRuntime(opts = {}) {
     }
     for (let i = 0; i < free.length; i++) free[i].length = 0;
     largeFree.clear();
+    channels.clear();
   }
 
   function clsIdx(n) {
@@ -161,8 +162,8 @@ export function createPionRuntime(opts = {}) {
       if (fn) fn(pBig(p)); sync();
     }
     if (tag === TAG_ARRAY) {
-      const len = Number(g64(p)), isObj = g32(p + 16), dp = Number(g64(p + 24));
-      if (isObj && dp) for (let i = 0; i < len; i++) { const v = g64(dp + i * 8); if (v) pion_rc_dec(v); sync(); }
+      const len = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
+      arrRcAll(dp, len, isObj, st, false);
       if (dp) rawFree(dp);
     } else if (tag === TAG_MAP) {
       const cap = Number(g64(p + 8)), vObj = g32(p + 16), kInt = g32(p + 20), es = Number(g64(p + 24));
@@ -179,17 +180,11 @@ export function createPionRuntime(opts = {}) {
     } else if (tag === TAG_BYTES || tag === TAG_STRBUF) {
       const dp = Number(g64(p + 16)); if (dp) rawFree(dp);
     } else if (tag === TAG_MUTEX) {
-      const valIsObj = g32(p + 8);
-      if (valIsObj) {
-        const v = g64(p);
-        if (v !== 0n) pion_rc_dec(v);
-      }
+      if (g32(p + 8)) { const v = g64(p); if (v !== 0n) pion_rc_dec(v); }
     } else if (tag === TAG_CHANNEL) {
       const ch = channels.get(p);
       if (ch) {
-        if (ch.elemIsObj) {
-          for (const v of ch.queue) pion_rc_dec(v);
-        }
+        if (ch.elemIsObj) for (const v of ch.queue) pion_rc_dec(v);
         channels.delete(p);
       }
     }
@@ -412,56 +407,94 @@ export function createPionRuntime(opts = {}) {
     s64(d, l); if (l && dp) u8.copyWithin(d + 8, dp, dp + l); u8[d + 8 + l] = 0; return o;
   }
 
-  function pion_arr_new(cap, isObj) {
-    const c = Math.max(Number(cap), 0), o = pion_alloc_uninit(32, TAG_ARRAY, 0n);
-    const dp = c ? rawZero(c * 8) : 0, p = pNum(o); sync();
-    s64(p, 0); s64(p + 8, c); s32(p + 16, isObj); s32(p + 20, 0); s64(p + 24, pBig(dp)); return o;
+  const arrStride = (p) => { const s = g32(p + 20); return s > 0 ? s : 8; };
+  function arrRcAll(dp, len, isObj, st, isInc) {
+    if (!isObj || !dp || len <= 0) return;
+    if (st <= 8) {
+      for (let i = 0; i < len; i++) { const v = g64(dp + i * 8); if (v) { if (isInc) pion_rc_inc(v); else pion_rc_dec(v); sync(); } }
+    } else {
+      const mask = isObj >>> 0;
+      for (let i = 0; i < len; i++) {
+        const base = dp + i * st;
+        for (let m = mask, k = 0; m !== 0; m >>>= 1, k++) {
+          if (m & 1) { const v = g64(base + k * 8); if (v) { if (isInc) pion_rc_inc(v); else pion_rc_dec(v); sync(); } }
+        }
+      }
+    }
+  }
+  function pion_arr_new(cap, flags) {
+    const c = Math.max(Number(cap), 0), f = flags | 0;
+    const isObj = f > 2 ? (f >>> 8) : (f === 1 ? 1 : 0), st = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0), esz = st || 8;
+    const o = pion_alloc_uninit(32, TAG_ARRAY, 0n);
+    const dp = c ? rawZero(c * esz) : 0, p = pNum(o); sync();
+    s64(p, 0); s64(p + 8, c); s32(p + 16, isObj); s32(p + 20, st); s64(p + 24, pBig(dp)); return o;
   }
   const pion_arr_len = (a) => { sync(); return g64(pNum(a)); };
   function arrEnsure(p, need) {
     sync(); const cap = Number(g64(p + 8)); if (need <= cap) return;
     let nc = cap < 8 ? 8 : cap * 2; while (nc < need) nc *= 2;
-    const len = Number(g64(p)), old = Number(g64(p + 24)), nd = rawAlloc(nc * 8); sync();
-    if (len && old) u8.copyWithin(nd, old, old + len * 8); if (old) rawFree(old);
+    const len = Number(g64(p)), esz = arrStride(p), old = Number(g64(p + 24)), nd = rawAlloc(nc * esz); sync();
+    if (len && old) u8.copyWithin(nd, old, old + len * esz); if (old) rawFree(old);
     s64(p + 8, nc); s64(p + 24, pBig(nd));
   }
+  function pion_arr_push_flat_grow(a) {
+    const p = pNum(a); sync(); const l = Number(g64(p)); arrEnsure(p, l + 1); sync();
+    return pBig(Number(g64(p + 24)) + l * arrStride(p));
+  }
   function pion_arr_push(a, v) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16);
-    arrEnsure(p, l + 1); if (isObj && v) pion_rc_inc(v); sync();
+    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20);
+    arrEnsure(p, l + 1);
+    if (st === 1) { sync(); u8[Number(g64(p + 24)) + l] = Number(v) & 0xff; s64(p, l + 1); return; }
+    if (isObj && v) pion_rc_inc(v); sync();
     s64(Number(g64(p + 24)) + l * 8, v); s64(p, l + 1);
   }
   function pion_arr_push_owned(a, v) {
-    const p = pNum(a); sync(); const l = Number(g64(p)); arrEnsure(p, l + 1); sync();
-    s64(Number(g64(p + 24)) + l * 8, v); s64(p, l + 1);
+    const p = pNum(a); sync(); const l = Number(g64(p)), st = g32(p + 20); arrEnsure(p, l + 1); sync();
+    const dp = Number(g64(p + 24));
+    if (st === 1) u8[dp + l] = Number(v) & 0xff; else s64(dp + l * 8, v);
+    s64(p, l + 1);
   }
   function pion_arr_get(a, i) {
     const p = pNum(a); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n);
-    // Match pion_rt.c: caller emits pion_rc_inc for borrowed element loads.
-    return g64(Number(g64(p + 24)) + Number(i) * 8);
+    const dp = Number(g64(p + 24));
+    return g32(p + 20) === 1 ? BigInt(u8[dp + Number(i)]) : g64(dp + Number(i) * 8);
   }
   function pion_arr_set(a, i, v) {
     const p = pNum(a); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n);
-    const isObj = g32(p + 16), off = Number(g64(p + 24)) + Number(i) * 8, old = g64(off);
+    const dp = Number(g64(p + 24));
+    if (g32(p + 20) === 1) { u8[dp + Number(i)] = Number(v) & 0xff; return; }
+    const isObj = g32(p + 16), off = dp + Number(i) * 8, old = g64(off);
     if (isObj && v) pion_rc_inc(v); sync(); s64(off, v); if (isObj && old) pion_rc_dec(old);
   }
   function pion_arr_pop(a) {
     const p = pNum(a); sync(); const l = Number(g64(p)); if (l <= 0) pion_panic_oob(-1n, 0n);
-    const v = g64(Number(g64(p + 24)) + (l - 1) * 8); s64(p, l - 1); return v;
+    const dp = Number(g64(p + 24));
+    const v = g32(p + 20) === 1 ? BigInt(u8[dp + (l - 1)]) : g64(dp + (l - 1) * 8);
+    s64(p, l - 1); return v;
   }
   function pion_arr_copy(a) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), o = pion_arr_new(BigInt(l), isObj);
+    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20);
+    const fl = st > 1 ? (st | (isObj << 8)) : (st === 1 ? 2 : isObj), esz = st || 8, o = pion_arr_new(BigInt(l), fl);
     const po = pNum(o); sync(); const src = Number(g64(p + 24)), dst = Number(g64(po + 24));
-    if (l) { u8.copyWithin(dst, src, src + l * 8); if (isObj) for (let i = 0; i < l; i++) { const v = g64(dst + i * 8); if (v) pion_rc_inc(v); } }
+    if (l) { u8.copyWithin(dst, src, src + l * esz); arrRcAll(dst, l, isObj, st, true); }
     s64(po, l); return o;
   }
   function pion_arr_clear(a) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), dp = Number(g64(p + 24));
-    if (isObj && dp) for (let i = 0; i < l; i++) { const v = g64(dp + i * 8); if (v) pion_rc_dec(v); sync(); }
+    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
+    arrRcAll(dp, l, isObj, st, false);
     s64(p, 0);
   }
   function pion_arr_reverse(a) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), dp = Number(g64(p + 24));
-    for (let i = 0, j = l - 1; i < j; i++, j--) { const x = g64(dp + i * 8); s64(dp + i * 8, g64(dp + j * 8)); s64(dp + j * 8, x); }
+    const p = pNum(a); sync(); const l = Number(g64(p)), dp = Number(g64(p + 24)), st = arrStride(p);
+    if (st === 8) {
+      for (let i = 0, j = l - 1; i < j; i++, j--) { const x = g64(dp + i * 8); s64(dp + i * 8, g64(dp + j * 8)); s64(dp + j * 8, x); }
+    } else {
+      const tmp = new Uint8Array(st);
+      for (let i = 0, j = l - 1; i < j; i++, j--) {
+        const oi = dp + i * st, oj = dp + j * st;
+        tmp.set(u8.subarray(oi, oi + st)); u8.copyWithin(oi, oj, oj + st); u8.set(tmp, oj);
+      }
+    }
   }
   function pion_arr_join(a, sep) {
     const p = pNum(a); sync(); const l = Number(g64(p)), dp = Number(g64(p + 24)), ps = new Array(l);
@@ -474,7 +507,11 @@ export function createPionRuntime(opts = {}) {
     for (let i = 0; i < l; i++) vs[i] = g64(dp + i * 8);
     vs.sort(cmp); sync(); for (let i = 0; i < l; i++) s64(dp + i * 8, vs[i]);
   }
-  const pion_arr_sort_int = (a) => arrSort(a, (x, y) => (x < y ? -1 : x > y ? 1 : 0));
+  const pion_arr_sort_int = (a) => {
+    const p = pNum(a); sync(); const l = Number(g64(p)); if (l <= 1) return;
+    if (g32(p + 20) === 1) { const dp = Number(g64(p + 24)); u8.subarray(dp, dp + l).sort(); return; }
+    arrSort(a, (x, y) => (x < y ? -1 : x > y ? 1 : 0));
+  };
   const pion_arr_sort_str = (a) => arrSort(a, pion_str_cmp);
 
   function mapNew(vObj, kInt) {
@@ -530,13 +567,11 @@ export function createPionRuntime(opts = {}) {
   const pion_map_has = (m, k) => (mapSlot(pNum(m), k) >= 0 ? 1 : 0);
   function pion_map_get(m, k) {
     const p = pNum(m), sl = mapSlot(p, k); if (sl < 0) return 0n; sync();
-    // Match pion_rt.c: caller emits pion_rc_inc for borrowed map values.
     return g64(Number(g64(p + 24)) + sl * 32 + 16);
   }
   function pion_map_try_get(m, k, outP) {
     const p = pNum(m), sl = mapSlot(p, k), op = pNum(outP);
     if (sl < 0) { if (op) { sync(); s64(op, 0); } return 0; }
-    // Match pion_rt.c: caller emits pion_rc_inc for borrowed map values.
     sync(); const v = g64(Number(g64(p + 24)) + sl * 32 + 16);
     if (op) s64(op, v); return 1;
   }
@@ -578,99 +613,52 @@ export function createPionRuntime(opts = {}) {
   }
 
   function pion_scope_begin() { return pion_alloc(8, TAG_SCOPE, 0n); }
-  function pion_scope_spawn(_scope, fnIdx, env) {
+  function pion_scope_spawn(_s, fnIdx, env) {
     const idx = Number(fnIdx);
-    if (idx !== 0 && exp && exp.__indirect_function_table) {
-      const fn = exp.__indirect_function_table.get(idx);
-      if (fn) fn(BigInt(env));
-    }
+    if (idx && exp && exp.__indirect_function_table) { const fn = exp.__indirect_function_table.get(idx); if (fn) fn(BigInt(env)); }
   }
-  function pion_scope_end(scope) { pion_rc_dec(scope); }
-
+  const pion_scope_end = (s) => pion_rc_dec(s);
   function pion_chan_new(cap, elemIsObj) {
-    const obj = pion_alloc(16, TAG_CHANNEL, 0n);
-    channels.set(pNum(obj), { cap: Number(cap), elemIsObj: elemIsObj | 0, queue: [], closed: false });
-    return obj;
+    const o = pion_alloc(16, TAG_CHANNEL, 0n);
+    channels.set(pNum(o), { cap: Number(cap), elemIsObj: elemIsObj | 0, queue: [], closed: false });
+    return o;
   }
   function pion_chan_send(ch, val) {
-    const c = channels.get(pNum(ch));
-    if (!c || c.closed) return 0;
+    const c = channels.get(pNum(ch)); if (!c || c.closed) return 0;
     if (c.elemIsObj && val !== 0n) pion_rc_inc(val);
-    c.queue.push(BigInt(val));
-    return 1;
+    c.queue.push(BigInt(val)); return 1;
   }
-  function pion_chan_recv(ch, outValPtr) {
-    const c = channels.get(pNum(ch));
-    const op = pNum(outValPtr);
-    if (!c || c.queue.length === 0) {
-      if (op) { sync(); s64(op, 0n); }
-      return 0;
-    }
-    const v = c.queue.shift();
-    if (op) { sync(); s64(op, v); }
-    return 1;
+  function pion_chan_recv(ch, outP) {
+    const c = channels.get(pNum(ch)), op = pNum(outP);
+    if (!c || !c.queue.length) { if (op) { sync(); s64(op, 0n); } return 0; }
+    const v = c.queue.shift(); if (op) { sync(); s64(op, v); } return 1;
   }
-  function pion_chan_close(ch) {
-    const c = channels.get(pNum(ch));
-    if (c) c.closed = true;
-  }
-
+  function pion_chan_close(ch) { const c = channels.get(pNum(ch)); if (c) c.closed = true; }
   function pion_mutex_new(initVal, valIsObj) {
-    const obj = pion_alloc(16, TAG_MUTEX, 0n);
-    const p = pNum(obj);
-    if (valIsObj && initVal !== 0n) pion_rc_inc(initVal);
-    sync();
-    s64(p, initVal);
-    s32(p + 8, valIsObj | 0);
-    return obj;
+    const o = pion_alloc(16, TAG_MUTEX, 0n), p = pNum(o);
+    if (valIsObj && initVal !== 0n) pion_rc_inc(initVal); sync();
+    s64(p, initVal); s32(p + 8, valIsObj | 0); return o;
   }
-  function pion_mutex_lock(m) {
-    sync();
-    return g64(pNum(m));
-  }
+  const pion_mutex_lock = (m) => (sync(), g64(pNum(m)));
   function pion_mutex_set(m, newVal) {
-    const p = pNum(m);
-    sync();
-    const valIsObj = g32(p + 8);
-    const oldVal = g64(p);
-    if (valIsObj && newVal !== 0n) pion_rc_inc(newVal);
-    sync();
-    s64(p, newVal);
-    if (valIsObj && oldVal !== 0n) pion_rc_dec(oldVal);
+    const p = pNum(m); sync(); const isObj = g32(p + 8), old = g64(p);
+    if (isObj && newVal !== 0n) pion_rc_inc(newVal); sync();
+    s64(p, newVal); if (isObj && old !== 0n) pion_rc_dec(old);
   }
-  function pion_mutex_set_and_unlock(m, newVal) { pion_mutex_set(m, newVal); }
-  function pion_mutex_unlock(_m) {}
-
-  function pion_atomic_new(initVal) {
-    const obj = pion_alloc(8, TAG_ATOMIC, 0n);
-    sync();
-    s64(pNum(obj), initVal);
-    return obj;
-  }
-  function pion_atomic_load(a) {
-    sync();
-    return g64(pNum(a));
-  }
-  function pion_atomic_store(a, val) {
-    sync();
-    s64(pNum(a), val);
-  }
-  function pion_atomic_fetch_add(a, delta) {
-    const p = pNum(a);
-    sync();
-    const old = g64(p);
-    s64(p, BigInt.asIntN(64, old + BigInt(delta)));
-    return old;
+  const pion_mutex_set_and_unlock = (m, v) => pion_mutex_set(m, v);
+  const pion_mutex_unlock = (_m) => {};
+  function pion_atomic_new(initVal) { const o = pion_alloc(8, TAG_ATOMIC, 0n); sync(); s64(pNum(o), initVal); return o; }
+  const pion_atomic_load = (a) => (sync(), g64(pNum(a)));
+  const pion_atomic_store = (a, v) => { sync(); s64(pNum(a), v); };
+  function pion_atomic_fetch_add(a, d) {
+    const p = pNum(a); sync(); const old = g64(p);
+    s64(p, BigInt.asIntN(64, old + BigInt(d))); return old;
   }
 
   const imports = {
     pion_rt: {
       pion_cur_tid: () => 1n, pion_alloc, pion_alloc_uninit,
       pion_rc_inc, pion_rc_dec, pion_rc_dec_slow, pion_rc_freeze, pion_rc_immortalize,
-      pion_scope_begin, pion_scope_spawn, pion_scope_end,
-      pion_chan_new, pion_chan_send, pion_chan_recv, pion_chan_close,
-      pion_mutex_new, pion_mutex_lock, pion_mutex_set, pion_mutex_set_and_unlock, pion_mutex_unlock,
-      pion_atomic_new, pion_atomic_load, pion_atomic_store, pion_atomic_fetch_add,
       pion_panic, pion_panic_oob, pion_debug_assert,
       pion_math_sqrt: Math.sqrt, pion_math_abs: Math.abs, pion_math_floor: Math.floor,
       pion_math_ceil: Math.ceil, pion_math_sin: Math.sin, pion_math_cos: Math.cos, pion_math_pow: Math.pow,
@@ -691,11 +679,15 @@ export function createPionRuntime(opts = {}) {
       pion_bytes_slice, pion_bytes_concat, pion_bytes_from_ptr, pion_bytes_copy_to_ptr,
       pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_byte, pion_strbuf_push_char,
       pion_strbuf_push_int, pion_strbuf_reset, pion_strbuf_to_str,
-      pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_get,
+      pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_push_flat_grow, pion_arr_get,
       pion_arr_set, pion_arr_pop, pion_arr_copy, pion_arr_clear, pion_arr_reverse,
       pion_arr_join, pion_arr_sort_int, pion_arr_sort_str,
       pion_map_new, pion_map_new_int, pion_map_len, pion_map_set, pion_map_has,
       pion_map_get, pion_map_try_get, pion_map_remove, pion_map_clear, pion_map_copy, pion_map_keys,
+      pion_scope_begin, pion_scope_spawn, pion_scope_end,
+      pion_chan_new, pion_chan_send, pion_chan_recv, pion_chan_close,
+      pion_mutex_new, pion_mutex_lock, pion_mutex_set, pion_mutex_set_and_unlock, pion_mutex_unlock,
+      pion_atomic_new, pion_atomic_load, pion_atomic_store, pion_atomic_fetch_add,
       pion_world_init: () => pion_alloc(16, TAG_WORLD, 0n),
       pion_world_print: (_w, s) => printFn(readStr(s)),
       pion_world_println: (_w, s) => printlnFn(readStr(s)),
