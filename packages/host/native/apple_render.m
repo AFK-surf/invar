@@ -901,7 +901,7 @@ MB_CORNER_SL
 "      if (target_px <= 0.01) {\n"
 "        g_small = src.sample(s, clamp(c_uv, uv0_min, uv0_max));\n"
 "      } else {\n"
-"        float r_tap = target_px * 1.5;\n"
+"        float r_tap = min(target_px * 0.75, 1.25);\n"
 "        float2 d0 = float2(r_tap, 0.0) * m0.xy;\n"
 "        float2 d1 = float2(0.0, r_tap) * m0.xy;\n"
 "        float2 dd = float2(r_tap * 0.70710678, r_tap * 0.70710678) * m0.xy;\n"
@@ -915,7 +915,7 @@ MB_CORNER_SL
 "                    src.sample(s, clamp(c_uv + float2(dd.x, -dd.y), uv0_min, uv0_max)) +\n"
 "                    src.sample(s, clamp(c_uv + float2(-dd.x, dd.y), uv0_min, uv0_max))) * 0.0625;\n"
 "      }\n"
-"      float blend1 = smoothstep(sig1 * 0.65, sig1, target_px);\n"
+"      float blend1 = smoothstep(sig1 * 0.15, sig1, target_px);\n"
 "      if (blend1 > 0.0) {\n"
 "        float4 c_lv1 = lv1.sample(s, clamp(pos.xy * m1.xy, m1.xy * 1.0, m1.zw));\n"
 "        return mix(g_small, c_lv1, blend1);\n"
@@ -1223,14 +1223,22 @@ static void glass_forget(void);
 
 static void ensure_levels(int w, int h) {
   if (lv_w >= w && lv_h >= h && lv[0]) return;
-  lv_w = w > lv_w ? w : lv_w;
-  lv_h = h > lv_h ? h : lv_h;
+  int nw = (w + 255) & ~255;
+  int nh = (h + 255) & ~255;
+  int rt_w = (int)ceil(at_w * at_scale);
+  int rt_h = (int)ceil(at_h * at_scale);
+  if (rt_w > 0 && nw > rt_w) nw = rt_w;
+  if (rt_h > 0 && nh > rt_h) nh = rt_h;
+  if (nw < w) nw = w;
+  if (nh < h) nh = h;
+  lv_w = nw > lv_w ? nw : lv_w;
+  lv_h = nh > lv_h ? nh : lv_h;
   for (int j = 0; j < 4; j++)
     lv[j] = level_tex(j == 0 ? MTLPixelFormatBGRA8Unorm : MTLPixelFormatRGBA16Float, (lv_w + (1 << j) - 1) >> j,
                       (lv_h + (1 << j) - 1) >> j);
   ltmp = level_tex(MTLPixelFormatRGBA16Float, lv_w, lv_h);
-  // (the blurs kept were shown by where they lie in levels of the old size: one made now would be shown by the new)
-  slots_invalidate();
+  // Each cached slot owns its own texture (`slot_bt[i]`) and `show_blur` reads `gtex.width`/`height` directly,
+  // so growing the shared scratch pyramid must not invalidate cached glass slots.
 }
 
 // Offscreen blur layers (kind == 14 PUSH_BLUR_LAYER / kind == 15 POP_BLUR_LAYER): lazily allocated on first use.
@@ -1469,6 +1477,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
   m->sp = sp;
   if (is_progressive && k == 0 && sp > 0.5f) k = 1;
+  if (is_progressive && sp >= 2.5f && k < 2) k = 2;
   // what is left of the deviation once the halvings' and the last look's (bilinear) spread are taken out
   float sk = sp / (float)(1 << k);
   float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;

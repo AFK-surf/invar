@@ -746,7 +746,7 @@ static const char *PFS =
     "      if (target_px <= 0.01) {\n"
     "        g_small = texture(u_src, clamp(c_uv, uv0_min, uv0_max));\n"
     "      } else {\n"
-    "        float r_tap = target_px * 1.5;\n"
+    "        float r_tap = min(target_px * 0.75, 1.25);\n"
     "        vec2 d0 = vec2(r_tap, 0.0) * m0.xy;\n"
     "        vec2 d1 = vec2(0.0, r_tap) * m0.xy;\n"
     "        vec2 dd = vec2(r_tap * 0.70710678, r_tap * 0.70710678) * m0.xy;\n"
@@ -760,7 +760,7 @@ static const char *PFS =
     "                    texture(u_src, clamp(c_uv + vec2(dd.x, -dd.y), uv0_min, uv0_max)) +\n"
     "                    texture(u_src, clamp(c_uv + vec2(-dd.x, dd.y), uv0_min, uv0_max))) * 0.0625;\n"
     "      }\n"
-    "      float blend1 = smoothstep(sig1 * 0.65, sig1, target_px);\n"
+    "      float blend1 = smoothstep(sig1 * 0.15, sig1, target_px);\n"
     "      if (blend1 > 0.0) {\n"
     "        vec4 c_lv1 = texture(u_lv1, clamp(gl_FragCoord.xy * m1.xy, m1.xy * 1.0, m1.zw));\n"
     "        o = mix(g_small, c_lv1, blend1);\n"
@@ -1153,8 +1153,8 @@ static void ensure_levels(int w, int h) {
   lv_w = nw > lv_w ? nw : lv_w;
   lv_h = nh > lv_h ? nh : lv_h;
   levels_rebuilt++;
-  // (the blurs kept were shown by where they lie in levels of the old size: one made now would be shown by the new)
-  slots_invalidate();
+  // Each cached slot owns its own texture (`bt` + `bw`/`bh`) and `show_blur` reads `bw`/`bh` directly,
+  // so growing the shared scratch pyramid must not invalidate cached glass slots.
   for (int j = 0; j < 4; j++)
     lv[j] = level_tex(j == 0 ? GL_RGBA8 : GL_RGB10_A2, (lv_w + (1 << j) - 1) >> j, (lv_h + (1 << j) - 1) >> j);
   lv[4] = level_tex(GL_RGB10_A2, lv_w, lv_h);
@@ -1478,6 +1478,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
   m->sp = sp;
   if (is_progressive && k == 0 && sp > 0.5f) k = 1;
+  if (is_progressive && sp >= 2.5f && k < 2) k = 2;
   // what is left of the deviation once the halvings' and the last look's (bilinear) spread are taken out
   float sk = sp / (float)(1 << k);
   float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;

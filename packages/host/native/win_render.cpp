@@ -925,7 +925,7 @@ static const char *prog_src =
     "    if (target_px <= 0.01) {\n"
     "      g_small = lv0.SampleLevel(samp, clamp(c_uv, uv0_min, uv0_max), 0);\n"
     "    } else {\n"
-    "      float r_tap = target_px * 1.5;\n"
+    "      float r_tap = min(target_px * 0.75, 1.25);\n"
     "      float2 d0 = float2(r_tap, 0.0) * m0.xy;\n"
     "      float2 d1 = float2(0.0, r_tap) * m0.xy;\n"
     "      float2 dd = float2(r_tap * 0.70710678, r_tap * 0.70710678) * m0.xy;\n"
@@ -939,7 +939,7 @@ static const char *prog_src =
     "                  lv0.SampleLevel(samp, clamp(c_uv + float2(dd.x, -dd.y), uv0_min, uv0_max), 0) +\n"
     "                  lv0.SampleLevel(samp, clamp(c_uv + float2(-dd.x, dd.y), uv0_min, uv0_max), 0)) * 0.0625;\n"
     "    }\n"
-    "    float blend1 = smoothstep(sig1 * 0.65, sig1, target_px);\n"
+    "    float blend1 = smoothstep(sig1 * 0.15, sig1, target_px);\n"
     "    if (blend1 > 0.0) {\n"
     "      float4 c_lv1 = lv1.SampleLevel(samp, clamp(pos.xy * m1.xy, m1.xy * 1.0, m1.zw), 0);\n"
     "      return lerp(g_small, c_lv1, blend1);\n"
@@ -1610,7 +1610,7 @@ static level level_tex(DXGI_FORMAT format, int w, int h) {
 
 static void glass_free(void);
 
-static int ensure_levels(int w, int h) {
+static int ensure_levels(int w, int h, int rt_w, int rt_h) {
   if (lv[0].t && lv_w >= w && lv_h >= h) return 1;
   for (int j = 0; j < 5; j++) {
     if (lv[j].srv) lv[j].srv->Release();
@@ -1618,8 +1618,14 @@ static int ensure_levels(int w, int h) {
     if (lv[j].t) lv[j].t->Release();
     lv[j] = level{};
   }
-  lv_w = w > lv_w ? w : lv_w;
-  lv_h = h > lv_h ? h : lv_h;
+  int nw = (w + 255) & ~255;
+  int nh = (h + 255) & ~255;
+  if (rt_w > 0 && nw > rt_w) nw = rt_w;
+  if (rt_h > 0 && nh > rt_h) nh = rt_h;
+  if (nw < w) nw = w;
+  if (nh < h) nh = h;
+  lv_w = nw > lv_w ? nw : lv_w;
+  lv_h = nh > lv_h ? nh : lv_h;
   for (int j = 0; j < 4; j++) {
     lv[j] = level_tex(j == 0 ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R10G10B10A2_UNORM, (lv_w + (1 << j) - 1) >> j,
                       (lv_h + (1 << j) - 1) >> j);
@@ -2233,7 +2239,7 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   // (a capture outside the part drawn: neither copied nor drawn. One that meets it is in it whole: @damage)
   if (cut_on && (px1 <= cut.left || cut.right <= px0 || py1 <= cut.top || cut.bottom <= py0)) return 0;
   int w = px1 - px0, h = py1 - py0;
-  if (!ensure_levels(w, h)) return 0;
+  if (!ensure_levels(w, h, pw, ph)) return 0;
   ID3D11Resource *res = NULL;
   target->GetResource(&res);
   D3D11_BOX box = {(UINT)px0, (UINT)py0, 0, (UINT)px1, (UINT)py1, 1};
@@ -2250,6 +2256,7 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   int k = 0;
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
   if (is_progressive && k == 0 && sp > 0.5f) k = 1;
+  if (is_progressive && sp >= 2.5f && k < 2) k = 2;
   int lw[4] = {w}, lh[4] = {h};
   for (int j = 1; j <= 3; j++) {
     lw[j] = (lw[j - 1] + 1) / 2;
