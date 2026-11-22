@@ -298,6 +298,49 @@ pub fn Scene::emit_line(
   }
 }
 
+/// Push an offscreen Gaussian blur layer (`kind = 14.0`, `slot 7 = sigma`).
+pub fn Scene::push_blur_layer(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Int {
+  let sigma = if radius > 0.0 { radius } else { 0.0 }
+  self.push_inst(
+    x, y, w, h, 0.0, 14.0, 0.0, sigma, c64(0xFFFF, 0xFFFF), 1.0,
+    0.0, 0.0, 0.0, 0.0,
+    clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+  )
+}
+
+/// Pop an offscreen Gaussian blur layer (`kind = 15.0`, `slot 7 = sigma`, `slot 11 = alpha`).
+pub fn Scene::pop_blur_layer(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Int {
+  let sigma = if radius > 0.0 { radius } else { 0.0 }
+  self.push_inst(
+    x, y, w, h, 0.0, 15.0, 0.0, sigma, c64(0xFFFF, 0xFFFF), alpha,
+    0.0, 0.0, 0.0, 0.0,
+    clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+  )
+}
+
 pub fn Scene::copy(self : Scene) -> Scene {
   Scene::{
     inst: self.inst.copy(),
@@ -1090,6 +1133,87 @@ fn inst_fade_across(
   }
 }
 
+struct BlurFrame {
+  id : view::NodeId
+  push_idx : Int
+  blur : Double
+  clip : (Double, Double, Double, Double)
+  rc : (Double, Double, Double, Double)
+  mut bx0 : Double
+  mut by0 : Double
+  mut bx1 : Double
+  mut by1 : Double
+}
+
+fn expand_blur_stack(scene : Scene, blur_stack : Array[BlurFrame], from_idx : Int, to_idx : Int) -> Unit {
+  if blur_stack.length() == 0 || from_idx >= to_idx {
+    return
+  }
+  let mut k = from_idx
+  while k < to_idx {
+    let b = k * inst_size
+    let kind = (scene.inst[b + 5] + 0.5).to_int()
+    let pad = if kind == 2 || kind == 14 || kind == 15 {
+      3.0 * dmax(scene.inst[b + 7], 0.0) + 2.0
+    } else {
+      0.0
+    }
+    let ix0 = scene.inst[b] - pad
+    let iy0 = scene.inst[b + 1] - pad
+    let ix1 = scene.inst[b] + scene.inst[b + 2] + pad
+    let iy1 = scene.inst[b + 1] + scene.inst[b + 3] + pad
+    if ix1 > ix0 && iy1 > iy0 {
+      for bf in blur_stack {
+        if ix0 < bf.bx0 { bf.bx0 = ix0 }
+        if iy0 < bf.by0 { bf.by0 = iy0 }
+        if ix1 > bf.bx1 { bf.bx1 = ix1 }
+        if iy1 > bf.by1 { bf.by1 = iy1 }
+      }
+    }
+    k += 1
+  }
+}
+
+fn pop_blur_frame(
+  scene : Scene,
+  tree : view::Tree,
+  blur_stack : Array[BlurFrame],
+  deferred_shadows : Array[DeferredGlassShadow],
+  fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))],
+) -> Unit {
+  let fl0 = scene.ninst
+  flush_deferred_shadows(scene, deferred_shadows)
+  expand_blur_stack(scene, blur_stack, fl0, scene.ninst)
+  let bf = match blur_stack.pop() {
+    Some(f) => f
+    None => return
+  }
+  let bw = dmax(0.0, bf.bx1 - bf.bx0)
+  let bh = dmax(0.0, bf.by1 - bf.by0)
+  let pb = bf.push_idx * inst_size
+  scene.inst[pb] = bf.bx0
+  scene.inst[pb + 1] = bf.by0
+  scene.inst[pb + 2] = bw
+  scene.inst[pb + 3] = bh
+  let pop_idx = scene.pop_blur_layer(
+    bf.bx0, bf.by0, bw, bh, bf.blur, alpha=1.0,
+    clip_x=bf.clip.0, clip_y=bf.clip.1, clip_x1=bf.clip.2, clip_y1=bf.clip.3,
+  )
+  scene.set_clip_corners(pop_idx, bf.rc.0, bf.rc.1, bf.rc.2, bf.rc.3)
+  for f in fading {
+    let (by, fbox, fsoft) = f
+    if by == bf.id || tree.holds_in_order(bf.id, by) || tree.drawn_clear_of(bf.id, by) {
+      continue
+    }
+    let (fx0, fy0, fx1, fy1) = fbox
+    let (fstart, ftop, fend, ffoot) = fsoft
+    let b = pop_idx * inst_size
+    inst_fade(scene.inst, b, fy0, ftop, fy1, ffoot)
+    inst_fade_across(scene.inst, b, fx0, fstart, fx1, fend)
+  }
+  expand_blur_stack(scene, blur_stack, pop_idx, pop_idx + 1)
+}
+
 fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Double, scale : Double) -> Unit {
   ensure_glyph_atlas(scale)
   let scales : Array[Double] = []
@@ -1099,11 +1223,15 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
   let eff_rc : Array[(Double, Double, Double, Double)] = []
   let deferred_shadows : Array[DeferredGlassShadow] = []
   let fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
+  let blur_stack : Array[BlurFrame] = []
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
     while fading.length() > 0 && !tree.holds_in_order(fading[fading.length() - 1].0, d.id) {
       let _ = fading.pop()
+    }
+    while blur_stack.length() > 0 && !tree.holds_in_order(blur_stack[blur_stack.length() - 1].id, d.id) {
+      pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
     }
     let node_scale = if i < scales.length() { scales[i] } else { 1.0 }
     let gd = tree.ground_drawn_of(d.id)
@@ -1117,17 +1245,41 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     } else {
       ((0.0, 0.0, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
     }
-    eff_clip.push(in_clip)
-    eff_rc.push(in_rc)
-    let (draw_clip, draw_rc) = if d.clips_self {
-      intersect_clip(in_clip, in_rc, d.x, d.y, d.x + d.w, d.y + d.h, node_corners_tuple(d))
+    let (node_in_clip, node_in_rc) = if d.blur > 0.0 && d.alpha > 0.0 {
+      let fl0 = scene.ninst
+      flush_deferred_shadows(scene, deferred_shadows)
+      expand_blur_stack(scene, blur_stack, fl0, scene.ninst)
+      let push_idx = scene.push_blur_layer(d.x, d.y, d.w, d.h, d.blur)
+      blur_stack.push(BlurFrame::{
+        id: d.id,
+        push_idx,
+        blur: d.blur,
+        clip: in_clip,
+        rc: in_rc,
+        bx0: d.x,
+        by0: d.y,
+        bx1: d.x + d.w,
+        by1: d.y + d.h,
+      })
+      ((0.0, 0.0, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
     } else {
       (in_clip, in_rc)
     }
+    eff_clip.push(node_in_clip)
+    eff_rc.push(node_in_rc)
+    let (draw_clip, draw_rc) = if d.clips_self {
+      intersect_clip(node_in_clip, node_in_rc, d.x, d.y, d.x + d.w, d.y + d.h, node_corners_tuple(d))
+    } else {
+      (node_in_clip, node_in_rc)
+    }
     let k0 = scene.ninst
     encode_drawn_node(scene, d, gd, node_scale, frame_no, now, scale, draw_clip, draw_rc, deferred_shadows)
+    expand_blur_stack(scene, blur_stack, k0, scene.ninst)
     for f in fading {
       let (by, fbox, fsoft) = f
+      if blur_stack.length() > 0 && !tree.holds_in_order(blur_stack[blur_stack.length() - 1].id, by) {
+        continue
+      }
       let (fx0, fy0, fx1, fy1) = fbox
       let (fstart, ftop, fend, ffoot) = fsoft
       if tree.drawn_clear_of(d.id, by) {
@@ -1157,6 +1309,9 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
       )
     }
     i += 1
+  }
+  while blur_stack.length() > 0 {
+    pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
   }
   flush_deferred_shadows(scene, deferred_shadows)
 }

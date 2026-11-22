@@ -1902,3 +1902,72 @@ test "50 on_before_frame registered before first startup survives set_view_app, 
   debug_assert(live_hits.v == 1, "set_view_app replacing a live tree clears old on_before_frame hooks")
   t2.dispose()
 }
+
+test "51 Scene::push/pop_blur_layer and View::blur subtree wrapping, overflow bbox union, ancestor clip, and nested LIFO" {
+  // 1. Direct Scene::push_blur_layer / pop_blur_layer encoding
+  let sc0 = Scene::new()
+  sc0.clear(400.0, 300.0, 2.0)
+  let pi = sc0.push_blur_layer(10.0, 20.0, 100.0, 50.0, 8.0)
+  let qi = sc0.pop_blur_layer(10.0, 20.0, 100.0, 50.0, 8.0, alpha=0.6, clip_x=5.0, clip_y=6.0, clip_x1=200.0, clip_y1=150.0)
+  debug_assert(pi == 0 && qi == 1, "push/pop return sequential instance indices")
+  debug_assert((sc0.inst[5] - 14.0).abs() < 1.0e-6 && (sc0.inst[7] - 8.0).abs() < 1.0e-6 && sc0.inst[20].abs() < 1.0e-6, "push_blur_layer encodes kind=14, slot7=sigma, tex_id=0")
+  let qb = qi * inst_size
+  debug_assert((sc0.inst[qb + 5] - 15.0).abs() < 1.0e-6 && (sc0.inst[qb + 7] - 8.0).abs() < 1.0e-6, "pop_blur_layer encodes kind=15, slot7=sigma")
+  debug_assert((sc0.inst[qb + 11] - 0.6).abs() < 1.0e-6, "pop_blur_layer slot11 encodes alpha")
+  debug_assert((sc0.inst[qb + 16] - 5.0).abs() < 1.0e-6 && (sc0.inst[qb + 18] - 200.0).abs() < 1.0e-6, "pop_blur_layer encodes clip")
+
+  // 2. View::blur under a rounded clipping ancestor with overflowing child + nested inner View::blur
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(clip_box : view::View) {
+      let _ = clip_box
+        .over_xy(10.0, 10.0)
+        .size(200.0, 180.0)
+        .r(16.0)
+        .clip()
+      // Pure wrapper outer blur (no ground) with sigma=6.0
+      let _ = clip_box.box(fn(outer : view::View) {
+        let _ = outer.over_xy(20.0, 20.0).size(80.0, 60.0).blur_is(6.0)
+        // Overflowing child extending to x=20+10+120=150 (past outer's 20+10+80=110)
+        let _ = outer.box(fn(child : view::View) {
+          let _ = child.over_xy(0.0, 0.0).size(120.0, 40.0).bg(0xFF0000FFL)
+        })
+        // Nested inner blur (sigma=3.0)
+        let _ = outer.box(fn(inner : view::View) {
+          let _ = inner.over_xy(10.0, 10.0).size(40.0, 30.0).blur_is(3.0)
+          let _ = inner.box(fn(leaf : view::View) {
+            let _ = leaf.size(40.0, 30.0).bg(0x00FF00FFL)
+          })
+        })
+      })
+    })
+  }, width=400.0, height=300.0, scale=1.0)
+  let sc = t.scene()
+  let kinds : Array[(Int, Int, Double)] = []
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    let k = (sc.inst[b + 5] + 0.5).to_int()
+    if k == 14 || k == 15 {
+      kinds.push((i, k, sc.inst[b + 7]))
+    }
+    i += 1
+  }
+  // Expect strict LIFO: PUSH(6.0), PUSH(3.0), POP(3.0), POP(6.0)
+  debug_assert(kinds.length() == 4, "nested View::blur emits 4 layer markers (2 push + 2 pop)")
+  debug_assert(kinds[0].1 == 14 && (kinds[0].2 - 6.0).abs() < 1.0e-6, "outer push first (sigma=6)")
+  debug_assert(kinds[1].1 == 14 && (kinds[1].2 - 3.0).abs() < 1.0e-6, "inner push second (sigma=3)")
+  debug_assert(kinds[2].1 == 15 && (kinds[2].2 - 3.0).abs() < 1.0e-6, "inner pop third (sigma=3)")
+  debug_assert(kinds[3].1 == 15 && (kinds[3].2 - 6.0).abs() < 1.0e-6, "outer pop fourth (sigma=6)")
+
+  // Outer push and pop must share backfilled bbox union covering overflowing child (w >= 120.0)
+  let opush = kinds[0].0 * inst_size
+  let opop = kinds[3].0 * inst_size
+  debug_assert(sc.inst[opush + 2] >= 120.0 && (sc.inst[opush + 2] - sc.inst[opop + 2]).abs() < 1.0e-6, "outer push/pop bbox width includes overflowing child (>= 120)")
+  debug_assert((sc.inst[opush] - sc.inst[opop]).abs() < 1.0e-6 && (sc.inst[opush + 1] - sc.inst[opop + 1]).abs() < 1.0e-6, "outer push/pop origin match")
+
+  // Ancestor rounded clip (10, 10, 210, 190, r=16) must land on outer POP (kind=15), while inner child is unclipped by ancestor
+  debug_assert((sc.inst[opop + 16] - 10.0).abs() < 1.0e-6 && (sc.inst[opop + 18] - 210.0).abs() < 1.0e-6, "ancestor clip lands on outer kind=15 pop")
+  debug_assert((sc.inst[opop + 24] - 16.0).abs() < 1.0e-6 && (sc.inst[opop + 27] - 16.0).abs() < 1.0e-6, "ancestor rounded clip corners rc=16 land on outer kind=15 pop")
+  debug_assert((sc.inst[opop + 11] - 1.0).abs() < 1.0e-6, "pop_blur_layer uses alpha=1.0 to avoid double-multiplying Drawn.alpha")
+  t.dispose()
+}
