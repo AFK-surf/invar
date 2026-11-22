@@ -600,6 +600,8 @@ static GLuint target_fb;
 
 static void glass_lost(void);
 static void canvas_lost(void);
+static void blur_layers_lost(void);
+static void blur_layers_free(void);
 
 // What the app does not paint left clear, what is under the surface showing (Android's over another app: OverActivity,
 // Native.overOther).
@@ -870,11 +872,81 @@ static void draw_parts(GLuint fb, int kept) {
   if (n != 0) pictures_missing = missing;
 }
 
+// Offscreen blur layers (kind == 14 PUSH_BLUR_LAYER / kind == 15 POP_BLUR_LAYER): lazily allocated
+// GL_RGBA8 layer targets and an RGBA8 blur pyramid (full 8-bit alpha for smooth premultiplied edges).
+#define MB_BLUR_LAYERS 4
+static level bl_lv[MB_BLUR_LAYERS];
+static int bl_w, bl_h;
+static level bl_py[5];
+static int bl_py_w, bl_py_h;
+
+static void blur_layers_lost(void) {
+  memset(bl_lv, 0, sizeof bl_lv);
+  bl_w = bl_h = 0;
+  memset(bl_py, 0, sizeof bl_py);
+  bl_py_w = bl_py_h = 0;
+}
+
+static void blur_layers_free(void) {
+  for (int j = 0; j < MB_BLUR_LAYERS; j++)
+    if (bl_lv[j].t) {
+      glDeleteTextures(1, &bl_lv[j].t);
+      glDeleteFramebuffers(1, &bl_lv[j].fb);
+    }
+  for (int j = 0; j < 5; j++)
+    if (bl_py[j].t) {
+      glDeleteTextures(1, &bl_py[j].t);
+      glDeleteFramebuffers(1, &bl_py[j].fb);
+    }
+  blur_layers_lost();
+}
+
+static int ensure_blur_layer(int depth, int tw, int th) {
+  if (depth < 0 || depth >= MB_BLUR_LAYERS || tw <= 0 || th <= 0) return 0;
+  if (bl_w != tw || bl_h != th) {
+    for (int j = 0; j < MB_BLUR_LAYERS; j++)
+      if (bl_lv[j].t) {
+        glDeleteTextures(1, &bl_lv[j].t);
+        glDeleteFramebuffers(1, &bl_lv[j].fb);
+      }
+    memset(bl_lv, 0, sizeof bl_lv);
+    bl_w = tw;
+    bl_h = th;
+  }
+  if (!bl_lv[depth].t) {
+    bl_lv[depth] = level_tex(GL_RGBA8, tw, th);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      glDeleteTextures(1, &bl_lv[depth].t);
+      glDeleteFramebuffers(1, &bl_lv[depth].fb);
+      bl_lv[depth] = (level){0};
+    }
+  }
+  return bl_lv[depth].t != 0 && bl_lv[depth].fb != 0;
+}
+
+static int ensure_blur_py(int w, int h) {
+  if (w <= 0 || h <= 0) return 0;
+  if (bl_py[0].t && bl_py_w >= w && bl_py_h >= h) return 1;
+  for (int j = 0; j < 5; j++)
+    if (bl_py[j].t) {
+      glDeleteTextures(1, &bl_py[j].t);
+      glDeleteFramebuffers(1, &bl_py[j].fb);
+    }
+  memset(bl_py, 0, sizeof bl_py);
+  bl_py_w = w > bl_py_w ? w : bl_py_w;
+  bl_py_h = h > bl_py_h ? h : bl_py_h;
+  for (int j = 0; j < 4; j++)
+    bl_py[j] = level_tex(GL_RGBA8, (bl_py_w + (1 << j) - 1) >> j, (bl_py_h + (1 << j) - 1) >> j);
+  bl_py[4] = level_tex(GL_RGBA8, bl_py_w, bl_py_h);
+  return bl_py[0].t != 0 && bl_py[4].t != 0;
+}
+
 // The canvas gone with the context it was made in (a new one: gl_setup), nothing of it given back.
 static void canvas_lost(void) {
   canvas_fb = canvas_tex = 0;
   canvas_w = canvas_h = 0;
   canvas_ok = 0;
+  blur_layers_lost();
 }
 
 // The canvas the surface's frames are drawn into, its size: made again at another size (or once the context is new:
@@ -1150,6 +1222,7 @@ static int reaches(const float *f, int32_t i, int32_t run, const float g[4]) {
   const float *b = f + (size_t)i * MB_INST;
   int kind = (int)(b[5] + 0.5f);
   float e = kind == 2 ? fabsf(b[7]) * 3.0f + 2.0f : 1.0f;
+  if (kind == 14 || kind == 15) e = fabsf(b[7]) * 3.0f + 2.0f;
   // (liquid: its group's bounds, each shape and the first's reach round it, 2 more: grab_of)
   if (kind == 6) e = fmaxf(fmaxf(b[23], f[(size_t)run * MB_INST + 23]), 0.0f) + 2.0f;
   e += 1.0f;
@@ -1200,9 +1273,35 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
   memcpy(o, f, (size_t)whole * MB_INST * sizeof(float));
   o += (size_t)whole * MB_INST;
+  int in_blur = 0, blur_hit = 0;
+  for (int32_t i = 0; i < whole; i++) {
+    int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
+    if (k == 14) {
+      if (in_blur == 0) blur_hit = reaches(f, i, i, g);
+      in_blur++;
+    } else if (k == 15 && in_blur > 0) {
+      in_blur--;
+      if (in_blur == 0) blur_hit = 0;
+    }
+  }
   int32_t picked = 0;
   for (int32_t i = whole; i < start; i++) {
-    if (!reaches(f, i, i, g)) continue;
+    int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
+    int take = 0;
+    if (k == 14) {
+      if (in_blur == 0) blur_hit = reaches(f, i, i, g);
+      in_blur++;
+      take = blur_hit;
+    } else if (k == 15) {
+      take = blur_hit;
+      if (in_blur > 0) {
+        in_blur--;
+        if (in_blur == 0) blur_hit = 0;
+      }
+    } else {
+      take = (in_blur > 0 && blur_hit) || reaches(f, i, i, g);
+    }
+    if (!take) continue;
     if (f[(size_t)i * MB_INST + 20] > (float)MB_STREAM_TEX) return 0;
     memcpy(o, f + (size_t)i * MB_INST, MB_INST * sizeof(float));
     o += MB_INST;
@@ -1440,7 +1539,7 @@ static void gl_present_kept(int32_t count, double r, double g, double b);
 // The floats a frame of `count` instances needs (`fbuf`'s room): its instances, its ground after them, and a row of
 // the shapes' pieces more (segs_upload reads whole rows).
 static size_t gl_frame_floats(int32_t count) {
-  return (size_t)(count > 0 ? count : 0) * MB_INST + MB_INST + SEGS_ROW * 4;
+  return (size_t)(count > 0 ? count : 0) * MB_INST + 2 * MB_INST + SEGS_ROW * 4;
 }
 
 static void gl_present(const double *buf, int32_t count, double r, double g, double b) {
@@ -1528,6 +1627,7 @@ static void draw_kept_read(void) {
 // glass's textures and the read back's framebuffer. A frame after makes what it needs again as it draws.
 void mb_render_trim(void) {
   glass_free();
+  blur_layers_free();
   glass_idle_frames = 0;
   if (read_fb) {
     glDeleteFramebuffers(1, &read_fb);
@@ -1572,8 +1672,8 @@ static int32_t gles_pixels_of(const double *inst, int32_t count, double r, doubl
   int kfw = fb_w, kfh = fb_h;
   double kw = cur_w, kh = cur_h, ks = cur_scale;
   size_t n = (size_t)count * MB_INST;
-  // (a row of the shapes' pieces more: segs_upload reads whole rows)
-  fcap = n + SEGS_ROW * 4;
+  // (two extra slots for ground + blur-layer composite, plus a row of the shapes' pieces: segs_upload reads whole rows)
+  fcap = n + 2 * MB_INST + SEGS_ROW * 4;
   fbuf = malloc(fcap * sizeof(float));
   for (size_t i = 0; i < n; i++) fbuf[i] = (float)inst[i];
   kept_count = count;
@@ -1704,7 +1804,7 @@ static void draw_into(GLuint fb, int part) {
   gn = 0;
   glBindVertexArray(vao);
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
-  glBufferData(GL_ARRAY_BUFFER, (n + MB_INST) * sizeof(float), fbuf, GL_STREAM_DRAW);
+  glBufferData(GL_ARRAY_BUFFER, (n + 2 * MB_INST) * sizeof(float), fbuf, GL_STREAM_DRAW);
   main_state();
   if (cut_on) {
     for (int i = 0; i < MB_INST / 4; i++)
@@ -1716,6 +1816,15 @@ static void draw_into(GLuint fb, int part) {
   // one draw per run of instances showing the same image (slot 20; 0: none, the atlas stands in; a native view's
   // picture where it shows, kind 9: nothing until it has one) of one kind (its program: use_prog), or sharing one
   // capture of glass (negative); GLES has no base instance, so the attributes start at the run instead
+  typedef struct {
+    int px0, pb0, w, h, top, active;
+    float sigma;
+    GLuint prev_fb;
+    int prev_cut_on;
+    int prev_cut[4];
+  } BlurLayer;
+  BlurLayer bstack[MB_BLUR_LAYERS];
+  int bdepth = 0, bover = 0;
   int32_t start = 0;
   int bound = 0, shows = 0, levels_sized = 0;
   unsigned frame_clock = slots_clock;
@@ -1725,11 +1834,152 @@ static void draw_into(GLuint fb, int part) {
   while (start < count) {
     int tid = (int)fbuf[start * MB_INST + 20];
     int kind = (int)(fbuf[start * MB_INST + 5] + 0.5f);
+    if (kind == 14) {
+      if (bdepth >= MB_BLUR_LAYERS) {
+        bover++;
+        start++;
+        continue;
+      }
+      const float *a = fbuf + (size_t)start * MB_INST;
+      float sc = (float)cur_scale;
+      float sigma = fabsf(a[7]);
+      float margin = sigma > 0.0f ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
+      int top = vy0 + vhp;
+      int px0 = (int)floorf((a[0] - margin) * sc), px1 = (int)ceilf((a[0] + a[2] + margin) * sc);
+      int pb0 = top - (int)ceilf((a[1] + a[3] + margin) * sc), pb1 = top - (int)floorf((a[1] - margin) * sc);
+      if (px0 < 0) px0 = 0;
+      if (px1 > fb_w) px1 = fb_w;
+      if (pb0 < vy0) pb0 = vy0;
+      if (pb1 > top) pb1 = top;
+      int bw = px1 - px0, bh = pb1 - pb0;
+      BlurLayer L = {px0, pb0, bw, bh, top, 0, sigma, target_fb, cut_on, {cut[0], cut[1], cut[2], cut[3]}};
+      if (bw > 0 && bh > 0 && ensure_blur_layer(bdepth, fb_w, fb_h)) {
+        L.active = 1;
+        target_fb = bl_lv[bdepth].fb;
+        cut_on = 1;
+        cut[0] = px0; cut[1] = pb0; cut[2] = bw; cut[3] = bh;
+        glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
+        glViewport(0, vy0, fb_w, vhp);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(px0, pb0, bw, bh);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+      } else {
+        cut_on = 1;
+        cut[0] = 0; cut[1] = 0; cut[2] = 0; cut[3] = 0;
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, 0, 0);
+      }
+      bstack[bdepth++] = L;
+      start++;
+      continue;
+    }
+    if (kind == 15) {
+      if (bover > 0) {
+        bover--;
+        start++;
+        continue;
+      }
+      if (bdepth <= 0) {
+        start++;
+        continue;
+      }
+      BlurLayer L = bstack[--bdepth];
+      if (!L.active) {
+        target_fb = L.prev_fb;
+        cut_on = L.prev_cut_on;
+        memcpy(cut, L.prev_cut, sizeof cut);
+        main_state();
+        start++;
+        continue;
+      }
+      if (ensure_blur_py(L.w, L.h)) {
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, bl_py[0].fb);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, bl_lv[bdepth].fb);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, bl_py[0].fb);
+        glBlitFramebuffer(L.px0, L.pb0, L.px0 + L.w, L.pb0 + L.h, 0, 0, L.w, L.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        float sc = (float)cur_scale;
+        float sp = L.sigma * sc;
+        int k = 0;
+        while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
+        float sk = sp / (float)(1 << k);
+        float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
+        float sg = sqrtf(sk * sk - pre > 0.0f ? sk * sk - pre : 0.0f);
+        int lw[4] = {L.w, 0, 0, 0}, lh[4] = {L.h, 0, 0, 0};
+        for (int j = 1; j <= 3; j++) {
+          lw[j] = (lw[j - 1] + 1) / 2;
+          lh[j] = (lh[j - 1] + 1) / 2;
+        }
+        glUseProgram(post);
+        for (int j = 1; j <= k; j++) {
+          glBindFramebuffer(GL_FRAMEBUFFER, bl_py[j].fb);
+          glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+          glClear(GL_COLOR_BUFFER_BIT);
+          post_pass(&bl_py[j - 1], lw[j - 1], lh[j - 1], &bl_py[j], lw[j], lh[j], 1, 0, 0, 0);
+        }
+        if (sg > 0.3f) {
+          glBindFramebuffer(GL_FRAMEBUFFER, bl_py[4].fb);
+          glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+          glClear(GL_COLOR_BUFFER_BIT);
+          post_pass(&bl_py[k], lw[k], lh[k], &bl_py[4], lw[k], lh[k], 2, sg, 1, 0);
+          glBindFramebuffer(GL_FRAMEBUFFER, bl_py[k].fb);
+          glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+          glClear(GL_COLOR_BUFFER_BIT);
+          post_pass(&bl_py[4], lw[k], lh[k], &bl_py[k], lw[k], lh[k], 2, sg, 0, 1);
+        }
+        target_fb = L.prev_fb;
+        cut_on = L.prev_cut_on;
+        memcpy(cut, L.prev_cut, sizeof cut);
+        main_state();
+        float comp[MB_INST];
+        memcpy(comp, fbuf + (size_t)start * MB_INST, MB_INST * sizeof(float));
+        float d = (float)(1 << k);
+        comp[0] = (float)L.px0 / sc;
+        comp[1] = (float)(L.top - (L.pb0 + L.h)) / sc;
+        comp[2] = (float)L.w / sc;
+        comp[3] = (float)L.h / sc;
+        comp[4] = 0.0f;
+        comp[5] = 4.0f;
+        comp[6] = 0.0f;
+        comp[7] = 0.0f;
+        comp[8] = 1.0f;
+        comp[9] = 1.0f;
+        comp[10] = 1.0f;
+        comp[12] = 0.0f;
+        comp[13] = (float)L.h / (d * (float)bl_py[k].h);
+        comp[14] = (float)L.w / (d * (float)bl_py[k].w);
+        comp[15] = -(float)L.h / (d * (float)bl_py[k].h);
+        comp[20] = 0.0f; comp[21] = 0.0f; comp[22] = 0.0f; comp[23] = 0.0f;
+        comp[32] = 0.0f; comp[33] = 0.0f; comp[34] = 0.0f; comp[35] = 0.0f;
+        comp[36] = 0.0f; comp[37] = 0.0f; comp[38] = 0.0f; comp[39] = 0.0f;
+        use_prog(4);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, bl_py[k].t);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)((size_t)(count + 1) * MB_INST * sizeof(float)),
+                        MB_INST * sizeof(float), comp);
+        draw_run(count + 1, 1);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, atlas);
+      } else {
+        target_fb = L.prev_fb;
+        cut_on = L.prev_cut_on;
+        memcpy(cut, L.prev_cut, sizeof cut);
+        main_state();
+      }
+      start++;
+      continue;
+    }
     // (kinds without their own program one run, as before)
     int own = tid >= 0 && has_own_prog(kind);
     int32_t end = start + 1;
     while (end < count && (int)fbuf[end * MB_INST + 20] == tid) {
       int k = (int)(fbuf[end * MB_INST + 5] + 0.5f);
+      if (k == 14 || k == 15) break;
       if (own ? k != kind : tid >= 0 && has_own_prog(k)) break;
       end++;
     }

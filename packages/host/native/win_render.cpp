@@ -1025,8 +1025,15 @@ static ID3D11PixelShader *kind_ps(int kind) {
 }
 
 // The shaders, buffers, atlas and states every target is drawn with (the window's, the offscreen one).
+static void blur_layers_release(void);
+static ID3D11Buffer *bl_comp_vbuf;
+
 static void make_pipeline(void) {
   // (those of a device before, if there was one, let go once made)
+  if (bl_comp_vbuf) {
+    bl_comp_vbuf->Release();
+    bl_comp_vbuf = NULL;
+  }
   if (kinds_thread) {
     WaitForSingleObject(kinds_thread, INFINITE);
     CloseHandle(kinds_thread);
@@ -1144,6 +1151,7 @@ void mb_render_set_size(int pw, int ph, double w, double h, double scale) {
   rtv = NULL;
   ctx->OMSetRenderTargets(0, NULL, NULL);
   ensure_canvas(0, 0);
+  blur_layers_release();
   chain->ResizeBuffers(0, (UINT)pw, (UINT)ph, DXGI_FORMAT_UNKNOWN, 0);
   ID3D11Texture2D *back = NULL;
   if (SUCCEEDED(chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&back))) {
@@ -1248,10 +1256,101 @@ static void glass_idle_tick(void) {
   glass_drawn = 0;
 }
 
+// Offscreen blur layers (kind == 14 PUSH_BLUR_LAYER / kind == 15 POP_BLUR_LAYER): lazily allocated
+// B8G8R8A8_UNORM layer targets and blur pyramid (full 8-bit alpha for smooth premultiplied edges).
+#define MB_BLUR_LAYERS 4
+static level bl_lv[MB_BLUR_LAYERS];
+static int bl_w, bl_h;
+static level bl_py[5];
+static int bl_py_w, bl_py_h;
+
+static void blur_layers_release(void) {
+  if (ctx) {
+    ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
+    ctx->PSSetShaderResources(0, 3, none);
+  }
+  for (int j = 0; j < MB_BLUR_LAYERS; j++) {
+    if (bl_lv[j].srv) bl_lv[j].srv->Release();
+    if (bl_lv[j].rt) bl_lv[j].rt->Release();
+    if (bl_lv[j].t) bl_lv[j].t->Release();
+    bl_lv[j] = level{};
+  }
+  bl_w = bl_h = 0;
+  for (int j = 0; j < 5; j++) {
+    if (bl_py[j].srv) bl_py[j].srv->Release();
+    if (bl_py[j].rt) bl_py[j].rt->Release();
+    if (bl_py[j].t) bl_py[j].t->Release();
+    bl_py[j] = level{};
+  }
+  bl_py_w = bl_py_h = 0;
+}
+
+static int ensure_blur_layer(int depth, int tw, int th) {
+  if (!dev || depth < 0 || depth >= MB_BLUR_LAYERS || tw <= 0 || th <= 0) return 0;
+  if (bl_w != tw || bl_h != th) {
+    for (int j = 0; j < MB_BLUR_LAYERS; j++) {
+      if (bl_lv[j].srv) bl_lv[j].srv->Release();
+      if (bl_lv[j].rt) bl_lv[j].rt->Release();
+      if (bl_lv[j].t) bl_lv[j].t->Release();
+      bl_lv[j] = level{};
+    }
+    bl_w = tw;
+    bl_h = th;
+  }
+  if (!bl_lv[depth].t) {
+    bl_lv[depth] = level_tex(DXGI_FORMAT_B8G8R8A8_UNORM, tw, th);
+    if (!bl_lv[depth].t || !bl_lv[depth].rt || !bl_lv[depth].srv) {
+      bl_lv[depth] = level{};
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int ensure_blur_py(int w, int h) {
+  if (!dev || w <= 0 || h <= 0) return 0;
+  if (bl_py[0].t && bl_py_w >= w && bl_py_h >= h) return 1;
+  for (int j = 0; j < 5; j++) {
+    if (bl_py[j].srv) bl_py[j].srv->Release();
+    if (bl_py[j].rt) bl_py[j].rt->Release();
+    if (bl_py[j].t) bl_py[j].t->Release();
+    bl_py[j] = level{};
+  }
+  bl_py_w = w > bl_py_w ? w : bl_py_w;
+  bl_py_h = h > bl_py_h ? h : bl_py_h;
+  for (int j = 0; j < 4; j++) {
+    bl_py[j] = level_tex(DXGI_FORMAT_B8G8R8A8_UNORM, (bl_py_w + (1 << j) - 1) >> j,
+                         (bl_py_h + (1 << j) - 1) >> j);
+    if (!bl_py[j].t || !bl_py[j].rt || !bl_py[j].srv) {
+      blur_layers_release();
+      return 0;
+    }
+  }
+  bl_py[4] = level_tex(DXGI_FORMAT_B8G8R8A8_UNORM, bl_py_w, bl_py_h);
+  if (!bl_py[4].t || !bl_py[4].rt || !bl_py[4].srv) {
+    blur_layers_release();
+    return 0;
+  }
+  return 1;
+}
+
+static int ensure_bl_comp_vbuf(void) {
+  if (bl_comp_vbuf) return 1;
+  if (!dev) return 0;
+  D3D11_BUFFER_DESC bd = {(UINT)(MB_INST * sizeof(float)), D3D11_USAGE_DYNAMIC,
+                          D3D11_BIND_VERTEX_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0};
+  if (FAILED(dev->CreateBuffer(&bd, NULL, &bl_comp_vbuf)) || !bl_comp_vbuf) {
+    bl_comp_vbuf = NULL;
+    return 0;
+  }
+  return 1;
+}
+
 // What drawing holds beyond the frames given back (a window minimized or hidden: win_app.c): glass's levels, made
 // again as a frame with glass is drawn.
 void mb_render_trim(void) {
   glass_free();
+  blur_layers_release();
   glass_idle_frames = 0;
 }
 
@@ -1616,18 +1715,163 @@ static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count
   }
   // one draw per run of instances showing the same image (slot 20; 0: none, the atlas stands in) of one kind (its
   // pixel shader: kind_ps), or sharing one capture of glass (negative)
+  struct BlurLayer {
+    int px0, py0, w, h, active;
+    float sigma;
+    ID3D11RenderTargetView *prev_rtv;
+    int prev_cut_on;
+    D3D11_RECT prev_cut;
+  };
+  BlurLayer bstack[MB_BLUR_LAYERS];
+  int bdepth = 0, bover = 0;
+  ID3D11RenderTargetView *cur_rtv = target;
   int32_t start = 0;
   int bound = 0, shows = 0;
   while (start < count) {
     int tid = (int)f[start * MB_INST + 20];
+    int kind0 = (int)(f[start * MB_INST + 5] + 0.5f);
+    if (kind0 == 14) {
+      if (bdepth >= MB_BLUR_LAYERS) {
+        bover++;
+        start++;
+        continue;
+      }
+      const float *a = f + (size_t)start * MB_INST;
+      float sc = (float)vscale;
+      float sigma = fabsf(a[7]);
+      float margin = sigma > 0.0f ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
+      int px0 = (int)floorf((a[0] - margin) * sc), py0 = (int)floorf((a[1] - margin) * sc);
+      int px1 = (int)ceilf((a[0] + a[2] + margin) * sc), py1 = (int)ceilf((a[1] + a[3] + margin) * sc);
+      if (px0 < 0) px0 = 0;
+      if (py0 < 0) py0 = 0;
+      if (px1 > pw) px1 = pw;
+      if (py1 > ph) py1 = ph;
+      int bw = px1 - px0, bh = py1 - py0;
+      BlurLayer L = {px0, py0, bw, bh, 0, sigma, cur_rtv, cut_on, cut};
+      if (bw > 0 && bh > 0 && ensure_blur_layer(bdepth, pw, ph)) {
+        static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        L.active = 1;
+        ctx->ClearRenderTargetView(bl_lv[bdepth].rt, zero);
+        cur_rtv = bl_lv[bdepth].rt;
+        cut_on = 1;
+        cut = {px0, py0, px1, py1};
+        main_state(cur_rtv, pw, ph);
+      } else {
+        cut_on = 1;
+        cut = {0, 0, 0, 0};
+        ctx->RSSetState(raster_cut);
+        ctx->RSSetScissorRects(1, &cut);
+      }
+      bstack[bdepth++] = L;
+      start++;
+      continue;
+    }
+    if (kind0 == 15) {
+      if (bover > 0) {
+        bover--;
+        start++;
+        continue;
+      }
+      if (bdepth <= 0) {
+        start++;
+        continue;
+      }
+      BlurLayer L = bstack[--bdepth];
+      if (!L.active) {
+        cur_rtv = L.prev_rtv;
+        cut_on = L.prev_cut_on;
+        cut = L.prev_cut;
+        main_state(cur_rtv, pw, ph);
+        start++;
+        continue;
+      }
+      if (ensure_blur_py(L.w, L.h) && ensure_bl_comp_vbuf()) {
+        static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
+        ctx->PSSetShaderResources(0, 3, none);
+        ctx->ClearRenderTargetView(bl_py[0].rt, zero);
+        D3D11_BOX box = {(UINT)L.px0, (UINT)L.py0, 0, (UINT)(L.px0 + L.w), (UINT)(L.py0 + L.h), 1};
+        ctx->CopySubresourceRegion(bl_py[0].t, 0, 0, 0, 0, bl_lv[bdepth].t, 0, &box);
+        ctx->VSSetShader(pvs, NULL, 0);
+        ctx->PSSetShader(pps, NULL, 0);
+        ctx->IASetInputLayout(NULL);
+        ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+        ctx->RSSetState(raster);
+        float sc = (float)vscale;
+        float sp = L.sigma * sc;
+        int k = 0;
+        while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
+        int lw[4] = {L.w, 0, 0, 0}, lh[4] = {L.h, 0, 0, 0};
+        for (int j = 1; j <= k; j++) {
+          lw[j] = (lw[j - 1] + 1) / 2;
+          lh[j] = (lh[j - 1] + 1) / 2;
+          ctx->ClearRenderTargetView(bl_py[j].rt, zero);
+          post_pass(&bl_py[j - 1], lw[j - 1], lh[j - 1], &bl_py[j], lw[j], lh[j], 1, 0, 0, 0);
+        }
+        float sk = sp / (float)(1 << k);
+        float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
+        float sg = sqrtf(sk * sk - pre > 0.0f ? sk * sk - pre : 0.0f);
+        if (sg > 0.3f) {
+          ctx->ClearRenderTargetView(bl_py[4].rt, zero);
+          post_pass(&bl_py[k], lw[k], lh[k], &bl_py[4], lw[k], lh[k], 2, sg, 1, 0);
+          ctx->ClearRenderTargetView(bl_py[k].rt, zero);
+          post_pass(&bl_py[4], lw[k], lh[k], &bl_py[k], lw[k], lh[k], 2, sg, 0, 1);
+        }
+        ctx->PSSetShaderResources(0, 3, none);
+        cur_rtv = L.prev_rtv;
+        cut_on = L.prev_cut_on;
+        cut = L.prev_cut;
+        main_state(cur_rtv, pw, ph);
+        float comp[MB_INST];
+        memcpy(comp, f + (size_t)start * MB_INST, MB_INST * sizeof(float));
+        float d = (float)(1 << k);
+        comp[0] = (float)L.px0 / sc;
+        comp[1] = (float)L.py0 / sc;
+        comp[2] = (float)L.w / sc;
+        comp[3] = (float)L.h / sc;
+        comp[4] = 0.0f;
+        comp[5] = 4.0f;
+        comp[6] = 0.0f;
+        comp[7] = 0.0f;
+        comp[8] = 1.0f;
+        comp[9] = 1.0f;
+        comp[10] = 1.0f;
+        comp[12] = 0.0f;
+        comp[13] = 0.0f;
+        comp[14] = (float)L.w / (d * (float)bl_py[k].w);
+        comp[15] = (float)L.h / (d * (float)bl_py[k].h);
+        comp[20] = 0.0f; comp[21] = 0.0f; comp[22] = 0.0f; comp[23] = 0.0f;
+        comp[32] = 0.0f; comp[33] = 0.0f; comp[34] = 0.0f; comp[35] = 0.0f;
+        comp[36] = 0.0f; comp[37] = 0.0f; comp[38] = 0.0f; comp[39] = 0.0f;
+        D3D11_MAPPED_SUBRESOURCE cm;
+        if (SUCCEEDED(ctx->Map(bl_comp_vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &cm))) {
+          memcpy(cm.pData, comp, MB_INST * sizeof(float));
+          ctx->Unmap(bl_comp_vbuf, 0);
+          UINT stride = MB_INST * sizeof(float), off = 0;
+          ctx->IASetVertexBuffers(0, 1, &bl_comp_vbuf, &stride, &off);
+          ctx->PSSetShaderResources(1, 1, &bl_py[k].srv);
+          ctx->PSSetShader(kind_ps(4), NULL, 0);
+          ctx->DrawInstanced(6, 1, 0, 0);
+          ctx->IASetVertexBuffers(0, 1, &vbuf, &stride, &off);
+          ctx->PSSetShaderResources(1, 1, &atlas_srv);
+        }
+      } else {
+        cur_rtv = L.prev_rtv;
+        cut_on = L.prev_cut_on;
+        cut = L.prev_cut;
+        main_state(cur_rtv, pw, ph);
+      }
+      start++;
+      continue;
+    }
     int32_t end = start + 1;
     while (end < count && (int)f[end * MB_INST + 20] == tid) end++;
     if (tid < 0) {
       glass_drawn = 1;
       if (tid != bound) {
-        shows = capture(target, pw, ph, f, start, end, count);
+        shows = capture(cur_rtv, pw, ph, f, start, end, count);
         bound = tid;
-        main_state(target, pw, ph);
+        main_state(cur_rtv, pw, ph);
       }
       ctx->PSSetShader(ps, NULL, 0);
       // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
@@ -1637,11 +1881,12 @@ static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count
       continue;
     }
     // holes for native views (kind 9) apart, written without blending: transparent there
-    int kind = (int)(f[start * MB_INST + 5] + 0.5f), hole = kind == 9, own = has_own_ps(kind);
+    int kind = kind0, hole = kind == 9, own = has_own_ps(kind);
     // (kinds without their own pixel shader one run, as before)
     end = start + 1;
     while (end < count && (int)f[end * MB_INST + 20] == tid) {
       int k = (int)(f[end * MB_INST + 5] + 0.5f);
+      if (k == 14 || k == 15) break;
       if ((k == 9) != hole || (own ? k != kind : has_own_ps(k))) break;
       end++;
     }
@@ -1898,6 +2143,11 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
       WaitForSingleObject(kinds_thread, INFINITE);
       CloseHandle(kinds_thread);
       kinds_thread = NULL;
+    }
+    blur_layers_release();
+    if (bl_comp_vbuf) {
+      bl_comp_vbuf->Release();
+      bl_comp_vbuf = NULL;
     }
     ctx->Release();
     dev->Release();
