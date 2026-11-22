@@ -1,0 +1,454 @@
+// Automated UI quality audit gates on `Tester`:
+// - Concentric corner ladder (`corner_faults`)
+// - WCAG 2.1 relative-luminance text contrast (`contrast_faults`)
+// - Unclipped text overflow & sibling text overlap (`words_over_faults`)
+// - Invisible interactive press targets (`unseen_press_faults`)
+// - Focused node viewport/clip visibility (`focus_visible_faults`)
+// - Frame-by-frame motion jump & jitter probe (`motion_steady_faults`, `MotionProbe`)
+// - Combined `ui_craft_audit` gate
+
+import "view"
+
+fn gate_label(tree : view::Tree, d : view::Drawn) -> String {
+  room_label(tree, d)
+}
+
+fn gate_label_id(tree : view::Tree, id : view::NodeId) -> String {
+  match tree.said_of(id) {
+    Some(s) => {
+      if s.label.length() > 0 {
+        return s.label
+      }
+    }
+    None => ()
+  }
+  let sl = tree.said_label(id)
+  if sl.length() > 0 {
+    return sl
+  }
+  "node#\{id.at}"
+}
+
+fn effective_radius(d : view::Drawn) -> Double {
+  let raw = match d.corners {
+    Some((tl, tr, br, bl)) => dmax(dmax(tl, tr), dmax(br, bl))
+    None => d.radius
+  }
+  let half = dmin(d.w, d.h) * 0.5
+  if raw > half { half } else { raw }
+}
+
+fn has_visible_surface(d : view::Drawn) -> Bool {
+  d.alpha > 0.01 &&
+  d.w > 0.5 &&
+  d.h > 0.5 &&
+  ((d.ground & 0xFFL) != 0L || (d.edge.0 > 0.0 && (d.edge.1 & 0xFFL) != 0L) || d.glass.is_some())
+}
+
+fn assert_fault_list(kind : String, faults : Array[String], label : String) -> Unit {
+  if faults.length() > 0 {
+    let mut msg = if label.length() > 0 {
+      "\{kind} failed in \{label} (\{faults.length()} fault(s)):"
+    } else {
+      "\{kind} failed (\{faults.length()} fault(s)):"
+    }
+    for f in faults {
+      msg = "\{msg}\n  - \{f}"
+    }
+    debug_assert(false, msg)
+  }
+}
+
+/// Gate 1: Concentric corner ladder check.
+/// Flags nested rounded boxes whose inner radius violates `inner_r <= max(0, outer_r - inset) + 1.5`.
+pub fn Tester::corner_faults(self : Tester) -> Array[String] {
+  let _ = self
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let faults : Array[String] = []
+  let mut i = 0
+  while i < n {
+    let child = held[i].0
+    let ir = effective_radius(child)
+    if ir > 0.5 && has_visible_surface(child) && !tree.over_all(child.id) {
+      let mut p = held[i].1
+      while p >= 0 {
+        let parent = held[p].0
+        let or_ = effective_radius(parent)
+        if or_ > 0.5 && has_visible_surface(parent) {
+          let il = child.x - parent.x
+          let it = child.y - parent.y
+          let ir_edge = (parent.x + parent.w) - (child.x + child.w)
+          let ib = (parent.y + parent.h) - (child.y + child.h)
+          if il >= -0.5 && it >= -0.5 && ir_edge >= -0.5 && ib >= -0.5 {
+            let cl = dmax(0.0, il)
+            let ct = dmax(0.0, it)
+            let cr = dmax(0.0, ir_edge)
+            let cb = dmax(0.0, ib)
+            let c_tl = dmax(cl, ct)
+            let c_tr = dmax(cr, ct)
+            let c_br = dmax(cr, cb)
+            let c_bl = dmax(cl, cb)
+            let corner_inset = dmin(dmin(c_tl, c_tr), dmin(c_br, c_bl))
+            if corner_inset <= or_ + 12.0 {
+              let allowed = dmax(0.0, or_ - corner_inset) + 1.5
+              if ir > allowed {
+                let cname = gate_label(tree, child)
+                let pname = gate_label(tree, parent)
+                faults.push(
+                  "corner: \{cname} r=\{ir} violates concentric ladder inside \{pname} (outer=\{or_}, inset=\{corner_inset})",
+                )
+              }
+            }
+          }
+          break
+        }
+        p = held[p].1
+      }
+    }
+    i += 1
+  }
+  faults
+}
+
+/// Assert that all nested rounded surfaces satisfy the concentric corner ladder.
+pub fn Tester::assert_corners(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("corner_faults", self.corner_faults(), label)
+}
+
+fn composite_background(held : Array[(view::Drawn, Int, Bool)], idx : Int, base_bg : Int64) -> Int64 {
+  let chain : Array[Int] = []
+  let mut cur = idx
+  while cur >= 0 {
+    chain.push(cur)
+    cur = held[cur].1
+  }
+  let mut bg = base_bg
+  let mut k = chain.length() - 1
+  while k >= 0 {
+    let d = held[chain[k]].0
+    if (d.ground & 0xFFL) != 0L && d.alpha > 0.01 {
+      bg = over(bg, alpha(d.ground, d.alpha))
+    }
+    k -= 1
+  }
+  bg
+}
+
+/// Gate 2: WCAG 2.1 relative-luminance contrast check for visible text nodes.
+/// Defaults to `4.5:1` for body text and `3.0:1` for large/bold text (`>= 18pt` bold or `>= 24pt`),
+/// or overrides with `min_ratio` when provided.
+pub fn Tester::contrast_faults(self : Tester, min_ratio? : Double) -> Array[String] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let base_bg = tree_theme().bg
+  let faults : Array[String] = []
+  let mut i = 0
+  while i < n {
+    let d = held[i].0
+    if d.words.length() > 0 && d.alpha >= 0.05 && d.bones == 0L && d.w > 0.5 && d.h > 0.5 {
+      let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, self.fake.width, self.fake.height)
+      if vx1 - vx0 > 0.5 && vy1 - vy0 > 0.5 {
+        let bg = composite_background(held, i, base_bg)
+        let fg = over(bg, alpha(d.ink, d.alpha))
+        let ratio = contrast_ratio(fg, bg)
+        let req = match min_ratio {
+          Some(m) => m
+          None => {
+            let is_large = d.words_look.size >= 24.0 ||
+            (d.words_look.size >= 18.0 && d.words_look.weight >= 600)
+            if is_large { 3.0 } else { 4.5 }
+          }
+        }
+        if ratio < req - 0.01 {
+          faults.push("contrast: \{d.words} ratio=\{ratio} < \{req}")
+        }
+      }
+    }
+    i += 1
+  }
+  faults
+}
+
+/// Assert that all visible text nodes satisfy WCAG contrast requirements.
+pub fn Tester::assert_contrast(self : Tester, min_ratio? : Double, label~ : String = "") -> Unit {
+  assert_fault_list("contrast_faults", self.contrast_faults(min_ratio?=min_ratio), label)
+}
+
+struct TextBox {
+  id : view::NodeId
+  words : String
+  vx0 : Double
+  vy0 : Double
+  vx1 : Double
+  vy1 : Double
+}
+
+/// Gate 3: Text overflow outside unclipped parent containers and sibling text overlap check.
+pub fn Tester::words_over_faults(self : Tester) -> Array[String] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let faults : Array[String] = []
+  let boxes : Array[TextBox] = []
+  let mut i = 0
+  while i < n {
+    let d = held[i].0
+    if d.words.length() > 0 && d.alpha > 0.02 && d.bones == 0L && d.w > 0.5 && d.h > 0.5 {
+      let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, self.fake.width, self.fake.height)
+      if vx1 - vx0 > 0.5 && vy1 - vy0 > 0.5 {
+        // Check unclipped overflow beyond immediate parent box
+        let p = held[i].1
+        if p >= 0 {
+          let par = held[p].0
+          if !par.clips && !par.clips_self && par.w > 0.5 && par.h > 0.5 {
+            if d.x < par.x - 2.0 ||
+            d.y < par.y - 2.0 ||
+            d.x + d.w > par.x + par.w + 2.0 ||
+            d.y + d.h > par.y + par.h + 2.0 {
+              faults.push("words_over: \"\{d.words}\" overflows parent \{gate_label(tree, par)}")
+            }
+          }
+        }
+        boxes.push(TextBox::{ id: d.id, words: d.words, vx0, vy0, vx1, vy1 })
+      }
+    }
+    i += 1
+  }
+  // Check pairwise overlap between non-nested text boxes
+  let nb = boxes.length()
+  let mut a = 0
+  while a < nb {
+    let ba = boxes[a]
+    let mut b = a + 1
+    while b < nb {
+      let bb = boxes[b]
+      if !tree.holds_in_order(ba.id, bb.id) && !tree.holds_in_order(bb.id, ba.id) {
+        let ix0 = dmax(ba.vx0, bb.vx0)
+        let iy0 = dmax(ba.vy0, bb.vy0)
+        let ix1 = dmin(ba.vx1, bb.vx1)
+        let iy1 = dmin(ba.vy1, bb.vy1)
+        let ow = ix1 - ix0
+        let oh = iy1 - iy0
+        if ow > 2.0 && oh > 2.0 {
+          let part = (ix0, iy0, ix1, iy1)
+          if !tree.covered_under(ba.id, bb.id, part) && !tree.covered_under(bb.id, ba.id, part) {
+            faults.push("words_over: \"\{ba.words}\" overlaps \"\{bb.words}\" (\{ow}x\{oh})")
+          }
+        }
+      }
+      b += 1
+    }
+    a += 1
+  }
+  faults
+}
+
+/// Assert zero unclipped text overflows and zero sibling text overlaps.
+pub fn Tester::assert_words_over(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("words_over_faults", self.words_over_faults(), label)
+}
+
+/// Gate 4: Zero invisible interactive press targets (`alpha < 0.02` still accepting clicks inside viewport).
+pub fn Tester::unseen_press_faults(self : Tester) -> Array[String] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let faults : Array[String] = []
+  let n = held.length()
+  let mut i = 0
+  while i < n {
+    let d = held[i].0
+    if d.alpha < 0.02 &&
+    d.w >= 1.0 &&
+    d.h >= 1.0 &&
+    tree.presses_do(d.id) &&
+    tree.takes_presses(d.id) {
+      let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, self.fake.width, self.fake.height)
+      if vx1 - vx0 >= 1.0 && vy1 - vy0 >= 1.0 {
+        let name = gate_label(tree, d)
+        faults.push("unseen_press: \{name} at (\{d.x}, \{d.y}) \{d.w}x\{d.h} alpha=\{d.alpha}")
+      }
+    }
+    i += 1
+  }
+  faults
+}
+
+/// Assert zero invisible clickable targets (`alpha < 0.02`).
+pub fn Tester::assert_unseen_press(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("unseen_press_faults", self.unseen_press_faults(), label)
+}
+
+/// Gate 5: Focused node visibility check (must be drawn and at least partially inside viewport & ancestor clips).
+pub fn Tester::focus_visible_faults(self : Tester) -> Array[String] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let (focused_opt, _) = tree.focused_now()
+  let fid = match focused_opt {
+    Some(id) => id
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let mut found = -1
+  let mut i = 0
+  while i < n {
+    if held[i].0.id == fid {
+      found = i
+      break
+    }
+    i += 1
+  }
+  if found < 0 {
+    return ["focus_visible: \{gate_label_id(tree, fid)} is focused but not drawn"]
+  }
+  let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, found, self.fake.width, self.fake.height)
+  if vx1 - vx0 <= 0.5 || vy1 - vy0 <= 0.5 {
+    let d = held[found].0
+    return ["focus_visible: \{gate_label(tree, d)} is focused but outside viewport or clipped"]
+  }
+  []
+}
+
+/// Assert that the currently focused node (if any) is visible within the viewport and ancestor clips.
+pub fn Tester::assert_focus_visible(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("focus_visible_faults", self.focus_visible_faults(), label)
+}
+
+/// Gate 6: Detect single-frame position/size jumps (`> max_jump_pt`) and 3-frame sign-reversing jitter (`> 2.0pt`).
+pub fn Tester::motion_steady_faults(
+  self : Tester,
+  samples : Array[(Double, Double, Double, Double)],
+  max_jump_pt~ : Double = 48.0,
+) -> Array[String] {
+  let _ = self
+  let faults : Array[String] = []
+  let n = samples.length()
+  let mut i = 1
+  while i < n {
+    let s0 = samples[i - 1]
+    let s1 = samples[i]
+    let dx = s1.0 - s0.0
+    let dy = s1.1 - s0.1
+    let dw = s1.2 - s0.2
+    let dh = s1.3 - s0.3
+    if dx.abs() > max_jump_pt ||
+    dy.abs() > max_jump_pt ||
+    dw.abs() > max_jump_pt ||
+    dh.abs() > max_jump_pt {
+      faults.push("motion_jump: frame \{i} jumped (dx=\{dx}, dy=\{dy}, dw=\{dw}, dh=\{dh}) > \{max_jump_pt}pt")
+    }
+    if i >= 2 {
+      let sp = samples[i - 2]
+      let dx1 = s0.0 - sp.0
+      let dx2 = s1.0 - s0.0
+      let dy1 = s0.1 - sp.1
+      let dy2 = s1.1 - s0.1
+      let x_osc = dx1 * dx2 < 0.0 && dx1.abs() > 2.0 && dx2.abs() > 2.0
+      let y_osc = dy1 * dy2 < 0.0 && dy1.abs() > 2.0 && dy2.abs() > 2.0
+      if x_osc || y_osc {
+        faults.push("motion_jitter: frames \{i - 2}..\{i} oscillated (dx=\{dx1}->\{dx2}, dy=\{dy1}->\{dy2})")
+      }
+    }
+    i += 1
+  }
+  faults
+}
+
+/// Frame-by-frame motion probe that attaches to `Tester::each_frame` and samples `(x, y, w, h)` for a named node.
+pub struct MotionProbe {
+  pub target : String
+  pub samples : Array[(Double, Double, Double, Double)]
+}
+
+/// Create a `MotionProbe` tracking semantic label or drawn text `target`.
+pub fn MotionProbe::new(target : String) -> MotionProbe {
+  MotionProbe::{ target, samples: [] }
+}
+
+/// Record the current `(x, y, w, h)` of `self.target` if drawn in `t`.
+pub fn MotionProbe::sample(self : MotionProbe, t : Tester) -> Unit {
+  match t.get(self.target) {
+    Some(d) => {
+      self.samples.push((d.x, d.y, d.w, d.h))
+      return
+    }
+    None => ()
+  }
+  for d in t.drawn() {
+    if d.words == self.target {
+      self.samples.push((d.x, d.y, d.w, d.h))
+      return
+    }
+  }
+}
+
+/// Attach this probe to `t.each_frame` and capture the initial frame immediately.
+pub fn MotionProbe::attach(self : MotionProbe, t : Tester) -> Unit {
+  self.sample(t)
+  t.each_frame(Some(fn() { self.sample(t) }))
+}
+
+/// Evaluate collected samples against `Tester::motion_steady_faults`.
+pub fn MotionProbe::faults(
+  self : MotionProbe,
+  t : Tester,
+  max_jump_pt~ : Double = 48.0,
+) -> Array[String] {
+  t.motion_steady_faults(self.samples, max_jump_pt=max_jump_pt)
+}
+
+/// Assert that collected motion samples contain no jumps or oscillations.
+pub fn MotionProbe::assert_steady(
+  self : MotionProbe,
+  t : Tester,
+  max_jump_pt~ : Double = 48.0,
+  label~ : String = "",
+) -> Unit {
+  assert_fault_list("motion_steady_faults", self.faults(t, max_jump_pt=max_jump_pt), label)
+}
+
+/// Combined UI craft audit aggregating room, scroll, corner, unseen-press, focus-visible, and text-overflow/overlap gates.
+pub fn Tester::ui_craft_audit(self : Tester) -> Array[String] {
+  let out : Array[String] = []
+  for f in self.room_faults() {
+    out.push(f)
+  }
+  for f in self.scroll_faults() {
+    out.push(f)
+  }
+  for f in self.corner_faults() {
+    out.push(f)
+  }
+  for f in self.unseen_press_faults() {
+    out.push(f)
+  }
+  for f in self.focus_visible_faults() {
+    out.push(f)
+  }
+  for f in self.words_over_faults() {
+    out.push(f)
+  }
+  out
+}
+
+/// Assert that `ui_craft_audit()` returns zero faults.
+pub fn Tester::assert_ui_craft(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("ui_craft_audit", self.ui_craft_audit(), label)
+}

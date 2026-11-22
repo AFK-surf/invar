@@ -1,0 +1,302 @@
+// Adversarial unit tests for all 6 UI quality audit gates (`audit_gates.pion`),
+// combined `ui_craft_audit`, and deterministic `InputTape` record/serialize/replay (`inputrec.pion`).
+
+import "signals"
+import "view"
+
+fn any_fault_prefix(faults : Array[String], pre : String) -> Bool {
+  for f in faults {
+    if str_has_prefix(f, pre) {
+      return true
+    }
+  }
+  false
+}
+
+test "gate 1: corner_faults passes concentric ladder and catches oversized inner radius" {
+  // Positive: outer r=16, pad=8 -> inner r=8 satisfies r <= 16 - 8 + 1.5
+  let t_ok = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(card : view::View) {
+      let _ = card
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(120.0)))
+      .pad(view::Live::Is(8.0))
+      .radius(view::Live::Is(16.0))
+      .ground(view::Live::Is(rgba(30, 30, 36, 255)))
+      let _ = card.box(fn(inner : view::View) {
+        let _ = inner
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(48.0)))
+        .radius(view::Live::Is(8.0))
+        .ground(view::Live::Is(rgba(60, 64, 76, 255)))
+      })
+    })
+  })
+  t_ok.assert_corners(label="concentric-ok")
+  t_ok.dispose()
+
+  // Negative: outer r=16, pad=8 -> inner r=14 violates 16 - 8 + 1.5 = 9.5
+  let t_bad = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(card : view::View) {
+      let _ = card
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(120.0)))
+      .pad(view::Live::Is(8.0))
+      .radius(view::Live::Is(16.0))
+      .ground(view::Live::Is(rgba(30, 30, 36, 255)))
+      let _ = card.box(fn(inner : view::View) {
+        let _ = inner
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(48.0)))
+        .radius(view::Live::Is(14.0))
+        .ground(view::Live::Is(rgba(60, 64, 76, 255)))
+      })
+    })
+  })
+  let faults = t_bad.corner_faults()
+  debug_assert(any_fault_prefix(faults, "corner:"), "expected corner: fault for oversized inner radius")
+  t_bad.dispose()
+}
+
+test "gate 2: contrast_faults enforces WCAG 2.1 ratio for body and large text" {
+  // Positive: dark ink on white background (~21:1)
+  let t_ok = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(card : view::View) {
+      let _ = card.pad(view::Live::Is(12.0)).ground(view::Live::Is(rgba(255, 255, 255, 255)))
+      let _ = card.words(
+        view::Live::Is("Readable"),
+        ink=rgba(17, 17, 17, 255),
+        look=view::WordsLook::of(14.0),
+      )
+    })
+  })
+  t_ok.assert_contrast(label="wcag-ok")
+  t_ok.dispose()
+
+  // Negative: light gray text on white background (~1.6:1 < 4.5)
+  let t_bad = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(card : view::View) {
+      let _ = card.pad(view::Live::Is(12.0)).ground(view::Live::Is(rgba(255, 255, 255, 255)))
+      let _ = card.words(
+        view::Live::Is("LowContrast"),
+        ink=rgba(200, 200, 200, 255),
+        look=view::WordsLook::of(14.0),
+      )
+    })
+  })
+  let faults = t_bad.contrast_faults()
+  debug_assert(any_fault_prefix(faults, "contrast:"), "expected contrast: fault for low-contrast text")
+  t_bad.dispose()
+}
+
+test "gate 3: words_over_faults catches sibling text overlap and unclipped overflow" {
+  // Positive: properly spaced column of text labels
+  let t_ok = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(col : view::View) {
+      let _ = col.gap(view::Live::Is(8.0)).pad(view::Live::Is(12.0))
+      let _ = col.words(view::Live::Is("Line One"), look=view::words_plain)
+      let _ = col.words(view::Live::Is("Line Two"), look=view::words_plain)
+    })
+  })
+  t_ok.assert_words_over(label="words-ok")
+  t_ok.dispose()
+
+  // Negative: two absolute text nodes colliding at the exact same position
+  let t_bad = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(stage : view::View) {
+      let _ = stage.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(100.0)))
+      let _ = stage.box(fn(a : view::View) {
+        let _ = a.over(view::Live::Is(true), edges=(Some(10.0), Some(10.0), None, None))
+        let _ = a.words(view::Live::Is("Overlap A"), look=view::words_plain)
+      })
+      let _ = stage.box(fn(b : view::View) {
+        let _ = b.over(view::Live::Is(true), edges=(Some(14.0), Some(12.0), None, None))
+        let _ = b.words(view::Live::Is("Overlap B"), look=view::words_plain)
+      })
+    })
+  })
+  let faults = t_bad.words_over_faults()
+  debug_assert(any_fault_prefix(faults, "words_over:"), "expected words_over: fault for overlapping text")
+  t_bad.dispose()
+}
+
+test "gate 4: unseen_press_faults catches alpha=0 clickable button and passes inert alpha=0" {
+  // Positive: alpha=0 button with presses(Is(false)) is inert and safe
+  let t_ok = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b
+      .width(view::Live::Is(Some(80.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .alpha(view::Live::Is(0.0))
+      .presses(view::Live::Is(false))
+      .on_press(fn() {})
+    })
+  })
+  t_ok.assert_unseen_press(label="inert-alpha-zero")
+  t_ok.dispose()
+
+  // Negative: alpha=0 button still accepting clicks -> click-through hazard
+  let t_bad = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b
+      .width(view::Live::Is(Some(80.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .alpha(view::Live::Is(0.0))
+      .on_press(fn() {})
+    })
+  })
+  let faults = t_bad.unseen_press_faults()
+  debug_assert(any_fault_prefix(faults, "unseen_press:"), "expected unseen_press: fault for alpha=0 clickable button")
+  t_bad.dispose()
+}
+
+test "gate 5: focus_visible_faults passes visible focused node and catches offscreen focused node" {
+  // Positive: focused button inside viewport
+  let t_ok = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .focusable(view::Live::Is(true))
+        .on_press(fn() {})
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t_ok.press("Tab")
+  t_ok.assert_focus_visible(label="focus-in-viewport")
+  t_ok.dispose()
+
+  // Negative: focused button positioned completely outside the viewport (x=900 > width=400)
+  let t_bad = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b
+        .over(view::Live::Is(true), edges=(Some(900.0), Some(20.0), None, None))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .focusable(view::Live::Is(true))
+        .on_press(fn() {})
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t_bad.press("Tab")
+  let faults = t_bad.focus_visible_faults()
+  debug_assert(any_fault_prefix(faults, "focus_visible:"), "expected focus_visible: fault for offscreen focused node")
+  t_bad.dispose()
+}
+
+test "gate 6: motion_steady_faults and MotionProbe catch jumps and oscillations" {
+  let pos_x = signals::signal(0.0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(pill : view::View) {
+      let _ = pill
+      .over_at(view::Live::By(fn() { (Some(pos_x.get()), Some(20.0), None, None) }))
+      .width(view::Live::Is(Some(80.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .words(view::Live::Is("Pill"), look=view::words_plain)
+    })
+  })
+  // Smooth trajectory via MotionProbe: 0 -> 10 -> 20 -> 30
+  let probe = MotionProbe::new("Pill")
+  probe.attach(t)
+  pos_x.set(10.0)
+  t.frame(ms=16.0)
+  pos_x.set(20.0)
+  t.frame(ms=16.0)
+  pos_x.set(30.0)
+  t.frame(ms=16.0)
+  probe.assert_steady(t, label="smooth-slide")
+
+  // Sudden jump (> 48pt)
+  pos_x.set(150.0)
+  t.frame(ms=16.0)
+  let jump_faults = probe.faults(t)
+  debug_assert(any_fault_prefix(jump_faults, "motion_jump:"), "expected motion_jump: fault")
+
+  // Back-and-forth oscillation (150 -> 160 -> 150)
+  let jitter_samples = [
+    (10.0, 20.0, 80.0, 40.0),
+    (20.0, 20.0, 80.0, 40.0),
+    (10.0, 20.0, 80.0, 40.0),
+  ]
+  let jitter_faults = t.motion_steady_faults(jitter_samples)
+  debug_assert(any_fault_prefix(jitter_faults, "motion_jitter:"), "expected motion_jitter: fault")
+  t.dispose()
+}
+
+test "combined ui_craft_audit passes clean layout and aggregates faults" {
+  let t_clean = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(card : view::View) {
+      let _ = card
+      .pad(view::Live::Is(12.0))
+      .radius(view::Live::Is(16.0))
+      .ground(view::Live::Is(rgba(255, 255, 255, 255)))
+      let _ = card.box(fn(btn : view::View) {
+        let _ = btn
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(44.0)))
+        .radius(view::Live::Is(4.0))
+        .ground(view::Live::Is(rgba(20, 20, 24, 255)))
+        .on_press(fn() {})
+        let _ = btn.words(view::Live::Is("Action"), ink=rgba(255, 255, 255, 255), look=view::words_plain)
+      })
+    })
+  })
+  t_clean.assert_ui_craft(label="clean-card")
+  t_clean.dispose()
+}
+
+test "inputrec: InputTape record -> to_lines -> from_lines -> deterministic replay" {
+  let tape = InputTape::new()
+  tape.record_move(40.0, 22.0, 16.0)
+  tape.record_press(40.0, 22.0, 32.0)
+  tape.record_release(40.0, 22.0, 48.0)
+  tape.record_wait(32.0)
+  tape.record_press(40.0, 22.0, 96.0)
+  tape.record_release(40.0, 22.0, 112.0)
+  tape.record_resize(640.0, 480.0, 144.0)
+  tape.record_text("hello world\nline2", 160.0)
+  tape.record_key(key_enter, 0, 176.0)
+  tape.record_wheel(100.0, 100.0, 0.0, -24.0, 0, 192.0)
+
+  let serialized = tape.to_lines()
+  let restored = InputTape::from_lines(serialized)
+  debug_assert(restored.len() == tape.len(), "round-trip event count matches")
+  debug_assert(restored.to_lines() == serialized, "round-trip serialization is bit-exact")
+
+  // Run original tape and restored tape on two fresh Tester trees and assert identical final state
+  let run_with_tape = fn(tp : InputTape) -> (Int, Double, Double) {
+    let clicks = ref_new(0)
+    let t = Tester::tree(
+      fn(root : view::View) {
+        let _ = root.box(fn(b : view::View) {
+          let _ = b
+          .width(view::Live::Is(Some(120.0)))
+          .height(view::Live::Is(Some(44.0)))
+          .on_press(fn() { clicks.v = clicks.v + 1 })
+          let _ = b.words(view::Live::Is("Tap"), look=view::words_plain)
+        })
+      },
+      width=400.0,
+      height=300.0,
+    )
+    tp.replay(t)
+    let out = (clicks.v, t.fake.width, t.fake.height)
+    t.dispose()
+    out
+  }
+
+  let res_orig = run_with_tape(tape)
+  let res_restored = run_with_tape(restored)
+  debug_assert(res_orig.0 == 2, "expected 2 clicks from replayed tape")
+  debug_assert(res_orig.1 == 640.0 && res_orig.2 == 480.0, "expected resized viewport 640x480")
+  debug_assert(
+    res_orig.0 == res_restored.0 && res_orig.1 == res_restored.1 && res_orig.2 == res_restored.2,
+    "deserialized tape replay reproduces identical final state",
+  )
+}
