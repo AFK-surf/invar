@@ -1329,8 +1329,8 @@
       // the foot and right less), 0.5 wide
       bool prog_glass = (v_pad.z < -0.5);
       vec3 g3 = backdrop(p);
-      float ps = prog_glass ? smoothstep(0.0, 1.0, fade_r) : 1.0;
-      float ts = prog_glass ? (ps <= 0.0 ? 0.0 : pow(ps, 1.35)) : 1.0;
+      float ps = prog_glass ? fade_r : 1.0;
+      float ts = prog_glass ? (fade_r <= 0.0 ? 0.0 : pow(fade_r, 1.25)) : 1.0;
       float sat = prog_glass ? mix(1.0, v_p.z, ps) : v_p.z;
       float bg_diff = prog_glass ? smoothstep(0.22, 0.72, abs(luma(col.rgb) - luma(g3))) : 0.0;
       float base_a = prog_glass ? mix(col.a, min(0.86, col.a + 0.34), bg_diff) : col.a;
@@ -1458,8 +1458,7 @@
       if (kf < 0.5) { o = texture(u_src, clamp(gl_FragCoord.xy * m0.xy, m0.xy * 0.5, m0.zw)); return; }
       float sig1 = pow(sp, 1.0 / kf);
       float r = clamp(ramp, 0.0, 1.0);
-      float s_r = smoothstep(0.0, 1.0, r);
-      float target_px = s_r <= 0.0 ? 0.0 : sp * pow(s_r, 1.25);
+      float target_px = r <= 0.0 ? 0.0 : sp * pow(r, 1.15);
       if (target_px <= sig1 || kf <= 1.05) {
         vec2 uv0_min = m0.xy * 0.5, uv0_max = m0.zw;
         vec2 c_uv = gl_FragCoord.xy * m0.xy;
@@ -1467,9 +1466,10 @@
         if (target_px <= 0.01) {
           g_small = texture(u_src, clamp(c_uv, uv0_min, uv0_max));
         } else {
-          vec2 d0 = vec2(target_px, 0.0) * m0.xy;
-          vec2 d1 = vec2(0.0, target_px) * m0.xy;
-          vec2 dd = vec2(target_px * 0.70710678, target_px * 0.70710678) * m0.xy;
+          float r_tap = target_px * 1.5;
+          vec2 d0 = vec2(r_tap, 0.0) * m0.xy;
+          vec2 d1 = vec2(0.0, r_tap) * m0.xy;
+          vec2 dd = vec2(r_tap * 0.70710678, r_tap * 0.70710678) * m0.xy;
           g_small  = texture(u_src, clamp(c_uv, uv0_min, uv0_max)) * 0.25;
           g_small += (texture(u_src, clamp(c_uv + d0, uv0_min, uv0_max)) +
                       texture(u_src, clamp(c_uv - d0, uv0_min, uv0_max)) +
@@ -1994,10 +1994,6 @@
           return;
         }
         dirtyTold = true; dirtyWhole = false; dirty = [];
-        for (let i = 0; i < AD_MAX; i++) {
-          const s = adSlots[i];
-          if (s.active && s.settleLeft > 0) dirty.push([s.cx - s.hx - 4, s.cy - s.hy - 4, s.hx * 2 + 8, s.hy * 2 + 8]);
-        }
         presentCached(true);
       });
     });
@@ -2235,6 +2231,87 @@
       gb: [x0 - 2, y0 - 2, x1 + 2, y1 + 2],
       shape: mShape, rad: mRad, edge,
     };
+  }
+
+  function closeAdaptiveParts(parts, count) {
+    if (!parts || !parts.length || count <= 0) return;
+    const W = canvas.width, Hh = canvas.height;
+    const sc = scale;
+    const caps = [];
+    for (let start = 0; start < count; ) {
+      const tid = Math.trunc(f32[start * INST + 20]);
+      if (tid >= 0) { start++; continue; }
+      let end = start;
+      while (end < count && Math.trunc(f32[end * INST + 20]) === tid) end++;
+      const a = start * INST;
+      const kind = Math.round(f32[a + 5]);
+      const isContained = kind === 5 && f32[a + 7] < 0;
+      const blur = (kind === 6 && f32[a + 7] < 0) ? 0 : Math.abs(f32[a + 7]);
+      const mergedLiquid = kind === 6 && f32[a + 23] > 0;
+      const unmergedLiquid = kind === 6 && !mergedLiquid;
+      let margin = isContained ? 0 : 3 * blur + (kind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (let i = start; i < end; i++) {
+        const b = i * INST;
+        let bx0 = Math.max(f32[b], f32[b + 16]), by0 = Math.max(f32[b + 1], f32[b + 17]);
+        let bx1 = Math.min(f32[b] + f32[b + 2], f32[b + 18]), by1 = Math.min(f32[b + 1] + f32[b + 3], f32[b + 19]);
+        if (kind === 6) {
+          const m = Math.max(unmergedLiquid ? f32[b + 23] : f32[a + 23], 0);
+          bx0 = f32[b] - m; by0 = f32[b + 1] - m; bx1 = f32[b] + f32[b + 2] + m; by1 = f32[b + 1] + f32[b + 3] + m;
+          if (unmergedLiquid) {
+            const bm = 3 * blur + f32[b + 21] * (1 + Math.abs(f32[b + 22])) + m + 2;
+            if (bm > margin) margin = bm;
+          }
+        }
+        x0 = Math.min(x0, bx0); y0 = Math.min(y0, by0); x1 = Math.max(x1, bx1); y1 = Math.max(y1, by1);
+      }
+      if (x1 > x0 && y1 > y0) {
+        const px0 = Math.max(0, Math.floor((x0 - margin) * sc)), px1 = Math.min(W, Math.ceil((x1 + margin) * sc));
+        const pb0 = Math.max(0, Hh - Math.ceil((y1 + margin) * sc)), pb1 = Math.min(Hh, Hh - Math.floor((y0 - margin) * sc));
+        if (px1 > px0 && pb1 > pb0) caps.push([px0, pb0, px1 - px0, pb1 - pb0]);
+      }
+      start = end;
+    }
+    if (!caps.length) return;
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const c of caps) {
+        let hit = false;
+        for (const p of parts) {
+          if (c[0] < p[0] + p[2] && p[0] < c[0] + c[2] && c[1] < p[1] + p[3] && p[1] < c[1] + c[3]) {
+            hit = true;
+            break;
+          }
+        }
+        if (!hit) continue;
+        let covers = false;
+        for (const p of parts) {
+          if (p[0] <= c[0] && p[1] <= c[1] && p[0] + p[2] >= c[0] + c[2] && p[1] + p[3] >= c[1] + c[3]) {
+            covers = true;
+            break;
+          }
+        }
+        if (covers) continue;
+        parts.push(c.slice());
+        changed = true;
+      }
+      if (changed) {
+        for (let i = 0; i < parts.length; i++) {
+          for (let j = i + 1; j < parts.length; ) {
+            const a = parts[i], b = parts[j];
+            if (a[0] <= b[0] + b[2] && b[0] <= a[0] + a[2] && a[1] <= b[1] + b[3] && b[1] <= a[1] + a[3]) {
+              const x0 = Math.min(a[0], b[0]), y0 = Math.min(a[1], b[1]);
+              const x1 = Math.max(a[0] + a[2], b[0] + b[2]), y1 = Math.max(a[1] + a[3], b[1] + b[3]);
+              parts[i] = [x0, y0, x1 - x0, y1 - y0];
+              parts.splice(j, 1);
+            } else {
+              j++;
+            }
+          }
+        }
+      }
+    }
   }
 
   function grabLevels(m) {
@@ -3024,7 +3101,8 @@
     adCurDt = adNextDt();
     adFrameSerial++;
     const whole = !dirtyTold || dirtyWhole || missing;
-    if (!whole && adSettling) {
+    const adaptiveDamage = !whole && adSettling;
+    if (adaptiveDamage) {
       for (let i = 0; i < AD_MAX; i++) {
         const s = adSlots[i];
         if (s.active && s.settleLeft > 0) dirty.push([s.cx - s.hx - 4, s.cy - s.hy - 4, s.hx * 2 + 8, s.hy * 2 + 8]);
@@ -3060,6 +3138,7 @@
       return;
     }
     const parts = takeParts(cvOk);
+    if (parts && adaptiveDamage) closeAdaptiveParts(parts, n);
     target = cv.fb;
     // the frame's instances and its shapes' pieces uploaded once, whether drawn whole or a part at a time (each part
     // uploaded them all again: a list scrolled spent a fifth of its frames in bufferData)
