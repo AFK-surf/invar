@@ -171,6 +171,10 @@ static gboolean on_tick(GtkWidget *w, GdkFrameClock *clock, gpointer data) {
 // as that frame ends, its first picture on the screen the app's page drawn (at its size as laid out: drawn again in the
 // snapshot where that is another), not its ground for the page's first moments.
 static int window_held, window_shown, window_to_show;
+static int window_hidden = 0;
+typedef int32_t (*mb_window_close_fn)(void);
+static mb_window_close_fn window_close_cb = NULL;
+static int dark_pending = -1;
 static int held_w, held_h;
 static guint held_source;
 static gboolean held_frame(gpointer data);
@@ -1198,6 +1202,7 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
   if (*app_id()) gtk_window_set_default_icon_name(app_id());
   GtkSettings *gs = gtk_settings_get_default();
   if (gs) {
+    if (dark_pending >= 0) g_object_set(gs, "gtk-application-prefer-dark-theme", dark_pending ? TRUE : FALSE, NULL);
     on_font_name(G_OBJECT(gs), NULL, NULL);
     g_signal_connect(gs, "notify::gtk-font-name", G_CALLBACK(on_font_name), NULL);
   }
@@ -1226,6 +1231,9 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
   drop_start();
   // (held: out of sight till the app shows it, its frames drawn meanwhile: held_frame)
   if (window_held && !window_shown) {
+    gtk_widget_realize(ws->area);
+  } else if (window_hidden) {
+    window_shown = 1;
     gtk_widget_realize(ws->area);
   } else {
     window_shown = 1;
@@ -1741,6 +1749,7 @@ moonbit_bytes_t mb_host_perf_read(void) { return moonbit_make_bytes(0, 0); }
 
 // The app drawn dark (@hostapi.set_dark): GTK's own parts (the title bar) drawn as dark.
 void mb_host_set_dark(int32_t dark) {
+  dark_pending = dark ? 1 : 0;
   GtkSettings *s = gtk_settings_get_default();
   if (s) g_object_set(s, "gtk-application-prefer-dark-theme", dark ? TRUE : FALSE, NULL);
 }
@@ -1802,9 +1811,30 @@ int32_t mb_host_drive(int32_t kind, moonbit_string_t text) {
 
 void mb_host_window_hold(void) { window_held = 1; }
 
-void mb_host_window_show(void) {
-  if (window_held && !window_shown) window_to_show = 1;
+void mb_host_window_center(void) {}
+
+void mb_host_window_hide(void) {
+  window_hidden = 1;
+  if (win_slots[0].win) gtk_widget_set_visible(win_slots[0].win, FALSE);
 }
+
+void mb_host_window_show(void) {
+  if (window_held && !window_shown && !window_hidden) {
+    window_to_show = 1;
+    return;
+  }
+  int was_hidden = window_hidden;
+  window_hidden = 0;
+  if (win_slots[0].win && (was_hidden || !gtk_widget_get_visible(win_slots[0].win))) {
+    if (window_held && !window_shown) {
+      window_to_show = 0;
+      window_shown = 1;
+    }
+    bring_back();
+  }
+}
+
+void mb_host_set_window_close(mb_window_close_fn f) { window_close_cb = f; }
 
 // The window as the app wants it, asked before `run` (@hostapi.window_setup): with `inset`, no title bar of the
 // system's, the app's top row is it, its buttons the app's.

@@ -336,14 +336,60 @@ static void draw_frame(void) {
 // with the app's page drawn, not with nothing for the page's first moments. So is each window beside the first, till
 // its first frame is (win_open: held).
 static int window_held, window_shown, window_to_show;
+static int window_center_pending = 0;
+static int window_hidden = 0;
+typedef int32_t (*mb_window_close_fn)(void);
+static mb_window_close_fn window_close_cb = NULL;
+static void tell_state(void);
+static void bring_back(void);
 
 static int cloak(HWND h, BOOL on) { return SUCCEEDED(DwmSetWindowAttribute(h, DWMWA_CLOAK, &on, sizeof on)); }
 
+static void center_hwnd(HWND h) {
+  if (!h) return;
+  HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi = {sizeof mi};
+  RECT rc;
+  if (!GetMonitorInfoW(mon, &mi) || !GetWindowRect(h, &rc)) return;
+  int w = rc.right - rc.left, hh = rc.bottom - rc.top;
+  int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2;
+  int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - hh) / 2;
+  SetWindowPos(h, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
 void mb_host_window_hold(void) { window_held = 1; }
 
-void mb_host_window_show(void) {
-  if (window_held && !window_shown) window_to_show = 1;
+void mb_host_window_center(void) {
+  if (hwnd) center_hwnd(hwnd);
+  else window_center_pending = 1;
 }
+
+void mb_host_window_hide(void) {
+  window_hidden = 1;
+  if (hwnd) {
+    ShowWindow(hwnd, SW_HIDE);
+    tell_state();
+  }
+}
+
+void mb_host_window_show(void) {
+  if (window_held && !window_shown && !window_hidden) {
+    window_to_show = 1;
+    return;
+  }
+  int was_hidden = window_hidden;
+  window_hidden = 0;
+  if (hwnd && (was_hidden || !IsWindowVisible(hwnd))) {
+    if (window_held && !window_shown) {
+      window_to_show = 0;
+      window_shown = 1;
+      cloak(hwnd, FALSE);
+    }
+    bring_back();
+  }
+}
+
+void mb_host_set_window_close(mb_window_close_fn f) { window_close_cb = f; }
 
 // After a round of frames, the compositor's beat waited for (mb_render_pace: what they presented taken by it): a window
 // held whose frame is there uncloaked, the first window once the app has shown it.
@@ -1294,6 +1340,7 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
                          wc.hInstance, NULL);
   win_making = -1;
   win_slots[0].h = hwnd;
+  title_dark_of(hwnd);
   // that client area at the monitor's scale
   UINT dpi = GetDpiForWindow(hwnd);
   ws->scale = win_scale(hwnd);
@@ -1304,10 +1351,14 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
   ImmAssociateContextEx(hwnd, NULL, 0);  // no input method until an editor has focus
   // (where it was last left, an app's: win_life.h place_put_back)
   int show = place_put_back();
+  if (window_center_pending) {
+    window_center_pending = 0;
+    center_hwnd(hwnd);
+  }
   if (!mb_render_init(hwnd)) exit(1);
   // (held: out of sight till the app shows it, mb_host_window_show; shown at once where DWM cannot cloak it)
   if (window_held && !window_shown && !cloak(hwnd, TRUE)) window_shown = 1;
-  ShowWindow(hwnd, show);
+  if (!window_hidden) ShowWindow(hwnd, show);
   life_start(t);
   drop_start(0);
   free(given);

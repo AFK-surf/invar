@@ -2933,6 +2933,9 @@ moonbit_string_t mb_host_env(moonbit_string_t name) {
 // The window held till the app shows it (@hostapi.window_hold): the system shows the app's own here, as it opens.
 void mb_host_window_hold(void) {}
 void mb_host_window_show(void) {}
+void mb_host_window_center(void) {}
+void mb_host_window_hide(void) {}
+void mb_host_set_window_close(int32_t (*f)(void)) { (void)f; }
 
 void mb_host_window_setup(double min_w, double min_h, double w, double h, int32_t inset) {
   (void)min_w; (void)min_h; (void)w; (void)h; (void)inset;

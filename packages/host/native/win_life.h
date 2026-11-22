@@ -364,7 +364,7 @@ static ULONGLONG asleep_at;    // as the PC went to sleep (0: awake)
 static int first_hidden_bare;  // a bare run's first hidden as it closed while another was open (put_away)
 static void bring_back(void) {
   if (!hwnd) return;
-  if (put_away_at || IsIconic(hwnd)) {
+  if (put_away_at || IsIconic(hwnd) || !IsWindowVisible(hwnd)) {
     fprintf(stdout, "win: brought back\n");
     fflush(stdout);
   }
@@ -1126,6 +1126,10 @@ static int life_message(UINT msg, WPARAM wp, LPARAM lp, LRESULT *r) {
   }
   switch (msg) {
     case WM_CLOSE:
+      if (window_close_cb && !window_close_cb()) {
+        *r = 0;
+        return 1;
+      }
       if (!put_away()) return 0;
       *r = 0;
       return 1;

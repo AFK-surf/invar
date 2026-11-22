@@ -1380,12 +1380,49 @@ void mb_host_window_setup(double min_w, double min_h, double w, double h, int32_
 // (mb_host_window_show): it comes up with the app's page drawn, not with its ground for the page's first moments.
 // Asked in a frame, it is shown as that frame ends (drawFrame: window_shown_now), the frame on it.
 static BOOL window_held, window_shown, window_to_show;
+static int window_center_pending = 0;
+static int window_hidden = 0;
+typedef int32_t (*mb_window_close_fn)(void);
+static mb_window_close_fn window_close_cb = NULL;
+static int dark_pending = -1;
 
 void mb_host_window_hold(void) { window_held = YES; }
 
-void mb_host_window_show(void) {
-  if (window_held && !window_shown) window_to_show = YES;
+void mb_host_window_center(void) {
+  NSWindow *w = win_slots[@0].win ?: the_view.window;
+  if (w) [w center];
+  else window_center_pending = 1;
 }
+
+void mb_host_window_hide(void) {
+  NSWindow *w = win_slots[@0].win ?: the_view.window;
+  window_hidden = 1;
+  if (w) {
+    [w orderOut:nil];
+    tell_state();
+  }
+}
+
+void mb_host_window_show(void) {
+  if (window_held && !window_shown && !window_hidden) {
+    window_to_show = YES;
+    return;
+  }
+  int was_hidden = window_hidden;
+  window_hidden = 0;
+  NSWindow *w = win_slots[@0].win ?: the_view.window;
+  if (w && (was_hidden || !w.isVisible)) {
+    if (window_held && !window_shown) {
+      window_shown = YES;
+      window_to_show = NO;
+      w.ignoresMouseEvents = NO;
+      w.alphaValue = 1;
+    }
+    bring_back();
+  }
+}
+
+void mb_host_set_window_close(mb_window_close_fn f) { window_close_cb = f; }
 
 static void window_shown_now(void) {
   NSWindow *w = the_view.window;
@@ -2024,6 +2061,7 @@ static void bring_back(void) {
 - (BOOL)windowShouldClose:(NSWindow *)w {
   // (a window of the run beside the first: closed, the run going on: win_closed)
   if (win_of(w) > 0) return YES;
+  if (window_close_cb && !window_close_cb()) return NO;
   // (the first, the windows beside it left as they are: a window of the app's own ends with it; an app's bundle's is
   // put away; a bare run's hidden while another is open, else it ends)
   if (window_run()) return YES;
@@ -2642,20 +2680,28 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
                                                                 return canvas ? nil : e;
                                                               }];
     // (held: out of sight till the app shows it, mb_host_window_show)
+    if (dark_pending >= 0)
+      w.appearance = [NSAppearance appearanceNamed:dark_pending ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
+    if (window_center_pending) {
+      window_center_pending = 0;
+      [w center];
+    }
     if (window_held && !window_shown) {
       w.alphaValue = 0;
       w.ignoresMouseEvents = YES;
     }
-    if (latency_run()) [w orderFrontRegardless];
-    else [w makeKeyAndOrderFront:nil];
-    [w makeFirstResponder:the_view];
+    if (!window_hidden) {
+      if (latency_run()) [w orderFrontRegardless];
+      else [w makeKeyAndOrderFront:nil];
+      [w makeFirstResponder:the_view];
+    }
     // full screen from as the system starts taking the window there, a window from as it starts bringing it back
     // (its slot's fullScreenOn)
     [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillEnterFullScreenNotification object:w queue:nil
                                                   usingBlock:^(NSNotification *n) { full_screen_going(w, true); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillExitFullScreenNotification object:w queue:nil
                                                   usingBlock:^(NSNotification *n) { full_screen_going(w, false); }];
-    if (!latency_run()) [NSApp activateIgnoringOtherApps:YES];
+    if (!latency_run() && !window_hidden) [NSApp activateIgnoringOtherApps:YES];
     // closed, the program ends (an app's bundle's window is put away instead: MBAppDelegate windowShouldClose)
     w.delegate = app_delegate;
     [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification
@@ -4043,7 +4089,8 @@ moonbit_bytes_t mb_host_perf_read(void) { return moonbit_make_bytes(0, 0); }
 
 // The app drawn dark or light (@hostapi.set_dark): the window's title bar the same.
 void mb_host_set_dark(int32_t dark) {
-  NSWindow *w = the_view.window;
+  dark_pending = dark != 0 ? 1 : 0;
+  NSWindow *w = win_slots[@0].win ?: the_view.window;
   if (w) w.appearance = [NSAppearance appearanceNamed:dark ? NSAppearanceNameDarkAqua : NSAppearanceNameAqua];
   ground_dark = dark != 0;
   set_ground();

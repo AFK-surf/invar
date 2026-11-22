@@ -134,6 +134,7 @@ static void bring_back(void) {
     gtk_window_set_startup_id(GTK_WINDOW(win_slots[0].win), activation_token);
     g_clear_pointer(&activation_token, g_free);
   }
+  gtk_widget_set_visible(win_slots[0].win, TRUE);
   gtk_window_present(GTK_WINDOW(win_slots[0].win));
   if (put_away_at >= 0) {
     say_shown(put_away_at);
@@ -180,6 +181,7 @@ static void quit(void) { exit(0); }
 
 static gboolean on_close(GtkWindow *w, gpointer data) {
   (void)w, (void)data;
+  if (window_close_cb && !window_close_cb()) return TRUE;
   if (!put_away()) quit();
   return TRUE;
 }
