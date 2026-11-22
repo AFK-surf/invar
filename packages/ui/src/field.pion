@@ -1,10 +1,11 @@
-// Pure-tree text editor Field, EditorResult, FieldEdit, caret/selection/undo/IME/clipboard state machine,
-// and `field(...)` tree node constructor.
-// Ported from libs/mbui/src/ui/editor.mbt, editor_undo.mbt, and tree_field.mbt.
+// Pure-tree text editor Field, EditorResult, FieldEdit, and `field(...)` tree node constructor.
+// Backed by `packages/editor` (`EditorState`, `UndoStack`, `SelectionHandleDrag`, `LoupeGeometry`).
 
+import "editor"
+import "hostapi"
+import "paint"
 import "signals"
 import "view"
-import "hostapi"
 
 pub let caret_blink_ms : Double = 530.0
 pub let caret_blinks_for_ms : Double = 30000.0
@@ -27,20 +28,18 @@ pub struct FieldEdit {
   pub now : String
 }
 
-struct UndoSnap {
-  text : String
-  caret : Int
-  anchor : Int
-}
-
 /// Retained text field state (owned by the app, bound to one pure-tree `field` node).
+/// All reactive signals are forwarded directly from `self.editor` (zero duplicated state).
 pub struct Field {
   pub phys_id : Int
+  pub editor : editor::EditorState
+  pub handle_drag : editor::SelectionHandleDrag
   text_sig : signals::Signal[String]
   caret_sig : signals::Signal[Int]
   anchor_sig : signals::Signal[Int]
   focused_sig : signals::Signal[Bool]
   composing_sig : signals::Signal[String]
+  layout_sig : signals::Signal[Int]
   pub mut color : Int64
   pub mut ph_color : Int64
   pub mut caret_color : Int64
@@ -48,8 +47,6 @@ pub struct Field {
   pub mut generation : Int
   pub mut tree_node : Option[view::NodeId]
   pub mut parked_flag : Bool
-  undo_stack : Array[UndoSnap]
-  redo_stack : Array[UndoSnap]
   pub mut on_submitted : Option[(String) -> Unit]
   pub mut on_edited : Option[(String) -> Unit]
   pub mut on_edit : Option[(FieldEdit) -> Unit]
@@ -58,6 +55,9 @@ pub struct Field {
   pub mut command_sends : Bool
   pub mut paste_limit : Int
   pub mut secret : Bool
+  pub mut last_font_size : Double
+  pub mut last_line_h : Double
+  pub mut last_max_w : Double
 }
 
 let focused_field_ref : Ref[Option[Field]] = ref_new(None)
@@ -74,14 +74,19 @@ pub fn focused_field_now() -> Option[Field] {
 }
 
 pub fn Field::new(text~ : String = "") -> Field {
-  let n = text.length()
+  let cfg = editor::EditorConfig::default()
+  cfg.enter_sends = true
+  let ed = editor::EditorState::new(text=text, config=cfg)
   Field::{
     phys_id: next_ui_id(),
-    text_sig: signals::signal(text),
-    caret_sig: signals::signal(n),
-    anchor_sig: signals::signal(n),
-    focused_sig: signals::signal(false),
-    composing_sig: signals::signal(""),
+    editor: ed,
+    handle_drag: editor::SelectionHandleDrag::new(),
+    text_sig: ed.text_signal(),
+    caret_sig: ed.caret_signal(),
+    anchor_sig: ed.anchor_signal(),
+    focused_sig: ed.focused_signal(),
+    composing_sig: ed.marked_signal(),
+    layout_sig: signals::signal(0),
     color: c64(0x1D1D, 0x1FFF),
     ph_color: c64(0x8E8E, 0x93FF),
     caret_color: c64(0x0A84, 0xFFFF),
@@ -89,8 +94,6 @@ pub fn Field::new(text~ : String = "") -> Field {
     generation: 0,
     tree_node: None,
     parked_flag: false,
-    undo_stack: [],
-    redo_stack: [],
     on_submitted: None,
     on_edited: None,
     on_edit: None,
@@ -99,7 +102,17 @@ pub fn Field::new(text~ : String = "") -> Field {
     command_sends: false,
     paste_limit: 0,
     secret: false,
+    last_font_size: 15.0,
+    last_line_h: 21.0,
+    last_max_w: 0.0,
   }
+}
+
+fn Field::sync_config(self : Field) -> Unit {
+  self.editor.config.enter_sends = self.enter_sends
+  self.editor.config.command_sends = self.command_sends
+  self.editor.config.paste_limit = self.paste_limit
+  self.editor.config.secret = self.secret
 }
 
 pub fn Field::text(self : Field) -> String {
@@ -134,86 +147,6 @@ pub fn Field::colors(self : Field, placeholder~ : Int64, caret~ : Int64) -> Unit
   self.sel_color = (caret & c64(0xFFFF, 0xFF00)) | 0x40L
 }
 
-fn clamp_pos(s : String, p : Int) -> Int {
-  if p < 0 { 0 } else if p > s.length() { s.length() } else { p }
-}
-
-fn str_slice(s : String, start : Int, end : Int) -> String {
-  let lo = clamp_pos(s, start)
-  let hi = clamp_pos(s, end)
-  if hi <= lo {
-    return ""
-  }
-  let sb = StringBuilder::new()
-  let mut i = lo
-  while i < hi {
-    sb.write_byte(s.code_unit_at(i) as Byte)
-    i += 1
-  }
-  sb.to_string()
-}
-
-pub fn Field::set(self : Field, text : String, caret? : Int) -> Unit {
-  let c = match caret {
-    Some(p) => clamp_pos(text, p)
-    None => text.length()
-  }
-  self.text_sig.set(text)
-  self.caret_sig.set(c)
-  self.anchor_sig.set(c)
-  self.composing_sig.set("")
-}
-
-pub fn Field::follow(self : Field, text : String, generation~ : Int = 0) -> Unit {
-  if generation != self.generation || (!self.focused_sig.untracked() && self.text_sig.untracked() != text) {
-    self.generation = generation
-    self.set(text)
-  }
-}
-
-pub fn Field::pick(self : Field, from : Int, to : Int) -> Unit {
-  let s = self.text_sig.untracked()
-  self.anchor_sig.set(clamp_pos(s, from))
-  self.caret_sig.set(clamp_pos(s, to))
-}
-
-pub fn Field::take(self : Field) -> String {
-  let out = self.text_sig.untracked()
-  self.set("")
-  out
-}
-
-pub fn Field::focus(self : Field) -> Unit {
-  match focused_field_ref.v {
-    Some(prev) if prev.phys_id != self.phys_id => prev.focused_sig.set(false)
-    _ => ()
-  }
-  focused_field_ref.v = Some(self)
-  self.focused_sig.set(true)
-}
-
-pub fn Field::let_go(self : Field) -> Unit {
-  self.focused_sig.set(false)
-  self.composing_sig.set("")
-  match focused_field_ref.v {
-    Some(cur) if cur.phys_id == self.phys_id => focused_field_ref.v = None
-    _ => ()
-  }
-}
-
-fn Field::push_undo(self : Field) -> Unit {
-  let snap = UndoSnap::{
-    text: self.text_sig.untracked(),
-    caret: self.caret_sig.untracked(),
-    anchor: self.anchor_sig.untracked(),
-  }
-  self.undo_stack.push(snap)
-  if self.undo_stack.length() > 100 {
-    array_remove_at(self.undo_stack, 0)
-  }
-  self.redo_stack.clear()
-}
-
 fn Field::notify_edit(self : Field, from : Int, was : String, now : String) -> Unit {
   match self.on_edited {
     Some(f) => f(now)
@@ -225,229 +158,267 @@ fn Field::notify_edit(self : Field, from : Int, was : String, now : String) -> U
   }
 }
 
-/// Insert text at current caret/selection (replaces selection if active).
-pub fn Field::insert(self : Field, ins : String) -> Unit {
-  self.composing_sig.set("")
-  if ins.length() == 0 {
-    return
+pub fn Field::set(self : Field, text : String, caret? : Int) -> Unit {
+  self.sync_config()
+  self.editor.set(text, caret?=caret)
+}
+
+pub fn Field::follow(self : Field, text : String, generation~ : Int = 0) -> Unit {
+  if generation != self.generation || (!self.focused_sig.untracked() && self.text_sig.untracked() != text) {
+    self.generation = generation
+    self.set(text)
   }
-  self.push_undo()
-  let was = self.text_sig.untracked()
-  let (lo, hi) = self.selection()
-  let next = str_slice(was, 0, lo) + ins + str_slice(was, hi, was.length())
-  let new_caret = lo + ins.length()
-  self.text_sig.set(next)
-  self.caret_sig.set(new_caret)
-  self.anchor_sig.set(new_caret)
-  self.notify_edit(lo, was, next)
+}
+
+pub fn Field::pick(self : Field, from : Int, to : Int) -> Unit {
+  self.editor.set_selection(from, to)
+}
+
+pub fn Field::take(self : Field) -> String {
+  let out = self.text_sig.untracked()
+  self.set("")
+  out
+}
+
+pub fn Field::focus(self : Field) -> Unit {
+  match focused_field_ref.v {
+    Some(prev) if prev.phys_id != self.phys_id => prev.editor.blur()
+    _ => ()
+  }
+  focused_field_ref.v = Some(self)
+  self.editor.focus()
+}
+
+pub fn Field::let_go(self : Field) -> Unit {
+  self.editor.blur()
+  match focused_field_ref.v {
+    Some(cur) if cur.phys_id == self.phys_id => focused_field_ref.v = None
+    _ => ()
+  }
+}
+
+/// Insert text at current caret/selection (commits active IME composition as an atomic undo step).
+pub fn Field::insert(self : Field, ins : String) -> Unit {
+  self.sync_config()
+  let was = self.editor.text
+  let (lo, _) = self.editor.selection_range()
+  let now = work_clock_now()
+  if self.editor.is_composing() {
+    self.editor.compose_commit(ins, now=now)
+  } else {
+    if ins.length() == 0 {
+      return
+    }
+    self.editor.insert_text(ins, now=now)
+  }
+  if self.editor.text != was {
+    self.notify_edit(lo, was, self.editor.text)
+  }
 }
 
 /// Set active IME composition text.
 pub fn Field::compose(self : Field, s : String) -> Unit {
-  self.composing_sig.set(s)
-}
-
-/// Delete selection or one character before caret.
-pub fn Field::backspace(self : Field) -> Unit {
-  self.composing_sig.set("")
-  let was = self.text_sig.untracked()
-  let (lo, hi) = self.selection()
-  if lo < hi {
-    self.push_undo()
-    let next = str_slice(was, 0, lo) + str_slice(was, hi, was.length())
-    self.text_sig.set(next)
-    self.caret_sig.set(lo)
-    self.anchor_sig.set(lo)
-    self.notify_edit(lo, was, next)
-  } else if lo > 0 {
-    self.push_undo()
-    let next = str_slice(was, 0, lo - 1) + str_slice(was, lo, was.length())
-    self.text_sig.set(next)
-    self.caret_sig.set(lo - 1)
-    self.anchor_sig.set(lo - 1)
-    self.notify_edit(lo - 1, was, next)
+  if s.length() == 0 {
+    self.editor.compose_cancel()
+  } else {
+    self.editor.compose_update(s, sel_start=0, sel_end=s.length())
   }
 }
 
-/// Delete selection or one character after caret.
+/// Delete selection or one grapheme cluster before caret.
+pub fn Field::backspace(self : Field) -> Unit {
+  self.sync_config()
+  let was = self.editor.text
+  self.editor.backspace(now=work_clock_now())
+  if self.editor.text != was {
+    self.notify_edit(self.editor.caret, was, self.editor.text)
+  }
+}
+
+/// Delete selection or one grapheme cluster after caret.
 pub fn Field::delete_forward(self : Field) -> Unit {
-  self.composing_sig.set("")
-  let was = self.text_sig.untracked()
-  let (lo, hi) = self.selection()
-  if lo < hi {
-    self.push_undo()
-    let next = str_slice(was, 0, lo) + str_slice(was, hi, was.length())
-    self.text_sig.set(next)
-    self.caret_sig.set(lo)
-    self.anchor_sig.set(lo)
-    self.notify_edit(lo, was, next)
-  } else if lo < was.length() {
-    self.push_undo()
-    let next = str_slice(was, 0, lo) + str_slice(was, lo + 1, was.length())
-    self.text_sig.set(next)
-    self.caret_sig.set(lo)
-    self.anchor_sig.set(lo)
-    self.notify_edit(lo, was, next)
+  self.sync_config()
+  let was = self.editor.text
+  self.editor.delete_forward(now=work_clock_now())
+  if self.editor.text != was {
+    self.notify_edit(self.editor.caret, was, self.editor.text)
   }
 }
 
 pub fn Field::copy_selection(self : Field) -> String {
-  let (lo, hi) = self.selection()
-  if lo >= hi {
-    return ""
-  }
-  let sel = str_slice(self.text_sig.untracked(), lo, hi)
-  if !self.secret {
+  self.sync_config()
+  let sel = self.editor.copy()
+  if sel.length() > 0 && !self.secret {
     clipboard_set(sel)
   }
   sel
 }
 
 pub fn Field::cut_selection(self : Field) -> String {
-  let sel = self.copy_selection()
-  if sel.length() > 0 {
-    self.backspace()
+  self.sync_config()
+  let was = self.editor.text
+  let (lo, _) = self.editor.selection_range()
+  let sel = self.editor.cut(now=work_clock_now())
+  if sel.length() > 0 && !self.secret {
+    clipboard_set(sel)
+  }
+  if self.editor.text != was {
+    self.notify_edit(lo, was, self.editor.text)
   }
   sel
 }
 
 pub fn Field::paste_text(self : Field, clip : String) -> Unit {
-  if self.paste_limit > 0 && clip.length() >= self.paste_limit {
-    match self.on_pasted {
-      Some(f) => f(clip)
+  self.sync_config()
+  let was = self.editor.text
+  let (lo, _) = self.editor.selection_range()
+  if !self.editor.paste(clip, now=work_clock_now()) {
+    match self.editor.take_pasted() {
+      Some(p) =>
+      match self.on_pasted {
+        Some(f) => f(p)
+        None => ()
+      }
       None => ()
     }
     return
   }
-  self.insert(clip)
+  if self.editor.text != was {
+    self.notify_edit(lo, was, self.editor.text)
+  }
 }
 
 pub fn Field::undo(self : Field) -> Bool {
-  if self.undo_stack.length() == 0 {
-    return false
+  self.sync_config()
+  let was = self.editor.text
+  if self.editor.undo(now=work_clock_now()) {
+    self.notify_edit(0, was, self.editor.text)
+    true
+  } else {
+    false
   }
-  let cur = UndoSnap::{
-    text: self.text_sig.untracked(),
-    caret: self.caret_sig.untracked(),
-    anchor: self.anchor_sig.untracked(),
-  }
-  self.redo_stack.push(cur)
-  let last_idx = self.undo_stack.length() - 1
-  let snap = self.undo_stack[last_idx]
-  array_remove_at(self.undo_stack, last_idx)
-  let was = cur.text
-  self.text_sig.set(snap.text)
-  self.caret_sig.set(snap.caret)
-  self.anchor_sig.set(snap.anchor)
-  self.notify_edit(0, was, snap.text)
-  true
 }
 
 pub fn Field::redo(self : Field) -> Bool {
-  if self.redo_stack.length() == 0 {
-    return false
+  self.sync_config()
+  let was = self.editor.text
+  if self.editor.redo(now=work_clock_now()) {
+    self.notify_edit(0, was, self.editor.text)
+    true
+  } else {
+    false
   }
-  let cur = UndoSnap::{
-    text: self.text_sig.untracked(),
-    caret: self.caret_sig.untracked(),
-    anchor: self.anchor_sig.untracked(),
-  }
-  self.undo_stack.push(cur)
-  let last_idx = self.redo_stack.length() - 1
-  let snap = self.redo_stack[last_idx]
-  array_remove_at(self.redo_stack, last_idx)
-  let was = cur.text
-  self.text_sig.set(snap.text)
-  self.caret_sig.set(snap.caret)
-  self.anchor_sig.set(snap.anchor)
-  self.notify_edit(0, was, snap.text)
-  true
+}
+
+/// Lay out visual lines for `max_w` using real font shaping via `measure_text_width`.
+pub fn Field::layout_for(
+  self : Field,
+  max_w : Double,
+  font_size~ : Double = 0.0,
+  line_h~ : Double = 0.0,
+) -> Array[editor::VisualLine] {
+  self.sync_config()
+  let sz = if font_size > 0.0 { font_size } else { self.last_font_size }
+  let lh = if line_h > 0.0 { line_h } else if self.last_line_h > 0.0 { self.last_line_h } else { sz * 1.4 }
+  self.last_font_size = sz
+  self.last_line_h = lh
+  self.last_max_w = max_w
+  let lines = self.editor.layout_lines(max_w, fn(s : String) { measure_text_width(s, sz) }, lh)
+  self.layout_sig.set(self.layout_sig.untracked() + 1)
+  lines
+}
+
+pub fn Field::move_up(self : Field, extend~ : Bool = false) -> Unit {
+  self.sync_config()
+  self.editor.move_up(extend=extend)
+}
+
+pub fn Field::move_down(self : Field, extend~ : Bool = false) -> Unit {
+  self.sync_config()
+  self.editor.move_down(extend=extend)
+}
+
+pub fn Field::select_word_at(self : Field, pos : Int) -> (Int, Int) {
+  self.sync_config()
+  self.editor.select_word_at(pos)
+}
+
+pub fn Field::select_line_at(self : Field, pos : Int) -> (Int, Int) {
+  self.sync_config()
+  self.editor.select_line_at(pos)
+}
+
+pub fn Field::selection_rects(self : Field) -> Array[paint::Rect] {
+  self.sync_config()
+  self.editor.selection_rects(color=self.sel_color)
+}
+
+pub fn Field::caret_pos(self : Field) -> editor::CaretPos {
+  self.sync_config()
+  self.editor.caret_pos(self.editor.caret)
+}
+
+pub fn Field::handles(
+  self : Field,
+  style~ : editor::HandleStyle = editor::HandleStyle::Android,
+) -> Option[(editor::SelectionHandle, editor::SelectionHandle)] {
+  self.sync_config()
+  editor::selection_handles_of(self.editor, style=style)
+}
+
+pub fn Field::loupe(
+  self : Field,
+  viewport_w : Double,
+  viewport_h : Double,
+  origin_x~ : Double = 0.0,
+  origin_y~ : Double = 0.0,
+) -> editor::LoupeGeometry {
+  self.sync_config()
+  editor::loupe_for_editor(self.editor, viewport_w, viewport_h, origin_x=origin_x, origin_y=origin_y)
 }
 
 /// Handle a keyboard event on this field. Returns true if consumed.
 pub fn Field::handle_key(self : Field, code : Int, mods : Int) -> Bool {
+  self.sync_config()
+  let platform = hostapi::keys_platform()
+  let is_apple = platform == editor::platform_macos || platform == editor::platform_ios
+  let primary = if is_apple { (mods & mod_cmd) != 0 } else { (mods & mod_ctrl) != 0 }
   let shift = (mods & mod_shift_key) != 0
-  let cmd = if keys_apple() { (mods & mod_cmd) != 0 } else { (mods & mod_ctrl) != 0 }
-  let s = self.text_sig.untracked()
-  let n = s.length()
-  let caret = self.caret_sig.untracked()
+  let alt = (mods & mod_alt) != 0
 
-  if code == key_code_backspace {
-    self.backspace()
-    return true
-  }
-  if code == key_code_delete {
-    self.delete_forward()
-    return true
-  }
-  if code == key_code_left {
-    let next = if shift {
-      clamp_pos(s, caret - 1)
-    } else {
-      let (lo, hi) = self.selection()
-      if lo < hi { lo } else { clamp_pos(s, caret - 1) }
-    }
-    self.caret_sig.set(next)
-    if !shift { self.anchor_sig.set(next) }
-    return true
-  }
-  if code == key_code_right {
-    let next = if shift {
-      clamp_pos(s, caret + 1)
-    } else {
-      let (lo, hi) = self.selection()
-      if lo < hi { hi } else { clamp_pos(s, caret + 1) }
-    }
-    self.caret_sig.set(next)
-    if !shift { self.anchor_sig.set(next) }
-    return true
-  }
-  if code == key_code_home || code == key_code_line_start || code == key_code_text_start {
-    self.caret_sig.set(0)
-    if !shift { self.anchor_sig.set(0) }
-    return true
-  }
-  if code == key_code_end || code == key_code_line_end || code == key_code_text_end {
-    self.caret_sig.set(n)
-    if !shift { self.anchor_sig.set(n) }
-    return true
-  }
-  if code == key_code_select_all || (cmd && code == key_of_char('a')) {
-    self.anchor_sig.set(0)
-    self.caret_sig.set(n)
-    return true
-  }
-  if code == key_code_copy || (cmd && code == key_of_char('c')) {
+  if code == key_code_copy || (primary && !alt && !shift && code == key_of_char('c')) {
     let _ = self.copy_selection()
     return true
   }
-  if code == key_code_cut || (cmd && code == key_of_char('x')) {
+  if code == key_code_cut || (primary && !alt && !shift && code == key_of_char('x')) {
     let _ = self.cut_selection()
     return true
   }
-  if cmd && code == key_of_char('v') {
+  if primary && !alt && !shift && code == key_of_char('v') {
     self.paste_text(clipboard_get())
     return true
   }
-  if cmd && code == key_of_char('z') {
-    if shift { let _ = self.redo() } else { let _ = self.undo() }
-    return true
+
+  let was = self.editor.text
+  let handled = self.editor.handle_key(code, mods, platform, now=work_clock_now())
+  if !handled {
+    return false
   }
-  if code == key_enter {
-    if (self.enter_sends && !shift) || (self.command_sends && cmd) {
-      match self.on_submitted {
-        Some(f) => {
-          f(self.text_sig.untracked())
-          return true
-        }
-        None => return false
+  match self.editor.take_submitted() {
+    Some(s) =>
+    match self.on_submitted {
+      Some(f) => {
+        f(s)
+        return true
       }
-    } else {
-      self.insert("\n")
-      return true
+      None => return false
     }
+    None => ()
   }
-  false
+  if self.editor.text != was {
+    self.notify_edit(self.editor.caret, was, self.editor.text)
+  }
+  true
 }
 
 struct TreeField {
@@ -526,6 +497,7 @@ pub fn field(
     Some(f) => f
     None => fn() { placeholder }
   }
+  let is_multi = max_lines != 1
   fld.color = color
   fld.ph_color = placeholder_color
   fld.caret_color = caret_color
@@ -537,30 +509,100 @@ pub fn field(
   fld.command_sends = command_sends
   fld.paste_limit = paste_limit
   fld.secret = secret
+  fld.editor.config.multiline = is_multi
+  fld.editor.config.wrap = is_multi
+  fld.sync_config()
   fld.on_submitted = submitted
   fld.on_pasted = pasted
   fld.on_edited = edited
   fld.on_edit = edit
 
+  let init_sz = (sz_fn)()
+  let line_h = if line > 0.0 { line } else { init_sz * 1.4 }
+  fld.last_font_size = init_sz
+  fld.last_line_h = line_h
+  let look = view::WordsLook::of(init_sz, line=line_h, wrap=is_multi, max_lines=max_lines)
+
   parent.box(fn(f : view::View) {
     let id = f.id()
     fld.tree_node = Some(id)
     tree_fields.push(TreeField::{ node_id: id, field: fld, font_size: sz_fn, line, hint: hint_fn })
-    let line_h = if line > 0.0 { line } else { (sz_fn)() * 1.4 }
     let min_h = line_h * (if min_lines > 0 { min_lines } else { 1 }).to_double()
     let _ = f.min_height(view::Live::Is(Some(min_h)))
     let _ = f.focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
     let _ = f.words(
       view::Live::By(fn() {
         let t = fld.text()
-        if t.length() > 0 { t } else { (hint_fn)() }
+        let m = fld.composed_said()
+        if t.length() > 0 || m.length() > 0 {
+          fld.editor.display_text()
+        } else {
+          (hint_fn)()
+        }
       }),
       ink=fld.color,
-      look=view::words_plain,
+      look=look,
     )
     let _ = f.ink(view::Live::By(fn() {
-      if fld.text().length() > 0 { fld.color } else { fld.ph_color }
+      if fld.text().length() > 0 || fld.composing() { fld.color } else { fld.ph_color }
     }))
+    // Pure-tree multi-line selection highlight overlay (one rect per spanned visual line).
+    let _ = f.box(fn(sel_layer : view::View) {
+      let _ = sel_layer.over(view::Live::Is(true)).presses(view::Live::Is(false))
+      sel_layer.each_of(
+        fn() {
+          let _ = fld.text()
+          let _ = fld.selection()
+          let _ = fld.composed_said()
+          let _ = fld.layout_sig.get()
+          let rects = fld.selection_rects()
+          let idxs : Array[Int] = []
+          for i in 0..<rects.length() {
+            idxs.push(i)
+          }
+          idxs
+        },
+        fn(row : view::View, idx : Int) {
+          let _ = row
+          .over_at(
+            view::Live::By(fn() {
+              let _ = fld.text()
+              let _ = fld.selection()
+              let _ = fld.layout_sig.get()
+              let rects = fld.selection_rects()
+              if idx < rects.length() {
+                let r = rects[idx]
+                (Some(r.x), Some(r.y), None, None)
+              } else {
+                (Some(0.0), Some(0.0), None, None)
+              }
+            }),
+          )
+          .width(
+            view::Live::By(fn() {
+              let _ = fld.text()
+              let _ = fld.selection()
+              let _ = fld.layout_sig.get()
+              let rects = fld.selection_rects()
+              if idx < rects.length() { Some(rects[idx].w) } else { Some(0.0) }
+            }),
+          )
+          .height(
+            view::Live::By(fn() {
+              let _ = fld.text()
+              let _ = fld.selection()
+              let _ = fld.layout_sig.get()
+              let rects = fld.selection_rects()
+              if idx < rects.length() { Some(rects[idx].h) } else { Some(0.0) }
+            }),
+          )
+          .ground(view::Live::Is(fld.sel_color))
+          .radius(view::Live::Is(3.0))
+          .presses(view::Live::Is(false))
+        },
+        at_once=true,
+      )
+    })
     let _ = f.says(
       view::Live::By(fn() {
         let lbl = if label.length() > 0 { label } else { (hint_fn)() }

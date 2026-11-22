@@ -425,3 +425,76 @@ test "End handle crossing left past Start flips to Start, and iOS handle style" 
     None => debug_assert(false, "expected iOS selection handles")
   }
 }
+
+test "layout lines cache invalidates on text edits, IME composition, set, undo and redo" {
+  let ed = EditorState::new(text="abc")
+  let l0 = ed.layout_lines(100.0, test_measure, 20.0)
+  debug_assert(l0.length() == 1 && l0[0].byte_end == 3, "initial 1 line")
+
+  // Insert newline -> lines must invalidate and lazily re-layout to 2 lines
+  ed.insert_text("\ndef", now=100.0)
+  let cp = ed.caret_pos(ed.caret)
+  debug_assert(cp.line == 1 && cp.x == 30.0 && cp.y == 20.0, "caret_pos lazily re-laid out after insert_text")
+  debug_assert(ed.lines.length() == 2, "2 visual lines after newline insert")
+
+  // IME compose_update invalidates layout so display_caret reflects marked text
+  ed.compose_update("你好", sel_start=0, sel_end=6)
+  let cp_ime = ed.caret_pos(ed.caret + ed.marked_sel_end)
+  debug_assert(cp_ime.line == 1 && cp_ime.x == 70.0, "caret_pos includes marked text after compose_update")
+  ed.compose_cancel()
+  let cp_cancel = ed.caret_pos(ed.caret)
+  debug_assert(cp_cancel.line == 1 && cp_cancel.x == 30.0, "caret_pos restored after compose_cancel")
+
+  // Undo invalidates layout back to 1 line
+  debug_assert(ed.undo(), "undo newline insert")
+  let cp_undo = ed.caret_pos(ed.caret)
+  debug_assert(cp_undo.line == 0 && cp_undo.x == 30.0 && ed.lines.length() == 1, "layout invalidated on undo")
+
+  // Redo invalidates layout back to 2 lines
+  debug_assert(ed.redo(), "redo newline insert")
+  let cp_redo = ed.caret_pos(ed.caret)
+  debug_assert(cp_redo.line == 1 && cp_redo.x == 30.0 && ed.lines.length() == 2, "layout invalidated on redo")
+
+  // Programmatic set() invalidates layout
+  ed.set("1\n2\n3")
+  let cp_set = ed.caret_pos(ed.caret)
+  debug_assert(cp_set.line == 2 && cp_set.y == 40.0 && ed.lines.length() == 3, "layout invalidated on set()")
+}
+
+test "secret mode maps text byte offsets to 3-byte bullet display offsets bidirectionally" {
+  let cfg = EditorConfig::default()
+  cfg.secret = true
+  let family = "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7"
+  // "a" (1B) + "你" (3B) + family (18B) + "b" (1B) => 23 bytes, 4 graphemes -> 4 bullets = 12 display bytes
+  let ed = EditorState::new(text="a你" + family + "b", config=cfg)
+  debug_assert(ed.display_text().length() == 12, "4 bullets = 12 UTF-8 bytes")
+  debug_assert(secret_display_offset(ed.text, 0) == 0, "offset 0 -> 0")
+  debug_assert(secret_display_offset(ed.text, 1) == 3, "after 'a' -> 3")
+  debug_assert(secret_display_offset(ed.text, 4) == 6, "after 'a你' -> 6")
+  debug_assert(secret_display_offset(ed.text, 22) == 9, "after family -> 9")
+  debug_assert(secret_display_offset(ed.text, 23) == 12, "end -> 12")
+  debug_assert(secret_text_offset(ed.text, 0) == 0, "inv 0 -> 0")
+  debug_assert(secret_text_offset(ed.text, 3) == 1, "inv 3 -> 1")
+  debug_assert(secret_text_offset(ed.text, 6) == 4, "inv 6 -> 4")
+  debug_assert(secret_text_offset(ed.text, 9) == 22, "inv 9 -> 22")
+  debug_assert(secret_text_offset(ed.text, 12) == 23, "inv 12 -> 23")
+
+  let _ = ed.layout_lines(300.0, test_measure, 20.0)
+  // Each bullet is non-ASCII -> 20px in test_measure
+  let cp1 = ed.caret_pos(1)
+  debug_assert(cp1.x == 20.0, "caret after 'a' sits at 1 bullet (20px)")
+  let cp3 = ed.caret_pos(22)
+  debug_assert(cp3.x == 60.0, "caret after 3 graphemes sits at 3 bullets (60px)")
+  debug_assert(ed.display_caret() == 12, "display_caret at end is 12")
+
+  // hit_test maps bullet x back to exact UTF-8 byte offset in text
+  debug_assert(ed.hit_test(20.0, 10.0) == 1, "hit_test 20px -> byte 1")
+  debug_assert(ed.hit_test(40.0, 10.0) == 4, "hit_test 40px -> byte 4")
+  debug_assert(ed.hit_test(60.0, 10.0) == 22, "hit_test 60px -> byte 22")
+  debug_assert(ed.hit_test(80.0, 10.0) == 23, "hit_test 80px -> byte 23")
+
+  // selection_rects for [1, 22) spans bullets 1..3 => x=20, w=40
+  ed.set_selection(1, 22)
+  let rects = ed.selection_rects()
+  debug_assert(rects.length() == 1 && rects[0].x == 20.0 && rects[0].w == 40.0, "secret selection_rects aligned to bullets")
+}

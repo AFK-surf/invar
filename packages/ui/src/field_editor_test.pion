@@ -1,0 +1,127 @@
+// End-to-end integration tests for `ui::Field` backed by `packages/editor`:
+// multi-line wrapping + Up/Down preferred_x, CJK + Emoji ZWJ deletion without UTF-8 corruption,
+// Blink 1000ms undo coalescing, IME compose/commit/undo, multi-line selection highlight rects,
+// touch selection handle crossover flip, and optical loupe geometry.
+
+import "editor"
+import "view"
+
+test "field_editor 01: multiline wrap, Up/Down preferred_x, and real measure_text_width" {
+  let fld = Field::new(text="Hello world\nHi\nLonger third line")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=6, font_size=15.0, line=22.0, label="Notes")
+  })
+  let lines = fld.layout_for(95.0, font_size=15.0, line_h=22.0)
+  debug_assert(lines.length() >= 4, "95pt wrap breaks multi-paragraph text into >= 4 lines")
+
+  // Place caret at byte 5 on line 0 and move down through short line "Hi" preserving preferred_x
+  fld.pick(5, 5)
+  let p0 = fld.caret_pos()
+  let want_x = p0.x
+  fld.move_down()
+  debug_assert(fld.editor.preferred_x == want_x, "preferred_x captured on first move_down")
+  fld.move_down()
+  debug_assert(fld.editor.preferred_x == want_x, "preferred_x preserved across short line")
+  fld.move_up()
+  debug_assert(fld.editor.preferred_x == want_x, "preferred_x preserved on move_up")
+  t.dispose()
+}
+
+test "field_editor 02: CJK + Emoji ZWJ grapheme deletion never corrupts UTF-8" {
+  let family = "\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7"
+  let fld = Field::new(text="Hi你好" + family)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=3, label="Chat")
+  })
+  t.press("Chat")
+  t.backspace()
+  debug_assert(fld.text() == "Hi你好", "single backspace deleted whole 18-byte ZWJ family emoji")
+  t.backspace()
+  debug_assert(fld.text() == "Hi你", "second backspace deleted whole 3-byte CJK char 好")
+  debug_assert(fld.undo(), "undo restored CJK + emoji")
+  debug_assert(fld.text() == "Hi你好" + family, "coalesced backspaces restored in one undo step")
+  t.dispose()
+}
+
+test "field_editor 03: Blink 1000ms undo coalescing driven by work_clock_now" {
+  let fld = Field::new()
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=3, label="Draft")
+  })
+  t.press("Draft")
+  // Fast burst within 1000ms coalesces into 1 undo step
+  t.type_text("h")
+  t.frame(ms=100.0)
+  t.type_text("i")
+  t.frame(ms=100.0)
+  t.type_text("!")
+  debug_assert(fld.editor.undo_stack.undo_len() == 1, "fast typing burst coalesced into 1 step")
+
+  // Pause > 1000ms starts a fresh undo step
+  t.frame(ms=1200.0)
+  t.type_text("ok")
+  debug_assert(fld.editor.undo_stack.undo_len() == 2, "typing after >1000ms pause starts step 2")
+  debug_assert(fld.undo(), "undo second burst")
+  debug_assert(fld.text() == "hi!", "reverted only post-pause burst")
+  debug_assert(fld.undo(), "undo first burst")
+  debug_assert(fld.text() == "", "reverted first burst cleanly")
+  t.dispose()
+}
+
+test "field_editor 04: IME compose, live display_text, atomic commit, and undo" {
+  let fld = Field::new(text="say ")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=3, label="IME")
+  })
+  fld.focus()
+  fld.compose("nihao")
+  debug_assert(fld.composing(), "composing active")
+  debug_assert(fld.editor.display_text() == "say nihao", "display_text splices marked text")
+  fld.insert("你好")
+  debug_assert(!fld.composing(), "commit clears composing")
+  debug_assert(fld.text() == "say 你好", "committed CJK text")
+  debug_assert(fld.undo(), "IME commit undone in 1 step")
+  debug_assert(fld.text() == "say ", "reverted whole IME commit")
+  t.dispose()
+}
+
+test "field_editor 05: multi-line selection highlight rects, handle crossover flip, and loupe geometry" {
+  let fld = Field::new(text="one two\nthree four")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=4, font_size=15.0, line=22.0, label="Body")
+  })
+  let _ = fld.layout_for(300.0, font_size=15.0, line_h=22.0)
+
+  // Cross-line selection from "two" (byte 4) to "three" (byte 13) -> 2 selection rects
+  fld.pick(4, 13)
+  let rects = fld.selection_rects()
+  debug_assert(rects.length() == 2, "cross-line selection emits 2 highlight rects")
+  t.frame(ms=16.0)
+
+  // Touch selection handles + crossover identity flip (Start dragged past End -> flips to End)
+  fld.pick(4, 7) // "two" on line 0
+  match fld.handles(style=editor::HandleStyle::Android) {
+    Some((sh, eh)) => {
+      debug_assert(eh.tip_x > sh.tip_x, "end handle sits right of start handle")
+      match fld.handle_drag.begin(fld.editor, sh.knob_cx, sh.knob_cy, style=editor::HandleStyle::Android) {
+        Some(editor::HandleKind::Start) => ()
+        _ => debug_assert(false, "expected Start handle grab")
+      }
+      // Drag right past end handle onto line 1 ("four")
+      let target_x = 120.0 - fld.handle_drag.grab_dx
+      let target_y = 32.0 - fld.handle_drag.grab_dy
+      match fld.handle_drag.update(fld.editor, target_x, target_y) {
+        Some(editor::HandleKind::End) => ()
+        _ => debug_assert(false, "expected Start handle to flip to End on crossover")
+      }
+      fld.handle_drag.end_drag()
+    }
+    None => debug_assert(false, "expected active selection handles")
+  }
+
+  // Optical loupe geometry + Glass::clear zoom
+  let lg = fld.loupe(480.0, 320.0, origin_x=24.0, origin_y=40.0)
+  debug_assert(lg.visible && lg.width == editor::loupe_default_width, "loupe geometry computed")
+  debug_assert(lg.to_glass().zoom == editor::loupe_default_zoom, "loupe Glass::clear zoom matches")
+  t.dispose()
+}

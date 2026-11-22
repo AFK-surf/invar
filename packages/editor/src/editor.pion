@@ -223,11 +223,81 @@ pub fn EditorState::focus(self : EditorState) -> Unit {
   self.sync_signals()
 }
 
+fn EditorState::invalidate_layout(self : EditorState) -> Unit {
+  self.lines = []
+}
+
+/// Map a UTF-8 byte offset in `raw` to its byte offset in secret bullet-masked `display_text()`
+/// (each grapheme cluster maps to one 3-byte U+2022 bullet).
+pub fn secret_display_offset(raw : String, raw_off : Int) -> Int {
+  let n = raw.length()
+  let clamped = snap_to_grapheme(raw, iclamp(raw_off, 0, n))
+  let mut i = 0
+  let mut count = 0
+  while i < clamped {
+    let next = next_grapheme_boundary(raw, i)
+    if next <= i {
+      break
+    }
+    i = next
+    count += 1
+  }
+  count * 3
+}
+
+/// Inverse of `secret_display_offset`: map a byte offset in bullet-masked `display_text()`
+/// back to a grapheme-aligned UTF-8 byte offset in `raw`.
+pub fn secret_text_offset(raw : String, disp_off : Int) -> Int {
+  if disp_off <= 0 {
+    return 0
+  }
+  let target_g = disp_off / 3
+  let n = raw.length()
+  let mut i = 0
+  let mut count = 0
+  while i < n && count < target_g {
+    let next = next_grapheme_boundary(raw, i)
+    if next <= i {
+      break
+    }
+    i = next
+    count += 1
+  }
+  i
+}
+
+fn EditorState::raw_display_text(self : EditorState) -> String {
+  if self.marked.length() == 0 {
+    self.text
+  } else {
+    str_slice(self.text, 0, self.caret) + self.marked + str_slice(self.text, self.caret, self.text.length())
+  }
+}
+
+fn EditorState::to_display_off(self : EditorState, raw_off : Int) -> Int {
+  let raw = self.raw_display_text()
+  if self.config.secret {
+    secret_display_offset(raw, raw_off)
+  } else {
+    snap_to_grapheme(raw, iclamp(raw_off, 0, raw.length()))
+  }
+}
+
+fn EditorState::from_display_off(self : EditorState, disp_off : Int) -> Int {
+  let raw = self.raw_display_text()
+  if self.config.secret {
+    secret_text_offset(raw, disp_off)
+  } else {
+    snap_to_grapheme(raw, iclamp(disp_off, 0, raw.length()))
+  }
+}
+
 pub fn EditorState::blur(self : EditorState) -> Unit {
   self.focused = false
   self.marked = ""
   self.marked_sel_start = 0
   self.marked_sel_end = 0
+  self.invalidate_layout()
   self.sync_signals()
 }
 
@@ -275,6 +345,7 @@ pub fn EditorState::set(self : EditorState, new_text : String, caret? : Int) -> 
   self.upstream = -1
   self.undo_stack.clear()
   self.look_cache_valid = false
+  self.invalidate_layout()
   self.sync_signals()
 }
 
@@ -494,6 +565,7 @@ pub fn EditorState::compose_start(self : EditorState) -> Unit {
   self.marked_sel_start = 0
   self.marked_sel_end = 0
   self.upstream = -1
+  self.invalidate_layout()
   self.sync_signals()
 }
 
@@ -512,6 +584,7 @@ pub fn EditorState::compose_update(
   self.marked_sel_end = iclamp(sel_end, self.marked_sel_start, ml)
   self.preferred_x = -1.0
   self.upstream = -1
+  self.invalidate_layout()
   self.sync_signals()
 }
 
@@ -542,6 +615,7 @@ pub fn EditorState::compose_commit(self : EditorState, s : String, now~ : Double
   self.undo_stack.break_run()
   self.preferred_x = -1.0
   self.upstream = -1
+  self.invalidate_layout()
   self.sync_signals()
 }
 
@@ -551,16 +625,13 @@ pub fn EditorState::compose_cancel(self : EditorState) -> Unit {
   self.marked_sel_start = 0
   self.marked_sel_end = 0
   self.upstream = -1
+  self.invalidate_layout()
   self.sync_signals()
 }
 
 /// Visible text including active IME `marked` composition spliced at `caret`.
 pub fn EditorState::display_text(self : EditorState) -> String {
-  let raw = if self.marked.length() == 0 {
-    self.text
-  } else {
-    str_slice(self.text, 0, self.caret) + self.marked + str_slice(self.text, self.caret, self.text.length())
-  }
+  let raw = self.raw_display_text()
   if !self.config.secret {
     return raw
   }
@@ -578,11 +649,12 @@ pub fn EditorState::display_text(self : EditorState) -> String {
 
 /// Caret byte offset within `display_text()`.
 pub fn EditorState::display_caret(self : EditorState) -> Int {
-  if self.marked.length() == 0 {
+  let raw_off = if self.marked.length() == 0 {
     self.caret
   } else {
     self.caret + self.marked_sel_end
   }
+  self.to_display_off(raw_off)
 }
 
 /// Set or clear the decorative syntax/mention coloring callback.
@@ -645,6 +717,7 @@ fn EditorState::delete_selection_raw(self : EditorState) -> Bool {
   self.anchor = lo
   self.caret = lo
   self.look_cache_valid = false
+  self.invalidate_layout()
   true
 }
 
@@ -668,13 +741,18 @@ fn EditorState::insert_raw(self : EditorState, ins : String) -> Unit {
   self.caret = self.caret + to_insert.length()
   self.anchor = self.caret
   self.look_cache_valid = false
+  self.invalidate_layout()
 }
 
 /// Insert text at current caret/selection with undo coalescing.
 pub fn EditorState::insert_text(self : EditorState, s : String, now~ : Double = 0.0) -> Unit {
+  let had_marked = self.marked.length() > 0
   self.marked = ""
   self.marked_sel_start = 0
   self.marked_sel_end = 0
+  if had_marked {
+    self.invalidate_layout()
+  }
   let before_text = self.text
   let before_anchor = self.anchor
   let before_caret = self.caret
@@ -701,9 +779,13 @@ pub fn EditorState::backspace(
   line~ : Bool = false,
   now~ : Double = 0.0,
 ) -> Unit {
+  let had_marked = self.marked.length() > 0
   self.marked = ""
   self.marked_sel_start = 0
   self.marked_sel_end = 0
+  if had_marked {
+    self.invalidate_layout()
+  }
   let before_text = self.text
   let before_anchor = self.anchor
   let before_caret = self.caret
@@ -721,6 +803,7 @@ pub fn EditorState::backspace(
       self.caret = target
       self.anchor = target
       self.look_cache_valid = false
+      self.invalidate_layout()
     }
   }
   self.preferred_x = -1.0
@@ -745,9 +828,13 @@ pub fn EditorState::delete_forward(
   line~ : Bool = false,
   now~ : Double = 0.0,
 ) -> Unit {
+  let had_marked = self.marked.length() > 0
   self.marked = ""
   self.marked_sel_start = 0
   self.marked_sel_end = 0
+  if had_marked {
+    self.invalidate_layout()
+  }
   let before_text = self.text
   let before_anchor = self.anchor
   let before_caret = self.caret
@@ -764,6 +851,7 @@ pub fn EditorState::delete_forward(
       self.text = str_slice(self.text, 0, self.caret) + str_slice(self.text, target, self.text.length())
       self.anchor = self.caret
       self.look_cache_valid = false
+      self.invalidate_layout()
     }
   }
   self.preferred_x = -1.0
@@ -823,9 +911,13 @@ pub fn EditorState::paste(self : EditorState, s : String, now~ : Double = 0.0) -
     self.pasted = Some(s)
     return false
   }
+  let had_marked = self.marked.length() > 0
   self.marked = ""
   self.marked_sel_start = 0
   self.marked_sel_end = 0
+  if had_marked {
+    self.invalidate_layout()
+  }
   let before_text = self.text
   let before_anchor = self.anchor
   let before_caret = self.caret
@@ -1049,14 +1141,15 @@ fn EditorState::line_index_of(self : EditorState, pos : Int, up : Bool) -> Int {
   nlines - 1
 }
 
-/// Visual position `(x, y, line, height)` of UTF-8 byte offset `pos`.
+/// Visual position `(x, y, line, height)` of UTF-8 byte offset `pos` (in `text` / `raw_display_text()`).
 pub fn EditorState::caret_pos(self : EditorState, pos : Int) -> CaretPos {
   self.ensure_lines()
   let src = self.display_text()
-  let clamped = snap_to_grapheme(src, iclamp(pos, 0, src.length()))
-  let up = clamped == self.caret && self.caret_is_upstream()
-  let idx = self.line_index_of(clamped, up)
+  let disp_pos = self.to_display_off(pos)
+  let up = pos == self.caret && self.caret_is_upstream()
+  let idx = self.line_index_of(disp_pos, up)
   let ln = self.lines[idx]
+  let clamped = iclamp(disp_pos, ln.byte_start, ln.byte_end)
   let prefix = str_slice(src, ln.byte_start, clamped)
   let x = measure_with(self.last_measure, prefix)
   CaretPos::{ x, y: ln.y, line: idx, height: ln.height }
@@ -1097,7 +1190,7 @@ fn EditorState::offset_on_line(self : EditorState, line_idx : Int, target_x : Do
   (ln.byte_end, is_soft_end)
 }
 
-/// Hit-test `(x, y)` to a UTF-8 grapheme byte offset and upstream flag.
+/// Hit-test `(x, y)` to a UTF-8 grapheme byte offset (in `text`) and upstream flag.
 pub fn EditorState::hit_test_with_upstream(self : EditorState, x : Double, y : Double) -> (Int, Bool) {
   self.ensure_lines()
   let nlines = self.lines.length()
@@ -1118,7 +1211,8 @@ pub fn EditorState::hit_test_with_upstream(self : EditorState, x : Double, y : D
     }
     idx = found
   }
-  self.offset_on_line(idx, x)
+  let (disp_off, up) = self.offset_on_line(idx, x)
+  (self.from_display_off(disp_off), up)
 }
 
 /// Hit-test `(x, y)` to the nearest UTF-8 grapheme byte offset.
@@ -1132,11 +1226,13 @@ pub fn EditorState::selection_rects(
   color~ : Int64 = paint::color_i64(0x0A84, 0xFF40),
 ) -> Array[paint::Rect] {
   let out : Array[paint::Rect] = []
-  let (lo, hi) = self.selection_range()
-  if lo >= hi {
+  let (raw_lo, raw_hi) = self.selection_range()
+  if raw_lo >= raw_hi {
     return out
   }
   self.ensure_lines()
+  let lo = self.to_display_off(raw_lo)
+  let hi = self.to_display_off(raw_hi)
   let src = self.display_text()
   for i in 0..<self.lines.length() {
     let ln = self.lines[i]
@@ -1168,16 +1264,16 @@ fn EditorState::visual_line_start_at(self : EditorState, pos : Int, up : Bool) -
   if self.lines.length() == 0 {
     return paragraph_start(self.text, pos)
   }
-  let idx = self.line_index_of(pos, up)
-  self.lines[idx].byte_start
+  let idx = self.line_index_of(self.to_display_off(pos), up)
+  self.from_display_off(self.lines[idx].byte_start)
 }
 
 fn EditorState::visual_line_end_at(self : EditorState, pos : Int, up : Bool) -> Int {
   if self.lines.length() == 0 {
     return paragraph_end(self.text, pos)
   }
-  let idx = self.line_index_of(pos, up)
-  self.lines[idx].byte_end
+  let idx = self.line_index_of(self.to_display_off(pos), up)
+  self.from_display_off(self.lines[idx].byte_end)
 }
 
 // ── Caret Movement ───────────────────────────────────────────────────────────────────────────
@@ -1255,8 +1351,8 @@ fn EditorState::move_vertical(self : EditorState, delta : Int, extend : Bool) ->
   } else if target_line >= nlines {
     self.move_to(self.text.length(), extend, false)
   } else {
-    let (off, up) = self.offset_on_line(target_line, self.preferred_x)
-    self.move_to(off, extend, up)
+    let (disp_off, up) = self.offset_on_line(target_line, self.preferred_x)
+    self.move_to(self.from_display_off(disp_off), extend, up)
   }
 }
 
@@ -1281,10 +1377,10 @@ pub fn EditorState::move_line_end(self : EditorState, extend~ : Bool = false) ->
     self.move_to(paragraph_end(self.text, self.caret), extend, false)
     return
   }
-  let idx = self.line_index_of(self.caret, up)
+  let idx = self.line_index_of(self.to_display_off(self.caret), up)
   let ln = self.lines[idx]
   let is_soft = !ln.hard_break && idx + 1 < self.lines.length() && self.lines[idx + 1].byte_start == ln.byte_end
-  self.move_to(ln.byte_end, extend, is_soft)
+  self.move_to(self.from_display_off(ln.byte_end), extend, is_soft)
 }
 
 pub fn EditorState::move_doc_start(self : EditorState, extend~ : Bool = false) -> Unit {
@@ -1320,6 +1416,7 @@ pub fn EditorState::undo(self : EditorState, now~ : Double = 0.0) -> Bool {
       self.preferred_x = -1.0
       self.upstream = -1
       self.look_cache_valid = false
+      self.invalidate_layout()
       self.sync_signals()
       true
     }
@@ -1340,6 +1437,7 @@ pub fn EditorState::redo(self : EditorState, now~ : Double = 0.0) -> Bool {
       self.preferred_x = -1.0
       self.upstream = -1
       self.look_cache_valid = false
+      self.invalidate_layout()
       self.sync_signals()
       true
     }
