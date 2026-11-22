@@ -54,7 +54,7 @@ static const char *VS =
     "layout(location=14) in vec4 a_fadex;\n"
     "uniform vec2 u_vp;\n"
     "uniform vec4 u_gb;\n"
-    "out vec2 v_pos; out vec2 v_cpos;\n"
+    "flat out vec4 v_rot;\n"
     "flat out vec4 v_rect; flat out vec4 v_p; flat out vec4 v_color; flat out vec4 v_c2; flat out vec4 v_clip; flat out vec4 v_pad;\n"
     "flat out vec4 v_rc; flat out vec4 v_rs; flat out vec4 v_rr; flat out vec4 v_oclip; flat out vec4 v_orc; flat out vec4 v_ors;\n"
     "// how far each pixel is into its fades (scene.mbt 52-59: from its left, top, right, foot; 1 and past: whole), worked\n"
@@ -73,9 +73,16 @@ static const char *VS =
     "  // turned (scene.mbt 32-35): drawn turned about its point, everything of how in its own place (v_pos), its clip\n"
     "  // there too or (35: one from outside what turned) where it is drawn (v_cpos)\n"
     "  vec2 at = pos;\n"
-    "  if (a_rot.x != 0.0) { vec2 d = pos - a_rot.yz; float c = cos(a_rot.x), s = sin(a_rot.x); at = a_rot.yz + vec2(c * d.x - s * d.y, s * d.x + c * d.y); }\n"
+    "  vec4 vrot = vec4(0.0);\n"
+    "  if (a_rot.x != 0.0) {\n"
+    "    float c = cos(a_rot.x), s = sin(a_rot.x);\n"
+    "    vec2 d = pos - a_rot.yz;\n"
+    "    at = a_rot.yz + vec2(c * d.x - s * d.y, s * d.x + c * d.y);\n"
+    "    float k = a_rot.w > 0.5 ? 2.0 : 1.0;\n"
+    "    vrot = vec4(c * k, s * k, a_rot.yz);\n"
+    "  }\n"
     "  gl_Position = vec4(at.x / u_vp.x * 2.0 - 1.0, 1.0 - at.y / u_vp.y * 2.0, 0.0, 1.0);\n"
-    "  v_pos = pos; v_cpos = a_rot.w > 0.5 ? at : pos; v_rect = a_rect; v_p = a_p; v_color = a_color; v_c2 = a_c2; v_clip = a_clip; v_pad = a_pad; v_rc = a_rc; v_rs = a_rs; v_rr = a_rr;\n"
+    "  v_rot = vrot; v_rect = a_rect; v_p = a_p; v_color = a_color; v_c2 = a_c2; v_clip = a_clip; v_pad = a_pad; v_rc = a_rc; v_rs = a_rs; v_rr = a_rr;\n"
     "  if (kind == 4 && a_pad.z > 0.5) v_pad.x = a_rot.w;\n"
     "  // (a glyph's p.x, which it has no use for: how it is turned, for its texels taken whole where it is not)\n"
     "  if (kind == 1 || kind == 3 || kind == 7) v_p.x = a_rot.x;\n"
@@ -90,11 +97,12 @@ static const char *FS =
     "#version 300 es\n"
     "precision highp float;\n"
     "precision highp int;\n"
-    "in vec2 v_pos; in vec2 v_cpos;\n"
+    "flat in vec4 v_rot;\n"
     "flat in vec4 v_rect; flat in vec4 v_p; flat in vec4 v_color; flat in vec4 v_c2; flat in vec4 v_clip; flat in vec4 v_pad;\n"
     "flat in vec4 v_rc; flat in vec4 v_rs; flat in vec4 v_rr; flat in vec4 v_oclip; flat in vec4 v_orc; flat in vec4 v_ors;\n"
     "in vec4 v_ramp;\n"
     "uniform float u_scale;\n"
+    "uniform float u_top;\n"
     "uniform sampler2D u_atlas;\n"
     "uniform sampler2D u_catlas;\n"
     "uniform sampler2D u_img;\n"
@@ -476,7 +484,15 @@ static const char *FS =
     "}\n"
     "// cut to its clip: a rect's, hard; a rounded one's, covered as edges are\n"
     "void main() {\n"
-    "  vec2 p = v_pos, cp = v_cpos;\n"
+    "  vec2 at_p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale;\n"
+    "  vec2 p = at_p, cp = at_p;\n"
+    "  float rl = dot(v_rot.xy, v_rot.xy);\n"
+    "  if (rl > 0.5) {\n"
+    "    vec2 cs = rl > 2.0 ? v_rot.xy * 0.5 : v_rot.xy;\n"
+    "    vec2 d = at_p - v_rot.zw;\n"
+    "    p = v_rot.zw + vec2(cs.x * d.x + cs.y * d.y, -cs.y * d.x + cs.x * d.y);\n"
+    "    cp = rl > 2.0 ? at_p : p;\n"
+    "  }\n"
     "  float cover = 1.0;\n"
     "  if (max(max(v_rc.x, v_rc.y), max(v_rc.z, v_rc.w)) > 0.0) {\n"
     "    cover = clip_cover(cp, v_clip, v_rc, v_rs, u_scale);\n"
@@ -511,14 +527,14 @@ static const char *FS_RECT =
     "#version 300 es\n"
     "precision highp float;\n"
     "precision highp int;\n"
-    "in vec2 v_pos;\n"
     "flat in vec4 v_rect;\n"
     "flat in vec4 v_color;\n"
     "flat in vec4 v_clip;\n"
     "uniform float u_scale;\n"
+    "uniform float u_top;\n"
     "out vec4 o;\n"
     "void main() {\n"
-    "  vec2 p = v_pos;\n"
+    "  vec2 p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale;\n"
     "  if (p.x < v_clip.x || p.y < v_clip.y || p.x > v_clip.z || p.y > v_clip.w) discard;\n"
     "  vec2 hs = v_rect.zw * 0.5;\n"
     "  vec2 q = abs(p - (v_rect.xy + hs)) - hs;\n"
@@ -589,7 +605,7 @@ static GLuint vao, vbo, atlas, catlas, post;
 static GLuint prog_flat;
 static GLint uf_vp;
 static GLuint prog_rect;
-static GLint ur_vp = -1, ur_scale = -1;
+static GLint ur_vp = -1, ur_scale = -1, ur_top = -1;
 static GLint pu_src, pu_a, pu_b, pu_c;
 
 static int fast_rect_enabled(void) {
@@ -621,7 +637,7 @@ static int is_simple_rect(const float *f, int32_t i) {
 static int has_own_prog(int kind) { return (kind >= 0 && kind <= 4) || kind == 10 || kind == 11; }
 typedef struct {
   GLuint p;
-  GLint vp, scale, map, uvc, gb, shape, rad, n, glight;
+  GLint vp, scale, top, map, uvc, gb, shape, rad, n, glight;
   unsigned gen;
 } kprog;
 static kprog progs[MB_KINDS + 1];
@@ -690,6 +706,7 @@ static kprog make_prog(GLuint vs, int kind) {
   glDeleteShader(fs);
   k.vp = glGetUniformLocation(k.p, "u_vp");
   k.scale = glGetUniformLocation(k.p, "u_scale");
+  k.top = glGetUniformLocation(k.p, "u_top");
   k.map = glGetUniformLocation(k.p, "u_map");
   k.uvc = glGetUniformLocation(k.p, "u_uvc");
   k.gb = glGetUniformLocation(k.p, "u_gb");
@@ -729,10 +746,11 @@ static void gl_setup(void) {
   if (rok) {
     ur_vp = glGetUniformLocation(prog_rect, "u_vp");
     ur_scale = glGetUniformLocation(prog_rect, "u_scale");
+    ur_top = glGetUniformLocation(prog_rect, "u_top");
   } else {
     glDeleteProgram(prog_rect);
     prog_rect = 0;
-    ur_vp = ur_scale = -1;
+    ur_vp = ur_scale = ur_top = -1;
   }
   glDeleteShader(vs);
   segs_tex = 0;
@@ -1535,6 +1553,7 @@ static void use_prog(int kind) {
   k->gen = prog_gen;
   glUniform2f(k->vp, (float)cur_w, (float)cur_h);
   glUniform1f(k->scale, (float)cur_scale);
+  glUniform1f(k->top, (float)(vy0 + vhp));
   glUniform4fv(k->map, 1, gmap);
   glUniform4fv(k->uvc, 1, guvc);
   glUniform4fv(k->gb, 1, ggb);
@@ -2233,6 +2252,7 @@ static void draw_into(GLuint fb, int part) {
       }
       glUniform2f(ur_vp, (float)cur_w, (float)cur_h);
       glUniform1f(ur_scale, (float)cur_scale);
+      glUniform1f(ur_top, (float)(vy0 + vhp));
     } else {
       use_prog(own ? kind : -1);
     }
