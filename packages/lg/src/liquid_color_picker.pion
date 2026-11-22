@@ -1,0 +1,754 @@
+// HSVA custom color picker with 2D saturation/value canvas, 6-stop hue bar,
+// checkerboard alpha bar, and flat Hex / Opacity text inputs.
+// Zero internal Glass::liquid and zero custom shaders so it composes safely inside
+// liquid_popover_node and liquid_panel_node across all GPU backends.
+
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+// ---------------------------------------------------------------------------
+// Color conversion & formatting utilities (RGBA8888: 0xRRGGBBAAL)
+// ---------------------------------------------------------------------------
+
+/// Convert an RGBA8888 color (`0xRRGGBBAAL`) to `(h, s, v, a)` with `h ∈ [0, 360)` and `s, v, a ∈ [0, 1]`.
+pub fn rgba_to_hsva(c : Int64) -> (Double, Double, Double, Double) {
+  let r = ((c >> 24) & 0xFFL).to_double() / 255.0
+  let g = ((c >> 16) & 0xFFL).to_double() / 255.0
+  let b = ((c >> 8) & 0xFFL).to_double() / 255.0
+  let a = (c & 0xFFL).to_double() / 255.0
+  let max_c = dmax(r, dmax(g, b))
+  let min_c = dmin(r, dmin(g, b))
+  let delta = max_c - min_c
+  let v = max_c
+  let s = if max_c <= 0.0 { 0.0 } else { delta / max_c }
+  let mut h = if delta <= 0.0 {
+    0.0
+  } else if max_c == r {
+    60.0 * ((g - b) / delta)
+  } else if max_c == g {
+    60.0 * ((b - r) / delta + 2.0)
+  } else {
+    60.0 * ((r - g) / delta + 4.0)
+  }
+  if h < 0.0 {
+    h = h + 360.0
+  }
+  if h >= 360.0 {
+    h = h - 360.0
+  }
+  (h, s, v, a)
+}
+
+/// Convert HSVA (`h` in degrees, `s, v, a ∈ [0, 1]`) to RGBA8888 (`0xRRGGBBAAL`).
+pub fn hsva_to_rgba(h : Double, s : Double, v : Double, a : Double) -> Int64 {
+  let mut hh = h - (h / 360.0).floor() * 360.0
+  if hh < 0.0 {
+    hh = hh + 360.0
+  }
+  if hh >= 360.0 {
+    hh = 0.0
+  }
+  let ss = clamp(s, 0.0, 1.0)
+  let vv = clamp(v, 0.0, 1.0)
+  let aa = clamp(a, 0.0, 1.0)
+  let c = vv * ss
+  let sector = hh / 60.0
+  let x = c * (1.0 - (sector - 2.0 * (sector / 2.0).floor() - 1.0).abs())
+  let m = vv - c
+  let (r1, g1, b1) = if hh < 60.0 {
+    (c, x, 0.0)
+  } else if hh < 120.0 {
+    (x, c, 0.0)
+  } else if hh < 180.0 {
+    (0.0, c, x)
+  } else if hh < 240.0 {
+    (0.0, x, c)
+  } else if hh < 300.0 {
+    (x, 0.0, c)
+  } else {
+    (c, 0.0, x)
+  }
+  let ch = fn(u : Double) -> Int64 { (clamp(u, 0.0, 1.0) * 255.0).round().to_int64() }
+  (ch(r1 + m) << 24) | (ch(g1 + m) << 16) | (ch(b1 + m) << 8) | ch(aa)
+}
+
+fn cp_is_space(cu : Int) -> Bool {
+  cu == 32 || cu == 9 || cu == 10 || cu == 13
+}
+
+fn cp_hex_nibble(cu : Int) -> Int {
+  if cu >= 48 && cu <= 57 {
+    cu - 48
+  } else if cu >= 65 && cu <= 70 {
+    cu - 65 + 10
+  } else if cu >= 97 && cu <= 102 {
+    cu - 97 + 10
+  } else {
+    -1
+  }
+}
+
+fn cp_trimmed_hex_digits(raw : String) -> Option[Array[Int]] {
+  let n = raw.length()
+  let mut lo = 0
+  while lo < n && cp_is_space(raw.code_unit_at(lo)) {
+    lo += 1
+  }
+  let mut hi = n
+  while hi > lo && cp_is_space(raw.code_unit_at(hi - 1)) {
+    hi -= 1
+  }
+  if lo < hi && raw.code_unit_at(lo) == 35 {
+    lo += 1
+  }
+  let count = hi - lo
+  if count != 3 && count != 6 && count != 8 {
+    return None
+  }
+  let digits : Array[Int] = []
+  let mut i = lo
+  while i < hi {
+    let d = cp_hex_nibble(raw.code_unit_at(i))
+    if d < 0 {
+      return None
+    }
+    digits.push(d)
+    i += 1
+  }
+  Some(digits)
+}
+
+/// Parse a hex color string (`#RGB`, `#RRGGBB`, `#RRGGBBAA`, optional `#`, trimmed, case-insensitive)
+/// into RGBA8888 (`0xRRGGBBAAL`). 3- and 6-digit inputs use `fallback_alpha` (clamped to `0..255`).
+pub fn parse_hex_color(raw : String, fallback_alpha~ : Int = 255) -> Option[Int64] {
+  let digits = match cp_trimmed_hex_digits(raw) {
+    Some(ds) => ds
+    None => { return None }
+  }
+  let fa = if fallback_alpha < 0 {
+    0
+  } else if fallback_alpha > 255 {
+    255
+  } else {
+    fallback_alpha
+  }
+  let len = digits.length()
+  if len == 3 {
+    let r = ((digits[0] << 4) | digits[0]).to_int64()
+    let g = ((digits[1] << 4) | digits[1]).to_int64()
+    let b = ((digits[2] << 4) | digits[2]).to_int64()
+    Some((r << 24) | (g << 16) | (b << 8) | fa.to_int64())
+  } else if len == 6 {
+    let r = ((digits[0] << 4) | digits[1]).to_int64()
+    let g = ((digits[2] << 4) | digits[3]).to_int64()
+    let b = ((digits[4] << 4) | digits[5]).to_int64()
+    Some((r << 24) | (g << 16) | (b << 8) | fa.to_int64())
+  } else {
+    let r = ((digits[0] << 4) | digits[1]).to_int64()
+    let g = ((digits[2] << 4) | digits[3]).to_int64()
+    let b = ((digits[4] << 4) | digits[5]).to_int64()
+    let a = ((digits[6] << 4) | digits[7]).to_int64()
+    Some((r << 24) | (g << 16) | (b << 8) | a)
+  }
+}
+
+fn cp_hex_char(v : Int) -> String {
+  let table : Array[String] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"]
+  let idx = if v < 0 { 0 } else if v > 15 { 15 } else { v }
+  table[idx]
+}
+
+fn cp_hex_byte(b : Int) -> String {
+  cp_hex_char((b >> 4) & 0xF) + cp_hex_char(b & 0xF)
+}
+
+/// Format an RGBA8888 color as uppercase `"#RRGGBB"`.
+pub fn format_hex_color(c : Int64) -> String {
+  let r = ((c >> 24) & 0xFFL).to_int()
+  let g = ((c >> 16) & 0xFFL).to_int()
+  let b = ((c >> 8) & 0xFFL).to_int()
+  "#" + cp_hex_byte(r) + cp_hex_byte(g) + cp_hex_byte(b)
+}
+
+/// Format an RGBA8888 color's alpha channel as a rounded integer percentage string (`"0"`..`"100"`).
+pub fn format_alpha_percent(c : Int64) -> String {
+  let a = (c & 0xFFL).to_double() / 255.0
+  let pct = clamp((a * 100.0).round(), 0.0, 100.0).to_int()
+  pct.to_string()
+}
+
+fn cp_parse_alpha_percent(raw : String) -> Option[Int] {
+  let n = raw.length()
+  let mut lo = 0
+  while lo < n && cp_is_space(raw.code_unit_at(lo)) {
+    lo += 1
+  }
+  let mut hi = n
+  while hi > lo && cp_is_space(raw.code_unit_at(hi - 1)) {
+    hi -= 1
+  }
+  if hi > lo && raw.code_unit_at(hi - 1) == 37 {
+    hi -= 1
+    while hi > lo && cp_is_space(raw.code_unit_at(hi - 1)) {
+      hi -= 1
+    }
+  }
+  if lo >= hi {
+    return None
+  }
+  let mut acc = 0
+  let mut i = lo
+  while i < hi {
+    let cu = raw.code_unit_at(i)
+    if cu < 48 || cu > 57 {
+      return None
+    }
+    acc = acc * 10 + (cu - 48)
+    if acc > 1000 {
+      acc = 1000
+    }
+    i += 1
+  }
+  Some(if acc > 100 { 100 } else { acc })
+}
+
+// ---------------------------------------------------------------------------
+// Visual helpers (checkerboard & hairlines)
+// ---------------------------------------------------------------------------
+
+fn cp_hairline() -> Int64 {
+  if is_dark() { 0xFFFFFF29L } else { 0x0000001CL }
+}
+
+fn cp_checker_light() -> Int64 {
+  if is_dark() { 0x2C2C2EFFL } else { 0xFFFFFFFFL }
+}
+
+fn cp_checker_dark() -> Int64 {
+  if is_dark() { 0x48484CFFL } else { 0xD1D1D6FFL }
+}
+
+fn cp_checker_shapes(w : Double, h : Double, cell : Double, sq_color : Int64) -> Array[paint::Shape] {
+  let outlines : Array[(Array[Double], Bool)] = []
+  let cols = (w / cell).ceil().to_int()
+  let rows = (h / cell).ceil().to_int()
+  let mut r = 0
+  while r < rows {
+    let y0 = r.to_double() * cell
+    let y1 = dmin(h, y0 + cell)
+    let mut c = 0
+    while c < cols {
+      if (r + c) % 2 == 1 {
+        let x0 = c.to_double() * cell
+        let x1 = dmin(w, x0 + cell)
+        outlines.push(([x0, y0, x1, y0, x1, y1, x0, y1], true))
+      }
+      c += 1
+    }
+    r += 1
+  }
+  if outlines.length() == 0 {
+    []
+  } else {
+    [paint::shape_of(outlines, fill=sq_color)]
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main component: liquid_color_picker_node
+// ---------------------------------------------------------------------------
+
+/// HSVA custom color picker with 2D SV canvas, 6-stop hue bar, optional checkerboard
+/// alpha bar, and optional flat Hex / Opacity text inputs.
+/// Contains zero `Glass::liquid` so it embeds safely inside `liquid_popover_node` and `liquid_panel_node`.
+pub fn liquid_color_picker_node(
+  parent : view::View,
+  color : () -> Int64,
+  on_change : (Int64) -> Unit,
+  width~ : Double = 224.0,
+  canvas_height~ : Double = 136.0,
+  show_alpha~ : Bool = true,
+  show_inputs~ : Bool = true,
+  label~ : () -> String = fn() { "Color Picker" },
+  loc~ : String = "",
+) -> view::View {
+  let init_c = signals::untracked(color)
+  let (init_h, init_s, init_v, init_a) = rgba_to_hsva(init_c)
+  let hue_sig = signals::signal(init_h)
+  let sat_sig = signals::signal(init_s)
+  let val_sig = signals::signal(init_v)
+  let alpha_sig = signals::signal(init_a)
+  let last_emitted = ui::ref_new(init_c)
+  let hex_field = ui::Field::new(text=format_hex_color(init_c))
+  let alpha_field = ui::Field::new(text=format_alpha_percent(init_c))
+
+  let current_rgba = fn() -> Int64 {
+    hsva_to_rgba(
+      signals::untracked(fn() { hue_sig.get() }),
+      signals::untracked(fn() { sat_sig.get() }),
+      signals::untracked(fn() { val_sig.get() }),
+      signals::untracked(fn() { alpha_sig.get() }),
+    )
+  }
+
+  let emit_from_hsva = fn(sync_hex : Bool, sync_alpha : Bool) -> Unit {
+    let next_c = current_rgba()
+    last_emitted.v = next_c
+    if sync_hex && !signals::untracked(fn() { hex_field.focused() }) {
+      let next_hex = format_hex_color(next_c)
+      if signals::untracked(fn() { hex_field.text() }) != next_hex {
+        hex_field.set(next_hex)
+      }
+    }
+    if sync_alpha && !signals::untracked(fn() { alpha_field.focused() }) {
+      let next_pct = format_alpha_percent(next_c)
+      if signals::untracked(fn() { alpha_field.text() }) != next_pct {
+        alpha_field.set(next_pct)
+      }
+    }
+    on_change(next_c)
+  }
+
+  let hue_stops : Array[Int64] = [
+    0xFF0000FFL,
+    0xFFFF00FFL,
+    0x00FF00FFL,
+    0x00FFFFFFL,
+    0x0000FFFFL,
+    0xFF00FFFFL,
+    0xFF0000FFL,
+  ]
+
+  parent.box(loc=loc, fn(root : view::View) -> Unit {
+    let _ = root
+    .width(view::Live::Is(Some(width)))
+    .gap(view::Live::Is(10.0))
+    .says(view::Live::By(fn() { Some(view::said(view::Role::Group, label=label())) }))
+
+    root.reacts(at_start=false, color, fn(ext_c : Int64) -> Unit {
+      if ext_c == last_emitted.v {
+        return
+      }
+      last_emitted.v = ext_c
+      let (nh, ns, nv, na) = rgba_to_hsva(ext_c)
+      if ns >= 0.001 && nv >= 0.001 {
+        hue_sig.set(nh)
+      }
+      if nv >= 0.001 {
+        sat_sig.set(ns)
+      }
+      val_sig.set(nv)
+      alpha_sig.set(na)
+      let next_hex = format_hex_color(ext_c)
+      if !signals::untracked(fn() { hex_field.focused() }) && signals::untracked(fn() { hex_field.text() }) != next_hex {
+        hex_field.set(next_hex)
+      }
+      let next_pct = format_alpha_percent(ext_c)
+      if !signals::untracked(fn() { alpha_field.focused() }) && signals::untracked(fn() { alpha_field.text() }) != next_pct {
+        alpha_field.set(next_pct)
+      }
+    })
+
+    // 1. 2D Saturation / Value Canvas
+    let _ = root.box(fn(sv_wrap : view::View) -> Unit {
+      let _ = sv_wrap
+      .width(view::Live::Is(Some(width)))
+      .height(view::Live::Is(Some(canvas_height)))
+      .shrink(view::Live::Is(0.0))
+
+      let _ = sv_wrap.box(fn(sv_grad : view::View) -> Unit {
+        let _ = sv_grad
+        .over(view::Live::Is(true))
+        .radius(view::Live::Is(10.0))
+        .clips(view::Live::Is(true))
+        .ground(view::Live::By(fn() { hsva_to_rgba(hue_sig.get(), 1.0, 1.0, 1.0) }))
+
+        // White horizontal gradient: opaque white at S=0 (left) -> transparent at S=1 (right)
+        let _ = sv_grad.box(fn(wf : view::View) -> Unit {
+          let _ = wf.over(view::Live::Is(true)).fades(view::Live::Is((0.0, 0.0, width, 0.0)))
+          let _ = wf.box(fn(ws : view::View) -> Unit {
+            let _ = ws.over(view::Live::Is(true)).ground(view::Live::Is(0xFFFFFFFFL))
+          })
+        })
+
+        // Black vertical gradient: transparent at V=1 (top) -> solid black at V=0 (bottom)
+        let _ = sv_grad.box(fn(bf : view::View) -> Unit {
+          let _ = bf.over(view::Live::Is(true)).fades(view::Live::Is((0.0, canvas_height, 0.0, 0.0)))
+          let _ = bf.box(fn(bs : view::View) -> Unit {
+            let _ = bs.over(view::Live::Is(true)).ground(view::Live::Is(0x000000FFL))
+          })
+        })
+
+        // Subtle inner hairline
+        let _ = sv_grad.box(fn(bd : view::View) -> Unit {
+          let _ = bd
+          .over(view::Live::Is(true))
+          .points(view::Live::Is(false))
+          .radius(view::Live::Is(10.0))
+          .edge(view::Live::By(fn() { (1.0, cp_hairline()) }))
+        })
+      })
+
+      // Circular SV indicator dot (sibling of clipped gradient layer so edges are never clipped)
+      let _ = sv_wrap.box(fn(dot : view::View) -> Unit {
+        let _ = dot
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(14.0)))
+        .height(view::Live::Is(Some(14.0)))
+        .radius(view::Live::Is(7.0))
+        .ground(view::Live::By(fn() { hsva_to_rgba(hue_sig.get(), sat_sig.get(), val_sig.get(), 1.0) }))
+        .edge(view::Live::Is((2.0, 0xFFFFFFFFL)))
+        .shadow(view::Live::Is((3.0, 1.0, 0x00000055L)))
+        .shadow_outside(view::Live::Is(true))
+        .offset(view::Live::By(fn() { (sat_sig.get() * width - 7.0, (1.0 - val_sig.get()) * canvas_height - 7.0) }))
+      })
+
+      // Interactive SV hit layer
+      let update_sv = fn(d : view::Drag) -> Unit {
+        if d.kind == view::DragIs::Off {
+          return
+        }
+        let ns = clamp(d.x / width, 0.0, 1.0)
+        let nv = clamp(1.0 - d.y / canvas_height, 0.0, 1.0)
+        sat_sig.set(ns)
+        val_sig.set(nv)
+        emit_from_hsva(true, true)
+      }
+      let _ = sv_wrap.box(fn(hit : view::View) -> Unit {
+        let _ = hit
+        .over(view::Live::Is(true))
+        .says(view::Live::Is(Some(view::said(view::Role::Slider, label="Color Saturation Brightness"))))
+        .cursor(view::Live::Is(Some(view::Cursor::Crosshair)))
+        .gesture(0.0, press=update_sv, drag=update_sv)
+      })
+    })
+
+    // 2. Hue Bar (6-segment spectrum)
+    let _ = root.box(fn(hue_row : view::View) -> Unit {
+      let _ = hue_row
+      .width(view::Live::Is(Some(width)))
+      .height(view::Live::Is(Some(20.0)))
+      .shrink(view::Live::Is(0.0))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+
+      let seg_w = width / 6.0
+      let _ = hue_row.box(fn(track : view::View) -> Unit {
+        let _ = track
+        .width(view::Live::Is(Some(width)))
+        .height(view::Live::Is(Some(12.0)))
+        .radius(view::Live::Is(6.0))
+        .clips(view::Live::Is(true))
+
+        let mut k = 0
+        while k < 6 {
+          let sx = k.to_double() * seg_w
+          let sw = if k < 5 { seg_w + 0.5 } else { width - sx }
+          let c0 = hue_stops[k]
+          let c1 = hue_stops[k + 1]
+          let _ = track.box(fn(seg : view::View) -> Unit {
+            let _ = seg
+            .over(view::Live::Is(true))
+            .width(view::Live::Is(Some(sw)))
+            .height(view::Live::Is(Some(12.0)))
+            .offset(view::Live::Is((sx, 0.0)))
+            .ground(view::Live::Is(c0))
+            let _ = seg.box(fn(fade : view::View) -> Unit {
+              let _ = fade.over(view::Live::Is(true)).fades(view::Live::Is((sw, 0.0, 0.0, 0.0)))
+              let _ = fade.box(fn(top : view::View) -> Unit {
+                let _ = top.over(view::Live::Is(true)).ground(view::Live::Is(c1))
+              })
+            })
+          })
+          k += 1
+        }
+
+        let _ = track.box(fn(bd : view::View) -> Unit {
+          let _ = bd
+          .over(view::Live::Is(true))
+          .points(view::Live::Is(false))
+          .radius(view::Live::Is(6.0))
+          .edge(view::Live::By(fn() { (0.5, cp_hairline()) }))
+        })
+      })
+
+      // Hue circular thumb
+      let _ = hue_row.box(fn(thumb : view::View) -> Unit {
+        let _ = thumb
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .width(view::Live::Is(Some(16.0)))
+        .height(view::Live::Is(Some(16.0)))
+        .radius(view::Live::Is(8.0))
+        .ground(view::Live::By(fn() { hsva_to_rgba(hue_sig.get(), 1.0, 1.0, 1.0) }))
+        .edge(view::Live::Is((2.0, 0xFFFFFFFFL)))
+        .shadow(view::Live::Is((3.0, 1.0, 0x00000055L)))
+        .shadow_outside(view::Live::Is(true))
+        .offset(view::Live::By(fn() { (clamp((hue_sig.get() / 360.0) * (width - 16.0), 0.0, width - 16.0), 2.0) }))
+      })
+
+      // Hue hit layer
+      let update_hue = fn(d : view::Drag) -> Unit {
+        if d.kind == view::DragIs::Off {
+          return
+        }
+        let nh = clamp(d.x / width, 0.0, 1.0) * 360.0
+        hue_sig.set(nh)
+        emit_from_hsva(true, true)
+      }
+      let _ = hue_row.box(fn(hit : view::View) -> Unit {
+        let _ = hit
+        .over(view::Live::Is(true))
+        .says(view::Live::Is(Some(view::said(view::Role::Slider, label="Hue"))))
+        .gesture(0.0, press=update_hue, drag=update_hue)
+      })
+    })
+
+    // 3. Alpha Bar (optional)
+    if show_alpha {
+      let _ = root.box(fn(alpha_row : view::View) -> Unit {
+        let _ = alpha_row
+        .width(view::Live::Is(Some(width)))
+        .height(view::Live::Is(Some(20.0)))
+        .shrink(view::Live::Is(0.0))
+        .lies_along(view::Live::Is(view::Lies::Middle))
+
+        let _ = alpha_row.box(fn(track : view::View) -> Unit {
+          let _ = track
+          .width(view::Live::Is(Some(width)))
+          .height(view::Live::Is(Some(12.0)))
+          .radius(view::Live::Is(6.0))
+          .clips(view::Live::Is(true))
+          .ground(view::Live::By(cp_checker_light))
+
+          let _ = track.box(fn(chk : view::View) -> Unit {
+            let _ = chk
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .shapes(view::Live::By(fn() { cp_checker_shapes(width, 12.0, 4.0, cp_checker_dark()) }))
+          })
+
+          let _ = track.box(fn(fade : view::View) -> Unit {
+            let _ = fade.over(view::Live::Is(true)).fades(view::Live::Is((width, 0.0, 0.0, 0.0)))
+            let _ = fade.box(fn(solid : view::View) -> Unit {
+              let _ = solid.over(view::Live::Is(true)).ground(view::Live::By(fn() { hsva_to_rgba(hue_sig.get(), sat_sig.get(), val_sig.get(), 1.0) }))
+            })
+          })
+
+          let _ = track.box(fn(bd : view::View) -> Unit {
+            let _ = bd
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .radius(view::Live::Is(6.0))
+            .edge(view::Live::By(fn() { (0.5, cp_hairline()) }))
+          })
+        })
+
+        // Alpha circular thumb (checkerboard + current RGBA + white ring + outer shadow)
+        let _ = alpha_row.box(fn(thumb : view::View) -> Unit {
+          let _ = thumb
+          .over(view::Live::Is(true))
+          .points(view::Live::Is(false))
+          .width(view::Live::Is(Some(16.0)))
+          .height(view::Live::Is(Some(16.0)))
+          .radius(view::Live::Is(8.0))
+          .shadow(view::Live::Is((3.0, 1.0, 0x00000055L)))
+          .shadow_outside(view::Live::Is(true))
+          .offset(view::Live::By(fn() { (clamp(alpha_sig.get() * (width - 16.0), 0.0, width - 16.0), 2.0) }))
+
+          let _ = thumb.box(fn(inner : view::View) -> Unit {
+            let _ = inner
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .radius(view::Live::Is(8.0))
+            .clips(view::Live::Is(true))
+            .ground(view::Live::By(cp_checker_light))
+            let _ = inner.box(fn(chk : view::View) -> Unit {
+              let _ = chk
+              .over(view::Live::Is(true))
+              .points(view::Live::Is(false))
+              .shapes(view::Live::By(fn() { cp_checker_shapes(16.0, 16.0, 4.0, cp_checker_dark()) }))
+            })
+            let _ = inner.box(fn(tint : view::View) -> Unit {
+              let _ = tint
+              .over(view::Live::Is(true))
+              .points(view::Live::Is(false))
+              .ground(view::Live::By(fn() { hsva_to_rgba(hue_sig.get(), sat_sig.get(), val_sig.get(), alpha_sig.get()) }))
+            })
+          })
+
+          let _ = thumb.box(fn(ring : view::View) -> Unit {
+            let _ = ring
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .radius(view::Live::Is(8.0))
+            .edge(view::Live::Is((2.0, 0xFFFFFFFFL)))
+          })
+        })
+
+        // Alpha hit layer
+        let update_alpha = fn(d : view::Drag) -> Unit {
+          if d.kind == view::DragIs::Off {
+            return
+          }
+          let na = clamp(d.x / width, 0.0, 1.0)
+          alpha_sig.set(na)
+          emit_from_hsva(true, true)
+        }
+        let _ = alpha_row.box(fn(hit : view::View) -> Unit {
+          let _ = hit
+          .over(view::Live::Is(true))
+          .says(view::Live::Is(Some(view::said(view::Role::Slider, label="Alpha"))))
+          .gesture(0.0, press=update_alpha, drag=update_alpha)
+        })
+      })
+    }
+
+    // 4. Hex & Opacity Inputs (optional)
+    if show_inputs {
+      let _ = root.box(fn(inputs_row : view::View) -> Unit {
+        let _ = inputs_row
+        .row(view::Live::Is(true))
+        .gap(view::Live::Is(8.0))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .width(view::Live::Is(Some(width)))
+
+        let _ = inputs_row.box(fn(hex_wrap : view::View) -> Unit {
+          let _ = hex_wrap
+          .grow(view::Live::Is(1.0))
+          .basis(view::Live::Is(Some(0.0)))
+          .min_width(view::Live::Is(Some(0.0)))
+
+          let apply_hex_color = fn(parsed : Int64, normalize : Bool) -> Unit {
+            let (nh, ns, nv, na) = rgba_to_hsva(parsed)
+            if ns >= 0.001 && nv >= 0.001 {
+              hue_sig.set(nh)
+            }
+            if nv >= 0.001 {
+              sat_sig.set(ns)
+            }
+            val_sig.set(nv)
+            alpha_sig.set(na)
+            last_emitted.v = parsed
+            if normalize {
+              let canon = format_hex_color(parsed)
+              if signals::untracked(fn() { hex_field.text() }) != canon {
+                hex_field.set(canon)
+              }
+            }
+            let next_pct = format_alpha_percent(parsed)
+            if !signals::untracked(fn() { alpha_field.focused() }) && signals::untracked(fn() { alpha_field.text() }) != next_pct {
+              alpha_field.set(next_pct)
+            }
+            on_change(parsed)
+          }
+
+          let _ = liquid_text_field_node(
+            hex_wrap,
+            hex_field,
+            placeholder="#000000",
+            height_by=fn() { 28.0 },
+            label=fn() { "Hex Color" },
+            flat=true,
+            radius=8.0,
+            show_label=false,
+            lead=fn(slot : view::View, _ink : () -> Int64) -> Unit {
+              let _ = slot.box(fn(sw : view::View) -> Unit {
+                let _ = sw
+                .width(view::Live::Is(Some(14.0)))
+                .height(view::Live::Is(Some(14.0)))
+                .shrink(view::Live::Is(0.0))
+                .radius(view::Live::Is(7.0))
+                .clips(view::Live::Is(true))
+                .ground(view::Live::By(cp_checker_light))
+                let _ = sw.box(fn(chk : view::View) -> Unit {
+                  let _ = chk
+                  .over(view::Live::Is(true))
+                  .points(view::Live::Is(false))
+                  .shapes(view::Live::By(fn() { cp_checker_shapes(14.0, 14.0, 3.5, cp_checker_dark()) }))
+                })
+                let _ = sw.box(fn(fill : view::View) -> Unit {
+                  let _ = fill
+                  .over(view::Live::Is(true))
+                  .points(view::Live::Is(false))
+                  .ground(view::Live::By(fn() { hsva_to_rgba(hue_sig.get(), sat_sig.get(), val_sig.get(), alpha_sig.get()) }))
+                })
+                let _ = sw.box(fn(bd : view::View) -> Unit {
+                  let _ = bd
+                  .over(view::Live::Is(true))
+                  .points(view::Live::Is(false))
+                  .radius(view::Live::Is(7.0))
+                  .edge(view::Live::By(fn() { (0.5, cp_hairline()) }))
+                })
+              })
+            },
+            edited=fn(s : String) -> Unit {
+              match cp_trimmed_hex_digits(s) {
+                Some(ds) if ds.length() == 6 || ds.length() == 8 => {
+                  let cur_a = (clamp(signals::untracked(fn() { alpha_sig.get() }), 0.0, 1.0) * 255.0).round().to_int()
+                  match parse_hex_color(s, fallback_alpha=cur_a) {
+                    Some(parsed) => apply_hex_color(parsed, false)
+                    None => ()
+                  }
+                }
+                _ => ()
+              }
+            },
+            submitted=fn(s : String) -> Unit {
+              let cur_a = (clamp(signals::untracked(fn() { alpha_sig.get() }), 0.0, 1.0) * 255.0).round().to_int()
+              match parse_hex_color(s, fallback_alpha=cur_a) {
+                Some(parsed) => apply_hex_color(parsed, true)
+                None => hex_field.set(format_hex_color(current_rgba()))
+              }
+            },
+          )
+        })
+
+        if show_alpha {
+          let _ = inputs_row.box(fn(alpha_wrap : view::View) -> Unit {
+            let _ = alpha_wrap
+            .width(view::Live::Is(Some(72.0)))
+            .shrink(view::Live::Is(0.0))
+
+            let _ = liquid_text_field_node(
+              alpha_wrap,
+              alpha_field,
+              placeholder="100",
+              height_by=fn() { 28.0 },
+              label=fn() { "Opacity" },
+              flat=true,
+              radius=8.0,
+              show_label=false,
+              trail=fn(slot : view::View, ink : () -> Int64) -> Unit {
+                let _ = slot.words(view::Live::Is("%"), look=words_at(ctrl_type_caption)).ink(view::Live::By(ink))
+              },
+              edited=fn(s : String) -> Unit {
+                match cp_parse_alpha_percent(s) {
+                  Some(pct) => {
+                    alpha_sig.set(pct.to_double() / 100.0)
+                    emit_from_hsva(true, false)
+                  }
+                  None => ()
+                }
+              },
+              submitted=fn(s : String) -> Unit {
+                match cp_parse_alpha_percent(s) {
+                  Some(pct) => {
+                    alpha_sig.set(pct.to_double() / 100.0)
+                    let next_c = current_rgba()
+                    last_emitted.v = next_c
+                    alpha_field.set(format_alpha_percent(next_c))
+                    on_change(next_c)
+                  }
+                  None => alpha_field.set(format_alpha_percent(current_rgba()))
+                }
+              },
+            )
+          })
+        }
+      })
+    }
+  })
+}

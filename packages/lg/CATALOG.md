@@ -263,6 +263,20 @@ let _ = lg::liquid_select_node(page, page, fn() {
 ### 19b. `lg::liquid_swatch_grid_node` & `lg::LiquidSwatch`
 - **适用场景**：基于 `headless::radio_group` 的圆形色板单选网格（选中项带 `2pt` 主题色同心外环 + `2pt` 内缝，`transparent=true` 项带浅底与红色对角矢量斜杠，无内部 `Glass::liquid`，可直接嵌入 `liquid_popover_node` / 工具栏弹层）。
 - **签名**：`pub struct LiquidSwatch`（`LiquidSwatch::new(color, label, transparent~=false)`）；`pub fn liquid_swatch_grid_node(parent : view::View, swatches : () -> Array[LiquidSwatch], selected : () -> Int, on_select : (Int) -> Unit, columns~ : Int = 6, swatch_size~ : Double = 24.0, gap~ : Double = 8.0, label~ : () -> String = fn() { "Color Swatches" }, loc~ : String = "") -> view::View`
+
+### 19c. `lg::liquid_color_picker_node`
+- **适用场景**：标准 HSVA 自定义取色器（2D 饱和度/明度色盘 + 6 段光谱色相条 + 矢量棋盘格透明度条 + 平嵌 Hex/Opacity 输入框；全部零 `Glass::liquid`、零自定义着色器，可直接安全嵌入 `liquid_popover_node` / `liquid_panel_node` 并通过 `assert_no_nested_glass`）。
+- **色值工具**：`pub fn rgba_to_hsva(c : Int64) -> (Double, Double, Double, Double)`、`pub fn hsva_to_rgba(h : Double, s : Double, v : Double, a : Double) -> Int64`、`pub fn parse_hex_color(raw : String, fallback_alpha~ : Int = 255) -> Option[Int64]`、`pub fn format_hex_color(c : Int64) -> String`、`pub fn format_alpha_percent(c : Int64) -> String`。
+- **签名**：`pub fn liquid_color_picker_node(parent : view::View, color : () -> Int64, on_change : (Int64) -> Unit, width~ : Double = 224.0, canvas_height~ : Double = 136.0, show_alpha~ : Bool = true, show_inputs~ : Bool = true, label~ : () -> String = fn() { "Color Picker" }, loc~ : String = "") -> view::View`
+```pion
+let _ = lg::liquid_color_picker_node(
+  body,
+  fn() { color.get() },
+  fn(c) { color.set(c) },
+  width=224.0,
+  canvas_height=136.0,
+)
+```
 ```pion
 let _ = lg::liquid_segmented_node(page, fn() { ["Day", "Week", "Month"] }, fn() { seg.get() }, fn(i) { seg.set(i) }, width=300.0)
 ```
@@ -285,9 +299,9 @@ let _ = lg::liquid_chip_node(page, fn() { "Metal" }, fn() { sel.set(!sel.get()) 
 ## 五、表单输入与反馈（Inputs & Feedback）
 
 ### 21. `lg::liquid_text_field_node` & `lg::liquid_search_bar_node`
-- **适用场景**：单层液态玻璃文本输入框（支持清除按钮与标签）与常驻搜索栏。
+- **适用场景**：单层液态玻璃文本输入框（支持 `flat=true` 平嵌零玻璃凹槽、`radius` 自定义圆角、`show_label=false` 隐藏可见标题保留无障碍标签、`lead`/`trail` 首尾插槽与清除按钮）与常驻搜索栏。
 - **签名**：
-  - `pub fn liquid_text_field_node(parent : view::View, field : ui::Field, placeholder~ : String = "", label~ : () -> String = fn() { "" }, clearable~ : Bool = false, disabled~ : () -> Bool = fn() { false }, loc~ : String = "") -> view::View`
+  - `pub fn liquid_text_field_node(parent : view::View, field : ui::Field, placeholder~ : String = "", placeholder_by? : () -> String, height_by? : () -> Double, label~ : () -> String = fn() { "" }, flat~ : Bool = false, radius? : Double, show_label~ : Bool = true, lead? : (view::View, () -> Int64) -> Unit, trail? : (view::View, () -> Int64) -> Unit, clearable~ : Bool = false, disabled~ : () -> Bool = fn() { false }, loc~ : String = "") -> view::View`
   - `pub fn liquid_search_bar_node(parent : view::View, field : ui::Field, placeholder~ : String = "Search", label~ : () -> String = fn() { "Search" }, loc~ : String = "") -> view::View`
 ```pion
 let field = ui::Field::new(text="")
