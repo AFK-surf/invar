@@ -21,6 +21,7 @@
 void mb_host_present(double *buf, int32_t count, double r, double g, double b);
 int32_t mb_render_drawn_pixels(int32_t x, int32_t y, int32_t w, int32_t h, moonbit_bytes_t out);
 void mb_host_render_dirty(double x, double y, double w, double h);
+int mb_render_snapshot_transparent(const char *path);
 
 static char *utf8_of(moonbit_string_t s) {
   char *out = g_utf16_to_utf8((const gunichar2 *)s, Moonbit_array_length(s), NULL, NULL, NULL);
@@ -251,11 +252,21 @@ int32_t mbf_snapshot(moonbit_string_t path) {
   return ok;
 }
 
-// A picture over a transparent ground: this renderer clears its frames opaque (gles_render.h), so there is none yet.
+// A picture over a transparent ground: drawn with over_other=1 so the framebuffer clears to (0, 0, 0, 0).
 int32_t mbf_snapshot_transparent(moonbit_string_t path) {
-  (void)path;
-  fprintf(stderr, "film: no transparent picture on Linux yet (MBUI_PICTURE_TRANSPARENT): its renderer draws opaque\n");
-  return 0;
+  char *destination = utf8_of(path);
+  char *dir = g_path_get_dirname(destination), *base = g_path_get_basename(destination);
+  char *name = g_strdup_printf(".%s.%d.%08x.tmp.png", base, (int)getpid(), g_random_int());
+  char *temporary = g_build_filename(dir, name, NULL);
+  int ok = mb_render_snapshot_transparent(temporary);
+  if (ok && rename(temporary, destination) != 0) ok = 0;
+  if (!ok) unlink(temporary);
+  g_free(dir);
+  g_free(base);
+  g_free(name);
+  g_free(temporary);
+  g_free(destination);
+  return ok;
 }
 
 // ---- the process ----

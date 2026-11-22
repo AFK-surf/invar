@@ -192,6 +192,19 @@ int mb_render_snapshot(const char *path) {
   return ok;
 }
 
+int mb_render_snapshot_transparent(const char *path) {
+  if (!ready || kept_count <= 0) return 0;
+  GLint was = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &was);
+  int prev_over = over_other;
+  over_other = 1;
+  draw_kept_read();
+  over_other = prev_over;
+  int ok = gl_png(path, read_fb);
+  glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)was);
+  return ok;
+}
+
 // ---------------------------------------------------------------------------
 // A video's frame made a picture (linux.h's mb_yuv: the streams' H.264, the players' frames): its planes uploaded as
 // the decoder gave them (a byte a texel: Y and I420's U and V as R8, NV12's U and V together as RG8), then drawn into
@@ -408,23 +421,34 @@ double mb_host_now(void);
 void mb_host_present(double *buf, int32_t count, double r, double g, double b);
 
 void mb_render_init_offscreen(double w, double h, double scale) {
-  EGLDisplay d = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
-  if (d == EGL_NO_DISPLAY || !eglInitialize(d, NULL, NULL)) {
-    LOG("mbui-render: no EGL display (surfaceless)");
-    exit(1);
+  static EGLDisplay off_dpy = EGL_NO_DISPLAY;
+  static EGLContext off_ctx = EGL_NO_CONTEXT;
+  if (off_ctx == EGL_NO_CONTEXT) {
+    EGLDisplay d = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
+    if (d == EGL_NO_DISPLAY || !eglInitialize(d, NULL, NULL)) {
+      LOG("mbui-render: no EGL display (surfaceless)");
+      exit(1);
+    }
+    eglBindAPI(EGL_OPENGL_ES_API);
+    static const EGLint want[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE};
+    EGLConfig cfg = NULL;
+    EGLint n = 0;
+    eglChooseConfig(d, want, &cfg, 1, &n);
+    static const EGLint attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE};
+    EGLContext ctx = eglCreateContext(d, n > 0 ? cfg : EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attrs);
+    if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
+      LOG("mbui-render: no OpenGL ES 3 context");
+      exit(1);
+    }
+    off_dpy = d;
+    off_ctx = ctx;
+    mb_render_setup();
+  } else {
+    if (!eglMakeCurrent(off_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, off_ctx)) {
+      LOG("mbui-render: failed to make offscreen EGL context current");
+      exit(1);
+    }
   }
-  eglBindAPI(EGL_OPENGL_ES_API);
-  static const EGLint want[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE};
-  EGLConfig cfg = NULL;
-  EGLint n = 0;
-  eglChooseConfig(d, want, &cfg, 1, &n);
-  static const EGLint attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 0, EGL_NONE};
-  EGLContext ctx = eglCreateContext(d, n > 0 ? cfg : EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attrs);
-  if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
-    LOG("mbui-render: no OpenGL ES 3 context");
-    exit(1);
-  }
-  mb_render_setup();
   gl_offscreen(w, h, scale);
   mb_text_set_scale(scale);
 }

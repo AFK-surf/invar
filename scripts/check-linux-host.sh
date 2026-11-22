@@ -26,6 +26,7 @@ mkdir -p "$OBJ_DIR"
 rm -f "$OBJ_DIR"/*.o "$LIB"
 
 C_SOURCES=(
+  "packages/hostapi/native/wake_bridge.c"
   "packages/host/compat/pion_mb_compat.c"
   "packages/host/native/linux_render.c"
   "packages/host/native/linux_text.c"
@@ -44,7 +45,7 @@ for src in "${C_SOURCES[@]}"; do
   base="$(basename "$src" .c)"
   obj="$OBJ_DIR/${base}.o"
   echo "  CC   $src"
-  if [ "$base" = "pion_mb_compat" ]; then
+  if [ "$base" = "pion_mb_compat" ] || [ "$base" = "wake_bridge" ]; then
     $CC -O2 -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native -c "$src" -o "$obj"
   else
     $CC -O2 -Ipackages/host/compat -Ipackages/host/native $PKG_CFLAGS -c "$src" -o "$obj"
@@ -63,6 +64,13 @@ REQUIRED_SYMS=(
   mb_host_present
   mb_host_shape
   mb_host_glass_light_angle
+  mb_host_wake_now
+  mb_host_wake_now_ptr
+  invar_hostapi_set_native_wake
+  invar_hostapi_call_native_wake
+  mbf_supported
+  mbf_snapshot
+  mbf_open
   mb_render_init_offscreen
   mb_render_present
   mb_render_snapshot
@@ -96,4 +104,8 @@ if [ -n "$PIONC" ]; then
   "$PIONC" check packages/host
   echo "==> Running $PIONC test --package host packages/host (Mesa llvmpipe)"
   LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$PIONC" test --package host packages/host
+  echo "==> Running $PIONC check packages/film"
+  "$PIONC" check packages/film
+  echo "==> Running $PIONC test --package film packages/film (Mesa llvmpipe)"
+  LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$PIONC" test --package film packages/film
 fi

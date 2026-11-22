@@ -602,6 +602,7 @@ static void glass_lost(void);
 static void canvas_lost(void);
 static void blur_layers_lost(void);
 static void blur_layers_free(void);
+static void offscreen_lost(void);
 
 // What the app does not paint left clear, what is under the surface showing (Android's over another app: OverActivity,
 // Native.overOther).
@@ -947,6 +948,7 @@ static void canvas_lost(void) {
   canvas_w = canvas_h = 0;
   canvas_ok = 0;
   blur_layers_lost();
+  offscreen_lost();
 }
 
 // The canvas the surface's frames are drawn into, its size: made again at another size (or once the context is new:
@@ -2053,22 +2055,46 @@ static void draw_into(GLuint fb, int part) {
 // Without the surface (mbui-render, src/render: a frame drawn as on the surface, read back as a PNG): a framebuffer of
 // its own the size the surface would be, drawn into.
 
-static GLuint off_tex;
+static GLuint off_tex, off_fb;
+static int off_pw, off_ph;
+
+static void offscreen_lost(void) {
+  off_tex = off_fb = 0;
+  off_pw = off_ph = 0;
+  read_fb = read_tex = 0;
+  read_w = read_h = 0;
+}
 
 static void gl_offscreen(double w, double h, double scale) {
   offscreen = 1;
   cur_w = w;
   cur_h = h;
   cur_scale = scale;
-  fb_w = (int)floor(w * scale + 0.5);
-  fb_h = (int)floor(h * scale + 0.5);
-  glGenTextures(1, &off_tex);
-  glBindTexture(GL_TEXTURE_2D, off_tex);
-  glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, fb_w, fb_h);
-  glGenFramebuffers(1, &target_fb);
+  int pw = (int)floor(w * scale + 0.5);
+  int ph = (int)floor(h * scale + 0.5);
+  if (pw <= 0) pw = 1;
+  if (ph <= 0) ph = 1;
+  fb_w = pw;
+  fb_h = ph;
+  if (!off_fb || pw != off_pw || ph != off_ph) {
+    if (off_fb) {
+      glDeleteFramebuffers(1, &off_fb);
+      glDeleteTextures(1, &off_tex);
+      off_fb = off_tex = 0;
+    }
+    glGenTextures(1, &off_tex);
+    glBindTexture(GL_TEXTURE_2D, off_tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, pw, ph);
+    glGenFramebuffers(1, &off_fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, off_fb);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, off_tex, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) LOG("mbui-render: no framebuffer");
+    off_pw = pw;
+    off_ph = ph;
+    canvas_ok = 0;
+  }
+  target_fb = off_fb;
   glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, off_tex, 0);
-  if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) LOG("mbui-render: no framebuffer");
 }
 
 // The offscreen framebuffer as its frames left it (not the last frame drawn again: what drawing only the parts that
