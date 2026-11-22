@@ -36,7 +36,7 @@
       under: null, underN: 0, whole: 0, picked: 0, grab: null, key: null, valid: false, used: 0,
     }));
   }
-  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta;
+  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta;
   let curW = 0, curH = 0, curScale = 1;
   const rtW = () => curW || canvas.width;
   const rtH = () => curH || canvas.height;
@@ -478,7 +478,7 @@
   layout(location=14) in vec4 a_fadex;
   uniform vec2 u_vp;
   uniform vec4 u_gb;
-  out vec2 v_pos; out vec2 v_cpos;
+  flat out vec4 v_rot;
   flat out vec4 v_rect; flat out vec4 v_p; flat out vec4 v_color; flat out vec4 v_c2; flat out vec4 v_clip; flat out vec4 v_pad;
   flat out vec4 v_rc; flat out vec4 v_rs; flat out vec4 v_rr; flat out vec4 v_oclip; flat out vec4 v_orc; flat out vec4 v_ors;
   // how far each pixel is into its fades (scene.mbt 52-59: from its left, top, right, foot; 1 and past: whole), worked
@@ -494,12 +494,19 @@
     if (merged_liquid) pos = mix(u_gb.xy, u_gb.zw, corner);
     // the pieces of shapes (kind 12): nothing drawn
     if (kind == 12) pos = vec2(0.0);
-    // turned (scene.mbt 32-35): drawn turned about its point, everything of how in its own place (v_pos), its clip there
-    // too or (35: one from outside what turned) where it is drawn (v_cpos)
+    // turned (scene.mbt 32-35): drawn turned about its point; fragment recovers exact p/cp from gl_FragCoord
     vec2 at = pos;
-    if (a_rot.x != 0.0) { vec2 d = pos - a_rot.yz; float c = cos(a_rot.x), s = sin(a_rot.x); at = a_rot.yz + vec2(c * d.x - s * d.y, s * d.x + c * d.y); }
+    vec4 vrot = vec4(0.0);
+    if (a_rot.x != 0.0) {
+      float c = cos(a_rot.x), s = sin(a_rot.x);
+      vec2 d = pos - a_rot.yz;
+      at = a_rot.yz + vec2(c * d.x - s * d.y, s * d.x + c * d.y);
+      float k = a_rot.w > 0.5 ? 2.0 : 1.0;
+      vrot = vec4(c * k, s * k, a_rot.yz);
+    }
     gl_Position = vec4(at.x / u_vp.x * 2.0 - 1.0, 1.0 - at.y / u_vp.y * 2.0, 0.0, 1.0);
-    v_pos = pos; v_cpos = a_rot.w > 0.5 ? at : pos; v_rect = a_rect; v_p = a_p; v_color = a_color; v_c2 = a_c2; v_clip = a_clip; v_pad = a_pad; v_rc = a_rc; v_rs = a_rs; v_rr = a_rr;
+    v_rot = vrot;
+    v_rect = a_rect; v_p = a_p; v_color = a_color; v_c2 = a_c2; v_clip = a_clip; v_pad = a_pad; v_rc = a_rc; v_rs = a_rs; v_rr = a_rr;
     // (a glyph's p.x, which it has no use for: how it is turned, for its texels taken whole where it is not)
     if (kind == 1 || kind == 3 || kind == 7) v_p.x = a_rot.x;
     if (kind == 4 && a_pad.z > 0.5) v_pad.x = a_rot.w;
@@ -803,11 +810,12 @@
   const FS = `#version 300 es
   precision highp float;
   precision highp int;
-  in vec2 v_pos; in vec2 v_cpos;
+  flat in vec4 v_rot;
   flat in vec4 v_rect; flat in vec4 v_p; flat in vec4 v_color; flat in vec4 v_c2; flat in vec4 v_clip; flat in vec4 v_pad;
   flat in vec4 v_rc; flat in vec4 v_rs; flat in vec4 v_rr; flat in vec4 v_oclip; flat in vec4 v_orc; flat in vec4 v_ors;
   in vec4 v_ramp;
   uniform float u_scale;
+  uniform float u_top;
   uniform sampler2D u_atlas;
   uniform sampler2D u_img;
   // glass (src/ui/glass.mbt): the blurred copy under it and where a point is in it (uv = p * u_map.xy + u_map.zw, kept
@@ -1207,7 +1215,15 @@
   }
   // cut to its clip: a rect's, hard; a rounded one's, covered as edges are
   void main() {
-    vec2 p = v_pos, cp = v_cpos;
+    vec2 at_p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale;
+    vec2 p = at_p, cp = at_p;
+    float rl = dot(v_rot.xy, v_rot.xy);
+    if (rl > 0.5) {
+      vec2 cs = rl > 2.0 ? v_rot.xy * 0.5 : v_rot.xy;
+      vec2 d = at_p - v_rot.zw;
+      p = v_rot.zw + vec2(cs.x * d.x + cs.y * d.y, -cs.y * d.x + cs.x * d.y);
+      cp = rl > 2.0 ? at_p : p;
+    }
     float cover = 1.0;
     if (max(max(v_rc.x, v_rc.y), max(v_rc.z, v_rc.w)) > 0.0) {
       cover = clip_cover(cp, v_clip, v_rc, v_rs, u_scale);
@@ -1236,14 +1252,14 @@
   const FS_RECT = `#version 300 es
   precision highp float;
   precision highp int;
-  in vec2 v_pos;
   flat in vec4 v_rect;
   flat in vec4 v_color;
   flat in vec4 v_clip;
   uniform float u_scale;
+  uniform float u_top;
   out vec4 o;
   void main() {
-    vec2 p = v_pos;
+    vec2 p = vec2(gl_FragCoord.x, u_top - gl_FragCoord.y) / u_scale;
     if (p.x < v_clip.x || p.y < v_clip.y || p.x > v_clip.z || p.y > v_clip.w) discard;
     vec2 hs = v_rect.zw * 0.5;
     vec2 q = abs(p - (v_rect.xy + hs)) - hs;
@@ -1323,7 +1339,7 @@
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
     gl.deleteShader(fs);
     const u = {};
-    for (const n of ['u_vp', 'u_scale', 'u_atlas', 'u_img', 'u_bd', 'u_map', 'u_uvc', 'u_gb', 'u_shape', 'u_rad', 'u_n', 'u_glight', 'u_segs']) {
+    for (const n of ['u_vp', 'u_scale', 'u_top', 'u_atlas', 'u_img', 'u_bd', 'u_map', 'u_uvc', 'u_gb', 'u_shape', 'u_rad', 'u_n', 'u_glight', 'u_segs']) {
       u[n] = gl.getUniformLocation(p, n);
     }
     gl.useProgram(p);
@@ -1353,6 +1369,7 @@
     const rw = rtW(), rh = rtH(), rs = rtScale();
     gl.uniform2f(u.u_vp, rw / rs, rh / rs);
     gl.uniform1f(u.u_scale, rs);
+    gl.uniform1f(u.u_top, rh);
     gl.uniform4fv(u.u_map, gmap);
     gl.uniform4fv(u.u_uvc, guvc);
     gl.uniform4fv(u.u_gb, ggb);
@@ -1389,6 +1406,7 @@
     gl.deleteShader(fsRect);
     urVp = gl.getUniformLocation(progRect, 'u_vp');
     urScale = gl.getUniformLocation(progRect, 'u_scale');
+    urTop = gl.getUniformLocation(progRect, 'u_top');
     progGen++;
     progNow = null;
     post = gl.createProgram();
@@ -2728,6 +2746,7 @@
         gl.useProgram(progRect);
         gl.uniform2f(urVp, tw / sc, th / sc);
         gl.uniform1f(urScale, sc);
+        gl.uniform1f(urTop, th);
       } else {
         useProg(own ? kind : -1);
       }
@@ -5231,7 +5250,7 @@
   const rolesKept = new Map();
   function winSave(s) {
     Object.assign(s, {
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
       segsTex, segsRows, segsHad, segsHadRows, uploadedFor, imeActive, composing, taHad, imeKind, viewLayer,
@@ -5240,7 +5259,7 @@
   }
   function winLoad(s) {
     ({
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
       segsTex, segsRows, segsHad, segsHadRows, uploadedFor, imeActive, composing, taHad, imeKind, viewLayer,
@@ -5387,7 +5406,7 @@
       } catch (err) { /* its context gone */ }
     }
     Object.assign(s, {
-      gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null,
+      gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null,
       progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       cv: null, cvOk: false, target: null,
@@ -5503,7 +5522,7 @@
       wid, win: child, role, minW, minH, closed: false, closing: false, pending: false, raf: 0, wake: { at: -1 },
       texs: new Map(),
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
-      ufVp: null, progRect: null, urVp: null, urScale: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
+      ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
