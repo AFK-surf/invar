@@ -32,22 +32,135 @@ fn ctrl_button_glass_params(size : LiquidButtonSize) -> (Double, Double) {
   }
 }
 
+fn opt_pair_d_eq(a : Option[(Double, Double)], b : Option[(Double, Double)]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((ax, ay)), Some((bx, by))) => ax == bx && ay == by
+    _ => false
+  }
+}
+
+/// Shared press-feedback scope lent by `liquid_pill_group_node` and `liquid_button_group_node` to
+/// their interactive children (`bind_pill_press`).
+struct PillPressScope {
+  pill : view::View
+  spot : signals::Signal[Option[(Double, Double)]]
+  press_way : motion::NodeWay
+  mut count : Int
+}
+
+let pill_press_lent : view::Lent[PillPressScope] = view::Lent::new()
+
+/// Theme-adaptive press overlay ink for controls inside a liquid glass pill group.
+pub fn liquid_pill_press_ink() -> Int64 {
+  liquid_press_ink()
+}
+
+/// Connects an interactive child control inside `liquid_pill_group_node` (or `liquid_button_group_node`)
+/// to its enclosing liquid glass pill's press response: moves the GPU `spot` specular highlight to
+/// the child's center and springs the outer pill scale via `motion::backdrop_press_spring`.
+/// No-op outside a pill group.
+pub fn bind_pill_press(child : view::View) -> Unit {
+  let pscope = match child.lent(pill_press_lent) {
+    Some(s) => s
+    None => return
+  }
+  let active = ui::ref_new(false)
+  let release = fn() -> Unit {
+    if active.v {
+      active.v = false
+      pscope.count = if pscope.count > 0 { pscope.count - 1 } else { 0 }
+      if pscope.count == 0 {
+        pscope.spot.set(None)
+        pscope.press_way.go(pscope.pill, 0.0, motion::backdrop_press_spring)
+      }
+    }
+  }
+  child.reacts(fn() { child.pressed() }, fn(down : Bool) -> Unit {
+    if down {
+      if !active.v {
+        active.v = true
+        pscope.count += 1
+      }
+      if !(pscope.pill.glass_solid() || ui::glass_solid()) {
+        let (gx, gy, _, _) = pscope.pill.placed_window_now()
+        let (cx, cy, cw, ch) = child.placed_window_now()
+        pscope.spot.set(Some((cx - gx + cw / 2.0, cy - gy + ch / 2.0)))
+      }
+      if !ui::reduced_motion() {
+        pscope.press_way.go(pscope.pill, 1.0, motion::backdrop_press_spring)
+      }
+    } else {
+      release()
+    }
+  })
+  let _ = child.owns(release)
+}
+
+/// A generic single-layer floating Liquid Glass pill container in `parent` for a group of bar
+/// controls built by `body`. Children that call `bind_pill_press` automatically steer the outer
+/// capsule's GPU `spot` highlight to their center and spring-scale the capsule (`1.05×`).
+pub fn liquid_pill_group_node(
+  parent : view::View,
+  body : (view::View) -> Unit,
+  height~ : Double = 40.0,
+  pad~ : Double = 3.0,
+  gap~ : Double = 2.0,
+  sharing~ : Bool = true,
+  solid? : () -> Int64,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(g : view::View) -> Unit {
+    let r = height / 2.0
+    let spot_sig : signals::Signal[Option[(Double, Double)]] = signals::signal_by(None, opt_pair_d_eq)
+    let press_way = motion::NodeWay::new(0.0)
+    let pscope = PillPressScope::{ pill: g, spot: spot_sig, press_way, count: 0 }
+    let _ = g
+    .row(view::Live::Is(true))
+    .height(view::Live::Is(Some(height)))
+    .radius(view::Live::Is(r))
+    .padding(view::Live::Is((pad, pad, pad, pad)))
+    .gap(view::Live::Is(gap))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .shrink(view::Live::Is(0.0))
+    .glass(view::Live::By(fn() {
+      let sol = match solid {
+        Some(f) => f()
+        None => clear
+      }
+      Some(liquid_bar_pill_glass(spot?=spot_sig.get(), solid=sol, sharing=sharing))
+    }))
+    .scale(view::Live::By(fn() { 1.0 + 0.05 * press_way.shown(g) }), about=view::Pivot::At(0.5, 0.5))
+    .edge(view::Live::By(fn() { if g.glass_solid() || ui::glass_solid() { liquid_solid_edge() } else { (0.0, clear) } }))
+    .shadow(view::Live::Is(shadow_default))
+    .shadow_outside(view::Live::Is(true))
+    .clips(view::Live::Is(true))
+    .lends(pill_press_lent, pscope)
+    body(g)
+  })
+}
+
 pub fn liquid_icon_button_node(
   parent : view::View,
   label : () -> String,
   icon : (view::View, () -> Int64) -> Unit,
   press : () -> Unit,
   size~ : LiquidButtonSize = LiquidButtonSize::Regular,
+  side? : Double,
   tint~ : Int64 = clear,
   surface~ : Int64 = clear,
   active~ : () -> Bool = fn() { false },
   disabled~ : () -> Bool = fn() { false },
   interactive~ : Bool = true,
+  sharing~ : Bool = false,
   highlight? : InteractiveHighlight,
   loc~ : String = "",
 ) -> view::View {
-  let side = ctrl_button_size_px(size)
-  let r = side / 2.0
+  let side_px = match side {
+    Some(s) => s
+    None => ctrl_button_size_px(size)
+  }
+  let r = side_px / 2.0
   headless::button(loc=loc, parent, label, fn(_e) -> Unit { press() }, disabled=disabled, fn(b : view::View, btn : headless::Button) -> Unit {
     let ih = match highlight {
       Some(l) => l
@@ -68,25 +181,38 @@ pub fn liquid_icon_button_node(
       }
     }
     let _ = b
-      .width(view::Live::Is(Some(side)))
-      .height(view::Live::Is(Some(side)))
-      .shrink(view::Live::Is(0.0))
-      .radius(view::Live::Is(r))
-      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-      .lies_along(view::Live::Is(view::Lies::Middle))
-      .ground_drawn(view::Live::By(fn() {
-        if !interactive {
-          return view::ground_as_laid
-        }
-        let (w, h) = ih.size.get()
-        let (dx, dy, sx, sy) = ih.stretch(b)
-        stretched(w, h, dx, dy, sx, sy)
-      }))
-      .alpha(view::Live::By(fn() { if btn.disabled() { ctrl_disabled_alpha } else { 1.0 } }))
-    lg_apply_glass_surface(b, fn() {
+    .width(view::Live::Is(Some(side_px)))
+    .height(view::Live::Is(Some(side_px)))
+    .shrink(view::Live::Is(0.0))
+    .radius(view::Live::Is(r))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .lies_along(view::Live::Is(view::Lies::Middle))
+    .shadow(view::Live::Is(shadow_default))
+    .shadow_outside(view::Live::Is(true))
+    .glass(view::Live::By(fn() {
       let (bz, rf) = ctrl_button_glass_params(size)
-      lg_capsule_glass(tint=eff_tint(), surface=surface, bezel=bz, refraction=rf)
-    })
+      let sp = if interactive && ih.pressed(b) > 0.001 {
+        let (w, h) = ih.size.get()
+        if w > 0.0 && h > 0.0 {
+          Some(ih.spot(b, w, h))
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+      Some(liquid_control_glass(tint=eff_tint(), surface=surface, bezel=bz, refraction=rf, spot?=sp, sharing=sharing))
+    }))
+    .edge(view::Live::By(fn() { if b.glass_solid() || ui::glass_solid() { liquid_solid_edge() } else { (0.0, clear) } }))
+    .ground_drawn(view::Live::By(fn() {
+      if !interactive {
+        return view::ground_as_laid
+      }
+      let (w, h) = ih.size.get()
+      let (dx, dy, sx, sy) = ih.stretch(b)
+      stretched(w, h, dx, dy, sx, sy)
+    }))
+    .alpha(view::Live::By(fn() { if btn.disabled() { ctrl_disabled_alpha } else { 1.0 } }))
     if interactive {
       let _ = b.gesture(
         ui::touch_slop(),
@@ -120,46 +246,46 @@ pub fn liquid_icon_button_node(
       )
       let _ = b.box(fn(ov : view::View) -> Unit {
         let _ = ov
-          .over(view::Live::Is(true))
-          .points(view::Live::Is(false))
-          .radius(view::Live::Is(r))
-          .ground(view::Live::Is(white))
-          .alpha(view::Live::By(fn() { clamp(ih.pressed(ov), 0.0, 1.0) * ctrl_press_glow_alpha }))
-          .ground_drawn(view::Live::By(fn() {
-            let (w, h) = ih.size.get()
-            let (dx, dy, sx, sy) = ih.stretch(ov)
-            stretched(w, h, dx, dy, sx, sy)
-          }))
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .radius(view::Live::Is(r))
+        .ground(view::Live::By(liquid_press_ink))
+        .alpha(view::Live::By(fn() { clamp(ih.pressed(ov), 0.0, 1.0) }))
+        .ground_drawn(view::Live::By(fn() {
+          let (w, h) = ih.size.get()
+          let (dx, dy, sx, sy) = ih.stretch(ov)
+          stretched(w, h, dx, dy, sx, sy)
+        }))
       })
     }
     let _ = b.box(fn(hov : view::View) -> Unit {
       let _ = hov
-        .over(view::Live::Is(true))
-        .points(view::Live::Is(false))
-        .radius(view::Live::Is(r))
-        .ground(view::Live::By(ctrl_hover_ink))
-        .alpha(view::Live::By(fn() { clamp(hover_way.shown(hov), 0.0, 1.0) * ctrl_hover_alpha }))
+      .over(view::Live::Is(true))
+      .points(view::Live::Is(false))
+      .radius(view::Live::Is(r))
+      .ground(view::Live::By(ctrl_hover_ink))
+      .alpha(view::Live::By(fn() { clamp(hover_way.shown(hov), 0.0, 1.0) * ctrl_hover_alpha }))
     })
     let _ = b.box(fn(c : view::View) -> Unit {
       let _ = c
-        .lines_up(view::Live::Is(Some(view::Along::Middle)))
-        .lies_along(view::Live::Is(view::Lies::Middle))
-        .offset(view::Live::By(fn() {
-          if interactive {
-            let (dx, dy, _, _) = ih.stretch(b)
-            (dx, dy)
-          } else {
-            (0.0, 0.0)
-          }
-        }))
-        .scale(view::Live::By(fn() {
-          if interactive {
-            let (_, _, sx, sy) = ih.stretch(b)
-            (sx + sy) / 2.0
-          } else {
-            1.0
-          }
-        }))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+      .offset(view::Live::By(fn() {
+        if interactive {
+          let (dx, dy, _, _) = ih.stretch(b)
+          (dx, dy)
+        } else {
+          (0.0, 0.0)
+        }
+      }))
+      .scale(view::Live::By(fn() {
+        if interactive {
+          let (_, _, sx, sy) = ih.stretch(b)
+          (sx + sy) / 2.0
+        } else {
+          1.0
+        }
+      }))
       icon(c, fn() { if eff_tint() != clear { white } else { colors().content } })
     })
     lg_focus_ring(b, fn() { btn.focus_shown() }, r)
@@ -197,18 +323,26 @@ pub fn liquid_button_group_node(
   let r_inner = inner_h / 2.0
   let div_h = h * ctrl_divider_ratio
   parent.box(loc=loc, fn(g : view::View) -> Unit {
+    let spot_sig : signals::Signal[Option[(Double, Double)]] = signals::signal_by(None, opt_pair_d_eq)
+    let press_way = motion::NodeWay::new(0.0)
+    let pscope = PillPressScope::{ pill: g, spot: spot_sig, press_way, count: 0 }
     let _ = g
-      .row(view::Live::Is(true))
-      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-      .height(view::Live::Is(Some(h)))
-      .shrink(view::Live::Is(0.0))
-      .padding(view::Live::Is((ctrl_group_pad, ctrl_group_pad, ctrl_group_pad, ctrl_group_pad)))
-      .radius(view::Live::Is(r_outer))
-      .says(view::Live::Is(Some(view::said(view::Role::Group, label="Action Group"))))
-    lg_apply_glass_surface(g, fn() {
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .height(view::Live::Is(Some(h)))
+    .shrink(view::Live::Is(0.0))
+    .padding(view::Live::Is((ctrl_group_pad, ctrl_group_pad, ctrl_group_pad, ctrl_group_pad)))
+    .radius(view::Live::Is(r_outer))
+    .shadow(view::Live::Is(shadow_default))
+    .shadow_outside(view::Live::Is(true))
+    .glass(view::Live::By(fn() {
       let (bz, rf) = ctrl_button_glass_params(size)
-      lg_capsule_glass(surface=surface, bezel=bz, refraction=rf)
-    })
+      Some(liquid_control_glass(tint=clear, surface=surface, bezel=bz, refraction=rf, spot?=spot_sig.get()))
+    }))
+    .scale(view::Live::By(fn() { 1.0 + 0.05 * press_way.shown(g) }), about=view::Pivot::At(0.5, 0.5))
+    .edge(view::Live::By(fn() { if g.glass_solid() || ui::glass_solid() { liquid_solid_edge() } else { (0.0, clear) } }))
+    .lends(pill_press_lent, pscope)
+    .says(view::Live::Is(Some(view::said(view::Role::Group, label="Action Group"))))
     g.each(
       fn() -> Array[Int] {
         let n = actions().length()
@@ -227,11 +361,11 @@ pub fn liquid_button_group_node(
         if idx > 0 {
           let _ = slot.box(fn(div : view::View) -> Unit {
             let _ = div
-              .width(view::Live::Is(Some(ctrl_hairline_w)))
-              .height(view::Live::Is(Some(div_h)))
-              .shrink(view::Live::Is(0.0))
-              .margin(view::Live::Is((ctrl_group_item_gap, 0.0, ctrl_group_item_gap, 0.0)))
-              .ground(view::Live::By(ctrl_divider_ink))
+            .width(view::Live::Is(Some(ctrl_hairline_w)))
+            .height(view::Live::Is(Some(div_h)))
+            .shrink(view::Live::Is(0.0))
+            .margin(view::Live::Is((ctrl_group_item_gap, 0.0, ctrl_group_item_gap, 0.0)))
+            .ground(view::Live::By(ctrl_divider_ink))
           })
         }
         let get_action = fn() -> Option[LiquidGroupAction] {
@@ -264,6 +398,7 @@ pub fn liquid_button_group_node(
           }
         }
         let _ = headless::button(loc=loc, slot, item_label, fn(_e) -> Unit { item_press() }, disabled=item_disabled, fn(b : view::View, btn : headless::Button) -> Unit {
+          bind_pill_press(b)
           let highlight_way = motion::NodeWay::new(0.0)
           let active_way = motion::NodeWay::new(if signals::untracked(item_active) { 1.0 } else { 0.0 })
           let press_way = motion::NodeWay::new(0.0)
@@ -289,30 +424,30 @@ pub fn liquid_button_group_node(
             press_way.go(b, if on { 1.0 } else { 0.0 }, motion::snappy_damped)
           })
           let _ = b
-            .width(view::Live::Is(Some(inner_h)))
-            .height(view::Live::Is(Some(inner_h)))
-            .shrink(view::Live::Is(0.0))
-            .radius(view::Live::Is(r_inner))
-            .lines_up(view::Live::Is(Some(view::Along::Middle)))
-            .lies_along(view::Live::Is(view::Lies::Middle))
-            .scale(view::Live::By(fn() { 1.0 - 0.07 * clamp(press_way.shown(b), 0.0, 1.0) }))
-            .alpha(view::Live::By(fn() { if btn.disabled() { ctrl_disabled_alpha } else { 1.0 } }))
+          .width(view::Live::Is(Some(inner_h)))
+          .height(view::Live::Is(Some(inner_h)))
+          .shrink(view::Live::Is(0.0))
+          .radius(view::Live::Is(r_inner))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .lies_along(view::Live::Is(view::Lies::Middle))
+          .scale(view::Live::By(fn() { 1.0 - 0.07 * clamp(press_way.shown(b), 0.0, 1.0) }))
+          .alpha(view::Live::By(fn() { if btn.disabled() { ctrl_disabled_alpha } else { 1.0 } }))
           let _ = b.box(fn(act : view::View) -> Unit {
             let _ = act
-              .over(view::Live::Is(true))
-              .points(view::Live::Is(false))
-              .radius(view::Live::Is(r_inner))
-              .ground(view::Live::By(ctrl_chip_selected_tint))
-              .scale(view::Live::By(fn() { lerp(0.88, 1.0, clamp(active_way.shown(act), 0.0, 1.0)) }))
-              .alpha(view::Live::By(fn() { clamp(active_way.shown(act), 0.0, 1.0) }))
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .radius(view::Live::Is(r_inner))
+            .ground(view::Live::By(ctrl_chip_selected_tint))
+            .scale(view::Live::By(fn() { lerp(0.88, 1.0, clamp(active_way.shown(act), 0.0, 1.0)) }))
+            .alpha(view::Live::By(fn() { clamp(active_way.shown(act), 0.0, 1.0) }))
           })
           let _ = b.box(fn(hov : view::View) -> Unit {
             let _ = hov
-              .over(view::Live::Is(true))
-              .points(view::Live::Is(false))
-              .radius(view::Live::Is(r_inner))
-              .ground(view::Live::By(ctrl_hover_ink))
-              .alpha(view::Live::By(fn() { clamp(highlight_way.shown(hov), 0.0, 1.0) * ctrl_press_glow_alpha }))
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .radius(view::Live::Is(r_inner))
+            .ground(view::Live::By(ctrl_hover_ink))
+            .alpha(view::Live::By(fn() { clamp(highlight_way.shown(hov), 0.0, 1.0) * ctrl_press_glow_alpha }))
           })
           let init_actions = signals::untracked(actions)
           if idx >= 0 && idx < init_actions.length() {
@@ -321,10 +456,10 @@ pub fn liquid_button_group_node(
           }
           b.show(fn() { btn.focus_shown() }, fn(ring : view::View) -> Unit {
             let _ = ring
-              .over(view::Live::Is(true))
-              .points(view::Live::Is(false))
-              .radius(view::Live::Is(r_inner))
-              .edge(view::Live::By(fn() { (ctrl_focus_w, colors().accent) }))
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .radius(view::Live::Is(r_inner))
+            .edge(view::Live::By(fn() { (ctrl_focus_w, colors().accent) }))
           })
         })
       },

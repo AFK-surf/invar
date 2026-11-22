@@ -1,0 +1,445 @@
+// Tests for calibrated control glass recipes, GPU spot touch highlights, pill/button group press
+// forwarding, discrete stops slider with live preview & value bubble, zero-relayout lazy-lens
+// toggle, segmented custom render_item, practical input params, and glass_control_shadow.
+
+import "headless"
+import "signals"
+import "ui"
+import "view"
+
+fn kit_has_active_liquid_spot(t : ui::Tester) -> Bool {
+  let insts = t.drawn_instances()
+  let mut i = 0
+  while i < insts.length() {
+    let a = insts[i]
+    if a.length() > 14 && a[5] == 6.0 && a[14] > 0.0 {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn kit_has_solid_hairline_edge(t : ui::Tester, expected_edge : (Double, Int64)) -> Bool {
+  let ch = fn(v : Double) -> Int64 { (v * 255.0).round().to_int64() }
+  let insts = t.drawn_instances()
+  let mut i = 0
+  while i < insts.length() {
+    let a = insts[i]
+    if a.length() > 15 && a[5] == 0.0 && (a[6] - expected_edge.0).abs() < 0.01 {
+      let c = (ch(a[12]) << 24) | (ch(a[13]) << 16) | (ch(a[14]) << 8) | ch(a[15])
+      if c == expected_edge.1 {
+        return true
+      }
+    }
+    i += 1
+  }
+  false
+}
+
+fn kit_sample_icon(parent : view::View, side : Double, ink : () -> Int64) -> Unit {
+  let _ = parent.box(fn(ic : view::View) -> Unit {
+    let _ = ic
+    .width(view::Live::Is(Some(side)))
+    .height(view::Live::Is(Some(side)))
+    .shrink(view::Live::Is(0.0))
+    .shapes(view::Live::By(fn() { ctrl_plus_shapes(side, ink()) }))
+  })
+}
+
+fn kit_spot_matches(a : Option[(Double, Double)], x : Double, y : Double) -> Bool {
+  match a {
+    Some((ax, ay)) => (ax - x).abs() < 1.0e-9 && (ay - y).abs() < 1.0e-9
+    None => false
+  }
+}
+
+test "lg_glass_control_shadow_light_and_dark" {
+  set_dark(Some(false))
+  let light_sh = glass_control_shadow()
+  debug_assert((light_sh.0 - 5.0).abs() < 1.0e-9, "light glass_control_shadow blur must be 5.0")
+  debug_assert((light_sh.1 - 2.0).abs() < 1.0e-9, "light glass_control_shadow dy must be 2.0")
+  debug_assert(light_sh.2 == 0x00000010L, "light glass_control_shadow color must be 0x00000010L")
+
+  set_dark(Some(true))
+  let dark_sh = glass_control_shadow()
+  debug_assert((dark_sh.0 - 6.0).abs() < 1.0e-9, "dark glass_control_shadow blur must be 6.0")
+  debug_assert((dark_sh.1 - 2.0).abs() < 1.0e-9, "dark glass_control_shadow dy must be 2.0")
+  debug_assert(dark_sh.2 == 0x00000038L, "dark glass_control_shadow color must be 0x00000038L")
+
+  set_dark(Some(false))
+}
+
+test "lg_calibrated_optical_recipes_spot_sharing_zoom_press_ink" {
+  let near = fn(a : Double, b : Double) -> Bool { (a - b).abs() < 1.0e-9 }
+  let modes = [false, true]
+  for dark in modes {
+    set_dark(Some(dark))
+    let sp = (18.0, 20.0)
+    let ctrl = liquid_control_glass(spot=sp, sharing=true)
+    let pill = liquid_bar_pill_glass(spot=sp)
+    let flt = liquid_floating_glass(spot=sp, sharing=true)
+    let tab = liquid_tab_bar_glass(spot=sp, merge=12.0)
+    let vclr = liquid_viewer_clear_glass(spot=sp)
+    let vdrk = liquid_viewer_dark_glass(spot=sp)
+    let lens = liquid_tab_lens_glass(1.0)
+    let ink = liquid_press_ink()
+    let edge = liquid_solid_edge()
+    debug_assert(kit_spot_matches(ctrl.spot, 18.0, 20.0) && ctrl.shares_capture, "control glass spot and sharing")
+    debug_assert(
+      kit_spot_matches(pill.spot, 18.0, 20.0) && pill.shares_capture && near(pill.blur, 2.5) && near(pill.bezel, 14.0),
+      "bar pill glass recipe",
+    )
+    debug_assert(
+      kit_spot_matches(flt.spot, 18.0, 20.0) && flt.adaptive && flt.shares_capture && near(flt.refraction, 28.0),
+      "floating glass recipe",
+    )
+    debug_assert(
+      kit_spot_matches(tab.spot, 18.0, 20.0) && near(tab.merge, 12.0) && near(tab.refraction, 28.0),
+      "tab bar glass recipe",
+    )
+    debug_assert(
+      kit_spot_matches(vclr.spot, 18.0, 20.0) && near(vclr.blur, 4.0) && near(vclr.saturation, 0.55),
+      "viewer clear glass recipe",
+    )
+    debug_assert(
+      kit_spot_matches(vdrk.spot, 18.0, 20.0) && near(vdrk.blur, 4.0) && vdrk.solid == 0x161618FFL,
+      "viewer dark glass recipe",
+    )
+    debug_assert(
+      near(lens.zoom, 1.08) && near(lens.bezel, 6.0) && near(lens.refraction, 5.5),
+      "tab lens glass recipe",
+    )
+    debug_assert(near(edge.0, 0.5), "solid hairline edge width must be 0.5")
+    debug_assert(
+      if dark { ink == 0xFFFFFF38L } else { ink == 0x0000001FL },
+      "press ink must adapt to theme",
+    )
+  }
+  set_dark(Some(false))
+}
+
+test "lg_button_and_icon_button_gpu_spot_and_solid_fallback" {
+  ui::set_glass_solid(None)
+  let t = lg_case(fn(p : view::View) -> Unit {
+    let _ = p.box(fn(r : view::View) -> Unit {
+      let _ = r.row(view::Live::Is(true)).gap(view::Live::Is(16.0)).lines_up(view::Live::Is(Some(view::Along::Middle)))
+      let _ = liquid_button_node(r, fn() { "Compact" }, fn() -> Unit { () }, height=32.0, px=12.0, sharing=true)
+      let _ = liquid_icon_button_node(
+        r,
+        fn() { "Orb" },
+        fn(v : view::View, ink : () -> Int64) -> Unit { kit_sample_icon(v, 18.0, ink) },
+        fn() -> Unit { () },
+        side=34.0,
+        sharing=true,
+      )
+    })
+  })
+  assert_no_nested_glass(t, label="buttons at rest")
+  let btn_d = require_drawn(t, "Compact", view::Role::Button)
+  let ico_d = require_drawn(t, "Orb", view::Role::Button)
+  let rest_spot = kit_has_active_liquid_spot(t)
+  // Press button -> GPU spot becomes active
+  t.press_at(btn_d.x + 16.0, btn_d.y + btn_d.h / 2.0)
+  t.run_for(120.0)
+  let btn_spot = kit_has_active_liquid_spot(t)
+  t.release(btn_d.x + 16.0, btn_d.y + btn_d.h / 2.0)
+  t.run_for(springs_out)
+  // Press icon button -> GPU spot becomes active
+  t.press_at(ico_d.x + ico_d.w / 2.0, ico_d.y + ico_d.h / 2.0)
+  t.run_for(120.0)
+  let ico_spot = kit_has_active_liquid_spot(t)
+  t.release(ico_d.x + ico_d.w / 2.0, ico_d.y + ico_d.h / 2.0)
+  t.run_for(springs_out)
+  let released_spot = kit_has_active_liquid_spot(t)
+  // Solid-glass fallback shows adaptive hairline edge with 0 liquid glass instances
+  ui::set_glass_solid(Some(true))
+  t.frame()
+  let solid_liquid = count_liquid_glass(t)
+  let solid_edge = kit_has_solid_hairline_edge(t, liquid_solid_edge())
+  ui::set_glass_solid(None)
+  debug_assert((btn_d.h - 32.0).abs() < 0.01, "button height must be 32")
+  debug_assert((ico_d.w - 34.0).abs() < 0.01, "icon button side must be 34")
+  debug_assert(!rest_spot, "rest state must have no active GPU spot")
+  debug_assert(btn_spot, "pressed button must activate GPU spot")
+  debug_assert(ico_spot, "pressed icon button must activate GPU spot")
+  debug_assert(!released_spot, "released controls must clear GPU spot")
+  debug_assert(solid_liquid == 0, "solid fallback must emit 0 liquid glass instances")
+  debug_assert(solid_edge, "solid fallback must render hairline edge")
+  t.dispose()
+}
+
+test "lg_pill_group_and_button_group_outer_spot_and_spring_scale" {
+  ui::set_glass_solid(None)
+  let modes = [false, true]
+  for dark in modes {
+    let pill_ref : ui::Ref[Option[view::View]] = ui::ref_new(None)
+    let t = lg_case(
+      fn(p : view::View) -> Unit {
+        let _ = p.box(fn(r : view::View) -> Unit {
+          let _ = r.row(view::Live::Is(true)).gap(view::Live::Is(16.0)).lines_up(view::Live::Is(Some(view::Along::Middle)))
+          let g = liquid_pill_group_node(r, fn(pg : view::View) -> Unit {
+            let _ = headless::button(pg, fn() { "Bell" }, fn(_e) -> Unit { () }, fn(b : view::View, _btn : headless::Button) -> Unit {
+              let _ = b
+              .width(view::Live::Is(Some(34.0)))
+              .height(view::Live::Is(Some(34.0)))
+              .radius(view::Live::Is(17.0))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .lies_along(view::Live::Is(view::Lies::Middle))
+              bind_pill_press(b)
+              kit_sample_icon(b, 18.0, fn() { colors().content })
+            })
+          }, height=40.0, pad=3.0, gap=2.0)
+          pill_ref.v = Some(g)
+          let _ = liquid_button_group_node(r, fn() {
+            [
+              LiquidGroupAction::new(label=fn() { "Edit" }, icon=fn(v, ink) { kit_sample_icon(v, 18.0, ink) }, press=fn() -> Unit { () }),
+              LiquidGroupAction::new(label=fn() { "Share" }, icon=fn(v, ink) { kit_sample_icon(v, 18.0, ink) }, press=fn() -> Unit { () }),
+            ]
+          })
+        })
+      },
+      dark=dark,
+    )
+    assert_no_nested_glass(t, label="pill group and button group")
+    let pill = match pill_ref.v {
+      Some(v) => v
+      None => {
+        debug_assert(false, "pill group view must be captured")
+        t.dispose()
+        return
+      }
+    }
+    let pscope = match pill.lent(pill_press_lent) {
+      Some(s) => s
+      None => {
+        debug_assert(false, "pill group must lend PillPressScope")
+        t.dispose()
+        return
+      }
+    }
+    let bell_d = require_drawn(t, "Bell", view::Role::Button)
+    let bx = bell_d.x + bell_d.w / 2.0
+    let by = bell_d.y + bell_d.h / 2.0
+    t.press_at(bx, by)
+    t.run_for(120.0)
+    let has_scope_spot = match pscope.spot.untracked() {
+      Some(_) => true
+      None => false
+    }
+    let pill_spot = kit_has_active_liquid_spot(t)
+    let pill_scaled = pill.drawn_scale() > 1.01
+    t.release(bx, by)
+    t.run_for(springs_out)
+    let scope_cleared = match pscope.spot.untracked() {
+      None => true
+      Some(_) => false
+    }
+    let pill_restored = (pill.drawn_scale() - 1.0).abs() < 0.002
+    let edit_d = require_drawn(t, "Edit", view::Role::Button)
+    let ex = edit_d.x + edit_d.w / 2.0
+    let ey = edit_d.y + edit_d.h / 2.0
+    t.press_at(ex, ey)
+    t.run_for(120.0)
+    let group_spot = kit_has_active_liquid_spot(t)
+    t.release(ex, ey)
+    t.run_for(springs_out)
+    debug_assert(has_scope_spot, "pill group scope spot must be set while child pressed")
+    debug_assert(pill_spot, "pill group must emit active GPU spot while child pressed")
+    debug_assert(pill_scaled, "pill group must spring-scale > 1.01 while child pressed")
+    debug_assert(scope_cleared, "pill group scope spot must clear on release")
+    debug_assert(pill_restored, "pill group scale must settle back to 1.0")
+    debug_assert(group_spot, "button group must emit active GPU spot while child pressed")
+    t.dispose()
+  }
+}
+
+test "lg_toggle_zero_relayout_lazy_lens_custom_size_and_solid_guard" {
+  ui::set_glass_solid(None)
+  let on = signals::signal(false)
+  let t = lg_case(fn(p : view::View) -> Unit {
+    let _ = liquid_toggle_node(
+      p,
+      fn() { on.get() },
+      fn(v : Bool) -> Unit { on.set(v) },
+      fn() { "Compact Toggle" },
+      width=52.0,
+      height=24.0,
+      track_color=fn() { 0x60606844L },
+      on_color=fn() { 0x0088FFFFL },
+    )
+  })
+  let rest_glass = t.drawn_glass().length()
+  let tr = require_drawn(t, "Compact Toggle", view::Role::Switch)
+  let tree = match ui::view_tree() {
+    Some(vt) => vt
+    None => {
+      debug_assert(false, "view_tree must be active")
+      t.dispose()
+      return
+    }
+  }
+  t.press_at(tr.x + 14.0, tr.y + tr.h / 2.0)
+  t.run_for(a_frame)
+  let held_glass = t.drawn_glass().length()
+  let laid0 = tree.work().laid
+  let mut i = 1
+  while i <= 10 {
+    t.move_to(tr.x + 14.0 + i.to_double() * 2.0, tr.y + tr.h / 2.0)
+    t.run_for(a_frame)
+    i += 1
+  }
+  t.release(tr.x + 34.0, tr.y + tr.h / 2.0)
+  let mut j = 0
+  while j < 12 {
+    t.run_for(a_frame)
+    j += 1
+  }
+  let laid_delta = tree.work().laid - laid0
+  t.run_for(springs_out)
+  let dragged_on = on.get()
+  let settled_glass = t.drawn_glass().length()
+  // Solid guard prevents glass lens even while held
+  ui::set_glass_solid(Some(true))
+  t.press_at(tr.x + 34.0, tr.y + tr.h / 2.0)
+  t.run_for(120.0)
+  let solid_held_glass = t.drawn_glass().length()
+  t.release(tr.x + 34.0, tr.y + tr.h / 2.0)
+  ui::set_glass_solid(None)
+  t.run_for(springs_out)
+  debug_assert((tr.w - 52.0).abs() < 0.01 && (tr.h - 24.0).abs() < 0.01, "custom toggle size must be 52x24")
+  debug_assert(rest_glass == 0, "idle toggle must emit 0 glass instances")
+  debug_assert(held_glass == 1, "held toggle must mount 1 lens glass instance")
+  debug_assert(laid_delta == 0, "toggle drag and settle must trigger 0 Flex layouts")
+  debug_assert(dragged_on, "dragging toggle right must turn it on")
+  debug_assert(settled_glass == 0, "settled toggle must emit 0 glass instances")
+  debug_assert(solid_held_glass == 0, "solid guard must prevent glass lens while held")
+  debug_assert(!on.get(), "tapping on toggle must turn it off")
+  t.dispose()
+}
+
+test "lg_slider_stops_snap_live_preview_thumb_label_value_bubble" {
+  ui::set_glass_solid(None)
+  let cur = signals::signal(0.0)
+  let names = ["Low", "Medium", "High", "Max"]
+  let t = lg_case(fn(p : view::View) -> Unit {
+    let _ = p.box(fn(b : view::View) -> Unit {
+      let _ = b.width(view::Live::Is(Some(320.0)))
+      let _ = liquid_slider_node(
+        b,
+        fn() { cur.get() },
+        fn(v : Double) -> Unit { cur.set(v) },
+        fn() { "Effort" },
+        least=0.0,
+        most=3.0,
+        stops=4,
+        thumb_label=fn(v : Double) -> String { names[clamp(v.round(), 0.0, 3.0).to_int()] },
+        value_bubble=fn(v : Double) -> String { "\{v.round().to_int()}/3" },
+      )
+    })
+  })
+  let rest_glass = t.drawn_glass().length()
+  assert_no_nested_glass(t, label="stops slider at rest")
+  let sr = require_drawn(t, "Effort", view::Role::Slider)
+  let sy = sr.y + sr.h / 2.0
+  // Drag from stop 0 toward ~68% (near stop 2 = "High") and check live preview BEFORE release
+  t.press_at(sr.x + 12.0, sy)
+  t.run_for(a_frame)
+  let held_glass = t.drawn_glass().length()
+  t.move_to(sr.x + sr.w * 0.68, sy)
+  t.run_for(a_frame)
+  let has_high = match t.find("High") {
+    Some(_) => true
+    None => false
+  }
+  let has_bubble = match t.find("2/3") {
+    Some(_) => true
+    None => false
+  }
+  let before_release_val = cur.get()
+  t.release(sr.x + sr.w * 0.68, sy)
+  t.run_for(springs_out)
+  let snapped = cur.get()
+  let after_glass = t.drawn_glass().length()
+  debug_assert(rest_glass == 0, "slider at rest must emit 0 glass instances")
+  debug_assert(held_glass == 1, "held slider must mount 1 lens glass instance")
+  debug_assert(has_high, "live thumb_label must preview High before release")
+  debug_assert(has_bubble, "live value_bubble must preview 2/3 before release")
+  debug_assert((before_release_val - 0.0).abs() < 0.01, "stops slider must not commit before release")
+  debug_assert((snapped - 2.0).abs() < 0.01, "stops slider must snap to stop 2 on release")
+  debug_assert(after_glass == 0, "settled slider must emit 0 glass instances")
+  t.dispose()
+}
+
+test "lg_segmented_render_item_and_solid_hairline" {
+  ui::set_glass_solid(None)
+  let sel = signals::signal(0)
+  let t = lg_case(fn(p : view::View) -> Unit {
+    let _ = liquid_segmented_node(
+      p,
+      fn() { ["First", "Second", "Third"] },
+      fn() { sel.get() },
+      fn(i : Int) -> Unit { sel.set(i) },
+      width=240.0,
+      render_item=fn(slot : view::View, _idx : Int, is_selected : () -> Bool) -> Unit {
+        kit_sample_icon(slot, 18.0, fn() { if is_selected() { colors().accent } else { colors().content } })
+      },
+    )
+  })
+  assert_no_nested_glass(t, label="custom render_item segmented")
+  let third_d = require_drawn(t, "Third", view::Role::Tab)
+  t.tap(third_d.x + third_d.w / 2.0, third_d.y + third_d.h / 2.0)
+  t.run_for(springs_out)
+  ui::set_glass_solid(Some(true))
+  t.frame()
+  let solid_edge = kit_has_solid_hairline_edge(t, liquid_solid_edge())
+  let solid_glass = t.drawn_glass().length()
+  ui::set_glass_solid(None)
+  debug_assert(sel.get() == 2, "tapping Third tab must select index 2")
+  debug_assert(solid_edge, "segmented control solid fallback must render hairline edge")
+  debug_assert(solid_glass == 0, "segmented control solid fallback must emit 0 glass")
+  t.dispose()
+}
+
+test "lg_inputs_placeholder_by_height_by_leading_on_escape_and_solid_edge" {
+  ui::set_glass_solid(None)
+  let sf = ui::Field::new()
+  let tf = ui::Field::new()
+  let hint = signals::signal("Find chats")
+  let escaped = ui::ref_new(0)
+  let t = lg_case(fn(p : view::View) -> Unit {
+    let _ = p.box(fn(b : view::View) -> Unit {
+      let _ = b.width(view::Live::Is(Some(360.0))).gap(view::Live::Is(12.0))
+      let _ = liquid_search_bar_node(
+        b,
+        sf,
+        placeholder_by=fn() { hint.get() },
+        height_by=fn() { 36.0 },
+        leading=fn(v : view::View, ink : () -> Int64) -> Unit { kit_sample_icon(v, 16.0, ink) },
+        on_escape=fn() -> Unit { escaped.v = escaped.v + 1 },
+      )
+      let _ = liquid_text_field_node(
+        b,
+        tf,
+        placeholder_by=fn() { hint.get() },
+        height_by=fn() { 38.0 },
+        label=fn() { "Query" },
+      )
+    })
+  })
+  assert_no_nested_glass(t, label="inputs with practical params")
+  let field_d = require_drawn(t, "Search", view::Role::TextField)
+  t.tap(field_d.x + field_d.w / 2.0, field_d.y + field_d.h / 2.0)
+  t.run_for(a_frame)
+  t.key(ui::key_escape)
+  t.run_for(a_frame)
+  ui::set_glass_solid(Some(true))
+  t.frame()
+  let solid_edge = kit_has_solid_hairline_edge(t, liquid_solid_edge())
+  let solid_glass = t.drawn_glass().length()
+  ui::set_glass_solid(None)
+  debug_assert(escaped.v == 1, "Escape in focused search bar must fire on_escape")
+  debug_assert(solid_edge, "inputs solid fallback must render hairline edge")
+  debug_assert(solid_glass == 0, "inputs solid fallback must emit 0 glass")
+  t.dispose()
+}
