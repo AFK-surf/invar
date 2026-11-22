@@ -390,3 +390,32 @@ let faults = lg::audit_glass(t, label="toolbar_scene")
 debug_assert(faults.length() == 0, "expected 0 glass faults")
 lg::assert_no_nested_glass(t, label="toolbar_scene")
 ```
+
+---
+
+## 八、Pion-JSX 组件薄壳（`packages/lg/src/jsx.pion`）
+
+配合 Pion `P31-C` 纯编译期脱糖 JSX 与 Leading-Dot `.Enum` 推导，`packages/lg` 提供 25 个 PascalCase JSX 组件薄壳，**100% 委托给对应 `liquid_*_node`（零手搓 `Glass::liquid`）**。静态与响应式双态属性统一采用 `prop` / `prop_by`（`prop_by` 优先），回调直接使用裸名（`on_press` / `on_change` / `on_select` / `on_close` / `on_toggle` / `on_action` / `on_dismiss` / `children`）。
+
+| 分类 | JSX 组件（`lg::*`） | 委托底层原语 |
+|---|---|---|
+| 按钮与标签 | `Button`、`IconButton`、`Badge`、`CountBadge`、`Chip` | `liquid_button_node`、`liquid_icon_button_node`、`liquid_badge_node`、`liquid_count_badge_node`、`liquid_chip_node` |
+| 容器与导航 | `Panel`、`Card`、`Toolbar`、`ToolbarDivider`、`BarPillGroup`、`NavBar` | `liquid_panel_node`、`liquid_card_node`、`liquid_toolbar_node`、`liquid_toolbar_divider`、`liquid_bar_pill_group_node`、`liquid_nav_bar_node` |
+| 控件与输入 | `Toggle`、`Slider`、`Segmented`、`Checkbox`、`Stepper`、`TextField`、`SearchBar` | `liquid_toggle_node`、`liquid_slider_node`、`liquid_segmented_node`、`liquid_checkbox_node`、`liquid_stepper_node`、`liquid_text_field_node`、`liquid_search_bar_node` |
+| 反馈与浮层 | `ProgressBar`、`ProgressRing`、`Dialog`、`Sheet`、`Drawer`、`Toast`、`Disclosure` | `liquid_progress_bar_node`、`liquid_progress_ring_node`、`liquid_dialog_node`、`liquid_sheet_node`、`liquid_drawer_node`、`liquid_toast_node`、`liquid_disclosure_node` |
+
+```pion
+<lg::NavBar
+  in={root}
+  title="Device Control"
+  trailing={fn(t) {
+    <lg::BarPillGroup in={t}>
+      <lg::Button label="Sync" flat ghost on_press=>{ sync() } />
+    </lg::BarPillGroup>
+  }}
+/>
+<lg::Panel in={root} gap={10.0}>
+  <lg::Badge label_by=>{ "电量 \{pct.get()}%" } tone={.Success} dot />
+  <lg::Toggle on_by=>{ wifi.get() } on_change={fn(v) { wifi.set(v) }} label="Wi-Fi" />
+</lg::Panel>
+```
