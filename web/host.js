@@ -2233,85 +2233,57 @@
     };
   }
 
+  // Host-added adaptive settle regions must include every capture they touch, including other captures they then reach.
   function closeAdaptiveParts(parts, count) {
     if (!parts || !parts.length || count <= 0) return;
-    const W = canvas.width, Hh = canvas.height;
-    const sc = scale;
-    const caps = [];
-    for (let start = 0; start < count; ) {
-      const tid = Math.trunc(f32[start * INST + 20]);
-      if (tid >= 0) { start++; continue; }
-      let end = start;
-      while (end < count && Math.trunc(f32[end * INST + 20]) === tid) end++;
-      const a = start * INST;
-      const kind = Math.round(f32[a + 5]);
-      const isContained = kind === 5 && f32[a + 7] < 0;
-      const blur = (kind === 6 && f32[a + 7] < 0) ? 0 : Math.abs(f32[a + 7]);
-      const mergedLiquid = kind === 6 && f32[a + 23] > 0;
-      const unmergedLiquid = kind === 6 && !mergedLiquid;
-      let margin = isContained ? 0 : 3 * blur + (kind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
-      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-      for (let i = start; i < end; i++) {
-        const b = i * INST;
-        let bx0 = Math.max(f32[b], f32[b + 16]), by0 = Math.max(f32[b + 1], f32[b + 17]);
-        let bx1 = Math.min(f32[b] + f32[b + 2], f32[b + 18]), by1 = Math.min(f32[b + 1] + f32[b + 3], f32[b + 19]);
-        if (kind === 6) {
-          const m = Math.max(unmergedLiquid ? f32[b + 23] : f32[a + 23], 0);
-          bx0 = f32[b] - m; by0 = f32[b + 1] - m; bx1 = f32[b] + f32[b + 2] + m; by1 = f32[b + 1] + f32[b + 3] + m;
-          if (unmergedLiquid) {
-            const bm = 3 * blur + f32[b + 21] * (1 + Math.abs(f32[b + 22])) + m + 2;
-            if (bm > margin) margin = bm;
-          }
-        }
-        x0 = Math.min(x0, bx0); y0 = Math.min(y0, by0); x1 = Math.max(x1, bx1); y1 = Math.max(y1, by1);
-      }
-      if (x1 > x0 && y1 > y0) {
-        const px0 = Math.max(0, Math.floor((x0 - margin) * sc)), px1 = Math.min(W, Math.ceil((x1 + margin) * sc));
-        const pb0 = Math.max(0, Hh - Math.ceil((y1 + margin) * sc)), pb1 = Math.min(Hh, Hh - Math.floor((y0 - margin) * sc));
-        if (px1 > px0 && pb1 > pb0) caps.push([px0, pb0, px1 - px0, pb1 - pb0]);
+    const W = rtW(), Hh = rtH();
+    const grabs = [], wasCut = cutOn;
+    cutOn = false;
+    for (let start = 0; start < count;) {
+      const tid = f32[start * INST + 20];
+      let end = start + 1;
+      while (end < count && f32[end * INST + 20] === tid) end++;
+      if (tid < 0) {
+        const m = grabOf(start, end, count);
+        if (m) grabs.push([Math.max(0, m.px0 - 1), Math.max(0, m.pb0 - 1),
+          Math.min(W, m.px0 + m.w + 1), Math.min(Hh, m.pb0 + m.h + 1)]);
       }
       start = end;
     }
-    if (!caps.length) return;
-    let changed = true;
-    while (changed) {
+    cutOn = wasCut;
+    let changed;
+    do {
       changed = false;
-      for (const c of caps) {
-        let hit = false;
-        for (const p of parts) {
-          if (c[0] < p[0] + p[2] && p[0] < c[0] + c[2] && c[1] < p[1] + p[3] && p[1] < c[1] + c[3]) {
-            hit = true;
-            break;
+      for (const p of parts) {
+        let x0 = p[0], y0 = p[1], x1 = x0 + p[2], y1 = y0 + p[3];
+        for (const g of grabs) {
+          if (x0 >= g[2] || x1 <= g[0] || y0 >= g[3] || y1 <= g[1]) continue;
+          if (x0 > g[0] || y0 > g[1] || x1 < g[2] || y1 < g[3]) {
+            x0 = Math.min(x0, g[0]); y0 = Math.min(y0, g[1]);
+            x1 = Math.max(x1, g[2]); y1 = Math.max(y1, g[3]);
+            changed = true;
           }
         }
-        if (!hit) continue;
-        let covers = false;
-        for (const p of parts) {
-          if (p[0] <= c[0] && p[1] <= c[1] && p[0] + p[2] >= c[0] + c[2] && p[1] + p[3] >= c[1] + c[3]) {
-            covers = true;
-            break;
-          }
-        }
-        if (covers) continue;
-        parts.push(c.slice());
-        changed = true;
+        p[0] = x0; p[1] = y0; p[2] = x1 - x0; p[3] = y1 - y0;
       }
-      if (changed) {
-        for (let i = 0; i < parts.length; i++) {
-          for (let j = i + 1; j < parts.length; ) {
-            const a = parts[i], b = parts[j];
-            if (a[0] <= b[0] + b[2] && b[0] <= a[0] + a[2] && a[1] <= b[1] + b[3] && b[1] <= a[1] + a[3]) {
-              const x0 = Math.min(a[0], b[0]), y0 = Math.min(a[1], b[1]);
-              const x1 = Math.max(a[0] + a[2], b[0] + b[2]), y1 = Math.max(a[1] + a[3], b[1] + b[3]);
-              parts[i] = [x0, y0, x1 - x0, y1 - y0];
-              parts.splice(j, 1);
-            } else {
-              j++;
-            }
+      for (let i = 0; i < parts.length; i++) {
+        const a = parts[i];
+        let ax0 = a[0], ay0 = a[1], ax1 = ax0 + a[2], ay1 = ay0 + a[3];
+        for (let j = i + 1; j < parts.length;) {
+          const b = parts[j];
+          const bx0 = b[0], by0 = b[1], bx1 = bx0 + b[2], by1 = by0 + b[3];
+          if (ax0 <= bx1 && bx0 <= ax1 && ay0 <= by1 && by0 <= ay1) {
+            ax0 = Math.min(ax0, bx0); ay0 = Math.min(ay0, by0);
+            ax1 = Math.max(ax1, bx1); ay1 = Math.max(ay1, by1);
+            a[0] = ax0; a[1] = ay0; a[2] = ax1 - ax0; a[3] = ay1 - ay0;
+            parts.splice(j, 1);
+            changed = true;
+          } else {
+            j++;
           }
         }
       }
-    }
+    } while (changed);
   }
 
   function grabLevels(m) {
