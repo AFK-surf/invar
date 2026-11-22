@@ -1,8 +1,8 @@
 # Invar
 
-Invar 是一个纯 Pion 编写的「细粒度 Signals + 保留模式纯节点树」跨端 GPU UI 框架：**零 MoonBit 运行时依赖、零 DOM 控件**，直接驱动五端原生/Web GPU 宿主渲染与排版。
+Invar 是一个纯 Pion 编写的「细粒度 Signals + 保留模式纯节点树」跨端 GPU UI 框架：**零 MoonBit 运行时依赖、零 DOM 控件**，直接驱动六端原生/Web GPU 宿主渲染与排版。
 
-Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-platform GPU UI framework (**zero MoonBit runtime, zero DOM widgets**), targeting five native and web GPU hosts.
+Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-platform GPU UI framework (**zero MoonBit runtime, zero DOM widgets**), targeting six native and web GPU hosts.
 
 ## For AI Agents
 
@@ -32,30 +32,34 @@ scope(world, fn(s : Scope) -> Unit {
 
 ---
 
-## 五端宿主现状 / 5-Platform Host Matrix
+## 六端宿主现状 / 6-Platform Host Matrix
+
+四端 GPU 渲染器（Metal / GLES3 / D3D11 / WebGL2）保持完全同步，包含 15 点 2-trimmed mean 抗乒乓时域自适应液态玻璃与 9-tap 小 sigma 渐进模糊。
 
 | 平台 | 渲染后端 | 文本与系统集成 | 核心源码 | 验证门禁 |
 |---|---|---|---|---|
-| **macOS** | Apple Metal | CoreText / AppKit / AVFoundation | `packages/host/native/apple_*.m`, `mac_app.m` | `pionc2 check packages/host` / `packages/lg_shots` |
+| **macOS** | Apple Metal | CoreText / AppKit / AVFoundation | `packages/host/native/apple_*.m`, `mac_app.m` | `invar host-check` / `packages/lg_shots` |
 | **iOS** | Apple Metal | CoreText / UIKit | `packages/host/native/apple_*.m`, `ios_app.m`, `ios_share.m` | `bash scripts/check-ios-host.sh` |
+| **Android** | EGL / GLES3 | NDK / JNI / FramePacer / Android Text | `packages/host/native/gles_render.h`, `android_host.c`, `android/` | `bash scripts/check-android-host.sh` |
 | **Linux** | EGL / GLES3 | GTK4 / Pango / Cairo / libsoup-3.0 | `packages/host/native/gles_render.h`, `linux_*.c` | `bash scripts/check-linux-host.sh` |
 | **Windows** | Direct3D 11 | DirectWrite / Win32 | `packages/host/native/win_render.cpp`, `win_*.c*` | 四端着色器同步门禁 |
-| **Web** | WebGL2 | `wasm32` + JS Host Bridge | `packages/host_web`, `web/host.js`, `web/pion_host_bridge.mjs` | `pionc2 build --release --target wasm32 packages/lg_web` |
+| **Web** | WebGL2 | `wasm32` + JS Host Bridge（支持 `wasm-opt -Oz`） | `packages/host_web`, `web/host.js`, `web/pion_host_bridge.mjs` | `invar web build && invar web check` |
 
 ---
 
-## 36 个包架构总览 / 36-Package Layout
+## 47 个包架构总览 / 47-Package Layout
 
 | 层级 | 包列表 | 数量 | 职责说明 |
 |---|---|---:|---|
 | **Layer 0（基础库）** | `halt`、`dmath`、`codec`、`zip`、`text`、`signals`、`layer0_check` | 7 | 中止原语、确定性数学、二进制编解码、inflate/SHA-256、Unicode（Bidi/断行/字素）、细粒度响应式 Signals 及联合检查 |
 | **Layer 1A（布局与绘制基础）** | `flex`、`pixels`、`paint`、`damage`、`layer1a_check` | 5 | Flexbox 布局、图像解码（PNG/JPEG/WebP）、矢量/圆角/液态玻璃绘制指令、脏区与遮挡裁剪及联合检查 |
 | **Layer 1B（图形与动效引擎）** | `shape`、`svg`、`font`、`skia`、`effect`、`motion`、`render`、`layer1b_check` | 8 | 文本塑形、SVG 解析、字体管理、2D 路径光栅化、后处理效果、闭式弹簧动效、实例合批渲染及联合检查 |
-| **Layer 2（节点树与交互框架）** | `view`、`headless`、`ui` | 3 | 保留模式纯节点树（`View`）、无头交互与无障碍原语（`headless`）、主题/输入法/`ui::Worker`/离屏 `Tester` 门禁（`ui`） |
-| **Layer 3（宿主桥接与出片）** | `hostapi`、`host`、`host_web`、`invar_host`、`film`、`kit` | 6 | 统一宿主 ABI、多端原生宿主、Web 宿主、兼容宿主包、确定性离屏出图/录片引擎（`film`）、基础 UI 套件（`kit`） |
-| **Liquid Glass 组件与展台** | `lg`、`lg_pages`、`lg_shots`、`lg_web` | 4 | iOS 27 液态玻璃组件库（37+ 公开组件 + `audit_glass` 门禁）、展厅页面、Metal 离屏出图器、WebAssembly 展台 |
+| **Layer 2（节点树、导航与交互框架）** | `view`、`headless`、`ui`、`editor`、`nav` | 5 | 保留模式纯节点树与 `ViewBlock` 快路径（`view`）、无头交互与无障碍原语（`headless`）、主题/输入法/只读选区与超链接/`ui::Worker`/6 道自动 UI 门禁/`InputTape` 回放/桌面缩放拖拽文件手柄/离屏 `Tester`（`ui`）、多行编辑器与光学放大镜（`editor`）、原生栈与手势导航（`nav`） |
+| **Layer 3（宿主桥接与出片）** | `hostapi`、`host`、`host_web`、`invar_host`、`film`、`kit` | 6 | 统一宿主 ABI、六端原生宿主、Web 宿主、兼容宿主包、确定性离屏出图/录片引擎（`film`）、基础 UI 套件（`kit`） |
+| **领域组件与系统扩展** | `code_field`、`terminal`、`player`、`media`、`figure`、`webpage`、`updater`、`textdiff`、`runfs` | 9 | 语法高亮代码编辑器、VT100/ANSI 终端、媒体播放状态机、媒体容器与转码、图表/插图组件、网页容器与桥接、SHA-512 + Ed25519 自更新验签、Myers 文本差分、沙箱文件系统 |
+| **Liquid Glass 组件与展台** | `lg`、`lg_pages`、`lg_shots`、`lg_web` | 4 | iOS 27 液态玻璃组件库（含单层液态玻璃编辑条 `edit_bar` 与 `audit_glass` 门禁）、展厅页面、Metal 离屏出图器、WebAssembly 展台 |
 | **站点与性能基准** | `site`、`bench`、`bench_gpu` | 3 | 官方展示站点、Layer-1 CPU 基准套件、Layer-2 同步 GPU 帧时基准套件 |
-| **合计** | `packages/*` | **36** | 全量纯 Pion 构建，零 MoonBit 依赖 |
+| **合计** | `packages/*` | **47** | 全量纯 Pion 构建，零 MoonBit 依赖 |
 
 ---
 

@@ -1,9 +1,10 @@
 # Working on `AFK-surf/invar` (for agents)
 
-Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-platform GPU UI framework (**zero MoonBit runtime, zero DOM widgets**), targeting five native/web hosts:
+Invar is a pure-Pion, fine-grained-Signals + retained-mode pure-node-tree cross-platform GPU UI framework (**zero MoonBit runtime, zero DOM widgets**), targeting six native/web hosts (47 packages across core layers, `editor`, `nav`, `code_field`, `terminal`, `player`, `media`, `figure`, `webpage`, `updater`, `textdiff`, `runfs`, `lg`, and 6 automated UI craft audit gates + `InputTape` replay in `ui`):
 
 - **macOS** — Apple Metal + CoreText (`packages/host/native/apple_*.m`, `mac_app.m`)
 - **iOS** — Apple Metal + CoreText (`packages/host/native/apple_*.m`, `ios_app.m`, `ios_share.m`)
+- **Android** — EGL / GLES3 + NDK / JNI + FramePacer (`packages/host/native/gles_render.h`, `android_host.c`, `packages/host/native/android/`)
 - **Linux** — EGL / GLES3 + GTK4 + Pango/Cairo (`packages/host/native/gles_render.h`, `linux_*.c`)
 - **Windows** — Direct3D 11 (`packages/host/native/win_render.cpp`, `win_*.c*`)
 - **Web** — `wasm32` + WebGL2 (`packages/host_web`, `web/host.js`, `web/pion_host_bridge.mjs`)
@@ -102,9 +103,9 @@ pub fn build_page(root : view::View) -> Unit {
 - **Mandatory test gate**: every UI test suite with scrollable views must assert `t.scroll_faults().length() == 0` (or call `t.assert_scrollable(label="...")`).
 
 ### 1.5 Keep all 4 GPU renderers in lockstep
-- Any shader, optical transfer model, or instance-layout change in the GPU renderer **MUST** be updated simultaneously across all 4 backends:
+- Any shader, optical transfer model (including 15-tap trimmed-mean temporal adaptive liquid glass and 9-tap small-sigma progressive blur), or instance-layout change in the GPU renderer **MUST** be updated simultaneously across all 4 backends:
   - `packages/host/native/apple_render.m` (macOS / iOS Metal)
-  - `packages/host/native/gles_render.h` (Linux EGL / GLES3)
+  - `packages/host/native/gles_render.h` (Linux / Android EGL / GLES3)
   - `packages/host/native/win_render.cpp` (Windows D3D11)
   - `web/host.js` (Web WebGL2)
 
@@ -148,8 +149,9 @@ $PIONC test examples/jsx_app
 $PIONC build --release --target wasm32 packages/lg_web
 
 # Native host compilation & symbol gates
-bash scripts/check-ios-host.sh                     # macOS: compiles all 12 iOS Metal host sources -> libinvar_host_ios.a
-PIONC=$PIONC bash scripts/check-linux-host.sh      # Linux: compiles all 10 EGL/GLES3+GTK4 host sources + llvmpipe host test
+bash scripts/check-ios-host.sh                     # macOS: compiles all 13 iOS Metal host sources -> libinvar_host_ios.a
+bash scripts/check-android-host.sh                 # macOS: NDK 27.2 JNI/EGL/GLES3 host + FramePacerTest + hygiene gate
+PIONC=$PIONC bash scripts/check-linux-host.sh      # Linux: compiles all 11 EGL/GLES3+GTK4 host sources + llvmpipe host test
 
 # Unified Layer-1 CPU + Layer-2 GPU + wasm32 benchmark suite
 PIONC=$PIONC bash scripts/bench.sh [--out bench.json] [--compare baseline.json] [--cpu-only] [--filter <substr>]
@@ -161,7 +163,7 @@ PIONC=$PIONC bash scripts/bench.sh [--out bench.json] [--compare baseline.json] 
 
 ## 3. Key References
 
-- [`README.md`](README.md) — 36-package architecture overview, unified `invar` CLI, and 5-platform host matrix.
+- [`README.md`](README.md) — 47-package architecture overview, unified `invar` CLI, and 6-platform host matrix.
 - [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md) — The 5 optical and architectural laws of Invar Liquid Glass.
 - [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) — One-page quick-reference catalog of all `lg::*` components and audit gates.
 - [`examples/jsx_app/`](examples/jsx_app/) — Recommended Pion-JSX + Leading-Dot `.Enum` + `ui::Worker` + `packages/lg` showcase app.
