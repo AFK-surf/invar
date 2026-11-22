@@ -59,42 +59,34 @@ scope(world, fn(s : Scope) -> Unit {
 
 ---
 
-## 快检与验证 / Quick Checks
+## 快检与统一 CLI / Quick Checks & `invar` CLI
 
-需要已自举的 `pionc2` 工具链（可将 `PIONC=/path/to/pionc2`，同目录含 `qbe` 与 `libpionrt.a`）：
+推荐使用统一的 `invar` CLI（运行 `bash scripts/install.sh` 安装到 `PATH`，或直接调用 `python3 scripts/invar`），并配置 `PIONC=/path/to/pionc2`（同目录含 `qbe` 与 `libpionrt.a`）：
 
 ```sh
-# 1. 核心纯 Pion 包单测
-pionc2 test packages/layer0_check
-pionc2 test packages/layer1a_check
-pionc2 test packages/layer1b_check
-pionc2 test packages/view
-pionc2 test packages/damage
-pionc2 test packages/headless
-pionc2 test packages/hostapi
-pionc2 test packages/ui
-pionc2 test packages/lg
-pionc2 test packages/bench
-pionc2 test packages/site
-pionc2 test examples/worker_app
+# 1. 环境体检、静态审计、格式/类型检查与全量单测（支持 --json）
+invar doctor --json
+invar audit --json
+invar check --json
+invar test --json
 
-# 2. 宿主与 Liquid Glass 包类型检查
-pionc2 check packages/hostapi
-pionc2 check packages/host
-pionc2 check packages/host_web
-pionc2 check packages/ui
-pionc2 check packages/lg
-pionc2 check packages/lg_pages
-pionc2 check packages/lg_shots
-pionc2 check packages/lg_web
-pionc2 check examples/worker_app
+# 2. 新建 Pion-JSX 应用与 WebAssembly 验证
+invar new my_app --template jsx-app
+invar web check --json          # 编译 lg_web.wasm + node --check + 导入表校验
+invar web dev                   # 启动本地 Web 预览
 
-# 3. Web wasm32 产物构建
+# 3. 离屏出图/像素对比（packages/film 支持 macOS Metal 与 Linux EGL/GLES3 llvmpipe）与原生宿主门禁
+invar shot
+invar diff
+invar host-check
+```
+
+单包开发快检也可以直接调用 `pionc2`：
+
+```sh
+pionc2 check examples/jsx_app
+pionc2 test examples/jsx_app
 pionc2 build --release --target wasm32 packages/lg_web
-
-# 4. 原生宿主编译与符号门禁
-bash scripts/check-ios-host.sh                  # macOS：编译全部 12 个 iOS Metal 源文件
-PIONC=pionc2 bash scripts/check-linux-host.sh   # Linux：编译全部 10 个 EGL/GLES3+GTK4 源文件并跑 llvmpipe 单测
 ```
 
 ---
@@ -118,7 +110,8 @@ PIONC=/path/to/pionc2 bash scripts/bench.sh --cpu-only --filter flex
 
 ## 文档导航 / Documentation
 
-- [`AGENTS.md`](AGENTS.md) — 仓库架构红线、双线程 Worker 规范、防手搓规范与快检命令
+- [`AGENTS.md`](AGENTS.md) — 仓库架构红线、双线程 Worker 规范、统一 `invar` CLI 与快检命令
 - [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md) — Liquid Glass 五大光学与架构铁律
 - [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) — `packages/lg` 一页纸组件速查目录与复制即用样例
-- [`examples/worker_app/`](examples/worker_app/) — 标准双线程 Invar App 完整范例
+- [`examples/jsx_app/`](examples/jsx_app/) — 推荐标杆：纯 Pion-JSX + Leading-Dot `.Enum` + `ui::Worker` + `packages/lg` 应用
+- [`examples/worker_app/`](examples/worker_app/) — 标准双线程 Builder API Invar App 完整范例

@@ -125,37 +125,26 @@ pub fn build_page(root : view::View) -> Unit {
 
 ---
 
-## 2. Quick Checks, Host Verification & Benchmarks
+## 2. Quick Checks, Unified `invar` CLI, Host Verification & Benchmarks
 
-Set `PIONC=/path/to/pionc2` (with sibling `qbe` and `libpionrt.a`, or `PION_QBE` / `PION_RT_LIB` exported).
+Install or run the unified CLI (`scripts/install.sh` puts `invar` on `PATH`, or invoke `python3 scripts/invar` directly). Set `PIONC=/path/to/pionc2` (with sibling `qbe` and `libpionrt.a`, or `PION_QBE` / `PION_RT_LIB` exported).
 
 ```sh
-# Type-check key packages
-$PIONC check packages/hostapi
-$PIONC check packages/host
-$PIONC check packages/host_web
-$PIONC check packages/ui
-$PIONC check packages/lg
-$PIONC check packages/lg_pages
-$PIONC check packages/lg_shots
-$PIONC check packages/lg_web
-$PIONC check examples/worker_app
+# Unified invar CLI (JSON output for agent automation)
+bash scripts/install.sh                            # install `invar` CLI shim
+invar doctor --json                                # verify pionc2, qbe, libpionrt.a, host deps
+invar audit --json                                 # static gates (zero Glass::liquid outside packages/lg, etc.)
+invar check --json                                 # fmt --check + type-check all packages & examples
+invar test --json                                  # unit tests across core layers, hostapi, kit, ui, lg, examples
+invar new my_app --template jsx-app                # scaffold a new Pion-JSX + ui::Worker app
+invar web build|dev|check                          # build/serve/verify wasm32 showcase & JS bridge
+invar shot / invar diff                            # deterministic offscreen PNG render & pixel diff
+invar host-check                                   # native iOS Metal / Linux EGL+GLES3 host gates
+invar bench                                        # unified CPU + GPU + wasm32 benchmark suite
 
-# Unit tests across core layers & Liquid Glass
-$PIONC test packages/layer0_check
-$PIONC test packages/layer1a_check
-$PIONC test packages/layer1b_check
-$PIONC test packages/view
-$PIONC test packages/damage
-$PIONC test packages/headless
-$PIONC test packages/hostapi
-$PIONC test packages/ui
-$PIONC test packages/lg
-$PIONC test packages/bench
-$PIONC test packages/site
-$PIONC test examples/worker_app
-
-# Web wasm32 release build
+# Direct pionc2 commands (single-package fast loop)
+$PIONC check examples/jsx_app
+$PIONC test examples/jsx_app
 $PIONC build --release --target wasm32 packages/lg_web
 
 # Native host compilation & symbol gates
@@ -166,11 +155,14 @@ PIONC=$PIONC bash scripts/check-linux-host.sh      # Linux: compiles all 10 EGL/
 PIONC=$PIONC bash scripts/bench.sh [--out bench.json] [--compare baseline.json] [--cpu-only] [--filter <substr>]
 ```
 
+> **Offscreen rendering (`packages/film`)**: `film::picture` and `film::film` support both **macOS Apple Metal** and **Linux EGL/GLES3** (including headless Mesa `llvmpipe`).
+
 ---
 
 ## 3. Key References
 
-- [`README.md`](README.md) — 36-package architecture overview and 5-platform host matrix.
+- [`README.md`](README.md) — 36-package architecture overview, unified `invar` CLI, and 5-platform host matrix.
 - [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md) — The 5 optical and architectural laws of Invar Liquid Glass.
 - [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) — One-page quick-reference catalog of all `lg::*` components and audit gates.
-- [`examples/worker_app/`](examples/worker_app/) — Reference dual-thread Invar app using `ui::Worker` and `packages/lg`.
+- [`examples/jsx_app/`](examples/jsx_app/) — Recommended Pion-JSX + Leading-Dot `.Enum` + `ui::Worker` + `packages/lg` showcase app.
+- [`examples/worker_app/`](examples/worker_app/) — Classic builder-API dual-thread Invar app using `ui::Worker` and `packages/lg`.
