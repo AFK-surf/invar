@@ -22,7 +22,7 @@
 - **适用场景**：苹果 Messages 级极简悬浮单层自适应液态玻璃输入胶囊（`min_height=44, r=22`，左侧扁平无框圆形 `+`/`Paperclip` 图标钮、中间透明无框 `ui::field`、右侧 `34pt` 正圆 `ArrowUp` 发送钮 + `36pt` 热区），零框套框、零矩形 `"Send"` 文字按钮。
 
 ### 00d. `lg::icon_node` / `<lg::Icon>` & `lg::liquid_back_button_node` / `<lg::BackButton>`
-- **适用场景**：31 个 100% `paint::shape_of` 几何矢量图标（`ChevronLeft`、`Search`、`Plus`、`Paperclip`、`ArrowUp`、`Pin`、`Users`、`Info`、`Settings`、`Sparkles`、`Refresh` 等，1.6–1.8pt 线宽，零 emoji/字体依赖），以及单层悬浮自适应液态玻璃返回岛 `<lg::BackButton>`（`36×36` 正圆 `<` 岛或 `< Label` 胶囊岛，36pt 热区）。
+- **适用场景**：32 个 100% `paint::shape_of` 几何矢量图标（`ChevronLeft`、`Search`、`Plus`、`Paperclip`、`ArrowUp`、`Pin`、`Users`、`Info`、`Settings`、`Sparkles`、`Refresh`、`Minus` 等，1.6–1.8pt 线宽，零 emoji/字体依赖），以及单层悬浮自适应液态玻璃返回岛 `<lg::BackButton>`（`36×36` 正圆 `<` 岛或 `< Label` 胶囊岛，36pt 热区）。
 
 ---
 
@@ -84,7 +84,7 @@ let inner_r = lg::concentric(lg::r_card, 8.0) // 12.0
 | 下拉选择器（Select） | `lg::liquid_select_node` + `lg::LiquidSelectOption` | 严禁手写按钮 + 弹出列表 |
 | 气泡弹层 / 悬浮提示 | `lg::liquid_popover_node` / `lg::liquid_tooltip_node` | 严禁绝对定位手绘气泡 |
 | 弹窗 / 底部 Sheet / 操作表 / 侧边浮岛抽屉 | `lg::liquid_dialog_node` / `lg::liquid_sheet_node` / `lg::liquid_action_sheet_node` / `lg::liquid_drawer_node` + `lg::DrawerSide` | 严禁手写模态遮罩、拖拽关闭与 Escape 关闭 |
-| 开关 / 滑块 / 分段控制 / 步进器 / 标签 | `lg::liquid_toggle_node` / `lg::liquid_slider_node` / `lg::liquid_segmented_node` / `lg::liquid_stepper_node` / `lg::liquid_chip_node` | 严禁手写按压折射透镜；玻璃浮层（`Sheet` / `Drawer` / `Dialog` / `Popover`）或实色卡片内的分段控制传 `flat=true`（实色内凹轨道、不挂拖拽透镜，零玻璃实例） |
+| 开关 / 滑块 / 分段控制 / 步进器 / 标签 | `lg::liquid_toggle_node` / `lg::liquid_slider_node` / `lg::liquid_segmented_node` / `lg::liquid_stepper_node` / `lg::liquid_chip_node`（放在内容层里的分段控制、步进器、标签传 `flat=true`：实色底，不是玻璃；只有浮在页面上的才用玻璃） | 严禁手写按压折射透镜；严禁内容层里的控件用玻璃 |
 | 文本输入 / 复选框 / 单选组 | `lg::liquid_text_field_node` / `lg::liquid_checkbox_node` / `lg::liquid_radio_group_node` | 严禁在玻璃内再嵌玻璃输入项 |
 | 轻提示 / 徽标 / 进度条 / 进度环 | `lg::liquid_toast_node` / `lg::liquid_badge_node` / `lg::liquid_count_badge_node` / `lg::liquid_progress_bar_node` / `lg::liquid_progress_ring_node` | 严禁手写状态色与进度动画 |
 | 连续平面→玻璃浮升容器 | `lg::lg_glass_lift_surface`（静止 `strength <= 0.001` 零玻璃，浮起渐现） | 严禁手动插值 `Glass::liquid` 或静止留 `alpha=0` 玻璃 |
