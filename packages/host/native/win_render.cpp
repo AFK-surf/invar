@@ -3540,7 +3540,7 @@ void mb_render_pace(void) {
 // the target, the text at the list's scale. A frame drawn there is drawn as a window's is, and its snapshot is of it.
 static ID3D11Texture2D *off_target;
 
-extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
+extern "C" int mb_render_init_offscreen(double w, double h, double scale) {
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
   // (the start's device let go of: drawn here by WARP's alone; what its pipeline holds of it is left, a run's)
   if (warm_taken()) {
@@ -3554,7 +3554,7 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
   }
   if (FAILED(make_device(D3D_DRIVER_TYPE_WARP, 0))) {
     fprintf(stderr, "no Direct3D 11 WARP device\n");
-    return;
+    return 0;
   }
   // which WARP drew it (the app's own beside it, as render_windows.sh puts the pinned one, or the system's)
   HMODULE warp = GetModuleHandleW(L"d3d10warp.dll");
@@ -3570,7 +3570,7 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
       dev->Release();
       dev = NULL;
     }
-    return;
+    return 0;
   }
   // (with every kind's pixel shader: what is drawn here is what a window draws once they are made)
   if (kinds_thread) WaitForSingleObject(kinds_thread, INFINITE);
@@ -3587,14 +3587,58 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
   td.SampleDesc.Count = 1;
   td.Usage = D3D11_USAGE_DEFAULT;
   td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-  dev->CreateTexture2D(&td, NULL, &off_target);
-  dev->CreateRenderTargetView(off_target, NULL, &rtv);
+  if (off_target) {
+    off_target->Release();
+    off_target = NULL;
+  }
+  if (rtv) {
+    rtv->Release();
+    rtv = NULL;
+  }
+  HRESULT hr_tex = dev->CreateTexture2D(&td, NULL, &off_target);
+  if (FAILED(hr_tex) || !off_target) {
+    fprintf(stderr, "win_render: offscreen CreateTexture2D failed (0x%08lx)\n", (unsigned long)hr_tex);
+    release_pipeline();
+    if (ctx) {
+      ctx->Release();
+      ctx = NULL;
+    }
+    if (dev) {
+      dev->Release();
+      dev = NULL;
+    }
+    return 0;
+  }
+  HRESULT hr_rtv = dev->CreateRenderTargetView(off_target, NULL, &rtv);
+  if (FAILED(hr_rtv) || !rtv) {
+    fprintf(stderr, "win_render: offscreen CreateRenderTargetView failed (0x%08lx)\n", (unsigned long)hr_rtv);
+    off_target->Release();
+    off_target = NULL;
+    release_pipeline();
+    if (ctx) {
+      ctx->Release();
+      ctx = NULL;
+    }
+    if (dev) {
+      dev->Release();
+      dev = NULL;
+    }
+    return 0;
+  }
   mb_text_set_scale(scale);
+  return 1;
 }
 
 // A frame drawn into the offscreen target and finished: out[0] the CPU's time of it, out[1] the GPU's (not measured
 // here: -1), in ms.
 extern "C" void mb_render_draw_timed(const double *inst, int32_t count, double r, double g, double b, double *out) {
+  if (!ctx || !rtv) {
+    if (out) {
+      out[0] = 0;
+      out[1] = -1;
+    }
+    return;
+  }
   LARGE_INTEGER f, t0, t1;
   QueryPerformanceFrequency(&f);
   QueryPerformanceCounter(&t0);

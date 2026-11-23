@@ -3,6 +3,7 @@
 
 import "view"
 import "hostapi"
+import "signals"
 
 let a11y_sep : String = "\u{1F}"
 
@@ -18,6 +19,7 @@ pub struct SemNode {
   pub label : String
   pub value : String
   pub description : String
+  pub range : Option[(Double, Double, Double)]
   pub actions : String
   pub widget : Int
   pub kids : Array[Int]
@@ -33,6 +35,15 @@ fn sem_kids_eq(a : Array[Int], b : Array[Int]) -> Bool {
   true
 }
 
+fn sem_range_eq(a : Option[(Double, Double, Double)], b : Option[(Double, Double, Double)]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((a0, a1, a2)), Some((b0, b1, b2))) =>
+      (a0 - b0).abs() < 0.001 && (a1 - b1).abs() < 0.001 && (a2 - b2).abs() < 0.001
+    _ => false
+  }
+}
+
 fn sem_node_eq(a : SemNode, b : SemNode) -> Bool {
   a.id == b.id &&
   a.role == b.role &&
@@ -44,6 +55,7 @@ fn sem_node_eq(a : SemNode, b : SemNode) -> Bool {
   a.label == b.label &&
   a.value == b.value &&
   a.description == b.description &&
+  sem_range_eq(a.range, b.range) &&
   a.actions == b.actions &&
   a.widget == b.widget &&
   sem_kids_eq(a.kids, b.kids)
@@ -144,20 +156,117 @@ pub fn A11yMirror::lines(self : A11yMirror) -> String {
   sb.to_string()
 }
 
-/// Build full SemNode snapshot from a view::Tree.
+fn append_action_letter(sb : StringBuilder, seen : String, ch : String) -> String {
+  if seen.contains(ch) {
+    return seen
+  }
+  sb.write_string(ch)
+  seen + ch
+}
+
+fn encode_sem_actions(tree : view::Tree, id : view::NodeId, actions : Array[view::Action]) -> String {
+  let sb = StringBuilder::new()
+  let mut seen = ""
+  for act in actions {
+    let letter = match act {
+      view::Action::Activate => "a"
+      view::Action::Increment => "i"
+      view::Action::Decrement => "d"
+      view::Action::Expand => "e"
+      view::Action::Collapse => "c"
+      view::Action::Dismiss => "x"
+      view::Action::Focus => "f"
+      view::Action::SetText(_) => "t"
+    }
+    seen = append_action_letter(sb, seen, letter)
+  }
+  if tree.acts_on(id) {
+    seen = append_action_letter(sb, seen, "a")
+    if tree.steps_do(id) {
+      seen = append_action_letter(sb, seen, "i")
+      seen = append_action_letter(sb, seen, "d")
+    }
+  }
+  sb.to_string()
+}
+
+/// Build full SemNode snapshot from a view::Tree, preserving semantic parent-child hierarchy
+/// and parent-relative coordinates expected by native hosts and A11yMirror.
 pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
   let order = tree.said_order()
-  let out : Array[SemNode] = []
-  let root_kids : Array[Int] = []
+  let n_order = order.length()
   let mut focus_id = 0
   let (focused_nid, _) = tree.focused_now()
-  for sn in order {
+  let abs_x : Array[Double] = []
+  let abs_y : Array[Double] = []
+  let abs_w : Array[Double] = []
+  let abs_h : Array[Double] = []
+  let nids : Array[Int] = []
+  let kids_by_nid : Map[Int, Array[Int]] = Map::new()
+  kids_by_nid[0] = []
+
+  let mut idx = 0
+  while idx < n_order {
+    let sn = order[idx]
+    let (dx, dy, dw, dh) = match tree.drawn_of(sn.id) {
+      Some(d) => (d.x, d.y, d.w, d.h)
+      None => (0.0, 0.0, 0.0, 0.0)
+    }
+    abs_x.push(dx)
+    abs_y.push(dy)
+    abs_w.push(dw)
+    abs_h.push(dh)
+    match sn.said {
+      Some(_) => {
+        let nid = sn.id.at + 1
+        nids.push(nid)
+        kids_by_nid[nid] = []
+      }
+      None => nids.push(0)
+    }
+    idx += 1
+  }
+
+  let parent_idx_of : Array[Int] = []
+  idx = 0
+  while idx < n_order {
+    let sn = order[idx]
+    if nids[idx] == 0 {
+      parent_idx_of.push(-1)
+      idx += 1
+      continue
+    }
+    let mut pidx = sn.parent
+    while pidx >= 0 && pidx < n_order && nids[pidx] == 0 {
+      pidx = order[pidx].parent
+    }
+    if pidx < 0 || pidx >= n_order {
+      pidx = -1
+    }
+    parent_idx_of.push(pidx)
+    let parent_nid = if pidx >= 0 { nids[pidx] } else { 0 }
+    match kids_by_nid.get(parent_nid) {
+      Some(ks) => ks.push(nids[idx])
+      None => {
+        let ks : Array[Int] = [nids[idx]]
+        kids_by_nid[parent_nid] = ks
+      }
+    }
+    idx += 1
+  }
+
+  let out : Array[SemNode] = []
+  idx = 0
+  while idx < n_order {
+    let sn = order[idx]
     let sd = match sn.said {
       Some(v) => v
-      None => continue
+      None => {
+        idx += 1
+        continue
+      }
     }
-    let nid = sn.id.at + 1
-    root_kids.push(nid)
+    let nid = nids[idx]
     match focused_nid {
       Some(fnid) => if fnid == sn.id { focus_id = nid }
       None => ()
@@ -179,12 +288,23 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
       Some(true) => flags_sb.write_string("s")
       _ => ()
     }
-    if sn.disabled { flags_sb.write_string("d") }
-    let (x, y, w, h) = match tree.drawn_of(sn.id) {
-      Some(d) => (d.x, d.y, d.w, d.h)
-      None => (0.0, 0.0, 0.0, 0.0)
+    match sd.pressed {
+      Some(true) => flags_sb.write_string("p")
+      _ => ()
     }
+    if sn.disabled { flags_sb.write_string("d") }
+    let pidx = parent_idx_of[idx]
+    let px = if pidx >= 0 { abs_x[pidx] } else { 0.0 }
+    let py = if pidx >= 0 { abs_y[pidx] } else { 0.0 }
+    let x = abs_x[idx] - px
+    let y = abs_y[idx] - py
+    let w = abs_w[idx]
+    let h = abs_h[idx]
     let lbl = if sd.label.length() > 0 { sd.label } else { tree.said_label(sn.id) }
+    let kids = match kids_by_nid.get(nid) {
+      Some(ks) => ks
+      None => []
+    }
     out.push(SemNode::{
       id: nid,
       role: rname,
@@ -196,10 +316,16 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
       label: lbl,
       value: sd.value,
       description: sd.description,
-      actions: if tree.acts_on(sn.id) { "a" } else { "" },
+      range: sd.range,
+      actions: encode_sem_actions(tree, sn.id, sd.actions),
       widget: nid,
-      kids: [],
+      kids,
     })
+    idx += 1
+  }
+  let root_kids = match kids_by_nid.get(0) {
+    Some(ks) => ks
+    None => []
   }
   let root = SemNode::{
     id: 0,
@@ -212,6 +338,7 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
     label: "",
     value: "",
     description: "",
+    range: None,
     actions: "",
     widget: 0,
     kids: root_kids,
@@ -226,11 +353,17 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
 /// Incremental sender state tracking what was last sent to the host.
 pub struct A11yTold {
   pub mirror : A11yMirror
+  pub node_ids : Map[Int, view::NodeId]
   pub mut initialized : Bool
 }
 
 pub fn A11yTold::new() -> A11yTold {
-  A11yTold::{ mirror: A11yMirror::new(), initialized: false }
+  A11yTold::{ mirror: A11yMirror::new(), node_ids: Map::new(), initialized: false }
+}
+
+/// Active window's incremental a11y state.
+pub fn view_a11y_told() -> A11yTold {
+  view_app.a11y
 }
 
 /// Reversible field escaping for the `\x1f`-delimited, `\n`-terminated a11y wire format.
@@ -285,25 +418,23 @@ fn encode_sem_wire(full : Bool, focus : Int, changed : Array[SemNode]) -> String
     let lbl = escape_sem_field(n.label)
     let val_s = escape_sem_field(n.value)
     let desc = escape_sem_field(n.description)
-    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{lbl}\{a11y_sep}\{val_s}\{a11y_sep}\{desc}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}\n")
+    let (r_low, r_at, r_high) = match n.range {
+      Some((lo, at_v, hi)) => ("\{lo}", "\{at_v}", "\{hi}")
+      None => ("", "", "")
+    }
+    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{lbl}\{a11y_sep}\{val_s}\{a11y_sep}\{desc}\{a11y_sep}\{r_low}\{a11y_sep}\{r_at}\{a11y_sep}\{r_high}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}\n")
   }
   sb.to_string()
 }
 
 /// Dispatch an incoming accessibility semantic action JSON on `hostapi::a11y_channel`
-/// (`{"id": N, "action"|"op": "press"|"activate"|"inc"|"increment"|"dec"|"decrement"|"focus"|...}`)
-/// directly to the matching node in the active `view_tree()` by node identity (`sn.id.at + 1 == id`).
+/// (`{"action":"resend"}` or `{"id": N, "action"|"op": "press"|"activate"|"inc"|"increment"|"dec"|"decrement"|"focus"|"dismiss"|"set_text", ...}`)
+/// directly to the matching node in the active `view_tree()` by node identity (`sn.id.at + 1 == id`)
+/// with generation validation against the last synced tree.
 pub fn a11y_handle_action(json : String) -> Bool {
   let obj = match hostapi::json_parse(json) {
     Some(hostapi::JsonValue::JObject(m)) => m
     _ => return false
-  }
-  let nid = match obj.get("id") {
-    Some(hostapi::JsonValue::JNumber(v)) => v.to_int()
-    _ => return false
-  }
-  if nid <= 0 {
-    return false
   }
   let op = match obj.get("action") {
     Some(hostapi::JsonValue::JString(s)) => s
@@ -311,6 +442,19 @@ pub fn a11y_handle_action(json : String) -> Bool {
       Some(hostapi::JsonValue::JString(s)) => s
       _ => return false
     }
+  }
+  if op == "resend" {
+    view_app.a11y.initialized = false
+    view_app.a11y.node_ids.clear()
+    hostapi::request_frame()
+    return true
+  }
+  let nid = match obj.get("id") {
+    Some(hostapi::JsonValue::JNumber(v)) => v.to_int()
+    _ => return false
+  }
+  if nid <= 0 {
+    return false
   }
   let tree = match view_tree() {
     Some(t) => t
@@ -327,26 +471,92 @@ pub fn a11y_handle_action(json : String) -> Bool {
     Some(id) => id
     None => return false
   }
+  match view_app.a11y.node_ids.get(nid) {
+    Some(expected) => {
+      if expected.gen != node_id.gen {
+        return false
+      }
+    }
+    None => ()
+  }
   let now = hostapi::now()
+  let mut ok = false
+  signals::start_batch()
   if op == "press" || op == "activate" || op == "expand" || op == "collapse" {
-    return tree.activate_at(node_id, now)
+    ok = tree.activate_at(node_id, now)
+  } else if op == "inc" || op == "increment" {
+    ok = tree.step_at(node_id, 1, now)
+  } else if op == "dec" || op == "decrement" {
+    ok = tree.step_at(node_id, -1, now)
+  } else if op == "focus" {
+    ok = tree.focus_to(Some(node_id), visible=true)
+  } else if op == "dismiss" {
+    ok = tree.ask_action("dismiss", now, from=Some(node_id))
+    if !ok {
+      ok = tree.key_at(key_escape, 0, now)
+    }
+  } else if op == "set_text" {
+    let txt_opt = match obj.get("text") {
+      Some(hostapi::JsonValue::JString(s)) => Some(s)
+      _ => match obj.get("value") {
+        Some(hostapi::JsonValue::JString(s)) => Some(s)
+        _ => None
+      }
+    }
+    match txt_opt {
+      Some(txt) => {
+        let _ = tree.focus_to(Some(node_id), visible=true)
+        let already_focused = match focused_field_ref.v {
+          Some(f) if f.focused_sig.untracked() => true
+          _ => false
+        }
+        if !already_focused {
+          let _ = tree.activate_at(node_id, now)
+        }
+        match focused_field_ref.v {
+          Some(f) if f.focused_sig.untracked() => {
+            f.set(txt)
+            ok = true
+          }
+          _ => {
+            match view_app.text_interceptor {
+              Some(_) => {
+                view_text(0, txt)
+                ok = true
+              }
+              None => ()
+            }
+          }
+        }
+      }
+      None => ()
+    }
   }
-  if op == "inc" || op == "increment" {
-    return tree.step_at(node_id, 1, now)
+  signals::end_batch()
+  if ok {
+    hostapi::request_frame()
   }
-  if op == "dec" || op == "decrement" {
-    return tree.step_at(node_id, -1, now)
+  ok
+}
+
+fn record_a11y_node_ids(tree : view::Tree, dst : Map[Int, view::NodeId]) -> Unit {
+  dst.clear()
+  for sn in tree.said_order() {
+    match sn.said {
+      Some(_) => {
+        dst[sn.id.at + 1] = sn.id
+      }
+      None => ()
+    }
   }
-  if op == "focus" {
-    return tree.focus_to(Some(node_id), visible=true)
-  }
-  false
 }
 
 /// Compute and send incremental a11y update for `tree` against `told`.
 /// Returns (wire_string, changed_nodes_count, full_sent).
 pub fn a11y_sync(tree : view::Tree, told : A11yTold, force_full~ : Bool = false) -> (String, Int, Bool) {
   let (all, focus) = tree_sem_nodes(tree)
+  record_a11y_node_ids(tree, told.node_ids)
+  record_a11y_node_ids(tree, view_app.a11y.node_ids)
   let full = force_full || !told.initialized
   let changed : Array[SemNode] = []
   if full {

@@ -210,7 +210,7 @@ typedef void (*mb_wheel_fn)(double, double, double, double, int32_t);
 typedef void (*mb_key_fn)(int32_t, int32_t);
 typedef void (*mb_text_fn)(int32_t, moonbit_string_t, int32_t, int32_t);
 
-extern void mb_render_init_offscreen(double w, double h, double scale);
+extern int mb_render_init_offscreen(double w, double h, double scale);
 extern void mb_render_present(const double *inst, int32_t count, double r, double g, double b);
 extern int mb_render_snapshot(const char *path);
 extern int32_t mb_render_drawn_pixels(int32_t x, int32_t y, int32_t w, int32_t h, moonbit_bytes_t out);
@@ -374,9 +374,10 @@ extern moonbit_string_t mb_host_native_result(int32_t id);
 
 static int pion_offscreen_active = 0;
 
-void pion_host_init_offscreen(double w, double h, double scale) {
-  pion_offscreen_active = 1;
-  mb_render_init_offscreen(w, h, scale);
+int32_t pion_host_init_offscreen(double w, double h, double scale) {
+  int ok = mb_render_init_offscreen(w, h, scale);
+  pion_offscreen_active = ok ? 1 : 0;
+  return ok ? 1 : 0;
 }
 
 void pion_host_present(const double *buf, int32_t count, double r, double g, double b) {

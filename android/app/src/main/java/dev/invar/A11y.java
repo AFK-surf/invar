@@ -117,6 +117,29 @@ final class A11y extends AccessibilityNodeProvider {
         refresh(app);
     }
 
+    private static String unescape(String s) {
+        if (s == null || s.indexOf('\\') < 0) return s == null ? "" : s;
+        StringBuilder out = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char nxt = s.charAt(i + 1);
+                if (nxt == '\\') { out.append('\\'); i++; continue; }
+                if (nxt == 'n') { out.append('\n'); i++; continue; }
+                if (nxt == 'r') { out.append('\r'); i++; continue; }
+                if (nxt == 'u' && i + 5 < s.length()
+                        && s.charAt(i + 2) == '0' && s.charAt(i + 3) == '0' && s.charAt(i + 4) == '1'
+                        && (s.charAt(i + 5) == 'f' || s.charAt(i + 5) == 'F')) {
+                    out.append('\u001f');
+                    i += 5;
+                    continue;
+                }
+            }
+            out.append(c);
+        }
+        return out.toString();
+    }
+
     /**
      * What the app told of its widgets now (main thread): an update (src/ui/a11y.mbt's head: the nodes that changed,
      * each whole, and which has the keyboard's focus), kept; one in nothing that holds it gone with what it holds; the
@@ -154,9 +177,9 @@ final class A11y extends AccessibilityNodeProvider {
                 n.y = Float.parseFloat(f[5]);
                 n.w = Float.parseFloat(f[6]);
                 n.h = Float.parseFloat(f[7]);
-                n.label = f[8];
-                n.value = f[9];
-                n.description = f[10];
+                n.label = unescape(f[8]);
+                n.value = unescape(f[9]);
+                n.description = unescape(f[10]);
                 if (!f[12].isEmpty()) {
                     n.range = true;
                     n.low = Float.parseFloat(f[11]);

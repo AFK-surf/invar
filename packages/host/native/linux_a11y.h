@@ -337,6 +337,28 @@ static gboolean a11y_selfcheck(gpointer data) {
   return G_SOURCE_REMOVE;
 }
 
+static gchar *a11y_unescape(const char *s) {
+  if (!s) return g_strdup("");
+  if (!strchr(s, '\\')) return g_strdup(s);
+  GString *out = g_string_sized_new(strlen(s));
+  for (size_t i = 0; s[i]; i++) {
+    if (s[i] == '\\' && s[i + 1]) {
+      char nxt = s[i + 1];
+      if (nxt == '\\') { g_string_append_c(out, '\\'); i++; continue; }
+      if (nxt == 'n') { g_string_append_c(out, '\n'); i++; continue; }
+      if (nxt == 'r') { g_string_append_c(out, '\r'); i++; continue; }
+      if (nxt == 'u' && s[i + 2] == '0' && s[i + 3] == '0' && s[i + 4] == '1' &&
+          (s[i + 5] == 'f' || s[i + 5] == 'F')) {
+        g_string_append_c(out, '\x1f');
+        i += 5;
+        continue;
+      }
+    }
+    g_string_append_c(out, s[i]);
+  }
+  return g_string_free(out, FALSE);
+}
+
 // What the widgets are now (@hostapi.a11y_tree): an update of them (a11y.mbt's head: the nodes that changed, each whole,
 // and the focus), kept; one in nothing that holds it gone with what it holds; each told set on its accessible
 void mb_host_a11y_tree(moonbit_string_t s) {
@@ -368,7 +390,7 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     n->nid = atoi(f[1]), n->role = g_strdup(f[2]), n->flags = g_strdup(f[3]);
     n->x = g_ascii_strtod(f[4], NULL), n->y = g_ascii_strtod(f[5], NULL);
     n->w = g_ascii_strtod(f[6], NULL), n->h = g_ascii_strtod(f[7], NULL);
-    n->label = g_strdup(f[8]), n->value = g_strdup(f[9]), n->help = g_strdup(f[10]);
+    n->label = a11y_unescape(f[8]), n->value = a11y_unescape(f[9]), n->help = a11y_unescape(f[10]);
     n->range = f[12][0] != 0;
     n->low = g_ascii_strtod(f[11], NULL), n->at = g_ascii_strtod(f[12], NULL), n->high = g_ascii_strtod(f[13], NULL);
     n->actions = g_strdup(f[14]), n->widget = atoi(f[15]);

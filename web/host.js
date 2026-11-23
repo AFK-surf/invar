@@ -6129,7 +6129,7 @@
       const id = nextTermId++;
       const entry = {
         term: 0, render: 0, rowIt: 0, cells: 0, mouse: 0, mouseEv: 0,
-        pending: true, closed: false, cols: c, rows: r, pendingOps: [],
+        pending: true, closed: false, initCols: c, initRows: r, cols: c, rows: r, pendingOps: [],
         dragActive: false, dragX0: 0, dragY0: 0, dragScreenX0: 0, dragScreenY0: 0,
         mouseSynced: false, mouseButtons: 0,
         buf: new Uint8Array(8192),
@@ -6138,7 +6138,7 @@
       ensureVt().then((loaded) => {
         const cur = terms.get(id);
         if (!cur || !cur.pending) return;
-        const objs = loaded ? initVtTermObj(cur.cols, cur.rows) : null;
+        const objs = loaded ? initVtTermObj(cur.initCols, cur.initRows) : null;
         if (!objs) {
           cur.pending = false;
           cur.closed = true;
@@ -6167,7 +6167,7 @@
     const id = nextTermId++;
     terms.set(id, {
       ...objs,
-      pending: false, closed: false, cols: c, rows: r, pendingOps: [],
+      pending: false, closed: false, initCols: c, initRows: r, cols: c, rows: r, pendingOps: [],
       dragActive: false, dragX0: 0, dragY0: 0, dragScreenX0: 0, dragScreenY0: 0,
       mouseSynced: false, mouseButtons: 0,
       buf: new Uint8Array(8192),
@@ -6206,7 +6206,8 @@
 
   H.termModes = (id) => {
     const t = terms.get(id);
-    return t && !t.pending && !t.closed && vt ? vtModes(t) : 0;
+    if (t && t.closed) return -1;
+    return t && !t.pending && vt ? vtModes(t) : 0;
   };
 
   H.termFrame = (id, flags) => {

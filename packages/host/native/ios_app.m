@@ -2442,6 +2442,29 @@ int32_t mb_host_a11y_on(void) {
   return UIAccessibilityIsVoiceOverRunning() || UIAccessibilityIsSwitchControlRunning() || getenv("MBUI_A11Y_SELFCHECK") ? 1 : 0;
 }
 
+static NSString *a11y_unescape(NSString *s) {
+  if (!s || [s rangeOfString:@"\\"].location == NSNotFound) return s ?: @"";
+  NSUInteger len = s.length;
+  NSMutableString *out = [NSMutableString stringWithCapacity:len];
+  for (NSUInteger i = 0; i < len; i++) {
+    unichar c = [s characterAtIndex:i];
+    if (c == '\\' && i + 1 < len) {
+      unichar nxt = [s characterAtIndex:i + 1];
+      if (nxt == '\\') { [out appendString:@"\\"]; i++; continue; }
+      if (nxt == 'n') { [out appendString:@"\n"]; i++; continue; }
+      if (nxt == 'r') { [out appendString:@"\r"]; i++; continue; }
+      if (nxt == 'u' && i + 5 < len &&
+          [[s substringWithRange:NSMakeRange(i + 2, 4)].lowercaseString isEqualToString:@"001f"]) {
+        [out appendString:@"\x1f"];
+        i += 5;
+        continue;
+      }
+    }
+    [out appendFormat:@"%C", c];
+  }
+  return out;
+}
+
 // What the widgets are now (@hostapi.a11y_tree): an update of them (a11y.mbt's head: the nodes that changed, each whole,
 // and the focus), kept; one in nothing that holds it gone with what it holds; VoiceOver told what changed
 void mb_host_a11y_tree(moonbit_string_t s) {
@@ -2471,7 +2494,7 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     MBA11yNode *n = [MBA11yNode new];
     n.nid = f[1].intValue, n.role = f[2], n.flags = f[3];
     n.rel = CGRectMake(f[4].doubleValue, f[5].doubleValue, f[6].doubleValue, f[7].doubleValue);
-    n.label = f[8], n.value = f[9], n.help = f[10];
+    n.label = a11y_unescape(f[8]), n.value = a11y_unescape(f[9]), n.help = a11y_unescape(f[10]);
     n.range = f[12].length > 0;
     n.low = f[11].doubleValue, n.at = f[12].doubleValue, n.high = f[13].doubleValue;
     n.actions = f[14], n.widget = f[15].intValue;

@@ -3512,3 +3512,289 @@ test "UAX #14 line breaking preserves Cyrillic, Greek, accented Latin words and 
   t2.dispose()
   t.dispose()
 }
+
+test "a11y hierarchy, range, actions, pressed, gen guard, resend, dismiss, and set_text" {
+  let slider_val = signals::signal(50.0)
+  let show_first = signals::signal(true)
+  let first_hits = signals::signal(0)
+  let second_hits = signals::signal(0)
+  let dismissed = signals::signal(0)
+  let fld = Field::new(text="hello")
+  let t = Tester::tree(fn(r : view::View) {
+    let _ = r.box(fn(col : view::View) {
+      let _ = col.width(view::Live::Is(Some(320.0))).height(view::Live::Is(Some(300.0)))
+      // Slider with range + Increment/Decrement + on_step
+      let _ = col
+        .box(fn(_v : view::View) { () })
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(28.0)))
+        .says(view::Live::By(fn() {
+          let v = slider_val.get()
+          Some(view::said(
+            view::Role::Slider,
+            label="Brightness",
+            value="\{v.round().to_int()}%",
+            range=(0.0, v, 100.0),
+            actions=[view::Action::Increment, view::Action::Decrement],
+          ))
+        }))
+        .on_step(fn(by : Int) {
+          slider_val.set(slider_val.untracked() + by.to_double() * 10.0)
+        })
+      // Nested TabList -> Tab hierarchy
+      let _ = col
+        .box(fn(tl : view::View) {
+          let _ = tl
+            .width(view::Live::Is(Some(200.0)))
+            .height(view::Live::Is(Some(32.0)))
+            .says(view::Live::Is(Some(view::said(view::Role::TabList, label="Sections"))))
+          let _ = tl
+            .box(fn(_tab : view::View) { () })
+            .width(view::Live::Is(Some(80.0)))
+            .height(view::Live::Is(Some(28.0)))
+            .says(view::Live::Is(Some(view::said(
+              view::Role::Tab,
+              label="Controls",
+              selected=true,
+              pressed=true,
+              actions=[view::Action::Activate, view::Action::Focus],
+            ))))
+            .on_press(fn() { () })
+        })
+      // Dismissible dialog
+      let _ = col
+        .box(fn(_dlg : view::View) { () })
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(32.0)))
+        .says(view::Live::Is(Some(view::said(
+          view::Role::Dialog,
+          label="Sheet",
+          actions=[view::Action::Dismiss],
+        ))))
+        .on_action("dismiss", fn(_a : view::ActionAt) -> Bool {
+          dismissed.set(dismissed.untracked() + 1)
+          true
+        })
+      // TextField backed by Field
+      let _ = field(col, fld, placeholder="Type here", label="NoteField")
+      // Swappable button to test slot reuse (gen mismatch guard)
+      col.show(
+        fn() { show_first.get() },
+        fn(b : view::View) {
+          let _ = b
+            .box(fn(_v : view::View) { () })
+            .width(view::Live::Is(Some(80.0)))
+            .height(view::Live::Is(Some(28.0)))
+            .says(view::Live::Is(Some(view::said(view::Role::Button, label="FirstBtn"))))
+            .on_press(fn() { first_hits.set(first_hits.untracked() + 1) })
+        },
+        at_once=true,
+      )
+      col.show(
+        fn() { !show_first.get() },
+        fn(b : view::View) {
+          let _ = b
+            .box(fn(_v : view::View) { () })
+            .width(view::Live::Is(Some(80.0)))
+            .height(view::Live::Is(Some(28.0)))
+            .says(view::Live::Is(Some(view::said(view::Role::Button, label="SecondBtn"))))
+            .on_press(fn() { second_hits.set(second_hits.untracked() + 1) })
+        },
+        at_once=true,
+      )
+    })
+  })
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => { debug_assert(false, "view_tree live"); return }
+  }
+  let told = view_a11y_told()
+  let (wire, _, full1) = a11y_sync(tree, told, force_full=true)
+  debug_assert(full1, "initial sync is full")
+
+  let split_us = fn(s : String) -> Array[String] {
+    let parts : Array[String] = []
+    let mut sb = StringBuilder::new()
+    let mut i = 0
+    while i < s.length() {
+      let b = s.code_unit_at(i)
+      if b == 31 {
+        parts.push(sb.to_string())
+        sb = StringBuilder::new()
+      } else {
+        sb.write_byte(b as Byte)
+      }
+      i += 1
+    }
+    parts.push(sb.to_string())
+    parts
+  }
+  let parse_pos_int = fn(s : String) -> Int {
+    let mut v = 0
+    let mut i = 0
+    while i < s.length() {
+      let b = s.code_unit_at(i)
+      if b >= 48 && b <= 57 {
+        v = v * 10 + (b - 48)
+      }
+      i += 1
+    }
+    v
+  }
+
+  // Parse wire lines to verify columns & hierarchy
+  let mut root_kids_str = ""
+  let mut tablist_id = 0
+  let mut tablist_kids_str = ""
+  let mut tab_id = 0
+  let mut tab_flags = ""
+  let mut slider_id = 0
+  let mut slider_low = ""
+  let mut slider_at = ""
+  let mut slider_high = ""
+  let mut slider_actions = ""
+  let mut dlg_id = 0
+  let mut field_id = 0
+  let mut first_btn_id = 0
+  for ln in split_lines(wire) {
+    if ln.length() == 0 { continue }
+    let cols = split_us(ln)
+    if cols.length() >= 17 && cols[0] == "N" {
+      let id_s = cols[1]
+      let role_s = cols[2]
+      let flags_s = cols[3]
+      let lbl_s = cols[8]
+      if id_s == "0" {
+        root_kids_str = cols[16]
+      } else if role_s == "TabList" && lbl_s == "Sections" {
+        tablist_id = parse_pos_int(id_s)
+        tablist_kids_str = cols[16]
+      } else if role_s == "Tab" && lbl_s == "Controls" {
+        tab_id = parse_pos_int(id_s)
+        tab_flags = flags_s
+      } else if role_s == "Slider" && lbl_s == "Brightness" {
+        slider_id = parse_pos_int(id_s)
+        slider_low = cols[11]
+        slider_at = cols[12]
+        slider_high = cols[13]
+        slider_actions = cols[14]
+      } else if role_s == "Dialog" && lbl_s == "Sheet" {
+        dlg_id = parse_pos_int(id_s)
+      } else if role_s == "TextField" && lbl_s == "NoteField" {
+        field_id = parse_pos_int(id_s)
+      } else if role_s == "Button" && lbl_s == "FirstBtn" {
+        first_btn_id = parse_pos_int(id_s)
+      }
+    }
+  }
+  debug_assert(slider_id > 0, "slider found in wire")
+  debug_assert(slider_low == "0" || slider_low == "0.0", "slider low col 11 present: \{slider_low}")
+  debug_assert(slider_at == "50" || slider_at == "50.0", "slider at col 12 present: \{slider_at}")
+  debug_assert(slider_high == "100" || slider_high == "100.0", "slider high col 13 present: \{slider_high}")
+  debug_assert(slider_actions.contains("i") && slider_actions.contains("d"), "slider actions contain i and d: \{slider_actions}")
+  debug_assert(tablist_id > 0 && tab_id > 0, "TabList and Tab found")
+  debug_assert(tablist_kids_str.contains("\{tab_id}"), "TabList kids (\{tablist_kids_str}) contains Tab id \{tab_id}")
+  debug_assert(!root_kids_str.contains("\{tab_id}"), "Tab id \{tab_id} must NOT be flattened into root kids (\{root_kids_str})")
+  debug_assert(tab_flags.contains("p"), "Tab pressed flag 'p' emitted: \{tab_flags}")
+  debug_assert(dlg_id > 0 && field_id > 0 && first_btn_id > 0, "Dialog, TextField, and FirstBtn found")
+
+  // Increment / decrement via a11y channel
+  hand_on_message(hostapi::a11y_channel, "{\"action\":\"increment\",\"id\":\{slider_id}}", None)
+  debug_assert((slider_val.untracked() - 60.0).abs() < 0.01, "slider incremented to 60")
+  hand_on_message(hostapi::a11y_channel, "{\"action\":\"decrement\",\"id\":\{slider_id}}", None)
+  debug_assert((slider_val.untracked() - 50.0).abs() < 0.01, "slider decremented back to 50")
+
+  // Dismiss via a11y channel
+  hand_on_message(hostapi::a11y_channel, "{\"action\":\"dismiss\",\"id\":\{dlg_id}}", None)
+  debug_assert(dismissed.untracked() == 1, "dismiss action delivered")
+
+  // set_text via a11y channel
+  hand_on_message(hostapi::a11y_channel, "{\"action\":\"set_text\",\"id\":\{field_id},\"text\":\"replaced!\"}", None)
+  debug_assert(fld.text() == "replaced!", "set_text replaced Field text, got \{fld.text()}")
+
+  // Gen mismatch guard: swap FirstBtn -> SecondBtn without re-syncing a11y; if slot is reused, old id must be rejected
+  show_first.set(false)
+  let _ = t.scene()
+  let old_ok = a11y_handle_action("{\"action\":\"press\",\"id\":\{first_btn_id}}")
+  debug_assert(!old_ok && first_hits.untracked() == 0 && second_hits.untracked() == 0, "stale node id / recycled slot rejected")
+
+  // Resend (without id!) resets initialized so next a11y_sync emits full=true
+  let resend_ok = a11y_handle_action("{\"action\":\"resend\"}")
+  debug_assert(resend_ok, "resend without id returns true")
+  let (_, _, full_after_resend) = a11y_sync(tree, told)
+  debug_assert(full_after_resend, "next a11y_sync after resend must send full=true")
+  t.dispose()
+}
+
+test "space overflow before kinsoku punctuation rewinds to prior legal break in plain and rich text" {
+  let t = Tester::tree(fn(_r : view::View) { () })
+  let h = hostapi::host()
+  h.shape = fn(s : String, _size : Double, _weight : Int, _style : Int, out : Array[Double]) -> Int {
+    let cps = utf16_codepoints(s)
+    let mut u = 0
+    let mut c = 0
+    while u < cps.length() && c * 4 + 3 < out.length() {
+      let cp = cps[u]
+      let ulen = if cp >= 0x10000 { 2 } else { 1 }
+      let adv = if cp == 32 { 6.0 } else { 10.0 }
+      out[c * 4] = u.to_double()
+      out[c * 4 + 1] = ulen.to_double()
+      out[c * 4 + 2] = if cp == 10 { 0.0 } else { adv }
+      out[c * 4 + 3] = if cp == 10 || cp == 32 || cp == 9 { -1.0 } else { (cp & 0x7FFF).to_double() }
+      u += ulen
+      c += 1
+    }
+    c
+  }
+  h.font_metrics = fn(_size : Double, _weight : Int, _style : Int, out : Array[Double]) {
+    out[0] = 16.0
+    out[1] = 4.0
+  }
+  reset_glyph_atlas()
+  let look = view::WordsLook::{ ..view::words_plain, size: 16.0, line: 20.0, wrap: true }
+
+  // Helper: verify rich layout_runs lines for both "甲乙 ，丙" and "甲乙丙 ，丁" at max_w=30pt
+  let check_runs = fn(s : String, expected_lines : Array[String]) -> Unit {
+    let rl = layout_runs([text::plain(s)], 16.0, 400, 0.0, 0, 0xFFFFFFFFL, true, 30.0, 0)
+    let clusters = rl.clusters
+    let vlines = rl.lines
+    debug_assert(
+      vlines.length() == expected_lines.length(),
+      "layout_runs(\"\{s}\") line count \{vlines.length()} != \{expected_lines.length()}",
+    )
+    let mut li = 0
+    while li < vlines.length() {
+      let vl = vlines[li]
+      let sb = StringBuilder::new()
+      let mut ci = vl.start
+      while ci < vl.end {
+        let cu = clusters[ci].cu
+        if cu == 32 {
+          sb.write_string(" ")
+        } else if cu == 0xFF0C {
+          sb.write_string("，")
+        } else if cu == 0x7532 {
+          sb.write_string("甲")
+        } else if cu == 0x4E59 {
+          sb.write_string("乙")
+        } else if cu == 0x4E19 {
+          sb.write_string("丙")
+        } else if cu == 0x4E01 {
+          sb.write_string("丁")
+        }
+        ci += 1
+      }
+      let got = sb.to_string()
+      debug_assert(!got.starts_with("，"), "line \{li} of \"\{s}\" must never start with fullwidth comma: \"\{got}\"")
+      debug_assert(got == expected_lines[li], "line \{li} of \"\{s}\": got \"\{got}\", expected \"\{expected_lines[li]}\"")
+      li += 1
+    }
+  }
+  check_runs("甲乙 ，丙", ["甲", "乙 ，", "丙"])
+  check_runs("甲乙丙 ，丁", ["甲乙", "丙 ，", "丁"])
+
+  // Also verify host_words_measure agrees on line count (3 lines for "甲乙丙 ，丁" at max_w=30pt)
+  let (_, mh) = host_words_measure("甲乙丙 ，丁", look, 30.0, 1.0)
+  debug_assert((mh / 20.0).round().to_int() == 3, "host_words_measure(\"甲乙丙 ，丁\") at 30pt == 3 lines")
+  t.dispose()
+}

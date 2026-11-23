@@ -13,7 +13,7 @@
 #include <unistd.h>
 #include "moonbit.h"
 
-void mb_render_init_offscreen(double w, double h, double scale);
+int mb_render_init_offscreen(double w, double h, double scale);
 void mb_render_set_size(double w, double h, double scale);
 void mb_text_set_scale(double scale);
 void mb_host_render_dirty(double x, double y, double w, double h);

@@ -472,14 +472,14 @@ void mb_yuv_draw(const mb_yuv *f, unsigned *tex, int *tw, int *th) {
 double mb_host_now(void);
 void mb_host_present(double *buf, int32_t count, double r, double g, double b);
 
-void mb_render_init_offscreen(double w, double h, double scale) {
+int mb_render_init_offscreen(double w, double h, double scale) {
   static EGLDisplay off_dpy = EGL_NO_DISPLAY;
   static EGLContext off_ctx = EGL_NO_CONTEXT;
   if (off_ctx == EGL_NO_CONTEXT) {
     EGLDisplay d = eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, NULL);
     if (d == EGL_NO_DISPLAY || !eglInitialize(d, NULL, NULL)) {
       LOG("mbui-render: no EGL display (surfaceless)");
-      exit(1);
+      return 0;
     }
     eglBindAPI(EGL_OPENGL_ES_API);
     static const EGLint want[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE};
@@ -490,7 +490,7 @@ void mb_render_init_offscreen(double w, double h, double scale) {
     EGLContext ctx = eglCreateContext(d, n > 0 ? cfg : EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, attrs);
     if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
       LOG("mbui-render: no OpenGL ES 3 context");
-      exit(1);
+      return 0;
     }
     off_dpy = d;
     off_ctx = ctx;
@@ -498,11 +498,12 @@ void mb_render_init_offscreen(double w, double h, double scale) {
   } else {
     if (!eglMakeCurrent(off_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, off_ctx)) {
       LOG("mbui-render: failed to make offscreen EGL context current");
-      exit(1);
+      return 0;
     }
   }
   gl_offscreen(w, h, scale);
   mb_text_set_scale(scale);
+  return 1;
 }
 
 void mb_render_draw_timed(const double *inst, int32_t count, double r, double g, double b, double *out) {

@@ -736,6 +736,29 @@ extern "C" {
 // (the run's first window's: a window beside it makes no tree for them, its widgets not read out yet, as on the Mac)
 int32_t mb_host_a11y_on(void) { return asked && mb_app_wid() == 0 && MB_A11Y_CLIENTS_LISTENING() ? 1 : 0; }
 
+static std::wstring a11y_unescape(const std::wstring &s) {
+  if (s.find(L'\\') == std::wstring::npos) return s;
+  std::wstring out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] == L'\\' && i + 1 < s.size()) {
+      wchar_t nxt = s[i + 1];
+      if (nxt == L'\\') { out.push_back(L'\\'); i++; continue; }
+      if (nxt == L'n') { out.push_back(L'\n'); i++; continue; }
+      if (nxt == L'r') { out.push_back(L'\r'); i++; continue; }
+      if (nxt == L'u' && i + 5 < s.size() &&
+          s[i + 2] == L'0' && s[i + 3] == L'0' && s[i + 4] == L'1' &&
+          (s[i + 5] == L'f' || s[i + 5] == L'F')) {
+        out.push_back(L'\x1f');
+        i += 5;
+        continue;
+      }
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
 // What the widgets are now (@hostapi.a11y_tree: an update of them, a11y.mbt's head: the nodes that changed, each whole,
 // and the focus): kept, one in nothing that holds it gone with what it holds, the readers told what changed
 void mb_host_a11y_tree(moonbit_string_t s) {
@@ -760,7 +783,7 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     Node d;
     d.id = (int)number(f[1]), d.role = f[2], d.flags = f[3];
     d.x = number(f[4]), d.y = number(f[5]), d.w = number(f[6]), d.h = number(f[7]);
-    d.label = f[8], d.value = f[9], d.description = f[10];
+    d.label = a11y_unescape(f[8]), d.value = a11y_unescape(f[9]), d.description = a11y_unescape(f[10]);
     d.range = !f[12].empty();
     d.low = number(f[11]), d.at = number(f[12]), d.high = number(f[13]);
     d.actions = f[14], d.widget = (int)number(f[15]);

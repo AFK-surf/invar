@@ -125,6 +125,27 @@ assert d['imports_total'] > 100 and d['imports_missing'] == []
 print('OK: web check lg_web (%d B raw, %d imports, 0 missing)' % (d['raw_bytes'], d['imports_total']))
 " "$WEB_CHK"
 
+echo "=== 8b. invar web build cleans stale _headers/_redirects/wasm across packages ==="
+SHARED_OUT="$TMP/shared_web_out"
+"$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+assert_py "
+import os, sys
+out = sys.argv[1]
+assert os.path.isfile(os.path.join(out, '_headers')), 'lg_web must emit _headers'
+assert os.path.isfile(os.path.join(out, '_redirects')), 'lg_web must emit _redirects'
+assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web must emit lg_web.wasm'
+" "$SHARED_OUT"
+"$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+assert_py "
+import os, sys
+out = sys.argv[1]
+assert not os.path.exists(os.path.join(out, '_headers')), 'stale _headers must be removed for custom pkg'
+assert not os.path.exists(os.path.join(out, '_redirects')), 'stale _redirects must be removed for custom pkg'
+assert not os.path.exists(os.path.join(out, 'lg_web.wasm')), 'stale lg_web.wasm must be removed for custom pkg'
+assert os.path.isfile(os.path.join(out, 'my_web_app.wasm')), 'custom wasm must exist'
+print('OK: shared web out dir cleaned of stale _headers, _redirects, and lg_web.wasm')
+" "$SHARED_OUT"
+
 echo "=== 9. invar diff --json --out --sbs (synthetic PNGs) ==="
 python3 - "$TMP" << 'PYEOF'
 import os, struct, sys, zlib

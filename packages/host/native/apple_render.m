@@ -3917,8 +3917,9 @@ int mb_render_snapshot_drawn(const char *path) {
 // whether it holds the frame drawn last (partial redraw: draw_parts).
 static int off_ok;
 
-void mb_render_init_offscreen(double w, double h, double scale) {
+int mb_render_init_offscreen(double w, double h, double scale) {
   mb_render_init(nil);
+  if (!dev) return 0;
   // (with every kind's pipeline: what is drawn here is what a window draws once they are made)
   dispatch_group_wait(kinds_made, DISPATCH_TIME_FOREVER);
   mb_render_set_size(w, h, scale);
@@ -3931,6 +3932,7 @@ void mb_render_init_offscreen(double w, double h, double scale) {
   td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   td.storageMode = MTLStorageModePrivate;
   off_target = [dev newTextureWithDescriptor:td];
+  return off_target ? 1 : 0;
 }
 
 // Draws a frame into the offscreen texture as a window's frame is drawn

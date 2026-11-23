@@ -140,6 +140,7 @@ export function attachHostBridge(rt, perfHooks = {}) {
   let a11yEl = null;
   const a11yNodes = new Map();
   let a11ySyncingFocus = false;
+  let lastA11yFocusId = "0";
   const pendingA11yGeom = new Set();
   let a11yGeomTimer = null;
 
@@ -170,15 +171,34 @@ export function attachHostBridge(rt, perfHooks = {}) {
     deliverA11yAction({ op: "press", action: "activate", id: Number(id) });
   }
 
+  function absA11yCoords(node) {
+    let x = node.x;
+    let y = node.y;
+    const seen = new Set([node.id]);
+    let pid = node.parent;
+    while (pid && pid !== "0" && !seen.has(pid)) {
+      seen.add(pid);
+      const p = a11yNodes.get(pid);
+      if (!p) break;
+      x += p.x;
+      y += p.y;
+      pid = p.parent;
+    }
+    return { x, y };
+  }
+
   function applyA11yGeometry(el, node) {
+    const abs = absA11yCoords(node);
     el.style.cssText =
-      `position:fixed;left:${node.x}px;top:${node.y}px;width:${node.w}px;height:${node.h}px;` +
+      `position:fixed;left:${abs.x}px;top:${abs.y}px;width:${node.w}px;height:${node.h}px;` +
       "margin:0;padding:0;border:0;background:transparent;pointer-events:none;";
     if (node._last) {
       node._last.x = node.x;
       node._last.y = node.y;
       node._last.w = node.w;
       node._last.h = node.h;
+      node._last.absX = abs.x;
+      node._last.absY = abs.y;
     }
   }
 
@@ -193,13 +213,17 @@ export function attachHostBridge(rt, perfHooks = {}) {
 
   function scheduleA11yGeom(id) {
     pendingA11yGeom.add(id);
+    const n = a11yNodes.get(id);
+    if (n && n.kids && n.kids.length) {
+      for (const k of n.kids) scheduleA11yGeom(k);
+    }
     if (a11yGeomTimer === null) {
       a11yGeomTimer = setTimeout(flushA11yGeom, 200);
     }
   }
 
   function syncA11yElement(node, root, structuralChanged) {
-    if (node.id === "0") return;
+    if (node.id === "0") return false;
     const spec = a11yRoleSpec(node.role);
     let el = node.el;
     let created = false;
@@ -219,14 +243,24 @@ export function attachHostBridge(rt, perfHooks = {}) {
         if (!cur || cur.flags.includes("d")) return;
         deliverA11yAction({ op: "focus", action: "focus", id: Number(nid) });
       });
-      if (spec.tag !== "button") {
-        el.addEventListener("keydown", (e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            activateA11yNode(nid);
-          }
-        });
-      }
+      el.addEventListener("keydown", (e) => {
+        const cur = a11yNodes.get(nid);
+        if (!cur || cur.flags.includes("d")) return;
+        if ((e.key === "ArrowUp" || e.key === "ArrowRight") && cur.actions.includes("i")) {
+          e.preventDefault();
+          deliverA11yAction({ op: "inc", action: "increment", id: Number(nid) });
+          return;
+        }
+        if ((e.key === "ArrowDown" || e.key === "ArrowLeft") && cur.actions.includes("d")) {
+          e.preventDefault();
+          deliverA11yAction({ op: "dec", action: "decrement", id: Number(nid) });
+          return;
+        }
+        if (spec.tag !== "button" && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          activateA11yNode(nid);
+        }
+      });
       node.el = el;
       root.appendChild(el);
       created = true;
@@ -241,11 +275,15 @@ export function attachHostBridge(rt, perfHooks = {}) {
       semanticChanged = true;
     }
 
+    const isGenericText = node.role === "Text" || (spec.tag === "span" && spec.role === null);
+    const hasKids = node.kids && node.kids.length > 0;
     const label = node.label || node.value || node.description || "";
-    if (!last || last.label !== label) {
-      if (label) el.setAttribute("aria-label", label);
+    if (!last || last.label !== label || last.isGenericText !== isGenericText || last.hasKids !== hasKids) {
+      if (!isGenericText && label) el.setAttribute("aria-label", label);
       else el.removeAttribute("aria-label");
-      if (el.textContent !== label) el.textContent = label;
+      if (!hasKids) {
+        if (el.textContent !== label) el.textContent = label;
+      }
       semanticChanged = true;
     }
 
@@ -263,6 +301,9 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (flags.includes("s")) el.setAttribute("aria-selected", "true");
       else el.removeAttribute("aria-selected");
 
+      if (flags.includes("p")) el.setAttribute("aria-pressed", "true");
+      else el.removeAttribute("aria-pressed");
+
       const disabled = flags.includes("d");
       if (disabled) el.setAttribute("aria-disabled", "true");
       else el.removeAttribute("aria-disabled");
@@ -276,21 +317,58 @@ export function attachHostBridge(rt, perfHooks = {}) {
       semanticChanged = true;
     }
 
+    if (
+      !last ||
+      last.hasRange !== node.hasRange ||
+      last.rangeLow !== node.rangeLow ||
+      last.rangeAt !== node.rangeAt ||
+      last.rangeHigh !== node.rangeHigh
+    ) {
+      if (node.hasRange) {
+        el.setAttribute("aria-valuemin", node.rangeLow);
+        el.setAttribute("aria-valuenow", node.rangeAt);
+        el.setAttribute("aria-valuemax", node.rangeHigh);
+      } else {
+        el.removeAttribute("aria-valuemin");
+        el.removeAttribute("aria-valuenow");
+        el.removeAttribute("aria-valuemax");
+      }
+      semanticChanged = true;
+    }
+
     const disabled = flags.includes("d");
-    const focusable = node.actions.includes("a") && !disabled;
+    const focusable =
+      (node.actions.includes("a") ||
+        node.actions.includes("i") ||
+        node.actions.includes("d") ||
+        node.actions.includes("f")) &&
+      !disabled;
     if (!last || last.actions !== node.actions || last.disabled !== disabled) {
       if (focusable) el.tabIndex = 0;
       else el.removeAttribute("tabindex");
       semanticChanged = true;
     }
 
+    const abs = absA11yCoords(node);
     const geomChanged =
-      !last || last.x !== node.x || last.y !== node.y || last.w !== node.w || last.h !== node.h;
+      !last ||
+      last.x !== node.x ||
+      last.y !== node.y ||
+      last.w !== node.w ||
+      last.h !== node.h ||
+      last.absX !== abs.x ||
+      last.absY !== abs.y;
 
     node._last = {
       role: spec.role,
       label,
+      isGenericText,
+      hasKids,
       value: node.value,
+      hasRange: node.hasRange,
+      rangeLow: node.rangeLow,
+      rangeAt: node.rangeAt,
+      rangeHigh: node.rangeHigh,
       flags,
       actions: node.actions,
       disabled,
@@ -298,6 +376,8 @@ export function attachHostBridge(rt, perfHooks = {}) {
       y: last ? last.y : node.y,
       w: last ? last.w : node.w,
       h: last ? last.h : node.h,
+      absX: last ? last.absX : abs.x,
+      absY: last ? last.absY : abs.y,
     };
 
     if (geomChanged) {
@@ -308,6 +388,7 @@ export function attachHostBridge(rt, perfHooks = {}) {
         scheduleA11yGeom(node.id);
       }
     }
+    return semanticChanged;
   }
 
   function applyA11yTree(wire) {
@@ -327,8 +408,10 @@ export function attachHostBridge(rt, perfHooks = {}) {
       } else if (parts[0] === "N" && parts.length >= 17) {
         const kidsRaw = parts[16] || "";
         const kids = kidsRaw ? kidsRaw.split(",").filter(Boolean) : [];
+        const hasRange = !!(parts[12] && parts[12].length > 0);
         batch.push({
           id: parts[1],
+          parent: "0",
           role: parts[2] || "",
           flags: parts[3] || "",
           x: Number(parts[4]) || 0,
@@ -338,6 +421,10 @@ export function attachHostBridge(rt, perfHooks = {}) {
           label: unescapeSemField(parts[8] || ""),
           value: unescapeSemField(parts[9] || ""),
           description: unescapeSemField(parts[10] || ""),
+          hasRange,
+          rangeLow: parts[11] || "",
+          rangeAt: parts[12] || "",
+          rangeHigh: parts[13] || "",
           actions: parts[14] || "",
           widget: Number(parts[15]) || 0,
           kids,
@@ -368,9 +455,13 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const n = batch[i];
       const prev = a11yNodes.get(n.id);
       if (prev) {
+        n.parent = prev.parent || "0";
         const nextKids = new Set(n.kids);
         for (const k of prev.kids) {
           if (!nextKids.has(k)) letGo.push(k);
+        }
+        if (prev.kids.length !== n.kids.length || prev.kids.some((k, idx) => k !== n.kids[idx])) {
+          structuralChanged = true;
         }
         n.el = prev.el || null;
         n._last = prev._last || null;
@@ -380,6 +471,14 @@ export function attachHostBridge(rt, perfHooks = {}) {
         structuralChanged = true;
       }
       a11yNodes.set(n.id, n);
+    }
+
+    for (let i = 0; i < batch.length; i++) {
+      const n = batch[i];
+      for (const k of n.kids) {
+        const c = a11yNodes.get(k);
+        if (c) c.parent = n.id;
+      }
     }
 
     for (let i = 0; i < letGo.length; i++) {
@@ -395,22 +494,50 @@ export function attachHostBridge(rt, perfHooks = {}) {
       }
     }
 
+    let anySemanticOrStruct = structuralChanged;
     for (let i = 0; i < batch.length; i++) {
-      syncA11yElement(batch[i], root, structuralChanged);
+      if (syncA11yElement(batch[i], root, structuralChanged)) {
+        anySemanticOrStruct = true;
+      }
     }
-    root.dataset.treeLen = String(wire.length);
 
-    if (focusId && focusId !== "0" && document.activeElement && root.contains(document.activeElement)) {
-      const target = a11yNodes.get(focusId)?.el;
-      if (target && target !== document.activeElement && typeof target.focus === "function") {
-        a11ySyncingFocus = true;
-        try {
-          target.focus({ preventScroll: true });
-        } finally {
-          a11ySyncingFocus = false;
+    // Mount children under their real semantic parent DOM element in kids order
+    if (structuralChanged) {
+      for (let i = 0; i < batch.length; i++) {
+        const p = batch[i];
+        const parentEl = p.id === "0" ? root : p.el;
+        if (!parentEl || !p.kids.length) continue;
+        for (const k of p.kids) {
+          const c = a11yNodes.get(k);
+          if (c && c.el && c.el !== parentEl && c.el.parentNode !== parentEl) {
+            parentEl.appendChild(c.el);
+          }
         }
       }
     }
+
+    if (anySemanticOrStruct) {
+      root.dataset.treeLen = String(wire.length);
+    }
+
+    if (focusId && focusId !== "0") {
+      const ae = document.activeElement;
+      const inA11y = !!(ae && root.contains(ae));
+      const isNeutralHost =
+        !ae || ae === document.body || ae === document.documentElement || ae.id === "c";
+      if (inA11y || (focusId !== lastA11yFocusId && isNeutralHost)) {
+        const target = a11yNodes.get(focusId)?.el;
+        if (target && target !== ae && typeof target.focus === "function") {
+          a11ySyncingFocus = true;
+          try {
+            target.focus({ preventScroll: true });
+          } finally {
+            a11ySyncingFocus = false;
+          }
+        }
+      }
+    }
+    lastA11yFocusId = focusId;
   }
 
   // WebAuthn / Passkeys async request table

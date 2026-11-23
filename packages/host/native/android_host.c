@@ -594,11 +594,12 @@ int32_t mb_render_pixels_of(const double *inst, int32_t count, double r, double 
 // density), the images' uploads done when it asks (Images.hold, mb_render_spin).
 double mb_host_now(void);
 
-void mb_render_init_offscreen(double w, double h, double scale) {
+int mb_render_init_offscreen(double w, double h, double scale) {
   JNIEnv *env = env_();
   gl_offscreen(w, h, scale);
   (*env)->CallStaticVoidMethod(env, text_cls, m_text_scale, (jfloat)scale);
   (*env)->CallStaticVoidMethod(env, images_cls, m_img_hold);
+  return 1;
 }
 
 void mb_render_draw_timed(const double *inst, int32_t count, double r, double g, double b, double *out) {

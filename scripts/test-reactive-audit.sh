@@ -340,4 +340,77 @@ pub fn same_signal_self_write() -> () -> Unit {
 ')"
 run_case "pos_e009_same_signal" "$PKG_E009_SAME_SIG" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
 
+# 12. Positive E009: plain signal alias `let a2 = a`, read `a.get()`, write `a2.set(...)`
+PKG_E009_PLAIN_ALIAS="$(make_pkg "pos_e009_plain_alias" '
+import "signals"
+
+pub fn plain_alias_self_write() -> () -> Unit {
+  let a = signals::signal(0)
+  let a2 = a
+  signals::effect(fn() -> Unit {
+    let v = a.get()
+    if v < 5 {
+      a2.set(v + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_plain_alias" "$PKG_E009_PLAIN_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
+# 13. Positive E009: distant alias `let ro = s.read()` more than 130 lines before effect
+DISTANT_PAD=""
+for _i in $(seq 1 135); do
+  DISTANT_PAD="${DISTANT_PAD}  let _pad_${_i} = ${_i}
+"
+done
+PKG_E009_DISTANT_ALIAS="$(make_pkg "pos_e009_distant_alias" "
+import \"signals\"
+
+pub fn distant_alias_self_write() -> () -> Unit {
+  let s = signals::signal(0)
+  let ro = s.read()
+${DISTANT_PAD}  signals::effect(fn() -> Unit {
+    let v = ro.get()
+    if v < 5 {
+      s.set(v + 1)
+    }
+  })
+}
+")"
+run_case "pos_e009_distant_alias" "$PKG_E009_DISTANT_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
+# 14. Negative E009: commented-out fake alias `// let r = b.read()` must NOT cause false positive
+PKG_E009_COMMENT_ALIAS="$(make_pkg "neg_e009_comment_alias" '
+import "signals"
+
+pub fn comment_alias_clean() -> () -> Unit {
+  let a = signals::signal(1)
+  let b = signals::signal(0)
+  let r = a.read()
+  // let r = b.read()
+  /* let a = b */
+  signals::effect(fn() -> Unit {
+    b.set(r.get() + 1)
+  })
+}
+')"
+run_case "neg_e009_comment_alias" "$PKG_E009_COMMENT_ALIAS" "clean"
+
+# 15. Positive E009: inner local alias inside effect closure body `let r = s.read()`
+PKG_E009_INNER_ALIAS="$(make_pkg "pos_e009_inner_alias" '
+import "signals"
+
+pub fn inner_alias_self_write() -> () -> Unit {
+  let s = signals::signal(0)
+  signals::effect(fn() -> Unit {
+    let r = s.read()
+    let v = r.get()
+    if v < 5 {
+      s.set(v + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_inner_alias" "$PKG_E009_INNER_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="

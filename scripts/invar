@@ -59,7 +59,7 @@ def discover_workspace_pkgs(mode):
         if name in WASM32_ONLY_PKGS:
             skipped.append({
                 "pkg": spec,
-                "reason": "wasm32-only package (verified via `invar web check`)",
+                "reason": "wasm32-only browser package (checked via invar web check)",
             })
             continue
         if mode == "check":
@@ -1097,21 +1097,84 @@ def _extract_closure_body(lines, start_line, start_col):
     return ""
 
 
-def _collect_readonly_signal_aliases(lines, start_line):
+def _strip_pion_comments_and_strings(src):
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if c == "/" and nxt == "/":
+            i += 2
+            while i < n and src[i] != "\n":
+                i += 1
+        elif c == "/" and nxt == "*":
+            i += 2
+            depth = 1
+            while i < n and depth > 0:
+                if src[i] == "/" and i + 1 < n and src[i + 1] == "*":
+                    depth += 1
+                    i += 2
+                elif src[i] == "*" and i + 1 < n and src[i + 1] == "/":
+                    depth -= 1
+                    i += 2
+                else:
+                    if src[i] == "\n":
+                        out.append("\n")
+                    i += 1
+        elif c == '"':
+            out.append('""')
+            i += 1
+            while i < n:
+                if src[i] == "\\":
+                    i += 2
+                elif src[i] == '"':
+                    i += 1
+                    break
+                else:
+                    if src[i] == "\n":
+                        out.append("\n")
+                    i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+_SIGNAL_ALIAS_RE = re.compile(
+    r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*([A-Za-z_]\w*)(?:\s*\.\s*read\s*\(\s*\))?(?=\s*(?:[;\n]|$))"
+)
+
+
+def _scan_signal_aliases(cleaned_text, aliases):
+    for m in _SIGNAL_ALIAS_RE.finditer(cleaned_text):
+        lhs, rhs = m.group(1), m.group(2)
+        if lhs != rhs and rhs not in ("true", "false", "None"):
+            aliases[lhs] = rhs
+
+
+def _resolve_alias_root(name, aliases):
+    cur = name
+    seen = set()
+    while cur in aliases and cur not in seen:
+        seen.add(cur)
+        cur = aliases[cur]
+    return cur
+
+
+def _collect_signal_aliases(lines, start_line):
     aliases = {}
     if not lines or start_line <= 1:
         return aliases
-    # Walk backward to enclosing fn header (bounded to 120 lines)
-    lo = max(0, start_line - 121)
-    fn_start = lo
-    for idx in range(start_line - 2, lo - 1, -1):
+    # Walk backward to the true enclosing fn header (no fixed line cap)
+    fn_start = 0
+    for idx in range(start_line - 2, -1, -1):
         if re.match(r"^\s*(?:pub\s+)?fn\s+[A-Za-z_]", lines[idx]):
             fn_start = idx
             break
-    alias_re = re.compile(r"\blet\s+([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*([A-Za-z_]\w*)\.read\s*\(\s*\)")
-    for idx in range(fn_start, start_line - 1):
-        for m in alias_re.finditer(lines[idx]):
-            aliases[m.group(1)] = m.group(2)
+    prefix_src = "\n".join(lines[fn_start : start_line - 1])
+    cleaned_prefix = _strip_pion_comments_and_strings(prefix_src)
+    _scan_signal_aliases(cleaned_prefix, aliases)
     return aliases
 
 
@@ -1120,18 +1183,17 @@ def _analyze_effect_signal_identity(file_lines_cache, fpath, line, col, captures
     body = _extract_closure_body(lines, line, col)
     if not body:
         return ("unknown", [])
-    # Strip line comments and string literals before scanning receiver.method(
-    cleaned = re.sub(r"//[^\n]*", "", body)
-    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
-    aliases = _collect_readonly_signal_aliases(lines, line)
+    cleaned = _strip_pion_comments_and_strings(body)
+    aliases = _collect_signal_aliases(lines, line)
+    _scan_signal_aliases(cleaned, aliases)
     cap_names = {c.get("name", "") for c in captures if c.get("name")}
     read_roots = set()
     write_roots = set()
     for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(", cleaned):
         recv, meth = m.group(1), m.group(2)
-        if recv not in cap_names:
+        root = _resolve_alias_root(recv, aliases)
+        if recv not in cap_names and root not in cap_names:
             continue
-        root = aliases.get(recv, recv)
         if meth in _EFFECT_READ_METHODS:
             read_roots.add(root)
         elif meth in _EFFECT_WRITE_METHODS:
@@ -2412,6 +2474,12 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
         else:
             wasm_opt_skipped = "wasm-opt not found"
 
+    for entry in os.listdir(out_dir):
+        if entry.endswith(".wasm") and entry not in (wasm_name, "ghostty-vt.wasm"):
+            try:
+                os.unlink(os.path.join(out_dir, entry))
+            except OSError:
+                pass
     required_files = list(WEB_DIST_RUNTIME_FILES) + list(WEB_STATIC_ASSETS)
     if pkg_name == "lg_web":
         required_files.extend(["_headers", "_redirects"])
@@ -2423,8 +2491,11 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
     if pkg_name != "lg_web":
         for cf in ("_headers", "_redirects"):
             custom_src = os.path.join(pkg_dir, cf)
+            dst_cf = os.path.join(out_dir, cf)
             if os.path.isfile(custom_src):
-                shutil.copy2(custom_src, os.path.join(out_dir, cf))
+                shutil.copy2(custom_src, dst_cf)
+            elif os.path.isfile(dst_cf):
+                os.unlink(dst_cf)
     vt_src = os.path.join(INVAR_ROOT, "web", "ghostty-vt.wasm")
     if os.path.isfile(vt_src):
         shutil.copy2(vt_src, os.path.join(out_dir, "ghostty-vt.wasm"))
