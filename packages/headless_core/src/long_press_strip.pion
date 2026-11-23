@@ -1,0 +1,212 @@
+// Long-press delayed pop-up strip with drag-to-select and release-to-commit state machine.
+
+import "signals"
+
+/// Bounding box of one selectable slot in a `LongPressStrip`.
+#derive(Eq)
+pub struct StripSlot {
+  pub x : Double
+  pub y : Double
+  pub w : Double
+  pub h : Double
+}
+
+pub fn StripSlot::new(x : Double, y : Double, w : Double, h : Double) -> StripSlot {
+  StripSlot::{ x, y, w, h }
+}
+
+/// Convenience 1D horizontal slot constructor spanning `[start, start + size]` with wide cross axis.
+pub fn StripSlot::from_1d(
+  start : Double,
+  size : Double,
+  cross_size~ : Double = 10000.0,
+) -> StripSlot {
+  StripSlot::{ x: start, y: -cross_size * 0.5, w: size, h: cross_size }
+}
+
+/// Lifecycle state of a `LongPressStrip` gesture.
+#derive(Eq)
+pub enum LongPressState {
+  Idle
+  Pending(Double)
+  Open(Int)
+  Commit(Int)
+  Cancelled
+}
+
+fn long_press_state_eq(a : LongPressState, b : LongPressState) -> Bool {
+  a == b
+}
+
+fn slot_pick_index(x : Double, y : Double, slots : Array[StripSlot]) -> Int {
+  let n = slots.length()
+  if n == 0 {
+    return 0
+  }
+  let mut i = 0
+  while i < n {
+    let s = slots[i]
+    if x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h {
+      return i
+    }
+    i += 1
+  }
+  let mut best_i = 0
+  let mut best_d2 = 1.0e30
+  let mut j = 0
+  while j < n {
+    let s = slots[j]
+    let cx = clamp_double(x, s.x, s.x + s.w)
+    let cy = clamp_double(y, s.y, s.y + s.h)
+    let dx = x - cx
+    let dy = y - cy
+    let d2 = dx * dx + dy * dy
+    if d2 < best_d2 {
+      best_d2 = d2
+      best_i = j
+    }
+    j += 1
+  }
+  best_i
+}
+
+/// State machine for long-press delayed pop-up strips (reaction bars, accent pickers, radial menus).
+pub struct LongPressStrip {
+  hold_ms : Double
+  slop_px : Double
+  state_sig : signals::Signal[LongPressState]
+  start_x : Ref[Double]
+  start_y : Ref[Double]
+  cur_x : Ref[Double]
+  cur_y : Ref[Double]
+}
+
+/// Create a `LongPressStrip` with hold delay `hold_ms` and pending movement tolerance `slop_px`.
+pub fn LongPressStrip::new(
+  hold_ms~ : Double = 320.0,
+  slop_px~ : Double = 10.0,
+) -> LongPressStrip {
+  LongPressStrip::{
+    hold_ms: if hold_ms >= 0.0 { hold_ms } else { 0.0 },
+    slop_px: if slop_px >= 0.0 { slop_px } else { 0.0 },
+    state_sig: signals::signal_by(LongPressState::Idle, long_press_state_eq),
+    start_x: ref_new(0.0),
+    start_y: ref_new(0.0),
+    cur_x: ref_new(0.0),
+    cur_y: ref_new(0.0),
+  }
+}
+
+/// Current lifecycle state (reactive).
+pub fn LongPressStrip::state(self : LongPressStrip) -> LongPressState {
+  self.state_sig.get()
+}
+
+/// Active or committed slot index, if open or committed (reactive).
+pub fn LongPressStrip::active_index(self : LongPressStrip) -> Option[Int] {
+  match self.state_sig.get() {
+    Open(idx) | Commit(idx) => Some(idx)
+    _ => None
+  }
+}
+
+/// Pointer down at `(x, y)` at `now_ms`: enters `Pending(now_ms + hold_ms)`.
+pub fn LongPressStrip::on_down(
+  self : LongPressStrip,
+  x : Double,
+  y : Double,
+  now_ms : Double,
+) -> LongPressState {
+  self.start_x.v = x
+  self.start_y.v = y
+  self.cur_x.v = x
+  self.cur_y.v = y
+  let st = LongPressState::Pending(now_ms + self.hold_ms)
+  self.state_sig.set(st)
+  st
+}
+
+/// Advance clock to `now_ms`: transitions `Pending(due)` to `Open(idx)` once `now_ms >= due`.
+pub fn LongPressStrip::on_tick(
+  self : LongPressStrip,
+  now_ms : Double,
+  slots : Array[StripSlot],
+) -> LongPressState {
+  match self.state_sig.untracked() {
+    Pending(due) =>
+      if now_ms >= due {
+        let idx = slot_pick_index(self.cur_x.v, self.cur_y.v, slots)
+        let st = LongPressState::Open(idx)
+        self.state_sig.set(st)
+        st
+      } else {
+        LongPressState::Pending(due)
+      }
+    other => other
+  }
+}
+
+/// Pointer move to `(x, y)` at `now_ms`:
+/// - During `Pending(due)`: auto-opens if `now_ms >= due`; otherwise cancels if moved past `slop_px`.
+/// - During `Open(_)`: updates active slot index to hit or nearest slot.
+pub fn LongPressStrip::on_move(
+  self : LongPressStrip,
+  x : Double,
+  y : Double,
+  now_ms : Double,
+  slots : Array[StripSlot],
+) -> LongPressState {
+  self.cur_x.v = x
+  self.cur_y.v = y
+  match self.state_sig.untracked() {
+    Pending(due) =>
+      if now_ms >= due {
+        let idx = slot_pick_index(x, y, slots)
+        let st = LongPressState::Open(idx)
+        self.state_sig.set(st)
+        st
+      } else {
+        let dx = x - self.start_x.v
+        let dy = y - self.start_y.v
+        if dx * dx + dy * dy > self.slop_px * self.slop_px {
+          self.state_sig.set(LongPressState::Cancelled)
+          LongPressState::Cancelled
+        } else {
+          LongPressState::Pending(due)
+        }
+      }
+    Open(_) => {
+      let idx = slot_pick_index(x, y, slots)
+      let st = LongPressState::Open(idx)
+      self.state_sig.set(st)
+      st
+    }
+    other => other
+  }
+}
+
+/// Pointer release: commits `Open(idx)` -> `Commit(idx)`, cancels `Pending(_)` -> `Cancelled`.
+pub fn LongPressStrip::on_up(self : LongPressStrip) -> LongPressState {
+  match self.state_sig.untracked() {
+    Open(idx) => {
+      let st = LongPressState::Commit(idx)
+      self.state_sig.set(st)
+      st
+    }
+    Pending(_) => {
+      self.state_sig.set(LongPressState::Cancelled)
+      LongPressState::Cancelled
+    }
+    other => other
+  }
+}
+
+/// Cancel the gesture.
+pub fn LongPressStrip::cancel(self : LongPressStrip) -> Unit {
+  self.state_sig.set(LongPressState::Cancelled)
+}
+
+/// Reset back to `Idle`.
+pub fn LongPressStrip::reset(self : LongPressStrip) -> Unit {
+  self.state_sig.set(LongPressState::Idle)
+}

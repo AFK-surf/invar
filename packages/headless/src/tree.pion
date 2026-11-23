@@ -1,6 +1,7 @@
 // Tree control: tri-state cascade checking, expand/collapse navigation (with RTL),
 // collapse focus recovery, roving focus, typeahead, and selection model.
 
+import "headless_core"
 import "signals"
 import "view"
 
@@ -34,57 +35,25 @@ pub fn TreeNodeSpec::new[K](
   TreeNodeSpec::{ key, parent, disabled }
 }
 
-fn tree_contains_key[K : view::ViewEq](arr : Array[K], target : K) -> Bool {
-  for x in arr {
-    if x.eq(target) {
-      return true
-    }
+fn to_core_tree_strategy(s : TreeCheckStrategy) -> headless_core::TreeCheckStrategy {
+  match s {
+    Independent => headless_core::TreeCheckStrategy::Independent
+    Cascade => headless_core::TreeCheckStrategy::Cascade
   }
-  false
 }
 
-fn tree_children_of[K : view::ViewEq](nodes : Array[TreeNodeSpec[K]], parent_key : K) -> Array[TreeNodeSpec[K]] {
-  let out : Array[TreeNodeSpec[K]] = []
-  for n in nodes {
-    match n.parent {
-      Some(p) => if p.eq(parent_key) { out.push(n) }
-      None => ()
-    }
+fn from_core_tree_state(s : headless_core::TreeCheckState) -> TreeCheckState {
+  match s {
+    Unchecked => TreeCheckState::Unchecked
+    Checked => TreeCheckState::Checked
+    Indeterminate => TreeCheckState::Indeterminate
   }
-  out
 }
 
-fn tree_state_of_node[K : view::ViewEq](
-  nodes : Array[TreeNodeSpec[K]],
-  checked : Array[K],
-  key : K,
-  depth : Int,
-) -> TreeCheckState {
-  if depth > 64 {
-    return if tree_contains_key(checked, key) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
-  }
-  let kids = tree_children_of(nodes, key)
-  let enabled_kids = view::array_filter(kids, fn(k : TreeNodeSpec[K]) -> Bool { !k.disabled })
-  if enabled_kids.length() == 0 {
-    return if tree_contains_key(checked, key) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
-  }
-  let mut any_checked = false
-  let mut any_unchecked = false
-  let mut any_indet = false
-  for k in enabled_kids {
-    match tree_state_of_node(nodes, checked, k.key, depth + 1) {
-      Checked => any_checked = true
-      Unchecked => any_unchecked = true
-      Indeterminate => any_indet = true
-    }
-  }
-  if any_indet || (any_checked && any_unchecked) {
-    TreeCheckState::Indeterminate
-  } else if any_checked {
-    TreeCheckState::Checked
-  } else {
-    TreeCheckState::Unchecked
-  }
+fn to_core_tree_specs[K](nodes : Array[TreeNodeSpec[K]]) -> Array[headless_core::TreeNodeSpec[K]] {
+  view::array_map(nodes, fn(n : TreeNodeSpec[K]) -> headless_core::TreeNodeSpec[K] {
+    headless_core::TreeNodeSpec::{ key: n.key, parent: n.parent, disabled: n.disabled }
+  })
 }
 
 /// Compute tri-state check status for every node in `nodes`.
@@ -93,33 +62,15 @@ pub fn tree_checked_states[K : view::ViewEq](
   checked : Array[K],
   strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
 ) -> Array[(K, TreeCheckState)] {
-  let out : Array[(K, TreeCheckState)] = []
-  for n in nodes {
-    let st = match strategy {
-      Independent =>
-        if tree_contains_key(checked, n.key) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
-      Cascade => tree_state_of_node(nodes, checked, n.key, 0)
-    }
-    out.push((n.key, st))
-  }
-  out
-}
-
-fn tree_collect_descendants[K : view::ViewEq](
-  nodes : Array[TreeNodeSpec[K]],
-  key : K,
-  out : Array[K],
-  depth : Int,
-) -> Unit {
-  if depth > 64 {
-    return
-  }
-  for k in tree_children_of(nodes, key) {
-    if !k.disabled {
-      out.push(k.key)
-      tree_collect_descendants(nodes, k.key, out, depth + 1)
-    }
-  }
+  let core_res = headless_core::tree_checked_states_by(
+    to_core_tree_specs(nodes),
+    checked,
+    fn(a : K, b : K) -> Bool { a.eq(b) },
+    strategy=to_core_tree_strategy(strategy),
+  )
+  view::array_map(core_res, fn(pair : (K, headless_core::TreeCheckState)) -> (K, TreeCheckState) {
+    (pair.0, from_core_tree_state(pair.1))
+  })
 }
 
 /// Toggle `target` in `checked` according to `strategy`, returning the updated checked key list.
@@ -129,74 +80,13 @@ pub fn toggle_tree_check[K : view::ViewEq](
   target : K,
   strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
 ) -> Array[K] {
-  match view::array_find_first(nodes, fn(n : TreeNodeSpec[K]) -> Bool { n.key.eq(target) }) {
-    Some(spec) => if spec.disabled { return checked.copy() }
-    None => ()
-  }
-  match strategy {
-    Independent => {
-      let next : Array[K] = []
-      let mut found = false
-      for k in checked {
-        if k.eq(target) {
-          found = true
-        } else {
-          next.push(k)
-        }
-      }
-      if !found {
-        next.push(target)
-      }
-      next
-    }
-    Cascade => {
-      let cur_state = tree_state_of_node(nodes, checked, target, 0)
-      let turn_on = cur_state != TreeCheckState::Checked
-      let affected : Array[K] = [target]
-      tree_collect_descendants(nodes, target, affected, 0)
-      let next : Array[K] = []
-      for k in checked {
-        if !tree_contains_key(affected, k) {
-          next.push(k)
-        }
-      }
-      if turn_on {
-        for k in affected {
-          if !tree_contains_key(next, k) {
-            next.push(k)
-          }
-        }
-      }
-      // Reconcile ancestors bottom-up so parent keys reflect full child coverage.
-      let mut cur_opt : Option[K] = Some(target)
-      let mut guard_steps = 0
-      while guard_steps < 64 {
-        guard_steps += 1
-        let cur_k = match cur_opt {
-          Some(k) => k
-          None => break
-        }
-        let parent_opt : Option[K] = match view::array_find_first(nodes, fn(n : TreeNodeSpec[K]) -> Bool { n.key.eq(cur_k) }) {
-          Some(sp) => sp.parent
-          None => None
-        }
-        match parent_opt {
-          Some(pk) => {
-            let p_state = tree_state_of_node(nodes, next, pk, 0)
-            let has_pk = tree_contains_key(next, pk)
-            if p_state == TreeCheckState::Checked && !has_pk {
-              next.push(pk)
-            } else if p_state != TreeCheckState::Checked && has_pk {
-              view::array_retain(next, fn(x : K) -> Bool { !x.eq(pk) })
-            }
-            cur_opt = Some(pk)
-          }
-          None => break
-        }
-      }
-      next
-    }
-  }
+  headless_core::toggle_tree_check_by(
+    to_core_tree_specs(nodes),
+    checked,
+    target,
+    fn(a : K, b : K) -> Bool { a.eq(b) },
+    strategy=to_core_tree_strategy(strategy),
+  )
 }
 
 struct TreeEntry[K] {

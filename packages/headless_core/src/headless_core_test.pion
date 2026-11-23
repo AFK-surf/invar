@@ -1,0 +1,387 @@
+// Comprehensive pure-Pion unit tests for all 18 modules in packages/headless_core.
+// Zero view, layout, or renderer dependencies.
+
+import "dmath"
+import "signals"
+
+fn assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn approx_eq(a : Double, b : Double, eps~ : Double = 1.0e-6) -> Bool {
+  dmath::abs(a - b) <= eps
+}
+
+fn opt_int_is(o : Option[Int], expected : Int) -> Bool {
+  match o {
+    Some(v) => v == expected
+    None => false
+  }
+}
+
+fn opt_str_is(o : Option[String], expected : String) -> Bool {
+  match o {
+    Some(v) => v == expected
+    None => false
+  }
+}
+
+test "01 core: CoreEq, Ref, Rect, Point, array & UTF-16 helpers" {
+  assert(42.eq(42) && !42.eq(7), "Int CoreEq")
+  assert("hello".eq("hello") && !"hello".eq("world"), "String CoreEq")
+  assert(true.eq(true) && !true.eq(false), "Bool CoreEq")
+  let r = ref_new(10)
+  r.v = 25
+  assert(r.v == 25, "Ref mutation")
+  let rc = Rect::new(10.0, 20.0, 100.0, 50.0)
+  assert(rc.contains(10.0, 20.0) && rc.contains(110.0, 70.0) && !rc.contains(9.0, 20.0), "Rect::contains")
+  let pt = Point::new(3.0, 4.0)
+  assert(pt == Point::{ x: 3.0, y: 4.0 }, "Point Eq")
+  assert(str_trim("  hi \t\n") == "hi", "str_trim")
+  assert(ascii_lower("AbC-123") == "abc-123", "ascii_lower")
+  assert(str_has_prefix("foobar", "foo") && !str_has_prefix("foo", "foobar"), "str_has_prefix")
+  let arr = [3, 1, 2]
+  array_sort_by(arr, fn(a : Int, b : Int) -> Int { a - b })
+  assert(arr[0] == 1 && arr[1] == 2 && arr[2] == 3, "array_sort_by")
+  let removed = array_remove(arr, 1)
+  assert(removed == 2 && arr.length() == 2 && arr[1] == 3, "array_remove")
+}
+
+test "02 roving: RovingIndex wraps, rtl, disabled skip, Home/End, neighbor on remove" {
+  let rv = RovingIndex::new(axis=GroupAxis::Horizontal, wraps=true, rtl=false)
+  let disabled = [false, true, false, false]
+  assert(opt_int_is(rv.step(RovingDir::Next, disabled, from_none=true), 0), "enter at first enabled")
+  assert(opt_int_is(rv.step_key(key_right, disabled), 2), "skip disabled index 1")
+  assert(opt_int_is(rv.step_key(key_right, disabled), 3), "advance to 3")
+  assert(opt_int_is(rv.step_key(key_right, disabled), 0), "wrap to 0")
+  assert(opt_int_is(rv.step_key(key_left, disabled), 3), "wrap backward to 3")
+  assert(opt_int_is(rv.step_key(key_home, disabled), 0), "Home -> 0")
+  assert(opt_int_is(rv.step_key(key_end, disabled), 3), "End -> 3")
+
+  // RTL reverses Left/Right
+  let rv_rtl = RovingIndex::new(axis=GroupAxis::Horizontal, wraps=false, rtl=true)
+  rv_rtl.set_active(Some(0))
+  assert(opt_int_is(rv_rtl.step_key(key_left, disabled), 2), "RTL Left advances")
+  assert(opt_int_is(rv_rtl.step_key(key_right, disabled), 0), "RTL Right retreats")
+
+  // Neighbor handoff on remove: removing focused index 2 hands off to 3 (adjusted -> 2)
+  rv.set_active(Some(2))
+  assert(opt_int_is(rv.on_remove(2, disabled), 2), "on_remove focused middle -> next neighbor adjusted")
+  // Removing last item (index 2 of [false, true, false]) hands off backward to 0
+  let dis2 = [false, true, false]
+  rv.set_active(Some(2))
+  assert(opt_int_is(rv.on_remove(2, dis2), 0), "on_remove last -> nearest preceding enabled")
+}
+
+test "03 typeahead: TypeaheadMatcher window prefix and cycling" {
+  let ta = TypeaheadMatcher::new(window_ms=500.0)
+  let labels = ["Apple", "Apricot", "Banana", "Berry"]
+  assert(opt_int_is(ta.match_at('a', 100.0, labels, None), 0), "first 'a' -> Apple")
+  assert(opt_int_is(ta.match_at('a', 200.0, labels, Some(0)), 1), "repeated 'a' cycles -> Apricot")
+  ta.reset()
+  assert(opt_int_is(ta.match_at('b', 100.0, labels, None), 2), "'b' -> Banana")
+  assert(opt_int_is(ta.match_at('e', 250.0, labels, Some(2)), 3), "'be' within window -> Berry")
+  // After window expires, prefix resets
+  assert(opt_int_is(ta.match_at('a', 1000.0, labels, Some(3)), 0), "expired window resets to 'a'")
+}
+
+test "04 selection: SelectionCore toggle, range, select_all, reactive anchor" {
+  let sel : SelectionCore[String] = SelectionCore::new(multiple=true)
+  let anchor_changes = ref_new(0)
+  let _ = signals::effect(fn() {
+    let _ = sel.anchor()
+    anchor_changes.v = anchor_changes.v + 1
+  })
+  let order = ["a", "b", "c", "d"]
+  let s1 = sel.toggle([], "b")
+  assert(s1.length() == 1 && s1[0] == "b" && opt_str_is(sel.anchor(), "b"), "toggle adds b & sets anchor")
+  let range = sel.select_range(order, "d")
+  assert(range.length() == 3 && range[0] == "b" && range[2] == "d", "select_range b..d")
+  let s2 = sel.toggle(s1, "b")
+  assert(s2.length() == 0, "toggle removes existing")
+  let all = sel.select_all(order)
+  assert(all.length() == 4, "select_all")
+  let cleared = sel.clear()
+  assert(cleared.length() == 0 && sel.anchor() is None, "clear resets anchor")
+  assert(anchor_changes.v >= 3, "reactive anchor signal fired")
+}
+
+test "05 overlay_stack: OverlayStackCore push/remove/top/dismiss_top and reactive open_count" {
+  let stack = OverlayStackCore::new()
+  let counts : Array[Int] = []
+  let _ = signals::effect(fn() {
+    counts.push(stack.count())
+  })
+  stack.push(10, close_on_escape=true, close_on_outside=true)
+  stack.push(20, close_on_escape=false, close_on_outside=true)
+  assert(stack.count() == 2 && opt_int_is(stack.top(), 20) && stack.is_top(20) && !stack.is_top(10), "top is 20")
+  // Escape skips 20 (close_on_escape=false) and dismisses 10
+  assert(opt_int_is(stack.dismiss_top(OverlayDismissReason::Escape), 10), "Escape dismisses eligible 10")
+  assert(stack.count() == 1 && stack.is_top(20), "20 remains on top")
+  assert(opt_int_is(stack.dismiss_top(OverlayDismissReason::Outside), 20), "Outside dismisses 20")
+  assert(stack.count() == 0 && stack.top() is None, "stack empty")
+  assert(counts.length() >= 4, "open_count signal updated reactively")
+}
+
+test "06 repeat: RepeatTimer frame-rate-independent timestamp firing" {
+  let rt = RepeatTimer::new(delay_ms=400.0, interval_ms=50.0, immediate=true)
+  assert(rt.on_down(1000.0) == 1 && rt.active(), "immediate fire on down")
+  assert(rt.on_tick(1399.0) == 0, "no fire before delay_ms")
+  assert(rt.on_tick(1400.0) == 1, "fires once at due_ms")
+  // Jump 125ms -> should fire at 1450 and 1500 (2 fires)
+  assert(rt.on_tick(1525.0) == 2, "frame-rate-independent catch-up fires")
+  match rt.next_due_ms() {
+    Some(due) => assert(approx_eq(due, 1550.0), "next_due_ms aligned to 1550")
+    None => panic("expected next_due_ms")
+  }
+  rt.on_up()
+  assert(!rt.active() && rt.next_due_ms() is None && rt.on_tick(2000.0) == 0, "on_up cancels timer")
+}
+
+test "07 tooltip: TooltipWarmup cold delay, warm instant open, cooldown expiry" {
+  let tw = TooltipWarmup::new(open_delay_ms=400.0, warmup_ms=300.0)
+  assert(tw.on_enter(1, 0.0) is None, "cold enter waits for delay")
+  assert(tw.on_tick(399.0) is None, "not open before delay")
+  assert(opt_int_is(tw.on_tick(400.0), 1) && opt_int_is(tw.active(), 1), "opens at 400ms")
+  tw.on_leave(1, 500.0)
+  assert(tw.active() is None, "closed on leave")
+  // Enter trigger 2 within 300ms warmup -> opens immediately
+  assert(opt_int_is(tw.on_enter(2, 700.0), 2), "warm enter opens immediately")
+  tw.on_leave(2, 800.0)
+  // Enter trigger 3 after warmup expired (> 1100ms) -> cold again
+  assert(tw.on_enter(3, 1200.0) is None, "expired warmup returns to cold delay")
+}
+
+test "08 anchor: pure scalar Rect anchor_place flip/clamp and edge_scroll_speed" {
+  let vp = Rect::new(0.0, 0.0, 400.0, 300.0)
+  // Anchor near bottom -> Below has no room, should flip to Above
+  let near_bottom = Rect::new(350.0, 260.0, 40.0, 30.0)
+  let (x, y, side) = anchor_place(near_bottom, 120.0, 80.0, vp, side=AnchorSide::Below, align=AnchorAlign::Start, gap=6.0, pad=8.0, flip=true)
+  assert(side == AnchorSide::Above, "flips to Above near bottom")
+  assert(approx_eq(x, 400.0 - 8.0 - 120.0), "clamped to right viewport pad")
+  assert(approx_eq(y, 260.0 - 6.0 - 80.0), "placed above with gap")
+
+  // flip=false keeps Below and clamps inside viewport
+  let (_, y2, side2) = anchor_place(near_bottom, 120.0, 80.0, vp, side=AnchorSide::Below, pad=8.0, flip=false)
+  assert(side2 == AnchorSide::Below && approx_eq(y2, 300.0 - 8.0 - 80.0), "no flip clamps to bottom pad")
+
+  assert(edge_scroll_speed(10.0, 0.0, 300.0, zone=50.0, max_speed=500.0) < 0.0, "near start negative")
+  assert(edge_scroll_speed(150.0, 0.0, 300.0, zone=50.0, max_speed=500.0) == 0.0, "interior zero")
+  assert(edge_scroll_speed(290.0, 0.0, 300.0, zone=50.0, max_speed=500.0) > 0.0, "near end positive")
+}
+
+test "09 cmdk: cmdk_score and cmdk_filter ranking & grouping" {
+  assert(cmdk_score("Open Settings", "set") > 0.0, "fuzzy match scores > 0")
+  assert(cmdk_score("Open Settings", "zzz") == 0.0, "non-match scores 0")
+  let items = [
+    cmdk_item("a", "Archive Chat", group="Chat"),
+    cmdk_item("b", "Settings", keywords=["preferences"], group="App"),
+    cmdk_item("c", "Secret Vault", group="App", disabled=true),
+  ]
+  let rows = cmdk_filter(items, "pref")
+  let keys = cmdk_keys(rows)
+  assert(keys.length() == 1 && keys[0] == "b", "keyword match finds Settings")
+  let all_rows = cmdk_filter(items, "")
+  assert(opt_str_is(cmdk_first(all_rows), "a"), "cmdk_first")
+  assert(opt_str_is(cmdk_move(all_rows, Some("a"), CmdkMove::NextItem), "b"), "cmdk_move skips disabled")
+}
+
+test "10 input_history: whitespace filter, dedup, cap, draft preservation" {
+  let h = InputHistory::new(max_entries=2, dedup_consecutive=true)
+  h.push("")
+  h.push("   \t\n  ")
+  assert(h.len() == 0, "whitespace-only ignored")
+  h.push("one")
+  h.push("one")
+  assert(h.len() == 1, "consecutive dedup")
+  h.push("two")
+  h.push("three")
+  assert(h.len() == 2 && h.entries()[0] == "two" && h.entries()[1] == "three", "evicts oldest")
+  assert(opt_str_is(h.prev("draft!"), "three") && h.is_browsing(), "prev enters history")
+  assert(opt_str_is(h.prev("ignored"), "two"), "prev steps older")
+  assert(h.prev("ignored") is None, "prev stops at oldest")
+  assert(opt_str_is(h.next(), "three"), "next steps newer")
+  assert(opt_str_is(h.next(), "draft!") && !h.is_browsing(), "next restores saved draft")
+}
+
+test "11 trigger_menu: UTF-16 & CJK detection, apply_trigger, Escape suppression" {
+  let rules = [TriggerRule::new("@"), TriggerRule::new("/")]
+  // CJK boundary allowed
+  let cn = "你好@张三"
+  match detect_trigger(cn, cn.length(), rules) {
+    Some(m) => {
+      assert(m.trigger == "@" && m.query == "张三" && m.start == "你好".length() && m.end == cn.length(), "CJK trigger match")
+      let (txt, cur) = apply_trigger(cn, m, "@zhangsan")
+      assert(txt == "你好@zhangsan " && cur == txt.length(), "apply_trigger replaces CJK span")
+    }
+    None => panic("expected CJK trigger match")
+  }
+  // ASCII word boundary blocks email
+  assert(detect_trigger("foo@bar", 7, rules) is None, "email rejected by boundary")
+
+  let applied = ref_new(("", 0, ""))
+  let tm : TriggerMenu[String] = TriggerMenu::new(rules, fn(t : String, c : Int, k : String) {
+    applied.v = (t, c, k)
+  })
+  assert(tm.update("/de", 3) is Some(_) && tm.open(), "menu opens")
+  assert(tm.handle_key(17, [("d", "/debug")], "/de") && !tm.open(), "Escape dismisses")
+  // Same token stays suppressed on update
+  assert(tm.update("/de", 3) is None, "suppressed until token changes")
+  assert(tm.update("/de ", 4) is None, "leaves token")
+  assert(tm.update("/de", 3) is Some(_) && tm.open(), "re-opens after leaving")
+  assert(tm.handle_key(7, [("d", "/debug")], "/de") && applied.v.0 == "/debug ", "Enter applies")
+}
+
+test "12 swipe: horizontal helpers + 4-way SwipeGesture axis lock & pull-back cancel" {
+  assert(approx_eq(swipe_damp(100.0, 80.0, 80.0, 0.5), 90.0), "swipe_damp rubber-band")
+  assert(swipe_resolve_horizontal(50.0, 0.0, SwipeSide::Closed, 80.0, 80.0, 0.4, 0.45) == SwipeSide::Leading, "horizontal resolve leading")
+
+  // 4-way axis lock: Up
+  let sg = SwipeGesture::new(axis_mode=SwipeAxisMode::FourWay, slop=8.0, distance_threshold=40.0, velocity_threshold=0.5, cancel_ratio=0.5)
+  let _ = sg.on_down(100.0, 100.0)
+  assert(sg.on_move(102.0, 96.0) == SwipeGestureState::Idle, "within slop stays Idle")
+  assert(sg.on_move(102.0, 40.0) == SwipeGestureState::Dragging(SwipeDir::Up, 60.0), "locks Up")
+  assert(sg.on_up(vx=0.0, vy=0.0) == SwipeGestureState::Committed(SwipeDir::Up), "commits Up")
+
+  // Pull-back cancel: reaches peak 80, pulls back to 30 (< 80 * 0.5 = 40) -> Cancelled even though > 0
+  let _ = sg.on_down(0.0, 0.0)
+  let _ = sg.on_move(80.0, 2.0)
+  assert(approx_eq(sg.peak_offset(), 80.0), "peak recorded")
+  let _ = sg.on_move(30.0, 2.0)
+  assert(sg.on_up(vx=0.0, vy=0.0) == SwipeGestureState::Cancelled, "pull-back below cancel_ratio cancels")
+
+  // HorizontalOnly rejects vertical drag
+  let sh = SwipeGesture::new(axis_mode=SwipeAxisMode::HorizontalOnly, slop=8.0)
+  let _ = sh.on_down(0.0, 0.0)
+  assert(sh.on_move(2.0, 20.0) == SwipeGestureState::Cancelled, "HorizontalOnly rejects vertical")
+}
+
+test "13 drawer: DrawerSnapCore edge delta, can_drag guard, snap points & velocity close" {
+  let allow = ref_new(false)
+  let dr = DrawerSnapCore::new(
+    edge=DrawerEdge::Bottom,
+    snap_points=[0.5, 1.0],
+    close_threshold=0.35,
+    velocity_threshold=0.5,
+    can_drag=fn() -> Bool { allow.v },
+  )
+  assert(!dr.on_down(0.0, 100.0) && !dr.dragging(), "can_drag=false blocks drag")
+  allow.v = true
+  assert(dr.on_down(0.0, 100.0) && dr.dragging(), "drag starts")
+  assert(approx_eq(dr.on_move(0.0, 250.0), 150.0) && approx_eq(dr.drag_offset(), 150.0), "bottom edge delta")
+  // extent=300, cur_frac=1.0, offset=150 -> next_frac=0.5 -> snaps to index 0 (0.5)
+  match dr.on_up(0.0, 0.1, 300.0, 1) {
+    Some(DrawerResolution::Snap(idx)) => assert(idx == 0, "snaps to 0.5")
+    _ => panic("expected Snap(0)")
+  }
+  // High velocity closes
+  let _ = dr.on_down(0.0, 100.0)
+  let _ = dr.on_move(0.0, 120.0)
+  match dr.on_up(0.0, 0.8, 300.0, 1) {
+    Some(DrawerResolution::Close) => ()
+    _ => panic("expected Close on fast flick")
+  }
+}
+
+test "14 reorder: reorder_apply, ReorderCore, TransferCore" {
+  let moved = reorder_apply(["a", "b", "c", "d"], 1, 3)
+  assert(moved[0] == "a" && moved[1] == "c" && moved[2] == "d" && moved[3] == "b", "reorder_apply")
+  let rc : ReorderCore[String] = ReorderCore::new()
+  assert(rc.grab(["a", "b", "c"], "a") && rc.grabbed(), "grab")
+  assert(rc.move_by(2, 3), "move_by")
+  match rc.commit() {
+    Some((from, to)) => assert(from == 0 && to == 2, "commit (0, 2)")
+    None => panic("expected commit")
+  }
+  let tc : TransferCore[String, String] = TransferCore::new()
+  assert(tc.grab("todo", ["t1", "t2"], "t2"), "transfer grab")
+  assert(tc.move_to_column(1, ["todo", "done"], fn(c : String) -> Int { if c == "done" { 1 } else { 2 } }), "move to next col")
+  match tc.commit() {
+    Some(d) => assert(d.from_col == "todo" && d.to_col == "done" && d.to_idx == 1, "transfer committed")
+    None => panic("expected transfer commit")
+  }
+}
+
+test "15 tree: tri-state cascade with disabled leaf" {
+  let nodes = [
+    TreeNodeSpec::new("root"),
+    TreeNodeSpec::new("a", parent="root"),
+    TreeNodeSpec::new("b", parent="root"),
+    TreeNodeSpec::new("c_dis", parent="root", disabled=true),
+  ]
+  // Toggling root checks enabled children a & b, skips disabled c_dis
+  let c1 = toggle_tree_check(nodes, [], "root")
+  assert(str_array_contains(c1, "root") && str_array_contains(c1, "a") && str_array_contains(c1, "b") && !str_array_contains(c1, "c_dis"), "cascade skips disabled leaf")
+  // Unchecking b makes root Indeterminate
+  let c2 = toggle_tree_check(nodes, c1, "b")
+  let states = tree_checked_states(nodes, c2)
+  assert(states[0].1 == TreeCheckState::Indeterminate, "root becomes Indeterminate")
+  assert(states[1].1 == TreeCheckState::Checked, "a stays Checked")
+  assert(states[2].1 == TreeCheckState::Unchecked, "b is Unchecked")
+}
+
+test "16 slider: clamp, snap, part, range_norm_pair, number round/format/parse" {
+  assert(approx_eq(slider_clamp(15.0, 0.0, 10.0), 10.0), "slider_clamp")
+  assert(approx_eq(slider_snap(2.6, 0.0, 10.0, 0.5), 2.5), "slider_snap")
+  assert(approx_eq(slider_part(25.0, 0.0, 100.0), 0.25), "slider_part")
+  let (lo, hi) = range_norm_pair(40.0, 42.0, 0.0, 100.0, 10.0)
+  assert(approx_eq(lo, 40.0) && approx_eq(hi, 50.0), "range_norm_pair enforces min_gap")
+  assert(approx_eq(number_round(3.14159, 2), 3.14), "number_round")
+  assert(number_format(-1.5, 2) == "-1.50", "number_format")
+  match number_parse("  -42.25 ") {
+    Some(v) => assert(approx_eq(v, -42.25), "number_parse")
+    None => panic("expected parsed number")
+  }
+  assert(number_parse("abc") is None, "invalid number_parse")
+}
+
+test "17 scrub_stepper: deadzone, sub-pixel residual, direction reversal" {
+  let sc = ScrubStepper::new(step_px=10.0, deadzone_px=4.0)
+  sc.on_down(100.0)
+  assert(!sc.active(), "inactive on down")
+  assert(sc.on_move(103.0) == 0 && !sc.active(), "within deadzone stays inactive")
+  // Crosses deadzone by 6px -> active, 0 steps, residual == 6.0
+  assert(sc.on_move(110.0) == 0 && sc.active() && approx_eq(sc.residual(), 6.0), "crosses deadzone with residual 6")
+  // +6px -> residual 12 -> emits +1, residual 2.0
+  assert(sc.on_move(116.0) == 1 && approx_eq(sc.residual(), 2.0), "emits +1 step, keeps residual 2")
+  // Reverse -6px -> residual -4.0, 0 steps
+  assert(sc.on_move(110.0) == 0 && approx_eq(sc.residual(), -4.0), "reverse folds residual to -4")
+  // Reverse -6px -> residual -10.0 -> emits -1, residual 0.0
+  assert(sc.on_move(104.0) == -1 && approx_eq(sc.residual(), 0.0), "reverse emits -1 step")
+  // Multi-step burst via on_delta
+  assert(sc.on_delta(25.0) == 2 && approx_eq(sc.residual(), 5.0), "multi-step burst + residual")
+  sc.on_up()
+  assert(!sc.active() && approx_eq(sc.residual(), 0.0), "on_up resets")
+}
+
+test "18 long_press_strip: slop cancel, timed open, drag slot switch, release commit" {
+  let slots = [
+    StripSlot::from_1d(0.0, 40.0),
+    StripSlot::from_1d(40.0, 40.0),
+    StripSlot::from_1d(80.0, 40.0),
+  ]
+  let lp = LongPressStrip::new(hold_ms=300.0, slop_px=10.0)
+
+  // 1) Move past slop during Pending -> Cancelled
+  assert(lp.on_down(20.0, 0.0, 100.0) == LongPressState::Pending(400.0), "enters Pending")
+  assert(lp.on_move(35.0, 0.0, 200.0, slots) == LongPressState::Cancelled, "slop exceeded cancels")
+  assert(lp.active_index() is None, "no active_index when cancelled")
+
+  // 2) Hold until due -> Open -> drag to slot 2 -> up -> Commit(2)
+  assert(lp.on_down(20.0, 0.0, 1000.0) == LongPressState::Pending(1300.0), "second press Pending")
+  assert(lp.on_tick(1299.0, slots) == LongPressState::Pending(1300.0), "not due yet")
+  assert(lp.on_tick(1300.0, slots) == LongPressState::Open(0), "opens at slot 0")
+  assert(opt_int_is(lp.active_index(), 0), "active_index is 0")
+  assert(lp.on_move(95.0, 0.0, 1350.0, slots) == LongPressState::Open(2), "drags to slot 2")
+  assert(opt_int_is(lp.active_index(), 2), "active_index is 2")
+  assert(lp.on_up() == LongPressState::Commit(2), "release commits slot 2")
+  assert(opt_int_is(lp.active_index(), 2), "committed active_index is 2")
+
+  // 3) Auto-open on_move when now_ms >= due, and Pending on_up cancels
+  let _ = lp.on_down(50.0, 0.0, 2000.0)
+  assert(lp.on_up() == LongPressState::Cancelled, "early release cancels")
+  let _ = lp.on_down(50.0, 0.0, 3000.0)
+  assert(lp.on_move(55.0, 0.0, 3300.0, slots) == LongPressState::Open(1), "on_move past due auto-opens")
+}

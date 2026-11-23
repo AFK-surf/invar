@@ -1,0 +1,189 @@
+// Pure Drawer / Sheet edge-directed drag, `can_drag` guard, multi-point snap resolution,
+// and reactive `dragging` / `drag_offset` signals.
+
+import "dmath"
+import "signals"
+
+/// Which edge of the viewport a drawer slides in from.
+#derive(Eq)
+pub enum DrawerEdge {
+  Bottom
+  Top
+  Left
+  Right
+}
+
+/// Resolution produced when a drawer drag ends.
+#derive(Eq)
+pub enum DrawerResolution {
+  Close
+  Snap(Int)
+}
+
+/// Compute edge-directed closing displacement from pointer delta `(dx, dy)`.
+pub fn drawer_edge_delta(edge : DrawerEdge, dx : Double, dy : Double) -> Double {
+  match edge {
+    Bottom => dy
+    Top => -dy
+    Left => -dx
+    Right => dx
+  }
+}
+
+/// Compute edge-directed closing velocity from pointer velocity `(vx, vy)`.
+pub fn drawer_edge_velocity(edge : DrawerEdge, vx : Double, vy : Double) -> Double {
+  match edge {
+    Bottom => vy
+    Top => -vy
+    Left => -vx
+    Right => vx
+  }
+}
+
+/// Pure reactive state machine for drawer drag & multi-point snap resolution.
+pub struct DrawerSnapCore {
+  edge_ : DrawerEdge
+  snap_points : Array[Double]
+  close_threshold : Double
+  velocity_threshold : Double
+  can_drag : () -> Bool
+  dragging_sig : signals::Signal[Bool]
+  drag_offset_sig : signals::Signal[Double]
+  active : Ref[Bool]
+  start_x : Ref[Double]
+  start_y : Ref[Double]
+}
+
+pub fn DrawerSnapCore::new(
+  edge~ : DrawerEdge = DrawerEdge::Bottom,
+  snap_points~ : Array[Double] = [1.0],
+  close_threshold~ : Double = 0.35,
+  velocity_threshold~ : Double = 0.5,
+  can_drag~ : () -> Bool = fn() { true },
+) -> DrawerSnapCore {
+  let snaps = if snap_points.length() > 0 { snap_points.copy() } else { [1.0] }
+  DrawerSnapCore::{
+    edge_: edge,
+    snap_points: snaps,
+    close_threshold,
+    velocity_threshold,
+    can_drag,
+    dragging_sig: signals::signal(false),
+    drag_offset_sig: signals::signal(0.0),
+    active: ref_new(false),
+    start_x: ref_new(0.0),
+    start_y: ref_new(0.0),
+  }
+}
+
+pub fn DrawerSnapCore::edge(self : DrawerSnapCore) -> DrawerEdge {
+  self.edge_
+}
+
+pub fn DrawerSnapCore::dragging(self : DrawerSnapCore) -> Bool {
+  self.dragging_sig.get()
+}
+
+pub fn DrawerSnapCore::drag_offset(self : DrawerSnapCore) -> Double {
+  self.drag_offset_sig.get()
+}
+
+pub fn DrawerSnapCore::clamp_snap_index(self : DrawerSnapCore, idx : Int) -> Int {
+  let n = self.snap_points.length()
+  if n == 0 {
+    return 0
+  }
+  if idx < 0 { 0 } else if idx >= n { n - 1 } else { idx }
+}
+
+pub fn DrawerSnapCore::snap_fraction(self : DrawerSnapCore, idx : Int) -> Double {
+  let n = self.snap_points.length()
+  if n == 0 {
+    return 1.0
+  }
+  self.snap_points[self.clamp_snap_index(idx)]
+}
+
+pub fn DrawerSnapCore::reset_drag(self : DrawerSnapCore) -> Unit {
+  self.active.v = false
+  self.dragging_sig.set(false)
+  self.drag_offset_sig.set(0.0)
+}
+
+/// Begin drag at `(x, y)` if `can_drag()` allows it.
+pub fn DrawerSnapCore::on_down(self : DrawerSnapCore, x : Double, y : Double) -> Bool {
+  if !signals::untracked(self.can_drag) {
+    self.active.v = false
+    return false
+  }
+  self.active.v = true
+  self.start_x.v = x
+  self.start_y.v = y
+  self.dragging_sig.set(true)
+  self.drag_offset_sig.set(0.0)
+  true
+}
+
+/// Update edge-directed drag offset for pointer position `(x, y)`.
+pub fn DrawerSnapCore::on_move(self : DrawerSnapCore, x : Double, y : Double) -> Double {
+  if !self.active.v {
+    return 0.0
+  }
+  if !signals::untracked(self.can_drag) {
+    self.reset_drag()
+    return 0.0
+  }
+  let delta = drawer_edge_delta(self.edge_, x - self.start_x.v, y - self.start_y.v)
+  self.drag_offset_sig.set(delta)
+  delta
+}
+
+/// Resolve drawer close vs nearest snap point on release.
+pub fn DrawerSnapCore::on_up(
+  self : DrawerSnapCore,
+  vx : Double,
+  vy : Double,
+  extent : Double,
+  current_snap_idx : Int,
+) -> Option[DrawerResolution] {
+  if !self.active.v {
+    return None
+  }
+  self.active.v = false
+  let offset = self.drag_offset_sig.untracked()
+  self.dragging_sig.set(false)
+  self.drag_offset_sig.set(0.0)
+  let close_vel = drawer_edge_velocity(self.edge_, vx, vy)
+  if close_vel >= self.velocity_threshold {
+    return Some(DrawerResolution::Close)
+  }
+  let eff_extent = if extent > 0.0 { extent } else { 300.0 }
+  let cur_frac = self.snap_fraction(current_snap_idx)
+  let next_frac = cur_frac - offset / eff_extent
+  if next_frac < self.close_threshold {
+    return Some(DrawerResolution::Close)
+  }
+  let n = self.snap_points.length()
+  if n == 0 {
+    return None
+  }
+  let mut best_i = 0
+  let mut best_d = dmath::abs(next_frac - self.snap_points[0])
+  let mut i = 1
+  while i < n {
+    let dist = dmath::abs(next_frac - self.snap_points[i])
+    if dist < best_d {
+      best_d = dist
+      best_i = i
+    }
+    i += 1
+  }
+  Some(DrawerResolution::Snap(best_i))
+}
+
+/// Cancel an in-progress drag.
+pub fn DrawerSnapCore::on_cancel(self : DrawerSnapCore) -> Unit {
+  if self.active.v {
+    self.reset_drag()
+  }
+}

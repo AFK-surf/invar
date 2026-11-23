@@ -1,6 +1,7 @@
 // Input trigger menu detection and replacement (`@`, `/`, `#`, etc.), UTF-16 & CJK safe.
+// Pure trigger detection, replacement, and menu state machine delegated to `headless_core`.
 
-import "signals"
+import "headless_core"
 import "view"
 
 /// Configuration for one trigger prefix (e.g. `@`, `/`, `#`).
@@ -32,111 +33,41 @@ pub struct TriggerMatch {
   pub end : Int
 }
 
-fn is_ascii_word_cu(c : Int) -> Bool {
-  (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
-}
-
-fn is_line_break_cu(c : Int) -> Bool {
-  c == 0x0A || c == 0x0D
-}
-
-fn is_space_cu(c : Int) -> Bool {
-  c == 0x20 || c == 0x09 || c == 0x3000
-}
-
-fn clamp_utf16_cursor(text : String, cursor : Int) -> Int {
-  let n = text.length()
-  let mut c = if cursor < 0 { 0 } else if cursor > n { n } else { cursor }
-  // Never split a UTF-16 surrogate pair (high 0xD800..0xDBFF, low 0xDC00..0xDFFF).
-  if c > 0 && c < n {
-    let prev = text.code_unit_at(c - 1)
-    let cur = text.code_unit_at(c)
-    if prev >= 0xD800 && prev <= 0xDBFF && cur >= 0xDC00 && cur <= 0xDFFF {
-      c -= 1
-    }
+fn to_core_rule(r : TriggerRule) -> headless_core::TriggerRule {
+  headless_core::TriggerRule::{
+    trigger: r.trigger,
+    allow_spaces: r.allow_spaces,
+    min_query_len: r.min_query_len,
+    max_query_len: r.max_query_len,
+    require_boundary: r.require_boundary,
   }
-  c
 }
 
-fn str_match_at(text : String, pos : Int, pat : String) -> Bool {
-  let pn = pat.length()
-  if pn == 0 || pos < 0 || pos + pn > text.length() {
-    return false
+fn to_core_match(m : TriggerMatch) -> headless_core::TriggerMatch {
+  headless_core::TriggerMatch::{ trigger: m.trigger, query: m.query, start: m.start, end: m.end }
+}
+
+fn from_core_match(m : headless_core::TriggerMatch) -> TriggerMatch {
+  TriggerMatch::{ trigger: m.trigger, query: m.query, start: m.start, end: m.end }
+}
+
+fn from_core_match_opt(o : Option[headless_core::TriggerMatch]) -> Option[TriggerMatch] {
+  match o {
+    Some(m) => Some(from_core_match(m))
+    None => None
   }
-  let mut i = 0
-  while i < pn {
-    if text.code_unit_at(pos + i) != pat.code_unit_at(i) {
-      return false
-    }
-    i += 1
-  }
-  true
 }
 
 /// Detect the nearest active trigger before UTF-16 `cursor` in `text`.
 /// Boundary check rejects ASCII word characters before the trigger (preventing `foo@bar`),
-/// while permitting whitespace and CJK characters (`你好@张三`).
+/// while permitting whitespace and CJK characters.
 pub fn detect_trigger(
   text : String,
   cursor : Int,
   rules : Array[TriggerRule],
 ) -> Option[TriggerMatch] {
-  let end = clamp_utf16_cursor(text, cursor)
-  if rules.length() == 0 {
-    return None
-  }
-  let mut best : Option[TriggerMatch] = None
-  for rule in rules {
-    let tlen = rule.trigger.length()
-    if tlen == 0 || tlen > end {
-      continue
-    }
-    let mut pos = end - tlen
-    let min_pos = if end - tlen - rule.max_query_len > 0 { end - tlen - rule.max_query_len } else { 0 }
-    while pos >= min_pos {
-      if str_match_at(text, pos, rule.trigger) {
-        let boundary_ok = !rule.require_boundary || pos == 0 || !is_ascii_word_cu(text.code_unit_at(pos - 1))
-        if boundary_ok {
-          let q_start = pos + tlen
-          let q_len = end - q_start
-          let mut valid = q_len >= rule.min_query_len && q_len <= rule.max_query_len
-          if valid {
-            let mut j = q_start
-            while j < end {
-              let cu = text.code_unit_at(j)
-              if is_line_break_cu(cu) || (!rule.allow_spaces && is_space_cu(cu)) {
-                valid = false
-                break
-              }
-              j += 1
-            }
-          }
-          if valid {
-            let query = view::str_slice_to(view::str_slice_from(text, q_start), q_len)
-            let cand = TriggerMatch::{ trigger: rule.trigger, query, start: pos, end }
-            match best {
-              Some(prev) => if cand.start > prev.start { best = Some(cand) }
-              None => best = Some(cand)
-            }
-            break
-          }
-        }
-      }
-      if pos == 0 {
-        break
-      }
-      let prev_cu = text.code_unit_at(pos - 1)
-      if is_line_break_cu(prev_cu) || (!rule.allow_spaces && is_space_cu(prev_cu)) {
-        // Still allow checking `pos - tlen` only if `pos` itself wasn't separated by a disallowed char;
-        // once we step past a line break or disallowed space inside the query window, stop scanning for this rule.
-        if pos <= end - tlen {
-          break
-        }
-      }
-      pos -= 1
-    }
-  }
-  best
+  let core_rules = view::array_map(rules, to_core_rule)
+  from_core_match_opt(headless_core::detect_trigger(text, cursor, core_rules))
 }
 
 /// Replace `[m.start, m.end)` in `text` with `replacement + suffix`, returning `(new_text, new_cursor)`.
@@ -146,32 +77,12 @@ pub fn apply_trigger(
   replacement : String,
   suffix~ : String = " ",
 ) -> (String, Int) {
-  let n = text.length()
-  let s = if m.start < 0 { 0 } else if m.start > n { n } else { m.start }
-  let e = if m.end < s { s } else if m.end > n { n } else { m.end }
-  let before = view::str_slice_to(text, s)
-  let after = view::str_slice_from(text, e)
-  let inserted = replacement + suffix
-  let next_text = before + inserted + after
-  (next_text, s + inserted.length())
-}
-
-fn opt_trigger_match_eq(a : Option[TriggerMatch], b : Option[TriggerMatch]) -> Bool {
-  match (a, b) {
-    (None, None) => true
-    (Some(x), Some(y)) => x == y
-    _ => false
-  }
+  headless_core::apply_trigger(text, to_core_match(m), replacement, suffix=suffix)
 }
 
 /// Reactive state machine for an input-triggered autocomplete menu (`@mention`, `/command`, `#tag`).
 pub struct TriggerMenu[K] {
-  rules : Array[TriggerRule]
-  on_apply : (String, Int, K) -> Unit
-  suffix : String
-  match_sig : signals::Signal[Option[TriggerMatch]]
-  active_sig : signals::Signal[Int]
-  dismissed_at : view::Ref[Option[(Int, String)]]
+  core : headless_core::TriggerMenu[K]
 }
 
 /// Create a `TriggerMenu[K]` controller.
@@ -180,70 +91,36 @@ pub fn TriggerMenu::new[K](
   on_apply : (String, Int, K) -> Unit,
   suffix~ : String = " ",
 ) -> TriggerMenu[K] {
+  let core_rules = view::array_map(rules, to_core_rule)
   TriggerMenu::{
-    rules,
-    on_apply,
-    suffix,
-    match_sig: signals::signal_by(None, opt_trigger_match_eq),
-    active_sig: signals::signal(0),
-    dismissed_at: view::ref_new(None),
+    core: headless_core::TriggerMenu::new(core_rules, on_apply, suffix=suffix),
   }
 }
 
 /// Re-evaluate active trigger from `text` and UTF-16 `cursor`.
 pub fn TriggerMenu::update[K](self : TriggerMenu[K], text : String, cursor : Int) -> Option[TriggerMatch] {
-  let found = detect_trigger(text, cursor, self.rules)
-  match found {
-    Some(m) => {
-      match self.dismissed_at.v {
-        Some((ds, dt)) =>
-          if ds == m.start && dt == m.trigger {
-            self.match_sig.set(None)
-            return None
-          }
-        None => ()
-      }
-      self.dismissed_at.v = None
-      match self.match_sig.untracked() {
-        Some(prev) => if prev.start != m.start || prev.trigger != m.trigger || prev.query != m.query {
-          self.active_sig.set(0)
-        }
-        None => self.active_sig.set(0)
-      }
-      self.match_sig.set(Some(m))
-      Some(m)
-    }
-    None => {
-      self.dismissed_at.v = None
-      self.match_sig.set(None)
-      None
-    }
-  }
+  from_core_match_opt(self.core.update(text, cursor))
 }
 
 pub fn TriggerMenu::active_match[K](self : TriggerMenu[K]) -> Option[TriggerMatch] {
-  self.match_sig.get()
+  from_core_match_opt(self.core.active_match())
 }
 
 pub fn TriggerMenu::open[K](self : TriggerMenu[K]) -> Bool {
-  self.match_sig.get() is Some(_)
+  self.core.open()
 }
 
 pub fn TriggerMenu::active_index[K](self : TriggerMenu[K]) -> Int {
-  self.active_sig.get()
+  self.core.active_index()
 }
 
 pub fn TriggerMenu::set_active_index[K](self : TriggerMenu[K], index : Int) -> Unit {
-  self.active_sig.set(if index < 0 { 0 } else { index })
+  self.core.set_active_index(index)
 }
 
 /// Dismiss the current trigger menu until the cursor leaves this trigger token.
 pub fn TriggerMenu::dismiss[K](self : TriggerMenu[K]) -> Unit {
-  match self.match_sig.untracked() {
-    Some(m) => self.dismissed_at.v = Some((m.start, m.trigger))
-    None => ()
-  }
-  self.match_sig.set(None)
+  self.core.dismiss()
 }
 
 /// Accept `(key, replacement)` against `text`, invoking `on_apply(new_text, new_cursor, key)`.
@@ -253,17 +130,7 @@ pub fn TriggerMenu::accept[K](
   key : K,
   replacement : String,
 ) -> Bool {
-  match self.match_sig.untracked() {
-    Some(m) => {
-      let (next_text, next_cursor) = apply_trigger(text, m, replacement, suffix=self.suffix)
-      self.dismissed_at.v = None
-      self.match_sig.set(None)
-      self.active_sig.set(0)
-      (self.on_apply)(next_text, next_cursor, key)
-      true
-    }
-    None => false
-  }
+  self.core.accept(text, key, replacement)
 }
 
 /// Handle Down/Up/Enter/Tab/Escape while the trigger menu is open.
@@ -273,30 +140,5 @@ pub fn TriggerMenu::handle_key[K](
   items : Array[(K, String)],
   text : String,
 ) -> Bool {
-  if self.match_sig.untracked() is None {
-    return false
-  }
-  if code == menu_key_escape {
-    self.dismiss()
-    return true
-  }
-  let n = items.length()
-  if n == 0 {
-    return false
-  }
-  let cur = self.active_sig.untracked()
-  let clamped = if cur < 0 { 0 } else if cur >= n { n - 1 } else { cur }
-  if code == group_key_down {
-    self.active_sig.set((clamped + 1) % n)
-    return true
-  }
-  if code == group_key_up {
-    self.active_sig.set((clamped + n - 1) % n)
-    return true
-  }
-  if code == listbox_key_enter || code == 18 {
-    let (k, rep) = items[clamped]
-    return self.accept(text, k, rep)
-  }
-  false
+  self.core.handle_key(code, items, text)
 }
