@@ -1,0 +1,369 @@
+// External async message delivery between frames, frame-start batching (`on_frame_take` / `wake_frame`),
+// typed zero-serialization `FrameOutbox[T]`, and `app_said` / `app_tell` host wrappers.
+
+import "hostapi"
+import "signals"
+import "view"
+
+let message_handlers : Map[String, (String, Option[Bytes]) -> Unit] = Map::new()
+let message_said : Map[String, (String, Option[Bytes]) -> Bool] = Map::new()
+let message_ahead : Map[String, (Array[Option[(String, Option[Bytes])]]) -> Unit] = Map::new()
+let messages_in : Array[(String, String, Option[Bytes])] = []
+let messages_handed : Ref[Int] = ref_new(0)
+let frame_take_cbs : Array[() -> Unit] = []
+let frame_woken : Ref[Bool] = ref_new(false)
+let frame_wake_asked : Ref[Bool] = ref_new(false)
+let frame_running : Ref[Bool] = ref_new(false)
+
+/// Register a handler for external messages arriving on `channel` (last handler wins).
+pub fn on_message(channel : String, handler : (String, Option[Bytes]) -> Unit) -> Unit {
+  message_handlers[channel] = handler
+}
+
+/// Register a signal-only fast-path handler for `channel` run before frame build.
+/// Returns `true` when the message was fully handled via signals; `false` defers it to `on_message`.
+pub fn on_message_said(channel : String, said : (String, Option[Bytes]) -> Bool) -> Unit {
+  message_said[channel] = said
+}
+
+/// Whether `channel` has a registered `on_message_said` fast-path handler.
+pub fn message_said_on(channel : String) -> Bool {
+  message_said.contains(channel)
+}
+
+/// Inspect the entire incoming batch for `channel` before individual `on_message_said` calls run.
+pub fn on_messages_ahead(
+  channel : String,
+  ahead : (Array[Option[(String, Option[Bytes])]]) -> Unit,
+) -> Unit {
+  message_ahead[channel] = ahead
+}
+
+/// Register a callback invoked once at frame start whenever `wake_frame()` was called since the last frame.
+pub fn on_frame_take(cb : () -> Unit) -> Unit {
+  frame_take_cbs.push(cb)
+}
+
+/// Remove all registered `on_frame_take` callbacks.
+pub fn clear_frame_takes() -> Unit {
+  frame_take_cbs.clear()
+}
+
+/// Coalesce multi-source wakeups into a single frame request; taken once at the next frame start via `on_frame_take`.
+pub fn wake_frame() -> Unit {
+  frame_woken.v = true
+  if frame_wake_asked.v {
+    return
+  }
+  frame_wake_asked.v = true
+  hostapi::wake_now()
+}
+
+fn drain_host_posts() -> Array[(String, String, Option[Bytes])] {
+  let came : Array[(String, String, Option[Bytes])] = []
+  if hostapi::post_take() > 0 {
+    while true {
+      match hostapi::post_next() {
+        Some((channel, json, b)) => {
+          let opt_b = if b.length() > 0 { Some(b) } else { None }
+          came.push((channel, json, opt_b))
+        }
+        None => break
+      }
+    }
+  }
+  came
+}
+
+fn messages_take_now(came : Array[(String, String, Option[Bytes])]) -> Unit {
+  if came.length() == 0 {
+    return
+  }
+  if messages_in.length() == 0 && message_ahead.length() > 0 {
+    for channel in message_ahead.keys() {
+      let mut has_any = false
+      for m in came {
+        if m.0 == channel {
+          has_any = true
+          break
+        }
+      }
+      if has_any {
+        match message_ahead.get(channel) {
+          Some(ahead) => {
+            let view_batch : Array[Option[(String, Option[Bytes])]] = []
+            for m in came {
+              if m.0 == channel {
+                view_batch.push(Some((m.1, m.2)))
+              } else {
+                view_batch.push(None)
+              }
+            }
+            ahead(view_batch)
+          }
+          None => ()
+        }
+      }
+    }
+  }
+  for m in came {
+    if messages_in.length() == 0 {
+      match message_said.get(m.0) {
+        Some(said) => {
+          if said(m.1, m.2) {
+            messages_handed.v = messages_handed.v + 1
+            continue
+          }
+        }
+        None => ()
+      }
+    }
+    messages_in.push(m)
+  }
+}
+
+fn messages_take(came : Array[(String, String, Option[Bytes])]) -> Unit {
+  if came.length() == 0 {
+    return
+  }
+  answered_from_outside(fn() -> Unit {
+    signals::start_batch()
+    messages_take_now(came)
+    signals::end_batch()
+  })
+}
+
+fn frame_takes() -> Unit {
+  if !frame_woken.v {
+    return
+  }
+  frame_woken.v = false
+  frame_wake_asked.v = false
+  if frame_take_cbs.length() == 0 {
+    return
+  }
+  let snapshot = frame_take_cbs.copy()
+  answered_from_outside(fn() -> Unit {
+    signals::start_batch()
+    for cb in snapshot {
+      cb()
+    }
+    signals::end_batch()
+  })
+}
+
+fn hand_on_message(channel : String, json : String, bytes : Option[Bytes]) -> Unit {
+  if channel == hostapi::system_channel {
+    system_took(json)
+  }
+  match message_handlers.get(channel) {
+    Some(f) => {
+      messages_handed.v = messages_handed.v + 1
+      signals::start_batch()
+      f(json, bytes)
+      signals::end_batch()
+    }
+    None => {
+      if channel == hostapi::system_channel {
+        messages_handed.v = messages_handed.v + 1
+      }
+    }
+  }
+}
+
+fn take_messages() -> Unit {
+  if messages_in.length() == 0 {
+    return
+  }
+  let taken = messages_in.copy()
+  messages_in.clear()
+  answered_from_outside(fn() -> Unit {
+    for m in taken {
+      hand_on_message(m.0, m.1, m.2)
+    }
+  })
+}
+
+/// Drain and dispatch pending host messages between frames.
+/// Signal-only handlers (`on_message_said`) run immediately; remaining messages request a frame for delivery.
+pub fn messages_between() -> Unit {
+  if frame_running.v {
+    outside_events.v = outside_events.v + 1
+    return
+  }
+  let came = drain_host_posts()
+  if came.length() == 0 {
+    return
+  }
+  messages_take(came)
+  if messages_in.length() > 0 {
+    hostapi::request_frame()
+  }
+}
+
+fn messages_arrive() -> Unit {
+  messages_handed.v = 0
+  let came = drain_host_posts()
+  if came.length() > 0 {
+    messages_take(came)
+  }
+  frame_takes()
+  take_messages()
+}
+
+pub fn messages_handed_count() -> Int {
+  messages_handed.v
+}
+
+pub fn messages_pending_count() -> Int {
+  messages_in.length()
+}
+
+fn messages_reset() -> Unit {
+  messages_in.clear()
+  messages_handed.v = 0
+  frame_woken.v = false
+  frame_wake_asked.v = false
+  frame_take_cbs.clear()
+  system_state_reset()
+}
+
+/// Query an app-defined host property by name.
+pub fn app_said(name : String) -> String {
+  hostapi::app_said(name)
+}
+
+/// Send an app-defined command `(name, arg)` to the host.
+pub fn app_tell(name : String, arg : String) -> Unit {
+  hostapi::app_tell(name, arg)
+}
+
+/// Thread-safe, zero-serialization typed outbox for delivering values from background threads
+/// to the render thread once per frame. Coalesces multiple `tell` calls into a single wake.
+pub struct FrameOutbox[T] {
+  buf : Mutex[Array[T]]
+  // meta slots: [0] = asked (0/1), [1] = wakes, [2] = takes
+  meta : Mutex[Array[Int]]
+  wake : Option[() -> Unit]
+}
+
+/// Create a `FrameOutbox[T]`. Defaults to waking the UI frame loop via `wake_frame()` (which triggers `ui::wake_now()`).
+pub fn FrameOutbox::new[T](wake? : () -> Unit) -> FrameOutbox[T] {
+  let empty : Array[T] = []
+  let meta_init : Array[Int] = [0, 0, 0]
+  FrameOutbox::{
+    buf: Mutex::new(empty),
+    meta: Mutex::new(meta_init),
+    wake,
+  }
+}
+
+fn FrameOutbox::ask[T](self : FrameOutbox[T]) -> Unit {
+  let mut should_wake = false
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    if m[0] == 0 {
+      m[0] = 1
+      m[1] = m[1] + 1
+      should_wake = true
+    }
+  })
+  if should_wake {
+    match self.wake {
+      Some(w) => w()
+      None => wake_frame()
+    }
+  }
+}
+
+/// Enqueue a typed change from any thread and request a frame if none is pending.
+pub fn FrameOutbox::tell[T](self : FrameOutbox[T], change : T) -> Unit {
+  self.buf.with_lock(fn(q : Array[T]) -> Unit {
+    q.push(change)
+  })
+  self.ask()
+}
+
+/// Drain up to `most` queued changes in FIFO order on the render thread.
+/// If items remain after a bounded `most` take, requests the next frame automatically.
+pub fn FrameOutbox::take[T](self : FrameOutbox[T], most? : Int) -> Array[T] {
+  let out : Array[T] = []
+  let mut has_more = false
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    m[0] = 0
+    m[2] = m[2] + 1
+  })
+  self.buf.with_lock(fn(q : Array[T]) -> Unit {
+    let n = q.length()
+    let limit = match most {
+      Some(m) => {
+        let clamped = if m < 0 { 0 } else { m }
+        if clamped < n { clamped } else { n }
+      }
+      None => n
+    }
+    let mut i = 0
+    while i < limit {
+      out.push(q[i])
+      i += 1
+    }
+    if limit < n {
+      let rest : Array[T] = []
+      let mut j = limit
+      while j < n {
+        rest.push(q[j])
+        j += 1
+      }
+      q.clear()
+      for item in rest {
+        q.push(item)
+      }
+      has_more = true
+    } else {
+      q.clear()
+    }
+  })
+  if has_more {
+    self.ask()
+  }
+  out
+}
+
+/// Bind this outbox to `on_frame_take` so queued items are drained once at frame start and handed to `apply`.
+pub fn FrameOutbox::bind[T](self : FrameOutbox[T], apply : (Array[T]) -> Unit, most? : Int) -> Unit {
+  on_frame_take(fn() -> Unit {
+    let batch = match most {
+      Some(m) => self.take(most=m)
+      None => self.take()
+    }
+    if batch.length() > 0 {
+      apply(batch)
+    }
+  })
+}
+
+/// Number of queued changes currently waiting in this outbox.
+pub fn FrameOutbox::waiting[T](self : FrameOutbox[T]) -> Int {
+  let mut n = 0
+  self.buf.with_lock(fn(q : Array[T]) -> Unit {
+    n = q.length()
+  })
+  n
+}
+
+/// Total number of coalesced frame wakes requested by this outbox.
+pub fn FrameOutbox::wakes[T](self : FrameOutbox[T]) -> Int {
+  let mut w = 0
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    w = m[1]
+  })
+  w
+}
+
+/// Total number of `take` calls performed on this outbox.
+pub fn FrameOutbox::takes[T](self : FrameOutbox[T]) -> Int {
+  let mut t = 0
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    t = m[2]
+  })
+  t
+}

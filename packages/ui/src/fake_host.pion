@@ -36,6 +36,12 @@ pub struct FakeHost {
   pub mut reduce_motion_flag : Bool
   pub mut reduce_transparency_flag : Bool
   pub mut increase_contrast_flag : Bool
+  pub mut window_inset_flag : Bool
+  pub mut window_zoomed_flag : Bool
+  pub mut window_snap_state_val : Int
+  pub mut font_scale_val : Double
+  pub mut full_screen_flag : Bool
+  pub mut app_visible_flag : Bool
   pub mut frame_requested : Bool
   pub mut wake_count : Int
   pub mut frame_count : Int
@@ -58,12 +64,27 @@ pub struct FakeHost {
   pub a11y_wires : Array[String]
   pub a11y_mirror : A11yMirror
   pub frames_log : Array[Int]
+  pub posted : Array[(String, String, Bytes)]
+  post_take_buf : Array[(String, String, Bytes)]
+  pub mut post_wakes : Int
+  pub app_said_map : Map[String, String]
+  pub app_tells : Array[(String, String)]
+  pub menus_set : Array[String]
+  pub hotkeys : Map[String, String]
+  pub mut badge_count : Int
+  pub opened_urls : Array[String]
+  pub lifecycle_log : Array[String]
+  pub open_view_ids : Map[Int, Bool]
+  pub open_stream_ids : Map[Int, Bool]
+  pub open_term_ids : Map[Int, Bool]
   due_timers : Array[DueTimer]
   images : Map[Int, FakeImage]
   streams : Map[Int, FakeStream]
   mut next_image_id : Int
   mut next_stream_id : Int
   mut next_view_id : Int
+  mut next_term_id : Int
+  mut next_window_id : Int
   pub mut h264_supported : Bool
   pub mut audio_supported : Bool
 }
@@ -87,6 +108,12 @@ pub fn FakeHost::new(
     reduce_motion_flag: false,
     reduce_transparency_flag: false,
     increase_contrast_flag: false,
+    window_inset_flag: false,
+    window_zoomed_flag: false,
+    window_snap_state_val: 0,
+    font_scale_val: 1.0,
+    full_screen_flag: false,
+    app_visible_flag: true,
     frame_requested: true,
     wake_count: 0,
     frame_count: 0,
@@ -109,12 +136,27 @@ pub fn FakeHost::new(
     a11y_wires: [],
     a11y_mirror: A11yMirror::new(),
     frames_log: [],
+    posted: [],
+    post_take_buf: [],
+    post_wakes: 0,
+    app_said_map: Map::new(),
+    app_tells: [],
+    menus_set: [],
+    hotkeys: Map::new(),
+    badge_count: 0,
+    opened_urls: [],
+    lifecycle_log: [],
+    open_view_ids: Map::new(),
+    open_stream_ids: Map::new(),
+    open_term_ids: Map::new(),
     due_timers: [],
     images: Map::new(),
     streams: Map::new(),
     next_image_id: 1,
     next_stream_id: 1,
     next_view_id: 1,
+    next_term_id: 1,
+    next_window_id: 1,
     h264_supported: true,
     audio_supported: true,
   }
@@ -167,6 +209,35 @@ pub fn FakeHost::stream_push_event(self : FakeHost, id : Int, ev : String) -> Un
   }
 }
 
+/// Post an external message immediately to this fake host; requests a frame on the first post since last take.
+pub fn FakeHost::post(self : FakeHost, channel : String, json : String, bytes? : Bytes) -> Unit {
+  if channel == "" {
+    return
+  }
+  if self.posted.length() == 0 {
+    self.frame_requested = true
+    self.post_wakes = self.post_wakes + 1
+  }
+  let b = match bytes {
+    Some(v) => v
+    None => "".to_bytes()
+  }
+  self.posted.push((channel, json, b))
+}
+
+/// Schedule an external message to arrive at exact virtual timestamp `ms`, triggering between-frame dispatch.
+pub fn FakeHost::post_at(self : FakeHost, ms : Double, channel : String, json : String, bytes? : Bytes) -> Unit {
+  let b_opt = bytes
+  self.due(ms, "post:" + channel, fn() {
+    match b_opt {
+      Some(b) => self.post(channel, json, bytes=b)
+      None => self.post(channel, json)
+    }
+    messages_between()
+    self.frame_requested = true
+  })
+}
+
 /// Build a hostapi::Host backed by this FakeHost and install it as the active host.
 /// Returns the previous hostapi::Host for restoration on dispose.
 pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
@@ -181,11 +252,60 @@ pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
   h.reduce_motion = fn() { self.reduce_motion_flag }
   h.reduce_transparency = fn() { self.reduce_transparency_flag }
   h.increase_contrast = fn() { self.increase_contrast_flag }
+  h.window_inset = fn() { self.window_inset_flag }
+  h.window_zoomed = fn() { self.window_zoomed_flag }
+  h.window_snap_state = fn() { self.window_snap_state_val }
+  h.font_scale = fn() { self.font_scale_val }
+  h.full_screen = fn() { self.full_screen_flag }
+  h.set_full_screen = fn(on : Bool) { self.full_screen_flag = on }
   h.window_corner = fn() { self.window_corner_r }
   h.env = fn(k : String) {
-    match self.env_vars.get(k) {
+    if k == "INVAR_APP_VISIBLE" {
+      if self.app_visible_flag { "1" } else { "0" }
+    } else {
+      match self.env_vars.get(k) {
+        Some(v) => v
+        None => ""
+      }
+    }
+  }
+  h.menu_setup = fn(json : String) { self.menus_set.push(json) }
+  h.hotkey_set = fn(id : String, accel : String) {
+    self.hotkeys[id] = accel
+    true
+  }
+  h.hotkey_clear = fn(id : String) { self.hotkeys.remove(id) }
+  h.set_badge = fn(n : Int) { self.badge_count = n }
+  h.open_url = fn(url : String) {
+    self.opened_urls.push(url)
+    true
+  }
+  h.app_said = fn(name : String) {
+    match self.app_said_map.get(name) {
       Some(v) => v
       None => ""
+    }
+  }
+  h.app_tell = fn(name : String, arg : String) {
+    self.app_tells.push((name, arg))
+  }
+  h.post_take = fn() {
+    let n = self.posted.length()
+    if n > 0 {
+      for item in self.posted {
+        self.post_take_buf.push(item)
+      }
+      self.posted.clear()
+    }
+    self.post_take_buf.length()
+  }
+  h.post_next = fn() {
+    if self.post_take_buf.length() == 0 {
+      None
+    } else {
+      let item = self.post_take_buf[0]
+      array_remove_at(self.post_take_buf, 0)
+      Some(item)
     }
   }
   h.request_frame = fn() { self.frame_requested = true }
@@ -307,6 +427,8 @@ pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
     let id = self.next_stream_id
     self.next_stream_id = id + 1
     self.streams[id] = FakeStream::{ id, events: [], closed: false, volume: 1.0 }
+    self.open_stream_ids[id] = true
+    self.lifecycle_log.push("st_open:\{id}")
     id
   }
   h.st_next = fn(id : Int) {
@@ -319,11 +441,25 @@ pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
       _ => ""
     }
   }
+  h.st_show = fn(id : Int, _ts : Double) {
+    self.lifecycle_log.push("st_show:\{id}")
+  }
+  h.st_frame = fn(id : Int, _data : Bytes, _key : Int, _ts : Double) {
+    self.lifecycle_log.push("st_frame:\{id}")
+  }
+  h.st_pointer_named = fn(id : Int, key : String, _png : () -> Bytes, _w : Double, _h : Double, _hx : Double, _hy : Double) {
+    self.lifecycle_log.push("st_pointer:\{id}:\{key}")
+  }
+  h.st_pointer_at = fn(id : Int, _x : Double, _y : Double, shown : Int) {
+    self.lifecycle_log.push("st_pointer_at:\{id}:\{shown}")
+  }
   h.st_close = fn(id : Int) {
     match self.streams.get(id) {
       Some(st) => st.closed = true
       None => ()
     }
+    self.open_stream_ids.remove(id)
+    self.lifecycle_log.push("st_close:\{id}")
   }
   h.st_h264_here = fn() { if self.h264_supported { 1 } else { 0 } }
   h.st_audio_here = fn() { if self.audio_supported { 1 } else { 0 } }
@@ -333,13 +469,75 @@ pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
       None => ()
     }
   }
-  h.view_open = fn(_kind : Int, _arg : String) {
+  h.view_open = fn(kind : Int, arg : String) {
     let id = self.next_view_id
     self.next_view_id = id + 1
+    self.open_view_ids[id] = true
+    self.lifecycle_log.push("view_open:\{id}:\{kind}:\{arg}")
     id
   }
+  h.view_place = fn(
+    id : Int,
+    x : Double,
+    y : Double,
+    w : Double,
+    h_val : Double,
+    _cx0 : Double,
+    _cy0 : Double,
+    _cx1 : Double,
+    _cy1 : Double,
+    _r0 : Double,
+    _r1 : Double,
+    _r2 : Double,
+    _r3 : Double,
+    show : Bool,
+  ) {
+    let tag = if show { "show" } else { "hide" }
+    self.lifecycle_log.push("view_place:\{id}:\{tag}:\{x.to_int()}x\{y.to_int()}x\{w.to_int()}x\{h_val.to_int()}")
+  }
+  h.view_tell = fn(id : Int, what : Int, text : String) {
+    self.lifecycle_log.push("view_tell:\{id}:\{what}:\{text}")
+  }
+  h.view_close = fn(id : Int) {
+    self.open_view_ids.remove(id)
+    self.lifecycle_log.push("view_close:\{id}")
+  }
+  h.tm_open = fn(cols : Int, rows : Int) {
+    let id = self.next_term_id
+    self.next_term_id = id + 1
+    self.open_term_ids[id] = true
+    self.lifecycle_log.push("tm_open:\{id}:\{cols}x\{rows}")
+    id
+  }
+  h.tm_resize = fn(id : Int, cols : Int, rows : Int, _cw : Int, _ch : Int) {
+    self.lifecycle_log.push("tm_resize:\{id}:\{cols}x\{rows}")
+  }
+  h.tm_write = fn(id : Int, data : Bytes) {
+    self.lifecycle_log.push("tm_write:\{id}:\{data.length()}")
+  }
+  h.tm_frame = fn(id : Int, full : Int) {
+    self.lifecycle_log.push("tm_frame:\{id}:\{full}")
+    "TERM".to_bytes()
+  }
+  h.tm_close = fn(id : Int) {
+    self.open_term_ids.remove(id)
+    self.lifecycle_log.push("tm_close:\{id}")
+  }
   h.windows_in_process = fn() { true }
-  h.window_open_id = fn(_what : String) { 1 }
+  h.window_opens = fn() { true }
+  h.window_open = fn(what : String) {
+    self.lifecycle_log.push("window_open:\{what}")
+    true
+  }
+  h.window_open_id = fn(what : String) {
+    let id = self.next_window_id
+    self.next_window_id = id + 1
+    self.lifecycle_log.push("window_open_id:\{id}:\{what}")
+    id
+  }
+  h.window_close_id = fn(wid : Int) {
+    self.lifecycle_log.push("window_close_id:\{wid}")
+  }
   let prev = hostapi::host()
   hostapi::set_host(h)
   prev

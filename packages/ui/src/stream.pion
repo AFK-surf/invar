@@ -175,6 +175,28 @@ pub fn Stream::audio_volume(self : Stream, v : Double) -> Unit {
   }
 }
 
+/// Set a named cursor bitmap for this remote/video stream.
+pub fn Stream::pointer(
+  self : Stream,
+  key : String,
+  png : () -> Bytes,
+  w : Double,
+  h : Double,
+  hx : Double,
+  hy : Double,
+) -> Unit {
+  if self.ensure_open() {
+    hostapi::stream_pointer(self.id, key, png, w, h, hx, hy)
+  }
+}
+
+/// Update pointer position and visibility on this stream.
+pub fn Stream::pointer_at(self : Stream, x : Double, y : Double, shown : Bool) -> Unit {
+  if self.id > 0 && !self.closed {
+    hostapi::stream_pointer_at(self.id, x, y, shown)
+  }
+}
+
 pub fn Stream::audio_played(self : Stream) -> Double {
   if self.id > 0 && !self.closed { hostapi::stream_audio_played(self.id) } else { 0.0 }
 }
@@ -400,6 +422,18 @@ pub fn stream(
   })
 }
 
+/// Pure-tree hardware-decoded video/remote-screen stream node (`st_open/show/close/frame/pointer`).
+pub fn stream_view_node(
+  parent : view::View,
+  s : Stream,
+  fit~ : Fit = Fit::FitFill,
+  closes~ : Bool = true,
+  layer~ : () -> Bool = fn() { false },
+) -> view::View {
+  let _ = s.ensure_open()
+  stream(parent, s, fit=fit, closes=closes, layer=layer)
+}
+
 fn streams_frame_begin() -> Unit {
   for s in open_streams {
     s.poll()
@@ -428,8 +462,19 @@ pub struct NativeView {
 }
 
 pub fn NativeView::new(kind : Int) -> NativeView {
-  let id = hostapi::view_open(kind, "")
+  NativeView::open(kind, arg="")
+}
+
+pub fn NativeView::open(kind : Int, arg~ : String = "") -> NativeView {
+  let id = hostapi::view_open(kind, arg)
   NativeView::{ phys_id: next_ui_id(), id, kind, visible: false, closed: false }
+}
+
+/// Send an opaque message `(what, text)` to this native host view (`hostapi::view_tell`).
+pub fn NativeView::tell(self : NativeView, what : Int, text : String) -> Unit {
+  if !self.closed && self.id > 0 {
+    hostapi::view_tell(self.id, what, text)
+  }
 }
 
 pub fn NativeView::close(self : NativeView) -> Unit {
@@ -493,6 +538,11 @@ pub fn native(
     let _ = b.owns(fn() {
       match remove_tree_native(id) {
         Some(removed) => {
+          if removed.view.visible && removed.view.id > 0 && !removed.view.closed {
+            hostapi::view_place(
+              removed.view.id, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false,
+            )
+          }
           removed.view.visible = false
           if !removed.kept {
             removed.view.close()
@@ -502,6 +552,22 @@ pub fn native(
       }
     })
   })
+}
+
+/// Pure-tree native host view node (WebView, video surface, etc.) managing `view_open/place/close/tell`.
+pub fn native_view_node(
+  parent : view::View,
+  kind : Int,
+  arg~ : String = "",
+  kept~ : Bool = false,
+  on_ready? : (NativeView) -> Unit,
+) -> view::View {
+  let nv = NativeView::open(kind, arg=arg)
+  match on_ready {
+    Some(cb) => cb(nv)
+    None => ()
+  }
+  native(parent, nv, kept=kept)
 }
 
 fn natives_frame_begin() -> Unit {
@@ -520,10 +586,203 @@ fn natives_frame_end() -> Unit {
   }
 }
 
+/// Native host PTY/VT terminal handle mounted directly as a pure-tree node.
+pub struct NativeTerminal {
+  pub phys_id : Int
+  pub mut id : Int
+  mut handle : Option[hostapi::Terminal]
+  pub mut cols : Int
+  pub mut rows : Int
+  pub mut cell_w : Int
+  pub mut cell_h : Int
+  pub mut visible : Bool
+  pub mut closed : Bool
+  pub mut last_frame : Bytes
+}
+
+pub fn NativeTerminal::open(
+  cols~ : Int = 80,
+  rows~ : Int = 24,
+  cell_w~ : Int = 8,
+  cell_h~ : Int = 16,
+) -> NativeTerminal {
+  let c = if cols > 0 { cols } else { 80 }
+  let r = if rows > 0 { rows } else { 24 }
+  let handle = hostapi::Terminal::open(c, r)
+  let id = match handle {
+    Some(t) => t.id
+    None => 0
+  }
+  NativeTerminal::{
+    phys_id: next_ui_id(),
+    id,
+    handle,
+    cols: c,
+    rows: r,
+    cell_w: if cell_w > 0 { cell_w } else { 8 },
+    cell_h: if cell_h > 0 { cell_h } else { 16 },
+    visible: false,
+    closed: id <= 0,
+    last_frame: "".to_bytes(),
+  }
+}
+
+pub fn NativeTerminal::write(self : NativeTerminal, data : Bytes) -> Unit {
+  if !self.closed {
+    match self.handle {
+      Some(t) => t.write(data)
+      None => ()
+    }
+  }
+}
+
+pub fn NativeTerminal::resize(
+  self : NativeTerminal,
+  cols : Int,
+  rows : Int,
+  cell_w : Int,
+  cell_h : Int,
+) -> Unit {
+  if self.closed {
+    return
+  }
+  let c = if cols > 0 { cols } else { 1 }
+  let r = if rows > 0 { rows } else { 1 }
+  let cw = if cell_w > 0 { cell_w } else { 8 }
+  let ch = if cell_h > 0 { cell_h } else { 16 }
+  if c == self.cols && r == self.rows && cw == self.cell_w && ch == self.cell_h {
+    return
+  }
+  self.cols = c
+  self.rows = r
+  self.cell_w = cw
+  self.cell_h = ch
+  match self.handle {
+    Some(t) => t.resize(c, r, cw, ch)
+    None => ()
+  }
+}
+
+pub fn NativeTerminal::frame(self : NativeTerminal, full~ : Bool = false) -> Bytes {
+  if self.closed {
+    return "".to_bytes()
+  }
+  match self.handle {
+    Some(t) => {
+      let b = t.frame(full)
+      self.last_frame = b
+      b
+    }
+    None => "".to_bytes()
+  }
+}
+
+pub fn NativeTerminal::close(self : NativeTerminal) -> Unit {
+  if self.closed {
+    return
+  }
+  self.closed = true
+  self.visible = false
+  match self.handle {
+    Some(t) => {
+      t.close()
+      self.handle = None
+      self.id = 0
+    }
+    None => ()
+  }
+}
+
+struct TreeTerminal {
+  node_id : view::NodeId
+  term : NativeTerminal
+  cell_w : Double
+  cell_h : Double
+  closes : Bool
+  mut drawn_this_frame : Bool
+}
+
+let tree_terminals : Array[TreeTerminal] = []
+
+fn find_tree_terminal(id : view::NodeId) -> Option[TreeTerminal] {
+  for tt in tree_terminals {
+    if tt.node_id == id {
+      return Some(tt)
+    }
+  }
+  None
+}
+
+fn remove_tree_terminal(id : view::NodeId) -> Option[TreeTerminal] {
+  let mut idx = -1
+  let mut i = 0
+  while i < tree_terminals.length() {
+    if tree_terminals[i].node_id == id {
+      idx = i
+      break
+    }
+    i += 1
+  }
+  if idx >= 0 {
+    let removed = tree_terminals[idx]
+    array_remove_at(tree_terminals, idx)
+    Some(removed)
+  } else {
+    None
+  }
+}
+
+/// Pure-tree native PTY/VT terminal node managing `tm_open/resize/write/frame/close`.
+pub fn native_terminal_node(
+  parent : view::View,
+  term : NativeTerminal,
+  cell_w~ : Double = 8.0,
+  cell_h~ : Double = 16.0,
+  closes~ : Bool = true,
+) -> view::View {
+  let cw = if cell_w > 0.0 { cell_w } else { 8.0 }
+  let ch = if cell_h > 0.0 { cell_h } else { 16.0 }
+  parent.box(fn(b : view::View) {
+    let id = b.id()
+    tree_terminals.push(TreeTerminal::{
+      node_id: id,
+      term,
+      cell_w: cw,
+      cell_h: ch,
+      closes,
+      drawn_this_frame: false,
+    })
+    let _ = b.owns(fn() {
+      match remove_tree_terminal(id) {
+        Some(removed) => {
+          removed.term.visible = false
+          if removed.closes {
+            removed.term.close()
+          }
+        }
+        None => ()
+      }
+    })
+  })
+}
+
+fn terminals_frame_begin() -> Unit {
+  for tt in tree_terminals {
+    tt.drawn_this_frame = false
+  }
+}
+
+fn terminals_frame_end() -> Unit {
+  for tt in tree_terminals {
+    tt.term.visible = tt.drawn_this_frame && !tt.term.closed
+  }
+}
+
 fn streams_and_natives_reset() -> Unit {
   open_streams.clear()
   tree_streams.clear()
   tree_natives.clear()
+  tree_terminals.clear()
 }
 
 /// Scrollbar constants matching upstream scroll_bar.mbt.

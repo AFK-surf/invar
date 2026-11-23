@@ -1,0 +1,443 @@
+// Comprehensive unit tests for W1 UI runtime parity:
+// - D1: Between-frame external message delivery, answered_from_outside deferral, on_frame_take/wake_frame, FrameOutbox[T], app_said/app_tell
+// - D2: Fine-grained reactive host_said signals and host command wrappers
+// - D3: NativeView, Stream, NativeTerminal, and Multi-Window tree lifecycle with zero handle leaks
+
+import "hostapi"
+import "signals"
+import "view"
+
+test "d1: post_at delivers external messages at exact timestamp and draws that frame across 60/120/24/7 fps" {
+  let diffs = check_fps_matrix(fn(rate : Double) -> String {
+    let status = signals::signal("idle")
+    let received_at : Ref[Double] = ref_new(-1.0)
+    let received_bytes : Ref[Int] = ref_new(0)
+    on_message("core.updates", fn(json : String, bytes : Option[Bytes]) -> Unit {
+      status.set(json)
+      received_at.v = hostapi::now()
+      match bytes {
+        Some(b) => received_bytes.v = b.length()
+        None => received_bytes.v = 0
+      }
+    })
+    let t = Tester::tree(
+      fn(root : view::View) {
+        let _ = root.words(view::Live::By(fn() { status.get() }), look=view::words_plain)
+      },
+      fps=rate,
+    )
+    t.post_at(50.0, "core.updates", "ready-50ms", bytes="BIN4".to_bytes())
+    t.run_shown(50.0)
+    debug_assert(t.unasked_faults().length() == 0, "no unasked faults on post_at")
+    debug_assert(received_at.v == 50.0, "post_at must deliver at exact timestamp 50ms")
+    debug_assert(received_bytes.v == 4, "post_at must preserve binary payload")
+    debug_assert(t.find("ready-50ms").is_some(), "frame at 50ms must draw updated message state")
+    let out = "\{status.untracked()}@\{received_at.v.to_int()}:\{received_bytes.v}"
+    t.dispose()
+    out
+  })
+  debug_assert(diffs.length() == 0, "post_at must produce identical results across 60/120/24/7 fps")
+}
+
+test "d1: on_message_said fast path and on_messages_ahead batch inspection" {
+  let ahead_seen : Ref[Int] = ref_new(0)
+  let fast_hits : Ref[Int] = ref_new(0)
+  let fallback_hits : Ref[Int] = ref_new(0)
+  on_messages_ahead("chan.fast", fn(batch : Array[Option[(String, Option[Bytes])]]) -> Unit {
+    ahead_seen.v = batch.length()
+  })
+  on_message_said("chan.fast", fn(json : String, _b : Option[Bytes]) -> Bool {
+    if json == "fast" {
+      fast_hits.v = fast_hits.v + 1
+      true
+    } else {
+      false
+    }
+  })
+  on_message("chan.fast", fn(_json : String, _b : Option[Bytes]) -> Unit {
+    fallback_hits.v = fallback_hits.v + 1
+  })
+  debug_assert(message_said_on("chan.fast"), "message_said_on reports registered channel")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(_b : view::View) { () })
+  })
+  t.post("chan.fast", "fast")
+  t.post("chan.fast", "slow")
+  debug_assert(t.post_wakes() == 1, "multiple posts before frame coalesce to 1 wake")
+  t.frame(ms=16.0)
+  debug_assert(ahead_seen.v == 2, "on_messages_ahead sees full batch")
+  debug_assert(fast_hits.v == 1, "on_message_said handles fast message")
+  debug_assert(fallback_hits.v == 1, "unhandled message falls through to on_message")
+  debug_assert(t.messages_taken() == 2, "messages_taken counts both fast and fallback messages")
+  t.dispose()
+}
+
+test "d1: answered_from_outside defers via signals::after_computing when called inside computed" {
+  let src = signals::signal(1)
+  let side = signals::signal(10)
+  let trace : Array[String] = []
+  let comp = signals::computed(fn(_prev : Option[Int]) -> Int {
+    let v = src.get()
+    trace.push("compute:\{v}:side=\{side.untracked()}")
+    if v == 2 {
+      answered_from_outside(fn() -> Unit {
+        trace.push("deferred:set_side_20")
+        side.set(20)
+      })
+      // Must NOT have mutated `side` re-entrantly while still inside computed!
+      debug_assert(side.untracked() == 10, "answered_from_outside must defer until computed finishes")
+    }
+    v * 100 + side.untracked()
+  })
+  debug_assert(comp.get() == 110, "initial computed value")
+  src.set(2)
+  let v2 = comp.get()
+  debug_assert(v2 == 210, "computed reads clean pre-defer value without re-entrant dirty read")
+  debug_assert(side.untracked() == 20, "deferred outside answer ran immediately after computed finished")
+  debug_assert(trace.length() == 3 && trace[2] == "deferred:set_side_20", "deferred callback executed after compute")
+}
+
+test "d1: on_frame_take, wake_frame coalescing, FrameOutbox[T], and app_said/app_tell" {
+  let outbox : FrameOutbox[Int] = FrameOutbox::new()
+  let received : Array[Int] = []
+  let take_runs : Ref[Int] = ref_new(0)
+  let label = signals::signal("empty")
+
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.words(view::Live::By(fn() { label.get() }), look=view::words_plain)
+  })
+  outbox.bind(
+    fn(batch : Array[Int]) -> Unit {
+      take_runs.v = take_runs.v + 1
+      for x in batch {
+        received.push(x)
+      }
+      label.set("got:\{received.length()}")
+    },
+    most=2,
+  )
+
+  let wakes_before = t.fake.wake_count
+  outbox.tell(10)
+  outbox.tell(20)
+  outbox.tell(30)
+  wake_frame()
+  wake_frame()
+  debug_assert(outbox.wakes() == 1, "3 tells coalesce to 1 outbox wake")
+  debug_assert(t.fake.wake_count == wakes_before + 1, "multi-source wake_frame coalesces to 1 host wake")
+  debug_assert(outbox.waiting() == 3, "3 items waiting before frame")
+
+  // Frame 1 takes 2 items (bounded by most=2) and automatically requests next frame for the 3rd
+  t.frame(ms=16.0)
+  debug_assert(take_runs.v == 1, "first frame ran on_frame_take once")
+  debug_assert(received.length() == 2 && received[0] == 10 && received[1] == 20, "FIFO order preserved")
+  debug_assert(outbox.waiting() == 1, "1 item remains after bounded take")
+  debug_assert(outbox.wakes() == 2, "remaining item re-woke next frame")
+
+  // Frame 2 drains the remaining item
+  t.frame(ms=16.0)
+  debug_assert(take_runs.v == 2, "second frame drained remainder")
+  debug_assert(received.length() == 3 && received[2] == 30, "third item delivered")
+  debug_assert(outbox.waiting() == 0, "outbox empty")
+  debug_assert(t.find("got:3").is_some(), "UI rendered updated signal from FrameOutbox")
+
+  // app_said / app_tell thin wrappers
+  t.fake.app_said_map["version"] = "2.5.0"
+  debug_assert(app_said("version") == "2.5.0", "app_said reads host property")
+  app_tell("ping", "ok")
+  debug_assert(t.fake.app_tells.length() == 1 && t.fake.app_tells[0].0 == "ping", "app_tell forwards to host")
+  t.dispose()
+}
+
+test "d2: host_said fine-grained reactivity isolates dark, inset, font_scale without waking unrelated nodes" {
+  let dark_evals : Ref[Int] = ref_new(0)
+  let inset_evals : Ref[Int] = ref_new(0)
+  let scale_evals : Ref[Int] = ref_new(0)
+  let unrelated_evals : Ref[Int] = ref_new(0)
+
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.align_items(view::Along::Start)
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.words(
+        view::Live::By(fn() {
+          dark_evals.v = dark_evals.v + 1
+          if system_dark_now() { "DARK" } else { "LIGHT" }
+        }),
+        look=view::words_plain,
+      )
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.words(
+        view::Live::By(fn() {
+          inset_evals.v = inset_evals.v + 1
+          if window_inset_now() { "INSET" } else { "FLAT" }
+        }),
+        look=view::words_plain,
+      )
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.words(
+        view::Live::By(fn() {
+          scale_evals.v = scale_evals.v + 1
+          "SCALE:\{(font_scale_now() * 10.0).round().to_int()}"
+        }),
+        look=view::words_plain,
+      )
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.words(
+        view::Live::By(fn() {
+          unrelated_evals.v = unrelated_evals.v + 1
+          "STATIC"
+        }),
+        look=view::words_plain,
+      )
+    })
+  })
+  let d0 = dark_evals.v
+  let i0 = inset_evals.v
+  let s0 = scale_evals.v
+  let u0 = unrelated_evals.v
+
+  // Toggle dark mode -> only dark_evals increments
+  t.fake.dark_mode = true
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(dark_evals.v == d0 + 1, "dark node re-evaluated on dark_mode change")
+  debug_assert(inset_evals.v == i0, "inset node untouched by dark_mode change")
+  debug_assert(scale_evals.v == s0, "scale node untouched by dark_mode change")
+  debug_assert(unrelated_evals.v == u0, "unrelated node untouched by dark_mode change")
+
+  // Toggle window_inset -> only inset_evals increments
+  t.fake.window_inset_flag = true
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(dark_evals.v == d0 + 1, "dark node untouched by inset change")
+  debug_assert(inset_evals.v == i0 + 1, "inset node re-evaluated on window_inset change")
+  debug_assert(scale_evals.v == s0, "scale node untouched by inset change")
+  debug_assert(unrelated_evals.v == u0, "unrelated node untouched by inset change")
+
+  // Measure text width before and after set_font_scale(Some(1.5))
+  let mut w_before = 0.0
+  for d in t.drawn() {
+    if d.words == "STATIC" {
+      w_before = d.w
+    }
+  }
+  set_font_scale(Some(1.5))
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(scale_evals.v == s0 + 1, "scale node re-evaluated on font_scale change")
+  debug_assert(unrelated_evals.v == u0, "unrelated node signal binding not re-evaluated")
+  let mut w_after = 0.0
+  for d in t.drawn() {
+    if d.words == "STATIC" {
+      w_after = d.w
+    }
+  }
+  debug_assert(w_after > w_before * 1.3, "set_font_scale must trigger text re-measurement with larger width")
+  set_font_scale(None)
+  t.dispose()
+}
+
+test "d2: host_said covers all 12 environment signals and host command wrappers" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(_b : view::View) { () })
+  })
+  t.fake.window_inset_flag = true
+  t.fake.window_zoomed_flag = true
+  t.fake.window_snap_state_val = 2
+  t.fake.dark_mode = true
+  t.fake.font_scale_val = 1.25
+  t.fake.a11y_enabled = true
+  t.fake.reduce_motion_flag = true
+  t.fake.reduce_transparency_flag = true
+  t.fake.increase_contrast_flag = true
+  t.fake.app_visible_flag = false
+  t.fake.full_screen_flag = true
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+
+  debug_assert(window_inset_now(), "window_inset_now")
+  debug_assert(window_zoomed_now(), "window_zoomed_now")
+  debug_assert(window_snap_state_now() == 2, "window_snap_state_now")
+  debug_assert(system_dark_now(), "system_dark_now")
+  debug_assert((font_scale_now() - 1.25).abs() < 1.0e-6, "font_scale_now")
+  debug_assert(reads_out_now(), "reads_out_now")
+  debug_assert(reduced_motion_now(), "reduced_motion_now")
+  debug_assert(glass_solid_now(), "glass_solid_now")
+  debug_assert(more_contrast_now(), "more_contrast_now")
+  debug_assert(!app_visible_now(), "app_visible_now")
+  debug_assert(full_screen_now(), "full_screen_now")
+
+  // System channel: bars + foldable tabletop pose
+  t.post(
+    hostapi::system_channel,
+    "{\"bars\":{\"top\":44,\"bottom\":34,\"left\":0,\"right\":0},\"fold\":{\"hinge\":\"half\",\"divisions\":[{\"x\":0,\"y\":280,\"w\":800,\"h\":24}]}}",
+  )
+  t.frame(ms=16.0)
+  let bars = system_bars()
+  debug_assert(bars.top == 44.0 && bars.bottom == 34.0, "system_bars updated from system channel")
+  match system_tabletop_now() {
+    Some((y0, y1)) => debug_assert(y0 == 280.0 && y1 == 304.0, "system_tabletop_now extracts horizontal hinge band")
+    None => debug_assert(false, "expected Some tabletop band for half-open horizontal fold")
+  }
+
+  // Host command wrappers
+  menu_setup("{\"items\":[]}")
+  debug_assert(t.fake.menus_set.length() == 1, "menu_setup forwarded")
+  debug_assert(hotkey_set("toggle", "Cmd+Shift+K"), "hotkey_set returns true")
+  debug_assert(t.fake.hotkeys.contains("toggle"), "hotkey recorded")
+  hotkey_clear("toggle")
+  debug_assert(!t.fake.hotkeys.contains("toggle"), "hotkey cleared")
+  set_badge(7)
+  debug_assert(t.fake.badge_count == 7, "set_badge forwarded")
+  debug_assert(open_url("https://example.com"), "open_url returns true")
+  debug_assert(t.fake.opened_urls.length() == 1 && t.fake.opened_urls[0] == "https://example.com", "open_url recorded")
+  t.dispose()
+}
+
+test "d3: native_view_node, stream_view_node, and native_terminal_node lifecycle with zero handle leaks" {
+  let mounted = signals::signal(true)
+  let box_w = signals::signal(320.0)
+  let box_h = signals::signal(160.0)
+  let nv_ref : Ref[Option[NativeView]] = ref_new(None)
+  let st_ref : Ref[Option[Stream]] = ref_new(None)
+  let tm_ref : Ref[Option[NativeTerminal]] = ref_new(None)
+  let stream_acks : Array[Double] = []
+
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.show(fn() { mounted.get() }, fn(host : view::View) {
+      let _ = native_view_node(
+        host,
+        1,
+        arg="https://example.org",
+        on_ready=fn(nv : NativeView) { nv_ref.v = Some(nv) },
+      )
+        .width(view::Live::By(fn() { Some(box_w.get()) }))
+        .height(view::Live::By(fn() { Some(box_h.get()) }))
+
+      let st = Stream::new(
+        shown=fn(ts : Double) { stream_acks.push(ts) },
+        broken=fn() { () },
+      )
+      st_ref.v = Some(st)
+      let _ = stream_view_node(host, st)
+        .width(view::Live::Is(Some(320.0)))
+        .height(view::Live::Is(Some(180.0)))
+
+      let term = NativeTerminal::open(cols=40, rows=10, cell_w=8, cell_h=16)
+      tm_ref.v = Some(term)
+      let _ = native_terminal_node(host, term, cell_w=8.0, cell_h=16.0)
+        .width(view::Live::By(fn() { Some(box_w.get()) }))
+        .height(view::Live::By(fn() { Some(box_h.get()) }))
+    })
+  })
+
+  // Verify mount created all 3 handles
+  debug_assert(t.fake.open_view_ids.length() == 1, "1 native view open after mount")
+  debug_assert(t.fake.open_stream_ids.length() == 1, "1 stream open after mount")
+  debug_assert(t.fake.open_term_ids.length() == 1, "1 terminal open after mount")
+
+  // Drive native tell, stream frame + decode ok + pointer, terminal write
+  match nv_ref.v {
+    Some(nv) => nv.tell(1, "reload")
+    None => debug_assert(false, "native view should be ready")
+  }
+  match st_ref.v {
+    Some(st) => {
+      st.frame("KEYFRAME".to_bytes(), true, 16.0)
+      st.pointer("arrow", fn() { "PNG".to_bytes() }, 16.0, 16.0, 0.0, 0.0)
+      st.pointer_at(40.0, 20.0, true)
+      t.fake.stream_push_event(st.id, "ok 320 180 16")
+    }
+    None => debug_assert(false, "stream should be created")
+  }
+  match tm_ref.v {
+    Some(tm) => tm.write("hello\r\n".to_bytes())
+    None => debug_assert(false, "terminal should be created")
+  }
+
+  // Resize triggers re-layout: native view placed at new size, terminal resized to 60x15
+  box_w.set(480.0)
+  box_h.set(240.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(stream_acks.length() == 1 && stream_acks[0] == 16.0, "stream decode ack delivered")
+  match tm_ref.v {
+    Some(tm) => debug_assert(tm.cols == 60 && tm.rows == 15, "terminal auto-resized to 480/8=60 x 240/16=15")
+    None => ()
+  }
+
+  // Unmount must close all 3 handles with zero leaks
+  mounted.set(false)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert(t.fake.open_view_ids.length() == 0, "native view closed on unmount (zero leak)")
+  debug_assert(t.fake.open_stream_ids.length() == 0, "stream closed on unmount (zero leak)")
+  debug_assert(t.fake.open_term_ids.length() == 0, "terminal closed on unmount (zero leak)")
+
+  // Verify lifecycle sequence recorded in FakeHost
+  let mut saw_view_open = false
+  let mut saw_view_place_show = false
+  let mut saw_view_tell = false
+  let mut saw_view_close = false
+  let mut saw_st_show = false
+  let mut saw_st_pointer = false
+  let mut saw_st_close = false
+  let mut saw_tm_resize = false
+  let mut saw_tm_close = false
+  for entry in t.fake.lifecycle_log {
+    if str_has_prefix(entry, "view_open:") { saw_view_open = true }
+    if str_has_prefix(entry, "view_place:") && str_contains(entry, ":show:") { saw_view_place_show = true }
+    if str_has_prefix(entry, "view_tell:") { saw_view_tell = true }
+    if str_has_prefix(entry, "view_close:") { saw_view_close = true }
+    if str_has_prefix(entry, "st_show:") { saw_st_show = true }
+    if str_has_prefix(entry, "st_pointer:") { saw_st_pointer = true }
+    if str_has_prefix(entry, "st_close:") { saw_st_close = true }
+    if str_has_prefix(entry, "tm_resize:") && str_contains(entry, "60x15") { saw_tm_resize = true }
+    if str_has_prefix(entry, "tm_close:") { saw_tm_close = true }
+  }
+  debug_assert(saw_view_open && saw_view_place_show && saw_view_tell && saw_view_close, "native view lifecycle complete")
+  debug_assert(saw_st_show && saw_st_pointer && saw_st_close, "stream lifecycle complete")
+  debug_assert(saw_tm_resize && saw_tm_close, "terminal lifecycle complete")
+  t.dispose()
+}
+
+test "d3: multi_window isolation builds secondary window trees and cleans up on close" {
+  let closed_ids : Array[Int] = []
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.words(view::Live::Is("MainWindow"), look=view::words_plain)
+  })
+  set_window_tree(fn(_wid : Int, what : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.words(view::Live::Is("Sub:" + what), look=view::words_plain)
+    }
+  })
+  when_window_closed(fn(wid : Int) { closed_ids.push(wid) })
+  debug_assert(windows_here(), "in-process multi-window enabled")
+
+  let w1 = window_open_here("inspector")
+  let w2 = window_open_here("preview")
+  debug_assert(w1 > 0 && w2 > 0 && w1 != w2, "distinct secondary window ids")
+  debug_assert(window_tree_of(w1).is_some() && window_tree_of(w2).is_some(), "each window owns its view::Tree")
+
+  // Per-window signal isolation: set glass_solid override only in w1
+  in_window(w1, fn() { set_glass_solid(Some(true)) })
+  in_window(w2, fn() { set_glass_solid(Some(false)) })
+  let mut w1_solid = false
+  let mut w2_solid = true
+  in_window(w1, fn() { w1_solid = glass_solid() })
+  in_window(w2, fn() { w2_solid = glass_solid() })
+  debug_assert(w1_solid && !w2_solid, "per-window globals stay isolated across windows")
+
+  // Step frames for secondary windows
+  debug_assert(window_frame(w1, 400.0, 300.0, 2.0, 16.0), "window_frame renders w1")
+  debug_assert(window_frame(w2, 400.0, 300.0, 2.0, 16.0), "window_frame renders w2")
+
+  window_close_here(w1)
+  window_close_here(w2)
+  debug_assert(window_tree_of(w1).is_none() && window_tree_of(w2).is_none(), "closed windows dispose trees")
+  debug_assert(closed_ids.length() == 2, "window_closed callbacks fired")
+  t.dispose()
+}

@@ -424,7 +424,412 @@ pub fn MotionProbe::assert_steady(
   assert_fault_list("motion_steady_faults", self.faults(t, max_jump_pt=max_jump_pt), label)
 }
 
-/// Combined UI craft audit aggregating room, scroll, corner, unseen-press, focus-visible, and text-overflow/overlap gates.
+let first_line_mark_most : Double = 24.0
+let first_line_slack : Double = 2.0
+let first_line_share : Double = 0.25
+let line_start_mark_most : Double = 40.0
+let line_start_near : Double = 2.5
+let gate_align_slack : Double = 2.0
+
+fn drawn_has_words(d : view::Drawn) -> Bool {
+  (d.words.length() > 0 || d.runs.length() > 0) && d.alpha > 0.01 && d.w > 0.5 && d.h > 0.5
+}
+
+fn drawn_is_visual_mark(d : view::Drawn) -> Bool {
+  d.alpha > 0.01 &&
+  d.w > 0.5 &&
+  d.h > 0.5 &&
+  (
+    d.image.is_some() ||
+    d.shapes.length() > 0 ||
+    d.lines.length() > 0 ||
+    d.rects.length() > 0 ||
+    (d.ground & 0xFFL) != 0L ||
+    (d.edge.0 > 0.0 && (d.edge.1 & 0xFFL) != 0L) ||
+    d.glass.is_some()
+  )
+}
+
+fn drawn_line_height(d : view::Drawn) -> Double {
+  let base_sz = if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }
+  if d.words_look.line > 0.0 {
+    d.words_look.line
+  } else if d.words_look.line < 0.0 {
+    -d.words_look.line * base_sz
+  } else {
+    base_sz * 1.2
+  }
+}
+
+fn collect_subtree(kids : Array[Array[Int]], root : Int) -> Array[Int] {
+  let all : Array[Int] = []
+  let stack : Array[Int] = [root]
+  while stack.length() > 0 {
+    match stack.pop() {
+      Some(k) => {
+        all.push(k)
+        for ch in kids[k] {
+          stack.push(ch)
+        }
+      }
+      None => break
+    }
+  }
+  all
+}
+
+fn sort_lines_by_top(lines : Array[(Double, Double, Double)]) -> Unit {
+  let n = lines.length()
+  let mut i = 1
+  while i < n {
+    let key = lines[i]
+    let mut j = i - 1
+    while j >= 0 && lines[j].0 > key.0 {
+      lines[j + 1] = lines[j]
+      j -= 1
+    }
+    lines[j + 1] = key
+    i += 1
+  }
+}
+
+fn sort_indices_by_x(held : Array[(view::Drawn, Int, Bool)], arr : Array[Int]) -> Unit {
+  let n = arr.length()
+  let mut i = 1
+  while i < n {
+    let key = arr[i]
+    let kx = held[key].0.x
+    let mut j = i - 1
+    while j >= 0 && held[arr[j]].0.x > kx {
+      arr[j + 1] = arr[j]
+      j -= 1
+    }
+    arr[j + 1] = key
+    i += 1
+  }
+}
+
+/// Gate 7: First-line alignment check.
+/// Beside a multi-line text block, a small icon/mark (<= 24pt, not an independent pressable control)
+/// must align vertically with the first line rather than centering on the full block height.
+pub fn Tester::first_line_faults(self : Tester) -> Array[String] {
+  let _ = self
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let faults : Array[String] = []
+  let kids : Array[Array[Int]] = []
+  let worded : Array[Bool] = []
+  let mut i = 0
+  while i < n {
+    kids.push([])
+    worded.push(false)
+    i += 1
+  }
+  i = 0
+  while i < n {
+    let p = held[i].1
+    if p >= 0 && p < n {
+      kids[p].push(i)
+    }
+    if drawn_has_words(held[i].0) {
+      let mut k = i
+      while k >= 0 && k < n && !worded[k] {
+        worded[k] = true
+        k = held[k].1
+      }
+    }
+    i += 1
+  }
+  let mut p = 0
+  while p < n {
+    if !worded[p] || kids[p].length() < 2 {
+      p += 1
+      continue
+    }
+    let blocks : Array[(Int, Array[(Double, Double, Double)])] = []
+    for b in kids[p] {
+      let bd = held[b].0
+      if !worded[b] || tree.over_all(bd.id) || bd.alpha <= 0.01 {
+        continue
+      }
+      let lines : Array[(Double, Double, Double)] = []
+      for w in collect_subtree(kids, b) {
+        let wd = held[w].0
+        if !drawn_has_words(wd) || tree.over_all(wd.id) {
+          continue
+        }
+        let lh_est = drawn_line_height(wd)
+        let line_count = if lh_est > 0.5 && wd.h > lh_est * 1.45 {
+          let c = (wd.h / lh_est).round().to_int()
+          if c >= 2 { c } else { 1 }
+        } else {
+          1
+        }
+        let lh = if line_count > 1 { wd.h / line_count.to_double() } else { wd.h }
+        if lh <= 0.5 {
+          continue
+        }
+        let mut li = 0
+        while li < line_count {
+          let y = wd.y + li.to_double() * lh
+          let mut same = false
+          for existing in lines {
+            if ((existing.0 + existing.1) - (y + y + lh)).abs() * 0.5 < dmin(existing.2, lh) * 0.5 {
+              same = true
+              break
+            }
+          }
+          if !same {
+            lines.push((y, y + lh, lh))
+          }
+          li += 1
+        }
+      }
+      if lines.length() >= 2 {
+        sort_lines_by_top(lines)
+        blocks.push((b, lines))
+      }
+    }
+    if blocks.length() == 0 {
+      p += 1
+      continue
+    }
+    for a in kids[p] {
+      let ad = held[a].0
+      if worded[a] || tree.over_all(ad.id) || ad.alpha <= 0.01 {
+        continue
+      }
+      let mut x0 = 1.0e9
+      let mut y0 = 1.0e9
+      let mut x1 = -1.0e9
+      let mut y1 = -1.0e9
+      let mut mark = -1
+      let mut big = false
+      for k in collect_subtree(kids, a) {
+        let kd = held[k].0
+        if tree.presses_do(kd.id) && tree.takes_presses(kd.id) {
+          big = true
+          break
+        }
+        if !drawn_is_visual_mark(kd) {
+          continue
+        }
+        if kd.w > first_line_mark_most + gate_align_slack || kd.h > first_line_mark_most + gate_align_slack {
+          big = true
+          break
+        }
+        x0 = dmin(x0, kd.x)
+        y0 = dmin(y0, kd.y)
+        x1 = dmax(x1, kd.x + kd.w)
+        y1 = dmax(y1, kd.y + kd.h)
+        if mark < 0 || kd.w * kd.h > held[mark].0.w * held[mark].0.h {
+          mark = k
+        }
+      }
+      if big || mark < 0 || y1 - y0 > first_line_mark_most + gate_align_slack {
+        continue
+      }
+      let mid = (y0 + y1) * 0.5
+      for blk in blocks {
+        let b = blk.0
+        let lines = blk.1
+        let bn = held[b].0
+        let apart = x1 <= bn.x + gate_align_slack || x0 >= bn.x + bn.w - gate_align_slack
+        let first = lines[0]
+        let last = lines[lines.length() - 1]
+        if !apart || mid < first.0 || mid > last.1 {
+          continue
+        }
+        let first_mid = (first.0 + first.1) * 0.5
+        let off = mid - first_mid
+        if off.abs() > dmax(first_line_slack, first.2 * first_line_share) {
+          faults.push(
+            "first_line: \{gate_label(tree, held[mark].0)} mid offset \{(off * 10.0).round() / 10.0}pt from first of \{lines.length()} lines beside it (\{gate_label(tree, bn)})",
+          )
+          break
+        }
+      }
+    }
+    p += 1
+  }
+  faults
+}
+
+/// Assert zero first-line alignment faults.
+pub fn Tester::assert_first_line(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("first_line_faults", self.first_line_faults(), label)
+}
+
+/// Gate 8: Continuation line-start alignment check.
+/// In a vertical stack whose first row leads with a mark (<= 40pt) followed by words,
+/// subsequent lines below must align with either the mark's left edge or the words' left edge,
+/// never floating in the gap between the two.
+pub fn Tester::line_start_faults(self : Tester) -> Array[String] {
+  let _ = self
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let faults : Array[String] = []
+  let kids : Array[Array[Int]] = []
+  let worded : Array[Bool] = []
+  let mut i = 0
+  while i < n {
+    kids.push([])
+    worded.push(false)
+    i += 1
+  }
+  i = 0
+  while i < n {
+    let p = held[i].1
+    if p >= 0 && p < n {
+      kids[p].push(i)
+    }
+    if drawn_has_words(held[i].0) {
+      let mut k = i
+      while k >= 0 && k < n && !worded[k] {
+        worded[k] = true
+        k = held[k].1
+      }
+    }
+    i += 1
+  }
+  let start_of = fn(idx : Int) -> Option[Double] {
+    let mut x = 1.0e9
+    for k in collect_subtree(kids, idx) {
+      let kd = held[k].0
+      if kd.alpha <= 0.01 || tree.over_all(kd.id) {
+        continue
+      }
+      if drawn_has_words(kd) || drawn_is_visual_mark(kd) {
+        x = dmin(x, kd.x)
+      }
+    }
+    if x < 1.0e8 { Some(x) } else { None }
+  }
+  let is_mark = fn(idx : Int) -> Bool {
+    if worded[idx] {
+      return false
+    }
+    let mut drew = false
+    for k in collect_subtree(kids, idx) {
+      let kd = held[k].0
+      if tree.presses_do(kd.id) && tree.takes_presses(kd.id) {
+        return false
+      }
+      if drawn_is_visual_mark(kd) {
+        if kd.w > line_start_mark_most + gate_align_slack || kd.h > line_start_mark_most + gate_align_slack {
+          return false
+        }
+        drew = true
+      }
+    }
+    drew
+  }
+  let mut p = 0
+  while p < n {
+    let pn = held[p].0
+    if !worded[p] || kids[p].length() < 2 {
+      p += 1
+      continue
+    }
+    let vis_kids : Array[Int] = []
+    for k in kids[p] {
+      let kd = held[k].0
+      if kd.alpha > 0.01 && !tree.over_all(kd.id) && start_of(k).is_some() {
+        vis_kids.push(k)
+      }
+    }
+    if vis_kids.length() < 2 {
+      p += 1
+      continue
+    }
+    // Find topmost child as potential header row
+    let mut head = -1
+    let mut top = 1.0e9
+    for k in vis_kids {
+      if held[k].0.y < top {
+        top = held[k].0.y
+        head = k
+      }
+    }
+    if head < 0 || !worded[head] || kids[head].length() < 2 {
+      p += 1
+      continue
+    }
+    let hn = held[head].0
+    // Verify at least one sibling is vertically below `head` (column layout)
+    let mut has_below = false
+    for k in vis_kids {
+      if k != head && held[k].0.y >= hn.y + hn.h - gate_align_slack {
+        has_below = true
+        break
+      }
+    }
+    if !has_below {
+      p += 1
+      continue
+    }
+    // Collect horizontal parts inside `head`
+    let parts : Array[Int] = []
+    for ch in kids[head] {
+      let cd = held[ch].0
+      if cd.alpha > 0.01 && !tree.over_all(cd.id) && start_of(ch).is_some() {
+        parts.push(ch)
+      }
+    }
+    if parts.length() < 2 {
+      p += 1
+      continue
+    }
+    sort_indices_by_x(held, parts)
+    let mark = parts[0]
+    let words = parts[1]
+    // Ensure mark and words sit side-by-side (horizontal row)
+    let md = held[mark].0
+    let wd = held[words].0
+    if wd.x < md.x + md.w - gate_align_slack || !is_mark(mark) || !worded[words] {
+      p += 1
+      continue
+    }
+    let mx = match start_of(mark) { Some(v) => v; None => { p += 1; continue } }
+    let wx = match start_of(words) { Some(v) => v; None => { p += 1; continue } }
+    if wx - mx <= 2.0 * gate_align_slack {
+      p += 1
+      continue
+    }
+    for k in vis_kids {
+      if k == head || held[k].0.y < hn.y + hn.h - gate_align_slack {
+        continue
+      }
+      match start_of(k) {
+        Some(x) => {
+          if x > mx + line_start_near && x < wx - gate_align_slack {
+            faults.push(
+              "line_start: \{gate_label(tree, held[k].0)} starts at \{(x * 10.0).round() / 10.0}, between mark (\{(mx * 10.0).round() / 10.0}) and words (\{(wx * 10.0).round() / 10.0}) in \{gate_label(tree, pn)}",
+            )
+          }
+        }
+        None => ()
+      }
+    }
+    p += 1
+  }
+  faults
+}
+
+/// Assert zero continuation line-start alignment faults.
+pub fn Tester::assert_line_start(self : Tester, label~ : String = "") -> Unit {
+  assert_fault_list("line_start_faults", self.line_start_faults(), label)
+}
+
+/// Combined UI craft audit aggregating room, scroll, corner, unseen-press, focus-visible, text-overflow/overlap, first-line, and line-start gates.
 pub fn Tester::ui_craft_audit(self : Tester) -> Array[String] {
   let out : Array[String] = []
   for f in self.room_faults() {
@@ -443,6 +848,12 @@ pub fn Tester::ui_craft_audit(self : Tester) -> Array[String] {
     out.push(f)
   }
   for f in self.words_over_faults() {
+    out.push(f)
+  }
+  for f in self.first_line_faults() {
+    out.push(f)
+  }
+  for f in self.line_start_faults() {
     out.push(f)
   }
   out
