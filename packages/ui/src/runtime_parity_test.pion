@@ -5,6 +5,7 @@
 
 import "hostapi"
 import "signals"
+import "text"
 import "view"
 
 test "d1: post_at delivers external messages at exact timestamp and draws that frame across 60/120/24/7 fps" {
@@ -240,6 +241,109 @@ test "d2: host_said fine-grained reactivity isolates dark, inset, font_scale wit
   t.dispose()
 }
 
+/// Horizontal span of the glyph quads (kind 1 mono / 3 colour / 7 adaptive) drawn inside `d`'s box.
+fn glyph_span_in(sc : Scene, d : view::Drawn) -> Double {
+  let mut lo = 1.0e9
+  let mut hi = -1.0e9
+  let mut k = 0
+  while k < sc.ninst {
+    let b = k * inst_size
+    let kind = sc.inst[b + 5]
+    let gy = sc.inst[b + 1] + sc.inst[b + 3] * 0.5
+    if (kind == 1.0 || kind == 3.0 || kind == 7.0) && gy >= d.y && gy <= d.y + d.h {
+      let gx = sc.inst[b]
+      if gx >= d.x - 1.0 && gx <= d.x + d.w + 1.0 {
+        if gx < lo {
+          lo = gx
+        }
+        if gx > hi {
+          hi = gx
+        }
+      }
+    }
+    k += 1
+  }
+  if hi >= lo { hi - lo } else { 0.0 }
+}
+
+fn drawn_named(t : Tester, name : String) -> Option[view::Drawn] {
+  for d in t.drawn() {
+    if d.words == name || (d.runs.length() > 0 && d.runs[0].text == name) {
+      return Some(d)
+    }
+  }
+  None
+}
+
+test "d2: set_font_scale scales drawn glyphs with the measured box (words, runs, fixed-width ViewBlock)" {
+  set_view_blocks_enabled(true)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.align_items(view::Along::Start)
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.words(view::Live::Is("PLAINWORDS"), look=view::words_plain)
+    })
+    let _ = root.box(fn(b : view::View) {
+      let run = text::plain("RICHRUNS")
+      let _ = b.words_runs(view::Live::Is([run]), ink=0x111111FFL, look=view::words_plain)
+    })
+    let _ = root.box(fn(b : view::View) {
+      // Fixed width and height: only the font-size cache key can tell its ViewBlock is stale.
+      let _ = b
+      .width(view::Live::Is(Some(400.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .words(view::Live::Is("FIXEDWIDTH"), look=view::words_plain)
+    })
+  })
+  t.resize(640.0, 480.0)
+  t.frame(ms=16.0)
+  let names = ["PLAINWORDS", "RICHRUNS", "FIXEDWIDTH"]
+  let before_w : Array[Double] = []
+  let before_span : Array[Double] = []
+  for name in names {
+    match drawn_named(t, name) {
+      Some(d) => {
+        before_w.push(d.w)
+        before_span.push(glyph_span_in(t.scene(), d))
+      }
+      None => debug_assert(false, "missing drawn node " + name)
+    }
+  }
+  set_font_scale(Some(1.5))
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let mut i = 0
+  for name in names {
+    match drawn_named(t, name) {
+      Some(d) => {
+        let span = glyph_span_in(t.scene(), d)
+        debug_assert(before_span[i] > 0.0, name + ": glyphs drawn before scaling")
+        if name != "FIXEDWIDTH" {
+          debug_assert(d.w > before_w[i] * 1.3, name + ": measured width grows with font scale")
+        }
+        let ratio = span / before_span[i]
+        debug_assert(ratio > 1.45 && ratio < 1.55, name + ": drawn glyph span must grow 1.5x with font scale, got \{ratio}")
+      }
+      None => debug_assert(false, "missing drawn node " + name)
+    }
+    i += 1
+  }
+  set_font_scale(None)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  i = 0
+  for name in names {
+    match drawn_named(t, name) {
+      Some(d) => {
+        let ratio = glyph_span_in(t.scene(), d) / before_span[i]
+        debug_assert((ratio - 1.0).abs() < 0.01, name + ": glyph span returns to 1x after set_font_scale(None)")
+      }
+      None => ()
+    }
+    i += 1
+  }
+  t.dispose()
+}
+
 test "d2: host_said covers all 12 environment signals and host command wrappers" {
   let t = Tester::tree(fn(root : view::View) {
     let _ = root.box(fn(_b : view::View) { () })
@@ -314,8 +418,8 @@ test "d3: native_view_node, stream_view_node, and native_terminal_node lifecycle
         arg="https://example.org",
         on_ready=fn(nv : NativeView) { nv_ref.v = Some(nv) },
       )
-        .width(view::Live::By(fn() { Some(box_w.get()) }))
-        .height(view::Live::By(fn() { Some(box_h.get()) }))
+      .width(view::Live::By(fn() { Some(box_w.get()) }))
+      .height(view::Live::By(fn() { Some(box_h.get()) }))
 
       let st = Stream::new(
         shown=fn(ts : Double) { stream_acks.push(ts) },
@@ -323,14 +427,14 @@ test "d3: native_view_node, stream_view_node, and native_terminal_node lifecycle
       )
       st_ref.v = Some(st)
       let _ = stream_view_node(host, st)
-        .width(view::Live::Is(Some(320.0)))
-        .height(view::Live::Is(Some(180.0)))
+      .width(view::Live::Is(Some(320.0)))
+      .height(view::Live::Is(Some(180.0)))
 
       let term = NativeTerminal::open(cols=40, rows=10, cell_w=8, cell_h=16)
       tm_ref.v = Some(term)
       let _ = native_terminal_node(host, term, cell_w=8.0, cell_h=16.0)
-        .width(view::Live::By(fn() { Some(box_w.get()) }))
-        .height(view::Live::By(fn() { Some(box_h.get()) }))
+      .width(view::Live::By(fn() { Some(box_w.get()) }))
+      .height(view::Live::By(fn() { Some(box_h.get()) }))
     })
   })
 
