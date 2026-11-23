@@ -1,6 +1,47 @@
 # `packages/lg` Component Catalog (一页纸速查目录)
 
-> **铁律**：下游业务代码严禁直接调用 `paint::Glass::liquid(...)`，所有液态玻璃界面必须 100% 从本目录选用 `lg::*` 组件，并在单测中调用 `lg::assert_no_nested_glass(t, label="...")`。若缺少桌面尺寸或通用原语，必须先向 `AFK-surf/invar` 提补齐。
+> **铁律**：
+> 1. **内容层零玻璃**：页面底色、消息流、列表、内容卡片、表单与代码块**一律使用 Content Surfaces（实色纸面 `lg::surface()` / `SurfaceCard` / `SurfaceSection` / `CodeBlock`）**，严禁对页面内容套 `Glass::liquid`。
+> 2. **悬浮层单层玻璃**：下游业务代码严禁直接调用 `paint::Glass::liquid(...)`，所有悬浮导航、工具栏、弹层与交互控件必须 100% 从本目录选用 `lg::*` 组件，并在单测中调用 `lg::assert_apple_ui(t, label="...")`（或 `lg::assert_no_nested_glass`）。
+
+---
+
+## Content Surfaces (Non-Glass — Use for Page Content)
+
+所有页面正文、卡片、分组设置、代码块与背景底面均从这里选用（自动跟随 `lg::is_dark()` 切换浅/深苹果色板，**零 `Glass::liquid`**）：
+
+### 0a. `lg::surface()` & `lg::SurfacePalette` & 同心圆角阶梯
+- **适用场景**：页面底色与内容层语义配色唯一权威来源（`canvas` / `grouped_bg` / `sidebar` / `card` / `card_secondary` / `ink` / `ink_secondary` / `ink_tertiary` / `separator` / `separator_strong` / `row_hover` / `row_selected` / `accent` / `accent_tint` / `positive` / `warning` / `danger` / `code_bg` / `code_header`）。
+- **圆角与分割线常量**：`r_sheet = 34.0`、`r_panel = 26.0`、`r_card = 20.0`、`r_row = 12.0`、`r_chip = 8.0`、`hairline_w = 0.5`、`lg::concentric(outer, inset)`。
+```pion
+let _ = root.ground(view::Live::By(fn() { lg::surface().canvas }))
+let inner_r = lg::concentric(lg::r_card, 8.0) // 12.0
+```
+
+### 0b. `lg::surface_card_node` / `<lg::SurfaceCard>`
+- **适用场景**：干净实色苹果内容卡片（`surface().card` 或 `secondary=true` 时 `surface().card_secondary` + `0.5pt` `surface().separator` 细边，零玻璃、零厚重外阴影）。
+- **签名**：`pub fn surface_card_node(parent : view::View, body : (view::View) -> Unit, radius~ : Double = r_card, pad~ : Double = 16.0, gap~ : Double = 0.0, secondary~ : Bool = false, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
+```pion
+<lg::SurfaceCard pad={16.0} gap={12.0} label="Summary">
+  <ui::Text size={15.0} weight={600} color_by=>{lg::surface().ink} text="Overview" />
+</lg::SurfaceCard>
+```
+
+### 0c. `lg::surface_section_node` / `<lg::SurfaceSection>`
+- **适用场景**：iOS 分组内容区块（可选顶部小标题 + 干净实色卡片 + 可选底部脚注）。
+- **签名**：`pub fn surface_section_node(parent : view::View, body : (view::View) -> Unit, header~ : () -> String = fn() { "" }, footer~ : () -> String = fn() { "" }, radius~ : Double = r_card, pad~ : Double = 0.0, loc~ : String = "") -> view::View`
+```pion
+<lg::SurfaceSection header="GENERAL" footer="Changes apply immediately." pad={14.0}>
+  <ui::Text size={14.0} color_by=>{lg::surface().ink} text="Automatic Updates" />
+</lg::SurfaceSection>
+```
+
+### 0d. `lg::surface_code_block_node` / `<lg::CodeBlock>`
+- **适用场景**：自带标题条（语言标签 + 扁平 Copy 按钮，36pt 热区）与 `ui::scroll_row` 横向滚区的实色代码块，宽屏与 320pt 窄屏均绝不右侧截断。
+- **签名**：`pub fn surface_code_block_node(parent : view::View, code : () -> String, lang~ : () -> String = fn() { "" }, on_copy? : () -> Unit, max_height? : Double, radius~ : Double = r_row, loc~ : String = "") -> view::View`
+```pion
+<lg::CodeBlock lang="pion" code="lg::assert_apple_ui(t, label=\"screen\")" max_height={180.0} />
+```
 
 ---
 
@@ -8,16 +49,17 @@
 
 | 常见业务需求 | 必须使用的 `lg::*` 组件 | 禁止手搓的做法 |
 |---|---|---|
-| 浮动主按钮 / 次按钮 / 玻璃容器内扁平按钮 | `lg::liquid_button_node`（容器内传 `flat=true` / `ghost=true`） | 严禁 `v.glass(Glass::liquid(...))` 拼按钮 |
+| 页面底色 / 卡片 / 分组区块 / 代码块 | `lg::surface()` / `lg::SurfaceCard` / `lg::SurfaceSection` / `lg::CodeBlock` | 严禁给页面内容套 `Glass::liquid` 或硬编码杂色 |
+| 分组列表 / 折叠面板（默认实色卡片） | `lg::liquid_list_node`（默认 `glass=false`）/ `lg::liquid_disclosure_node`（默认 `glass=false`） | 严禁内容列表默认挂玻璃或手拼非同心圆角 |
+| 内容面板 / 悬浮检查器 / 卡片 / 控制中心磁贴 | `lg::liquid_panel_node` / `lg::liquid_card_node`（默认实色；悬浮检查器/磁贴显式 `floating=true`）/ `lg::liquid_control_tile_node` | 严禁直接套 `Glass::liquid` 面板 |
+| 浮动主按钮 / 次按钮 / 玻璃容器内扁平按钮 | `lg::liquid_button_node`（容器内传 `flat=true` / `ghost=true`，主按钮 `prominent=true`） | 严禁 `v.glass(Glass::liquid(...))` 拼按钮 |
 | 图标按钮（圆/胶囊） | `lg::liquid_icon_button_node` | 严禁手动圆框 + `Glass::liquid` |
 | 多图标合并胶囊操作组 | `lg::liquid_button_group_node` + `lg::LiquidGroupAction` | 严禁横排多个玻璃图标按钮硬贴 |
 | 浮动工具栏 + 分割线 | `lg::liquid_toolbar_node` + `lg::liquid_toolbar_divider` + `flat=true, ghost=true` 按钮 | 严禁在工具栏内再放 `flat=false` 玻璃按钮 |
-| 顶栏悬浮药丸操作组 | `lg::liquid_bar_pill_group_node`（紧凑 `lg_bar_pill_shadow`，内置 `flat=true, ghost=true` 32pt 按钮） | 严禁手写顶栏胶囊或套用大阴影弹层 |
+| 顶栏悬浮药丸操作组 | `lg::liquid_bar_pill_group_node`（紧凑 `lg_bar_pill_shadow`，内置 `flat=true, ghost=true` 按钮） | 严禁手写顶栏胶囊或套用大阴影弹层 |
 | 顶部导航栏 | `lg::liquid_nav_bar_node`（默认 `glass=false`，左右槽放浮动玻璃岛） | 严禁玻璃栏里再嵌玻璃按钮 |
 | 底部 Tab 栏 / iOS 26 折叠 Tab 栏 | `lg::liquid_bottom_tabs_node` / `lg::liquid_collapsible_tabs_node` | 严禁手写底栏放大镜 |
 | 搜索栏 / 球形展开搜索框 | `lg::liquid_search_bar_node` / `lg::liquid_search_morph_node` | 严禁手写搜索变形动效 |
-| 浮动检查器 / 卡片 / 控制中心磁贴 | `lg::liquid_panel_node` / `lg::liquid_card_node` / `lg::liquid_control_tile_node` | 严禁直接套 `Glass::liquid` 面板 |
-| 分组列表 / 折叠面板 | `lg::liquid_list_node` + `lg::LiquidListRow` / `lg::liquid_disclosure_node` | 严禁手工拼列表圆角（破坏同心圆角） |
 | 触发式下拉菜单 / 图标菜单按钮 / 独立命令面板 | `lg::liquid_menu_node` / `lg::liquid_menu_button_node` / `lg::liquid_menu_panel_node` | 严禁手写浮层菜单与键盘导航 |
 | 下拉选择器（Select） | `lg::liquid_select_node` + `lg::LiquidSelectOption` | 严禁手写按钮 + 弹出列表 |
 | 气泡弹层 / 悬浮提示 | `lg::liquid_popover_node` / `lg::liquid_tooltip_node` | 严禁绝对定位手绘气泡 |
@@ -27,414 +69,89 @@
 | 轻提示 / 徽标 / 进度条 / 进度环 | `lg::liquid_toast_node` / `lg::liquid_badge_node` / `lg::liquid_count_badge_node` / `lg::liquid_progress_bar_node` / `lg::liquid_progress_ring_node` | 严禁手写状态色与进度动画 |
 | 连续平面→玻璃浮升容器 | `lg::lg_glass_lift_surface`（静止 `strength <= 0.001` 零玻璃，浮起渐现） | 严禁手动插值 `Glass::liquid` 或静止留 `alpha=0` 玻璃 |
 | 毛细融合 / 放大镜 / 自适应亮度 / 渐进模糊 | `lg::liquid_merge_node` / `lg::liquid_magnifier_node` / `lg::liquid_adaptive_surface_node` / `lg::liquid_progressive_blur_node` | 严禁手调 shader 参数 |
-| 单测零玻璃嵌套门禁 | `lg::audit_glass` / `lg::assert_no_nested_glass` / `lg::count_liquid_glass` | 严禁肉眼检查代替自动门禁 |
+| 单测苹果双层 UI 门禁 | `lg::assert_apple_ui` / `lg::audit_glass` / `lg::assert_no_nested_glass` / `lg::count_liquid_glass` | 严禁肉眼检查代替自动门禁 |
 | 纵向/横向可滚动区域 | `ui::scroll_box` / `ui::scroll_row` / `kit::scroll_area` | 严禁在已有兄弟节点的容器上直接 `.scrolls(...)` 或遗漏 Flex 祖先 `.fill()` / `min_height(0)` |
 
 ---
 
 ## 一、按钮与操作（Buttons & Actions）
 
-### 1. `lg::liquid_button_node`
-- **适用场景**：独立液态玻璃胶囊按钮（默认 `height=32.0`、`pad_x=14.0`，与 `icon_button = 32pt`、`dialog_close = 32pt` 对齐），或作为玻璃容器内部的扁平/幽灵按钮（传 `flat=true`、`ghost=true`）。多激活工具栏按钮传 `neutral_active=true` 可使用中性半透明选中底（`0xFFFFFF22` / `0x00000016`）+ `colors().content` 前景，避免同时泛蓝。
-- **签名**：`pub fn liquid_button_node(parent : view::View, label : () -> String, press : () -> Unit, content? : (view::View) -> Unit, tint~ : Int64 = clear, surface~ : Int64 = clear, flat~ : Bool = false, interactive~ : Bool = true, disabled~ : () -> Bool = fn() { false }, ghost~ : Bool = false, height~ : Double = button_h, pad_x~ : Double = button_px, active~ : () -> Bool = fn() { false }, neutral_active~ : Bool = false, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_button_node(row, fn() { "Publish" }, fn() { on_publish() }, tint=0x007AFFFFL)
-let _ = lg::liquid_button_node(bar, fn() { "Pen" }, fn() { tool.set(1) }, flat=true, ghost=true, height=32.0, pad_x=10.0, active=fn() { tool.get() == 1 }, neutral_active=true)
-```
+### 1. `lg::liquid_button_node` / `<lg::Button>`
+- **适用场景**：独立液态玻璃胶囊按钮（默认 `height=30.0`、`pad_x=12.0`，自动扩展 `36pt` 热区），主操作传 `prominent=true`，玻璃容器内部传 `flat=true`、`ghost=true`。多激活工具栏按钮传 `neutral_active=true` 可使用中性半透明选中底，避免同时泛蓝。
+- **签名**：`pub fn liquid_button_node(parent : view::View, label : () -> String, press : () -> Unit, content? : (view::View) -> Unit, tint~ : Int64 = clear, surface~ : Int64 = clear, flat~ : Bool = false, prominent~ : Bool = false, interactive~ : Bool = true, disabled~ : () -> Bool = fn() { false }, ghost~ : Bool = false, height~ : Double = button_h, pad_x~ : Double = button_px, active~ : () -> Bool = fn() { false }, neutral_active~ : Bool = false, loc~ : String = "") -> view::View`
 
-### 2. `lg::liquid_icon_button_node` & `lg::LiquidButtonSize`
-- **适用场景**：浮动单层玻璃圆形图标按钮（支持 `Small=28pt` / `Regular=32pt` / `Large=40pt` 与激活态）。
-- **签名**：`pub enum LiquidButtonSize`；`pub fn liquid_icon_button_node(parent : view::View, label : () -> String, icon : (view::View, () -> Int64) -> Unit, press : () -> Unit, size~ : LiquidButtonSize = LiquidButtonSize::Regular, tint~ : Int64 = clear, surface~ : Int64 = clear, active~ : () -> Bool = fn() { false }, disabled~ : () -> Bool = fn() { false }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_icon_button_node(
-  row, fn() { "Favorite" },
-  fn(c, ink) { lg::flight_icon(c, 18.0, ink) },
-  fn() { fav.set(!fav.get()) },
-  active=fn() { fav.get() },
-)
-```
+### 2. `lg::liquid_icon_button_node` / `<lg::IconButton>` & `lg::LiquidButtonSize`
+- **适用场景**：浮动单层玻璃圆形图标按钮（`Small=28pt` / `Regular=32pt` / `Large=40pt`）。
 
 ### 3. `lg::liquid_button_group_node` & `lg::LiquidGroupAction`
-- **适用场景**：多个相关图标操作共用同一片单层液态玻璃胶囊（如编辑工具组）。
-- **签名**：`pub struct LiquidGroupAction`；`pub fn LiquidGroupAction::new(label~ : () -> String, icon~ : (view::View, () -> Int64) -> Unit, press~ : () -> Unit, active~ : () -> Bool = fn() { false }, disabled~ : () -> Bool = fn() { false }) -> LiquidGroupAction`；`pub fn liquid_button_group_node(parent : view::View, actions : () -> Array[LiquidGroupAction], size~ : LiquidButtonSize = LiquidButtonSize::Regular, surface~ : Int64 = clear, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_button_group_node(row, fn() {
-  [
-    lg::LiquidGroupAction::new(label=fn() { "Cut" }, icon=fn(c, ink) { lg::flight_icon(c, 16.0, ink) }, press=fn() { () }),
-    lg::LiquidGroupAction::new(label=fn() { "Copy" }, icon=fn(c, ink) { lg::flight_icon(c, 16.0, ink) }, press=fn() { () }),
-  ]
-})
-```
+- **适用场景**：多个相关图标操作共用同一片单层液态玻璃胶囊。
 
 ### 4. `lg::liquid_control_tile_node` & `lg::liquid_control_item_node` & `lg::flight_icon`
-- **适用场景**：控制中心风格方圆角玻璃磁贴（单层玻璃）以及卡片内扁平切换项（零玻璃）。
-- **签名**：
-  - `pub fn liquid_control_tile_node(parent : view::View, label : () -> String, press : () -> Unit, angle~ : Double = 45.0, icon? : (view::View, () -> Int64) -> Unit, loc~ : String = "") -> view::View`
-  - `pub fn liquid_control_item_node(parent : view::View, on : () -> Bool, turn : (Bool) -> Unit, label : () -> String, icon? : (view::View, () -> Int64) -> Unit, loc~ : String = "") -> view::View`
-  - `pub fn flight_icon(parent : view::View, size : Double, ink : () -> Int64, loc~ : String = "") -> Unit`
-```pion
-let _ = lg::liquid_control_tile_node(row, fn() { "Airplane" }, fn() { toggle_flight() })
-let _ = lg::liquid_control_item_node(card, fn() { wifi.get() }, fn(v) { wifi.set(v) }, fn() { "Wi-Fi" })
-```
+- **适用场景**：控制中心风格悬浮液态玻璃磁贴（单层玻璃，内部 `floating=true`）以及卡片内扁平切换项（零玻璃）。
 
 ---
 
 ## 二、工具栏与导航（Toolbars & Navigation）
 
-### 5. `lg::liquid_toolbar_node` & `lg::liquid_toolbar_divider`
-- **适用场景**：单层液态玻璃浮动工具栏容器（默认 `height=36.0, r=18.0`、`pad_x=3.0`、`gap=2.0`，上下对称 `3.0pt` 内边距，内放 `30pt` 扁平按钮/图标钮严格同心 `18 - 3 = 15`；内部只放 `flat=true` 按钮与 `liquid_toolbar_divider`）。
-- **签名**：
-  - `pub fn liquid_toolbar_node(parent : view::View, body : (view::View) -> Unit, height~ : Double = 36.0, pad_x~ : Double = ovl_toolbar_px, pad? : Double, gap~ : Double = ovl_toolbar_gap, loc~ : String = "") -> view::View`
-  - `pub fn liquid_toolbar_divider(parent : view::View, height~ : Double = 20.0, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_toolbar_node(page, fn(bar) {
-  let _ = lg::liquid_button_node(bar, fn() { "Select" }, fn() { () }, flat=true, ghost=true, pad_x=10.0)
-  let _ = lg::liquid_toolbar_divider(bar, height=16.0)
-  let _ = lg::liquid_button_node(bar, fn() { "Note" }, fn() { () }, flat=true, ghost=true, pad_x=10.0)
-})
-```
+### 5. `lg::liquid_toolbar_node` / `<lg::Toolbar>` & `lg::liquid_toolbar_divider` / `<lg::ToolbarDivider>`
+- **适用场景**：单层液态玻璃浮动工具栏容器（`height=36.0, r=18.0`，内放 `flat=true, ghost=true` 按钮与分割线）。
 
-### 5b. `lg::liquid_bar_pill_group_node`
-- **适用场景**：顶栏悬浮液态玻璃药丸操作组（同步 `monoid` PR #8052 `bar_pill_group_node`）：单层 `lg_capsule_glass()` 胶囊（默认 `height=36.0, r=18.0, pad=2.0, gap=2.0`，内置 `32pt` 圆形图标按钮或扁平胶囊按钮 `r=16.0` 严格同心 `18 - 2 = 16`），搭配紧凑外阴影 `lg_bar_pill_shadow()` 防止相邻 `6pt` 间距药丸互相渗出光晕，兼容 `glass_solid()` 1pt 细边降级。内部按钮一律传 `flat=true, ghost=true`（零嵌套玻璃）。
-- **签名**：`pub fn liquid_bar_pill_group_node(parent : view::View, body : (view::View) -> Unit, height~ : Double = 36.0, pad~ : Double = 2.0, gap~ : Double = 2.0, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_bar_pill_group_node(nav_trailing, fn(pill) {
-  let _ = lg::liquid_button_node(pill, fn() { "Share" }, fn() { () }, flat=true, ghost=true, pad_x=12.0)
-  let _ = lg::liquid_button_node(pill, fn() { "Export" }, fn() { () }, flat=true, ghost=true, pad_x=12.0)
-}, label=fn() { "Bar Actions" })
-```
+### 5b. `lg::liquid_bar_pill_group_node` / `<lg::BarPillGroup>`
+- **适用场景**：顶栏悬浮液态玻璃药丸操作组（紧凑外阴影 `lg_bar_pill_shadow()`，防止相邻 6pt 间距药丸互相渗出光晕；内部按钮一律 `flat=true, ghost=true`）。
 
-### 6. `lg::liquid_nav_bar_node`
+### 6. `lg::liquid_nav_bar_node` / `<lg::NavBar>`
 - **适用场景**：页面顶部导航栏（默认 `height=46.0`、透明布局层 `glass=false`，左右槽托管独立单层玻璃岛）。
-- **签名**：`pub fn liquid_nav_bar_node(parent : view::View, title : () -> String, subtitle~ : () -> String = fn() { "" }, leading? : (view::View) -> Unit, trailing? : (view::View) -> Unit, height~ : Double = 46.0, glass~ : Bool = false, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_nav_bar_node(page, fn() { "Settings" }, subtitle=fn() { "Invar" }, trailing=fn(t) {
-  let _ = lg::liquid_icon_button_node(t, fn() { "More" }, fn(c, ink) { lg::flight_icon(c, 16.0, ink) }, fn() { () })
-})
-```
 
-### 7. `lg::liquid_bottom_tabs_node`、`lg::liquid_bottom_tab_node` & `lg::tab_face`
-- **适用场景**：iOS 27 浮动液态玻璃底部 Tab 栏，按压拖拽时触发折射放大镜。
-- **签名**：
-  - `pub fn liquid_bottom_tabs_node(parent : view::View, labels : Array[String], selected : () -> Int, select : (Int) -> Unit, label~ : String = "", faces? : Array[(view::View, () -> Int64) -> Unit], drag? : DampedDrag, light? : InteractiveHighlight, loc~ : String = "") -> view::View`
-  - `pub fn tab_face(name : String) -> (view::View, () -> Int64) -> Unit`
-```pion
-let _ = lg::liquid_bottom_tabs_node(wrap, ["Home", "Explore", "Library"], fn() { tab.get() }, fn(i) { tab.set(i) }, label="Main Tabs")
-```
-
-### 8. `lg::liquid_collapsible_tabs_node`
-- **适用场景**：iOS 26/27 滚动时自动折叠为胶囊圆球 + 独立操作球的液态玻璃 Tab 栏。
-- **签名**：`pub fn liquid_collapsible_tabs_node(parent : view::View, tabs : Array[String], chosen : () -> Int, choose : (Int) -> Unit, minimized : () -> Bool, on_expand : () -> Unit, on_action : () -> Unit, action_label~ : () -> String = fn() { "Search" }, expanded_width~ : Double = 320.0, label~ : String = "", loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_collapsible_tabs_node(
-  page, ["Home", "Browse", "Radio"],
-  fn() { tab.get() }, fn(i) { tab.set(i) },
-  fn() { minimized.get() }, fn() { minimized.set(false) }, fn() { open_search() },
-)
-```
-
-### 9. `lg::liquid_search_morph_node`
-- **适用场景**：圆形搜索球与展开态搜索栏 + 独立取消球之间的双岛液态变形。
-- **签名**：`pub fn liquid_search_morph_node(parent : view::View, field : ui::Field, expanded : () -> Bool, set_expanded : (Bool) -> Unit, width~ : Double = 360.0, placeholder~ : String = "Search", label~ : () -> String = fn() { "Search" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_search_morph_node(page, search_field, fn() { exp.get() }, fn(v) { exp.set(v) }, width=360.0, placeholder="Search docs")
-```
+### 7. `lg::liquid_bottom_tabs_node`、`lg::liquid_collapsible_tabs_node` & `lg::liquid_search_morph_node`
+- **适用场景**：iOS 26/27 浮动液态玻璃底部 Tab 栏（按压拖拽触发折射放大镜）、滚动自动折叠 Tab 栏与双岛变形搜索框。
 
 ---
 
-## 三、面板与浮层（Panels & Overlays）
+## 三、面板、列表与浮层（Panels, Lists & Overlays）
 
-### 10. `lg::liquid_panel_node`
-- **适用场景**：自适应内容高度的高密度液态玻璃检查器/浮层面板（深/浅双端对称 75% 密度 `0x202020BF` / `0xFDFCFDBF`）。默认 `radius=24.0, pad=12.0`（对应内部同心圆角 `12.0`）；**若面板内贴底放 `32pt` 胶囊按钮（`r=16`），必须传 `radius=28.0, pad=12.0`（`28 - 12 = 16` 严格同心）**，或使内部子块圆角精确等于 `radius - pad`。
-- **签名**：`pub fn liquid_panel_node(parent : view::View, body : (view::View) -> Unit, radius~ : Double = ovl_panel_radius, pad~ : Double = ovl_panel_pad, gap~ : Double = 0.0, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_panel_node(page, fn(p) {
-  let _ = p.box(fn(w) { let _ = w.words(view::Live::Is("Inspector"), look=lg::words_at(14.0)) })
-}, gap=8.0, label=fn() { "Inspector" })
-```
+### 10. `lg::liquid_panel_node` / `<lg::Panel>`
+- **适用场景**：默认渲染干净实色苹果内容卡片（`floating=false`）；显式传 `floating=true` 时挂载 75% 对称高密度单层液态玻璃（悬浮检查器如 `OPTICAL PARAMETERS`）。
+- **签名**：`pub fn liquid_panel_node(parent : view::View, body : (view::View) -> Unit, radius~ : Double = ovl_panel_radius, pad~ : Double = ovl_panel_pad, gap~ : Double = 0.0, floating~ : Bool = false, label~ : () -> String = fn() { "Panel" }, loc~ : String = "") -> view::View`
 
-### 11. `lg::liquid_card_node`
-- **适用场景**：固定宽高（`w × h`）的单层液态玻璃展示卡片容器。
-- **签名**：`pub fn liquid_card_node(parent : view::View, w : Double, h : Double, label : () -> String, content~ : (view::View) -> Unit = fn(_v) { () }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_card_node(page, 280.0, 160.0, fn() { "Metrics" }, content=fn(c) {
-  let _ = c.box(fn(w) { let _ = w.words(view::Live::Is("120 fps"), look=lg::words_at(20.0, weight=600)) })
-})
-```
+### 11. `lg::liquid_card_node` / `<lg::Card>`
+- **适用场景**：固定宽高（`w × h`）卡片容器，默认实色苹果卡片（`floating=false`）；控制中心悬浮磁贴显式传 `floating=true` 启用液态玻璃折射。
+- **签名**：`pub fn liquid_card_node(parent : view::View, w : Double, h : Double, label : () -> String, content~ : (view::View) -> Unit = fn(_v) { () }, radius~ : Double = tile_size / 2.0, angle~ : Double = 45.0, floating~ : Bool = false, press? : () -> Unit, light? : InteractiveHighlight, loc~ : String = "") -> view::View`
 
 ### 12. `lg::liquid_list_node` & `lg::LiquidListRow`
-- **适用场景**：设置页与分组列表单层玻璃容器，内置同心圆角（`r=24, pad=6 -> row r=18`）与无悬空分割线。
-- **签名**：`pub struct LiquidListRow`；`pub fn LiquidListRow::new(title~ : String, subtitle~ : String = "", value~ : String = "", icon? : (view::View, () -> Int64) -> Unit, chevron~ : Bool = false, on_press? : () -> Unit, active~ : Bool = false, destructive~ : Bool = false, disabled~ : Bool = false) -> LiquidListRow`；`pub fn liquid_list_node(parent : view::View, rows : () -> Array[LiquidListRow], header~ : () -> String = fn() { "" }, footer~ : () -> String = fn() { "" }, dividers~ : Bool = true, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_list_node(page, fn() {
-  [lg::LiquidListRow::new(title="Wi-Fi", value="Office", chevron=true, on_press=fn() { () })]
-}, header=fn() { "Network" })
-```
+- **适用场景**：设置页与分组列表容器（默认 `glass=false` 为干净实色苹果分组卡片，内置同心圆角 `r=24, pad=6 -> row r=18` 与无悬空分割线；玻璃弹层/抽屉内部传 `flat=true`；仅悬浮弹层独立列表显式传 `glass=true`）。
+- **签名**：`pub fn liquid_list_node(parent : view::View, rows : () -> Array[LiquidListRow], header~ : () -> String = fn() { "" }, footer~ : () -> String = fn() { "" }, dividers~ : Bool = true, flat~ : Bool = false, glass~ : Bool = false, loc~ : String = "") -> view::View`
 
-### 13. `lg::liquid_disclosure_node`
-- **适用场景**：可展开/收起的单层液态玻璃折叠面板（同心圆角 `r=22 -> header r=16`）。
-- **签名**：`pub fn liquid_disclosure_node(parent : view::View, title : () -> String, open : () -> Bool, on_toggle : (Bool) -> Unit, content : (view::View) -> Unit, subtitle~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_disclosure_node(page, fn() { "Advanced" }, fn() { open.get() }, fn(v) { open.set(v) }, fn(b) {
-  let _ = b.box(fn(w) { let _ = w.words(view::Live::Is("Details"), look=lg::words_at(14.0)) })
-})
-```
+### 13. `lg::liquid_disclosure_node` / `<lg::Disclosure>`
+- **适用场景**：可展开/收起折叠面板（默认 `glass=false` 为干净实色苹果卡片，同心圆角 `r=22 -> header r=16`；悬浮弹层内显式传 `glass=true`）。
+- **签名**：`pub fn liquid_disclosure_node(parent : view::View, title : () -> String, open : () -> Bool, on_toggle : (Bool) -> Unit, content : (view::View) -> Unit, subtitle~ : () -> String = fn() { "" }, disabled~ : () -> Bool = fn() { false }, glass~ : Bool = false, loc~ : String = "") -> view::View`
 
-### 14. `lg::liquid_popover_node`、`lg::liquid_popover_button_node` & `lg::liquid_tooltip_node`
-- **适用场景**：锚定在触发器旁的液态玻璃气泡弹层（含开箱即用的 `liquid_popover_button_node`，支持 `flat=true, ghost=true` 零嵌套玻璃嵌入工具栏）与悬浮提示（含完整 `headless::Placement` 定位）。
-- **签名**：
-  - `pub fn liquid_popover_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, trigger_label : () -> String, trigger_look : (view::View, headless::Disclosure) -> Unit, content_label : () -> String, content_look : (view::View) -> Unit, placement~ : headless::Placement = headless::Placement::BelowCenter, width~ : Double = 280.0, anchor_size~ : (Double, Double) = (36.0, 36.0), trigger_face? : (view::View) -> Unit, loc~ : String = "") -> view::View`
-  - `pub fn liquid_popover_button_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, label : () -> String, content_look : (view::View) -> Unit, icon? : (view::View, () -> Int64) -> Unit, show_label~ : Bool = true, flat~ : Bool = false, ghost~ : Bool = false, active~ : () -> Bool = fn() { false }, height~ : Double = button_h, pad_x~ : Double = 12.0, content_label~ : () -> String = fn() { "Popover" }, placement~ : headless::Placement = headless::Placement::BelowCenter, width~ : Double = 240.0, loc~ : String = "") -> view::View`
-  - `pub fn liquid_tooltip_node(parent : view::View, host : view::View, tip : () -> String, trigger_look : (view::View) -> Unit, placement~ : headless::Placement = headless::Placement::AboveCenter, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_tooltip_node(page, host_root, fn() { "Reset optical params" }, fn(tr) {
-  let _ = lg::liquid_button_node(tr, fn() { "Reset" }, fn() { () })
-})
-```
-
-### 15. `lg::liquid_dialog_node`
-- **适用场景**：模态居中液态玻璃确认弹窗（深/浅对称 75% 密度 `0x202020BF` / `0xFDFCFDBF`，`r=28, 按钮区 inset=12 -> 32pt 按钮 r=16` 严格同心，内置 Escape 关闭与扁平操作按钮）。
-- **签名**：`pub fn liquid_dialog_node(parent : view::View, open : () -> Bool, on_close : () -> Unit, title : () -> String, text : () -> String, on_action~ : () -> Unit = fn() { () }, cancel~ : () -> String = fn() { "Cancel" }, action~ : () -> String = fn() { "Okay" }, width~ : Double = 480.0, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_dialog_node(page, fn() { dlg.get() }, fn() { dlg.set(false) }, fn() { "Delete Item?" }, fn() { "This cannot be undone." }, on_action=fn() { do_delete() }, action=fn() { "Delete" })
-```
-
-### 16. `lg::liquid_sheet_node` & `lg::liquid_action_sheet_node` & `lg::LiquidActionSheetItem`
-- **适用场景**：底部独立浮动 Sheet（`r=28, footer inset=12 -> 32pt 按钮 r=16` 严格同心；支持 `detents=true` 响应式两档 detent：中档为 80% 对称密度浮岛 `0x202020CC`/`0xFDFCFDCC`，展开高档平滑过渡至 86% 对称高可读表面 `0x202020DC`/`0xFDFCFDDC`，窄屏自动贴底展开、宽屏保持悬浮圆角岛）与底部操作表（`r=22, pad=6 -> item r=16`）。
-- **签名**：
-  - `pub fn liquid_sheet_node(parent : view::View, open : () -> Bool, on_close : () -> Unit, title : () -> String, body : (view::View) -> Unit, subtitle~ : () -> String = fn() { "" }, footer? : (view::View) -> Unit, width~ : Double = 520.0, max_height~ : Double = 560.0, detents~ : Bool = false, expanded~ : () -> Bool = fn() { false }, on_expanded~ : (Bool) -> Unit = fn(_v : Bool) -> Unit { () }, loc~ : String = "") -> view::View`
-  - `pub struct LiquidActionSheetItem`；`pub fn LiquidActionSheetItem::new(label~ : String, on_select~ : () -> Unit, destructive~ : Bool = false, disabled~ : Bool = false) -> LiquidActionSheetItem`
-  - `pub fn liquid_action_sheet_node(parent : view::View, open : () -> Bool, on_close : () -> Unit, items : () -> Array[LiquidActionSheetItem], title~ : () -> String = fn() { "" }, message~ : () -> String = fn() { "" }, cancel_label~ : () -> String = fn() { "Cancel" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_sheet_node(
-  page, fn() { open.get() }, fn() { open.set(false) }, fn() { "Share" },
-  fn(b) { let _ = b.box(fn(w) { let _ = w.words(view::Live::Is("Sheet body"), look=lg::words_at(15.0)) }) },
-  detents=true, expanded=fn() { exp.get() }, on_expanded=fn(v) { exp.set(v) },
-)
-```
-
-### 16b. `lg::liquid_drawer_node` & `lg::DrawerSide`
-- **适用场景**：侧边浮岛液态玻璃抽屉（iPadOS 26 / iOS 26 浮岛侧栏几何：`10pt` 窗口外边距、`r=28, pad=12 -> 32pt 关闭/底部按钮 r=16` 严格同心、单层 80% 对称密度 `lg_drawer_glass()`），支持 `DrawerSide::Leading` / `DrawerSide::Trailing`、水平橡皮筋拖拽关闭、Escape/遮罩关闭与 `glass_solid()` 1pt 细边降级。
-- **签名**：
-  - `pub enum DrawerSide { Leading; Trailing }`
-  - `pub fn liquid_drawer_node(parent : view::View, open : () -> Bool, on_close : () -> Unit, title : () -> String, body : (view::View) -> Unit, side~ : DrawerSide = DrawerSide::Leading, width~ : Double = 320.0, subtitle~ : () -> String = fn() { "" }, footer? : (view::View) -> Unit, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_drawer_node(
-  page, fn() { open.get() }, fn() { open.set(false) }, fn() { "Inspector" },
-  fn(b) { let _ = lg::liquid_list_node(b, fn() { rows }, dividers=false, flat=true) },
-  side=lg::DrawerSide::Trailing, width=320.0, subtitle=fn() { "Floating Island" },
-)
-```
+### 14–16. 悬浮弹层与模态容器（单层液态玻璃）
+- `lg::liquid_popover_node`、`lg::liquid_popover_button_node`、`lg::liquid_tooltip_node`
+- `lg::liquid_dialog_node` / `<lg::Dialog>`（70% 对称密度，`r=28 -> 32pt 按钮 r=16`）
+- `lg::liquid_sheet_node` / `<lg::Sheet>`（80%→86% 双档 detent 响应）与 `lg::liquid_action_sheet_node`
+- `lg::liquid_drawer_node` / `<lg::Drawer>`（80% 浮岛侧栏抽屉，`DrawerSide::Leading | Trailing`）
 
 ---
 
-## 四、菜单与选择（Menus & Selection）
+## 四、菜单、选择、表单与反馈（Menus, Controls, Inputs & Feedback）
 
-### 17. `lg::liquid_menu_node`、`lg::liquid_menu_button_node`、`lg::liquid_menu_panel_node` & `lg::LiquidMenuEntry`
-- **适用场景**：带液态融合过渡的下拉菜单（自定义触发器 / 开箱即用圆或胶囊菜单按钮 / 独立命令面板如 Slash Menu）。
-- **签名**：
-  - `pub struct LiquidMenuEntry` (`LiquidMenuEntry::item`, `LiquidMenuEntry::check`, `LiquidMenuEntry::separator`)
-  - `pub fn liquid_menu_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, trigger_label : () -> String, trigger_look : (view::View, headless::Disclosure) -> Unit, entries : () -> Array[LiquidMenuEntry], menu_label~ : () -> String = fn() { "" }, placement~ : headless::Placement = headless::Placement::BelowStart, width~ : Double = 220.0, loc~ : String = "") -> view::View`
-  - `pub fn liquid_menu_button_node(parent : view::View, host : view::View, open : () -> Bool, set_open : (Bool) -> Unit, label : () -> String, entries : () -> Array[LiquidMenuEntry], icon? : (view::View, () -> Int64) -> Unit, show_label~ : Bool = true, flat~ : Bool = false, ghost~ : Bool = false, active~ : () -> Bool = fn() { false }, height~ : Double = button_h, pad_x~ : Double = 12.0, menu_label~ : () -> String = fn() { "Menu" }, placement~ : headless::Placement = headless::Placement::BelowStart, min_width~ : Double = 212.0, loc~ : String = "") -> view::View`
-  - `pub fn liquid_menu_panel_node(parent : view::View, entries : () -> Array[LiquidMenuEntry], on_close : () -> Unit, header~ : () -> String = fn() { "" }, menu_label~ : () -> String = fn() { "Menu" }, width~ : Double = 240.0, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_menu_button_node(row, page, fn() { open.get() }, fn(v) { open.set(v) }, fn() { "Insert" }, fn() {
-  [
-    lg::LiquidMenuEntry::item(label="Sticky Note", on_select=fn() { add_note() }),
-    lg::LiquidMenuEntry::separator(),
-    lg::LiquidMenuEntry::item(label="Delete", destructive=true, on_select=fn() { del() }),
-  ]
-}, height=36.0, pad_x=12.0)
-```
-
-### 18. `lg::liquid_select_node` & `lg::LiquidSelectOption`
-- **适用场景**：单选下拉选择器（胶囊触发器 + 高密度玻璃菜单）。
-- **签名**：`pub struct LiquidSelectOption`；`pub fn LiquidSelectOption::new(label~ : String, detail~ : String = "", disabled~ : Bool = false) -> LiquidSelectOption`；`pub fn liquid_select_node(parent : view::View, host : view::View, options : () -> Array[LiquidSelectOption], selected : () -> Int, on_select : (Int) -> Unit, placeholder~ : String = "Select...", label~ : () -> String = fn() { "" }, placement~ : headless::Placement = headless::Placement::BelowStart, width~ : Double = 240.0, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_select_node(page, page, fn() {
-  [lg::LiquidSelectOption::new(label="Metal"), lg::LiquidSelectOption::new(label="GLES3")]
-}, fn() { idx.get() }, fn(i) { idx.set(i) })
-```
-
-### 19. `lg::liquid_segmented_node`
-- **适用场景**：分段切换控件（默认 `height=30.0`、内胶囊 `25.0`，`15 - 2.5 = 12.5` 精确同心；支持拖拽滑动与按压清透透镜）。
-- **签名**：`pub fn liquid_segmented_node(parent : view::View, labels : () -> Array[String], selected : () -> Int, on_select : (Int) -> Unit, width? : Double, height~ : Double = 30.0, drag? : DampedDrag, loc~ : String = "") -> view::View`
-
-### 19b. `lg::liquid_swatch_grid_node` & `lg::LiquidSwatch`
-- **适用场景**：基于 `headless::radio_group` 的圆形色板单选网格（选中项带 `2pt` 主题色同心外环 + `2pt` 内缝，`transparent=true` 项带浅底与红色对角矢量斜杠，无内部 `Glass::liquid`，可直接嵌入 `liquid_popover_node` / 工具栏弹层）。
-- **签名**：`pub struct LiquidSwatch`（`LiquidSwatch::new(color, label, transparent~=false)`）；`pub fn liquid_swatch_grid_node(parent : view::View, swatches : () -> Array[LiquidSwatch], selected : () -> Int, on_select : (Int) -> Unit, columns~ : Int = 6, swatch_size~ : Double = 24.0, gap~ : Double = 8.0, label~ : () -> String = fn() { "Color Swatches" }, loc~ : String = "") -> view::View`
-
-### 19c. `lg::liquid_color_picker_node`
-- **适用场景**：标准 HSVA 自定义取色器（2D 饱和度/明度色盘 + 6 段光谱色相条 + 矢量棋盘格透明度条 + 平嵌 Hex/Opacity 输入框；全部零 `Glass::liquid`、零自定义着色器，可直接安全嵌入 `liquid_popover_node` / `liquid_panel_node` 并通过 `assert_no_nested_glass`）。
-- **色值工具**：`pub fn rgba_to_hsva(c : Int64) -> (Double, Double, Double, Double)`、`pub fn hsva_to_rgba(h : Double, s : Double, v : Double, a : Double) -> Int64`、`pub fn parse_hex_color(raw : String, fallback_alpha~ : Int = 255) -> Option[Int64]`、`pub fn format_hex_color(c : Int64) -> String`、`pub fn format_alpha_percent(c : Int64) -> String`。
-- **签名**：`pub fn liquid_color_picker_node(parent : view::View, color : () -> Int64, on_change : (Int64) -> Unit, width~ : Double = 224.0, canvas_height~ : Double = 136.0, show_alpha~ : Bool = true, show_inputs~ : Bool = true, label~ : () -> String = fn() { "Color Picker" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_color_picker_node(
-  body,
-  fn() { color.get() },
-  fn(c) { color.set(c) },
-  width=224.0,
-  canvas_height=136.0,
-)
-```
-```pion
-let _ = lg::liquid_segmented_node(page, fn() { ["Day", "Week", "Month"] }, fn() { seg.get() }, fn(i) { seg.set(i) }, width=300.0)
-```
-
-### 20. `lg::liquid_checkbox_node`、`lg::liquid_radio_group_node`、`lg::liquid_stepper_node`、`lg::liquid_chip_node`
-- **适用场景**：复选框（含空标签仅渲染 `18×18` 勾选框 + `aria_label`）、单选组（`18×18`）、数值步进器（`32pt`）、可筛选玻璃标签（`28pt`）。
-- **签名**：
-  - `pub fn liquid_checkbox_node(parent : view::View, checked : () -> Bool, on_change : (Bool) -> Unit, label : () -> String, mixed~ : () -> Bool = fn() { false }, disabled~ : () -> Bool = fn() { false }, aria_label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-  - `pub fn liquid_radio_group_node(parent : view::View, labels : () -> Array[String], selected : () -> Int, on_select : (Int) -> Unit, horizontal~ : Bool = false, disabled~ : () -> Bool = fn() { false }, loc~ : String = "") -> view::View`
-  - `pub fn liquid_stepper_node(parent : view::View, value : () -> Int, on_change : (Int) -> Unit, min~ : Int = 0, max~ : Int = 100, step~ : Int = 1, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-  - `pub fn liquid_chip_node(parent : view::View, label : () -> String, on_press : () -> Unit, selected~ : () -> Bool = fn() { false }, tint~ : Int64 = clear, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_checkbox_node(page, fn() { ok.get() }, fn(v) { ok.set(v) }, fn() { "Agree" })
-let _ = lg::liquid_stepper_node(page, fn() { qty.get() }, fn(v) { qty.set(v) }, min=0, max=10, label=fn() { "Qty" })
-let _ = lg::liquid_chip_node(page, fn() { "Metal" }, fn() { sel.set(!sel.get()) }, selected=fn() { sel.get() })
-```
+- **菜单与选择**：`liquid_menu_node`、`liquid_menu_button_node`、`liquid_menu_panel_node`、`liquid_select_node`、`liquid_segmented_node` / `<lg::Segmented>`、`liquid_swatch_grid_node`、`liquid_color_picker_node`
+- **表单与控件**：`liquid_text_field_node` / `<lg::TextField>`、`liquid_search_bar_node` / `<lg::SearchBar>`、`liquid_toggle_node` / `<lg::Toggle>`、`liquid_slider_node` / `<lg::Slider>`、`liquid_checkbox_node` / `<lg::Checkbox>`、`liquid_radio_group_node`、`liquid_stepper_node` / `<lg::Stepper>`、`liquid_chip_node` / `<lg::Chip>`
+- **反馈**：`liquid_toast_node` / `<lg::Toast>`、`liquid_badge_node` / `<lg::Badge>`、`liquid_count_badge_node` / `<lg::CountBadge>`、`liquid_progress_bar_node` / `<lg::ProgressBar>`、`liquid_progress_ring_node` / `<lg::ProgressRing>`
 
 ---
 
-## 五、表单输入与反馈（Inputs & Feedback）
+## 五、光学物理原语与动效控制器（Optical Physics & Motion）
 
-### 21. `lg::liquid_text_field_node` & `lg::liquid_search_bar_node`
-- **适用场景**：单层液态玻璃文本输入框（支持 `flat=true` 平嵌零玻璃凹槽、`radius` 自定义圆角、`show_label=false` 隐藏可见标题保留无障碍标签、`lead`/`trail` 首尾插槽与清除按钮）与常驻搜索栏。
-- **签名**：
-  - `pub fn liquid_text_field_node(parent : view::View, field : ui::Field, placeholder~ : String = "", placeholder_by? : () -> String, height_by? : () -> Double, label~ : () -> String = fn() { "" }, flat~ : Bool = false, radius? : Double, show_label~ : Bool = true, lead? : (view::View, () -> Int64) -> Unit, trail? : (view::View, () -> Int64) -> Unit, clearable~ : Bool = false, disabled~ : () -> Bool = fn() { false }, loc~ : String = "") -> view::View`
-  - `pub fn liquid_search_bar_node(parent : view::View, field : ui::Field, placeholder~ : String = "Search", label~ : () -> String = fn() { "Search" }, loc~ : String = "") -> view::View`
-```pion
-let field = ui::Field::new(text="")
-let _ = lg::liquid_text_field_node(page, field, placeholder="Project name", label=fn() { "Name" }, clearable=true)
-```
-
-### 22. `lg::liquid_toggle_node` & `lg::liquid_slider_node`
-- **适用场景**：iOS 27 阻尼拖拽开关与连续/步进滑块（静止态零隐藏玻璃，按压时浮现折射透镜）。
-- **签名**：
-  - `pub fn liquid_toggle_node(parent : view::View, on : () -> Bool, turn : (Bool) -> Unit, label : () -> String, disabled~ : () -> Bool = fn() { false }, drag? : DampedDrag, loc~ : String = "") -> view::View`
-  - `pub fn liquid_slider_node(parent : view::View, value : () -> Double, change : (Double) -> Unit, label : () -> String, least~ : Double = 0.0, most~ : Double = 100.0, step~ : Double = 0.0, committed~ : (Double) -> Unit = fn(_v) { () }, drag? : DampedDrag, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_toggle_node(page, fn() { wifi.get() }, fn(v) { wifi.set(v) }, fn() { "Wi-Fi" })
-let _ = lg::liquid_slider_node(page, fn() { vol.get() }, fn(v) { vol.set(v) }, fn() { "Volume" }, least=0.0, most=100.0)
-```
-
-### 23. `lg::liquid_toast_node` & `lg::LiquidStatus`
-- **适用场景**：胶囊形态轻提示（`Info` / `Success` / `Warning` / `Error`，支持操作按钮与关闭）。
-- **签名**：`pub enum LiquidStatus`；`pub fn liquid_toast_node(parent : view::View, visible : () -> Bool, title : () -> String, subtitle~ : () -> String = fn() { "" }, status~ : LiquidStatus = LiquidStatus::Info, action_label~ : () -> String = fn() { "" }, on_action? : () -> Unit, on_dismiss? : () -> Unit, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_toast_node(page, fn() { saved.get() }, fn() { "Saved" }, status=lg::LiquidStatus::Success)
-```
-
-### 24. `lg::liquid_badge_node`、`lg::liquid_count_badge_node` & `lg::LiquidTone`
-- **适用场景**：状态徽标与角标计数（扁平非玻璃，可安全放进任何玻璃容器内）。
-- **签名**：`pub enum LiquidTone`；`pub fn liquid_badge_node(parent : view::View, label : () -> String, tone~ : LiquidTone = LiquidTone::Neutral, dot~ : Bool = false, loc~ : String = "") -> view::View`；`pub fn liquid_count_badge_node(parent : view::View, count : () -> Int, max_count~ : Int = 99, tone~ : LiquidTone = LiquidTone::Danger, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_badge_node(row, fn() { "Online" }, tone=lg::LiquidTone::Success, dot=true)
-let _ = lg::liquid_count_badge_node(row, fn() { unread.get() }, tone=lg::LiquidTone::Danger)
-```
-
-### 25. `lg::liquid_progress_bar_node` & `lg::liquid_progress_ring_node`
-- **适用场景**：确定值（`Some(0.0..1.0)`）与不确定态（`None`）线形/环形进度指示器。
-- **签名**：
-  - `pub fn liquid_progress_bar_node(parent : view::View, value : () -> Option[Double], label~ : () -> String = fn() { "" }, show_value~ : Bool = false, tint~ : Int64 = clear, loc~ : String = "") -> view::View`
-  - `pub fn liquid_progress_ring_node(parent : view::View, value : () -> Option[Double], size~ : Double = 36.0, stroke~ : Double = 3.5, tint~ : Int64 = clear, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_progress_bar_node(page, fn() { Some(0.65) }, label=fn() { "Syncing" }, show_value=true)
-let _ = lg::liquid_progress_ring_node(page, fn() { Some(0.75) }, size=32.0)
-```
+- `liquid_merge_node` / `LiquidMerge`、`liquid_adaptive_surface_node` / `adaptive_glass`、`liquid_magnifier_node`、`liquid_progressive_blur_node`、`lg_glass_lift_surface`（静止 `strength <= 0.001` 零玻璃，浮升渐现单层玻璃）、`DampedDrag`、`InteractiveHighlight`、`set_dark` / `is_dark` / `colors()` / `ui_theme()` / `words_at()` / `alpha()` / `over()`。
 
 ---
 
-## 六、光学物理原语与动效控制器（Optical Physics & Motion Primitives）
+## 六、审计门禁（Audit Gates）
 
-### 26. `lg::liquid_merge_node` & `lg::LiquidMerge`
-- **适用场景**：毛细管液滴融合/分离物理舞台（带滞后断开与回弹控制器）。
-- **签名**：`pub struct LiquidMerge` (`new`, `attach`, `is_separated`, `is_bonded`, `set_separated`, `merge_at`, `gap_at`)；`pub fn liquid_merge_node(parent : view::View, controller? : LiquidMerge, main_w~ : Double = merge_main_w, main_h~ : Double = merge_main_h, sat_size~ : Double = merge_sat_size, arena_w~ : Double = 0.0, arena_h~ : Double = 0.0, arena? : () -> (Double, Double), main_label~ : () -> String = fn() { "" }, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
+### `lg::assert_apple_ui`、`lg::audit_glass`、`lg::assert_no_nested_glass` & `lg::count_liquid_glass`
+- **`lg::audit_glass(t, label~="scene", max_glass_coverage~=0.45, allow_large_overlay~=false)`**：同时检测 Law 2 玻璃重叠/嵌套、Law 1 内容层滥用液态玻璃（总面积 > 45% 或单块 > 65%w × 55%h）与 `t.unasked_faults()`。
+- **`lg::assert_apple_ui(t, label~="scene", max_glass_coverage~=0.45, allow_large_overlay~=false)`**：一站式校验 `assert_no_nested_glass` + `t.assert_scrollable()` + `t.assert_ui_craft()`。
 ```pion
-let ctrl = lg::LiquidMerge::new(separated=false)
-let _ = lg::liquid_merge_node(page, controller=ctrl, label=fn() { "Merge Stage" })
-```
-
-### 27. `lg::liquid_adaptive_surface_node` & `lg::adaptive_glass`
-- **适用场景**：根据背景亮度自动在浅色/暗色光学传输模型间切换的自适应液态玻璃表面。
-- **签名**：`pub fn adaptive_glass(lum : Double, min_side : Double) -> paint::Glass`；`pub fn liquid_adaptive_surface_node(parent : view::View, luminance : () -> Double, size~ : Double = adaptive_size, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_adaptive_surface_node(stage, fn() { bg_lum.get() }, size=160.0)
-```
-
-### 28. `lg::liquid_magnifier_node` & `lg::liquid_progressive_blur_node`
-- **适用场景**：文本光标折射放大镜与边缘渐进模糊阅读带。
-- **签名**：
-  - `pub fn liquid_magnifier_node(parent : view::View, words : () -> String, label~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-  - `pub fn liquid_progressive_blur_node(parent : view::View, words~ : () -> String = fn() { "" }, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::liquid_magnifier_node(stage, fn() { "Drag loupe over copy" })
-let _ = lg::liquid_progressive_blur_node(stage, words=fn() { "Progressive blur band" })
-```
-
-### 28b. `lg::lg_glass_lift_surface`
-- **适用场景**：连续平面→液态玻璃浮升绑定（同步 `monoid` #8049 `glass_lift_node`）：静止态（`strength <= 0.001`）零玻璃、零背景抓取、保留 `flat_ground`；浮升态（`0.001 < strength <= 1.0`）平滑淡出 `flat_ground` 并渐显 `lg_capsule_glass().at_strength(t)` 与外阴影，兼容 `glass_solid()` 降级。
-- **签名**：`pub fn lg_glass_lift_surface(v : view::View, strength : () -> Double, radius : Double, flat_ground~ : () -> Int64 = fn() { clear }, shadow~ : (Double, Double, Int64) = shadow_default, loc~ : String = "") -> view::View`
-```pion
-let _ = lg::lg_glass_lift_surface(
-  card, fn() { lift.get() }, 18.0,
-  flat_ground=fn() { if lg::is_dark() { 0x1E1F24FFL } else { 0xF5F5F7FFL } },
-)
-```
-
-### 29. `lg::DampedDrag`、`lg::InteractiveHighlight` 与主题/令牌工具
-- **适用场景**：闭式弹簧阻尼拖拽、按压镜面高光与弹性拉伸、主题深浅切换与标准字号/颜色工具。
-- **签名**：
-  - `pub struct DampedDrag` (`new`, `attach`, `value`, `progress`, `pressed`, `jelly`, `animate_to`, `slide_to`)
-  - `pub struct InteractiveHighlight` (`new`, `attach`, `pressed`, `offset`, `spot`, `stretch`)
-  - `pub fn set_dark(dark : Option[Bool]) -> Unit` / `pub fn is_dark() -> Bool` / `pub fn colors() -> Colors` / `pub fn ui_theme() -> ui::Theme` / `pub fn words_at(size : Double, weight~ : Int = 400, wrap~ : Bool = false, lines~ : Int = 0) -> view::WordsLook` / `pub fn alpha(c : Int64, share : Double) -> Int64` / `pub fn over(base : Int64, top : Int64) -> Int64`
-```pion
-lg::set_dark(Some(true))
-ui::set_tree_theme(lg::ui_theme)
-```
-
----
-
-## 七、审计门禁（Audit Gates）
-
-### 30. `lg::count_liquid_glass`、`lg::audit_glass` & `lg::assert_no_nested_glass`
-- **适用场景**：在所有业务 UI 与组件单测中自动校验「零液态玻璃重叠/嵌套（容差 `0.5pt`，面积 `> 1.0 pt²` 精确报索引与坐标）」与 `ui::Tester::unasked_faults()`。
-- **签名**：
-  - `pub fn count_liquid_glass(t : ui::Tester) -> Int`
-  - `pub fn audit_glass(t : ui::Tester, label~ : String = "scene") -> Array[String]`
-  - `pub fn assert_no_nested_glass(t : ui::Tester, label~ : String = "scene") -> Unit`
-```pion
-let n = lg::count_liquid_glass(t)
-let faults = lg::audit_glass(t, label="toolbar_scene")
-debug_assert(faults.length() == 0, "expected 0 glass faults")
-lg::assert_no_nested_glass(t, label="toolbar_scene")
-```
-
----
-
-## 八、Pion-JSX 组件薄壳（`packages/lg/src/jsx.pion`）
-
-配合 Pion `P31-C` 纯编译期脱糖 JSX 与 Leading-Dot `.Enum` 推导，`packages/lg` 提供 25 个 PascalCase JSX 组件薄壳，**100% 委托给对应 `liquid_*_node`（零手搓 `Glass::liquid`）**。静态与响应式双态属性统一采用 `prop` / `prop_by`（`prop_by` 优先），回调直接使用裸名（`on_press` / `on_change` / `on_select` / `on_close` / `on_toggle` / `on_action` / `on_dismiss` / `children`）。
-
-| 分类 | JSX 组件（`lg::*`） | 委托底层原语 |
-|---|---|---|
-| 按钮与标签 | `Button`、`IconButton`、`Badge`、`CountBadge`、`Chip` | `liquid_button_node`、`liquid_icon_button_node`、`liquid_badge_node`、`liquid_count_badge_node`、`liquid_chip_node` |
-| 容器与导航 | `Panel`、`Card`、`Toolbar`、`ToolbarDivider`、`BarPillGroup`、`NavBar` | `liquid_panel_node`、`liquid_card_node`、`liquid_toolbar_node`、`liquid_toolbar_divider`、`liquid_bar_pill_group_node`、`liquid_nav_bar_node` |
-| 控件与输入 | `Toggle`、`Slider`、`Segmented`、`Checkbox`、`Stepper`、`TextField`、`SearchBar` | `liquid_toggle_node`、`liquid_slider_node`、`liquid_segmented_node`、`liquid_checkbox_node`、`liquid_stepper_node`、`liquid_text_field_node`、`liquid_search_bar_node` |
-| 反馈与浮层 | `ProgressBar`、`ProgressRing`、`Dialog`、`Sheet`、`Drawer`、`Toast`、`Disclosure` | `liquid_progress_bar_node`、`liquid_progress_ring_node`、`liquid_dialog_node`、`liquid_sheet_node`、`liquid_drawer_node`、`liquid_toast_node`、`liquid_disclosure_node` |
-
-```pion
-<lg::NavBar
-  in={root}
-  title="Device Control"
-  trailing={fn(t) {
-    <lg::BarPillGroup in={t}>
-      <lg::Button label="Sync" flat ghost on_press=>{ sync() } />
-    </lg::BarPillGroup>
-  }}
-/>
-<lg::Panel in={root} gap={10.0}>
-  <lg::Badge label_by=>{ "电量 \{pct.get()}%" } tone={.Success} dot />
-  <lg::Toggle on_by=>{ wifi.get() } on_change={fn(v) { wifi.set(v) }} label="Wi-Fi" />
-</lg::Panel>
+lg::assert_apple_ui(t, label="main_screen")
 ```
