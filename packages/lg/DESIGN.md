@@ -35,10 +35,10 @@ Reserve single-layer `paint::Glass::liquid` exclusively for floating navigation,
   2. **No plain-text top-bar capsules** like `"Back"` or `"Search"` (use `<lg::BackButton>` and `<lg::BarPillGroup>` with `<lg::Icon>`).
   3. **No box-in-box composer bars** or rectangular `"Send"` text buttons (use `<lg::ComposerBar>`).
   4. **No three-box opaque stack (`[header] / [scroll_box] / [footer]`)** that prevents content from scrolling beneath floating Liquid Glass chrome.
-- **Floating toolbars & controls**:
-  - `liquid_toolbar_node`, `liquid_button_node` (`flat=false`), `liquid_icon_button_node`, `liquid_button_group_node`, `liquid_segmented_node`, `liquid_stepper_node`, `liquid_chip_node`, `liquid_text_field_node` (`flat=false`).
-  - Inside a glass overlay (`Sheet`, `Drawer`, `Dialog`, `Popover`) or a solid card, `liquid_segmented_node` / `<lg::Segmented>` takes `flat=true`: a solid recessed track instead of the glass track, the solid thumb kept fully opaque while dragged, and no drag loupe, so it adds zero glass instances at rest and while dragging.
-  - The stepper and chip set in the Content Layer (a settings row, a form) take `flat=true` too: a solid fill (`ctrl_content_fill`, iOS's tertiary system fill), no glass. Only what floats over the page is glass.
+- **Floating toolbars & controls & automatic `SurfaceContext` material adaptation**:
+  - `liquid_toolbar_node`, `liquid_button_node`, `liquid_icon_button_node`, `liquid_button_group_node`, `liquid_segmented_node`, `liquid_stepper_node`, `liquid_chip_node`, `liquid_select_node`, `liquid_text_field_node`.
+  - Every Content Layer container (`surface_card_node`, `liquid_list_node`, `page_shell_node` scrolling body, `liquid_panel_node`, `liquid_disclosure_node`) and every Glass Overlay container (`liquid_sheet_node`, `liquid_action_sheet_node`, `liquid_drawer_node`, `liquid_dialog_shell_node`, `liquid_dialog_node`, `liquid_popover_node`, `liquid_panel_shell_node`, `liquid_toolbar_node`, `liquid_bar_pill_group_node`, `liquid_pill_group_node`, `lg_edit_bar`) automatically lends `SurfaceContext::Content` down the view tree via `view::Lent` (zero extra nodes, zero signal overhead).
+  - Controls inside `SurfaceContext::Content` (`Button`, `Chip` including removable `on_remove`, `Stepper`, `Segmented`, `Select`, `TextField`) automatically resolve to unified Apple Content Layer solid surfaces (`ctrl_flat_fill` / `ctrl_flat_edge` / `ctrl_recessed_fill` / `ctrl_recessed_edge` / `ctrl_flat_selected_fill` = `surface().accent`) with zero Liquid Glass — no need to manually pass `flat=true` everywhere. Floating top/bottom chrome slots in `PageShell` (`leading`, `trailing`, `bottom`) lend `SurfaceContext::Floating` so floating islands automatically retain Liquid Glass. Passing explicit `flat=true` or `flat=false` always overrides context.
 - **Floating overlays & inspectors**:
   - `liquid_menu_node`, `liquid_menu_panel_node`, `liquid_menu_button_node`, `liquid_select_node`, `liquid_popover_node`, `liquid_tooltip_node`, `liquid_sheet_node`, `liquid_action_sheet_node`, `liquid_drawer_node`, `liquid_dialog_node`, `liquid_toast_node`, plus opt-in floating inspectors (`liquid_panel_node(..., floating=true)`) and Control Center tiles (`liquid_control_tile_node`, `liquid_card_node(..., floating=true)`).
 - **Refractive interaction lenses & optical physics**:
@@ -80,7 +80,10 @@ R_inner = lg::concentric(R_outer, pad) = max(0.0, R_outer - pad)
 - **Symmetric light/dark glass density ladder**: Regular floating controls and capsules use `0x20202067L` (dark) / `0xFDFCFD67L` (light); dense floating panels and dialogs (`lg_panel_glass`, `liquid_dialog_node`) use `0x202020BFL` / `0xFDFCFDBFL` (75% veil) or `0xB3` (70%); detached sheets and floating island drawers (`lg_sheet_glass`, `lg_drawer_glass`) use `0x202020CCL` / `0xFDFCFDCCL` (80% veil), morphing smoothly up to 86% (`0xDC`) on expanded sheets.
 - **Contrast**: All foreground text and icons maintain **WCAG >= 4.5:1** contrast against both Content Layer surfaces and glass `solid` fallbacks in Light and Dark modes.
 - **Zero hidden glass instances at rest**: Controls that reveal a clear refractive loupe only while pressed/dragged (`liquid_segmented_node`, `liquid_bottom_tabs_node`, `liquid_toggle_node`, `liquid_slider_node`) must return `None` from `.glass(...)` whenever `p <= 0.001`. Never submit `alpha == 0` glass passes to the GPU.
-- **No `outside=false` shadows under glass**: Shadows beneath `paint::Glass::liquid` render outside the SDF contour (`shadow_outside(view::Live::Is(true))`) so they never darken the refracted interior.
+- **No `outside=false` shadows under glass & 3-tier outside shadow ladder**: Shadows beneath `paint::Glass::liquid` render outside the SDF contour (`shadow_outside(view::Live::Is(true))`) so they never darken the refracted interior, following a unified 3-tier theme-adaptive ladder:
+  1. Compact top/bottom bar pills (`lg_bar_pill_shadow`): Light `(4.0, 1.5, 0x00000012L)` / Dark `(6.0, 2.0, 0x00000040L)`.
+  2. Floating glass controls (`glass_control_shadow`, also `shadow_default` in Light): Light `(5.0, 2.0, 0x00000010L)` / Dark `(6.0, 2.0, 0x00000038L)`.
+  3. Floating glass overlays (`glass_overlay_shadow` — `Popover`, `Menu`, `Panel`, `Sheet`, `Drawer`, `Dialog`, `Toast`, `Tooltip`, `Toolbar`): Light `(8.0, 4.0, 0x00000014L)` / Dark `(8.0, 4.0, 0x00000042L)`.
 
 ---
 

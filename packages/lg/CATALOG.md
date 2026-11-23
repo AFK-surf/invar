@@ -72,7 +72,7 @@ let inner_r = lg::concentric(lg::r_card, 8.0) // 12.0
 | 页面底色 / 卡片 / 分组区块 / 代码块 | `lg::surface()` / `lg::SurfaceCard` / `lg::SurfaceSection` / `lg::CodeBlock` | 严禁给页面内容套 `Glass::liquid` 或硬编码杂色 |
 | 分组列表 / 折叠面板（默认实色卡片） | `lg::liquid_list_node`（默认 `glass=false`）/ `lg::liquid_disclosure_node`（默认 `glass=false`） | 严禁内容列表默认挂玻璃或手拼非同心圆角 |
 | 内容面板 / 悬浮检查器 / 卡片 / 控制中心磁贴 | `lg::liquid_panel_node` / `lg::liquid_card_node`（默认实色；悬浮检查器/磁贴显式 `floating=true`）/ `lg::liquid_control_tile_node` | 严禁直接套 `Glass::liquid` 面板 |
-| 浮动主按钮 / 次按钮 / 玻璃容器内扁平按钮 | `lg::liquid_button_node`（容器内传 `flat=true` / `ghost=true`，主按钮 `prominent=true`） | 严禁 `v.glass(Glass::liquid(...))` 拼按钮 |
+| 浮动主按钮 / 次按钮 / 玻璃容器与内容层按钮 | `lg::liquid_button_node`（内容层与玻璃浮层内自动切苹果实色，无需手写 `flat=true`；顶栏悬浮槽自动保持液态玻璃；可显式传 `flat=true/false` 覆写，主按钮 `prominent=true`） | 严禁 `v.glass(Glass::liquid(...))` 拼按钮 |
 | 图标按钮（圆/胶囊） | `lg::liquid_icon_button_node` | 严禁手动圆框 + `Glass::liquid` |
 | 多图标合并胶囊操作组 | `lg::liquid_button_group_node` + `lg::LiquidGroupAction` | 严禁横排多个玻璃图标按钮硬贴 |
 | 浮动工具栏 + 分割线 | `lg::liquid_toolbar_node` + `lg::liquid_toolbar_divider` + `flat=true, ghost=true` 按钮 | 严禁在工具栏内再放 `flat=false` 玻璃按钮 |
@@ -84,8 +84,8 @@ let inner_r = lg::concentric(lg::r_card, 8.0) // 12.0
 | 下拉选择器（Select） | `lg::liquid_select_node` + `lg::LiquidSelectOption` | 严禁手写按钮 + 弹出列表 |
 | 气泡弹层 / 悬浮提示 | `lg::liquid_popover_node` / `lg::liquid_tooltip_node` | 严禁绝对定位手绘气泡 |
 | 弹窗 / 底部 Sheet / 操作表 / 侧边浮岛抽屉 | `lg::liquid_dialog_node` / `lg::liquid_sheet_node` / `lg::liquid_action_sheet_node` / `lg::liquid_drawer_node` + `lg::DrawerSide` | 严禁手写模态遮罩、拖拽关闭与 Escape 关闭 |
-| 开关 / 滑块 / 分段控制 / 步进器 / 标签 | `lg::liquid_toggle_node` / `lg::liquid_slider_node` / `lg::liquid_segmented_node` / `lg::liquid_stepper_node` / `lg::liquid_chip_node`（放在内容层里的分段控制、步进器、标签传 `flat=true`：实色底，不是玻璃；只有浮在页面上的才用玻璃） | 严禁手写按压折射透镜；严禁内容层里的控件用玻璃 |
-| 文本输入 / 复选框 / 单选组 | `lg::liquid_text_field_node` / `lg::liquid_checkbox_node` / `lg::liquid_radio_group_node` | 严禁在玻璃内再嵌玻璃输入项 |
+| 开关 / 滑块 / 分段控制 / 步进器 / 标签 | `lg::liquid_toggle_node` / `lg::liquid_slider_node` / `lg::liquid_segmented_node` / `lg::liquid_stepper_node` / `lg::liquid_chip_node`（放在内容层容器 `SurfaceCard`/`PageShell` body/`List` 或玻璃浮层 `Sheet`/`Drawer`/`Dialog`/`Popover` 内时，通过 `SurfaceContext::Content` 自动切统一苹果实色控件体系，零玻璃叠玻璃，无需到处手写 `flat=true`；浮在画布/顶底栏上的自动保持液态玻璃，也可显式传 `flat=false/true` 覆写） | 严禁手写按压折射透镜；严禁内容层里的控件用玻璃 |
+| 文本输入 / 选择器 / 复选框 / 单选组 | `lg::liquid_text_field_node` / `lg::liquid_select_node` / `lg::liquid_checkbox_node` / `lg::liquid_radio_group_node`（内容层与浮层内自动切统一凹槽/实色底，零玻璃叠玻璃） | 严禁在玻璃内再嵌玻璃输入项 |
 | 轻提示 / 徽标 / 进度条 / 进度环 | `lg::liquid_toast_node` / `lg::liquid_badge_node` / `lg::liquid_count_badge_node` / `lg::liquid_progress_bar_node` / `lg::liquid_progress_ring_node` | 严禁手写状态色与进度动画 |
 | 连续平面→玻璃浮升容器 | `lg::lg_glass_lift_surface`（静止 `strength <= 0.001` 零玻璃，浮起渐现） | 严禁手动插值 `Glass::liquid` 或静止留 `alpha=0` 玻璃 |
 | 毛细融合 / 放大镜 / 自适应亮度 / 渐进模糊 | `lg::liquid_merge_node` / `lg::liquid_magnifier_node` / `lg::liquid_adaptive_surface_node` / `lg::liquid_progressive_blur_node` | 严禁手调 shader 参数 |
