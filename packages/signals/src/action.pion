@@ -1,0 +1,193 @@
+// Atomic async action lifecycle bound to `Optimistic` patches (`Action`, `ActionTicket`).
+// Pure Layer-0 signals primitive: zero IO, zero thread or UI dependencies.
+
+pub struct Action[Res, Err] {
+  in_flight_sig : Signal[Int]
+  pending_comp : Computed[Bool]
+  error_sig : Signal[Option[Err]]
+  last_ok_sig : Signal[Option[Res]]
+  mut latest_seq : Int64
+}
+
+pub struct ActionTicket[Res, Err] {
+  action : Action[Res, Err]
+  seq_id : Int64
+  mut settled : Bool
+  reverts : Array[() -> Unit]
+}
+
+pub fn action[Res, Err]() -> Action[Res, Err] {
+  let in_flight_sig = signal(0)
+  let pending_comp = computed(fn(_prev : Option[Bool]) -> Bool { in_flight_sig.get() > 0 })
+  let error_sig : Signal[Option[Err]] = signal_by(
+    None,
+    fn(a : Option[Err], b : Option[Err]) -> Bool { a.is_none() && b.is_none() },
+  )
+  let last_ok_sig : Signal[Option[Res]] = signal_by(
+    None,
+    fn(a : Option[Res], b : Option[Res]) -> Bool { a.is_none() && b.is_none() },
+  )
+  Action::{
+    in_flight_sig,
+    pending_comp,
+    error_sig,
+    last_ok_sig,
+    latest_seq: 0.to_int64(),
+  }
+}
+
+pub fn Action::pending[Res, Err](self : Action[Res, Err]) -> ReadSignal[Bool] {
+  self.pending_comp.read()
+}
+
+pub fn Action::in_flight[Res, Err](self : Action[Res, Err]) -> ReadSignal[Int] {
+  self.in_flight_sig.read()
+}
+
+pub fn Action::error[Res, Err](self : Action[Res, Err]) -> ReadSignal[Option[Err]] {
+  self.error_sig.read()
+}
+
+pub fn Action::last_ok[Res, Err](self : Action[Res, Err]) -> ReadSignal[Option[Res]] {
+  self.last_ok_sig.read()
+}
+
+pub fn Action::clear_error[Res, Err](self : Action[Res, Err]) -> Unit {
+  self.error_sig.set(None)
+}
+
+fn Action::dec_in_flight[Res, Err](self : Action[Res, Err]) -> Unit {
+  let cur = self.in_flight_sig.state.pending
+  if cur > 0 {
+    self.in_flight_sig.set(cur - 1)
+  }
+}
+
+pub fn Action::begin[Res, Err](
+  self : Action[Res, Err],
+  clear_err~ : Bool = true,
+) -> ActionTicket[Res, Err] {
+  self.latest_seq += 1.to_int64()
+  let seq_id = self.latest_seq
+  batch(fn() -> Unit {
+    self.in_flight_sig.set(self.in_flight_sig.state.pending + 1)
+    if clear_err {
+      self.error_sig.set(None)
+    }
+  })
+  ActionTicket::{ action: self, seq_id, settled: false, reverts: [] }
+}
+
+pub fn ActionTicket::with_optimistic[Res, Err](
+  self : ActionTicket[Res, Err],
+  revert : () -> Unit,
+) -> ActionTicket[Res, Err] {
+  if self.settled {
+    revert()
+  } else {
+    self.reverts.push(revert)
+  }
+  self
+}
+
+pub fn ActionTicket::seq[Res, Err](self : ActionTicket[Res, Err]) -> Int64 {
+  self.seq_id
+}
+
+pub fn ActionTicket::is_latest[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
+  self.seq_id == self.action.latest_seq
+}
+
+pub fn ActionTicket::is_settled[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
+  self.settled
+}
+
+fn ActionTicket::revert_all[Res, Err](self : ActionTicket[Res, Err]) -> Unit {
+  let mut i = self.reverts.length() - 1
+  while i >= 0 {
+    (self.reverts[i])()
+    i -= 1
+  }
+  self.reverts.clear()
+}
+
+pub fn ActionTicket::succeed[Res, Err](
+  self : ActionTicket[Res, Err],
+  res : Res,
+  commit : (Res) -> Unit,
+) -> Bool {
+  if self.settled {
+    return false
+  }
+  self.settled = true
+  batch(fn() -> Unit {
+    self.revert_all()
+    commit(res)
+    self.action.last_ok_sig.set(Some(res))
+    self.action.error_sig.set(None)
+    self.action.dec_in_flight()
+  })
+  true
+}
+
+pub fn ActionTicket::succeed_if_latest[Res, Err](
+  self : ActionTicket[Res, Err],
+  res : Res,
+  commit : (Res) -> Unit,
+) -> Bool {
+  if self.settled {
+    return false
+  }
+  if !self.is_latest() {
+    self.settled = true
+    batch(fn() -> Unit {
+      self.revert_all()
+      self.action.dec_in_flight()
+    })
+    return false
+  }
+  self.succeed(res, commit)
+}
+
+pub fn ActionTicket::fail[Res, Err](self : ActionTicket[Res, Err], err : Err) -> Bool {
+  if self.settled {
+    return false
+  }
+  self.settled = true
+  batch(fn() -> Unit {
+    self.revert_all()
+    self.action.error_sig.set(Some(err))
+    self.action.dec_in_flight()
+  })
+  true
+}
+
+pub fn ActionTicket::fail_if_latest[Res, Err](
+  self : ActionTicket[Res, Err],
+  err : Err,
+) -> Bool {
+  if self.settled {
+    return false
+  }
+  if !self.is_latest() {
+    self.settled = true
+    batch(fn() -> Unit {
+      self.revert_all()
+      self.action.dec_in_flight()
+    })
+    return false
+  }
+  self.fail(err)
+}
+
+pub fn ActionTicket::cancel[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
+  if self.settled {
+    return false
+  }
+  self.settled = true
+  batch(fn() -> Unit {
+    self.revert_all()
+    self.action.dec_in_flight()
+  })
+  true
+}
