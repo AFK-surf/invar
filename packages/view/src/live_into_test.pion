@@ -1,0 +1,133 @@
+// Unit tests for `Live[T]` `#into` converters, `Live::eval`, `Live::to_getter`,
+// and reactive `Tree` updates across all 7 input forms.
+
+import "signals"
+
+fn accept_live[T](into v : Live[T]) -> Live[T] {
+  v
+}
+
+fn bind_live_words(parent : View, into w : Live[String], out : Ref[Option[NodeId]]) -> Unit {
+  let node = parent.box(fn(v : View) {
+    let _ = v.words(w, look=words_plain)
+  })
+  out.v = Some(node.id())
+}
+
+test "live_into: all 7 #into converters, eval, and to_getter" {
+  let sig = signals::signal("sig-0")
+  let read_sig : signals::ReadSignal[String] = sig.read()
+  let comp = signals::computed(fn(_prev : Option[String]) -> String { "comp:" + sig.get() })
+  let derived = signals::derived_signal(fn(_prev : Option[String]) -> String { "drv:" + sig.get() })
+  let opt = signals::optimistic(fn() -> String { "opt:" + sig.get() })
+
+  let l_val : Live[String] = accept_live("literal")
+  let l_fn : Live[String] = accept_live(fn() -> String { "fn:" + sig.get() })
+  let l_read : Live[String] = accept_live(read_sig)
+  let l_sig : Live[String] = accept_live(sig)
+  let l_comp : Live[String] = accept_live(comp)
+  let l_drv : Live[String] = accept_live(derived)
+  let l_opt : Live[String] = accept_live(opt)
+  let l_raw : Live[String] = accept_live(.Is("raw"))
+
+  debug_assert(l_val.eval() == "literal", "Live::of_value eval")
+  debug_assert(l_fn.eval() == "fn:sig-0", "Live::of_fn eval")
+  debug_assert(l_read.eval() == "sig-0", "Live::of_read_signal eval")
+  debug_assert(l_sig.eval() == "sig-0", "Live::of_signal eval")
+  debug_assert(l_comp.eval() == "comp:sig-0", "Live::of_computed eval")
+  debug_assert(l_drv.eval() == "drv:sig-0", "Live::of_derived eval")
+  debug_assert(l_opt.eval() == "opt:sig-0", "Live::of_optimistic eval")
+  debug_assert(l_raw.eval() == "raw", "explicit Live::Is passthrough")
+
+  let g_val = l_val.to_getter()
+  let g_sig = l_sig.to_getter()
+  debug_assert(g_val() == "literal", "to_getter on Live::Is")
+  debug_assert(g_sig() == "sig-0", "to_getter on Live::By")
+
+  // Reactive updates propagate through all reactive converters
+  sig.set("sig-1")
+  debug_assert(l_fn.eval() == "fn:sig-1", "of_fn reacts to signal")
+  debug_assert(l_read.eval() == "sig-1", "of_read_signal reacts to signal")
+  debug_assert(l_sig.eval() == "sig-1", "of_signal reacts to signal")
+  debug_assert(l_comp.eval() == "comp:sig-1", "of_computed reacts to signal")
+  debug_assert(l_drv.eval() == "drv:sig-1", "of_derived reacts to signal")
+  debug_assert(l_opt.eval() == "opt:sig-1", "of_optimistic reacts to signal")
+  debug_assert(g_sig() == "sig-1", "to_getter reacts to signal")
+
+  // DerivedSignal local override & Optimistic pending edit
+  derived.set("drv-local")
+  debug_assert(l_drv.eval() == "drv-local", "of_derived reflects local override")
+
+  let undo = opt.set_value("opt-pending")
+  debug_assert(l_opt.eval() == "opt-pending", "of_optimistic reflects pending edit")
+  undo()
+  debug_assert(l_opt.eval() == "opt:sig-1", "of_optimistic reverts after undo")
+}
+
+test "live_into: reactive Tree bindings update on Signal/ReadSignal/Computed/Derived/Optimistic" {
+  let base = signals::signal("v0")
+  let ro : signals::ReadSignal[String] = base.read()
+  let comp = signals::computed(fn(_prev : Option[String]) -> String { "c:" + base.get() })
+  let drv = signals::derived_signal(fn(_prev : Option[String]) -> String { "d:" + base.get() })
+  let opt = signals::optimistic(fn() -> String { "o:" + base.get() })
+
+  let id_val : Ref[Option[NodeId]] = ref_new(None)
+  let id_fn : Ref[Option[NodeId]] = ref_new(None)
+  let id_ro : Ref[Option[NodeId]] = ref_new(None)
+  let id_sig : Ref[Option[NodeId]] = ref_new(None)
+  let id_comp : Ref[Option[NodeId]] = ref_new(None)
+  let id_drv : Ref[Option[NodeId]] = ref_new(None)
+  let id_opt : Ref[Option[NodeId]] = ref_new(None)
+
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.as_col()
+    bind_live_words(root, "static", id_val)
+    bind_live_words(root, fn() -> String { "fn:" + base.get() }, id_fn)
+    bind_live_words(root, ro, id_ro)
+    bind_live_words(root, base, id_sig)
+    bind_live_words(root, comp, id_comp)
+    bind_live_words(root, drv, id_drv)
+    bind_live_words(root, opt, id_opt)
+  })
+
+  let check_words = fn(id_ref : Ref[Option[NodeId]], expected : String, msg : String) -> Unit {
+    match id_ref.v {
+      Some(id) =>
+      match tree.drawn_of(id) {
+        Some(d) => debug_assert(d.words == expected, msg)
+        None => debug_assert(false, msg + " (not drawn)")
+      }
+      None => debug_assert(false, msg + " (missing id)")
+    }
+  }
+
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  check_words(id_val, "static", "initial static")
+  check_words(id_fn, "fn:v0", "initial fn")
+  check_words(id_ro, "v0", "initial read_signal")
+  check_words(id_sig, "v0", "initial signal")
+  check_words(id_comp, "c:v0", "initial computed")
+  check_words(id_drv, "d:v0", "initial derived")
+  check_words(id_opt, "o:v0", "initial optimistic")
+
+  base.set("v1")
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  check_words(id_val, "static", "static unchanged")
+  check_words(id_fn, "fn:v1", "updated fn")
+  check_words(id_ro, "v1", "updated read_signal")
+  check_words(id_sig, "v1", "updated signal")
+  check_words(id_comp, "c:v1", "updated computed")
+  check_words(id_drv, "d:v1", "updated derived")
+  check_words(id_opt, "o:v1", "updated optimistic")
+
+  let undo = opt.set_value("o:fast")
+  drv.set("d:local")
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  check_words(id_drv, "d:local", "derived local override in tree")
+  check_words(id_opt, "o:fast", "optimistic pending in tree")
+
+  undo()
+  let _ = tree.frame(300.0, 200.0, now=48.0)
+  check_words(id_opt, "o:v1", "optimistic reverted in tree")
+  tree.dispose()
+}
