@@ -897,7 +897,7 @@ export function createPionRuntime(opts = {}) {
       pion_world_eprintln: (_w, s) => eprintlnFn(readStr(s)),
       pion_world_clock_ms: () => BigInt(Math.floor(performance.now())),
       pion_clock_monotonic_us: () => BigInt(Math.round(performance.now() * 1000)),
-      pion_fs_mmap_ro: (_p, okOut) => { const op = pNum(okOut); if (op) { sync(); dv.setInt32(op, 0, true); } return makeStr("fs_mmap_ro unavailable in web runtime"); },
+      pion_fs_mmap_ro: (_p, okOut) => { const op = pNum(okOut); if (op) { sync(); dv.setInt32(op, 0, true); } return mkStr("fs_mmap_ro unavailable in web runtime"); },
       pion_fs_write_atomic_bytes: () => 0,
       pion_ptr_alloc: (b) => pBig(rawZero(Number(b))),
       pion_ptr_free: (p) => rawFree(pNum(p)),

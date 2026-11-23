@@ -46,9 +46,16 @@ WEB_RUNTIME_FILES = [
     "pion_wasm_rt_web.min.mjs",
 ]
 
-# Non-JS files the page fetches at boot (index.html preloads inter.woff2); kept
+# Runtime JS files copied into dist output (index.html imports pion_wasm_rt_web.min.mjs).
+WEB_DIST_RUNTIME_FILES = [
+    "host.js",
+    "pion_host_bridge.mjs",
+    "pion_wasm_rt_web.min.mjs",
+]
+
+# Non-JS files the page fetches at boot or Cloudflare static assets config; kept
 # apart from WEB_RUNTIME_FILES so E003 does not run `node --check` on them.
-WEB_STATIC_ASSETS = ["inter.woff2"]
+WEB_STATIC_ASSETS = ["inter.woff2", "_headers"]
 
 
 def emit_json(obj):
@@ -236,10 +243,10 @@ def parse_wasm_imports(wasm_path):
 
 def extract_web_provided_pion_rt():
     provided = set()
-    rt_path = os.path.join(INVAR_ROOT, "web", "pion_wasm_rt_web.mjs")
+    rt_path = os.path.join(INVAR_ROOT, "web", "pion_wasm_rt_web.min.mjs")
     bridge_path = os.path.join(INVAR_ROOT, "web", "pion_host_bridge.mjs")
 
-    # Parse `pion_rt: { ... }` inside pion_wasm_rt_web.mjs
+    # Parse `pion_rt: { ... }` inside pion_wasm_rt_web.min.mjs (the file imported by index.html)
     if os.path.isfile(rt_path):
         src = open(rt_path, "r", encoding="utf-8").read()
         m = re.search(r"pion_rt\s*:\s*\{", src)
@@ -1364,7 +1371,7 @@ def cmd_audit(args):
                         wasm_path,
                         1,
                         f"Missing pion_rt WASM imports: {', '.join(wasm_imports_report['missing'])}",
-                        "Add the missing imports to web/pion_wasm_rt_web.mjs or web/pion_host_bridge.mjs.",
+                        "Add the missing imports to web/pion_wasm_rt_web.min.mjs or web/pion_host_bridge.mjs.",
                     )
                 if wasm_imports_report["other_modules"]:
                     add_diag(
@@ -1949,6 +1956,8 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
     if rc != 0:
         return {"ok": False, "error": (out + err).strip(), "elapsed_ms": build_ms}
 
+    wasm_opt_ran = False
+    wasm_opt_skipped = None
     if do_opt:
         wasm_opt = shutil.which("wasm-opt")
         if wasm_opt:
@@ -1958,18 +1967,34 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
                 "--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-nontrapping-float-to-int",
                 wasm_file, "-o", wasm_file,
             ])
+            if rc2 != 0 and "bulk-memory-opt" in (out2 + err2):
+                rc2, out2, err2, _ = run_cmd([
+                    wasm_opt, "-Oz",
+                    "--enable-bulk-memory", "--enable-nontrapping-float-to-int",
+                    wasm_file, "-o", wasm_file,
+                ])
             if rc2 != 0:
-                return {"ok": False, "error": f"wasm-opt failed: {(out2 + err2).strip()}"}
+                return {"ok": False, "error": f"wasm-opt failed: {(out2 + err2).strip()}", "wasm_opt_ran": False}
+            wasm_opt_ran = True
+        else:
+            wasm_opt_skipped = "wasm-opt not found"
 
-    for wf in WEB_RUNTIME_FILES + WEB_STATIC_ASSETS:
+    required_files = list(WEB_DIST_RUNTIME_FILES) + list(WEB_STATIC_ASSETS)
+    if pkg_name == "lg_web":
+        required_files.append("_redirects")
+    for wf in required_files:
         src = os.path.join(INVAR_ROOT, "web", wf)
-        if os.path.isfile(src):
-            shutil.copy2(src, os.path.join(out_dir, wf))
+        if not os.path.isfile(src):
+            return {"ok": False, "error": f"Missing required web asset: web/{wf}", "wasm_opt_ran": wasm_opt_ran}
+        shutil.copy2(src, os.path.join(out_dir, wf))
 
     # Write clean index.html tailored to wasm_name & title
-    tpl_html = open(os.path.join(INVAR_ROOT, "web", "index.html"), "r", encoding="utf-8").read()
+    tpl_path = os.path.join(INVAR_ROOT, "web", "index.html")
+    if not os.path.isfile(tpl_path):
+        return {"ok": False, "error": "Missing required web asset: web/index.html", "wasm_opt_ran": wasm_opt_ran}
+    tpl_html = open(tpl_path, "r", encoding="utf-8").read()
     tpl_html = re.sub(r"<title>.*?</title>", f"<title>{title}</title>", tpl_html, count=1, flags=re.S)
-    tpl_html = tpl_html.replace('"lg_web.wasm"', f'"{wasm_name}"')
+    tpl_html = tpl_html.replace("./lg_web.wasm", f"./{wasm_name}").replace('"lg_web.wasm"', f'"{wasm_name}"')
     with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(tpl_html)
 
@@ -1988,7 +2013,7 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
             brotli_bytes = os.path.getsize(wasm_file + ".br")
             os.unlink(wasm_file + ".br")
 
-    return {
+    result = {
         "ok": imp_res["ok"],
         "out_dir": out_dir,
         "wasm_file": wasm_file,
@@ -1997,8 +2022,12 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
         "brotli_bytes": brotli_bytes,
         "imports_total": imp_res["total"],
         "imports_missing": imp_res["missing"],
+        "wasm_opt_ran": wasm_opt_ran,
         "elapsed_ms": build_ms,
     }
+    if wasm_opt_skipped:
+        result["wasm_opt_skipped"] = wasm_opt_skipped
+    return result
 
 
 def cmd_web(args):

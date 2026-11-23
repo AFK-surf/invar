@@ -2071,6 +2071,11 @@
   function setupGL() {
     // with alpha: native views (below) show through the holes the app paints (kind 9), and default-FB glass blits to RGBA8
     gl = canvas.getContext('webgl2', { premultipliedAlpha: true, antialias: false, alpha: true });
+    if (!gl) {
+      const bootEl = typeof document !== 'undefined' ? document.getElementById('boot') : null;
+      if (bootEl) bootEl.textContent = 'WebGL2 is required to run Invar.';
+      throw new Error('WebGL2 context unavailable');
+    }
     extParallel = gl.getExtension('KHR_parallel_shader_compile');
     cv = null;
     cvOk = false;
@@ -5984,43 +5989,49 @@
     for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
     return decodeURIComponent(escape(s));
   };
-  const termAsked = (globalThis.__mbrender || typeof WebAssembly === 'undefined' || typeof fetch === 'undefined' || typeof URL === 'undefined')
-    ? null
-    : (() => {
-        try {
-          const u = new URL('ghostty-vt.wasm', hostScriptSrc);
-          const q = new URL(hostScriptSrc, location.href).search;
-          if (q) u.search = q;
-          return fetch(u)
-            .then((r) => (r.ok && !(r.headers.get('content-type') || '').includes('text/html') ? r.arrayBuffer() : null))
-            .then((b) => {
-              if (!b || b.byteLength < 8) return null;
-              const hdr = new Uint8Array(b, 0, 4);
-              if (hdr[0] !== 0 || hdr[1] !== 0x61 || hdr[2] !== 0x73 || hdr[3] !== 0x6d) return null;
-              return WebAssembly.instantiate(b, {});
-            })
-            .then((res) => {
-              if (!res) return;
-              const x = res.instance.exports;
-              const s = x.ghostty_alloc(0, 4096);
-              if (!s) return;
-              vt = x;
-              vtScratch = s;
-              try {
-                const p = x.ghostty_type_json();
-                const m = new Uint8Array(x.memory.buffer);
-                let e = p;
-                while (m[e] !== 0) e++;
-                const tj = JSON.parse(utf8Decode(m.subarray(p, e)));
-                const lsb = tj?.types?.GhosttyCell?.bits?.wide?.lsb;
-                if (typeof lsb === 'number') vtWideLsb = lsb;
-              } catch (_) {}
-            })
-            .catch(() => {});
-        } catch (_) {
-          return null;
-        }
-      })();
+  let vtAsked = null;
+  function ensureVt() {
+    if (vt) return Promise.resolve(vt);
+    if (vtAsked) return vtAsked;
+    if (globalThis.__mbrender || typeof WebAssembly === 'undefined' || typeof fetch === 'undefined' || typeof URL === 'undefined') {
+      return Promise.resolve(null);
+    }
+    try {
+      const u = new URL('ghostty-vt.wasm', hostScriptSrc);
+      const q = new URL(hostScriptSrc, location.href).search;
+      if (q) u.search = q;
+      vtAsked = fetch(u)
+        .then((r) => (r.ok && !(r.headers.get('content-type') || '').includes('text/html') ? r.arrayBuffer() : null))
+        .then((b) => {
+          if (!b || b.byteLength < 8) return null;
+          const hdr = new Uint8Array(b, 0, 4);
+          if (hdr[0] !== 0 || hdr[1] !== 0x61 || hdr[2] !== 0x73 || hdr[3] !== 0x6d) return null;
+          return WebAssembly.instantiate(b, {});
+        })
+        .then((res) => {
+          if (!res) return null;
+          const x = res.instance.exports;
+          const s = x.ghostty_alloc(0, 4096);
+          if (!s) return null;
+          vt = x;
+          vtScratch = s;
+          try {
+            const p = x.ghostty_type_json();
+            const m = new Uint8Array(x.memory.buffer);
+            let e = p;
+            while (m[e] !== 0) e++;
+            const tj = JSON.parse(utf8Decode(m.subarray(p, e)));
+            const lsb = tj?.types?.GhosttyCell?.bits?.wide?.lsb;
+            if (typeof lsb === 'number') vtWideLsb = lsb;
+          } catch (_) {}
+          return vt;
+        })
+        .catch(() => null);
+      return vtAsked;
+    } catch (_) {
+      return Promise.resolve(null);
+    }
+  }
 
   function vtModes(t) {
     const dv = new DataView(vt.memory.buffer);
@@ -6047,7 +6058,10 @@
   }
 
   H.termOpen = (cols, rows) => {
-    if (!vt) return 0;
+    if (!vt) {
+      ensureVt();
+      return 0;
+    }
     const c = cols > 0 ? cols : 1;
     const r = rows > 0 ? rows : 1;
     if (vt.ghostty_terminal_new(0, vtScratch, c, r) !== 0) return 0;
@@ -6576,8 +6590,8 @@
     cb = { frame, pointer, wheel, key: (code, mods) => { modifiersSaid = mods; key(code, mods); }, text };
     window.__mb = cb;
     resize();
-    // (the app's first frame once the host knows what it decodes and whether its terminal Wasm is beside it)
-    (termAsked ? Promise.all([h264Asked, termAsked]) : h264Asked).then(() => {
+    // (the app's first frame once the host knows what it decodes; terminal Wasm loads lazily on termOpen)
+    h264Asked.then(() => {
       known = true;
       H.requestFrame();
     });

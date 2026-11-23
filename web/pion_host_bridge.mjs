@@ -69,8 +69,203 @@ export function attachHostBridge(rt, perfHooks = {}) {
   const perfLines = [];
   let perfBytes = 0;
 
-  // Accessibility live DOM mirror (lazily created when enabled)
+  // Accessibility live DOM mirror (lazily created on first tree sync)
   let a11yEl = null;
+  const a11yNodes = new Map();
+
+  function ensureA11yRoot() {
+    if (a11yEl && a11yEl.isConnected) return a11yEl;
+    if (typeof document === "undefined" || !document.body) return null;
+    a11yEl = document.getElementById("a11y") || document.createElement("div");
+    a11yEl.id = "a11y";
+    a11yEl.setAttribute("role", "application");
+    a11yEl.setAttribute("aria-label", "Invar Application");
+    a11yEl.style.cssText = "position:fixed;inset:0;pointer-events:none;overflow:hidden;opacity:0;z-index:1;";
+    if (!a11yEl.isConnected) document.body.appendChild(a11yEl);
+    return a11yEl;
+  }
+
+  function a11yRoleSpec(role) {
+    switch (role) {
+      case "Button": return { tag: "button", role: null };
+      case "Checkbox": return { tag: "div", role: "checkbox" };
+      case "Switch":
+      case "Toggle": return { tag: "div", role: "switch" };
+      case "Radio": return { tag: "div", role: "radio" };
+      case "Tab": return { tag: "div", role: "tab" };
+      case "MenuItem": return { tag: "div", role: "menuitem" };
+      case "Link": return { tag: "div", role: "link" };
+      case "TextField":
+      case "SearchField": return { tag: "div", role: "textbox" };
+      case "Slider": return { tag: "div", role: "slider" };
+      case "Dialog": return { tag: "div", role: "dialog" };
+      case "Heading": return { tag: "div", role: "heading" };
+      default: return { tag: "span", role: "region" };
+    }
+  }
+
+  function activateA11yNode(id) {
+    const cur = a11yNodes.get(id);
+    if (!cur || cur.flags.includes("d")) return;
+    const cx = cur.x + cur.w * 0.5;
+    const cy = cur.y + cur.h * 0.5;
+    const mb = globalThis.__mb;
+    if (mb && mb.pointer) {
+      mb.pointer(0, cx, cy, 0);
+      mb.pointer(2, cx, cy, 0);
+    }
+    const H = host();
+    if (H && H.requestFrame) H.requestFrame();
+  }
+
+  function syncA11yElement(node, root) {
+    if (node.id === "0") return;
+    const spec = a11yRoleSpec(node.role);
+    let el = node.el;
+    if (!el || el.tagName.toLowerCase() !== spec.tag) {
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      el = document.createElement(spec.tag);
+      if (spec.tag === "button") el.type = "button";
+      el.dataset.a11yId = node.id;
+      const nid = node.id;
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        activateA11yNode(nid);
+      });
+      if (spec.tag !== "button") {
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            activateA11yNode(nid);
+          }
+        });
+      }
+      node.el = el;
+      root.appendChild(el);
+    }
+    if (spec.role) el.setAttribute("role", spec.role);
+    else el.removeAttribute("role");
+
+    const label = node.label || node.value || node.description || "";
+    if (label) el.setAttribute("aria-label", label);
+    else el.removeAttribute("aria-label");
+    if (el.textContent !== label) el.textContent = label;
+
+    const flags = node.flags;
+    if (flags.includes("C")) el.setAttribute("aria-checked", "true");
+    else if (flags.includes("c")) el.setAttribute("aria-checked", "false");
+    else if (flags.includes("M")) el.setAttribute("aria-checked", "mixed");
+    else el.removeAttribute("aria-checked");
+
+    if (flags.includes("E")) el.setAttribute("aria-expanded", "true");
+    else if (flags.includes("e")) el.setAttribute("aria-expanded", "false");
+    else el.removeAttribute("aria-expanded");
+
+    if (flags.includes("s")) el.setAttribute("aria-selected", "true");
+    else el.removeAttribute("aria-selected");
+
+    const disabled = flags.includes("d");
+    if (disabled) el.setAttribute("aria-disabled", "true");
+    else el.removeAttribute("aria-disabled");
+    if (spec.tag === "button") el.disabled = disabled;
+
+    if (node.value) el.setAttribute("aria-valuetext", node.value);
+    else el.removeAttribute("aria-valuetext");
+
+    if (node.actions.includes("a") && !disabled) el.tabIndex = 0;
+    else el.removeAttribute("tabindex");
+
+    el.style.cssText =
+      `position:fixed;left:${node.x}px;top:${node.y}px;width:${node.w}px;height:${node.h}px;` +
+      "margin:0;padding:0;border:0;background:transparent;pointer-events:none;";
+  }
+
+  function applyA11yTree(wire) {
+    const root = ensureA11yRoot();
+    if (!root || !wire) return;
+    const lines = wire.split("\n");
+    let full = false;
+    let focusId = "0";
+    const batch = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+      const parts = line.split("\x1f");
+      if (parts[0] === "T") {
+        full = parts[1] === "1";
+        focusId = parts[2] || "0";
+      } else if (parts[0] === "N" && parts.length >= 17) {
+        const kidsRaw = parts[16] || "";
+        const kids = kidsRaw ? kidsRaw.split(",").filter(Boolean) : [];
+        batch.push({
+          id: parts[1],
+          role: parts[2] || "",
+          flags: parts[3] || "",
+          x: Number(parts[4]) || 0,
+          y: Number(parts[5]) || 0,
+          w: Number(parts[6]) || 0,
+          h: Number(parts[7]) || 0,
+          label: parts[8] || "",
+          value: parts[9] || "",
+          description: parts[10] || "",
+          actions: parts[14] || "",
+          widget: Number(parts[15]) || 0,
+          kids,
+        });
+      }
+    }
+
+    if (full) {
+      for (const n of a11yNodes.values()) {
+        if (n.el && n.el.parentNode) n.el.parentNode.removeChild(n.el);
+      }
+      a11yNodes.clear();
+    }
+
+    const held = new Set();
+    for (let i = 0; i < batch.length; i++) {
+      for (const k of batch[i].kids) held.add(k);
+    }
+
+    const letGo = [];
+    for (let i = 0; i < batch.length; i++) {
+      const n = batch[i];
+      const prev = a11yNodes.get(n.id);
+      if (prev) {
+        const nextKids = new Set(n.kids);
+        for (const k of prev.kids) {
+          if (!nextKids.has(k)) letGo.push(k);
+        }
+        n.el = prev.el || null;
+      } else {
+        n.el = null;
+      }
+      a11yNodes.set(n.id, n);
+    }
+
+    for (let i = 0; i < letGo.length; i++) {
+      const k = letGo[i];
+      if (held.has(k)) continue;
+      const gone = a11yNodes.get(k);
+      if (gone) {
+        if (gone.el && gone.el.parentNode) gone.el.parentNode.removeChild(gone.el);
+        a11yNodes.delete(k);
+        for (const c of gone.kids) letGo.push(c);
+      }
+    }
+
+    for (let i = 0; i < batch.length; i++) {
+      syncA11yElement(batch[i], root);
+    }
+    root.dataset.treeLen = String(wire.length);
+
+    if (focusId && focusId !== "0" && document.activeElement && root.contains(document.activeElement)) {
+      const target = a11yNodes.get(focusId)?.el;
+      if (target && target !== document.activeElement && typeof target.focus === "function") {
+        target.focus({ preventScroll: true });
+      }
+    }
+  }
 
   // WebAuthn / Passkeys async request table
   let waNextId = 1;
@@ -409,7 +604,7 @@ export function attachHostBridge(rt, perfHooks = {}) {
     mb_web_a11y_on() {
       const H = host();
       if (H && H.a11yOn) return H.a11yOn() ? 1 : 0;
-      return a11yEl ? 1 : 0;
+      return typeof document !== "undefined" && !!document.body ? 1 : 0;
     },
     mb_web_a11y_tree(sPtr, sLen) {
       const s = rt.readUtf8(sPtr, sLen);
@@ -418,15 +613,7 @@ export function attachHostBridge(rt, perfHooks = {}) {
         H.a11yTree(s);
         return;
       }
-      if (typeof document === "undefined" || !document.body) return;
-      if (!a11yEl) {
-        a11yEl = document.createElement("div");
-        a11yEl.setAttribute("role", "region");
-        a11yEl.setAttribute("aria-live", "polite");
-        a11yEl.style.cssText = "position:fixed;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;pointer-events:none;";
-        document.body.appendChild(a11yEl);
-      }
-      a11yEl.dataset.treeLen = String(s.length);
+      applyA11yTree(s);
     },
     mb_web_over_done(openApp) {
       const s = globalThis.__mbshare;
