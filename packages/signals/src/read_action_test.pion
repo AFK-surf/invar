@@ -1,0 +1,288 @@
+// Deterministic unit tests for `ReadSignal`, `DerivedSignal::update`, and `Action`.
+
+test "ReadSignal unifies Signal, Computed, DerivedSignal, and Optimistic" {
+  let s = signal(10)
+  let c = computed(fn(_p : Option[Int]) -> Int { s.get() * 2 })
+  let d = derived_signal(fn(_p : Option[Int]) -> Int { s.get() + 1 })
+  let opt = optimistic(fn() -> Int { s.get() })
+
+  let rs : ReadSignal[Int] = s.read()
+  let rc : ReadSignal[Int] = c.read()
+  let rd : ReadSignal[Int] = d.read()
+  let ro : ReadSignal[Int] = opt.read()
+
+  debug_assert(!rs.watched() && !rc.watched() && !rd.watched() && !ro.watched(), "initially unwatched")
+  debug_assert(rs.untracked() == 10 && rc.untracked() == 20, "untracked read sig/comp")
+  debug_assert(rd.untracked() == 11 && ro.untracked() == 10, "untracked read derived/opt")
+
+  // Tracked dependency & watched state
+  let seen : Array[Int] = []
+  let untracked_seen = [0]
+  let stop = effect(fn() -> Unit {
+    let sum = rs.get() + rc.get() + rd.get() + ro.get()
+    seen.push(sum)
+    // untracked read must not register extra dependency
+    untracked_seen[0] = rs.untracked()
+  })
+  debug_assert(rs.watched() && rc.watched() && rd.watched() && ro.watched(), "watched inside effect")
+  debug_assert(seen.length() == 1 && seen[0] == 51 && untracked_seen[0] == 10, "initial tracked sum")
+
+  // Verify untracked does NOT track in an effect that only calls untracked()
+  let u_runs = [0]
+  let stop_u = effect(fn() -> Unit {
+    let _ = rs.untracked()
+    let _ = rc.untracked()
+    u_runs[0] += 1
+  })
+  debug_assert(u_runs[0] == 1, "untracked effect initial run")
+
+  s.set(20)
+  debug_assert(seen.length() == 2 && seen[1] == 101, "tracked effect updated once on signal change")
+  debug_assert(u_runs[0] == 1, "untracked effect did not re-run")
+
+  let undo = opt.push(fn(x : Int) -> Int { x + 5 })
+  debug_assert(seen.length() == 3 && seen[2] == 106, "tracked effect saw optimistic overlay")
+  undo()
+  debug_assert(seen.length() == 4 && seen[3] == 101, "tracked effect saw optimistic revert")
+
+  // ReadSignal::map and ReadSignal::map_by
+  let mapped = rs.map(fn(x : Int) -> String { "v=" + x.to_string() })
+  let mapped_parity = rc.map_by(
+    fn(x : Int) -> Int { x / 10 },
+    fn(a : Int, b : Int) -> Bool { a == b },
+  )
+  let m_runs = [0]
+  let stop_m = effect(fn() -> Unit {
+    let _ = mapped.get()
+    let _ = mapped_parity.get()
+    m_runs[0] += 1
+  })
+  debug_assert(mapped.untracked() == "v=20" && mapped_parity.untracked() == 4 && m_runs[0] == 1, "map initial")
+  s.set(21)
+  debug_assert(mapped.untracked() == "v=21" && mapped_parity.untracked() == 4 && m_runs[0] == 2, "map updated")
+
+  stop()
+  stop_u()
+  stop_m()
+  debug_assert(!rs.watched() && !rc.watched() && !rd.watched() && !ro.watched(), "unwatched after stop")
+}
+
+test "DerivedSignal::update functional update" {
+  let base = signal(5)
+  let d = derived_signal(fn(_p : Option[Int]) -> Int { base.get() * 10 })
+  let runs = [0]
+  let last = [0]
+  let stop = effect(fn() -> Unit {
+    runs[0] += 1
+    last[0] = d.get()
+  })
+  debug_assert(runs[0] == 1 && last[0] == 50, "derived initial")
+  d.update(fn(x : Int) -> Int { x + 7 })
+  debug_assert(runs[0] == 2 && last[0] == 57, "derived functional update")
+  d.update(fn(x : Int) -> Int { x })
+  debug_assert(runs[0] == 2 && last[0] == 57, "no-op update does not trigger")
+  base.set(6)
+  debug_assert(runs[0] == 3 && last[0] == 60, "upstream resets derived override")
+  stop()
+}
+
+test "Action atomic single-frame succeed without flicker" {
+  let auth = signal(10)
+  let opt = optimistic(fn() -> Int { auth.get() })
+  let act : Action[Int, String] = action()
+
+  let frames : Array[String] = []
+  let stop = effect(fn() -> Unit {
+    let v = opt.get()
+    let p = act.pending().get()
+    let n = act.in_flight().get()
+    frames.push(v.to_string() + ":" + p.to_string() + ":" + n.to_string())
+  })
+  debug_assert(frames.length() == 1 && frames[0] == "10:false:0", "initial frame")
+
+  let ticket = batch(fn() -> ActionTicket[Int, String] {
+    act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 1 }))
+  })
+  debug_assert(ticket.seq() == 1.to_int64() && ticket.is_latest() && !ticket.is_settled(), "ticket active")
+  debug_assert(frames.length() == 2 && frames[1] == "11:true:1", "optimistic + pending in one frame")
+
+  // Succeed commits authoritative value and reverts optimistic patch in a single batch:
+  // downstream effect must fire exactly ONCE, never seeing old authority 10 again.
+  let ok = ticket.succeed(11, fn(res : Int) -> Unit { auth.set(res) })
+  debug_assert(ok && ticket.is_settled(), "ticket succeeded")
+  debug_assert(frames.length() == 3 && frames[2] == "11:false:0", "single-frame atomic commit without flicker")
+  debug_assert(opt.get() == 11 && !opt.is_pending(), "optimistic cleared cleanly")
+  let last_ok = act.last_ok().untracked()
+  debug_assert(
+    match last_ok {
+      Some(v) => v == 11
+      None => false
+    },
+    "last_ok recorded",
+  )
+  debug_assert(act.error().untracked().is_none(), "error remains none")
+  stop()
+}
+
+test "Action atomic single-frame fail rollback and error" {
+  let auth = signal(100)
+  let opt = optimistic(fn() -> Int { auth.get() })
+  let act : Action[Int, String] = action()
+
+  let frames : Array[String] = []
+  let stop = effect(fn() -> Unit {
+    let v = opt.get()
+    let p = act.pending().get()
+    let err_str = match act.error().get() {
+      Some(e) => e
+      None => "none"
+    }
+    frames.push(v.to_string() + ":" + p.to_string() + ":" + err_str)
+  })
+  debug_assert(frames.length() == 1 && frames[0] == "100:false:none", "initial")
+
+  let ticket = batch(fn() -> ActionTicket[Int, String] {
+    act.begin()
+    .with_optimistic(opt.push(fn(x : Int) -> Int { x + 20 }))
+    .with_optimistic(opt.push(fn(x : Int) -> Int { x + 5 }))
+  })
+  debug_assert(frames.length() == 2 && frames[1] == "125:true:none", "chained optimistic patches applied")
+
+  let failed = ticket.fail("network timeout")
+  debug_assert(failed && ticket.is_settled(), "ticket failed")
+  debug_assert(
+    frames.length() == 3 && frames[2] == "100:false:network timeout",
+    "rollback + error + pending=false in single frame",
+  )
+
+  // clear_err=false preserves existing error on next begin
+  let t2 = act.begin(clear_err=false)
+  debug_assert(
+    match act.error().untracked() {
+      Some(e) => e == "network timeout"
+      None => false
+    },
+    "begin(clear_err=false) keeps previous error",
+  )
+  let _ = t2.cancel()
+  act.clear_error()
+  debug_assert(act.error().untracked().is_none(), "clear_error clears error")
+
+  stop()
+}
+
+test "Action concurrent out-of-order race with succeed_if_latest" {
+  let auth = signal(0)
+  let opt = optimistic(fn() -> Int { auth.get() })
+  let act : Action[Int, String] = action()
+
+  let t1 = act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 1 }))
+  let t2 = act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 1 }))
+
+  debug_assert(t1.seq() == 1.to_int64() && t2.seq() == 2.to_int64(), "monotonic seq")
+  debug_assert(!t1.is_latest() && t2.is_latest(), "t2 is latest")
+  debug_assert(act.in_flight().untracked() == 2 && act.pending().untracked(), "2 in flight")
+  debug_assert(opt.untracked() == 2, "both optimistic +1 stacked")
+
+  // t2 arrives FIRST (latest) -> commits authoritative value 200
+  let commit_log : Array[Int] = []
+  let ok2 = t2.succeed_if_latest(200, fn(res : Int) -> Unit {
+    commit_log.push(res)
+    auth.set(res)
+  })
+  debug_assert(ok2 && t2.is_settled(), "t2 committed as latest")
+  debug_assert(auth.untracked() == 200 && opt.untracked() == 201, "t1 optimistic +1 still active")
+  debug_assert(act.in_flight().untracked() == 1 && act.pending().untracked(), "1 still in flight")
+
+  // t1 arrives LATE (stale) -> must NOT call commit, only revert its patch and dec in_flight
+  let ok1 = t1.succeed_if_latest(100, fn(res : Int) -> Unit {
+    commit_log.push(res)
+    auth.set(res)
+  })
+  debug_assert(!ok1 && t1.is_settled(), "stale t1 ignored")
+  debug_assert(commit_log.length() == 1 && commit_log[0] == 200, "stale t1 never called commit")
+  debug_assert(auth.untracked() == 200 && opt.untracked() == 200, "authority preserved and optimistic reverted")
+  debug_assert(act.in_flight().untracked() == 0 && !act.pending().untracked(), "in_flight zeroed")
+}
+
+test "Action concurrent out-of-order race with fail_if_latest" {
+  let auth = signal(10)
+  let opt = optimistic(fn() -> Int { auth.get() })
+  let act : Action[Int, String] = action()
+
+  let t1 = act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 1 }))
+  let t2 = act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 2 }))
+  debug_assert(act.in_flight().untracked() == 2 && opt.untracked() == 13, "both optimistic active")
+
+  // t2 (latest) succeeds first
+  let ok2 = t2.succeed_if_latest(50, fn(res : Int) -> Unit { auth.set(res) })
+  debug_assert(ok2 && auth.untracked() == 50 && opt.untracked() == 51, "t2 committed, t1 patch still active")
+  debug_assert(act.error().untracked().is_none() && act.in_flight().untracked() == 1, "no error, 1 in flight")
+
+  // Stale t1 fails late -> must NOT pollute error, only revert its patch and dec in_flight
+  let f1 = t1.fail_if_latest("stale err")
+  debug_assert(!f1 && t1.is_settled(), "stale t1 fail_if_latest returned false and settled")
+  debug_assert(act.error().untracked().is_none(), "error stays None after stale failure")
+  debug_assert(auth.untracked() == 50 && opt.untracked() == 50, "t1 optimistic reverted")
+  debug_assert(act.in_flight().untracked() == 0 && !act.pending().untracked(), "in_flight zeroed")
+
+  // Latest t3 fails -> records error and reverts patch
+  let t3 = act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 5 }))
+  debug_assert(opt.untracked() == 55, "t3 optimistic active")
+  let f3 = t3.fail_if_latest("real err")
+  debug_assert(f3 && t3.is_settled(), "latest t3 fail_if_latest returned true")
+  debug_assert(!t3.fail_if_latest("dup err"), "repeat fail_if_latest idempotent")
+  debug_assert(
+    match act.error().untracked() {
+      Some(e) => e == "real err"
+      None => false
+    },
+    "latest failure recorded",
+  )
+  debug_assert(opt.untracked() == 50 && act.in_flight().untracked() == 0, "t3 reverted and zeroed")
+}
+
+test "Action ticket settlement is idempotent" {
+  let auth = signal(1)
+  let opt = optimistic(fn() -> Int { auth.get() })
+  let act : Action[Int, String] = action()
+
+  let runs = [0]
+  let stop = effect(fn() -> Unit {
+    let _ = opt.get()
+    let _ = act.pending().get()
+    let _ = act.in_flight().get()
+    let _ = act.error().get()
+    runs[0] += 1
+  })
+  debug_assert(runs[0] == 1, "initial")
+
+  let t1 = act.begin().with_optimistic(opt.push(fn(x : Int) -> Int { x + 10 }))
+  let after_begin = runs[0]
+  debug_assert(t1.succeed(11, fn(v : Int) -> Unit { auth.set(v) }), "first succeed true")
+  let after_succeed = runs[0]
+  debug_assert(after_succeed == after_begin + 1, "succeed triggered once")
+  debug_assert(!t1.succeed(99, fn(v : Int) -> Unit { auth.set(v) }), "second succeed false")
+  debug_assert(!t1.fail("late err"), "fail after succeed false")
+  debug_assert(!t1.cancel(), "cancel after succeed false")
+  debug_assert(runs[0] == after_succeed, "no extra effect runs on repeat settle")
+  debug_assert(auth.untracked() == 11 && act.in_flight().untracked() == 0, "state intact")
+
+  let t2 = act.begin()
+  debug_assert(t2.fail("boom"), "first fail true")
+  let after_fail = runs[0]
+  debug_assert(!t2.fail("boom2"), "second fail false")
+  debug_assert(!t2.cancel(), "cancel after fail false")
+  debug_assert(!t2.succeed(5, fn(v : Int) -> Unit { auth.set(v) }), "succeed after fail false")
+  debug_assert(runs[0] == after_fail && act.in_flight().untracked() == 0, "fail idempotent")
+
+  let t3 = act.begin()
+  debug_assert(t3.cancel(), "first cancel true")
+  let after_cancel = runs[0]
+  debug_assert(!t3.cancel(), "second cancel false")
+  debug_assert(!t3.succeed(6, fn(v : Int) -> Unit { auth.set(v) }), "succeed after cancel false")
+  debug_assert(!t3.fail("err"), "fail after cancel false")
+  debug_assert(runs[0] == after_cancel && act.in_flight().untracked() == 0, "cancel idempotent")
+
+  stop()
+}
