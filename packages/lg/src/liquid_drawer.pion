@@ -132,12 +132,17 @@ pub fn liquid_drawer_node(
     let init_off_x = sign * (width + inset * 2.0)
     h.show(shown_open, leave=ovl_drawer_leave_ms, fn(s : view::View) -> Unit {
       let slide = motion::NodeWay::new(init_off_x)
+      let closing_by_drag = ui::ref_new(false)
+      let released_by_up = ui::ref_new(false)
       slide.go(s, 0.0, motion::move_damped)
       s.reacts(
         open,
         fn(on : Bool) -> Unit {
           if on {
+            closing_by_drag.v = false
             slide.go(s, 0.0, motion::move_damped)
+          } else if closing_by_drag.v {
+            closing_by_drag.v = false
           } else {
             slide.go(s, sign * eff_travel(s), motion::move_damped)
           }
@@ -162,21 +167,52 @@ pub fn liquid_drawer_node(
           .ground(view::Live::By(fn() { alpha(black, ovl_drawer_scrim_alpha * vis(scrim_box)) }))
         })
       }
+      let drawer_edge = match side {
+        DrawerSide::Leading => headless::DrawerEdge::Left
+        DrawerSide::Trailing => headless::DrawerEdge::Right
+      }
       let _ = s.box(fn(room : view::View) -> Unit {
         let _ = room
         .width(view::Live::By(fn() { Some(eff_w(room) + 2.0 * inset) }))
         .max_width(view::Live::By(fn() { Some(eff_w(room) + 2.0 * inset) }), within=true)
         .padding(view::Live::Is((inset, inset, inset, inset)))
-        let _ = headless::dialog(
+        let _ = headless::drawer(
           room,
           title,
           open,
           on_close,
+          edge=drawer_edge,
+          close_threshold=1.0 - ovl_drawer_dismiss_ratio,
+          velocity_threshold=ovl_drawer_dismiss_vel,
+          overpull_max=ovl_drawer_overpull_max,
+          drag_surface=false,
+          on_release=fn(off : Double, vel : Double, will_close : Bool) -> Unit {
+            released_by_up.v = true
+            slide.put(off * sign)
+            if will_close {
+              closing_by_drag.v = true
+              let cur_off_x = sign * signals::untracked(fn() { eff_travel(s) })
+              slide.go(s, cur_off_x, motion::move_damped, velocity=vel * sign)
+            } else {
+              slide.go(s, 0.0, motion::move_damped, velocity=vel * sign)
+            }
+          },
           description=subtitle,
           loc=loc,
-          fn(card : view::View, dlg : headless::Dialog) -> Unit {
-            let drag_start_wx = ui::ref_new(0.0)
-            let drag_start_x = ui::ref_new(0.0)
+          fn(card : view::View, dr : headless::Drawer) -> Unit {
+            card.reacts(
+              at_start=false,
+              fn() { (dr.dragging(), dr.drag_offset()) },
+              fn(st : (Bool, Double)) -> Unit {
+                if st.0 {
+                  slide.put(st.1 * sign)
+                } else if released_by_up.v {
+                  released_by_up.v = false
+                } else if signals::untracked(open) {
+                  slide.go(card, 0.0, motion::move_damped)
+                }
+              },
+            )
             let _ = card
             .grow(view::Live::Is(1.0))
             .radius(view::Live::Is(radius))
@@ -194,136 +230,103 @@ pub fn liquid_drawer_node(
             .edge(view::Live::By(fn() { if card.glass_solid() { liquid_overlay_solid_edge() } else { (0.0, clear) } }))
             .clips(view::Live::Is(true))
             .offset(view::Live::By(fn() { (slide.shown(card), 0.0) }))
-            // Full-card gesture container inside `headless::dialog` (avoids outer no-op `on_drag`).
-            let _ = card.box(fn(pan : view::View) -> Unit {
-              let _ = pan
-              .grow(view::Live::Is(1.0))
-              .min_height(view::Live::Is(Some(0.0)))
-              .gesture(
-                ui::touch_slop(),
-                press=fn(d : view::Drag) -> Unit {
-                  drag_start_wx.v = d.wx
-                  drag_start_x.v = slide.value_at(d.at)
-                },
-                drag=fn(d : view::Drag) -> Unit {
-                  match d.kind {
-                    Down | Moved => {
-                      let raw = drag_start_x.v + (d.wx - drag_start_wx.v)
-                      let dismiss_raw = raw * sign
-                      let mapped = if dismiss_raw >= 0.0 {
-                        dismiss_raw
-                      } else {
-                        let over_d = -dismiss_raw
-                        -(over_d * ovl_drawer_overpull_max / (over_d + ovl_drawer_overpull_max * 2.0))
-                      }
-                      slide.put(mapped * sign)
-                    }
-                    Up | Off => {
-                      let cur = slide.value_at(d.at)
-                      let dismiss_dist = cur * sign
-                      let dismiss_vel = d.vx() * sign
-                      let cur_w = signals::untracked(fn() { eff_w(card) })
-                      let is_up = match d.kind { Up => true; _ => false }
-                      let should_close = is_up &&
-                      (dismiss_dist > cur_w * ovl_drawer_dismiss_ratio || dismiss_vel > ovl_drawer_dismiss_vel) &&
-                      dismiss_vel >= -ovl_drawer_dismiss_vel
-                      if should_close {
-                        let cur_off_x = sign * signals::untracked(fn() { eff_travel(card) })
-                        slide.go(card, cur_off_x, motion::move_damped, velocity=d.vx())
-                        dlg.close()
-                      } else {
-                        slide.go(card, 0.0, motion::move_damped, velocity=d.vx())
-                      }
-                    }
-                  }
-                },
-              )
-              if show_header {
-                // Header row: title + optional subtitle + concentric circular close button (12pt inset + 16pt r == 28pt)
-                let _ = pan.box(fn(hdr : view::View) -> Unit {
-                  let _ = hdr
-                  .row(view::Live::Is(true))
-                  .lines_up(view::Live::Is(Some(view::Along::Start)))
-                  .lies_along(view::Live::Is(view::Lies::Between))
-                  .gap(view::Live::Is(ovl_drawer_pad))
-                  .padding(view::Live::Is((ovl_drawer_hdr_pl, ovl_drawer_pad, ovl_drawer_pad, ovl_drawer_pad)))
-                  let _ = hdr.box(fn(titles : view::View) -> Unit {
-                    let _ = titles.grow(view::Live::Is(1.0)).gap(view::Live::Is(ovl_text_gap)).padding(view::Live::Is((0.0, 2.0, 0.0, 0.0)))
-                    let _ = titles.box(fn(w : view::View) -> Unit {
-                      let _ = w
-                      .words(view::Live::By(title), look=words_at(ovl_type_title, weight=ovl_weight_semibold, wrap=true))
-                      .ink(view::Live::By(fn() { colors().content }))
+            // Full-card drag handle managed by `headless::drawer` (rubber-band over-pull, velocity & reverse-flick guard).
+            let _ = dr.handle(
+              card,
+              extent_by=fn() { signals::untracked(fn() { eff_w(card) }) },
+              slop=ui::touch_slop(),
+              loc=loc,
+              fn(pan : view::View, _d : headless::Drawer) -> Unit {
+                let _ = pan
+                .grow(view::Live::Is(1.0))
+                .min_height(view::Live::Is(Some(0.0)))
+                if show_header {
+                  // Header row: title + optional subtitle + concentric circular close button (12pt inset + 16pt r == 28pt)
+                  let _ = pan.box(fn(hdr : view::View) -> Unit {
+                    let _ = hdr
+                    .row(view::Live::Is(true))
+                    .lines_up(view::Live::Is(Some(view::Along::Start)))
+                    .lies_along(view::Live::Is(view::Lies::Between))
+                    .gap(view::Live::Is(ovl_drawer_pad))
+                    .padding(view::Live::Is((ovl_drawer_hdr_pl, ovl_drawer_pad, ovl_drawer_pad, ovl_drawer_pad)))
+                    let _ = hdr.box(fn(titles : view::View) -> Unit {
+                      let _ = titles.grow(view::Live::Is(1.0)).gap(view::Live::Is(ovl_text_gap)).padding(view::Live::Is((0.0, 2.0, 0.0, 0.0)))
+                      let _ = titles.box(fn(w : view::View) -> Unit {
+                        let _ = w
+                        .words(view::Live::By(title), look=words_at(ovl_type_title, weight=ovl_weight_semibold, wrap=true))
+                        .ink(view::Live::By(fn() { colors().content }))
+                      })
+                      titles.show(fn() { subtitle() != "" }, fn(sub : view::View) -> Unit {
+                        let _ = sub
+                        .words(view::Live::By(subtitle), look=words_at(ovl_type_sub, wrap=true))
+                        .ink(view::Live::By(ovl_muted_ink))
+                      })
                     })
-                    titles.show(fn() { subtitle() != "" }, fn(sub : view::View) -> Unit {
-                      let _ = sub
-                      .words(view::Live::By(subtitle), look=words_at(ovl_type_sub, wrap=true))
-                      .ink(view::Live::By(ovl_muted_ink))
-                    })
-                  })
-                  let _ = headless::button(hdr, fn() { "Close" }, fn(_e) -> Unit { dlg.close() }, loc=loc, fn(btn_v : view::View, btn : headless::Button) -> Unit {
-                    let _ = btn_v
-                    .width(view::Live::Is(Some(36.0)))
-                    .height(view::Live::Is(Some(36.0)))
-                    .margin(view::Live::Is((-3.0, -3.0, -3.0, -3.0)))
-                    .shrink(view::Live::Is(0.0))
-                    .radius(view::Live::Is(18.0))
-                    .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                    .lies_along(view::Live::Is(view::Lies::Middle))
-                    let hover_t = motion::hover_fade(btn_v, fn() { btn.hovered() })
-                    let press_t = motion::hover_fade(btn_v, fn() { btn.pressed() }, duration_ms=motion::pointer_tap_ms)
-                    let _ = btn_v.box(fn(pill : view::View) -> Unit {
-                      let _ = pill
-                      .width(view::Live::Is(Some(ovl_close_btn_size)))
-                      .height(view::Live::Is(Some(ovl_close_btn_size)))
-                      .radius(view::Live::Is(ovl_close_btn_size / 2.0))
+                    let _ = headless::button(hdr, fn() { "Close" }, fn(_e) -> Unit { dr.close() }, loc=loc, fn(btn_v : view::View, btn : headless::Button) -> Unit {
+                      let _ = btn_v
+                      .width(view::Live::Is(Some(36.0)))
+                      .height(view::Live::Is(Some(36.0)))
+                      .margin(view::Live::Is((-3.0, -3.0, -3.0, -3.0)))
+                      .shrink(view::Live::Is(0.0))
+                      .radius(view::Live::Is(18.0))
                       .lines_up(view::Live::Is(Some(view::Along::Middle)))
                       .lies_along(view::Live::Is(view::Lies::Middle))
-                      .ground(view::Live::By(fn() {
-                        let base = ovl_close_ground()
-                        let h_v = hover_t()
-                        let p_v = press_t()
-                        let with_h = if h_v > 0.001 { over(base, alpha(ovl_row_hover(), h_v)) } else { base }
-                        if p_v > 0.001 { over(with_h, alpha(ovl_row_press(), p_v)) } else { with_h }
-                      }))
-                      lg_focus_ring(pill, fn() { btn.focus_shown() }, ovl_close_btn_size / 2.0)
-                      let _ = pill.box(fn(ic : view::View) -> Unit {
-                        let _ = ic
-                        .width(view::Live::Is(Some(ovl_close_icon_size)))
-                        .height(view::Live::Is(Some(ovl_close_icon_size)))
-                        .shapes(view::Live::By(fn() { ovl_close_shapes(ovl_close_icon_size, colors().content) }))
+                      let hover_t = motion::hover_fade(btn_v, fn() { btn.hovered() })
+                      let press_t = motion::hover_fade(btn_v, fn() { btn.pressed() }, duration_ms=motion::pointer_tap_ms)
+                      let _ = btn_v.box(fn(pill : view::View) -> Unit {
+                        let _ = pill
+                        .width(view::Live::Is(Some(ovl_close_btn_size)))
+                        .height(view::Live::Is(Some(ovl_close_btn_size)))
+                        .radius(view::Live::Is(ovl_close_btn_size / 2.0))
+                        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                        .lies_along(view::Live::Is(view::Lies::Middle))
+                        .ground(view::Live::By(fn() {
+                          let base = ovl_close_ground()
+                          let h_v = hover_t()
+                          let p_v = press_t()
+                          let with_h = if h_v > 0.001 { over(base, alpha(ovl_row_hover(), h_v)) } else { base }
+                          if p_v > 0.001 { over(with_h, alpha(ovl_row_press(), p_v)) } else { with_h }
+                        }))
+                        lg_focus_ring(pill, fn() { btn.focus_shown() }, ovl_close_btn_size / 2.0)
+                        let _ = pill.box(fn(ic : view::View) -> Unit {
+                          let _ = ic
+                          .width(view::Live::Is(Some(ovl_close_icon_size)))
+                          .height(view::Live::Is(Some(ovl_close_icon_size)))
+                          .shapes(view::Live::By(fn() { ovl_close_shapes(ovl_close_icon_size, colors().content) }))
+                        })
                       })
                     })
                   })
-                })
-                // Hairline separator below header
-                let _ = pan.box(fn(sep : view::View) -> Unit {
-                  let _ = sep.height(view::Live::Is(Some(ovl_hairline_h))).ground(view::Live::By(ovl_hairline))
-                })
-              }
-              // Body slot (strictly zero glass-on-glass)
-              let _ = pan.box(fn(b : view::View) -> Unit {
-                let _ = b
-                .grow(view::Live::Is(1.0))
-                .min_height(view::Live::Is(Some(0.0)))
-                .padding(view::Live::Is((body_pad, body_pad, body_pad, body_pad)))
-                body(b)
-              })
-              // Optional footer slot
-              match footer {
-                Some(draw_footer) => {
-                  let _ = pan.box(fn(f : view::View) -> Unit {
-                    let _ = f.box(fn(sep : view::View) -> Unit {
-                      let _ = sep.height(view::Live::Is(Some(ovl_hairline_h))).ground(view::Live::By(ovl_hairline))
-                    })
-                    let _ = f.box(fn(inner : view::View) -> Unit {
-                      let _ = inner.padding(view::Live::Is((ovl_drawer_pad, ovl_drawer_pad, ovl_drawer_pad, ovl_drawer_pad)))
-                      draw_footer(inner)
-                    })
+                  // Hairline separator below header
+                  let _ = pan.box(fn(sep : view::View) -> Unit {
+                    let _ = sep.height(view::Live::Is(Some(ovl_hairline_h))).ground(view::Live::By(ovl_hairline))
                   })
                 }
-                None => ()
-              }
-            })
+                // Body slot (strictly zero glass-on-glass)
+                let _ = pan.box(fn(b : view::View) -> Unit {
+                  let _ = b
+                  .grow(view::Live::Is(1.0))
+                  .min_height(view::Live::Is(Some(0.0)))
+                  .padding(view::Live::Is((body_pad, body_pad, body_pad, body_pad)))
+                  body(b)
+                })
+                // Optional footer slot
+                match footer {
+                  Some(draw_footer) => {
+                    let _ = pan.box(fn(f : view::View) -> Unit {
+                      let _ = f.box(fn(sep : view::View) -> Unit {
+                        let _ = sep.height(view::Live::Is(Some(ovl_hairline_h))).ground(view::Live::By(ovl_hairline))
+                      })
+                      let _ = f.box(fn(inner : view::View) -> Unit {
+                        let _ = inner.padding(view::Live::Is((ovl_drawer_pad, ovl_drawer_pad, ovl_drawer_pad, ovl_drawer_pad)))
+                        draw_footer(inner)
+                      })
+                    })
+                  }
+                  None => ()
+                }
+              },
+            )
           },
         )
       })

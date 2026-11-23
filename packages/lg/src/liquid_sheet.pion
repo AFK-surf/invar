@@ -1,6 +1,7 @@
 // Liquid Glass Detached Floating Sheet and ActionSheet components over headless::dialog.
 
 import "headless"
+import "headless_core"
 import "motion"
 import "signals"
 import "ui"
@@ -176,14 +177,82 @@ pub fn liquid_sheet_node(
           let ins = cur_inset()
           (ins, ins, ins, ins)
         }))
-        let _ = headless::dialog(
+        let released_by_up = ui::ref_new(false)
+        let sheet_snaps : Array[Double] = if detents { [0.52, 1.0] } else { [1.0] }
+        let _ = headless::drawer(
           room,
           title,
           open,
           on_close,
+          edge=headless::DrawerEdge::Bottom,
+          snap_points=sheet_snaps,
+          active_snap=fn() -> Int { if detents && exp_state.get() { 1 } else { 0 } },
+          on_snap=fn(idx : Int) -> Unit {
+            if detents {
+              let next = idx >= 1
+              exp_state.set(next)
+              on_expanded(next)
+              detent_way.go(s, if next { 1.0 } else { 0.0 }, motion::move_damped)
+            }
+          },
+          on_release=fn(_off : Double, vel : Double, will_close : Bool) -> Unit {
+            released_by_up.v = true
+            if will_close {
+              drag_y.go(s, 320.0, motion::move_damped, velocity=vel)
+            } else {
+              drag_y.go(s, 0.0, motion::move_damped, velocity=vel)
+            }
+          },
+          close_threshold=if detents { 0.40 } else { 0.75 },
+          velocity_threshold=ovl_sheet_drag_vel,
+          overpull_max=ovl_sheet_overpull_max,
+          drag_surface=false,
           description=subtitle,
           loc=loc,
-          fn(card : view::View, dlg : headless::Dialog) -> Unit {
+          fn(card : view::View, dr : headless::Drawer) -> Unit {
+            card.reacts(
+              at_start=false,
+              fn() { (dr.dragging(), dr.drag_offset()) },
+              fn(st : (Bool, Double)) -> Unit {
+                if st.0 {
+                  let raw_off = st.1
+                  if !detents {
+                    drag_y.put(raw_off)
+                  } else {
+                    let (half_h, full_h) = heights()
+                    let span = full_h - half_h
+                    if exp_state.untracked() {
+                      if raw_off <= 0.0 {
+                        detent_way.put(1.0)
+                        drag_y.put(raw_off)
+                      } else if raw_off <= span {
+                        detent_way.put(1.0 - raw_off / span)
+                        drag_y.put(0.0)
+                      } else {
+                        detent_way.put(0.0)
+                        drag_y.put(raw_off - span)
+                      }
+                    } else if raw_off >= 0.0 {
+                      detent_way.put(0.0)
+                      drag_y.put(raw_off)
+                    } else if -raw_off <= span {
+                      detent_way.put(-raw_off / span)
+                      drag_y.put(0.0)
+                    } else {
+                      detent_way.put(1.0)
+                      drag_y.put(-headless_core::drawer_rubber_pull(-raw_off - span, ovl_sheet_overpull_max))
+                    }
+                  }
+                } else if released_by_up.v {
+                  released_by_up.v = false
+                } else if signals::untracked(open) {
+                  drag_y.go(card, 0.0, motion::move_damped)
+                  if detents {
+                    detent_way.go(card, if exp_state.untracked() { 1.0 } else { 0.0 }, motion::move_damped)
+                  }
+                }
+              },
+            )
             let toggle_detent = fn() -> Unit {
               if detents {
                 let next = !exp_state.untracked()
@@ -212,183 +281,126 @@ pub fn liquid_sheet_node(
             .alpha(view::Live::By(fn() { look().alpha }))
             .offset(view::Live::By(fn() { (0.0, look().dy + drag_y.shown(card)) }))
             lg_apply_glass_surface(card, fn() { lg_sheet_glass_at(detent_val(card)) })
-            // Interactive grabber + header drag handle
-            let drag_start_wy = ui::ref_new(0.0)
-            let drag_start_dy = ui::ref_new(0.0)
-            let drag_start_det = ui::ref_new(0.0)
-            let _ = card.box(fn(handle : view::View) -> Unit {
-              let _ = handle.gesture(
-                ui::touch_slop(),
-                press=fn(d : view::Drag) -> Unit {
-                  drag_start_wy.v = d.wy
-                  drag_start_dy.v = drag_y.value_at(d.at)
-                  drag_start_det.v = if detents { detent_way.value_at(d.at) } else { 0.0 }
-                },
-                drag=fn(d : view::Drag) -> Unit {
-                  let (half_h, full_h) = heights()
-                  let span = full_h - half_h
-                  match d.kind {
-                    Down | Moved => {
-                      let raw_dy = d.wy - drag_start_wy.v
-                      if !detents {
-                        let tot = drag_start_dy.v + raw_dy
-                        if tot >= 0.0 {
-                          drag_y.put(tot)
-                        } else {
-                          let over_d = -tot
-                          drag_y.put(-(over_d * ovl_sheet_overpull_max / (over_d + ovl_sheet_overpull_max * 2.0)))
-                        }
-                      } else {
-                        let total_up = drag_start_det.v * span - (drag_start_dy.v + raw_dy)
-                        if total_up >= 0.0 && total_up <= span {
-                          detent_way.put(total_up / span)
-                          drag_y.put(0.0)
-                        } else if total_up > span {
-                          detent_way.put(1.0)
-                          let over_d = total_up - span
-                          drag_y.put(-(over_d * ovl_sheet_overpull_max / (over_d + ovl_sheet_overpull_max * 2.0)))
-                        } else {
-                          detent_way.put(0.0)
-                          drag_y.put(-total_up)
-                        }
-                      }
-                    }
-                    Up | Off => {
-                      let vy = d.vy()
-                      let cur_dy = drag_y.value_at(d.at)
-                      let cur_det = if detents { detent_way.value_at(d.at) } else { 0.0 }
-                      let is_up = match d.kind { Up => true; _ => false }
-                      let can_close = is_up &&
-                      cur_det < 0.15 &&
-                      (cur_dy > ovl_sheet_drag_dismiss || vy > ovl_sheet_drag_vel) &&
-                      vy >= -ovl_sheet_drag_vel
-                      if can_close {
-                        drag_y.go(card, 320.0, motion::move_damped, velocity=vy)
-                        dlg.close()
-                      } else {
-                        drag_y.go(card, 0.0, motion::move_damped, velocity=vy)
-                        if detents {
-                          let next = if vy <= -ovl_sheet_drag_vel {
-                            true
-                          } else if vy >= ovl_sheet_drag_vel {
-                            false
-                          } else {
-                            cur_det >= 0.45
-                          }
-                          exp_state.set(next)
-                          on_expanded(next)
-                          detent_way.go(card, if next { 1.0 } else { 0.0 }, motion::move_damped)
-                        }
-                      }
-                    }
-                  }
-                },
-              )
-              // Header row: title + optional subtitle + X/Y symmetric concentric close button
-              // (floating r=28pt -> 12pt top & 12pt right; docked r=24pt -> 8pt top & 8pt right; 16pt + pad == top_r).
-              let _ = handle.box(fn(hdr : view::View) -> Unit {
-                let _ = hdr
-                .row(view::Live::Is(true))
-                .lines_up(view::Live::Is(Some(view::Along::Start)))
-                .lies_along(view::Live::Is(view::Lies::Between))
-                .gap(view::Live::Is(ovl_sheet_gap))
-                .padding(view::Live::By(fn() {
-                  let corner_pad = lerp(ovl_sheet_hdr_pr, ovl_sheet_hdr_pr_expanded, dock_t(hdr))
-                  (ovl_sheet_pad, corner_pad, corner_pad, ovl_sheet_gap)
-                }))
-                let _ = hdr.box(fn(titles : view::View) -> Unit {
-                  // Top clearance keeps the title comfortably below the overlaid top-center grabber capsule.
-                  let _ = titles.grow(view::Live::Is(1.0)).gap(view::Live::Is(ovl_text_gap)).padding(view::Live::Is((0.0, 12.0, 0.0, 0.0)))
-                  let _ = titles.box(fn(w : view::View) -> Unit {
-                    let _ = w
-                    .words(view::Live::By(title), look=words_at(ovl_type_title, weight=ovl_weight_semibold, wrap=true))
-                    .ink(view::Live::By(fn() { colors().content }))
+            // Interactive grabber + header drag handle delegated to `headless::drawer`
+            let _ = dr.handle(
+              card,
+              extent_by=fn() -> Double {
+                if detents {
+                  let wh = s.window_h()
+                  if wh > 0.0 { wh } else { max_height }
+                } else {
+                  320.0
+                }
+              },
+              slop=ui::touch_slop(),
+              loc=loc,
+              fn(handle : view::View, _d : headless::Drawer) -> Unit {
+                // Header row: title + optional subtitle + X/Y symmetric concentric close button
+                // (floating r=28pt -> 12pt top & 12pt right; docked r=24pt -> 8pt top & 8pt right; 16pt + pad == top_r).
+                let _ = handle.box(fn(hdr : view::View) -> Unit {
+                  let _ = hdr
+                  .row(view::Live::Is(true))
+                  .lines_up(view::Live::Is(Some(view::Along::Start)))
+                  .lies_along(view::Live::Is(view::Lies::Between))
+                  .gap(view::Live::Is(ovl_sheet_gap))
+                  .padding(view::Live::By(fn() {
+                    let corner_pad = lerp(ovl_sheet_hdr_pr, ovl_sheet_hdr_pr_expanded, dock_t(hdr))
+                    (ovl_sheet_pad, corner_pad, corner_pad, ovl_sheet_gap)
+                  }))
+                  let _ = hdr.box(fn(titles : view::View) -> Unit {
+                    // Top clearance keeps the title comfortably below the overlaid top-center grabber capsule.
+                    let _ = titles.grow(view::Live::Is(1.0)).gap(view::Live::Is(ovl_text_gap)).padding(view::Live::Is((0.0, 12.0, 0.0, 0.0)))
+                    let _ = titles.box(fn(w : view::View) -> Unit {
+                      let _ = w
+                      .words(view::Live::By(title), look=words_at(ovl_type_title, weight=ovl_weight_semibold, wrap=true))
+                      .ink(view::Live::By(fn() { colors().content }))
+                    })
+                    titles.show(fn() { subtitle() != "" }, fn(sub : view::View) -> Unit {
+                      let _ = sub
+                      .words(view::Live::By(subtitle), look=words_at(ovl_type_sub, wrap=true))
+                      .ink(view::Live::By(ovl_muted_ink))
+                    })
                   })
-                  titles.show(fn() { subtitle() != "" }, fn(sub : view::View) -> Unit {
-                    let _ = sub
-                    .words(view::Live::By(subtitle), look=words_at(ovl_type_sub, wrap=true))
-                    .ink(view::Live::By(ovl_muted_ink))
-                  })
-                })
-                let _ = headless::button(hdr, fn() { "Close" }, fn(_e) -> Unit { dlg.close() }, loc=loc, fn(btn_v : view::View, btn : headless::Button) -> Unit {
-                  let _ = btn_v
-                  .width(view::Live::Is(Some(36.0)))
-                  .height(view::Live::Is(Some(36.0)))
-                  .margin(view::Live::Is((-3.0, -3.0, -3.0, -3.0)))
-                  .shrink(view::Live::Is(0.0))
-                  .radius(view::Live::Is(18.0))
-                  .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                  .lies_along(view::Live::Is(view::Lies::Middle))
-                  let hover_t = motion::hover_fade(btn_v, fn() { btn.hovered() })
-                  let press_t = motion::hover_fade(btn_v, fn() { btn.pressed() }, duration_ms=motion::pointer_tap_ms)
-                  let _ = btn_v.box(fn(pill : view::View) -> Unit {
-                    let _ = pill
-                    .width(view::Live::Is(Some(ovl_close_btn_size)))
-                    .height(view::Live::Is(Some(ovl_close_btn_size)))
-                    .radius(view::Live::Is(ovl_close_btn_size / 2.0))
+                  let _ = headless::button(hdr, fn() { "Close" }, fn(_e) -> Unit { dr.close() }, loc=loc, fn(btn_v : view::View, btn : headless::Button) -> Unit {
+                    let _ = btn_v
+                    .width(view::Live::Is(Some(36.0)))
+                    .height(view::Live::Is(Some(36.0)))
+                    .margin(view::Live::Is((-3.0, -3.0, -3.0, -3.0)))
+                    .shrink(view::Live::Is(0.0))
+                    .radius(view::Live::Is(18.0))
                     .lines_up(view::Live::Is(Some(view::Along::Middle)))
                     .lies_along(view::Live::Is(view::Lies::Middle))
-                    .ground(view::Live::By(fn() {
-                      let base = ovl_close_ground()
-                      let h_v = hover_t()
-                      let p_v = press_t()
-                      let with_h = if h_v > 0.001 { over(base, alpha(ovl_row_hover(), h_v)) } else { base }
-                      if p_v > 0.001 { over(with_h, alpha(ovl_row_press(), p_v)) } else { with_h }
-                    }))
-                    lg_focus_ring(pill, fn() { btn.focus_shown() }, ovl_close_btn_size / 2.0)
-                    let _ = pill.box(fn(ic : view::View) -> Unit {
-                      let _ = ic
-                      .width(view::Live::Is(Some(ovl_close_icon_size)))
-                      .height(view::Live::Is(Some(ovl_close_icon_size)))
-                      .shapes(view::Live::By(fn() { ovl_close_shapes(ovl_close_icon_size, colors().content) }))
+                    let hover_t = motion::hover_fade(btn_v, fn() { btn.hovered() })
+                    let press_t = motion::hover_fade(btn_v, fn() { btn.pressed() }, duration_ms=motion::pointer_tap_ms)
+                    let _ = btn_v.box(fn(pill : view::View) -> Unit {
+                      let _ = pill
+                      .width(view::Live::Is(Some(ovl_close_btn_size)))
+                      .height(view::Live::Is(Some(ovl_close_btn_size)))
+                      .radius(view::Live::Is(ovl_close_btn_size / 2.0))
+                      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                      .lies_along(view::Live::Is(view::Lies::Middle))
+                      .ground(view::Live::By(fn() {
+                        let base = ovl_close_ground()
+                        let h_v = hover_t()
+                        let p_v = press_t()
+                        let with_h = if h_v > 0.001 { over(base, alpha(ovl_row_hover(), h_v)) } else { base }
+                        if p_v > 0.001 { over(with_h, alpha(ovl_row_press(), p_v)) } else { with_h }
+                      }))
+                      lg_focus_ring(pill, fn() { btn.focus_shown() }, ovl_close_btn_size / 2.0)
+                      let _ = pill.box(fn(ic : view::View) -> Unit {
+                        let _ = ic
+                        .width(view::Live::Is(Some(ovl_close_icon_size)))
+                        .height(view::Live::Is(Some(ovl_close_icon_size)))
+                        .shapes(view::Live::By(fn() { ovl_close_shapes(ovl_close_icon_size, colors().content) }))
+                      })
                     })
                   })
                 })
-              })
-              // Top-center drag-indicator capsule overlaid at top edge so it never pushes the close button downward.
-              let _ = handle.box(fn(grab_wrap : view::View) -> Unit {
-                let _ = grab_wrap
-                .over(view::Live::Is(true))
-                .points(view::Live::Is(false))
-                .lies_along(view::Live::Is(view::Lies::Start))
-                .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                if detents {
-                  let _ = headless::button(
-                    grab_wrap,
-                    fn() { if exp_state.get() { "Collapse Sheet" } else { "Expand Sheet" } },
-                    fn(_e) -> Unit { toggle_detent() },
-                    loc=loc,
-                    fn(gb : view::View, btn : headless::Button) -> Unit {
-                      let _ = gb
-                      .width(view::Live::Is(Some(64.0)))
-                      .height(view::Live::Is(Some(24.0)))
-                      .radius(view::Live::Is(12.0))
-                      .lines_up(view::Live::Is(Some(view::Along::Middle)))
-                      .lies_along(view::Live::Is(view::Lies::Middle))
-                      lg_focus_ring(gb, fn() { btn.focus_shown() }, 12.0)
-                      let _ = gb.box(fn(grab : view::View) -> Unit {
+                // Top-center drag-indicator capsule overlaid at top edge so it never pushes the close button downward.
+                let _ = handle.box(fn(grab_wrap : view::View) -> Unit {
+                  let _ = grab_wrap
+                  .over(view::Live::Is(true))
+                  .points(view::Live::Is(false))
+                  .lies_along(view::Live::Is(view::Lies::Start))
+                  .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                  if detents {
+                    let _ = headless::button(
+                      grab_wrap,
+                      fn() { if exp_state.get() { "Collapse Sheet" } else { "Expand Sheet" } },
+                      fn(_e) -> Unit { toggle_detent() },
+                      loc=loc,
+                      fn(gb : view::View, btn : headless::Button) -> Unit {
+                        let _ = gb
+                        .width(view::Live::Is(Some(64.0)))
+                        .height(view::Live::Is(Some(24.0)))
+                        .radius(view::Live::Is(12.0))
+                        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                        .lies_along(view::Live::Is(view::Lies::Middle))
+                        lg_focus_ring(gb, fn() { btn.focus_shown() }, 12.0)
+                        let _ = gb.box(fn(grab : view::View) -> Unit {
+                          let _ = grab
+                          .width(view::Live::Is(Some(ovl_sheet_grabber_w)))
+                          .height(view::Live::Is(Some(ovl_sheet_grabber_h)))
+                          .radius(view::Live::Is(ovl_sheet_grabber_h / 2.0))
+                          .ground(view::Live::By(ovl_grabber_color))
+                        })
+                      },
+                    )
+                  } else {
+                    let _ = grab_wrap.box(fn(grab_slot : view::View) -> Unit {
+                      let _ = grab_slot.padding(view::Live::Is((0.0, 8.0, 0.0, 0.0)))
+                      let _ = grab_slot.box(fn(grab : view::View) -> Unit {
                         let _ = grab
                         .width(view::Live::Is(Some(ovl_sheet_grabber_w)))
                         .height(view::Live::Is(Some(ovl_sheet_grabber_h)))
                         .radius(view::Live::Is(ovl_sheet_grabber_h / 2.0))
                         .ground(view::Live::By(ovl_grabber_color))
                       })
-                    },
-                  )
-                } else {
-                  let _ = grab_wrap.box(fn(grab_slot : view::View) -> Unit {
-                    let _ = grab_slot.padding(view::Live::Is((0.0, 8.0, 0.0, 0.0)))
-                    let _ = grab_slot.box(fn(grab : view::View) -> Unit {
-                      let _ = grab
-                      .width(view::Live::Is(Some(ovl_sheet_grabber_w)))
-                      .height(view::Live::Is(Some(ovl_sheet_grabber_h)))
-                      .radius(view::Live::Is(ovl_sheet_grabber_h / 2.0))
-                      .ground(view::Live::By(ovl_grabber_color))
                     })
-                  })
-                }
-              })
-            })
+                  }
+                })
+              },
+            )
             // Body slot (grows and clips cleanly when `detents=true` expands/contracts)
             let _ = card.box(fn(b : view::View) -> Unit {
               if detents {
