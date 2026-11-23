@@ -1,0 +1,509 @@
+// Tree control: tri-state cascade checking, expand/collapse navigation (with RTL),
+// collapse focus recovery, roving focus, typeahead, and selection model.
+
+import "signals"
+import "view"
+
+/// Tri-state checkbox value for tree nodes.
+#derive(Eq)
+pub enum TreeCheckState {
+  Unchecked
+  Checked
+  Indeterminate
+}
+
+/// Strategy for computing and toggling checked states across parent/child tree nodes.
+#derive(Eq)
+pub enum TreeCheckStrategy {
+  Independent
+  Cascade
+}
+
+/// Minimal structural descriptor of a tree node for pure tri-state check calculations.
+pub struct TreeNodeSpec[K] {
+  pub key : K
+  pub parent : Option[K]
+  pub disabled : Bool
+}
+
+pub fn TreeNodeSpec::new[K](
+  key : K,
+  parent? : K,
+  disabled~ : Bool = false,
+) -> TreeNodeSpec[K] {
+  TreeNodeSpec::{ key, parent, disabled }
+}
+
+fn tree_contains_key[K : view::ViewEq](arr : Array[K], target : K) -> Bool {
+  for x in arr {
+    if x.eq(target) {
+      return true
+    }
+  }
+  false
+}
+
+fn tree_children_of[K : view::ViewEq](nodes : Array[TreeNodeSpec[K]], parent_key : K) -> Array[TreeNodeSpec[K]] {
+  let out : Array[TreeNodeSpec[K]] = []
+  for n in nodes {
+    match n.parent {
+      Some(p) => if p.eq(parent_key) { out.push(n) }
+      None => ()
+    }
+  }
+  out
+}
+
+fn tree_state_of_node[K : view::ViewEq](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  key : K,
+  depth : Int,
+) -> TreeCheckState {
+  if depth > 64 {
+    return if tree_contains_key(checked, key) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
+  }
+  let kids = tree_children_of(nodes, key)
+  if kids.length() == 0 {
+    return if tree_contains_key(checked, key) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
+  }
+  let mut any_checked = false
+  let mut any_unchecked = false
+  let mut any_indet = false
+  for k in kids {
+    match tree_state_of_node(nodes, checked, k.key, depth + 1) {
+      Checked => any_checked = true
+      Unchecked => any_unchecked = true
+      Indeterminate => any_indet = true
+    }
+  }
+  if any_indet || (any_checked && any_unchecked) {
+    TreeCheckState::Indeterminate
+  } else if any_checked {
+    TreeCheckState::Checked
+  } else {
+    TreeCheckState::Unchecked
+  }
+}
+
+/// Compute tri-state check status for every node in `nodes`.
+pub fn tree_checked_states[K : view::ViewEq](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
+) -> Array[(K, TreeCheckState)] {
+  let out : Array[(K, TreeCheckState)] = []
+  for n in nodes {
+    let st = match strategy {
+      Independent =>
+        if tree_contains_key(checked, n.key) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
+      Cascade => tree_state_of_node(nodes, checked, n.key, 0)
+    }
+    out.push((n.key, st))
+  }
+  out
+}
+
+fn tree_collect_descendants[K : view::ViewEq](
+  nodes : Array[TreeNodeSpec[K]],
+  key : K,
+  out : Array[K],
+  depth : Int,
+) -> Unit {
+  if depth > 64 {
+    return
+  }
+  for k in tree_children_of(nodes, key) {
+    if !k.disabled {
+      out.push(k.key)
+    }
+    tree_collect_descendants(nodes, k.key, out, depth + 1)
+  }
+}
+
+/// Toggle `target` in `checked` according to `strategy`, returning the updated checked key list.
+pub fn toggle_tree_check[K : view::ViewEq](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  target : K,
+  strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
+) -> Array[K] {
+  match view::array_find_first(nodes, fn(n : TreeNodeSpec[K]) -> Bool { n.key.eq(target) }) {
+    Some(spec) => if spec.disabled { return checked.copy() }
+    None => ()
+  }
+  match strategy {
+    Independent => {
+      let next : Array[K] = []
+      let mut found = false
+      for k in checked {
+        if k.eq(target) {
+          found = true
+        } else {
+          next.push(k)
+        }
+      }
+      if !found {
+        next.push(target)
+      }
+      next
+    }
+    Cascade => {
+      let cur_state = tree_state_of_node(nodes, checked, target, 0)
+      let turn_on = cur_state != TreeCheckState::Checked
+      let affected : Array[K] = [target]
+      tree_collect_descendants(nodes, target, affected, 0)
+      let next : Array[K] = []
+      for k in checked {
+        if !tree_contains_key(affected, k) {
+          next.push(k)
+        }
+      }
+      if turn_on {
+        for k in affected {
+          if !tree_contains_key(next, k) {
+            next.push(k)
+          }
+        }
+      }
+      // Reconcile ancestors bottom-up so parent keys reflect full child coverage.
+      let mut cur_opt : Option[K] = Some(target)
+      let mut guard_steps = 0
+      while guard_steps < 64 {
+        guard_steps += 1
+        let cur_k = match cur_opt {
+          Some(k) => k
+          None => break
+        }
+        let parent_opt : Option[K] = match view::array_find_first(nodes, fn(n : TreeNodeSpec[K]) -> Bool { n.key.eq(cur_k) }) {
+          Some(sp) => sp.parent
+          None => None
+        }
+        match parent_opt {
+          Some(pk) => {
+            let p_state = tree_state_of_node(nodes, next, pk, 0)
+            let has_pk = tree_contains_key(next, pk)
+            if p_state == TreeCheckState::Checked && !has_pk {
+              next.push(pk)
+            } else if p_state != TreeCheckState::Checked && has_pk {
+              view::array_retain(next, fn(x : K) -> Bool { !x.eq(pk) })
+            }
+            cur_opt = Some(pk)
+          }
+          None => break
+        }
+      }
+      next
+    }
+  }
+}
+
+struct TreeEntry[K] {
+  node : view::View
+  key : K
+  parent_key : Option[K]
+  has_children : () -> Bool
+  text : () -> String
+  off : () -> Bool
+}
+
+/// Tree controller handed to its look to register items via `Tree::item`.
+pub struct Tree[K] {
+  is_selected : (K) -> Bool
+  on_select : (Array[K]) -> Unit
+  is_expanded : (K) -> Bool
+  on_expand : (K, Bool) -> Unit
+  rtl : Bool
+  off : () -> Bool
+  focus : RovingFocus
+  ta : Typeahead
+  sel : SelectionModel[K]
+  entries : Array[TreeEntry[K]]
+  current_selection : () -> Array[K]
+}
+
+/// Per-item reactive state handed to `Tree::item`'s look.
+pub struct TreeItem {
+  node : view::View
+  sel : () -> Bool
+  exp : () -> Bool
+  branch : () -> Bool
+  off : () -> Bool
+  level_ : Int
+}
+
+pub fn TreeItem::selected(self : TreeItem) -> Bool {
+  (self.sel)()
+}
+
+pub fn TreeItem::expanded(self : TreeItem) -> Bool {
+  (self.exp)()
+}
+
+pub fn TreeItem::has_children(self : TreeItem) -> Bool {
+  (self.branch)()
+}
+
+pub fn TreeItem::disabled(self : TreeItem) -> Bool {
+  (self.off)()
+}
+
+pub fn TreeItem::level(self : TreeItem) -> Int {
+  self.level_
+}
+
+pub fn TreeItem::focused(self : TreeItem) -> Bool {
+  self.node.focused()
+}
+
+pub fn TreeItem::focus_shown(self : TreeItem) -> Bool {
+  self.node.focus_shown()
+}
+
+pub fn TreeItem::hovered(self : TreeItem) -> Bool {
+  self.node.pointed()
+}
+
+pub fn TreeItem::pressed(self : TreeItem) -> Bool {
+  self.node.pressed()
+}
+
+pub fn Tree::disabled[K](self : Tree[K]) -> Bool {
+  (self.off)()
+}
+
+pub fn Tree::focus_stop[K](self : Tree[K], visible~ : Bool = true) -> Bool {
+  self.focus.focus_stop(visible=visible)
+}
+
+fn Tree::live_entries[K](self : Tree[K]) -> Array[TreeEntry[K]] {
+  view::array_filter(self.entries, fn(e : TreeEntry[K]) -> Bool {
+    e.node.alive() && !e.node.leaving() && e.node.takes_input() && !(e.off)()
+  })
+}
+
+fn Tree::is_descendant_of[K : view::ViewEq](self : Tree[K], key : K, ancestor : K) -> Bool {
+  let mut cur : Option[K] = Some(key)
+  let mut steps = 0
+  while steps < 64 {
+    steps += 1
+    let k = match cur {
+      Some(x) => x
+      None => return false
+    }
+    match view::array_find_first(self.entries, fn(e : TreeEntry[K]) -> Bool { e.key.eq(k) }) {
+      Some(e) =>
+        match e.parent_key {
+          Some(pk) => {
+            if pk.eq(ancestor) {
+              return true
+            }
+            cur = Some(pk)
+          }
+          None => return false
+        }
+      None => return false
+    }
+  }
+  false
+}
+
+/// Mount a headless tree container in `parent` (using `Role::Listbox` + `Role::Option`).
+pub fn tree[K : view::ViewEq](
+  parent : view::View,
+  label : () -> String,
+  is_selected : (K) -> Bool,
+  on_select : (Array[K]) -> Unit,
+  is_expanded : (K) -> Bool,
+  on_expand : (K, Bool) -> Unit,
+  look : (view::View, Tree[K]) -> Unit,
+  current_selection? : () -> Array[K],
+  multiple~ : Bool = false,
+  wraps~ : Bool = false,
+  rtl~ : Bool = false,
+  typeahead_ms~ : Double = 500.0,
+  disabled~ : () -> Bool = fn() { false },
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let cur_sel_fn : () -> Array[K] = match current_selection {
+    Some(f) => f
+    None => fn() -> Array[K] { [] }
+  }
+  let tr : Tree[K] = Tree::{
+    is_selected,
+    on_select,
+    is_expanded,
+    on_expand,
+    rtl,
+    off: disabled,
+    focus: RovingFocus::new(axis=GroupAxis::Vertical, roving=true, wraps=wraps),
+    ta: Typeahead::new(window_ms=typeahead_ms),
+    sel: SelectionModel::new(multiple=multiple),
+    entries: [],
+    current_selection: cur_sel_fn,
+  }
+  parent.box(fn(v : view::View) {
+    look(v, tr)
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Listbox, label=label())) }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if disabled() || !focus_in(v, false) {
+          return false
+        }
+        let expand_key = if rtl { group_key_left } else { group_key_right }
+        let collapse_key = if rtl { group_key_right } else { group_key_left }
+        let live = tr.live_entries()
+        if k.mods == 0 && (k.code == expand_key || k.code == collapse_key) {
+          match view::array_find_first(live, fn(e : TreeEntry[K]) -> Bool { e.node.focused() }) {
+            Some(cur) => {
+              if k.code == expand_key {
+                if (cur.has_children)() {
+                  if !signals::untracked(fn() -> Bool { is_expanded(cur.key) }) {
+                    on_expand(cur.key, true)
+                    return true
+                  }
+                  // Already expanded -> move focus to first live child.
+                  match view::array_find_first(live, fn(c : TreeEntry[K]) -> Bool {
+                    match c.parent_key {
+                      Some(pk) => pk.eq(cur.key)
+                      None => false
+                    }
+                  }) {
+                    Some(first_child) => {
+                      let _ = first_child.node.ask_focus(visible=true)
+                      return true
+                    }
+                    None => return false
+                  }
+                }
+                return false
+              } else {
+                // Collapse key
+                if (cur.has_children)() && signals::untracked(fn() -> Bool { is_expanded(cur.key) }) {
+                  on_expand(cur.key, false)
+                  return true
+                }
+                match cur.parent_key {
+                  Some(pk) =>
+                    match view::array_find_first(live, fn(p : TreeEntry[K]) -> Bool { p.key.eq(pk) }) {
+                      Some(p_entry) => {
+                        let _ = p_entry.node.ask_focus(visible=true)
+                        return true
+                      }
+                      None => return false
+                    }
+                  None => return false
+                }
+              }
+            }
+            None => return false
+          }
+        }
+        // Shift+Up/Down/Home/End range select in multiple mode.
+        if multiple &&
+          k.mods == shift_mod &&
+          (k.code == group_key_up || k.code == group_key_down || k.code == group_key_home || k.code == group_key_end) {
+          if tr.sel.anchor() is None {
+            match view::array_find_first(live, fn(e : TreeEntry[K]) -> Bool { e.node.focused() }) {
+              Some(cur) => tr.sel.set_anchor(Some(cur.key))
+              None => ()
+            }
+          }
+          match tr.focus.step(k.code) {
+            Some(next_node) => {
+              match view::array_find_first(live, fn(e : TreeEntry[K]) -> Bool { e.node.id() == next_node.id() }) {
+                Some(target) => {
+                  let order = view::array_map(live, fn(e : TreeEntry[K]) -> K { e.key })
+                  on_select(tr.sel.select_range(order, target.key))
+                  return true
+                }
+                None => return false
+              }
+            }
+            None => return false
+          }
+        }
+        if k.mods == 0 && tr.focus.step(k.code) is Some(_) {
+          return true
+        }
+        let nodes = view::array_map(live, fn(e : TreeEntry[K]) -> view::View { e.node })
+        tr.ta.handle_key(k, nodes, fn(i : Int) -> String { (live[i].text)() })
+      })
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// Register a tree item node in `parent`.
+pub fn Tree::item[K : view::ViewEq](
+  self : Tree[K],
+  parent : view::View,
+  key : K,
+  label : () -> String,
+  look : (view::View, TreeItem) -> Unit,
+  parent_key? : K,
+  has_children~ : () -> Bool = fn() { false },
+  level~ : Int = 1,
+  text? : () -> String,
+  check? : () -> TreeCheckState,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let sel_fn = fn() -> Bool { (self.is_selected)(key) }
+    let exp_fn = fn() -> Bool { (self.is_expanded)(key) }
+    let text_fn : () -> String = match text {
+      Some(t) => t
+      None => label
+    }
+    self.entries.push(TreeEntry::{ node: v, key, parent_key, has_children, text: text_fn, off })
+    let _ = v.owns(fn() {
+      view::array_retain(self.entries, fn(e : TreeEntry[K]) -> Bool { e.node.id() != v.id() })
+    })
+    // When this branch collapses while focus is on any of its descendants, reclaim focus onto `v`.
+    v.reacts(exp_fn, fn(open : Bool) {
+      if !open && !signals::untracked(off) && v.alive() && !v.leaving() && v.takes_input() {
+        let desc_focused = view::array_any(self.entries, fn(e : TreeEntry[K]) -> Bool {
+          e.node.alive() && e.node.focused() && self.is_descendant_of(e.key, key)
+        })
+        if desc_focused {
+          let _ = v.ask_focus(visible=true)
+        }
+      }
+    }, at_start=false)
+    look(v, TreeItem::{ node: v, sel: sel_fn, exp: exp_fn, branch: has_children, off, level_: level })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space, tab=false)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        let chk_opt : Option[view::Check] = match check {
+          Some(cf) =>
+            match cf() {
+              Unchecked => Some(view::Check::Off)
+              Checked => Some(view::Check::On)
+              Indeterminate => Some(view::Check::Mixed)
+            }
+          None => None
+        }
+        let exp_opt : Option[Bool] = if has_children() { Some(exp_fn()) } else { None }
+        Some(view::said(view::Role::Option, label=label(), selected=sel_fn(), expanded?=exp_opt, check?=chk_opt))
+      }))
+      .on_press(fn() {
+        if !off() {
+          let cur = signals::untracked(self.current_selection)
+          let next = self.sel.toggle(cur, key)
+          (self.on_select)(next)
+        }
+      })
+    self.focus.add(v, off=off, first=sel_fn)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

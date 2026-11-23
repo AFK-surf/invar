@@ -1,0 +1,637 @@
+// Comprehensive pure-Pion unit tests for Wave 2 headless primitives (10 modules)
+// plus FocusRecovery whole-container unmount hardening and zero-draw invariants.
+
+import "dmath"
+import "signals"
+import "view"
+
+fn opt_str_is(o : Option[String], expected : String) -> Bool {
+  match o {
+    Some(s) => s == expected
+    None => false
+  }
+}
+
+fn opt_str_eq(a : Option[String], b : Option[String]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+fn str_arr_eq(a : Array[String], b : Array[String]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+test "p1-00 FocusRecovery whole-container unmount does not steal focus, single-item unmount still recovers" {
+  let show_menu = signals::signal(true)
+  let show_item2 = signals::signal(true)
+  let outer_btn : view::Ref[Option[view::View]] = view::ref_new(None)
+  let item1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let item2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let item3 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let rf = RovingFocus::new(axis=GroupAxis::Vertical, roving=true, wraps=true)
+
+  let tree = make_tree(fn(root : view::View) {
+    outer_btn.v = Some(root.box(fn(v : view::View) {
+      let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+    }))
+    root.show(fn() -> Bool { show_menu.get() }, fn(container : view::View) {
+      let n1 = container.box(fn(v : view::View) {
+        let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+      })
+      rf.add(n1)
+      item1.v = Some(n1)
+      container.show(fn() -> Bool { show_item2.get() }, fn(s : view::View) {
+        let n2 = s.box(fn(v : view::View) {
+          let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+        })
+        rf.add(n2)
+        item2.v = Some(n2)
+      }, at_once=true)
+      let n3 = container.box(fn(v : view::View) {
+        let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+      })
+      rf.add(n3)
+      item3.v = Some(n3)
+    }, at_once=true)
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let n2 = match item2.v { Some(x) => x; None => panic("n2") }
+  let n3 = match item3.v { Some(x) => x; None => panic("n3") }
+  let outer = match outer_btn.v { Some(x) => x; None => panic("outer") }
+
+  // 1) Single-item unmount hands focus to surviving neighbor n3.
+  assert(n2.ask_focus(visible=true) && n2.focused(), "focus n2")
+  show_item2.set(false)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  assert(n3.focused(), "single-item removal hands focus to n3")
+
+  // 2) Whole-container unmount must NOT let sibling n1 steal focus during teardown.
+  show_menu.set(false)
+  let _ = outer.ask_focus(visible=true)
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  assert(outer.focused(), "whole-container unmount preserves outer focus without stealing")
+  let n1 = match item1.v { Some(x) => x; None => panic("n1") }
+  assert(!n1.alive() && !n1.focused(), "unmounted sibling n1 is not focused")
+  tree.dispose()
+}
+
+test "p1-01 Reorder keyboard/drag, reorder_apply, edge_scroll_speed, and Transfer RTL" {
+  // Pure helpers
+  let moved = reorder_apply(["a", "b", "c", "d"], 1, 3)
+  assert(moved.length() == 4 && moved[0] == "a" && moved[1] == "c" && moved[2] == "d" && moved[3] == "b", "reorder_apply forward")
+  let moved_back = reorder_apply(["a", "b", "c", "d"], 3, 0)
+  assert(moved_back[0] == "d" && moved_back[1] == "a", "reorder_apply backward")
+  assert(edge_scroll_speed(10.0, 0.0, 300.0, zone=50.0, max_speed=500.0) < 0.0, "edge_scroll_speed near start negative")
+  assert(edge_scroll_speed(150.0, 0.0, 300.0, zone=50.0, max_speed=500.0) == 0.0, "edge_scroll_speed interior zero")
+  assert(edge_scroll_speed(290.0, 0.0, 300.0, zone=50.0, max_speed=500.0) > 0.0, "edge_scroll_speed near end positive")
+
+  // Keyboard Reorder
+  let items = signals::signal_by(["a", "b", "c"], str_arr_eq)
+  let cancels = view::ref_new(0)
+  let r_ref : view::Ref[Option[Reorder[String]]] = view::ref_new(None)
+  let na : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = reorder(
+      root,
+      fn() -> String { "Tasks" },
+      fn() -> Array[String] { items.get() },
+      fn(from : Int, to : Int) { items.set(reorder_apply(items.untracked(), from, to)) },
+      fn(v : view::View, r : Reorder[String]) {
+        r_ref.v = Some(r)
+        na.v = Some(r.item(v, "a", fn() -> String { "A" }, fn(_n : view::View, _it : ReorderItem) { () }))
+        let _ = r.item(v, "b", fn() -> String { "B" }, fn(_n : view::View, _it : ReorderItem) { () })
+        let _ = r.item(v, "c", fn() -> String { "C" }, fn(_n : view::View, _it : ReorderItem) { () })
+      },
+      on_cancel=fn() { cancels.v = cancels.v + 1 },
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let r = match r_ref.v { Some(x) => x; None => panic("r") }
+  let a_node = match na.v { Some(x) => x; None => panic("na") }
+
+  assert(a_node.ask_focus(visible=true), "focus a")
+  // Space grabs, End moves to 2, Space commits -> ["b", "c", "a"]
+  assert(tree.key_at(1032, 0, 16.0) && r.grabbed(), "Space grabs a")
+  assert(tree.key_at(9, 0, 32.0), "End moves draft to end")
+  match r.draft() {
+    Some(d) => assert(d.from == 0 && d.to == 2, "draft at 0 -> 2")
+    None => panic("missing draft")
+  }
+  assert(tree.key_at(1032, 0, 48.0) && !r.grabbed(), "Space commits")
+  let cur = items.get()
+  assert(cur[0] == "b" && cur[1] == "c" && cur[2] == "a", "reordered to b, c, a")
+
+  // Grab + Down + Escape cancels without mutating
+  assert(tree.key_at(1032, 0, 64.0) && r.grabbed(), "re-grab")
+  assert(tree.key_at(17, 0, 80.0) && !r.grabbed() && cancels.v == 1, "Escape cancels reorder")
+  tree.dispose()
+
+  // Cross-column Transfer (RTL: Left moves to next column)
+  let commits : Array[(String, Int, String, Int)] = []
+  let board = Transfer::new(
+    fn() -> Array[String] { ["todo", "doing", "done"] },
+    fn(col : String) -> Array[String] {
+      if col == "todo" { ["t1", "t2"] } else if col == "doing" { ["t3"] } else { [] }
+    },
+    fn(fc : String, fi : Int, tc : String, ti : Int) { commits.push((fc, fi, tc, ti)) },
+    rtl=true,
+  )
+  let t1_node : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree2 = make_tree(fn(root : view::View) {
+    let _ = board.column(root, "todo", fn() -> String { "Todo" }, fn(v : view::View, c : TransferColumn[String, String]) {
+      t1_node.v = Some(c.item(v, "t1", fn() -> String { "T1" }, fn(_n : view::View, _it : ReorderItem) { () }))
+      let _ = c.item(v, "t2", fn() -> String { "T2" }, fn(_n : view::View, _it : ReorderItem) { () })
+    })
+    let _ = board.column(root, "doing", fn() -> String { "Doing" }, fn(v : view::View, c : TransferColumn[String, String]) {
+      let _ = c.item(v, "t3", fn() -> String { "T3" }, fn(_n : view::View, _it : ReorderItem) { () })
+    })
+  })
+  let _ = tree2.frame(400.0, 200.0, now=0.0)
+  let tn = match t1_node.v { Some(x) => x; None => panic("t1") }
+  assert(tn.ask_focus(visible=true), "focus t1")
+  assert(tree2.key_at(1032, 0, 16.0) && board.grabbed(), "Space grabs t1")
+  assert(tree2.key_at(3, 0, 32.0), "RTL Left moves todo -> doing")
+  assert(tree2.key_at(7, 0, 48.0) && !board.grabbed(), "Enter commits cross-column transfer")
+  assert(commits.length() == 1 && commits[0].0 == "todo" && commits[0].2 == "doing", "transfer committed todo -> doing")
+  tree2.dispose()
+}
+
+test "p1-02 Tree tri-state cascade checks, RTL expand/collapse, collapse focus recovery, and typeahead" {
+  let specs = [
+    TreeNodeSpec::new("root"),
+    TreeNodeSpec::new("a", parent="root"),
+    TreeNodeSpec::new("b", parent="root"),
+  ]
+  let checked1 = toggle_tree_check(specs, [], "a", strategy=TreeCheckStrategy::Cascade)
+  let states1 = tree_checked_states(specs, checked1, strategy=TreeCheckStrategy::Cascade)
+  assert(states1[0].1 == TreeCheckState::Indeterminate, "parent indeterminate when 1/2 children checked")
+  assert(states1[1].1 == TreeCheckState::Checked && states1[2].1 == TreeCheckState::Unchecked, "a checked, b unchecked")
+
+  let checked2 = toggle_tree_check(specs, checked1, "b", strategy=TreeCheckStrategy::Cascade)
+  let states2 = tree_checked_states(specs, checked2, strategy=TreeCheckStrategy::Cascade)
+  assert(states2[0].1 == TreeCheckState::Checked, "parent checked when all children checked")
+
+  let checked3 = toggle_tree_check(specs, checked2, "root", strategy=TreeCheckStrategy::Cascade)
+  let states3 = tree_checked_states(specs, checked3, strategy=TreeCheckStrategy::Cascade)
+  assert(states3[0].1 == TreeCheckState::Unchecked && states3[1].1 == TreeCheckState::Unchecked && states3[2].1 == TreeCheckState::Unchecked, "toggling checked parent unchecks subtree")
+
+  // Interactive Tree with expand/collapse + collapse focus recovery
+  let expanded = signals::signal(false)
+  let selected = signals::signal_by(["root"], str_arr_eq)
+  let root_item : view::Ref[Option[view::View]] = view::ref_new(None)
+  let child_item : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tbox_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let t = make_tree(fn(root : view::View) {
+    tbox_ref.v = Some(tree(
+      root,
+      fn() -> String { "Files" },
+      fn(k : String) -> Bool { str_array_contains(selected.get(), k) },
+      fn(next : Array[String]) { selected.set(next) },
+      fn(k : String) -> Bool { k == "root" && expanded.get() },
+      fn(k : String, open : Bool) { if k == "root" { expanded.set(open) } },
+      fn(v : view::View, tr : Tree[String]) {
+        root_item.v = Some(tr.item(
+          v,
+          "root",
+          fn() -> String { "src" },
+          fn(_n : view::View, _it : TreeItem) { () },
+          has_children=fn() -> Bool { true },
+        ))
+        v.show(fn() -> Bool { expanded.get() }, fn(s : view::View) {
+          child_item.v = Some(tr.item(
+            s,
+            "child",
+            fn() -> String { "main.pion" },
+            fn(_n : view::View, _it : TreeItem) { () },
+            parent_key="root",
+            level=2,
+          ))
+        }, at_once=true)
+      },
+      current_selection=fn() -> Array[String] { selected.get() },
+    ))
+  })
+  let _ = t.frame(300.0, 200.0, now=0.0)
+  let tb = match tbox_ref.v { Some(x) => x; None => panic("tb") }
+  let ri = match root_item.v { Some(x) => x; None => panic("ri") }
+
+  match said_of(t, tb.id()) {
+    Some(s) => assert(s.role == view::Role::Listbox, "tree container Role::Listbox")
+    None => panic("missing tree said")
+  }
+  match said_of(t, ri.id()) {
+    Some(s) => assert(s.role == view::Role::Option && opt_bool_is(s.expanded, false), "tree item Role::Option collapsed")
+    None => panic("missing item said")
+  }
+
+  assert(ri.ask_focus(visible=true), "focus root item")
+  // Right expands root
+  assert(t.key_at(4, 0, 16.0) && expanded.get(), "Right expands root")
+  let _ = t.frame(300.0, 200.0, now=16.0)
+  // Right again enters first child
+  assert(t.key_at(4, 0, 32.0), "Right moves to first child")
+  let ci = match child_item.v { Some(x) => x; None => panic("ci") }
+  assert(ci.focused(), "child focused")
+
+  // Collapsing root while child is focused recovers focus back onto root
+  expanded.set(false)
+  let _ = t.frame(300.0, 200.0, now=48.0)
+  assert(ri.focused(), "collapse recovers focus back to parent")
+  t.dispose()
+}
+
+test "p1-03 Menubar Role::MenuBar, Down/Enter open, Left/Right & hover hot-switch, Escape focus return" {
+  let open_menu : signals::Signal[Option[String]] = signals::signal_by(None, opt_str_eq)
+  let mb_node : view::Ref[Option[view::View]] = view::ref_new(None)
+  let file_trig : view::Ref[Option[view::View]] = view::ref_new(None)
+  let edit_trig : view::Ref[Option[view::View]] = view::ref_new(None)
+  let first_file_item : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let t = make_tree(fn(root : view::View) {
+    mb_node.v = Some(menubar(
+      root,
+      fn() -> String { "App Menu" },
+      fn() -> Option[String] { open_menu.get() },
+      fn(k : Option[String]) { open_menu.set(k) },
+      fn(v : view::View, mb : Menubar[String]) {
+        file_trig.v = Some(mb.trigger(v, "file", fn() -> String { "File" }, fn(n : view::View, _tr : MenubarTrigger) {
+          let _ = n.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(28.0)))
+        }))
+        edit_trig.v = Some(mb.trigger(v, "edit", fn() -> String { "Edit" }, fn(n : view::View, _tr : MenubarTrigger) {
+          let _ = n.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(28.0)))
+        }))
+        root.show(fn() -> Bool { opt_str_is(open_menu.get(), "file") }, fn(s : view::View) {
+          let _ = mb.menu(s, "file", fn(mv : view::View, m : Menu) {
+            first_file_item.v = Some(m.item(mv, fn() -> String { "New" }, fn(_n : view::View) { () }, fn(_n : view::View, _mi : MenuItem) { () }))
+          })
+        }, at_once=true)
+        root.show(fn() -> Bool { opt_str_is(open_menu.get(), "edit") }, fn(s : view::View) {
+          let _ = mb.menu(s, "edit", fn(mv : view::View, m : Menu) {
+            let _ = m.item(mv, fn() -> String { "Undo" }, fn(_n : view::View) { () }, fn(_n : view::View, _mi : MenuItem) { () })
+          })
+        }, at_once=true)
+      },
+    ))
+  })
+  let _ = t.frame(400.0, 200.0, now=0.0)
+  let mbn = match mb_node.v { Some(x) => x; None => panic("mbn") }
+  let ft = match file_trig.v { Some(x) => x; None => panic("ft") }
+  let et = match edit_trig.v { Some(x) => x; None => panic("et") }
+
+  match said_of(t, mbn.id()) {
+    Some(s) => assert(s.role == view::Role::MenuBar, "Role::MenuBar")
+    None => panic("missing menubar said")
+  }
+  assert(ft.ask_focus(visible=true), "focus File trigger")
+  assert(t.key_at(6, 0, 16.0) && opt_str_is(open_menu.get(), "file"), "Down opens File menu")
+  let _ = t.frame(400.0, 200.0, now=16.0)
+  let ffi = match first_file_item.v { Some(x) => x; None => panic("ffi") }
+  assert(ffi.focused(), "Down focuses first menu item")
+
+  // Right inside open menu hot-switches to Edit
+  assert(t.key_at(4, 0, 32.0) && opt_str_is(open_menu.get(), "edit"), "Right hot-switches to Edit")
+  let _ = t.frame(400.0, 200.0, now=32.0)
+
+  // Escape closes Edit and returns focus to Edit trigger
+  assert(t.key_at(17, 0, 48.0) && open_menu.get() is None, "Escape closes menu")
+  assert(et.focused(), "Escape returns focus to Edit trigger")
+  t.dispose()
+}
+
+test "p1-04 TriggerMenu UTF-16 & Chinese detection, boundary check, apply_trigger, and keyboard nav" {
+  let rules = [TriggerRule::new("@"), TriggerRule::new("/"), TriggerRule::new("#")]
+
+  // Email must NOT trigger @
+  assert(detect_trigger("user@example.com", 16, rules) is None, "email does not trigger @")
+
+  // Chinese preceding @ MUST trigger safely
+  let cn = "你好@张三"
+  match detect_trigger(cn, cn.length(), rules) {
+    Some(m) => {
+      assert(m.trigger == "@" && m.query == "张三" && m.start == "你好".length() && m.end == cn.length(), "Chinese trigger match")
+      let (next_text, next_cur) = apply_trigger(cn, m, "@ZhangSan")
+      assert(next_text == "你好@ZhangSan " && next_cur == next_text.length(), "apply_trigger replaces Chinese query")
+    }
+    None => panic("expected Chinese @ trigger match")
+  }
+
+  // Slash command & TriggerMenu keyboard navigation
+  let applied : view::Ref[(String, Int, String)] = view::ref_new(("", 0, ""))
+  let tm : TriggerMenu[String] = TriggerMenu::new(rules, fn(nt : String, nc : Int, k : String) {
+    applied.v = (nt, nc, k)
+  })
+  let m = tm.update("/de", 3)
+  assert(m is Some(_) && tm.open(), "slash trigger opened")
+  let items = [("deploy", "/deploy"), ("debug", "/debug")]
+  assert(tm.handle_key(6, items, "/de") && tm.active_index() == 1, "Down selects second item")
+  assert(tm.handle_key(7, items, "/de") && !tm.open(), "Enter accepts selected item")
+  assert(applied.v.0 == "/debug " && applied.v.2 == "debug", "on_apply received replacement")
+}
+
+test "p1-05 InputHistory push dedup/cap, prev draft preservation, next draft restore, and reset_cursor" {
+  let h = InputHistory::new(max_entries=3, dedup_consecutive=true)
+  h.push("first")
+  h.push("first")
+  assert(h.len() == 1, "consecutive duplicate skipped")
+  h.push("second")
+  h.push("third")
+  h.push("fourth")
+  assert(h.len() == 3 && h.entries()[0] == "second", "max_entries cap drops oldest")
+
+  assert(opt_str_is(h.prev("wip draft"), "fourth"), "prev 1 -> fourth")
+  assert(opt_str_is(h.prev("ignored"), "third"), "prev 2 -> third")
+  assert(opt_str_is(h.prev("ignored"), "second"), "prev 3 -> second")
+  assert(h.prev("ignored") is None, "prev at oldest -> None")
+  assert(opt_str_is(h.next(), "third"), "next -> third")
+  assert(opt_str_is(h.next(), "fourth"), "next -> fourth")
+  assert(opt_str_is(h.next(), "wip draft"), "next past newest restores saved draft")
+  assert(!h.is_browsing() && h.next() is None, "back at live draft")
+}
+
+test "p1-06 InlineEdit preview/edit toggle, Enter commit, Escape cancel, and submit_on_blur" {
+  let title = signals::signal("Initial")
+  let cancels = view::ref_new(0)
+  let ie_ref : view::Ref[Option[InlineEdit]] = view::ref_new(None)
+  let prev_node : view::Ref[Option[view::View]] = view::ref_new(None)
+  let inp_node : view::Ref[Option[view::View]] = view::ref_new(None)
+  let other_node : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let t = make_tree(fn(root : view::View) {
+    let _ = inline_edit(
+      root,
+      fn() -> String { "Title" },
+      fn() -> String { title.get() },
+      fn(next : String) { title.set(next) },
+      fn(v : view::View, ie : InlineEdit) {
+        ie_ref.v = Some(ie)
+        v.show(fn() -> Bool { !ie.editing() }, fn(s : view::View) {
+          prev_node.v = Some(ie.preview(s, fn(_n : view::View, _h : InlineEdit) { () }))
+        }, at_once=true)
+        v.show(fn() -> Bool { ie.editing() }, fn(s : view::View) {
+          inp_node.v = Some(ie.input(s, fn(_n : view::View, _h : InlineEdit) { () }))
+        }, at_once=true)
+      },
+      on_cancel=fn() { cancels.v = cancels.v + 1 },
+      submit_on_blur=true,
+    )
+    other_node.v = Some(root.box(fn(v : view::View) {
+      let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true))
+    }))
+  })
+  let _ = t.frame(300.0, 200.0, now=0.0)
+  let ie = match ie_ref.v { Some(x) => x; None => panic("ie") }
+  let pn = match prev_node.v { Some(x) => x; None => panic("pn") }
+  let other = match other_node.v { Some(x) => x; None => panic("other") }
+
+  // Press preview -> enters edit mode & focuses input
+  assert(pn.press() && ie.editing(), "press preview starts editing")
+  let _ = t.frame(300.0, 200.0, now=16.0)
+  let inp1 = match inp_node.v { Some(x) => x; None => panic("inp1") }
+  assert(inp1.focused(), "input focused on edit start")
+
+  // Edit draft + Escape cancels, restores draft, and returns focus to preview
+  ie.set_draft("Discarded")
+  assert(t.key_at(17, 0, 32.0) && !ie.editing() && cancels.v == 1 && title.get() == "Initial", "Escape cancels")
+  let _ = t.frame(300.0, 200.0, now=32.0)
+  let pn2 = match prev_node.v { Some(x) => x; None => panic("pn2") }
+  assert(pn2.focused(), "Escape returns focus to preview")
+
+  // Re-enter edit, modify draft, Enter commits
+  ie.start()
+  let _ = t.frame(300.0, 200.0, now=48.0)
+  ie.set_draft("Committed")
+  assert(t.key_at(7, 0, 64.0) && !ie.editing() && title.get() == "Committed", "Enter commits")
+  let _ = t.frame(300.0, 200.0, now=64.0)
+
+  // Blur commits when submit_on_blur=true
+  ie.start()
+  let _ = t.frame(300.0, 200.0, now=80.0)
+  ie.set_draft("Via Blur")
+  assert(other.ask_focus(visible=true), "focus other node to blur input")
+  let _ = t.frame(300.0, 200.0, now=96.0)
+  assert(!ie.editing() && title.get() == "Via Blur", "submit_on_blur commits on blur")
+  t.dispose()
+}
+
+test "p1-07 SwipeActions axis lock slop, rubber-band damping, and snap open/close" {
+  let sa_ref : view::Ref[Option[SwipeActions]] = view::ref_new(None)
+  let sa_node_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let t = make_tree(fn(root : view::View) {
+    sa_node_ref.v = Some(swipe_actions(
+      root,
+      fn(v : view::View, sa : SwipeActions) {
+        sa_ref.v = Some(sa)
+        let _ = v.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(60.0)))
+      },
+      leading_width=80.0,
+      trailing_width=100.0,
+      slop=8.0,
+      threshold=0.4,
+      rubber_band=0.25,
+    ))
+  })
+  let _ = t.frame(300.0, 100.0, now=0.0)
+  let sa = match sa_ref.v { Some(x) => x; None => panic("sa") }
+  let sn = match sa_node_ref.v { Some(x) => x; None => panic("sn") }
+
+  // Vertical gesture locks to vertical -> offset remains 0
+  let _ = t.drag_at(sn.id(), view::DragIs::Down, 150.0, 30.0, 10.0)
+  let _ = t.drag_at(sn.id(), view::DragIs::Moved, 152.0, 50.0, 26.0)
+  let _ = t.drag_at(sn.id(), view::DragIs::Moved, 220.0, 50.0, 42.0)
+  assert(!sa.dragging() && sa.offset() == 0.0, "vertical lock ignores horizontal motion")
+  let _ = t.drag_at(sn.id(), view::DragIs::Up, 220.0, 50.0, 58.0)
+
+  // Horizontal drag right past leading_width (80) applies rubber-band damping
+  let _ = t.drag_at(sn.id(), view::DragIs::Down, 50.0, 30.0, 100.0)
+  let _ = t.drag_at(sn.id(), view::DragIs::Moved, 170.0, 30.0, 200.0) // dx = 120 -> 80 + (120 - 80) * 0.25 = 90
+  assert(sa.dragging() && dmath::abs(sa.offset() - 90.0) < 0.01, "rubber-band damped offset = 90")
+  let _ = t.drag_at(sn.id(), view::DragIs::Up, 170.0, 30.0, 260.0)
+  assert(!sa.dragging() && sa.open_side() == SwipeSide::Leading && sa.offset() == 80.0, "snapped open to Leading")
+
+  sa.close()
+  assert(sa.open_side() == SwipeSide::Closed && sa.offset() == 0.0, "programmatic close resets offset")
+  t.dispose()
+}
+
+test "p1-08 NumberInput stepping, commit_text clamping, and repeat_hold buttons across time" {
+  let num_sig = signals::signal(10.0)
+  let ni_ref : view::Ref[Option[NumberInput]] = view::ref_new(None)
+  let inp_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let inc_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let t = make_tree(fn(root : view::View) {
+    let _ = number_input(
+      root,
+      fn() -> String { "Quantity" },
+      fn() -> Double { num_sig.get() },
+      fn(next : Double) { num_sig.set(next) },
+      fn(v : view::View, ni : NumberInput) {
+        ni_ref.v = Some(ni)
+        inp_ref.v = Some(ni.input(v, fn(n : view::View, _h : NumberInput) {
+          let _ = n.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(30.0)))
+        }))
+        inc_ref.v = Some(ni.increment_button(v, fn(n : view::View, _b : Button) {
+          let _ = n.width(view::Live::Is(Some(30.0))).height(view::Live::Is(Some(30.0)))
+        }))
+        let _ = ni.decrement_button(v, fn(n : view::View, _b : Button) {
+          let _ = n.width(view::Live::Is(Some(30.0))).height(view::Live::Is(Some(30.0)))
+        })
+      },
+      min=0.0,
+      max=25.0,
+      step=0.5,
+      large_step=5.0,
+      precision=1,
+      repeat_delay_ms=200.0,
+      repeat_interval_ms=50.0,
+    )
+  })
+  let _ = t.frame(300.0, 100.0, now=0.0)
+  let ni = match ni_ref.v { Some(x) => x; None => panic("ni") }
+  let inp = match inp_ref.v { Some(x) => x; None => panic("inp") }
+  let inc_btn = match inc_ref.v { Some(x) => x; None => panic("inc") }
+
+  assert(ni.formatted() == "10.0", "precision 1 formatting")
+  assert(ni.commit_text(" 12.34 ") && dmath::abs(num_sig.get() - 12.3) < 0.001, "commit_text parses & rounds")
+  assert(ni.commit_text("999") && num_sig.get() == 25.0, "commit_text clamps to max")
+  assert(!ni.commit_text("abc"), "invalid text returns false")
+  num_sig.set(10.0)
+  let _ = t.frame(300.0, 100.0, now=10.0)
+
+  // Keyboard Up (+0.5), PageUp (+5.0), Home (0.0)
+  assert(inp.ask_focus(visible=true), "focus input")
+  assert(t.key_at(5, 0, 20.0) && dmath::abs(num_sig.get() - 10.5) < 0.001, "Up adds step")
+  assert(t.key_at(15, 0, 30.0) && dmath::abs(num_sig.get() - 15.5) < 0.001, "PageUp adds large_step")
+  assert(t.key_at(8, 0, 40.0) && num_sig.get() == 0.0, "Home sets min")
+
+  // Hold increment_button: fires repeat_hold after 200ms + every 50ms
+  t.hold_press(inc_btn.id())
+  let _ = t.frame(300.0, 100.0, now=100.0)
+  let _ = t.frame(300.0, 100.0, now=350.0) // 100+200=300 (fire 1), 350 (fire 2)
+  assert(num_sig.get() >= 1.0, "repeat_hold incremented value while held")
+  let _ = t.press_held(inc_btn.id())
+  t.dispose()
+}
+
+test "p1-09 RangeSlider dual Role::Slider thumbs, min_gap anti-crossing, and RTL keyboard" {
+  let lo_sig = signals::signal(20.0)
+  let hi_sig = signals::signal(60.0)
+  let lo_node : view::Ref[Option[view::View]] = view::ref_new(None)
+  let hi_node : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let t = make_tree(fn(root : view::View) {
+    let _ = range_slider(
+      root,
+      fn() -> String { "Price" },
+      fn() -> Double { lo_sig.get() },
+      fn() -> Double { hi_sig.get() },
+      min=0.0,
+      max=100.0,
+      step=10.0,
+      fn(a : Double, b : Double) {
+        lo_sig.set(a)
+        hi_sig.set(b)
+      },
+      fn(v : view::View, rs : RangeSlider) {
+        let _ = v.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(30.0)))
+        lo_node.v = Some(rs.thumb(v, RangeThumb::Low, fn() -> String { "Min Price" }, fn(_n : view::View, _s : RangeThumbState) { () }))
+        hi_node.v = Some(rs.thumb(v, RangeThumb::High, fn() -> String { "Max Price" }, fn(_n : view::View, _s : RangeThumbState) { () }))
+      },
+      min_gap=20.0,
+      rtl=true,
+    )
+  })
+  let _ = t.frame(300.0, 100.0, now=0.0)
+  let ln = match lo_node.v { Some(x) => x; None => panic("ln") }
+  let hn = match hi_node.v { Some(x) => x; None => panic("hn") }
+
+  match (said_of(t, ln.id()), said_of(t, hn.id())) {
+    (Some(s1), Some(s2)) => assert(s1.role == view::Role::Slider && s2.role == view::Role::Slider, "both thumbs Role::Slider")
+    _ => panic("missing thumb said")
+  }
+
+  // RTL: Left (3) increments Low; End (9) clamps to high - min_gap = 40
+  assert(ln.ask_focus(visible=true), "focus Low thumb")
+  assert(t.key_at(3, 0, 16.0) && lo_sig.get() == 30.0, "RTL Left increments Low thumb")
+  assert(t.key_at(9, 0, 32.0) && lo_sig.get() == 40.0, "Low thumb clamped to high - min_gap = 40")
+
+  // High thumb Home (8) clamps to low + min_gap = 60
+  assert(hn.ask_focus(visible=true), "focus High thumb")
+  assert(t.key_at(8, 0, 48.0) && hi_sig.get() == 60.0, "High thumb cannot cross below low + min_gap")
+  t.dispose()
+}
+
+test "p1-10 Drawer overlay stack, snap_points, velocity dismiss, can_drag guard, and zero-draw check" {
+  let open = signals::signal(true)
+  let snap_idx = signals::signal(1)
+  let allow_drag = signals::signal(false)
+  let dr_ref : view::Ref[Option[Drawer]] = view::ref_new(None)
+  let dr_node : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let t = make_tree(fn(root : view::View) {
+    dr_node.v = Some(drawer(
+      root,
+      fn() -> String { "Details Sheet" },
+      fn() -> Bool { open.get() },
+      fn() { open.set(false) },
+      fn(v : view::View, d : Drawer) {
+        dr_ref.v = Some(d)
+        let _ = v.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(300.0)))
+      },
+      edge=DrawerEdge::Bottom,
+      snap_points=[0.5, 1.0],
+      active_snap=fn() -> Int { snap_idx.get() },
+      on_snap=fn(i : Int) { snap_idx.set(i) },
+      close_threshold=0.25,
+      velocity_threshold=0.5,
+      can_drag=fn() -> Bool { allow_drag.get() },
+    ))
+  })
+  let _ = t.frame(300.0, 300.0, now=0.0)
+  let dr = match dr_ref.v { Some(x) => x; None => panic("dr") }
+  let dn = match dr_node.v { Some(x) => x; None => panic("dn") }
+  assert(overlays_open(t) == 1, "Drawer joined unified overlay stack")
+
+  // Zero-draw invariant: headless drawer draws no painted ground or words of its own.
+  for d in t.drawn() {
+    assert(d.ground == 0.to_int64() && d.words == "", "headless drawer draws nothing")
+  }
+
+  // can_drag = false blocks drag
+  let _ = t.drag_at(dn.id(), view::DragIs::Down, 150.0, 50.0, 10.0)
+  let _ = t.drag_at(dn.id(), view::DragIs::Moved, 150.0, 200.0, 60.0)
+  assert(!dr.dragging() && dr.drag_offset() == 0.0, "can_drag=false guards scroll handoff")
+  let _ = t.drag_at(dn.id(), view::DragIs::Up, 150.0, 200.0, 80.0)
+
+  // can_drag = true: slow drag down by 150px (0.5 of 300px) snaps from 1.0 -> 0.5 (index 0)
+  allow_drag.set(true)
+  let _ = t.drag_at(dn.id(), view::DragIs::Down, 150.0, 50.0, 100.0)
+  let _ = t.drag_at(dn.id(), view::DragIs::Moved, 150.0, 200.0, 600.0)
+  assert(dr.dragging() && dmath::abs(dr.drag_offset() - 150.0) < 0.01, "drag_offset tracks downward drag")
+  let _ = t.drag_at(dn.id(), view::DragIs::Up, 150.0, 200.0, 700.0)
+  assert(open.get() && snap_idx.get() == 0, "slow drag snapped to 0.5 snap point")
+
+  // Fast downward fling closes drawer by velocity threshold
+  let _ = t.drag_at(dn.id(), view::DragIs::Down, 150.0, 100.0, 800.0)
+  let _ = t.drag_at(dn.id(), view::DragIs::Moved, 150.0, 130.0, 816.0)
+  let _ = t.drag_at(dn.id(), view::DragIs::Moved, 150.0, 170.0, 832.0)
+  let _ = t.drag_at(dn.id(), view::DragIs::Up, 150.0, 170.0, 836.0)
+  assert(!open.get(), "fast downward fling closed drawer")
+  let _ = t.frame(300.0, 300.0, now=850.0)
+  assert(overlays_open(t) == 0, "overlay stack empty after drawer close")
+  t.dispose()
+}

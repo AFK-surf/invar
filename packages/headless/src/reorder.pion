@@ -1,0 +1,676 @@
+// Single-list drag/keyboard reorder (`Reorder[K]`) and cross-container transfer (`Transfer[C, K]`).
+
+import "dmath"
+import "signals"
+import "view"
+
+/// Return a new array with the item at `from` moved to `to` (safe no-op if out of bounds).
+pub fn reorder_apply[T](items : Array[T], from : Int, to : Int) -> Array[T] {
+  let n = items.length()
+  let out : Array[T] = []
+  for x in items {
+    out.push(x)
+  }
+  if n <= 1 || from < 0 || from >= n {
+    return out
+  }
+  let dst = if to < 0 { 0 } else if to >= n { n - 1 } else { to }
+  if from == dst {
+    return out
+  }
+  let moved = out[from]
+  let _ = view::array_remove(out, from)
+  let res : Array[T] = []
+  let mut i = 0
+  while i <= out.length() {
+    if i == dst {
+      res.push(moved)
+    }
+    if i < out.length() {
+      res.push(out[i])
+    }
+    i += 1
+  }
+  res
+}
+
+/// Active reorder draft while an item is grabbed.
+pub struct ReorderDraft[K] {
+  pub key : K
+  pub from : Int
+  pub to : Int
+}
+
+struct ReorderEntry[K] {
+  node : view::View
+  key : K
+  off : () -> Bool
+}
+
+/// Single-list drag and keyboard reorder controller.
+pub struct Reorder[K] {
+  order : () -> Array[K]
+  on_commit : (Int, Int) -> Unit
+  on_cancel : Option[() -> Unit]
+  axis : GroupAxis
+  rtl : Bool
+  off : () -> Bool
+  focus : RovingFocus
+  entries : Array[ReorderEntry[K]]
+  draft_sig : signals::Signal[Option[ReorderDraft[K]]]
+}
+
+/// Per-item reactive state passed to a `Reorder::item` look.
+pub struct ReorderItem {
+  node : view::View
+  is_grabbed : () -> Bool
+  off : () -> Bool
+}
+
+pub fn ReorderItem::grabbed(self : ReorderItem) -> Bool {
+  (self.is_grabbed)()
+}
+
+pub fn ReorderItem::disabled(self : ReorderItem) -> Bool {
+  (self.off)()
+}
+
+pub fn ReorderItem::focused(self : ReorderItem) -> Bool {
+  self.node.focused()
+}
+
+pub fn ReorderItem::focus_shown(self : ReorderItem) -> Bool {
+  self.node.focus_shown()
+}
+
+pub fn ReorderItem::hovered(self : ReorderItem) -> Bool {
+  self.node.pointed()
+}
+
+pub fn ReorderItem::pressed(self : ReorderItem) -> Bool {
+  self.node.pressed()
+}
+
+pub fn Reorder::disabled[K](self : Reorder[K]) -> Bool {
+  (self.off)()
+}
+
+pub fn Reorder::draft[K](self : Reorder[K]) -> Option[ReorderDraft[K]] {
+  self.draft_sig.get()
+}
+
+pub fn Reorder::grabbed[K](self : Reorder[K]) -> Bool {
+  self.draft_sig.get() is Some(_)
+}
+
+pub fn Reorder::grabbed_key[K](self : Reorder[K]) -> Option[K] {
+  match self.draft_sig.get() {
+    Some(d) => Some(d.key)
+    None => None
+  }
+}
+
+pub fn Reorder::grab[K : view::ViewEq](self : Reorder[K], key : K) -> Bool {
+  if signals::untracked(self.off) {
+    return false
+  }
+  let ord = signals::untracked(self.order)
+  match view::array_search_eq(ord, key) {
+    Some(idx) => {
+      self.draft_sig.set(Some(ReorderDraft::{ key, from: idx, to: idx }))
+      true
+    }
+    None => false
+  }
+}
+
+pub fn Reorder::move_to[K](self : Reorder[K], index : Int) -> Bool {
+  if signals::untracked(self.off) {
+    return false
+  }
+  match self.draft_sig.untracked() {
+    Some(d) => {
+      let n = signals::untracked(self.order).length()
+      if n <= 0 {
+        return false
+      }
+      let next = if index < 0 { 0 } else if index >= n { n - 1 } else { index }
+      if next != d.to {
+        self.draft_sig.set(Some(ReorderDraft::{ key: d.key, from: d.from, to: next }))
+      }
+      true
+    }
+    None => false
+  }
+}
+
+pub fn Reorder::move_by[K](self : Reorder[K], delta : Int) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(d) => self.move_to(d.to + delta)
+    None => false
+  }
+}
+
+pub fn Reorder::commit[K](self : Reorder[K]) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(d) => {
+      self.draft_sig.set(None)
+      if d.from != d.to {
+        (self.on_commit)(d.from, d.to)
+      }
+      true
+    }
+    None => false
+  }
+}
+
+pub fn Reorder::cancel[K](self : Reorder[K]) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(_) => {
+      self.draft_sig.set(None)
+      match self.on_cancel {
+        Some(f) => f()
+        None => ()
+      }
+      true
+    }
+    None => false
+  }
+}
+
+fn Reorder::target_index_at[K : view::ViewEq](self : Reorder[K], wx : Double, wy : Double) -> Int {
+  let ord = signals::untracked(self.order)
+  let n = ord.length()
+  if n <= 1 {
+    return 0
+  }
+  let mut best_idx = 0
+  let mut best_dist = 1.0e18
+  let mut i = 0
+  while i < n {
+    let k = ord[i]
+    match view::array_find_first(self.entries, fn(e : ReorderEntry[K]) -> Bool { e.key.eq(k) && e.node.alive() }) {
+      Some(e) => {
+        let (rx, ry, rw, rh) = e.node.rect()
+        let dist = match self.axis {
+          Horizontal => dmath::abs(wx - (rx + rw * 0.5))
+          Vertical => dmath::abs(wy - (ry + rh * 0.5))
+          Both => dmath::abs(wx - (rx + rw * 0.5)) + dmath::abs(wy - (ry + rh * 0.5))
+        }
+        if dist < best_dist {
+          best_dist = dist
+          best_idx = i
+        }
+      }
+      None => ()
+    }
+    i += 1
+  }
+  best_idx
+}
+
+/// A reorderable list container in `parent`.
+pub fn reorder[K : view::ViewEq](
+  parent : view::View,
+  label : () -> String,
+  order : () -> Array[K],
+  on_commit : (Int, Int) -> Unit,
+  look : (view::View, Reorder[K]) -> Unit,
+  axis~ : GroupAxis = GroupAxis::Vertical,
+  rtl~ : Bool = false,
+  wraps~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  on_cancel? : () -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let r : Reorder[K] = Reorder::{
+    order,
+    on_commit,
+    on_cancel,
+    axis,
+    rtl,
+    off: disabled,
+    focus: RovingFocus::new(axis=axis, roving=true, wraps=wraps, rtl=rtl),
+    entries: [],
+    draft_sig: signals::signal_by(None, fn(a : Option[ReorderDraft[K]], b : Option[ReorderDraft[K]]) -> Bool {
+      match (a, b) {
+        (None, None) => true
+        (Some(x), Some(y)) => x.key.eq(y.key) && x.from == y.from && x.to == y.to
+        _ => false
+      }
+    }),
+  }
+  parent.box(fn(v : view::View) {
+    look(v, r)
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Listbox, label=label())) }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if disabled() || !focus_in(v, false) || k.mods != 0 {
+          return false
+        }
+        match r.draft_sig.untracked() {
+          Some(_) => {
+            if k.code == menu_key_escape {
+              return r.cancel()
+            }
+            if k.code == listbox_key_space || k.code == listbox_key_enter {
+              return r.commit()
+            }
+            if k.code == group_key_home {
+              return r.move_to(0)
+            }
+            if k.code == group_key_end {
+              let n = signals::untracked(order).length()
+              return r.move_to(if n > 0 { n - 1 } else { 0 })
+            }
+            let (prev_keys, next_keys) = axis_keys_rtl(axis, rtl)
+            if int_array_contains(prev_keys, k.code) {
+              return r.move_by(-1)
+            }
+            if int_array_contains(next_keys, k.code) {
+              return r.move_by(1)
+            }
+            false
+          }
+          None => {
+            if k.code == listbox_key_space {
+              match view::array_find_first(r.entries, fn(e : ReorderEntry[K]) -> Bool { e.node.focused() }) {
+                Some(e) => {
+                  if !(e.off)() {
+                    return r.grab(e.key)
+                  }
+                  return false
+                }
+                None => return false
+              }
+            }
+            r.focus.step(k.code) is Some(_)
+          }
+        }
+      })
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// Register one reorderable item in `parent`.
+pub fn Reorder::item[K : view::ViewEq](
+  self : Reorder[K],
+  parent : view::View,
+  key : K,
+  label : () -> String,
+  look : (view::View, ReorderItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  slop~ : Double = 4.0,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let is_grabbed = fn() -> Bool {
+      match self.draft_sig.get() {
+        Some(d) => d.key.eq(key)
+        None => false
+      }
+    }
+    self.entries.push(ReorderEntry::{ node: v, key, off })
+    let _ = v.owns(fn() {
+      view::array_retain(self.entries, fn(e : ReorderEntry[K]) -> Bool { e.node.id() != v.id() })
+    })
+    let drag_start : view::Ref[(Double, Double)] = view::ref_new((0.0, 0.0))
+    let drag_active = view::ref_new(false)
+    look(v, ReorderItem::{ node: v, is_grabbed, off })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=0, tab=false)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Option, label=label(), selected=is_grabbed()))
+      }))
+      .on_drag(fn(d : view::Drag) {
+        if signals::untracked(off) {
+          return
+        }
+        match d.kind {
+          Down => {
+            drag_start.v = (d.wx, d.wy)
+            drag_active.v = false
+          }
+          Moved => {
+            let (sx, sy) = drag_start.v
+            if !drag_active.v {
+              let dist = dmath::abs(d.wx - sx) + dmath::abs(d.wy - sy)
+              if dist >= slop {
+                drag_active.v = self.grab(key)
+              }
+            }
+            if drag_active.v {
+              let idx = self.target_index_at(d.wx, d.wy)
+              let _ = self.move_to(idx)
+            }
+          }
+          Up => {
+            if drag_active.v {
+              drag_active.v = false
+              let _ = self.commit()
+            }
+          }
+          Off => {
+            if drag_active.v {
+              drag_active.v = false
+              let _ = self.cancel()
+            }
+          }
+        }
+      }, captures=true)
+    self.focus.add(v, off=off)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-container Transfer[C, K] (multi-column Kanban reorder & transfer)
+// ---------------------------------------------------------------------------
+
+/// Active transfer draft across columns.
+pub struct TransferDraft[C, K] {
+  pub key : K
+  pub from_col : C
+  pub from_idx : Int
+  pub to_col : C
+  pub to_idx : Int
+}
+
+struct TransferColEntry[C] {
+  col : C
+  node : view::View
+  focus : RovingFocus
+}
+
+struct TransferItemEntry[C, K] {
+  col : C
+  key : K
+  node : view::View
+  off : () -> Bool
+}
+
+/// Multi-column reorder & cross-container transfer controller (Kanban board).
+pub struct Transfer[C, K] {
+  columns : () -> Array[C]
+  items_in : (C) -> Array[K]
+  on_commit : (C, Int, C, Int) -> Unit
+  on_cancel : Option[() -> Unit]
+  rtl : Bool
+  off : () -> Bool
+  cols : Array[TransferColEntry[C]]
+  items : Array[TransferItemEntry[C, K]]
+  draft_sig : signals::Signal[Option[TransferDraft[C, K]]]
+}
+
+/// Per-column handle passed to `Transfer::column`.
+pub struct TransferColumn[C, K] {
+  board : Transfer[C, K]
+  col : C
+  focus : RovingFocus
+}
+
+/// Create a `Transfer[C, K]` controller.
+pub fn Transfer::new[C : view::ViewEq, K : view::ViewEq](
+  columns : () -> Array[C],
+  items_in : (C) -> Array[K],
+  on_commit : (C, Int, C, Int) -> Unit,
+  rtl~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  on_cancel? : () -> Unit,
+) -> Transfer[C, K] {
+  Transfer::{
+    columns,
+    items_in,
+    on_commit,
+    on_cancel,
+    rtl,
+    off: disabled,
+    cols: [],
+    items: [],
+    draft_sig: signals::signal_by(None, fn(a : Option[TransferDraft[C, K]], b : Option[TransferDraft[C, K]]) -> Bool {
+      match (a, b) {
+        (None, None) => true
+        (Some(x), Some(y)) =>
+          x.key.eq(y.key) &&
+          x.from_col.eq(y.from_col) &&
+          x.from_idx == y.from_idx &&
+          x.to_col.eq(y.to_col) &&
+          x.to_idx == y.to_idx
+        _ => false
+      }
+    }),
+  }
+}
+
+pub fn Transfer::draft[C, K](self : Transfer[C, K]) -> Option[TransferDraft[C, K]] {
+  self.draft_sig.get()
+}
+
+pub fn Transfer::grabbed[C, K](self : Transfer[C, K]) -> Bool {
+  self.draft_sig.get() is Some(_)
+}
+
+pub fn Transfer::disabled[C, K](self : Transfer[C, K]) -> Bool {
+  (self.off)()
+}
+
+pub fn Transfer::grab[C : view::ViewEq, K : view::ViewEq](self : Transfer[C, K], col : C, key : K) -> Bool {
+  if signals::untracked(self.off) {
+    return false
+  }
+  let list = signals::untracked(fn() -> Array[K] { (self.items_in)(col) })
+  match view::array_search_eq(list, key) {
+    Some(idx) => {
+      self.draft_sig.set(Some(TransferDraft::{ key, from_col: col, from_idx: idx, to_col: col, to_idx: idx }))
+      true
+    }
+    None => false
+  }
+}
+
+pub fn Transfer::move_to[C : view::ViewEq, K](self : Transfer[C, K], col : C, index : Int) -> Bool {
+  if signals::untracked(self.off) {
+    return false
+  }
+  match self.draft_sig.untracked() {
+    Some(d) => {
+      let target_list = signals::untracked(fn() -> Array[K] { (self.items_in)(col) })
+      let max_idx = if col.eq(d.from_col) {
+        if target_list.length() > 0 { target_list.length() - 1 } else { 0 }
+      } else {
+        target_list.length()
+      }
+      let clamped = if index < 0 { 0 } else if index > max_idx { max_idx } else { index }
+      self.draft_sig.set(Some(TransferDraft::{
+        key: d.key,
+        from_col: d.from_col,
+        from_idx: d.from_idx,
+        to_col: col,
+        to_idx: clamped,
+      }))
+      true
+    }
+    None => false
+  }
+}
+
+pub fn Transfer::move_within[C : view::ViewEq, K](self : Transfer[C, K], delta : Int) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(d) => self.move_to(d.to_col, d.to_idx + delta)
+    None => false
+  }
+}
+
+pub fn Transfer::move_to_column[C : view::ViewEq, K](self : Transfer[C, K], col_delta : Int) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(d) => {
+      let all_cols = signals::untracked(self.columns)
+      match view::array_search_eq(all_cols, d.to_col) {
+        Some(ci) => {
+          let next_ci = ci + col_delta
+          if next_ci < 0 || next_ci >= all_cols.length() {
+            return false
+          }
+          self.move_to(all_cols[next_ci], d.to_idx)
+        }
+        None => false
+      }
+    }
+    None => false
+  }
+}
+
+pub fn Transfer::commit[C : view::ViewEq, K](self : Transfer[C, K]) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(d) => {
+      self.draft_sig.set(None)
+      if !d.from_col.eq(d.to_col) || d.from_idx != d.to_idx {
+        (self.on_commit)(d.from_col, d.from_idx, d.to_col, d.to_idx)
+      }
+      true
+    }
+    None => false
+  }
+}
+
+pub fn Transfer::cancel[C, K](self : Transfer[C, K]) -> Bool {
+  match self.draft_sig.untracked() {
+    Some(_) => {
+      self.draft_sig.set(None)
+      match self.on_cancel {
+        Some(f) => f()
+        None => ()
+      }
+      true
+    }
+    None => false
+  }
+}
+
+/// Mount a column of `self` in `parent`.
+pub fn Transfer::column[C : view::ViewEq, K : view::ViewEq](
+  self : Transfer[C, K],
+  parent : view::View,
+  col : C,
+  label : () -> String,
+  look : (view::View, TransferColumn[C, K]) -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let col_focus = RovingFocus::new(axis=GroupAxis::Vertical, roving=true, wraps=false)
+  parent.box(fn(v : view::View) {
+    self.cols.push(TransferColEntry::{ col, node: v, focus: col_focus })
+    let _ = v.owns(fn() {
+      view::array_retain(self.cols, fn(e : TransferColEntry[C]) -> Bool { e.node.id() != v.id() })
+    })
+    let handle = TransferColumn::{ board: self, col, focus: col_focus }
+    look(v, handle)
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Listbox, label=label())) }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if (self.off)() || !focus_in(v, false) || k.mods != 0 {
+          return false
+        }
+        match self.draft_sig.untracked() {
+          Some(d) => {
+            if k.code == menu_key_escape {
+              return self.cancel()
+            }
+            if k.code == listbox_key_space || k.code == listbox_key_enter {
+              return self.commit()
+            }
+            if k.code == group_key_up {
+              return self.move_within(-1)
+            }
+            if k.code == group_key_down {
+              return self.move_within(1)
+            }
+            if k.code == group_key_home {
+              return self.move_to(d.to_col, 0)
+            }
+            if k.code == group_key_end {
+              let n = signals::untracked(fn() -> Array[K] { (self.items_in)(d.to_col) }).length()
+              return self.move_to(d.to_col, n)
+            }
+            let prev_col_key = if self.rtl { group_key_right } else { group_key_left }
+            let next_col_key = if self.rtl { group_key_left } else { group_key_right }
+            if k.code == prev_col_key {
+              return self.move_to_column(-1)
+            }
+            if k.code == next_col_key {
+              return self.move_to_column(1)
+            }
+            false
+          }
+          None => {
+            if k.code == listbox_key_space {
+              match view::array_find_first(self.items, fn(e : TransferItemEntry[C, K]) -> Bool {
+                e.col.eq(col) && e.node.focused()
+              }) {
+                Some(e) => {
+                  if !(e.off)() {
+                    return self.grab(col, e.key)
+                  }
+                  return false
+                }
+                None => return false
+              }
+            }
+            col_focus.step(k.code) is Some(_)
+          }
+        }
+      })
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// Register one draggable/reorderable item inside a `TransferColumn`.
+pub fn TransferColumn::item[C : view::ViewEq, K : view::ViewEq](
+  self : TransferColumn[C, K],
+  parent : view::View,
+  key : K,
+  label : () -> String,
+  look : (view::View, ReorderItem) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.board.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let is_grabbed = fn() -> Bool {
+      match self.board.draft_sig.get() {
+        Some(d) => d.key.eq(key)
+        None => false
+      }
+    }
+    self.board.items.push(TransferItemEntry::{ col: self.col, key, node: v, off })
+    let _ = v.owns(fn() {
+      view::array_retain(self.board.items, fn(e : TransferItemEntry[C, K]) -> Bool { e.node.id() != v.id() })
+    })
+    look(v, ReorderItem::{ node: v, is_grabbed, off })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=0, tab=false)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Option, label=label(), selected=is_grabbed()))
+      }))
+    self.focus.add(v, off=off)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

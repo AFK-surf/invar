@@ -1,0 +1,209 @@
+// Mobile row swipe actions: horizontal/vertical axis lock slop, over-drag rubber-band damping,
+// displacement/velocity snap open or close, and reactive `offset`/`open_side`/`dragging` signals.
+
+import "dmath"
+import "signals"
+import "view"
+
+/// Which action tray of a swipeable row is currently open.
+#derive(Eq)
+pub enum SwipeSide {
+  Closed
+  Leading
+  Trailing
+}
+
+fn swipe_side_eq(a : SwipeSide, b : SwipeSide) -> Bool {
+  a == b
+}
+
+/// Reactive state and controls for a swipe-actions row.
+pub struct SwipeActions {
+  offset_sig : signals::Signal[Double]
+  side_sig : signals::Signal[SwipeSide]
+  dragging_sig : signals::Signal[Bool]
+  leading_width : Double
+  trailing_width : Double
+  off : () -> Bool
+  on_open : Option[(SwipeSide) -> Unit]
+}
+
+pub fn SwipeActions::offset(self : SwipeActions) -> Double {
+  self.offset_sig.get()
+}
+
+pub fn SwipeActions::open_side(self : SwipeActions) -> SwipeSide {
+  self.side_sig.get()
+}
+
+pub fn SwipeActions::dragging(self : SwipeActions) -> Bool {
+  self.dragging_sig.get()
+}
+
+pub fn SwipeActions::disabled(self : SwipeActions) -> Bool {
+  (self.off)()
+}
+
+/// Programmatically snap the row to `side`.
+pub fn SwipeActions::open(self : SwipeActions, side : SwipeSide) -> Unit {
+  let eff : SwipeSide = match side {
+    Leading => if self.leading_width > 0.0 { SwipeSide::Leading } else { SwipeSide::Closed }
+    Trailing => if self.trailing_width > 0.0 { SwipeSide::Trailing } else { SwipeSide::Closed }
+    Closed => SwipeSide::Closed
+  }
+  let target_off = match eff {
+    Leading => self.leading_width
+    Trailing => -self.trailing_width
+    Closed => 0.0
+  }
+  let prev = self.side_sig.untracked()
+  self.dragging_sig.set(false)
+  self.offset_sig.set(target_off)
+  self.side_sig.set(eff)
+  if prev != eff {
+    match self.on_open {
+      Some(f) => f(eff)
+      None => ()
+    }
+  }
+}
+
+/// Close any open swipe tray.
+pub fn SwipeActions::close(self : SwipeActions) -> Unit {
+  self.open(SwipeSide::Closed)
+}
+
+fn swipe_damp(raw : Double, leading_w : Double, trailing_w : Double, rubber : Double) -> Double {
+  if raw > 0.0 {
+    if leading_w <= 0.0 {
+      0.0
+    } else if raw > leading_w {
+      leading_w + (raw - leading_w) * rubber
+    } else {
+      raw
+    }
+  } else if raw < 0.0 {
+    if trailing_w <= 0.0 {
+      0.0
+    } else if raw < -trailing_w {
+      -trailing_w + (raw + trailing_w) * rubber
+    } else {
+      raw
+    }
+  } else {
+    0.0
+  }
+}
+
+/// Mount a swipeable row container in `parent`.
+pub fn swipe_actions(
+  parent : view::View,
+  look : (view::View, SwipeActions) -> Unit,
+  leading_width~ : Double = 0.0,
+  trailing_width~ : Double = 0.0,
+  slop~ : Double = 8.0,
+  threshold~ : Double = 0.4,
+  velocity_threshold~ : Double = 0.45,
+  rubber_band~ : Double = 0.35,
+  disabled~ : () -> Bool = fn() { false },
+  on_open? : (SwipeSide) -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let lw = if leading_width > 0.0 { leading_width } else { 0.0 }
+  let tw = if trailing_width > 0.0 { trailing_width } else { 0.0 }
+  let rb = if rubber_band < 0.0 { 0.0 } else if rubber_band > 1.0 { 1.0 } else { rubber_band }
+  let sa = SwipeActions::{
+    offset_sig: signals::signal(0.0),
+    side_sig: signals::signal_by(SwipeSide::Closed, swipe_side_eq),
+    dragging_sig: signals::signal(false),
+    leading_width: lw,
+    trailing_width: tw,
+    off: disabled,
+    on_open,
+  }
+  parent.box(fn(v : view::View) {
+    look(v, sa)
+    // Axis lock: 0 = undecided, 1 = horizontal, 2 = vertical
+    let axis_lock = view::ref_new(0)
+    let start_wx = view::ref_new(0.0)
+    let start_wy = view::ref_new(0.0)
+    let start_off = view::ref_new(0.0)
+    let start_side : view::Ref[SwipeSide] = view::ref_new(SwipeSide::Closed)
+    let able = fn() -> Bool { !disabled() }
+    let _ = v
+      .presses(view::Live::By(able))
+      .on_drag(fn(d : view::Drag) {
+        if signals::untracked(disabled) {
+          return
+        }
+        match d.kind {
+          Down => {
+            axis_lock.v = 0
+            start_wx.v = d.wx
+            start_wy.v = d.wy
+            start_off.v = sa.offset_sig.untracked()
+            start_side.v = sa.side_sig.untracked()
+          }
+          Moved => {
+            let dx = d.wx - start_wx.v
+            let dy = d.wy - start_wy.v
+            if axis_lock.v == 0 {
+              let adx = dmath::abs(dx)
+              let ady = dmath::abs(dy)
+              if ady >= slop && ady > adx {
+                axis_lock.v = 2
+                return
+              }
+              if adx >= slop {
+                axis_lock.v = 1
+                sa.dragging_sig.set(true)
+              } else {
+                return
+              }
+            }
+            if axis_lock.v == 1 {
+              let next = swipe_damp(start_off.v + dx, lw, tw, rb)
+              sa.offset_sig.set(next)
+            }
+          }
+          Up => {
+            if axis_lock.v == 1 {
+              let cur = sa.offset_sig.untracked()
+              let vx = d.vx()
+              let next_side : SwipeSide = if vx >= velocity_threshold {
+                match start_side.v {
+                  Trailing => SwipeSide::Closed
+                  _ => if lw > 0.0 { SwipeSide::Leading } else { SwipeSide::Closed }
+                }
+              } else if vx <= -velocity_threshold {
+                match start_side.v {
+                  Leading => SwipeSide::Closed
+                  _ => if tw > 0.0 { SwipeSide::Trailing } else { SwipeSide::Closed }
+                }
+              } else if lw > 0.0 && cur >= lw * threshold {
+                SwipeSide::Leading
+              } else if tw > 0.0 && cur <= -tw * threshold {
+                SwipeSide::Trailing
+              } else {
+                SwipeSide::Closed
+              }
+              sa.open(next_side)
+            }
+            axis_lock.v = 0
+          }
+          Off => {
+            if axis_lock.v == 1 {
+              sa.open(start_side.v)
+            }
+            axis_lock.v = 0
+          }
+        }
+      }, captures=true)
+    v.reacts(disabled, fn(off : Bool) {
+      if off {
+        sa.close()
+      }
+    }, at_start=false)
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}

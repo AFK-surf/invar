@@ -1,0 +1,622 @@
+// Runtime Agent Bridge protocol: semantic snapshot, side-channel-safe query,
+// confirmation/redaction/hidden safety markers (auto-cleaned via View::owns),
+// structured action execution, JSON export, and Tester convenience methods.
+
+import "signals"
+import "view"
+
+// ---------------------------------------------------------------------------
+// Safety & value-writer markers (stored via View::lends -> auto-cleaned by View::owns)
+// ---------------------------------------------------------------------------
+
+let agent_confirm_key : view::Lent[String] = view::Lent::new()
+let agent_secret_key : view::Lent[Bool] = view::Lent::new()
+let agent_hidden_key : view::Lent[Bool] = view::Lent::new()
+let agent_writer_key : view::Lent[(view::NodeId, (String) -> Unit)] = view::Lent::new()
+
+/// Mark `v` (and its subtree) as requiring explicit approval with `reason` before agent actions execute.
+pub fn agent_confirm(v : view::View, reason : String) -> view::View {
+  v.lends(agent_confirm_key, reason)
+}
+
+/// Mark `v` (and its subtree) as secret: values are redacted to `"[redacted]"` and excluded from query matching.
+pub fn agent_secret(v : view::View) -> view::View {
+  v.lends(agent_secret_key, true)
+}
+
+/// Mark `v` (and its entire subtree) as hidden from agent snapshots, queries, and actions.
+pub fn agent_hidden(v : view::View) -> view::View {
+  v.lends(agent_hidden_key, true)
+}
+
+/// Attach a programmatic value writer to `v` so `AgentAction::SetValue` can update it directly.
+pub fn agent_value_writer(v : view::View, write : (String) -> Unit) -> view::View {
+  v.lends(agent_writer_key, (v.id(), write))
+}
+
+fn node_writer_of(v : view::View) -> Option[(String) -> Unit] {
+  match v.lent(agent_writer_key) {
+    Some((owner_id, write)) => if owner_id == v.id() { Some(write) } else { None }
+    None => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Protocol types
+// ---------------------------------------------------------------------------
+
+/// Actions an agent can inspect and invoke on a semantic node.
+#derive(Eq)
+pub enum AgentAction {
+  Press
+  Focus
+  Increment
+  Decrement
+  SetValue(String)
+}
+
+/// One visible, allowed semantic node exposed to an agent.
+pub struct AgentEntry {
+  pub ref_id : String
+  pub node_id : view::NodeId
+  pub role : view::Role
+  pub label : String
+  pub description : String
+  pub value : String
+  pub redacted : Bool
+  pub check : Option[view::Check]
+  pub expanded : Option[Bool]
+  pub selected : Option[Bool]
+  pub pressed : Option[Bool]
+  pub disabled : Bool
+  pub range : Option[(Double, Double, Double)]
+  pub confirm : Option[String]
+  pub actions : Array[AgentAction]
+  pub rect : (Double, Double, Double, Double)
+}
+
+/// One action step targeting a node either by `ref_id` or by semantic query.
+pub struct AgentStep {
+  pub target_ref : Option[String]
+  pub target_text : Option[String]
+  pub target_role : Option[view::Role]
+  pub target_within : Option[String]
+  pub action : AgentAction
+}
+
+/// Target a specific node by its `ref_id` from a snapshot.
+pub fn AgentStep::by_ref(ref_id : String, action : AgentAction) -> AgentStep {
+  AgentStep::{
+    target_ref: Some(ref_id),
+    target_text: None,
+    target_role: None,
+    target_within: None,
+    action,
+  }
+}
+
+/// Target a unique node matching `(text, role, within)`.
+pub fn AgentStep::by_query(
+  action : AgentAction,
+  text~ : String = "",
+  role? : view::Role,
+  within~ : String = "",
+) -> AgentStep {
+  AgentStep::{
+    target_ref: None,
+    target_text: if text != "" { Some(text) } else { None },
+    target_role: role,
+    target_within: if within != "" { Some(within) } else { None },
+    action,
+  }
+}
+
+/// Approval policy for actions hitting `agent_confirm`-guarded nodes.
+#derive(Eq)
+pub enum AgentApproval {
+  Deny
+  AllowAll
+  AllowRef(String)
+  AllowReason(String)
+}
+
+/// Structured error returned by `agent_act`.
+pub enum AgentActError {
+  NotFound(String)
+  Ambiguous(Array[String])
+  Disabled(String)
+  NeedsConfirm(String)
+  UnsupportedAction(String)
+}
+
+/// Outcome of executing one `AgentStep`.
+pub enum AgentActResult {
+  Ok(AgentEntry)
+  Err(AgentActError)
+}
+
+pub fn agent_act_is_ok(r : AgentActResult) -> Bool {
+  match r {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+pub fn agent_act_is_err(r : AgentActResult) -> Bool {
+  !agent_act_is_ok(r)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn agent_ref_of(id : view::NodeId) -> String {
+  "n\{id.at}:\{id.gen}"
+}
+
+fn agent_ascii_lower(s : String) -> String {
+  let sb = StringBuilder::new()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_char((c + 32).unsafe_to_char())
+    } else {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn agent_contains_ci(hay : String, needle : String) -> Bool {
+  if needle == "" {
+    return true
+  }
+  str_contains(agent_ascii_lower(hay), agent_ascii_lower(needle))
+}
+
+fn said_has_action(acts : Array[view::Action], target : view::Action) -> Bool {
+  for a in acts {
+    if a == target {
+      return true
+    }
+  }
+  false
+}
+
+fn agent_label_of(tree : view::Tree, sn : view::SaidNode, sd : view::Said, redacted : Bool) -> String {
+  if sd.label != "" {
+    sd.label
+  } else if redacted {
+    ""
+  } else if view::role_named_by_held(sd.role) {
+    tree.words_within(sn.id, fn(_id : view::NodeId) -> String { "" })
+  } else {
+    ""
+  }
+}
+
+fn build_agent_entry(tree : view::Tree, sn : view::SaidNode, sd : view::Said, v : view::View) -> AgentEntry {
+  let redacted = match v.lent(agent_secret_key) {
+    Some(true) => true
+    _ => false
+  }
+  let confirm = v.lent(agent_confirm_key)
+  let label = agent_label_of(tree, sn, sd, redacted)
+  let value = if redacted { "[redacted]" } else { sd.value }
+  let acts : Array[AgentAction] = []
+  if !sn.disabled {
+    if tree.presses_do(sn.id) || said_has_action(sd.actions, view::Action::Activate) {
+      acts.push(AgentAction::Press)
+    }
+    if tree.can_focus(sn.id) {
+      acts.push(AgentAction::Focus)
+    }
+    if said_has_action(sd.actions, view::Action::Increment) {
+      acts.push(AgentAction::Increment)
+    }
+    if said_has_action(sd.actions, view::Action::Decrement) {
+      acts.push(AgentAction::Decrement)
+    }
+    if node_writer_of(v) is Some(_) {
+      acts.push(AgentAction::SetValue(""))
+    }
+  }
+  AgentEntry::{
+    ref_id: agent_ref_of(sn.id),
+    node_id: sn.id,
+    role: sd.role,
+    label,
+    description: if redacted { "" } else { sd.description },
+    value,
+    redacted,
+    check: sd.check,
+    expanded: sd.expanded,
+    selected: sd.selected,
+    pressed: sd.pressed,
+    disabled: sn.disabled,
+    range: sd.range,
+    confirm,
+    actions: acts,
+    rect: sn.rect,
+  }
+}
+
+fn is_agent_hidden(v : view::View) -> Bool {
+  match v.lent(agent_hidden_key) {
+    Some(true) => true
+    _ => false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public snapshot, query, act, and JSON APIs
+// ---------------------------------------------------------------------------
+
+/// Capture the current semantic snapshot of all visible, allowed, non-hidden nodes in `tree`.
+pub fn agent_snapshot(tree : view::Tree) -> Array[AgentEntry] {
+  let order = tree.said_order()
+  let out : Array[AgentEntry] = []
+  for sn in order {
+    if sn.hidden || !sn.allowed {
+      continue
+    }
+    let sd = match sn.said {
+      Some(s) => s
+      None => continue
+    }
+    let v = match tree.view_of(sn.id) {
+      Some(node) => node
+      None => continue
+    }
+    if is_agent_hidden(v) {
+      continue
+    }
+    out.push(build_agent_entry(tree, sn, sd, v))
+  }
+  out
+}
+
+/// Query visible, allowed nodes matching optional `text`, `role`, and ancestor `within`.
+/// Skips `value` and `description` matching on redacted nodes to prevent secret side-channel probing.
+pub fn agent_query(
+  tree : view::Tree,
+  text~ : String = "",
+  role? : view::Role,
+  within~ : String = "",
+) -> Array[AgentEntry] {
+  let order = tree.said_order()
+  let out : Array[AgentEntry] = []
+  let mut idx = 0
+  while idx < order.length() {
+    let sn = order[idx]
+    if !sn.hidden && sn.allowed {
+      match (sn.said, tree.view_of(sn.id)) {
+        (Some(sd), Some(v)) => {
+          if !is_agent_hidden(v) {
+            let entry = build_agent_entry(tree, sn, sd, v)
+            let role_ok = match role {
+              Some(r) => entry.role == r
+              None => true
+            }
+            let within_ok = if within == "" {
+              true
+            } else {
+              let mut matched_anc = false
+              let mut p = sn.parent
+              while p >= 0 && p < order.length() {
+                let psn = order[p]
+                let pref = agent_ref_of(psn.id)
+                if pref == within {
+                  matched_anc = true
+                  break
+                }
+                match (psn.said, tree.view_of(psn.id)) {
+                  (Some(psd), Some(pv)) => {
+                    if !is_agent_hidden(pv) {
+                      let pred = match pv.lent(agent_secret_key) {
+                        Some(true) => true
+                        _ => false
+                      }
+                      let plbl = agent_label_of(tree, psn, psd, pred)
+                      if agent_contains_ci(plbl, within) {
+                        matched_anc = true
+                        break
+                      }
+                    }
+                  }
+                  _ => ()
+                }
+                p = psn.parent
+              }
+              matched_anc
+            }
+            let text_ok = if text == "" {
+              true
+            } else if entry.redacted {
+              // Never match against secret value/description (side-channel protection).
+              agent_contains_ci(entry.label, text)
+            } else {
+              agent_contains_ci(entry.label, text) ||
+              agent_contains_ci(entry.description, text) ||
+              agent_contains_ci(entry.value, text)
+            }
+            if role_ok && within_ok && text_ok {
+              out.push(entry)
+            }
+          }
+        }
+        _ => ()
+      }
+    }
+    idx += 1
+  }
+  out
+}
+
+fn approval_allows(allow : AgentApproval, entry : AgentEntry, reason : String) -> Bool {
+  match allow {
+    Deny => false
+    AllowAll => true
+    AllowRef(r) => r == entry.ref_id
+    AllowReason(rs) => rs == reason
+  }
+}
+
+/// Execute one `AgentStep` against `tree` with safety, ambiguity, disabled, and confirmation checks.
+pub fn agent_act(
+  tree : view::Tree,
+  step : AgentStep,
+  allow~ : AgentApproval = AgentApproval::Deny,
+  at~ : Double = 0.0,
+) -> AgentActResult {
+  let target : AgentEntry = match step.target_ref {
+    Some(rid) => {
+      let snap = agent_snapshot(tree)
+      match view::array_find_first(snap, fn(e : AgentEntry) -> Bool { e.ref_id == rid }) {
+        Some(e) => e
+        None => return AgentActResult::Err(AgentActError::NotFound(rid))
+      }
+    }
+    None => {
+      let q_text = match step.target_text {
+        Some(t) => t
+        None => ""
+      }
+      let q_within = match step.target_within {
+        Some(w) => w
+        None => ""
+      }
+      let matches = agent_query(tree, text=q_text, role?=step.target_role, within=q_within)
+      if matches.length() == 0 {
+        return AgentActResult::Err(AgentActError::NotFound(q_text))
+      }
+      if matches.length() > 1 {
+        let refs : Array[String] = view::array_map(matches, fn(e : AgentEntry) -> String { e.ref_id })
+        return AgentActResult::Err(AgentActError::Ambiguous(refs))
+      }
+      matches[0]
+    }
+  }
+  if target.disabled {
+    return AgentActResult::Err(AgentActError::Disabled(target.ref_id))
+  }
+  match target.confirm {
+    Some(reason) =>
+      if !approval_allows(allow, target, reason) {
+        return AgentActResult::Err(AgentActError::NeedsConfirm(reason))
+      }
+    None => ()
+  }
+  let ok = match step.action {
+    Press => tree.activate_at(target.node_id, at)
+    Focus =>
+      if tree.can_focus(target.node_id) {
+        tree.focus_to(Some(target.node_id), visible=true)
+      } else {
+        false
+      }
+    Increment => tree.step_at(target.node_id, 1, at)
+    Decrement => tree.step_at(target.node_id, -1, at)
+    SetValue(next_val) =>
+      match tree.view_of(target.node_id) {
+        Some(v) =>
+          match node_writer_of(v) {
+            Some(write) => {
+              signals::untracked(fn() { write(next_val) })
+              true
+            }
+            None => false
+          }
+        None => false
+      }
+  }
+  if !ok {
+    return AgentActResult::Err(AgentActError::UnsupportedAction(target.ref_id))
+  }
+  AgentActResult::Ok(target)
+}
+
+/// Execute a sequence of `AgentStep`s in order, stopping immediately on the first error.
+pub fn agent_act_all(
+  tree : view::Tree,
+  steps : Array[AgentStep],
+  allow~ : AgentApproval = AgentApproval::Deny,
+  at~ : Double = 0.0,
+) -> Array[AgentActResult] {
+  let out : Array[AgentActResult] = []
+  for s in steps {
+    let res = agent_act(tree, s, allow=allow, at=at)
+    let failed = agent_act_is_err(res)
+    out.push(res)
+    if failed {
+      break
+    }
+  }
+  out
+}
+
+fn json_write_escaped(sb : StringBuilder, s : String) -> Unit {
+  sb.write_char('"')
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 34 {
+      sb.write_string("\\\"")
+    } else if c == 92 {
+      sb.write_string("\\\\")
+    } else if c == 10 {
+      sb.write_string("\\n")
+    } else if c == 13 {
+      sb.write_string("\\r")
+    } else if c == 9 {
+      sb.write_string("\\t")
+    } else {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i += 1
+  }
+  sb.write_char('"')
+}
+
+fn agent_action_name(a : AgentAction) -> String {
+  match a {
+    Press => "Press"
+    Focus => "Focus"
+    Increment => "Increment"
+    Decrement => "Decrement"
+    SetValue(_) => "SetValue"
+  }
+}
+
+/// Serialize `agent_snapshot(tree)` to a JSON array string.
+pub fn agent_snapshot_json(tree : view::Tree) -> String {
+  let entries = agent_snapshot(tree)
+  let sb = StringBuilder::new()
+  sb.write_char('[')
+  let mut i = 0
+  while i < entries.length() {
+    if i > 0 {
+      sb.write_char(',')
+    }
+    let e = entries[i]
+    sb.write_string("{\"ref_id\":")
+    json_write_escaped(sb, e.ref_id)
+    sb.write_string(",\"role\":")
+    json_write_escaped(sb, role_name(e.role))
+    sb.write_string(",\"label\":")
+    json_write_escaped(sb, e.label)
+    sb.write_string(",\"description\":")
+    json_write_escaped(sb, e.description)
+    sb.write_string(",\"value\":")
+    json_write_escaped(sb, e.value)
+    sb.write_string(",\"redacted\":")
+    sb.write_string(if e.redacted { "true" } else { "false" })
+    sb.write_string(",\"disabled\":")
+    sb.write_string(if e.disabled { "true" } else { "false" })
+    match e.check {
+      Some(c) => {
+        sb.write_string(",\"check\":")
+        let cs = StringBuilder::new()
+        view::check_output(c, cs)
+        json_write_escaped(sb, cs.to_string())
+      }
+      None => ()
+    }
+    match e.expanded {
+      Some(b) => {
+        sb.write_string(",\"expanded\":")
+        sb.write_string(if b { "true" } else { "false" })
+      }
+      None => ()
+    }
+    match e.selected {
+      Some(b) => {
+        sb.write_string(",\"selected\":")
+        sb.write_string(if b { "true" } else { "false" })
+      }
+      None => ()
+    }
+    match e.pressed {
+      Some(b) => {
+        sb.write_string(",\"pressed\":")
+        sb.write_string(if b { "true" } else { "false" })
+      }
+      None => ()
+    }
+    match e.range {
+      Some((lo, cur, hi)) => {
+        sb.write_string(",\"range\":[\{lo},\{cur},\{hi}]")
+      }
+      None => ()
+    }
+    match e.confirm {
+      Some(reason) => {
+        sb.write_string(",\"confirm\":")
+        json_write_escaped(sb, reason)
+      }
+      None => ()
+    }
+    sb.write_string(",\"actions\":[")
+    let mut j = 0
+    while j < e.actions.length() {
+      if j > 0 {
+        sb.write_char(',')
+      }
+      json_write_escaped(sb, agent_action_name(e.actions[j]))
+      j += 1
+    }
+    sb.write_string("]}")
+    i += 1
+  }
+  sb.write_char(']')
+  sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Tester convenience methods
+// ---------------------------------------------------------------------------
+
+/// Capture the current `AgentEntry` snapshot from this `Tester`'s live tree.
+pub fn Tester::agent_snapshot(self : Tester) -> Array[AgentEntry] {
+  let _ = self
+  match view_tree() {
+    Some(tr) => agent_snapshot(tr)
+    None => []
+  }
+}
+
+/// Query this `Tester`'s live tree via `agent_query`.
+pub fn Tester::agent_query(
+  self : Tester,
+  text~ : String = "",
+  role? : view::Role,
+  within~ : String = "",
+) -> Array[AgentEntry] {
+  let _ = self
+  match view_tree() {
+    Some(tr) => agent_query(tr, text=text, role?=role, within=within)
+    None => []
+  }
+}
+
+/// Execute `step` on this `Tester`'s live tree and advance a frame when it succeeds.
+pub fn Tester::agent_act(
+  self : Tester,
+  step : AgentStep,
+  allow~ : AgentApproval = AgentApproval::Deny,
+) -> AgentActResult {
+  let tr = match view_tree() {
+    Some(t) => t
+    None => return AgentActResult::Err(AgentActError::NotFound("no active tree"))
+  }
+  let res = agent_act(tr, step, allow=allow, at=self.fake.now_ms)
+  if agent_act_is_ok(res) {
+    self.fake.frame_requested = true
+    self.frame()
+  }
+  res
+}

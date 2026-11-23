@@ -1,0 +1,316 @@
+// Desktop menubar: Role::MenuBar + RovingFocus, open-state horizontal/hover hot-switching,
+// Down/Enter/Space open, Escape close & focus return.
+
+import "signals"
+import "view"
+
+struct MenubarEntry[K] {
+  key : K
+  node : view::View
+  off : () -> Bool
+}
+
+/// A desktop menubar handed to its look to register triggers (`Menubar::trigger`) and menus (`Menubar::menu`).
+pub struct Menubar[K] {
+  node : view::View
+  open_key : () -> Option[K]
+  set_open : (Option[K]) -> Unit
+  rtl : Bool
+  wraps : Bool
+  off : () -> Bool
+  focus : RovingFocus
+  entries : Array[MenubarEntry[K]]
+  enter_menu : view::Ref[Bool]
+}
+
+/// Per-trigger reactive state passed to `Menubar::trigger`'s look.
+pub struct MenubarTrigger {
+  node : view::View
+  is_open : () -> Bool
+  off : () -> Bool
+}
+
+pub fn MenubarTrigger::open(self : MenubarTrigger) -> Bool {
+  (self.is_open)()
+}
+
+pub fn MenubarTrigger::disabled(self : MenubarTrigger) -> Bool {
+  (self.off)()
+}
+
+pub fn MenubarTrigger::focused(self : MenubarTrigger) -> Bool {
+  self.node.focused()
+}
+
+pub fn MenubarTrigger::focus_shown(self : MenubarTrigger) -> Bool {
+  self.node.focus_shown()
+}
+
+pub fn MenubarTrigger::hovered(self : MenubarTrigger) -> Bool {
+  self.node.pointed()
+}
+
+pub fn MenubarTrigger::pressed(self : MenubarTrigger) -> Bool {
+  self.node.pressed()
+}
+
+pub fn Menubar::node[K](self : Menubar[K]) -> view::View {
+  self.node
+}
+
+pub fn Menubar::disabled[K](self : Menubar[K]) -> Bool {
+  (self.off)()
+}
+
+pub fn Menubar::open_menu[K](self : Menubar[K]) -> Option[K] {
+  (self.open_key)()
+}
+
+pub fn Menubar::close[K](self : Menubar[K]) -> Unit {
+  self.enter_menu.v = false
+  if signals::untracked(self.open_key) is Some(_) {
+    (self.set_open)(None)
+  }
+}
+
+fn Menubar::live_entries[K](self : Menubar[K]) -> Array[MenubarEntry[K]] {
+  view::array_filter(self.entries, fn(e : MenubarEntry[K]) -> Bool {
+    e.node.alive() && !e.node.leaving() && e.node.takes_input() && !(e.off)()
+  })
+}
+
+fn Menubar::step_horizontal[K : view::ViewEq](self : Menubar[K], delta : Int, focus_menu : Bool) -> Bool {
+  let live = self.live_entries()
+  let n = live.length()
+  if n == 0 {
+    return false
+  }
+  let cur_idx : Option[Int] = match signals::untracked(self.open_key) {
+    Some(k) => view::array_search_by(live, fn(e : MenubarEntry[K]) -> Bool { e.key.eq(k) })
+    None => view::array_search_by(live, fn(e : MenubarEntry[K]) -> Bool { e.node.focused() })
+  }
+  let next_idx = match cur_idx {
+    Some(i) => {
+      let raw = i + delta
+      if raw < 0 {
+        if self.wraps { n - 1 } else { 0 }
+      } else if raw >= n {
+        if self.wraps { 0 } else { n - 1 }
+      } else {
+        raw
+      }
+    }
+    None => if delta >= 0 { 0 } else { n - 1 }
+  }
+  let target = live[next_idx]
+  let _ = target.node.ask_focus(visible=true)
+  if signals::untracked(self.open_key) is Some(_) {
+    self.enter_menu.v = focus_menu
+    (self.set_open)(Some(target.key))
+  }
+  true
+}
+
+/// Mount a desktop menubar (`Role::MenuBar`) in `parent`.
+pub fn menubar[K : view::ViewEq](
+  parent : view::View,
+  label : () -> String,
+  open_key : () -> Option[K],
+  set_open : (Option[K]) -> Unit,
+  look : (view::View, Menubar[K]) -> Unit,
+  rtl~ : Bool = false,
+  wraps~ : Bool = true,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let mb : Menubar[K] = Menubar::{
+      node: v,
+      open_key,
+      set_open,
+      rtl,
+      wraps,
+      off: disabled,
+      focus: RovingFocus::new(axis=GroupAxis::Horizontal, roving=true, wraps=wraps, rtl=rtl),
+      entries: [],
+      enter_menu: view::ref_new(false),
+    }
+    look(v, mb)
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::MenuBar, label=label())) }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if disabled() || k.mods != 0 || !focus_in(v, false) {
+          return false
+        }
+        if k.code == menu_key_escape {
+          if signals::untracked(open_key) is Some(_) {
+            mb.close()
+            return true
+          }
+          return false
+        }
+        let prev_key = if rtl { group_key_right } else { group_key_left }
+        let next_key = if rtl { group_key_left } else { group_key_right }
+        if k.code == prev_key {
+          return mb.step_horizontal(-1, false)
+        }
+        if k.code == next_key {
+          return mb.step_horizontal(1, false)
+        }
+        if k.code == group_key_home {
+          return mb.focus.focus_first(visible=true)
+        }
+        if k.code == group_key_end {
+          return mb.focus.focus_last(visible=true)
+        }
+        false
+      })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Register a top-level trigger item in `self`.
+pub fn Menubar::trigger[K : view::ViewEq](
+  self : Menubar[K],
+  parent : view::View,
+  key : K,
+  label : () -> String,
+  look : (view::View, MenubarTrigger) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let is_open = fn() -> Bool {
+      match (self.open_key)() {
+        Some(k) => k.eq(key)
+        None => false
+      }
+    }
+    self.entries.push(MenubarEntry::{ key, node: v, off })
+    let _ = v.owns(fn() {
+      view::array_retain(self.entries, fn(e : MenubarEntry[K]) -> Bool { e.node.id() != v.id() })
+    })
+    look(v, MenubarTrigger::{ node: v, is_open, off })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space, tab=false)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::MenuItem, label=label(), expanded=is_open()))
+      }))
+      .on_press(fn() {
+        if off() {
+          return
+        }
+        if signals::untracked(is_open) {
+          self.close()
+        } else {
+          self.enter_menu.v = v.focus_shown()
+          (self.set_open)(Some(key))
+        }
+      })
+      .on_key(fn(k : view::Key) -> Bool {
+        if off() || k.mods != 0 || !v.focused() {
+          return false
+        }
+        if k.code == menu_key_down {
+          self.enter_menu.v = true
+          (self.set_open)(Some(key))
+          return true
+        }
+        false
+      })
+    // Hover hot-switch while any menu in the bar is open.
+    v.reacts(fn() -> Bool { v.pointed() }, fn(over : Bool) {
+      if over && !signals::untracked(off) {
+        match signals::untracked(self.open_key) {
+          Some(cur) =>
+            if !cur.eq(key) {
+              self.enter_menu.v = false
+              let _ = v.ask_focus(visible=false)
+              (self.set_open)(Some(key))
+            }
+          None => ()
+        }
+      }
+    }, at_start=false)
+    self.focus.add(v, off=off, first=is_open)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount the dropdown menu for `key` in `parent`, wiring Escape focus return and Left/Right hot-switching.
+pub fn Menubar::menu[K : view::ViewEq](
+  self : Menubar[K],
+  parent : view::View,
+  key : K,
+  look : (view::View, Menu) -> Unit,
+  label? : () -> String,
+  wraps~ : Bool = true,
+  typeahead~ : Bool = true,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let inner_ref : view::Ref[Option[Menu]] = view::ref_new(None)
+  parent.box(fn(wrap : view::View) {
+    let v = menu(
+      wrap,
+      fn(n : view::View, m : Menu) {
+        inner_ref.v = Some(m)
+        look(n, m)
+      },
+      label?=label,
+      on_close=fn() {
+        self.close()
+        match view::array_find_first(self.entries, fn(e : MenubarEntry[K]) -> Bool { e.key.eq(key) && e.node.alive() }) {
+          Some(e) => { let _ = e.node.ask_focus(visible=true) }
+          None => ()
+        }
+      },
+      wraps=wraps,
+      typeahead=typeahead,
+      made_for=resolve_made_for(made_for, loc),
+      loc=loc,
+    )
+    let _ = wrap.on_key(fn(k : view::Key) -> Bool {
+      if (self.off)() || k.mods != 0 || !focus_in(wrap, false) {
+        return false
+      }
+      let prev_key = if self.rtl { group_key_right } else { group_key_left }
+      let next_key = if self.rtl { group_key_left } else { group_key_right }
+      if k.code == prev_key {
+        return self.step_horizontal(-1, true)
+      }
+      if k.code == next_key {
+        return self.step_horizontal(1, true)
+      }
+      false
+    })
+    if self.enter_menu.v {
+      let _ = v.at_moment(v.cause_at(), fn() {
+        if self.enter_menu.v {
+          self.enter_menu.v = false
+          match inner_ref.v {
+            Some(m) => { let _ = m.focus_first(visible=true) }
+            None => ()
+          }
+        }
+      })
+    }
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}

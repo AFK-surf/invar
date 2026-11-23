@@ -1,0 +1,281 @@
+// Headless Drawer / Sheet gesture state machine: unified onto `overlay` stack (`join_overlay` / `wire_overlay`),
+// `DrawerEdge`, multi-point `snap_points`, velocity-threshold dismiss, and `can_drag` scroll-handoff guard.
+
+import "dmath"
+import "signals"
+import "view"
+
+/// Which edge of the viewport the drawer slides in from.
+#derive(Eq)
+pub enum DrawerEdge {
+  Bottom
+  Top
+  Left
+  Right
+}
+
+/// Drawer / Sheet handle passed to its look.
+pub struct Drawer {
+  node : view::View
+  ov : Overlay
+  edge_ : DrawerEdge
+  now : () -> Bool
+  close_fn : () -> Unit
+  snap_points : Array[Double]
+  active_snap : () -> Int
+  on_snap : Option[(Int) -> Unit]
+  close_threshold : Double
+  velocity_threshold : Double
+  can_drag : () -> Bool
+  dragging_sig : signals::Signal[Bool]
+  drag_offset_sig : signals::Signal[Double]
+}
+
+pub fn Drawer::open(self : Drawer) -> Bool {
+  (self.now)()
+}
+
+pub fn Drawer::edge(self : Drawer) -> DrawerEdge {
+  self.edge_
+}
+
+pub fn Drawer::overlay(self : Drawer) -> Overlay {
+  self.ov
+}
+
+pub fn Drawer::dragging(self : Drawer) -> Bool {
+  self.dragging_sig.get()
+}
+
+pub fn Drawer::drag_offset(self : Drawer) -> Double {
+  self.drag_offset_sig.get()
+}
+
+pub fn Drawer::snap_index(self : Drawer) -> Int {
+  let n = self.snap_points.length()
+  if n == 0 {
+    return 0
+  }
+  let idx = (self.active_snap)()
+  if idx < 0 { 0 } else if idx >= n { n - 1 } else { idx }
+}
+
+pub fn Drawer::snap_fraction(self : Drawer) -> Double {
+  let n = self.snap_points.length()
+  if n == 0 {
+    return 1.0
+  }
+  self.snap_points[self.snap_index()]
+}
+
+pub fn Drawer::snap_to(self : Drawer, idx : Int) -> Unit {
+  let n = self.snap_points.length()
+  if n == 0 {
+    return
+  }
+  let clamped = if idx < 0 { 0 } else if idx >= n { n - 1 } else { idx }
+  self.drag_offset_sig.set(0.0)
+  self.dragging_sig.set(false)
+  match self.on_snap {
+    Some(f) => f(clamped)
+    None => ()
+  }
+}
+
+pub fn Drawer::close(self : Drawer) -> Unit {
+  self.drag_offset_sig.set(0.0)
+  self.dragging_sig.set(false)
+  (self.close_fn)()
+}
+
+fn Drawer::attach_drag(self : Drawer, target : view::View) -> Unit {
+  let active = view::ref_new(false)
+  let start_wx = view::ref_new(0.0)
+  let start_wy = view::ref_new(0.0)
+  let _ = target.on_drag(fn(d : view::Drag) {
+    if !signals::untracked(self.now) {
+      return
+    }
+    match d.kind {
+      Down => {
+        if !signals::untracked(self.can_drag) {
+          active.v = false
+          return
+        }
+        active.v = true
+        start_wx.v = d.wx
+        start_wy.v = d.wy
+        self.dragging_sig.set(true)
+        self.drag_offset_sig.set(0.0)
+      }
+      Moved => {
+        if !active.v {
+          return
+        }
+        if !signals::untracked(self.can_drag) {
+          active.v = false
+          self.dragging_sig.set(false)
+          self.drag_offset_sig.set(0.0)
+          return
+        }
+        let delta = match self.edge_ {
+          Bottom => d.wy - start_wy.v
+          Top => start_wy.v - d.wy
+          Left => start_wx.v - d.wx
+          Right => d.wx - start_wx.v
+        }
+        self.drag_offset_sig.set(delta)
+      }
+      Up => {
+        if !active.v {
+          return
+        }
+        active.v = false
+        let offset = self.drag_offset_sig.untracked()
+        self.dragging_sig.set(false)
+        self.drag_offset_sig.set(0.0)
+        let close_vel = match self.edge_ {
+          Bottom => d.vy()
+          Top => -d.vy()
+          Left => -d.vx()
+          Right => d.vx()
+        }
+        if close_vel >= self.velocity_threshold {
+          self.close()
+          return
+        }
+        let (_, _, rw, rh) = self.node.rect()
+        let extent = match self.edge_ {
+          Bottom | Top => if rh > 0.0 { rh } else if d.h > 0.0 { d.h } else { 300.0 }
+          Left | Right => if rw > 0.0 { rw } else if d.w > 0.0 { d.w } else { 300.0 }
+        }
+        let cur_frac = self.snap_fraction()
+        let next_frac = cur_frac - offset / extent
+        if next_frac < self.close_threshold {
+          self.close()
+          return
+        }
+        let n = self.snap_points.length()
+        if n > 0 {
+          let mut best_i = 0
+          let mut best_d = dmath::abs(next_frac - self.snap_points[0])
+          let mut i = 1
+          while i < n {
+            let dist = dmath::abs(next_frac - self.snap_points[i])
+            if dist < best_d {
+              best_d = dist
+              best_i = i
+            }
+            i += 1
+          }
+          self.snap_to(best_i)
+        }
+      }
+      Off => {
+        if active.v {
+          active.v = false
+          self.dragging_sig.set(false)
+          self.drag_offset_sig.set(0.0)
+        }
+      }
+    }
+  }, captures=true)
+}
+
+/// Optional dedicated drag handle inside a `Drawer` (e.g. top grabber bar of a bottom sheet).
+pub fn Drawer::handle(
+  self : Drawer,
+  parent : view::View,
+  look : (view::View, Drawer) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    look(v, self)
+    let _ = v.presses(view::Live::By(self.now))
+    self.attach_drag(v)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount a headless Drawer / Sheet in `parent`, unified onto the window's overlay stack.
+pub fn drawer(
+  parent : view::View,
+  label : () -> String,
+  open : () -> Bool,
+  on_close : () -> Unit,
+  look : (view::View, Drawer) -> Unit,
+  edge~ : DrawerEdge = DrawerEdge::Bottom,
+  snap_points~ : Array[Double] = [1.0],
+  active_snap~ : () -> Int = fn() { 0 },
+  on_snap? : (Int) -> Unit,
+  modal~ : Bool = true,
+  close_on_escape~ : Bool = true,
+  close_on_outside~ : Bool = true,
+  close_threshold~ : Double = 0.35,
+  velocity_threshold~ : Double = 0.5,
+  can_drag~ : () -> Bool = fn() { true },
+  first_takes? : (view::Said) -> Bool,
+  return_focus? : view::View,
+  description~ : () -> String = fn() { "" },
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let snaps = if snap_points.length() > 0 { snap_points.copy() } else { [1.0] }
+  parent.box(fn(v : view::View) {
+    let close = fn() {
+      if signals::untracked(open) {
+        on_close()
+      }
+    }
+    let anchor_fn = fn() -> Option[view::View] { None }
+    let (ov, off, live) = join_overlay(
+      v,
+      fn(_how : OverlayDismiss) { close() },
+      close_on_escape,
+      close_on_outside,
+      fn() -> Bool { !open() },
+      anchor_fn,
+    )
+    let dr = Drawer::{
+      node: v,
+      ov,
+      edge_: edge,
+      now: open,
+      close_fn: close,
+      snap_points: snaps,
+      active_snap,
+      on_snap,
+      close_threshold,
+      velocity_threshold,
+      can_drag,
+      dragging_sig: signals::signal(false),
+      drag_offset_sig: signals::signal(0.0),
+    }
+    look(v, dr)
+    wire_overlay(
+      ov,
+      off,
+      live,
+      modal,
+      close_on_escape,
+      close_on_outside,
+      anchor_fn,
+      return_focus,
+      true,
+      first_takes,
+      return_focus is Some(_),
+      Some(fn() -> Bool { open() && focus_in(v, true) }),
+    )
+    dr.attach_drag(v)
+    let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Dialog, label=label(), description=description()))
+    }))
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
