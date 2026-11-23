@@ -139,9 +139,9 @@ fn utf16_to_utf8_off(s : String, u16_off : Int) -> Int {
   if i > n { n } else { i }
 }
 
-/// Build an O(N) lookup table mapping UTF-16 code-unit index -> UTF-8 lead byte.
-/// Astral code points (4-byte UTF-8) span 2 UTF-16 code units and push `b0` twice.
-fn utf16_lead_bytes(s : String) -> Array[Int] {
+/// Build an O(N) lookup table mapping UTF-16 code-unit index -> Unicode code point.
+/// Astral code points (4-byte UTF-8) span 2 UTF-16 code units and push `cp` twice.
+fn utf16_codepoints(s : String) -> Array[Int] {
   let n = s.length()
   let out : Array[Int] = []
   let mut i = 0
@@ -150,15 +150,18 @@ fn utf16_lead_bytes(s : String) -> Array[Int] {
     if b0 < 0x80 {
       out.push(b0)
       i += 1
-    } else if (b0 & 0xE0) == 0xC0 {
-      out.push(b0)
+    } else if (b0 & 0xE0) == 0xC0 && i + 1 < n {
+      let cp = ((b0 & 0x1F) << 6) | (s.code_unit_at(i + 1) & 0x3F)
+      out.push(cp)
       i += 2
-    } else if (b0 & 0xF0) == 0xE0 {
-      out.push(b0)
+    } else if (b0 & 0xF0) == 0xE0 && i + 2 < n {
+      let cp = ((b0 & 0x0F) << 12) | ((s.code_unit_at(i + 1) & 0x3F) << 6) | (s.code_unit_at(i + 2) & 0x3F)
+      out.push(cp)
       i += 3
-    } else if (b0 & 0xF8) == 0xF0 {
-      out.push(b0)
-      out.push(b0)
+    } else if (b0 & 0xF8) == 0xF0 && i + 3 < n {
+      let cp = ((b0 & 0x07) << 18) | ((s.code_unit_at(i + 1) & 0x3F) << 12) | ((s.code_unit_at(i + 2) & 0x3F) << 6) | (s.code_unit_at(i + 3) & 0x3F)
+      out.push(cp)
+      out.push(cp)
       i += 4
     } else {
       out.push(b0)
@@ -166,6 +169,26 @@ fn utf16_lead_bytes(s : String) -> Array[Int] {
     }
   }
   out
+}
+
+/// CJK closing/separating punctuation forbidden at the start of a wrapped line.
+fn is_cjk_no_line_start(cp : Int) -> Bool {
+  cp == 0xFF0C || cp == 0x3002 || cp == 0xFF1F || cp == 0xFF01 || cp == 0xFF1B ||
+  cp == 0xFF1A || cp == 0x3001 || cp == 0xFF09 || cp == 0x3011 || cp == 0x300B ||
+  cp == 0x300D || cp == 0x300F || cp == 0x201D || cp == 0x2019 || cp == 0x3009 ||
+  cp == 0x3015 || cp == 0xFF5D || cp == 0xFF3D || cp == 0x2026 || cp == 0x00B7
+}
+
+/// CJK opening punctuation forbidden at the end of a wrapped line.
+fn is_cjk_no_line_end(cp : Int) -> Bool {
+  cp == 0xFF08 || cp == 0x3010 || cp == 0x300A || cp == 0x300C || cp == 0x300E ||
+  cp == 0x201C || cp == 0x2018 || cp == 0x3008 || cp == 0x3014 || cp == 0xFF5B ||
+  cp == 0xFF3B
+}
+
+/// Whether a soft line break is allowed immediately after `cur_cp` before `next_cp` (0 at line end).
+fn can_break_after_cp(cur_cp : Int, next_cp : Int) -> Bool {
+  (cur_cp == 45 || cur_cp >= 128) && !is_cjk_no_line_end(cur_cp) && !is_cjk_no_line_start(next_cp)
 }
 
 /// Post-process CoreText/hostapi ligature clusters (`gkey == -2`), aligned with upstream `text.mbt:1089-1119`.
@@ -682,7 +705,7 @@ fn encode_words(
     let eff_clip_x1 = if use_box_clip { dmin(clip_x1, d.x + d.w) } else { clip_x1 }
     let eff_clip_y1 = if use_box_clip && d.h > 0.0 { dmin(clip_y1, d.y + d.h) } else { clip_y1 }
     // Partition shaped clusters into visual lines (word-boundary wrapping by d.w if wrap=true)
-    let lead = utf16_lead_bytes(raw)
+    let cps = utf16_codepoints(raw)
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
@@ -697,8 +720,8 @@ fn encode_words(
       while end < n {
         let adv = advs[end] + spacing
         let loc = locs[end]
-        let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
-        let is_space = cu == 32 || cu == 9
+        let cp = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
+        let is_space = cp == 32 || cp == 9
         if wrap && end > start && line_w + adv > d.w {
           if !is_space && last_break_end > start {
             end = last_break_end
@@ -713,7 +736,13 @@ fn encode_words(
         }
         line_w = line_w + adv
         end += 1
-        if !is_space && (cu == 45 || cu >= 128) {
+        let next_cp = if end < n {
+          let nloc = locs[end]
+          if nloc >= 0 && nloc < cps.length() { cps[nloc] } else { 0 }
+        } else {
+          0
+        }
+        if !is_space && can_break_after_cp(cp, next_cp) {
           last_break_end = end
           break_line_w = line_w
         }
@@ -768,8 +797,8 @@ fn encode_words(
       if wrapped {
         while start < n {
           let sloc = locs[start]
-          let scu = if sloc >= 0 && sloc < lead.length() { lead[sloc] } else { 0 }
-          if scu == 32 || scu == 9 {
+          let scp = if sloc >= 0 && sloc < cps.length() { cps[sloc] } else { 0 }
+          if scp == 32 || scp == 9 {
             start += 1
           } else {
             break
@@ -848,13 +877,13 @@ fn layout_runs(
         if n > 0 {
           shaped_any = true
           resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
-          let lead = utf16_lead_bytes(seg)
+          let cps = utf16_codepoints(seg)
           let mut k = 0
           while k < n {
             let loc = sbuf[k * 4].to_int()
             let adv = sbuf[k * 4 + 2] + spacing
             let gkey = sbuf[k * 4 + 3].to_int()
-            let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
+            let cu = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
             clusters.push(RunsCluster::{ adv, gkey, cu, rink, run_bg: run.bg })
             k += 1
           }
@@ -907,7 +936,8 @@ fn layout_runs(
         }
         line_w = line_w + adv
         end += 1
-        if !is_space && (cu == 45 || cu >= 128) {
+        let next_cp = if end < p_end { clusters[end].cu } else { 0 }
+        if !is_space && can_break_after_cp(cu, next_cp) {
           last_break_end = end
           break_line_w = line_w
         }
@@ -1050,7 +1080,7 @@ pub fn host_words_measure(
     }
     shaped_any = true
     resolve_ligatures(raw, n, sbuf, sz, weight, style_bits)
-    let lead = utf16_lead_bytes(raw)
+    let cps = utf16_codepoints(raw)
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
@@ -1064,8 +1094,8 @@ pub fn host_words_measure(
       while end < n {
         let adv = sbuf[end * 4 + 2] + spacing
         let loc = sbuf[end * 4].to_int()
-        let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
-        let is_space = cu == 32 || cu == 9
+        let cp = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
+        let is_space = cp == 32 || cp == 9
         if wrap && end > start && line_w + adv > max_w {
           if !is_space && last_break_end > start {
             end = last_break_end
@@ -1080,7 +1110,13 @@ pub fn host_words_measure(
         }
         line_w = line_w + adv
         end += 1
-        if !is_space && (cu == 45 || cu >= 128) {
+        let next_cp = if end < n {
+          let nloc = sbuf[end * 4].to_int()
+          if nloc >= 0 && nloc < cps.length() { cps[nloc] } else { 0 }
+        } else {
+          0
+        }
+        if !is_space && can_break_after_cp(cp, next_cp) {
           last_break_end = end
           break_line_w = line_w
         }
@@ -1097,8 +1133,8 @@ pub fn host_words_measure(
       if wrapped {
         while start < n {
           let sloc = sbuf[start * 4].to_int()
-          let scu = if sloc >= 0 && sloc < lead.length() { lead[sloc] } else { 0 }
-          if scu == 32 || scu == 9 {
+          let scp = if sloc >= 0 && sloc < cps.length() { cps[sloc] } else { 0 }
+          if scp == 32 || scp == 9 {
             start += 1
           } else {
             break
@@ -1203,13 +1239,13 @@ pub fn host_runs_least_measure(
     if n > 0 {
       shaped_any = true
     }
-    let lead = utf16_lead_bytes(run.text)
+    let cps = utf16_codepoints(run.text)
     let mut k = 0
     while k < n {
       let loc = sbuf[k * 4].to_int()
       let adv = sbuf[k * 4 + 2] + spacing
-      let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
-      if cu == 32 || cu == 9 || cu == 10 {
+      let cp = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
+      if cp == 32 || cp == 9 || cp == 10 {
         if word_w > widest {
           widest = word_w
         }

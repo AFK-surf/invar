@@ -1750,6 +1750,14 @@ static void make_pipeline(void) {
       kps[k] = NULL;
     }
   ID3DBlob *vcode = compile("vmain", "vs_4_0"), *pcode = compile("fmain", "ps_4_0"), *fcode = compile("fflat", "ps_4_0");
+  if (!vcode || !pcode || !fcode) {
+    fprintf(stderr, "win_render: core shader compile failed (vmain=%p fmain=%p fflat=%p)\n",
+            (void *)vcode, (void *)pcode, (void *)fcode);
+    if (vcode) vcode->Release();
+    if (pcode) pcode->Release();
+    if (fcode) fcode->Release();
+    return;
+  }
   dev->CreateVertexShader(vcode->GetBufferPointer(), vcode->GetBufferSize(), NULL, &vs);
   dev->CreatePixelShader(pcode->GetBufferPointer(), pcode->GetBufferSize(), NULL, &ps);
   dev->CreatePixelShader(fcode->GetBufferPointer(), fcode->GetBufferSize(), NULL, &ps_flat);
@@ -1768,9 +1776,30 @@ static void make_pipeline(void) {
   ID3DBlob *ep = compile("fedge", "ps_4_0", edge_src);
   ID3DBlob *gp = compile("fprog", "ps_4_0", prog_src);
   ID3DBlob *ap = compile("fad", "ps_4_0", ad_src);
-  dev->CreateVertexShader(pv->GetBufferPointer(), pv->GetBufferSize(), NULL, &pvs);
-  dev->CreatePixelShader(pp->GetBufferPointer(), pp->GetBufferSize(), NULL, &pps);
-  dev->CreatePixelShader(ep->GetBufferPointer(), ep->GetBufferSize(), NULL, &edge_ps);
+  if (pv) {
+    if (FAILED(dev->CreateVertexShader(pv->GetBufferPointer(), pv->GetBufferSize(), NULL, &pvs)))
+      pvs = NULL;
+    pv->Release();
+  } else {
+    fprintf(stderr, "win_render: vpost shader compile failed\n");
+    pvs = NULL;
+  }
+  if (pp) {
+    if (FAILED(dev->CreatePixelShader(pp->GetBufferPointer(), pp->GetBufferSize(), NULL, &pps)))
+      pps = NULL;
+    pp->Release();
+  } else {
+    fprintf(stderr, "win_render: fpost shader compile failed\n");
+    pps = NULL;
+  }
+  if (ep) {
+    if (FAILED(dev->CreatePixelShader(ep->GetBufferPointer(), ep->GetBufferSize(), NULL, &edge_ps)))
+      edge_ps = NULL;
+    ep->Release();
+  } else {
+    fprintf(stderr, "win_render: fedge shader compile failed\n");
+    edge_ps = NULL;
+  }
   if (gp) {
     if (FAILED(dev->CreatePixelShader(gp->GetBufferPointer(), gp->GetBufferSize(), NULL, &prog_ps)))
       prog_ps = NULL;
@@ -1781,9 +1810,6 @@ static void make_pipeline(void) {
       ad_ps = NULL;
     ap->Release();
   }
-  pv->Release();
-  pp->Release();
-  ep->Release();
   ID3DBlob *rcode = compile("frect", "ps_4_0", rect_src);
   if (rcode) {
     if (FAILED(dev->CreatePixelShader(rcode->GetBufferPointer(), rcode->GetBufferSize(), NULL, &rect_ps)))
@@ -2874,7 +2900,7 @@ static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count
       if (py1 > ph) py1 = ph;
       int bw = px1 - px0, bh = py1 - py0;
       BlurLayer L = {px0, py0, bw, bh, 0, sigma, cur_rtv, cut_on, cut};
-      if (bw > 0 && bh > 0 && ensure_blur_layer(bdepth, pw, ph)) {
+      if (sigma > 0.0f && bw > 0 && bh > 0 && ensure_blur_layer(bdepth, pw, ph)) {
         static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         L.active = 1;
         ctx->ClearRenderTargetView(bl_lv[bdepth].rt, zero);

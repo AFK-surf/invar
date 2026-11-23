@@ -3181,3 +3181,130 @@ test "66 Scene::emit_cubic_bezier adaptive C1 subdivision, instance budget, and 
   }
   debug_assert(max_err <= tol, "max cubic-to-quad sampling error \{max_err} must be <= \{tol}")
 }
+
+test "67 CJK kinsoku line-breaking keeps punctuation off forbidden edges and matches measurement" {
+  // Pure predicate checks
+  debug_assert(is_cjk_no_line_start(0xFF0C), "fullwidth comma cannot start line")
+  debug_assert(is_cjk_no_line_start(0x3002), "ideographic period cannot start line")
+  debug_assert(is_cjk_no_line_start(0xFF1F), "fullwidth question mark cannot start line")
+  debug_assert(is_cjk_no_line_start(0xFF09), "fullwidth right paren cannot start line")
+  debug_assert(is_cjk_no_line_end(0xFF08), "fullwidth left paren cannot end line")
+  debug_assert(is_cjk_no_line_end(0x3010), "black lenticular left bracket cannot end line")
+  debug_assert(is_cjk_no_line_end(0x201C), "left double quote cannot end line")
+  debug_assert(!can_break_after_cp(0x4E2D, 0xFF0C), "no break before fullwidth comma")
+  debug_assert(!can_break_after_cp(0xFF08, 0x4E2D), "no break after fullwidth left paren")
+  debug_assert(can_break_after_cp(0x4E2D, 0x6587), "break allowed between CJK ideographs")
+  debug_assert(can_break_after_cp(0x4E2D, 0), "break allowed at end of line")
+
+  // Install a UTF-16-accurate shaper (10pt per CJK char, 6pt per ASCII char) on FakeHost
+  let t = Tester::tree(fn(_root : view::View) {})
+  let h = hostapi::host()
+  h.shape = fn(s : String, _size : Double, _weight : Int, _style : Int, out : Array[Double]) -> Int {
+    let cps = utf16_codepoints(s)
+    let mut u = 0
+    let mut c = 0
+    while u < cps.length() && c * 4 + 3 < out.length() {
+      let cp = cps[u]
+      let ulen = if cp >= 0x10000 { 2 } else { 1 }
+      let adv = if cp >= 128 { 10.0 } else { 6.0 }
+      out[c * 4] = u.to_double()
+      out[c * 4 + 1] = ulen.to_double()
+      out[c * 4 + 2] = if cp == 10 { 0.0 } else { adv }
+      out[c * 4 + 3] = if cp == 10 || cp == 32 || cp == 9 { -1.0 } else { (cp & 0x7FFF).to_double() }
+      u += ulen
+      c += 1
+    }
+    c
+  }
+  reset_glyph_atlas()
+
+  // 1) No-line-start punctuation (`，`, `？`, `。`, `）`) must never land at start of line 2
+  let cases_no_start : Array[String] = [
+    "你好世界，测试",
+    "你好世界？测试",
+    "你好世界。测试",
+    "你好世界）测试",
+  ]
+  for txt in cases_no_start {
+    let layout = layout_runs([text::plain(txt)], 14.0, 400, 0.0, 0, 0x111111FFL, true, 40.0, 0)
+    debug_assert(layout.lines.length() >= 2, "must wrap into >= 2 lines: \{txt}")
+    let line2_first = layout.clusters[layout.lines[1].start].cu
+    debug_assert(!is_cjk_no_line_start(line2_first), "forbidden line-start punct on line 2 for \{txt}")
+  }
+
+  // 2) No-line-end punctuation (`（`, `【`, `“`) must never be stranded at end of line 1
+  let cases_no_end : Array[String] = [
+    "你好世（测试）",
+    "你好世【测试】",
+    "你好世“测试”",
+  ]
+  for txt in cases_no_end {
+    let layout = layout_runs([text::plain(txt)], 14.0, 400, 0.0, 0, 0x111111FFL, true, 40.0, 0)
+    debug_assert(layout.lines.length() >= 2, "must wrap into >= 2 lines: \{txt}")
+    let line1_last = layout.clusters[layout.lines[0].end - 1].cu
+    debug_assert(!is_cjk_no_line_end(line1_last), "forbidden line-end punct on line 1 for \{txt}")
+  }
+
+  // 3) Mixed CJK + ASCII: host_words_measure line count matches encode_words drawn glyph rows
+  let mixed = "Hello 你好世界，测试（Invar）排版。"
+  let look = view::WordsLook::{ ..view::words_plain, size: 14.0, line: 20.0, wrap: true }
+  let (_mw, mh) = host_words_measure(mixed, look, 72.0, 1.0)
+  let measured_lines = (mh / 20.0 + 0.5).to_int()
+  let sc = Scene::new()
+  let t2 = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(72.0)))
+        .words(view::Live::Is(mixed), ink=0x111111FFL, look=look)
+    })
+  }, width=200.0, height=200.0)
+  let h2 = hostapi::host()
+  h2.shape = fn(s : String, _size : Double, _weight : Int, _style : Int, out : Array[Double]) -> Int {
+    let cps = utf16_codepoints(s)
+    let mut u = 0
+    let mut c = 0
+    while u < cps.length() && c * 4 + 3 < out.length() {
+      let cp = cps[u]
+      let ulen = if cp >= 0x10000 { 2 } else { 1 }
+      let adv = if cp >= 128 { 10.0 } else { 6.0 }
+      out[c * 4] = u.to_double()
+      out[c * 4 + 1] = ulen.to_double()
+      out[c * 4 + 2] = if cp == 10 { 0.0 } else { adv }
+      out[c * 4 + 3] = if cp == 10 || cp == 32 || cp == 9 { -1.0 } else { (cp & 0x7FFF).to_double() }
+      u += ulen
+      c += 1
+    }
+    c
+  }
+  reset_glyph_atlas()
+  let mut drawn_words : Option[view::Drawn] = None
+  for d in t2.drawn() {
+    if d.words == mixed {
+      drawn_words = Some(d)
+    }
+  }
+  match drawn_words {
+    Some(d) => {
+      let _ = encode_words(sc, d, 1.0, 0.0, 0.0, 1000.0, 1000.0)
+    }
+    None => debug_assert(false, "mixed words node must be drawn")
+  }
+  let ys : Array[Int] = []
+  let mut k = 0
+  while k < sc.ninst {
+    let row = (sc.inst[k * inst_size + 1] / 20.0).to_int()
+    let mut seen = false
+    for ry in ys {
+      if ry == row {
+        seen = true
+        break
+      }
+    }
+    if !seen {
+      ys.push(row)
+    }
+    k += 1
+  }
+  debug_assert(ys.length() == measured_lines, "encode_words rows (\{ys.length()}) must match host_words_measure lines (\{measured_lines})")
+  t2.dispose()
+  t.dispose()
+}

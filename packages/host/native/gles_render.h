@@ -3652,7 +3652,7 @@ static void draw_into(GLuint fb, int part) {
       if (pb1 > top) pb1 = top;
       int bw = px1 - px0, bh = pb1 - pb0;
       BlurLayer L = {px0, pb0, bw, bh, top, 0, sigma, target_fb, cut_on, {cut[0], cut[1], cut[2], cut[3]}};
-      if (bw > 0 && bh > 0 && ensure_blur_layer(bdepth, fb_w, fb_h)) {
+      if (sigma > 0.0f && bw > 0 && bh > 0 && ensure_blur_layer(bdepth, fb_w, fb_h)) {
         L.active = 1;
         target_fb = bl_lv[bdepth].fb;
         cut_on = 1;
