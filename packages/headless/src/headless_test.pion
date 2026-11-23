@@ -659,3 +659,449 @@ test "16 toaster lifecycle, due time, close, and choice Radio" {
   }
   tree.dispose()
 }
+
+test "17 RovingFocus public API, RTL reversal, wrap/clamp, and FocusRecovery" {
+  let show_b = signals::signal(true)
+  let off_c = signals::signal(false)
+  let rf = RovingFocus::new(axis=GroupAxis::Horizontal, roving=true, wraps=true, rtl=true)
+  let va : view::Ref[Option[view::View]] = view::ref_new(None)
+  let vb : view::Ref[Option[view::View]] = view::ref_new(None)
+  let vc : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.box(fn(bar : view::View) {
+      let a = bar.box(fn(v : view::View) {
+        let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+      })
+      rf.add(a)
+      va.v = Some(a)
+      bar.show(fn() -> Bool { show_b.get() }, fn(s : view::View) {
+        let b = s.box(fn(v : view::View) {
+          let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+        })
+        rf.add(b)
+        vb.v = Some(b)
+      }, at_once=true)
+      let c = bar.box(fn(v : view::View) {
+        let able = fn() -> Bool { !off_c.get() }
+        let _ = v.presses(view::Live::By(able)).focusable(view::Live::By(able), keys=view::focus_enter)
+      })
+      rf.add(c, off=fn() -> Bool { off_c.get() })
+      vc.v = Some(c)
+      let _ = bar.on_key(fn(k : view::Key) -> Bool {
+        if k.mods != 0 { return false }
+        rf.step(k.code) is Some(_)
+      })
+    })
+  })
+  let _ = tree.frame(300.0, 100.0, now=0.0)
+  let na = match va.v { Some(x) => x; None => panic("missing a") }
+  let nb = match vb.v { Some(x) => x; None => panic("missing b") }
+  let nc = match vc.v { Some(x) => x; None => panic("missing c") }
+
+  assert(rf.live().length() == 3, "3 live items")
+  assert(rf.focus_stop() && na.focused(), "focus_stop focuses first")
+  // RTL: Left (3) moves forward (a -> b -> c -> a), Right (4) moves backward
+  assert(tree.key_at(3, 0, 16.0) && nb.focused(), "RTL Left moves a -> b")
+  assert(tree.key_at(3, 0, 32.0) && nc.focused(), "RTL Left moves b -> c")
+  assert(tree.key_at(3, 0, 48.0) && na.focused(), "RTL Left wraps c -> a")
+  assert(tree.key_at(4, 0, 64.0) && nc.focused(), "RTL Right wraps a -> c")
+  assert(rf.focus_first() && na.focused(), "focus_first -> a")
+  assert(rf.focus_last() && nc.focused(), "focus_last -> c")
+
+  // FocusRecovery on disable: disable c while focused -> moves to neighbor b
+  off_c.set(true)
+  let _ = tree.frame(300.0, 100.0, now=80.0)
+  assert(nb.focused(), "FocusRecovery handed focus from disabled c to neighbor b")
+
+  // FocusRecovery on unmount: unmount b while focused -> moves to surviving neighbor a
+  show_b.set(false)
+  let _ = tree.frame(300.0, 100.0, now=96.0)
+  assert(na.focused(), "FocusRecovery handed focus from unmounted b to surviving a")
+  tree.dispose()
+}
+
+test "18 Typeahead prefix match, repeated-key cycling, window reset, and reset()" {
+  let ta = Typeahead::new(window_ms=500.0)
+  let labels = ["Apple", "Apricot", "Banana", "Blueberry"]
+  let text_of = fn(i : Int) -> String { labels[i] }
+
+  // 'b' matches Banana (2)
+  assert(opt_int_is(ta.match_next('b', 100.0, 4, None, text_of), 2), "b -> Banana")
+  // 'l' within 500ms builds "bl" -> Blueberry (3)
+  assert(opt_int_is(ta.match_next('l', 250.0, 4, Some(2), text_of), 3), "bl -> Blueberry")
+  // After window expires (>500ms), 'a' starts fresh -> Apple (0)
+  assert(opt_int_is(ta.match_next('a', 900.0, 4, Some(3), text_of), 0), "a after timeout -> Apple")
+  // Repeating 'a' cycles from 0 -> Apricot (1)
+  assert(opt_int_is(ta.match_next('a', 1000.0, 4, Some(0), text_of), 1), "aa cycles -> Apricot")
+  // reset() clears buffer
+  ta.reset()
+  assert(opt_int_is(ta.match_next('a', 1050.0, 4, Some(1), text_of), 0), "after reset, a cycles -> Apple")
+}
+
+test "19 FocusRecovery standalone track on unmount, disable, and normal blur" {
+  let show_a = signals::signal(true)
+  let off_b = signals::signal(false)
+  let rec = FocusRecovery::new()
+  let va : view::Ref[Option[view::View]] = view::ref_new(None)
+  let vb : view::Ref[Option[view::View]] = view::ref_new(None)
+  let vc : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    root.show(fn() -> Bool { show_a.get() }, fn(s : view::View) {
+      let a = s.box(fn(v : view::View) {
+        let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+      })
+      va.v = Some(a)
+      rec.track(a, fn() -> Option[view::View] { vb.v })
+    }, at_once=true)
+    let b = root.box(fn(v : view::View) {
+      let able = fn() -> Bool { !off_b.get() }
+      let _ = v.presses(view::Live::By(able)).focusable(view::Live::By(able), keys=view::focus_enter)
+    })
+    vb.v = Some(b)
+    rec.track(b, fn() -> Option[view::View] { vc.v }, off=fn() -> Bool { off_b.get() })
+    let c = root.box(fn(v : view::View) {
+      let _ = v.presses(view::Live::Is(true)).focusable(view::Live::Is(true), keys=view::focus_enter)
+    })
+    vc.v = Some(c)
+  })
+  let _ = tree.frame(200.0, 100.0, now=0.0)
+  let na = match va.v { Some(x) => x; None => panic("missing a") }
+  let nb = match vb.v { Some(x) => x; None => panic("missing b") }
+  let nc = match vc.v { Some(x) => x; None => panic("missing c") }
+
+  // Normal focus move from a -> c should NOT trigger recovery back to b
+  assert(na.ask_focus(visible=true) && na.focused(), "a focused")
+  assert(nc.ask_focus(visible=true) && nc.focused() && !nb.focused(), "normal blur does not recover")
+
+  // Unmount a while focused -> recovers to b
+  assert(na.ask_focus(visible=true) && na.focused(), "a focused again")
+  show_a.set(false)
+  let _ = tree.frame(200.0, 100.0, now=16.0)
+  assert(nb.focused(), "unmounting a recovered focus to b")
+
+  // Disable b while focused -> recovers to c
+  off_b.set(true)
+  let _ = tree.frame(200.0, 100.0, now=32.0)
+  assert(nc.focused(), "disabling b recovered focus to c")
+  tree.dispose()
+}
+
+test "20 SelectionModel[K] and Listbox multi-select Shift+Arrow, Shift+Click, Ctrl/Cmd+A" {
+  let sm : SelectionModel[String] = SelectionModel::new(multiple=true)
+  let order = ["a", "b", "c", "d"]
+  let s1 = sm.toggle([], "b")
+  assert(s1.length() == 1 && s1[0] == "b", "toggle adds b")
+  let anchor_ok = match sm.anchor() {
+    Some(a) => a == "b"
+    None => false
+  }
+  assert(anchor_ok, "anchor set to b")
+  let s2 = sm.select_range(order, "d")
+  assert(s2.length() == 3 && s2[0] == "b" && s2[1] == "c" && s2[2] == "d", "select_range b..d")
+  let s3 = sm.toggle(s2, "c")
+  assert(s3.length() == 2 && s3[0] == "b" && s3[1] == "d", "toggle removes c")
+  let s4 = sm.select_all(order)
+  assert(s4.length() == 4, "select_all returns all 4")
+  let s5 = sm.clear()
+  assert(s5.length() == 0 && sm.anchor() is None, "clear empties and resets anchor")
+
+  // Listbox multi-select integration
+  let selected : view::Ref[Array[String]] = view::ref_new([])
+  let shift_on = view::ref_new(false)
+  let o1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let o2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let o3 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let o4 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let has_key = fn(k : String) -> Bool { str_array_contains(selected.v, k) }
+  let tree = make_tree(fn(root : view::View) {
+    let _ = listbox(
+      root,
+      fn() -> String { "Items" },
+      has_key,
+      fn(k : String) {
+        if str_array_contains(selected.v, k) {
+          view::array_retain(selected.v, fn(x : String) -> Bool { x != k })
+        } else {
+          selected.v.push(k)
+        }
+      },
+      fn(v : view::View, lb : Listbox[String]) {
+        o1.v = Some(lb.option(v, "a", fn() -> String { "Alpha" }, fn(_n : view::View, _o : ListOption) { () }))
+        o2.v = Some(lb.option(v, "b", fn() -> String { "Beta" }, fn(_n : view::View, _o : ListOption) { () }))
+        o3.v = Some(lb.option(v, "c", fn() -> String { "Gamma" }, fn(_n : view::View, _o : ListOption) { () }))
+        o4.v = Some(lb.option(v, "d", fn() -> String { "Delta" }, fn(_n : view::View, _o : ListOption) { () }))
+      },
+      multiple=true,
+      on_select_many=fn(ks : Array[String]) { selected.v = ks },
+      shift_held=fn() -> Bool { shift_on.v },
+    )
+  })
+  let _ = tree.frame(200.0, 200.0, now=0.0)
+  let v1 = match o1.v { Some(x) => x; None => panic("o1") }
+  let v3 = match o3.v { Some(x) => x; None => panic("o3") }
+  let v4 = match o4.v { Some(x) => x; None => panic("o4") }
+
+  // Focus & press item 1 (sets anchor = a)
+  let _ = v1.ask_focus(visible=true)
+  let _ = v1.press()
+  assert(selected.v.length() == 1 && has_key("a"), "press selected a")
+
+  // Shift+Down twice -> range a..c
+  assert(tree.key_at(6, 1, 16.0), "Shift+Down 1")
+  assert(selected.v.length() == 2 && has_key("a") && has_key("b"), "Shift+Down selected a,b")
+  assert(tree.key_at(6, 1, 32.0), "Shift+Down 2")
+  assert(selected.v.length() == 3 && has_key("a") && has_key("b") && has_key("c"), "Shift+Down selected a,b,c")
+  assert(v3.focused(), "focus on c")
+
+  // Shift+Click on item 4 -> range a..d
+  shift_on.v = true
+  let _ = v4.press()
+  shift_on.v = false
+  assert(selected.v.length() == 4 && has_key("d"), "Shift+Click extended range to a..d")
+
+  // Reset and test Ctrl+A
+  selected.v = []
+  assert(tree.key_at(1000 + 97, 2, 48.0), "Ctrl+A handled")
+  assert(selected.v.length() == 4, "Ctrl+A selected all 4")
+  tree.dispose()
+}
+
+test "21 repeat_hold frame-rate-independent scheduling and auto-cancel" {
+  let ticks = view::ref_new(0)
+  let off = signals::signal(false)
+  let show_btn = signals::signal(true)
+  let btn_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    root.show(fn() -> Bool { show_btn.get() }, fn(s : view::View) {
+      let b = s.box(fn(v : view::View) {
+        let able = fn() -> Bool { !off.get() }
+        let _ = v
+          .width(view::Live::Is(Some(80.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .presses(view::Live::By(able))
+        let _ = repeat_hold(v, fn() { ticks.v = ticks.v + 1 }, delay_ms=400.0, interval_ms=70.0, disabled=fn() -> Bool { off.get() })
+      })
+      btn_ref.v = Some(b)
+    }, at_once=true)
+  })
+  let _ = tree.frame(200.0, 100.0, now=100.0)
+  let btn = match btn_ref.v { Some(x) => x; None => panic("missing btn") }
+  // Hold down at t=100ms
+  tree.hold_press(btn.id())
+  // Before 400ms delay (t=499ms): 0 ticks
+  let _ = tree.frame(200.0, 100.0, now=499.0)
+  assert(ticks.v == 0, "no fire before delay_ms")
+  // At t=500ms (100 + 400): 1st fire
+  let _ = tree.frame(200.0, 100.0, now=500.0)
+  assert(ticks.v == 1, "fires once at delay_ms")
+  // At t=570ms: 2nd fire; at t=640ms: 3rd fire
+  let _ = tree.frame(200.0, 100.0, now=570.0)
+  assert(ticks.v == 2, "fires at +70ms")
+  let _ = tree.frame(200.0, 100.0, now=640.0)
+  assert(ticks.v == 3, "fires at +140ms")
+  // Release pointer -> cancels
+  let _ = tree.press_held(btn.id())
+  let _ = tree.frame(200.0, 100.0, now=900.0)
+  assert(ticks.v == 3, "release cancels repeat_hold")
+
+  // Hold again at t=1000ms, then disable -> cancels
+  let _ = tree.frame(200.0, 100.0, now=1000.0)
+  tree.hold_press(btn.id())
+  let _ = tree.frame(200.0, 100.0, now=1400.0)
+  assert(ticks.v == 4, "fires after second hold")
+  off.set(true)
+  let _ = tree.frame(200.0, 100.0, now=1600.0)
+  assert(ticks.v == 4, "disable cancels repeat_hold")
+  let _ = tree.press_held(btn.id())
+  off.set(false)
+  let _ = tree.frame(200.0, 100.0, now=1700.0)
+
+  // Hold again at t=1700ms, then unmount -> cancels
+  tree.hold_press(btn.id())
+  let _ = tree.frame(200.0, 100.0, now=2100.0)
+  assert(ticks.v == 5, "fires before unmount")
+  show_btn.set(false)
+  let _ = tree.frame(200.0, 100.0, now=2300.0)
+  assert(ticks.v == 5, "unmount cancels repeat_hold")
+  tree.dispose()
+}
+
+test "22 nested Dialog + Popover overlay_stack Escape and outside-press isolation" {
+  let dlg_open = signals::signal(true)
+  let pop_open = signals::signal(false)
+  let pop = Popover::new(fn() -> Bool { pop_open.get() }, fn(b : Bool) { pop_open.set(b) })
+  let trig_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = dialog(
+      root,
+      fn() -> String { "Settings Dialog" },
+      fn() -> Bool { dlg_open.get() },
+      fn() { dlg_open.set(false) },
+      fn(dv : view::View, _d : Dialog) {
+        let _ = dv.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(200.0)))
+        trig_ref.v = Some(pop.trigger(dv, fn() -> String { "Options" }, fn(tv : view::View, _ds : Disclosure) {
+          let _ = tv.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(30.0)))
+        }))
+        pop.layer(dv, fn() -> String { "Options Popover" }, fn(pv : view::View, _op : Option[view::View]) {
+          let _ = pv.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(60.0)))
+        }, at_once=true)
+      },
+      modal=true,
+    )
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  assert(overlays_open(tree) == 1, "dialog open -> 1 overlay")
+  let trig = match trig_ref.v { Some(x) => x; None => panic("missing trigger") }
+
+  // Open Popover inside Dialog
+  let _ = trig.press()
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+  assert(dlg_open.get() && pop_open.get(), "both dialog and popover open")
+  assert(overlays_open(tree) == 2, "dialog + popover -> 2 overlays")
+
+  // 1st Escape closes ONLY Popover; Dialog stays open
+  assert(tree.key_at(17, 0, 32.0), "1st Escape handled")
+  let _ = tree.frame(400.0, 300.0, now=32.0)
+  assert(!pop_open.get(), "1st Escape closed Popover")
+  assert(dlg_open.get(), "Dialog stayed open after 1st Escape")
+  assert(overlays_open(tree) == 1, "1 overlay remaining")
+
+  // Re-open Popover, then click inside Dialog (outside Popover & trigger) -> closes ONLY Popover
+  let _ = trig.press()
+  let _ = tree.frame(400.0, 300.0, now=48.0)
+  assert(pop_open.get() && overlays_open(tree) == 2, "popover re-opened")
+  // Dialog is 300x200 at (0,0); trigger is at top (80x30), popover below it (100x60); (250, 150) is inside Dialog, outside Popover
+  tree.went_down(64.0, x=250.0, y=150.0)
+  let _ = tree.frame(400.0, 300.0, now=64.0)
+  assert(!pop_open.get(), "outside click inside Dialog closed Popover")
+  assert(dlg_open.get(), "Dialog stayed open when clicking inside Dialog")
+
+  // 2nd Escape closes Dialog
+  assert(tree.key_at(17, 0, 80.0), "2nd Escape handled")
+  let _ = tree.frame(400.0, 300.0, now=80.0)
+  assert(!dlg_open.get(), "2nd Escape closed Dialog")
+  assert(overlays_open(tree) == 0, "0 overlays open")
+  tree.dispose()
+}
+
+test "23 RTL navigation across slider, submenu, radio_group, tabs, and toggle_group" {
+  let sval = signals::signal(50.0)
+  let sub_open = signals::signal(false)
+  let cur_tab = signals::signal("a")
+  let cur_tg = signals::signal(1)
+  let sl_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let sub_trig_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tab_a : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tab_b : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tg1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tg2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let sub = Submenu::new(fn() -> Bool { sub_open.get() }, fn(b : Bool) { sub_open.set(b) })
+  let tabs = Tabs::new(fn() -> String { cur_tab.get() }, fn(k : String) { cur_tab.set(k) }, rtl=true)
+  let tree = make_tree(fn(root : view::View) {
+    sl_ref.v = Some(slider(
+      root,
+      fn() -> String { "RTL Volume" },
+      fn() -> Double { sval.get() },
+      min=0.0,
+      max=100.0,
+      step=10.0,
+      fn(next : Double) { sval.set(next) },
+      fn(_v : view::View, _s : Slider) { () },
+      rtl=true,
+    ))
+    let _ = menu(root, fn(v : view::View, m : Menu) {
+      sub_trig_ref.v = Some(m.sub_trigger(v, sub, fn() -> String { "More" }, fn(_n : view::View, _mi : MenuItem) { () }, rtl=true))
+    })
+    root.show(fn() -> Bool { sub_open.get() }, fn(s : view::View) {
+      let _ = sub.menu(s, fn(v : view::View, m : Menu) {
+        let _ = m.item(v, fn() -> String { "Sub1" }, fn(_n : view::View) { () }, fn(_n : view::View, _mi : MenuItem) { () })
+      }, rtl=true)
+    }, at_once=true)
+    let _ = tabs.list(root, fn() -> String { "RTL Tabs" }, fn(v : view::View, rg : RadioGroup[String]) {
+      tab_a.v = Some(rg.item(v, fn() -> String { "a" }, fn() -> String { "First" }, fn(_n : view::View, _r : RadioItem) { () }))
+      tab_b.v = Some(rg.item(v, fn() -> String { "b" }, fn() -> String { "Second" }, fn(_n : view::View, _r : RadioItem) { () }))
+    })
+    let _ = toggle_group(
+      root,
+      fn() -> String { "RTL Align" },
+      fn(k : Int) -> Bool { cur_tg.get() == k },
+      fn(k : Int, on : Bool) { cur_tg.set(if on { k } else { 0 }) },
+      fn(v : view::View, g : ToggleGroup[Int]) {
+        tg1.v = Some(g.item(v, 1, fn() -> String { "Start" }, fn(_n : view::View, _t : Toggle) { () }))
+        tg2.v = Some(g.item(v, 2, fn() -> String { "End" }, fn(_n : view::View, _t : Toggle) { () }))
+      },
+      rtl=true,
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+
+  // Slider RTL: Left (3) increments, Right (4) decrements
+  let sl = match sl_ref.v { Some(x) => x; None => panic("sl") }
+  let _ = sl.ask_focus(visible=true)
+  assert(tree.key_at(3, 0, 16.0) && sval.get() == 60.0, "RTL slider Left increments")
+  assert(tree.key_at(4, 0, 32.0) && sval.get() == 50.0, "RTL slider Right decrements")
+
+  // Submenu RTL: Left (3) opens, Right (4) closes
+  let st = match sub_trig_ref.v { Some(x) => x; None => panic("st") }
+  let _ = st.ask_focus(visible=true)
+  assert(tree.key_at(3, 0, 48.0) && sub_open.get(), "RTL submenu Left opens")
+  let _ = tree.frame(300.0, 200.0, now=48.0)
+  assert(tree.key_at(4, 0, 64.0) && !sub_open.get(), "RTL submenu Right closes")
+
+  // Tabs / RadioGroup RTL: Left (3) moves First -> Second
+  let ta = match tab_a.v { Some(x) => x; None => panic("ta") }
+  let tb = match tab_b.v { Some(x) => x; None => panic("tb") }
+  let _ = ta.ask_focus(visible=true)
+  assert(tree.key_at(3, 0, 80.0) && tb.focused() && cur_tab.get() == "b", "RTL tabs Left -> Second")
+
+  // ToggleGroup RTL: Left (3) moves Start -> End
+  let g1 = match tg1.v { Some(x) => x; None => panic("g1") }
+  let g2 = match tg2.v { Some(x) => x; None => panic("g2") }
+  let _ = g1.ask_focus(visible=true)
+  assert(tree.key_at(3, 0, 96.0) && g2.focused(), "RTL toggle_group Left -> End")
+  tree.dispose()
+}
+
+test "24 Toolbar Role::Toolbar, roving focus, RTL, and FocusRecovery" {
+  let pressed = view::ref_new("")
+  let show_mid = signals::signal(true)
+  let tb_ref : view::Ref[Option[Toolbar]] = view::ref_new(None)
+  let b1 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let b2 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let b3 : view::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = make_tree(fn(root : view::View) {
+    let _ = toolbar(
+      root,
+      fn() -> String { "Formatting" },
+      fn(v : view::View, tb : Toolbar) {
+        tb_ref.v = Some(tb)
+        b1.v = Some(tb.item(v, fn() -> String { "Bold" }, fn(_n : view::View) { pressed.v = "Bold" }, fn(_n : view::View, _b : Button) { () }))
+        v.show(fn() -> Bool { show_mid.get() }, fn(s : view::View) {
+          b2.v = Some(tb.item(s, fn() -> String { "Italic" }, fn(_n : view::View) { pressed.v = "Italic" }, fn(_n : view::View, _b : Button) { () }))
+        }, at_once=true)
+        b3.v = Some(tb.item(v, fn() -> String { "Underline" }, fn(_n : view::View) { pressed.v = "Underline" }, fn(_n : view::View, _b : Button) { () }))
+      },
+    )
+  })
+  let _ = tree.frame(300.0, 100.0, now=0.0)
+  let tb = match tb_ref.v { Some(x) => x; None => panic("missing tb") }
+  let n1 = match b1.v { Some(x) => x; None => panic("missing b1") }
+  let n2 = match b2.v { Some(x) => x; None => panic("missing b2") }
+  let n3 = match b3.v { Some(x) => x; None => panic("missing b3") }
+
+  match said_of(tree, tb.node().id()) {
+    Some(s) => assert(s.role == view::Role::Toolbar && s.label == "Formatting", "Toolbar role and label")
+    None => panic("missing toolbar said")
+  }
+  assert(!tb.disabled(), "toolbar enabled")
+  assert(tree.focus_order().length() == 1, "single roving Tab stop in Toolbar")
+  assert(tb.focus_stop() && n1.focused(), "focus_stop focuses Bold")
+  assert(tree.key_at(4, 0, 16.0) && n2.focused(), "Right -> Italic")
+  let _ = n2.press()
+  assert(pressed.v == "Italic", "pressing Italic invokes callback")
+  // Unmount Italic while focused -> FocusRecovery hands focus to Underline
+  show_mid.set(false)
+  let _ = tree.frame(300.0, 100.0, now=32.0)
+  assert(n3.focused(), "FocusRecovery moved focus to Underline")
+  tree.dispose()
+}
