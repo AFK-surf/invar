@@ -49,9 +49,9 @@ pub fn liquid_segmented_node(
       .padding(view::Live::Is((ctrl_seg_pad, 0.0, ctrl_seg_pad, 0.0)))
       .radius(view::Live::Is(outer_r))
       if is_flat {
-        // Flat: unified Apple Content Layer recessed track (zero glass instances).
+        // Flat: Native iOS 27 tertiarySystemFill recessed track (zero resting glass).
         let _ = g
-        .ground(view::Live::By(ctrl_recessed_fill))
+        .ground(view::Live::By(ctrl_seg_flat_track_fill))
         .edge(view::Live::By(ctrl_recessed_edge))
       } else {
         let _ = g.edge(view::Live::By(fn() {
@@ -97,6 +97,9 @@ pub fn liquid_segmented_node(
         }
       })
       let _ = g.by_room(fn(inner : view::View, room : view::Room) -> Unit {
+        let no_lens = fn() -> Bool { inner.glass_solid() || ui::glass_solid() || ui::reduced_motion() }
+        let lens = fn(n : view::View) -> Double { if no_lens() { 0.0 } else { dd.pressed(n) } }
+        let holding : signals::Signal[Bool] = signals::signal(false)
         let count_fn = fn() -> Int {
           let n = labels().length()
           if n > 0 { n } else { 1 }
@@ -108,7 +111,7 @@ pub fn liquid_segmented_node(
         let seg_w = fn() -> Double { room.width() / count_fn().to_double() }
         let thumb_shape = fn(n : view::View) -> view::GroundShape {
           let sw = seg_w()
-          let (sx, sy) = dd.jelly(n, 10.0)
+          let (sx, sy) = if no_lens() { (1.0, 1.0) } else { dd.jelly(n, 10.0) }
           let tw = dmax(0.0, sw + dmin(sw * (sx - 1.0), ctrl_seg_max_grow_x))
           let th = inner_h * sy
           let r = th / 2.0
@@ -141,7 +144,7 @@ pub fn liquid_segmented_node(
             .edge(view::Live::By(fn() {
               if is_dark() { (0.5, 0xFFFFFF18L) } else { (0.5, 0x0000000FL) }
             }))
-            .alpha(view::Live::By(fn() { if is_flat { 1.0 } else { 1.0 - clamp(dd.pressed(pill), 0.0, 1.0) } }))
+            .alpha(view::Live::By(fn() { clamp(1.0 - clamp(lens(pill), 0.0, 1.0) * 1.6, 0.0, 1.0) }))
             .ground_drawn(view::Live::By(fn() { thumb_shape(pill) }))
           })
         })
@@ -158,17 +161,21 @@ pub fn liquid_segmented_node(
           let i = to.to_int()
           current.v = i
           dd.update_value(to)
-          dd.release()
+          if lifted.v {
+            dd.release()
+          }
           if i != signals::untracked(selected) {
             on_select(i)
           }
           lifted.v = false
+          holding.set(false)
         }
         let on_drag = fn(d : view::Drag) -> Unit {
           match d.kind {
             Down => {
-              if !lifted.v {
+              if !lifted.v && !no_lens() {
                 lifted.v = true
+                holding.set(true)
                 dd.press()
               }
               dd.update_value(pos_at(d.wx))
@@ -252,23 +259,25 @@ pub fn liquid_segmented_node(
                       ui::touch_slop(),
                       press=fn(d : view::Drag) -> Unit {
                         strip_origin_x.v = d.wx - d.x - idx_f * seg_w()
-                        lifted.v = false
                         pressed_idx.v = idx
-                      },
-                      hold=(
-                        200.0,
-                        fn(d : view::Drag) -> Unit {
-                          if !lifted.v {
-                            lifted.v = true
-                            dd.press()
-                          }
+                        if !no_lens() {
+                          lifted.v = true
+                          holding.set(true)
+                          dd.press()
                           dd.update_value(pos_at(d.wx))
-                        },
-                      ),
+                        } else {
+                          lifted.v = false
+                        }
+                      },
                       tap=fn(_d : view::Drag) -> Unit {
                         let i = pressed_idx.v
                         current.v = i
                         dd.slide_to(i.to_double())
+                        if lifted.v {
+                          dd.release()
+                          lifted.v = false
+                          holding.set(false)
+                        }
                         if i != signals::untracked(selected) {
                           on_select(i)
                         }
@@ -290,41 +299,69 @@ pub fn liquid_segmented_node(
             at_once=true,
           )
         })
-        // Mount the clear refraction loupe AFTER `row` so dragging magnifies and refracts
-        // segment labels underneath (iOS 26/27 optical Z-order, calibrated bezel to avoid ghosting).
-        // Flat mode never mounts the loupe, so it stays glass-free at rest and while dragging.
-        if !is_flat {
-          let _ = inner.box(fn(gl : view::View) -> Unit {
+        let lens_shape = fn(n : view::View) -> view::GroundShape {
+          let sw = seg_w()
+          let p = clamp(lens(n), 0.0, 1.0)
+          let v = if no_lens() { 0.0 } else { dd.velocity(n) / 10.0 }
+          let stretch_x = 1.0 / (1.0 - clamp(v * 0.75, -0.2, 0.2))
+          let stretch_y = 1.0 - clamp(v * 0.25, -0.2, 0.2)
+          let base_lw = sw + lerp(0.0, 20.0, p)
+          let base_lh = lerp(inner_h, height + 12.0, p)
+          let tw = dmax(0.0, sw + dmin(base_lw * stretch_x - sw, ctrl_seg_max_grow_x))
+          let th = base_lh * stretch_y
+          let r = th / 2.0
+          view::GroundShape::{
+            dx: dd.value(n) * sw + (sw - tw) / 2.0,
+            dy: (height - th) / 2.0,
+            dw: tw - sw,
+            dh: th - inner_h,
+            corners: Some((r, r, r, r)),
+          }
+        }
+        // Lazy-mount the clear refraction loupe AFTER `row` on first press so dragging magnifies and
+        // refracts segment labels underneath (iOS 26/27 optical Z-order) while keeping 0 glass at rest.
+        let lens_mounted : signals::Signal[Bool] = signals::signal(false)
+        inner.reacts(fn() { !no_lens() && (holding.get() || dd.pressed(inner) > 0.001) }, fn(active : Bool) -> Unit {
+          if active && !lens_mounted.untracked() {
+            lens_mounted.set(true)
+          }
+        })
+        inner.show(
+          fn() { lens_mounted.get() },
+          fn(gl : view::View) -> Unit {
+            let full = fn() -> Double { clamp(lens(gl), 0.0, 1.0) }
             let _ = gl
             .over(view::Live::Is(true))
             .points(view::Live::Is(false))
             .width(view::Live::By(fn() { Some(seg_w()) }))
             .height(view::Live::Is(Some(inner_h)))
             .radius(view::Live::Is(inner_r))
-            .shadow(view::Live::Is(shadow_thumb))
+            .shadow(view::Live::By(fn() { lg_seg_lens_shadow(full()) }))
             .shadow_outside(view::Live::Is(true))
             .glass(view::Live::By(fn() {
-              let p = dd.pressed(gl)
+              let p = full()
               if p > 0.001 {
                 Some(
                   lg_clear_lens_glass(
                     p,
-                    bezel=8.0,
-                    refraction=8.5,
-                    chroma=-0.03,
-                    zoom_add=0.12,
-                    rim_max=0.6,
-                    solid=alpha(colors().container, 1.0 / 0.4),
+                    bezel=9.0,
+                    refraction=9.0,
+                    chroma=0.04,
+                    zoom_add=0.0,
+                    rim_max=1.0,
+                    tint=0xFFFFFF00L,
+                    solid=ctrl_seg_thumb_idle(),
                   ),
                 )
               } else {
                 None
               }
             }))
-            .alpha(view::Live::By(fn() { clamp(dd.pressed(gl), 0.0, 1.0) }))
-            .ground_drawn(view::Live::By(fn() { thumb_shape(gl) }))
-          })
-        }
+            .alpha(view::Live::By(full))
+            .ground_drawn(view::Live::By(fn() { lens_shape(gl) }))
+          },
+          at_once=true,
+        )
       })
     },
   )
