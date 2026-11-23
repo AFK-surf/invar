@@ -1,7 +1,8 @@
 // Headless Drawer / Sheet gesture state machine: unified onto `overlay` stack (`join_overlay` / `wire_overlay`),
 // `DrawerEdge`, multi-point `snap_points`, velocity-threshold dismiss, and `can_drag` scroll-handoff guard.
+// Pure drag/snap state machine delegated to `headless_core::DrawerSnapCore`.
 
-import "dmath"
+import "headless_core"
 import "signals"
 import "view"
 
@@ -14,6 +15,15 @@ pub enum DrawerEdge {
   Right
 }
 
+fn to_core_drawer_edge(edge : DrawerEdge) -> headless_core::DrawerEdge {
+  match edge {
+    Bottom => headless_core::DrawerEdge::Bottom
+    Top => headless_core::DrawerEdge::Top
+    Left => headless_core::DrawerEdge::Left
+    Right => headless_core::DrawerEdge::Right
+  }
+}
+
 /// Drawer / Sheet handle passed to its look.
 pub struct Drawer {
   node : view::View
@@ -21,14 +31,9 @@ pub struct Drawer {
   edge_ : DrawerEdge
   now : () -> Bool
   close_fn : () -> Unit
-  snap_points : Array[Double]
   active_snap : () -> Int
   on_snap : Option[(Int) -> Unit]
-  close_threshold : Double
-  velocity_threshold : Double
-  can_drag : () -> Bool
-  dragging_sig : signals::Signal[Bool]
-  drag_offset_sig : signals::Signal[Double]
+  core : headless_core::DrawerSnapCore
 }
 
 pub fn Drawer::open(self : Drawer) -> Bool {
@@ -44,38 +49,24 @@ pub fn Drawer::overlay(self : Drawer) -> Overlay {
 }
 
 pub fn Drawer::dragging(self : Drawer) -> Bool {
-  self.dragging_sig.get()
+  self.core.dragging()
 }
 
 pub fn Drawer::drag_offset(self : Drawer) -> Double {
-  self.drag_offset_sig.get()
+  self.core.drag_offset()
 }
 
 pub fn Drawer::snap_index(self : Drawer) -> Int {
-  let n = self.snap_points.length()
-  if n == 0 {
-    return 0
-  }
-  let idx = (self.active_snap)()
-  if idx < 0 { 0 } else if idx >= n { n - 1 } else { idx }
+  self.core.clamp_snap_index((self.active_snap)())
 }
 
 pub fn Drawer::snap_fraction(self : Drawer) -> Double {
-  let n = self.snap_points.length()
-  if n == 0 {
-    return 1.0
-  }
-  self.snap_points[self.snap_index()]
+  self.core.snap_fraction((self.active_snap)())
 }
 
 pub fn Drawer::snap_to(self : Drawer, idx : Int) -> Unit {
-  let n = self.snap_points.length()
-  if n == 0 {
-    return
-  }
-  let clamped = if idx < 0 { 0 } else if idx >= n { n - 1 } else { idx }
-  self.drag_offset_sig.set(0.0)
-  self.dragging_sig.set(false)
+  let clamped = self.core.clamp_snap_index(idx)
+  self.core.reset_drag()
   match self.on_snap {
     Some(f) => f(clamped)
     None => ()
@@ -83,101 +74,35 @@ pub fn Drawer::snap_to(self : Drawer, idx : Int) -> Unit {
 }
 
 pub fn Drawer::close(self : Drawer) -> Unit {
-  self.drag_offset_sig.set(0.0)
-  self.dragging_sig.set(false)
+  self.core.reset_drag()
   (self.close_fn)()
 }
 
 fn Drawer::attach_drag(self : Drawer, target : view::View) -> Unit {
-  let active = view::ref_new(false)
-  let start_wx = view::ref_new(0.0)
-  let start_wy = view::ref_new(0.0)
   let _ = target.on_drag(fn(d : view::Drag) {
     if !signals::untracked(self.now) {
       return
     }
     match d.kind {
       Down => {
-        if !signals::untracked(self.can_drag) {
-          active.v = false
-          return
-        }
-        active.v = true
-        start_wx.v = d.wx
-        start_wy.v = d.wy
-        self.dragging_sig.set(true)
-        self.drag_offset_sig.set(0.0)
+        let _ = self.core.on_down(d.wx, d.wy)
       }
       Moved => {
-        if !active.v {
-          return
-        }
-        if !signals::untracked(self.can_drag) {
-          active.v = false
-          self.dragging_sig.set(false)
-          self.drag_offset_sig.set(0.0)
-          return
-        }
-        let delta = match self.edge_ {
-          Bottom => d.wy - start_wy.v
-          Top => start_wy.v - d.wy
-          Left => start_wx.v - d.wx
-          Right => d.wx - start_wx.v
-        }
-        self.drag_offset_sig.set(delta)
+        let _ = self.core.on_move(d.wx, d.wy)
       }
       Up => {
-        if !active.v {
-          return
-        }
-        active.v = false
-        let offset = self.drag_offset_sig.untracked()
-        self.dragging_sig.set(false)
-        self.drag_offset_sig.set(0.0)
-        let close_vel = match self.edge_ {
-          Bottom => d.vy()
-          Top => -d.vy()
-          Left => -d.vx()
-          Right => d.vx()
-        }
-        if close_vel >= self.velocity_threshold {
-          self.close()
-          return
-        }
         let (_, _, rw, rh) = self.node.rect()
         let extent = match self.edge_ {
           Bottom | Top => if rh > 0.0 { rh } else if d.h > 0.0 { d.h } else { 300.0 }
           Left | Right => if rw > 0.0 { rw } else if d.w > 0.0 { d.w } else { 300.0 }
         }
-        let cur_frac = self.snap_fraction()
-        let next_frac = cur_frac - offset / extent
-        if next_frac < self.close_threshold {
-          self.close()
-          return
-        }
-        let n = self.snap_points.length()
-        if n > 0 {
-          let mut best_i = 0
-          let mut best_d = dmath::abs(next_frac - self.snap_points[0])
-          let mut i = 1
-          while i < n {
-            let dist = dmath::abs(next_frac - self.snap_points[i])
-            if dist < best_d {
-              best_d = dist
-              best_i = i
-            }
-            i += 1
-          }
-          self.snap_to(best_i)
+        match self.core.on_up(d.vx(), d.vy(), extent, self.snap_index()) {
+          Some(headless_core::DrawerResolution::Close) => self.close()
+          Some(headless_core::DrawerResolution::Snap(idx)) => self.snap_to(idx)
+          None => ()
         }
       }
-      Off => {
-        if active.v {
-          active.v = false
-          self.dragging_sig.set(false)
-          self.drag_offset_sig.set(0.0)
-        }
-      }
+      Off => self.core.on_cancel()
     }
   }, captures=true)
 }
@@ -227,7 +152,13 @@ pub fn drawer(
   made_for? : String,
   loc~ : String = "",
 ) -> view::View {
-  let snaps = if snap_points.length() > 0 { snap_points.copy() } else { [1.0] }
+  let core = headless_core::DrawerSnapCore::new(
+    edge=to_core_drawer_edge(edge),
+    snap_points=snap_points,
+    close_threshold=close_threshold,
+    velocity_threshold=velocity_threshold,
+    can_drag=can_drag,
+  )
   parent.box(fn(v : view::View) {
     let close = fn() {
       if signals::untracked(open) {
@@ -249,14 +180,9 @@ pub fn drawer(
       edge_: edge,
       now: open,
       close_fn: close,
-      snap_points: snaps,
       active_snap,
       on_snap,
-      close_threshold,
-      velocity_threshold,
-      can_drag,
-      dragging_sig: signals::signal(false),
-      drag_offset_sig: signals::signal(0.0),
+      core,
     }
     look(v, dr)
     wire_overlay(

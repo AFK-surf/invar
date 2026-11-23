@@ -1,0 +1,222 @@
+// Pure tri-state tree checking with cascade/independent strategies and disabled-child skipping.
+
+/// Tri-state checkbox value for tree nodes.
+#derive(Eq)
+pub enum TreeCheckState {
+  Unchecked
+  Checked
+  Indeterminate
+}
+
+/// Strategy for computing and toggling checked states across parent/child tree nodes.
+#derive(Eq)
+pub enum TreeCheckStrategy {
+  Independent
+  Cascade
+}
+
+/// Minimal structural descriptor of a tree node for pure tri-state check calculations.
+pub struct TreeNodeSpec[K] {
+  pub key : K
+  pub parent : Option[K]
+  pub disabled : Bool
+}
+
+pub fn TreeNodeSpec::new[K](
+  key : K,
+  parent? : K,
+  disabled~ : Bool = false,
+) -> TreeNodeSpec[K] {
+  TreeNodeSpec::{ key, parent, disabled }
+}
+
+fn tree_contains_key_by[K](arr : Array[K], target : K, eq : (K, K) -> Bool) -> Bool {
+  for x in arr {
+    if eq(x, target) {
+      return true
+    }
+  }
+  false
+}
+
+fn tree_children_of_by[K](
+  nodes : Array[TreeNodeSpec[K]],
+  parent_key : K,
+  eq : (K, K) -> Bool,
+) -> Array[TreeNodeSpec[K]] {
+  let out : Array[TreeNodeSpec[K]] = []
+  for n in nodes {
+    match n.parent {
+      Some(p) => if eq(p, parent_key) { out.push(n) }
+      None => ()
+    }
+  }
+  out
+}
+
+fn tree_state_of_node_by[K](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  key : K,
+  depth : Int,
+  eq : (K, K) -> Bool,
+) -> TreeCheckState {
+  if depth > 64 {
+    return if tree_contains_key_by(checked, key, eq) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
+  }
+  let kids = tree_children_of_by(nodes, key, eq)
+  let enabled_kids = array_filter(kids, fn(k : TreeNodeSpec[K]) -> Bool { !k.disabled })
+  if enabled_kids.length() == 0 {
+    return if tree_contains_key_by(checked, key, eq) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
+  }
+  let mut any_checked = false
+  let mut any_unchecked = false
+  let mut any_indet = false
+  for k in enabled_kids {
+    match tree_state_of_node_by(nodes, checked, k.key, depth + 1, eq) {
+      Checked => any_checked = true
+      Unchecked => any_unchecked = true
+      Indeterminate => any_indet = true
+    }
+  }
+  if any_indet || (any_checked && any_unchecked) {
+    TreeCheckState::Indeterminate
+  } else if any_checked {
+    TreeCheckState::Checked
+  } else {
+    TreeCheckState::Unchecked
+  }
+}
+
+/// Compute tri-state check status for every node in `nodes` using custom equality `eq`.
+pub fn tree_checked_states_by[K](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  eq : (K, K) -> Bool,
+  strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
+) -> Array[(K, TreeCheckState)] {
+  let out : Array[(K, TreeCheckState)] = []
+  for n in nodes {
+    let st = match strategy {
+      Independent =>
+        if tree_contains_key_by(checked, n.key, eq) { TreeCheckState::Checked } else { TreeCheckState::Unchecked }
+      Cascade => tree_state_of_node_by(nodes, checked, n.key, 0, eq)
+    }
+    out.push((n.key, st))
+  }
+  out
+}
+
+/// Compute tri-state check status for every node in `nodes`.
+pub fn tree_checked_states[K : CoreEq](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
+) -> Array[(K, TreeCheckState)] {
+  tree_checked_states_by(nodes, checked, fn(a : K, b : K) -> Bool { a.eq(b) }, strategy=strategy)
+}
+
+fn tree_collect_descendants_by[K](
+  nodes : Array[TreeNodeSpec[K]],
+  key : K,
+  out : Array[K],
+  depth : Int,
+  eq : (K, K) -> Bool,
+) -> Unit {
+  if depth > 64 {
+    return
+  }
+  for k in tree_children_of_by(nodes, key, eq) {
+    if !k.disabled {
+      out.push(k.key)
+      tree_collect_descendants_by(nodes, k.key, out, depth + 1, eq)
+    }
+  }
+}
+
+/// Toggle `target` in `checked` according to `strategy` using custom equality `eq`.
+pub fn toggle_tree_check_by[K](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  target : K,
+  eq : (K, K) -> Bool,
+  strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
+) -> Array[K] {
+  match array_find_first(nodes, fn(n : TreeNodeSpec[K]) -> Bool { eq(n.key, target) }) {
+    Some(spec) => if spec.disabled { return checked.copy() }
+    None => ()
+  }
+  match strategy {
+    Independent => {
+      let next : Array[K] = []
+      let mut found = false
+      for k in checked {
+        if eq(k, target) {
+          found = true
+        } else {
+          next.push(k)
+        }
+      }
+      if !found {
+        next.push(target)
+      }
+      next
+    }
+    Cascade => {
+      let cur_state = tree_state_of_node_by(nodes, checked, target, 0, eq)
+      let turn_on = cur_state != TreeCheckState::Checked
+      let affected : Array[K] = [target]
+      tree_collect_descendants_by(nodes, target, affected, 0, eq)
+      let next : Array[K] = []
+      for k in checked {
+        if !tree_contains_key_by(affected, k, eq) {
+          next.push(k)
+        }
+      }
+      if turn_on {
+        for k in affected {
+          if !tree_contains_key_by(next, k, eq) {
+            next.push(k)
+          }
+        }
+      }
+      let mut cur_opt : Option[K] = Some(target)
+      let mut guard_steps = 0
+      while guard_steps < 64 {
+        guard_steps += 1
+        let cur_k = match cur_opt {
+          Some(k) => k
+          None => break
+        }
+        let parent_opt : Option[K] = match array_find_first(nodes, fn(n : TreeNodeSpec[K]) -> Bool { eq(n.key, cur_k) }) {
+          Some(sp) => sp.parent
+          None => None
+        }
+        match parent_opt {
+          Some(pk) => {
+            let p_state = tree_state_of_node_by(nodes, next, pk, 0, eq)
+            let has_pk = tree_contains_key_by(next, pk, eq)
+            if p_state == TreeCheckState::Checked && !has_pk {
+              next.push(pk)
+            } else if p_state != TreeCheckState::Checked && has_pk {
+              array_retain(next, fn(x : K) -> Bool { !eq(x, pk) })
+            }
+            cur_opt = Some(pk)
+          }
+          None => break
+        }
+      }
+      next
+    }
+  }
+}
+
+/// Toggle `target` in `checked` according to `strategy`, returning the updated checked key list.
+pub fn toggle_tree_check[K : CoreEq](
+  nodes : Array[TreeNodeSpec[K]],
+  checked : Array[K],
+  target : K,
+  strategy~ : TreeCheckStrategy = TreeCheckStrategy::Cascade,
+) -> Array[K] {
+  toggle_tree_check_by(nodes, checked, target, fn(a : K, b : K) -> Bool { a.eq(b) }, strategy=strategy)
+}

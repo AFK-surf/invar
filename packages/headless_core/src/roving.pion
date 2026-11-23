@@ -1,0 +1,234 @@
+// Pure index roving cursor: axis/RTL directional stepping, wrap-around, disabled skipping,
+// Home/End navigation, and neighbor handoff on removal.
+
+import "signals"
+
+/// Which arrow keys step along a roving group: Horizontal, Vertical, or Both.
+#derive(Eq)
+pub enum GroupAxis {
+  Horizontal
+  Vertical
+  Both
+}
+
+/// Logical roving navigation step.
+#derive(Eq)
+pub enum RovingDir {
+  Prev
+  Next
+  First
+  Last
+}
+
+/// Key code constants matching Invar's standard navigation key codes.
+pub let key_left : Int = 3
+pub let key_right : Int = 4
+pub let key_up : Int = 5
+pub let key_down : Int = 6
+pub let key_home : Int = 8
+pub let key_end : Int = 9
+
+/// Map a key code to a `RovingDir` given `axis` and `rtl`.
+pub fn roving_key_dir(axis : GroupAxis, rtl : Bool, code : Int) -> Option[RovingDir] {
+  if code == key_home {
+    return Some(RovingDir::First)
+  }
+  if code == key_end {
+    return Some(RovingDir::Last)
+  }
+  let (prev_keys, next_keys) = match axis {
+    Horizontal => if rtl { ([key_right], [key_left]) } else { ([key_left], [key_right]) }
+    Vertical => ([key_up], [key_down])
+    Both =>
+      if rtl {
+        ([key_right, key_up], [key_left, key_down])
+      } else {
+        ([key_left, key_up], [key_right, key_down])
+      }
+  }
+  if int_array_contains(prev_keys, code) {
+    Some(RovingDir::Prev)
+  } else if int_array_contains(next_keys, code) {
+    Some(RovingDir::Next)
+  } else {
+    None
+  }
+}
+
+/// Pure index step among `0..<count` enabled items.
+pub fn roving_step_in_enabled(
+  current : Option[Int],
+  count : Int,
+  dir : RovingDir,
+  wraps : Bool,
+  from_none : Bool,
+) -> Option[Int] {
+  if count <= 0 {
+    return None
+  }
+  match current {
+    Some(i) =>
+      match dir {
+        Prev => Some(if i > 0 { i - 1 } else if wraps { count - 1 } else { 0 })
+        Next => Some(if i + 1 < count { i + 1 } else if wraps { 0 } else { count - 1 })
+        First => Some(0)
+        Last => Some(count - 1)
+      }
+    None =>
+      if !from_none {
+        None
+      } else {
+        match dir {
+          Next | First => Some(0)
+          Prev | Last => Some(count - 1)
+        }
+      }
+  }
+}
+
+/// Compute the surviving enabled neighbor index if item at `removed_idx` is removed from `disabled`.
+/// Prefers the next enabled item after `removed_idx`, falling back to the nearest preceding enabled item.
+pub fn roving_neighbor_on_remove(removed_idx : Int, disabled : Array[Bool]) -> Option[Int] {
+  let n = disabled.length()
+  let mut fwd = removed_idx + 1
+  if fwd < 0 {
+    fwd = 0
+  }
+  while fwd < n {
+    if !disabled[fwd] {
+      return Some(fwd)
+    }
+    fwd += 1
+  }
+  let mut bwd = removed_idx - 1
+  if bwd >= n {
+    bwd = n - 1
+  }
+  while bwd >= 0 {
+    if !disabled[bwd] {
+      return Some(bwd)
+    }
+    bwd -= 1
+  }
+  None
+}
+
+/// Reactive pure-index roving cursor.
+pub struct RovingIndex {
+  axis : GroupAxis
+  wraps : Bool
+  rtl : Bool
+  active_sig : signals::Signal[Option[Int]]
+}
+
+pub fn RovingIndex::new(
+  axis~ : GroupAxis = GroupAxis::Horizontal,
+  wraps~ : Bool = true,
+  rtl~ : Bool = false,
+) -> RovingIndex {
+  RovingIndex::{
+    axis,
+    wraps,
+    rtl,
+    active_sig: signals::signal_by(None, opt_int_eq),
+  }
+}
+
+pub fn RovingIndex::axis(self : RovingIndex) -> GroupAxis {
+  self.axis
+}
+
+pub fn RovingIndex::wraps(self : RovingIndex) -> Bool {
+  self.wraps
+}
+
+pub fn RovingIndex::rtl(self : RovingIndex) -> Bool {
+  self.rtl
+}
+
+pub fn RovingIndex::active(self : RovingIndex) -> Option[Int] {
+  self.active_sig.get()
+}
+
+pub fn RovingIndex::set_active(self : RovingIndex, idx : Option[Int]) -> Unit {
+  self.active_sig.set(idx)
+}
+
+/// Step cursor in `dir` across `disabled` (where `disabled[i] == true` skips item `i`).
+pub fn RovingIndex::step(
+  self : RovingIndex,
+  dir : RovingDir,
+  disabled : Array[Bool],
+  from_none~ : Bool = true,
+) -> Option[Int] {
+  let enabled : Array[Int] = []
+  let mut i = 0
+  while i < disabled.length() {
+    if !disabled[i] {
+      enabled.push(i)
+    }
+    i += 1
+  }
+  let n = enabled.length()
+  if n == 0 {
+    self.active_sig.set(None)
+    return None
+  }
+  let cur_pos : Option[Int] = match self.active_sig.untracked() {
+    Some(cur_idx) => array_search_by(enabled, fn(x : Int) -> Bool { x == cur_idx })
+    None => None
+  }
+  match roving_step_in_enabled(cur_pos, n, dir, self.wraps, from_none) {
+    Some(pos) => {
+      let next_idx = enabled[pos]
+      self.active_sig.set(Some(next_idx))
+      Some(next_idx)
+    }
+    None => None
+  }
+}
+
+/// Step cursor using a key code (Left/Right/Up/Down/Home/End) respecting `axis` and `rtl`.
+pub fn RovingIndex::step_key(
+  self : RovingIndex,
+  code : Int,
+  disabled : Array[Bool],
+  from_none~ : Bool = false,
+) -> Option[Int] {
+  match roving_key_dir(self.axis, self.rtl, code) {
+    Some(dir) => self.step(dir, disabled, from_none=from_none)
+    None => None
+  }
+}
+
+/// Update the active cursor after item `removed_idx` is removed from `disabled` (pre-removal array).
+/// Returns the new post-removal index (adjusted by -1 when after `removed_idx`), if any.
+pub fn RovingIndex::on_remove(
+  self : RovingIndex,
+  removed_idx : Int,
+  disabled : Array[Bool],
+) -> Option[Int] {
+  match self.active_sig.untracked() {
+    None => None
+    Some(cur) =>
+      if cur == removed_idx {
+        match roving_neighbor_on_remove(removed_idx, disabled) {
+          Some(nb) => {
+            let adjusted = if nb > removed_idx { nb - 1 } else { nb }
+            self.active_sig.set(Some(adjusted))
+            Some(adjusted)
+          }
+          None => {
+            self.active_sig.set(None)
+            None
+          }
+        }
+      } else if cur > removed_idx {
+        let adjusted = cur - 1
+        self.active_sig.set(Some(adjusted))
+        Some(adjusted)
+      } else {
+        Some(cur)
+      }
+  }
+}

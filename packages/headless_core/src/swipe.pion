@@ -1,0 +1,306 @@
+// Pure horizontal swipe-row helpers and 4-way swipe gesture state machine with axis lock
+// and pull-back cancel detection.
+
+import "dmath"
+import "signals"
+
+/// Which horizontal action tray of a swipeable row is currently open.
+#derive(Eq)
+pub enum SwipeSide {
+  Closed
+  Leading
+  Trailing
+}
+
+/// Apply rubber-band damping beyond `[ -trailing_w, leading_w ]`.
+pub fn swipe_damp(raw : Double, leading_w : Double, trailing_w : Double, rubber : Double) -> Double {
+  if raw > 0.0 {
+    if leading_w <= 0.0 {
+      0.0
+    } else if raw > leading_w {
+      leading_w + (raw - leading_w) * rubber
+    } else {
+      raw
+    }
+  } else if raw < 0.0 {
+    if trailing_w <= 0.0 {
+      0.0
+    } else if raw < -trailing_w {
+      -trailing_w + (raw + trailing_w) * rubber
+    } else {
+      raw
+    }
+  } else {
+    0.0
+  }
+}
+
+/// Resolve the resting `SwipeSide` on horizontal swipe release from offset and velocity.
+pub fn swipe_resolve_horizontal(
+  offset : Double,
+  vx : Double,
+  start_side : SwipeSide,
+  leading_w : Double,
+  trailing_w : Double,
+  threshold : Double,
+  velocity_threshold : Double,
+) -> SwipeSide {
+  if vx >= velocity_threshold {
+    match start_side {
+      Trailing => SwipeSide::Closed
+      _ => if leading_w > 0.0 { SwipeSide::Leading } else { SwipeSide::Closed }
+    }
+  } else if vx <= -velocity_threshold {
+    match start_side {
+      Leading => SwipeSide::Closed
+      _ => if trailing_w > 0.0 { SwipeSide::Trailing } else { SwipeSide::Closed }
+    }
+  } else if leading_w > 0.0 && offset >= leading_w * threshold {
+    SwipeSide::Leading
+  } else if trailing_w > 0.0 && offset <= -trailing_w * threshold {
+    SwipeSide::Trailing
+  } else {
+    SwipeSide::Closed
+  }
+}
+
+/// Locked swipe direction for 4-way swipe gestures.
+#derive(Eq)
+pub enum SwipeDir {
+  Left
+  Right
+  Up
+  Down
+}
+
+/// Allowed axis locking mode for `SwipeGesture`.
+#derive(Eq)
+pub enum SwipeAxisMode {
+  HorizontalOnly
+  VerticalOnly
+  FourWay
+}
+
+/// Reactive state of `SwipeGesture`.
+#derive(Eq)
+pub enum SwipeGestureState {
+  Idle
+  Dragging(SwipeDir, Double)
+  Committed(SwipeDir)
+  Cancelled
+}
+
+fn swipe_gesture_state_eq(a : SwipeGestureState, b : SwipeGestureState) -> Bool {
+  a == b
+}
+
+/// 4-way swipe gesture state machine with slop deadzone, axis lock, pull-back cancel detection,
+/// and reactive `state()` / `offset()` signals.
+pub struct SwipeGesture {
+  axis_mode : SwipeAxisMode
+  slop : Double
+  distance_threshold : Double
+  velocity_threshold : Double
+  cancel_ratio : Double
+  state_sig : signals::Signal[SwipeGestureState]
+  offset_sig : signals::Signal[Double]
+  tracking : Ref[Bool]
+  rejected : Ref[Bool]
+  locked_dir : Ref[Option[SwipeDir]]
+  start_x : Ref[Double]
+  start_y : Ref[Double]
+  peak : Ref[Double]
+}
+
+/// Create a `SwipeGesture` state machine.
+pub fn SwipeGesture::new(
+  axis_mode~ : SwipeAxisMode = SwipeAxisMode::FourWay,
+  slop~ : Double = 8.0,
+  distance_threshold~ : Double = 48.0,
+  velocity_threshold~ : Double = 0.45,
+  cancel_ratio~ : Double = 0.5,
+) -> SwipeGesture {
+  SwipeGesture::{
+    axis_mode,
+    slop: if slop >= 0.0 { slop } else { 0.0 },
+    distance_threshold: if distance_threshold >= 0.0 { distance_threshold } else { 0.0 },
+    velocity_threshold: if velocity_threshold >= 0.0 { velocity_threshold } else { 0.0 },
+    cancel_ratio: clamp_double(cancel_ratio, 0.0, 1.0),
+    state_sig: signals::signal_by(SwipeGestureState::Idle, swipe_gesture_state_eq),
+    offset_sig: signals::signal(0.0),
+    tracking: ref_new(false),
+    rejected: ref_new(false),
+    locked_dir: ref_new(None),
+    start_x: ref_new(0.0),
+    start_y: ref_new(0.0),
+    peak: ref_new(0.0),
+  }
+}
+
+/// Reactive gesture state.
+pub fn SwipeGesture::state(self : SwipeGesture) -> SwipeGestureState {
+  self.state_sig.get()
+}
+
+/// Reactive signed displacement along the locked direction (0.0 when idle/cancelled).
+pub fn SwipeGesture::offset(self : SwipeGesture) -> Double {
+  self.offset_sig.get()
+}
+
+/// Maximum displacement reached along the locked direction during the current drag.
+pub fn SwipeGesture::peak_offset(self : SwipeGesture) -> Double {
+  self.peak.v
+}
+
+/// Reset to `Idle` and clear offset.
+pub fn SwipeGesture::reset(self : SwipeGesture) -> Unit {
+  self.tracking.v = false
+  self.rejected.v = false
+  self.locked_dir.v = None
+  self.peak.v = 0.0
+  self.offset_sig.set(0.0)
+  self.state_sig.set(SwipeGestureState::Idle)
+}
+
+/// Begin tracking a potential swipe at `(x, y)`.
+pub fn SwipeGesture::on_down(self : SwipeGesture, x : Double, y : Double) -> SwipeGestureState {
+  self.tracking.v = true
+  self.rejected.v = false
+  self.locked_dir.v = None
+  self.start_x.v = x
+  self.start_y.v = y
+  self.peak.v = 0.0
+  self.offset_sig.set(0.0)
+  self.state_sig.set(SwipeGestureState::Idle)
+  SwipeGestureState::Idle
+}
+
+fn dir_project(dir : SwipeDir, dx : Double, dy : Double) -> Double {
+  match dir {
+    Right => dx
+    Left => -dx
+    Down => dy
+    Up => -dy
+  }
+}
+
+/// Feed pointer movement `(x, y)` into the gesture state machine.
+pub fn SwipeGesture::on_move(self : SwipeGesture, x : Double, y : Double) -> SwipeGestureState {
+  if !self.tracking.v || self.rejected.v {
+    return self.state_sig.untracked()
+  }
+  let dx = x - self.start_x.v
+  let dy = y - self.start_y.v
+  let adx = dmath::abs(dx)
+  let ady = dmath::abs(dy)
+  match self.locked_dir.v {
+    None => {
+      match self.axis_mode {
+        HorizontalOnly => {
+          if ady >= self.slop && ady > adx {
+            self.rejected.v = true
+            self.state_sig.set(SwipeGestureState::Cancelled)
+            return SwipeGestureState::Cancelled
+          }
+          if adx >= self.slop {
+            let dir = if dx >= 0.0 { SwipeDir::Right } else { SwipeDir::Left }
+            self.locked_dir.v = Some(dir)
+          } else {
+            return SwipeGestureState::Idle
+          }
+        }
+        VerticalOnly => {
+          if adx >= self.slop && adx > ady {
+            self.rejected.v = true
+            self.state_sig.set(SwipeGestureState::Cancelled)
+            return SwipeGestureState::Cancelled
+          }
+          if ady >= self.slop {
+            let dir = if dy >= 0.0 { SwipeDir::Down } else { SwipeDir::Up }
+            self.locked_dir.v = Some(dir)
+          } else {
+            return SwipeGestureState::Idle
+          }
+        }
+        FourWay => {
+          if adx >= self.slop || ady >= self.slop {
+            let dir = if adx >= ady {
+              if dx >= 0.0 { SwipeDir::Right } else { SwipeDir::Left }
+            } else {
+              if dy >= 0.0 { SwipeDir::Down } else { SwipeDir::Up }
+            }
+            self.locked_dir.v = Some(dir)
+          } else {
+            return SwipeGestureState::Idle
+          }
+        }
+      }
+    }
+    Some(_) => ()
+  }
+  match self.locked_dir.v {
+    Some(dir) => {
+      let proj = dir_project(dir, dx, dy)
+      if proj > self.peak.v {
+        self.peak.v = proj
+      }
+      self.offset_sig.set(proj)
+      let st = SwipeGestureState::Dragging(dir, proj)
+      self.state_sig.set(st)
+      st
+    }
+    None => SwipeGestureState::Idle
+  }
+}
+
+/// Complete the gesture on pointer release with optional velocity `(vx, vy)`.
+/// Pull-back cancel detection: if the release offset crossed origin (`<= 0`) or fell below
+/// `peak * cancel_ratio`, resolves to `Cancelled` even if above distance/velocity thresholds.
+pub fn SwipeGesture::on_up(
+  self : SwipeGesture,
+  vx~ : Double = 0.0,
+  vy~ : Double = 0.0,
+) -> SwipeGestureState {
+  if !self.tracking.v {
+    return self.state_sig.untracked()
+  }
+  self.tracking.v = false
+  if self.rejected.v {
+    self.offset_sig.set(0.0)
+    self.state_sig.set(SwipeGestureState::Cancelled)
+    return SwipeGestureState::Cancelled
+  }
+  match self.locked_dir.v {
+    None => {
+      self.offset_sig.set(0.0)
+      self.state_sig.set(SwipeGestureState::Idle)
+      SwipeGestureState::Idle
+    }
+    Some(dir) => {
+      let cur = self.offset_sig.untracked()
+      let vel = dir_project(dir, vx, vy)
+      let pulled_back = cur <= 0.0 || (self.peak.v > 0.0 && cur < self.peak.v * self.cancel_ratio)
+      let next : SwipeGestureState = if pulled_back {
+        SwipeGestureState::Cancelled
+      } else if cur >= self.distance_threshold || vel >= self.velocity_threshold {
+        SwipeGestureState::Committed(dir)
+      } else {
+        SwipeGestureState::Cancelled
+      }
+      self.locked_dir.v = None
+      self.state_sig.set(next)
+      next
+    }
+  }
+}
+
+/// Explicitly cancel the gesture.
+pub fn SwipeGesture::cancel(self : SwipeGesture) -> SwipeGestureState {
+  self.tracking.v = false
+  self.rejected.v = false
+  self.locked_dir.v = None
+  self.peak.v = 0.0
+  self.offset_sig.set(0.0)
+  self.state_sig.set(SwipeGestureState::Cancelled)
+  SwipeGestureState::Cancelled
+}
