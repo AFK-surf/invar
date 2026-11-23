@@ -5,6 +5,7 @@ Subcommands: doctor, check, test, audit, new, web, shot, diff, host-check, bench
 """
 
 import argparse
+from collections import deque
 import functools
 import gzip
 import http.server
@@ -735,8 +736,459 @@ def cmd_test(args):
 
 
 # ---------------------------------------------------------------------------
-# Subcommand 4: audit
+# Subcommand 4: audit (including typed reactive static audit E007-E010)
 # ---------------------------------------------------------------------------
+
+REACTIVE_SIGNAL_WRITES = {
+    "signals::Signal::set",
+    "signals::Signal::set_at",
+    "signals::Signal::update",
+    "signals::DerivedSignal::set",
+    "signals::DerivedSignal::update",
+    "signals::Optimistic::push",
+    "signals::Optimistic::set_value",
+    "signals::Optimistic::clear",
+    "signals::Keyed::set",
+    "signals::Keyed::add",
+    "signals::Keyed::remove",
+    "signals::KeyedList::put",
+    "signals::KeyedList::drop",
+    "signals::Action::begin",
+    "signals::Action::clear_error",
+    "signals::ActionTicket::succeed",
+    "signals::ActionTicket::succeed_if_latest",
+    "signals::ActionTicket::fail",
+    "signals::ActionTicket::fail_if_latest",
+    "signals::ActionTicket::cancel",
+}
+
+REACTIVE_SIGNAL_READS = {
+    "signals::Signal::get",
+    "signals::ReadSignal::get",
+    "signals::Computed::get",
+    "signals::DerivedSignal::get",
+    "signals::Optimistic::get",
+    "signals::Keyed::has",
+    "signals::KeyedList::get",
+    "signals::KeyedList::keys",
+}
+
+REACTIVE_EFFECT_CALLEES = {
+    "signals::effect",
+    "signals::effect_at",
+    "signals::effect_cleanup",
+}
+
+# Callees whose primary getter/condition/key-list closure argument is a pure reactive read.
+REACTIVE_GETTER_CALLEES = {
+    "view::Live::By",
+    "view::Live::of_fn",
+    "signals::computed",
+    "signals::computed_ref",
+    "signals::computed_by",
+    "signals::computed_by_at",
+    "signals::computed_scoped",
+    "signals::computed_scoped_by",
+    "signals::computed_following",
+    "signals::derived_signal",
+    "signals::derived_signal_ref",
+    "signals::derived_signal_by",
+    "signals::optimistic",
+    "signals::optimistic_ref",
+    "signals::optimistic_by",
+    "signals::ReadSignal::map",
+    "signals::ReadSignal::map_by",
+    "view::View::show",
+    "view::View::pick",
+    "view::View::each",
+    "view::View::each_by",
+    "view::View::each_of",
+}
+
+REACTIVE_GETTER_ARGS = {"0", "getter", "authority", "f", "when", "keys", "cond", "by"}
+
+# Framework engine-internal housekeeping boundaries that E007 BFS does not expand:
+# - view::Tree::measured_now: lazy layout sync inside view::View::laid_size
+# - ui::image_bump_rev: internal UI image-cache revision counter inside ui::add_image
+REACTIVE_E007_OPAQUE_INTERNALS = {
+    "view::Tree::measured_now",
+    "ui::image_bump_rev",
+}
+
+REACTIVE_SAFE_SIGNAL_PREFIXES = (
+    "signals::Signal[",
+    "signals::ReadSignal[",
+    "signals::Computed[",
+    "signals::DerivedSignal[",
+    "signals::Optimistic[",
+    "signals::KeyedList[",
+    "signals::Action[",
+    "signals::ActionTicket[",
+)
+REACTIVE_SAFE_SIGNAL_EXACT = {"signals::Keyed"}
+
+REACTIVE_WRITABLE_SIGNAL_PREFIXES = (
+    "signals::Signal[",
+    "signals::DerivedSignal[",
+    "signals::Optimistic[",
+    "signals::KeyedList[",
+    "signals::Action[",
+)
+REACTIVE_WRITABLE_SIGNAL_EXACT = {"signals::Keyed"}
+
+# Framework handles whose public getters read internal reactive signals / springs.
+# Ordinary user mutable structs, Array, FixedArray, Map, Bytes, StringBuilder, and Ref
+# are deliberately excluded so E008 catches every non-reactive mutable capture.
+REACTIVE_SAFE_FRAMEWORK_HANDLE_PREFIXES = (
+    "headless::",
+    "view::Column[",
+    "nav::NavController[",
+)
+REACTIVE_SAFE_FRAMEWORK_HANDLE_EXACT = {
+    "view::View",
+    "view::Scroll",
+    "view::Room",
+    "view::Tree",
+    "view::BarState",
+    "view::TracksKept",
+    "ui::Field",
+    "ui::SelectableText",
+    "ui::LinkedText",
+    "kit::Field",
+    "motion::NodeWay",
+    "motion::Way",
+    "motion::LiquidBond",
+    "motion::HandPart",
+    "motion::Shape",
+    "motion::Part",
+    "motion::PressFeel",
+    "motion::ShakeWay",
+    "lg::DampedDrag",
+    "lg::LiquidMerge",
+    "lg::InteractiveHighlight",
+    "lg::OvlMorphHandoff",
+    "code_field::CodeField",
+    "terminal::TerminalModel",
+}
+
+# Invar engine-internal implementation files exempt from E008 mutable-type checks
+# (let mut captures are still forbidden everywhere).
+REACTIVE_E008_INTERNAL_PREFIXES = (
+    "packages/signals/",
+    "packages/view/",
+    "packages/bench/",
+)
+REACTIVE_E008_INTERNAL_FILES = {
+    "packages/kit/src/icons.pion",
+}
+
+_AUDIT_SHORT_CODES = {
+    "INVAR_E007_REACTIVE_WRITE": "E007",
+    "INVAR_E008_REACTIVE_MUT_CAPTURE": "E008",
+    "INVAR_E009_EFFECT_SELF_WRITE": "E009",
+    "INVAR_E010_REACTIVE_IO": "E010",
+}
+
+
+def _pionc_supports_query_analyze(pionc_info):
+    if not pionc_info.get("found") or not pionc_info.get("path"):
+        return False
+    rc, out, err, _ = run_cmd([pionc_info["path"], "--help"])
+    help_text = out + "\n" + err
+    return bool(re.search(r"\bquery\b[^\n]*\banalyze\b", help_text))
+
+
+def _is_reactive_read_closure(cl):
+    cc = cl.get("context_callee", "")
+    ca = cl.get("context_arg", "")
+    if cc in REACTIVE_GETTER_CALLEES and ca in REACTIVE_GETTER_ARGS:
+        return True
+    if cc == "ui::Show" and ca in ("when", "0"):
+        return True
+    if ca.endswith("_by") and not ca.startswith("on_") and ca not in ("children", "ref_view"):
+        return True
+    return False
+
+
+def _is_reactive_io_target(target):
+    if target in ("builtin::scope", "builtin::spawn"):
+        return True
+    for pref in ("builtin::io_", "builtin::fs_", "builtin::net_", "builtin::proc_", "builtin::sleep"):
+        if target.startswith(pref):
+            return True
+    return False
+
+
+def _is_safe_reactive_capture_ty(ty):
+    if not ty:
+        return False
+    if ty in REACTIVE_SAFE_SIGNAL_EXACT or ty.startswith(REACTIVE_SAFE_SIGNAL_PREFIXES):
+        return True
+    if ty in REACTIVE_SAFE_FRAMEWORK_HANDLE_EXACT or ty.startswith(REACTIVE_SAFE_FRAMEWORK_HANDLE_PREFIXES):
+        return True
+    if ty.startswith("Option[") and ty.endswith("]"):
+        return _is_safe_reactive_capture_ty(ty[7:-1])
+    return False
+
+
+def _is_writable_signal_ty(ty):
+    if not ty:
+        return False
+    if ty in REACTIVE_WRITABLE_SIGNAL_EXACT or ty.startswith(REACTIVE_WRITABLE_SIGNAL_PREFIXES):
+        return True
+    if ty.startswith("Option[") and ty.endswith("]"):
+        return _is_writable_signal_ty(ty[7:-1])
+    return False
+
+
+def _has_inline_allow(file_lines_cache, file_path, line, code):
+    if not file_path or line <= 0:
+        return False
+    lines = file_lines_cache.get(file_path)
+    if lines is None:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            lines = []
+        file_lines_cache[file_path] = lines
+    short_code = _AUDIT_SHORT_CODES.get(code, code)
+    for ln in (line, line - 1):
+        if 1 <= ln <= len(lines):
+            text = lines[ln - 1]
+            idx = text.find("invar-audit-allow:")
+            if idx != -1:
+                tail = text[idx + len("invar-audit-allow:"):]
+                tokens = {tok.strip() for tok in re.split(r"[,\s;]+", tail) if tok.strip()}
+                if code in tokens or short_code in tokens or "all" in tokens:
+                    return True
+    return False
+
+
+def _bfs_find_call_chain(direct_calls, fn_calls, pred, opaque_nodes=()):
+    q = deque()
+    visited = set()
+    for c in direct_calls:
+        t = c.get("target", "")
+        if not t or t in opaque_nodes:
+            continue
+        if pred(t):
+            return [t]
+        if t not in visited:
+            visited.add(t)
+            q.append((t, [t]))
+    while q:
+        cur, path = q.popleft()
+        for nxt in fn_calls.get(cur, ()):
+            if not nxt or nxt in opaque_nodes:
+                continue
+            if pred(nxt):
+                return path + [nxt]
+            if nxt not in visited:
+                visited.add(nxt)
+                q.append((nxt, path + [nxt]))
+    return None
+
+
+def _discover_analyze_targets(target_dir):
+    if not target_dir:
+        if os.path.isfile(os.path.join(INVAR_ROOT, "pion.toml")):
+            return [INVAR_ROOT]
+        targets = []
+        for sub in ("packages", "examples"):
+            sd = os.path.join(INVAR_ROOT, sub)
+            if os.path.isdir(sd):
+                for name in sorted(os.listdir(sd)):
+                    p = os.path.join(sd, name)
+                    if os.path.isfile(os.path.join(p, "pion.toml")):
+                        targets.append(p)
+        return targets
+
+    if os.path.isfile(os.path.join(target_dir, "pion.toml")) or os.path.isdir(os.path.join(target_dir, "src")):
+        return [target_dir]
+
+    skip_dirs = {".git", "target", "_build", "node_modules", "out", "tmp", "__pycache__"}
+    targets = []
+    for r_d, ds, fs in os.walk(target_dir):
+        ds[:] = [d for d in sorted(ds) if d not in skip_dirs and not d.startswith(".")]
+        if "pion.toml" in fs:
+            targets.append(r_d)
+            ds[:] = []
+    return targets
+
+
+def _run_reactive_audit(target_dir, no_reactive, add_diag):
+    if no_reactive:
+        return {"ran": False, "reason": "disabled via --no-reactive"}
+
+    pionc = resolve_pionc()
+    if not pionc["found"]:
+        return {"ran": False, "reason": "pionc not found"}
+
+    if not _pionc_supports_query_analyze(pionc):
+        return {"ran": False, "reason": "pionc does not support `query analyze`"}
+
+    targets = _discover_analyze_targets(target_dir)
+    if not targets:
+        return {"ran": False, "reason": "no Pion packages found in target"}
+
+    env = build_pion_env(pionc)
+    fn_calls = {}
+    closures = []
+    seen_closures = set()
+
+    for t in targets:
+        rc, out, err, _ = run_cmd([pionc["path"], "query", "analyze", "--json", t], cwd=INVAR_ROOT, env=env)
+        combined_err = (out + "\n" + err).lower()
+        if rc != 0 and ("unknown query kind" in combined_err or "usage:" in combined_err):
+            return {"ran": False, "reason": "pionc does not support `query analyze`"}
+        payload = None
+        if out.strip():
+            try:
+                payload = json.loads(out)
+            except ValueError:
+                payload = None
+        if not isinstance(payload, dict) or "closures" not in payload or "fns" not in payload:
+            reason = (err.strip() or out.strip() or f"exit code {rc}")[:200]
+            return {"ran": False, "reason": f"pionc query analyze failed for {t}: {reason}"}
+
+        for fn in payload.get("fns", []):
+            fq = f"{fn.get('pkg', '')}::{fn.get('name', '')}"
+            if fq not in fn_calls:
+                fn_calls[fq] = [c.get("target", "") for c in fn.get("calls", []) if c.get("target")]
+
+        for cl in payload.get("closures", []):
+            fpath = os.path.realpath(cl.get("file", "")) if cl.get("file") else ""
+            key = (fpath, cl.get("line", 0), cl.get("col", 0), cl.get("context_callee", ""), cl.get("context_arg", ""))
+            if key not in seen_closures:
+                seen_closures.add(key)
+                closures.append((fpath, cl))
+
+    scope_root = os.path.realpath(target_dir) if target_dir else INVAR_ROOT
+    file_lines_cache = {}
+    closures_checked = 0
+
+    for fpath, cl in closures:
+        if not fpath:
+            continue
+        if fpath != scope_root and not fpath.startswith(scope_root + os.sep):
+            continue
+        if fpath.endswith("_test.pion"):
+            continue
+
+        closures_checked += 1
+        rel = os.path.relpath(fpath, INVAR_ROOT) if fpath.startswith(INVAR_ROOT + os.sep) else fpath
+        line = int(cl.get("line", 1) or 1)
+        cc = cl.get("context_callee", "")
+        ca = cl.get("context_arg", "")
+        ctx_desc = f"{cc}({ca})" if cc else f"arg {ca}"
+
+        if _is_reactive_read_closure(cl):
+            # E007: Reactive read closure writing signals directly or transitively
+            if not _has_inline_allow(file_lines_cache, fpath, line, "INVAR_E007_REACTIVE_WRITE"):
+                wchain = _bfs_find_call_chain(
+                    cl.get("calls", []),
+                    fn_calls,
+                    lambda tgt: tgt in REACTIVE_SIGNAL_WRITES,
+                    opaque_nodes=REACTIVE_E007_OPAQUE_INTERNALS,
+                )
+                if wchain:
+                    chain_str = " -> ".join(["closure"] + wchain)
+                    add_diag(
+                        "INVAR_E007_REACTIVE_WRITE",
+                        "error",
+                        rel,
+                        line,
+                        f"Reactive read closure `{ctx_desc}` writes signal via call chain: {chain_str}",
+                        "Do not write signals inside reactive getters or render bindings; move signal writes into event callbacks (on_press, etc.), ui::Worker handlers, signals::Action, or signals::effect.",
+                    )
+
+            # E008: Reactive read closure capturing let mut or non-reactive mutable objects
+            if not _has_inline_allow(file_lines_cache, fpath, line, "INVAR_E008_REACTIVE_MUT_CAPTURE"):
+                is_internal_engine_file = (
+                    rel in REACTIVE_E008_INTERNAL_FILES
+                    or rel.startswith(REACTIVE_E008_INTERNAL_PREFIXES)
+                )
+                for cap in cl.get("captures", []):
+                    cap_name = cap.get("name", "")
+                    cap_ty = cap.get("ty", "")
+                    if cap.get("is_mut"):
+                        add_diag(
+                            "INVAR_E008_REACTIVE_MUT_CAPTURE",
+                            "error",
+                            rel,
+                            line,
+                            f"Reactive read closure `{ctx_desc}` captures mutable binding `let mut {cap_name} : {cap_ty}`",
+                            "Replace `let mut` with `signals::signal(...)` / `ReadSignal` or an immutable `val struct` snapshot so UI updates track changes.",
+                        )
+                    elif (
+                        not is_internal_engine_file
+                        and cap.get("is_mutable_ty")
+                        and not _is_safe_reactive_capture_ty(cap_ty)
+                    ):
+                        add_diag(
+                            "INVAR_E008_REACTIVE_MUT_CAPTURE",
+                            "error",
+                            rel,
+                            line,
+                            f"Reactive read closure `{ctx_desc}` captures non-reactive mutable value `{cap_name} : {cap_ty}`",
+                            "Use `signals::signal(...)` / `ReadSignal` / `Computed`, or an immutable `val struct` snapshot; mutations to non-reactive objects will not trigger UI updates.",
+                        )
+
+            # E010: Reactive read closure performing blocking IO or spawning threads
+            if not _has_inline_allow(file_lines_cache, fpath, line, "INVAR_E010_REACTIVE_IO"):
+                iochain = _bfs_find_call_chain(
+                    cl.get("calls", []),
+                    fn_calls,
+                    _is_reactive_io_target,
+                )
+                if iochain:
+                    chain_str = " -> ".join(["closure"] + iochain)
+                    add_diag(
+                        "INVAR_E010_REACTIVE_IO",
+                        "error",
+                        rel,
+                        line,
+                        f"Reactive read closure `{ctx_desc}` performs blocking IO/concurrency via call chain: {chain_str}",
+                        "Never perform IO or spawn threads inside reactive getters or render bindings; move IO into `ui::Worker`.",
+                    )
+
+        # E009: signals::effect reading and writing captured signal(s) in the same effect
+        if cc in REACTIVE_EFFECT_CALLEES and ca in ("0", "f"):
+            if not _has_inline_allow(file_lines_cache, fpath, line, "INVAR_E009_EFFECT_SELF_WRITE"):
+                writable_caps = [
+                    cap for cap in cl.get("captures", [])
+                    if _is_writable_signal_ty(cap.get("ty", ""))
+                ]
+                if writable_caps:
+                    rchain = _bfs_find_call_chain(
+                        cl.get("calls", []),
+                        fn_calls,
+                        lambda tgt: tgt in REACTIVE_SIGNAL_READS,
+                    )
+                    wchain = _bfs_find_call_chain(
+                        cl.get("calls", []),
+                        fn_calls,
+                        lambda tgt: tgt in REACTIVE_SIGNAL_WRITES,
+                        opaque_nodes=REACTIVE_E007_OPAQUE_INTERNALS,
+                    )
+                    if rchain and wchain:
+                        cap_names = ", ".join(c.get("name", "") for c in writable_caps)
+                        add_diag(
+                            "INVAR_E009_EFFECT_SELF_WRITE",
+                            "error",
+                            rel,
+                            line,
+                            f"`{cc}` both reads ({' -> '.join(rchain)}) and writes ({' -> '.join(wchain)}) with captured signal(s) [{cap_names}]",
+                            "Avoid reading and writing signals inside the same `signals::effect` (risk of cross-frame self-trigger loops); use `signals::computed` / `signals::derived_signal` for derived state or move writes into event handlers.",
+                        )
+
+    return {
+        "ran": True,
+        "closures_checked": closures_checked,
+        "fns_checked": len(fn_calls),
+    }
+
 
 def cmd_audit(args):
     diags = []
@@ -1055,6 +1507,13 @@ def cmd_audit(args):
                 "Assert `t.scroll_faults().length() == 0` in `src/*_test.pion`.",
             )
 
+    # E007-E010: Typed reactive static audit via `pionc query analyze --json`
+    reactive_report = _run_reactive_audit(
+        target_dir,
+        bool(getattr(args, "no_reactive", False)),
+        add_diag,
+    )
+
     err_cnt = sum(1 for d in diags if d["severity"] == "error")
     warn_cnt = sum(1 for d in diags if d["severity"] == "warning")
     ok = err_cnt == 0
@@ -1063,6 +1522,7 @@ def cmd_audit(args):
         "error_count": err_cnt,
         "warning_count": warn_cnt,
         "diagnostics": diags,
+        "reactive_audit": reactive_report,
     }
     if wasm_imports_report is not None:
         res["wasm_imports"] = wasm_imports_report
@@ -1075,6 +1535,10 @@ def cmd_audit(args):
             print(f"  fixit: {d['fixit']}")
         if wasm_imports_report is not None:
             print(f"WASM imports: {wasm_imports_report['total']} total ({wasm_imports_report['pion_rt_total']} pion_rt), {len(wasm_imports_report['missing'])} missing")
+        if reactive_report.get("ran"):
+            print(f"Reactive audit: {reactive_report['closures_checked']} closures, {reactive_report['fns_checked']} fns checked")
+        else:
+            print(f"Reactive audit: skipped ({reactive_report.get('reason', 'unavailable')})")
         print(f"invar audit: {'OK' if ok else 'FAILED'} ({err_cnt} errors, {warn_cnt} warnings)")
     return 0 if ok else 1
 
@@ -1905,10 +2369,12 @@ def build_parser():
     sp.set_defaults(func=cmd_test)
 
     # audit
-    sp = sub.add_parser("audit", help="Run Invar architectural, lockstep, JS, and WASM import audits")
+    sp = sub.add_parser("audit", help="Run Invar architectural, reactive, lockstep, JS, and WASM import audits")
     sp.add_argument("--json", action="store_true", help="Output structured JSON")
     sp.add_argument("--build-wasm", action="store_true", help="Build lg_web wasm32 and verify all imports")
     sp.add_argument("--wasm", default="", help="Path to an existing .wasm file to verify imports")
+    sp.add_argument("--reactive", action="store_true", help="Enable typed reactive static audit (default: auto when pionc supports query analyze)")
+    sp.add_argument("--no-reactive", action="store_true", help="Disable typed reactive static audit")
     sp.add_argument("target_dir", nargs="?", default="", help="Optional target directory to audit")
     sp.set_defaults(func=cmd_audit)
 
