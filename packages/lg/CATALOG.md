@@ -12,6 +12,8 @@
 ### 00a. `lg::page_shell_node` / `<lg::PageShell>`
 - **适用场景**：全高（100%）滚动穿透式苹果页面壳：干净实色底面（`surface().canvas` / `grouped_bg`）+ 唯一全高 `ui::scroll_box`（自动加 `top_inset` / `bottom_inset`）+ 悬浮顶/底槽（`leading` / `title` / `subtitle` / `trailing` / `bottom`）。零实色顶栏、零横贯硬分割线，内容滚动直接穿过玻璃岛下方产生真实折射。
 - **无裸文字不加卷边模糊**：顶/底栏只有自包含玻璃岛（`<lg::BackButton>`、频道胶囊、`<lg::BarPillGroup>`、`<lg::ComposerBar>`、`<lg::BottomTabs>`）时默认零模糊，清晰内容直接穿过玻璃岛折射；只有裸露 `title` / `subtitle` 文字压在内容上时，顶部才自动挂紧凑的全高 `smoothstep` 渐隐（`liquid_scroll_edge_node`，高 `header_height + 22`，默认 66pt）。`top_edge_blur=true/false` 可强制开关；底栏带裸文字时传 `bottom_edge_blur=true`，挂 `bottom_height + 8`（默认 64pt）的底部渐隐。
+- **动态底栏高度**：底栏高度会变（多行输入、展开的工具条）时传 `bottom_inset_by=fn() { ... }`（`() -> Double`），滚区底部 inset 随信号实时更新，优先于静态 `bottom_inset`。
+- **贴底封底**：无底部渐隐时，底栏下方 36pt 封底（18pt 渐隐 + 实色）为不透明实色、不接收指针（`points=false`），被它盖住的半截行不计入热区检查，底栏旁的滚轮与选区照常落到列表。
 
 ### 00b. `lg::split_shell_node` / `<lg::SplitShell>`
 - **适用场景**：响应式双栏 `NavigationSplitView`（`breakpoint=760.0`、`sidebar_width=264.0`）：宽屏渲染固定宽实色 `surface().sidebar` + `0.5pt` `surface().separator` 竖细线 + `.fill()` 详情区；窄屏按 `show_detail()` 自动全屏切换侧栏或详情，绝不挤压截断。
@@ -82,7 +84,7 @@ let inner_r = lg::concentric(lg::r_card, 8.0) // 12.0
 | 下拉选择器（Select） | `lg::liquid_select_node` + `lg::LiquidSelectOption` | 严禁手写按钮 + 弹出列表 |
 | 气泡弹层 / 悬浮提示 | `lg::liquid_popover_node` / `lg::liquid_tooltip_node` | 严禁绝对定位手绘气泡 |
 | 弹窗 / 底部 Sheet / 操作表 / 侧边浮岛抽屉 | `lg::liquid_dialog_node` / `lg::liquid_sheet_node` / `lg::liquid_action_sheet_node` / `lg::liquid_drawer_node` + `lg::DrawerSide` | 严禁手写模态遮罩、拖拽关闭与 Escape 关闭 |
-| 开关 / 滑块 / 分段控制 / 步进器 / 标签 | `lg::liquid_toggle_node` / `lg::liquid_slider_node` / `lg::liquid_segmented_node` / `lg::liquid_stepper_node` / `lg::liquid_chip_node` | 严禁手写按压折射透镜 |
+| 开关 / 滑块 / 分段控制 / 步进器 / 标签 | `lg::liquid_toggle_node` / `lg::liquid_slider_node` / `lg::liquid_segmented_node` / `lg::liquid_stepper_node` / `lg::liquid_chip_node` | 严禁手写按压折射透镜；玻璃浮层（`Sheet` / `Drawer` / `Dialog` / `Popover`）或实色卡片内的分段控制传 `flat=true`（实色内凹轨道、不挂拖拽透镜，零玻璃实例） |
 | 文本输入 / 复选框 / 单选组 | `lg::liquid_text_field_node` / `lg::liquid_checkbox_node` / `lg::liquid_radio_group_node` | 严禁在玻璃内再嵌玻璃输入项 |
 | 轻提示 / 徽标 / 进度条 / 进度环 | `lg::liquid_toast_node` / `lg::liquid_badge_node` / `lg::liquid_count_badge_node` / `lg::liquid_progress_bar_node` / `lg::liquid_progress_ring_node` | 严禁手写状态色与进度动画 |
 | 连续平面→玻璃浮升容器 | `lg::lg_glass_lift_surface`（静止 `strength <= 0.001` 零玻璃，浮起渐现） | 严禁手动插值 `Glass::liquid` 或静止留 `alpha=0` 玻璃 |
