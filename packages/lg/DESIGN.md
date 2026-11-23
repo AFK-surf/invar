@@ -38,6 +38,7 @@ Reserve single-layer `paint::Glass::liquid` exclusively for floating navigation,
 - **Floating toolbars & controls**:
   - `liquid_toolbar_node`, `liquid_button_node` (`flat=false`), `liquid_icon_button_node`, `liquid_button_group_node`, `liquid_segmented_node`, `liquid_stepper_node`, `liquid_chip_node`, `liquid_text_field_node` (`flat=false`).
   - Inside a glass overlay (`Sheet`, `Drawer`, `Dialog`, `Popover`) or a solid card, `liquid_segmented_node` / `<lg::Segmented>` takes `flat=true`: a solid recessed track instead of the glass track, the solid thumb kept fully opaque while dragged, and no drag loupe, so it adds zero glass instances at rest and while dragging.
+  - The stepper and chip set in the Content Layer (a settings row, a form) take `flat=true` too: a solid fill (`ctrl_content_fill`, iOS's tertiary system fill), no glass. Only what floats over the page is glass.
 - **Floating overlays & inspectors**:
   - `liquid_menu_node`, `liquid_menu_panel_node`, `liquid_menu_button_node`, `liquid_select_node`, `liquid_popover_node`, `liquid_tooltip_node`, `liquid_sheet_node`, `liquid_action_sheet_node`, `liquid_drawer_node`, `liquid_dialog_node`, `liquid_toast_node`, plus opt-in floating inspectors (`liquid_panel_node(..., floating=true)`) and Control Center tiles (`liquid_control_tile_node`, `liquid_card_node(..., floating=true)`).
 - **Refractive interaction lenses & optical physics**:
