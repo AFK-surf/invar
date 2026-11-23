@@ -2785,3 +2785,145 @@ test "61 encode_runs and host_runs_measure wrap on cross-run word boundaries wit
   debug_assert((cjk_h / 20.0).round().to_int() >= 2, "CJK runs must wrap cleanly across lines")
   tc.dispose()
 }
+
+test "62 UTF-16 locs wrapping never drops characters or splits words after em-dash, CJK, or 4-byte emoji" {
+  // Install a CoreText/Web/Pango/DWrite-accurate UTF-16 shaper: emits one cluster per Unicode scalar
+  // with UTF-16 code-unit `loc` offsets (1 for BMP including em-dash/CJK, 2 for 4-byte emoji).
+  let make_utf16_shaper = fn() -> (String, Double, Int, Int, Array[Double]) -> Int {
+    fn(s : String, sz : Double, _w : Int, _st : Int, out : Array[Double]) -> Int {
+      let n = s.length()
+      let adv = sz * 0.6
+      let mut i = 0
+      let mut u16 = 0
+      let mut c = 0
+      while i < n && (c + 1) * 4 <= out.length() {
+        let b0 = s.code_unit_at(i)
+        let (blen, u16_len) = if b0 < 0x80 {
+          (1, 1)
+        } else if (b0 & 0xE0) == 0xC0 {
+          (2, 1)
+        } else if (b0 & 0xF0) == 0xE0 {
+          (3, 1)
+        } else if (b0 & 0xF8) == 0xF0 {
+          (4, 2)
+        } else {
+          (1, 1)
+        }
+        let is_sp = b0 == 32 || b0 == 9 || b0 == 10
+        out[c * 4] = u16.to_double()
+        out[c * 4 + 1] = u16_len.to_double()
+        out[c * 4 + 2] = adv
+        out[c * 4 + 3] = if is_sp { -1.0 } else { (100 + (c % 50)).to_double() }
+        i += blen
+        u16 += u16_len
+        c += 1
+      }
+      c
+    }
+  }
+
+  let look = view::WordsLook::{ ..view::words_plain, size: 15.0, line: 20.0, wrap: true }
+  // Case A: Exact em-dash repro ("approve" must NOT become "a\nprove" with 'p' dropped)
+  let sentence = "Great — let's record the 60fps Apple Metal interaction flow and approve the cutover decision."
+  // 93 Unicode scalars total, 16 spaces -> 77 non-space glyphs.
+  // At 9.0pt/char, box_w=600.0 fits 66 chars (594pt):
+  //   "Great — let's record the 60fps Apple Metal interaction flow and" = 63 chars -> line 1
+  //   "approve the cutover decision." = 29 chars -> line 2 ("approve" is non-space indices 52..58)
+  let box_w = 600.0
+  let t1 = Tester::tree(fn(root : view::View) {
+    let h = hostapi::host()
+    h.shape = make_utf16_shaper()
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(box_w))).words(view::Live::Is(sentence), ink=0xFFFFFFFFL, look=look)
+    })
+  }, width=700.0, height=200.0)
+  let (_, mh1) = host_words_measure(sentence, look, box_w, 1.0)
+  let measured_lines1 = (mh1 / 20.0).round().to_int()
+  let sc1 = t1.scene()
+  let ys1 : Array[Double] = []
+  let distinct1 : Array[Double] = []
+  let mut i = 0
+  while i < sc1.ninst {
+    let b = i * inst_size
+    if (sc1.inst[b + 5] - 1.0).abs() < 0.01 {
+      let gy = sc1.inst[b + 1]
+      ys1.push(gy)
+      let mut seen = false
+      for dy in distinct1 {
+        if (dy - gy).abs() < 1.0 {
+          seen = true
+          break
+        }
+      }
+      if !seen {
+        distinct1.push(gy)
+      }
+    }
+    i += 1
+  }
+  debug_assert(ys1.length() == 79, "em-dash repro must emit all 79 non-space glyphs without dropping 'p', got \{ys1.length()}")
+  debug_assert(distinct1.length() == 2 && measured_lines1 == 2, "encode_words (\{distinct1.length()}) and host_words_measure (\{measured_lines1}) must both wrap into 2 lines")
+  // "Great—let'srecordthe60fpsAppleMetalinteractionflowand" = 53 non-space glyphs, followed by "approve" (53..59)
+  let app_y = ys1[53]
+  debug_assert(app_y > ys1[0] + 10.0, "'approve' must wrap intact to line 2")
+  let mut ai = 54
+  while ai < 60 {
+    debug_assert((ys1[ai] - app_y).abs() < 0.5, "all 7 letters of 'approve' must remain on line 2")
+    ai += 1
+  }
+  t1.dispose()
+
+  // Case B: Mixed CJK + 4-byte emoji + ASCII word wrapping
+  let mixed = "中文🚀展示 approve cutover"
+  // Scalars: 中(0) 文(1) 🚀(2, u16+=2) 展(3) 示(4) ' '(5) approve(6..12) ' '(13) cutover(14..20)
+  // Non-space glyphs: 5 + 7 + 7 = 19. At 9pt/char, box_w=95.0 fits 10 chars (90pt):
+  //   Line 1: "中文🚀展示" (5 chars) -> + " approve" (13 > 10), so "approve" wraps intact to line 2
+  //   Line 2: "approve" (7 chars)
+  //   Line 3: "cutover" (7 chars)
+  let t2 = Tester::tree(fn(root : view::View) {
+    let h = hostapi::host()
+    h.shape = make_utf16_shaper()
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(95.0))).words(view::Live::Is(mixed), ink=0xFFFFFFFFL, look=look)
+    })
+  }, width=200.0, height=200.0)
+  let (_, mh2) = host_words_measure(mixed, look, 95.0, 1.0)
+  let measured_lines2 = (mh2 / 20.0).round().to_int()
+  let sc2 = t2.scene()
+  let ys2 : Array[Double] = []
+  let distinct2 : Array[Double] = []
+  let mut j = 0
+  while j < sc2.ninst {
+    let b = j * inst_size
+    if (sc2.inst[b + 5] - 1.0).abs() < 0.01 {
+      let gy = sc2.inst[b + 1]
+      ys2.push(gy)
+      let mut seen = false
+      for dy in distinct2 {
+        if (dy - gy).abs() < 1.0 {
+          seen = true
+          break
+        }
+      }
+      if !seen {
+        distinct2.push(gy)
+      }
+    }
+    j += 1
+  }
+  debug_assert(ys2.length() == 19, "CJK+emoji+ASCII must emit all 19 non-space glyphs, got \{ys2.length()}")
+  debug_assert(distinct2.length() == measured_lines2, "CJK+emoji encode_words (\{distinct2.length()}) must match host_words_measure (\{measured_lines2})")
+  let m_app_y = ys2[5]
+  let mut mi = 6
+  while mi < 12 {
+    debug_assert((ys2[mi] - m_app_y).abs() < 0.5, "'approve' after CJK+emoji must stay intact on one line")
+    mi += 1
+  }
+
+  // Case C: host_runs_least_measure with em-dash and CJK prefix
+  let least_runs = [text::plain("状态 — approve ok")]
+  let least_w = host_runs_least_measure(least_runs, look, view::runs_plain, 1.0)
+  // Longest unbreakable word is "approve" = 7 * 9.0 = 63.0pt -> ceil(63.5) = 64.0
+  debug_assert(least_w >= 63.0 && least_w <= 65.0, "host_runs_least_measure with CJK+em-dash prefix must equal 'approve' width (~64pt), got \{least_w}")
+  t2.dispose()
+}

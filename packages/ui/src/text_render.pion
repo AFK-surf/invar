@@ -80,6 +80,35 @@ fn utf16_slice(s : String, u16_start : Int, u16_end : Int) -> String {
   }
 }
 
+/// Build an O(N) lookup table mapping UTF-16 code-unit index -> UTF-8 lead byte.
+/// Astral code points (4-byte UTF-8) span 2 UTF-16 code units and push `b0` twice.
+fn utf16_lead_bytes(s : String) -> Array[Int] {
+  let n = s.length()
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let b0 = s.code_unit_at(i)
+    if b0 < 0x80 {
+      out.push(b0)
+      i += 1
+    } else if (b0 & 0xE0) == 0xC0 {
+      out.push(b0)
+      i += 2
+    } else if (b0 & 0xF0) == 0xE0 {
+      out.push(b0)
+      i += 3
+    } else if (b0 & 0xF8) == 0xF0 {
+      out.push(b0)
+      out.push(b0)
+      i += 4
+    } else {
+      out.push(b0)
+      i += 1
+    }
+  }
+  out
+}
+
 /// Post-process CoreText/hostapi ligature clusters (`gkey == -2`), aligned with upstream `text.mbt:1089-1119`.
 fn resolve_ligatures(
   text : String,
@@ -594,6 +623,7 @@ fn encode_words(
     let eff_clip_x1 = if use_box_clip { dmin(clip_x1, d.x + d.w) } else { clip_x1 }
     let eff_clip_y1 = if use_box_clip && d.h > 0.0 { dmin(clip_y1, d.y + d.h) } else { clip_y1 }
     // Partition shaped clusters into visual lines (word-boundary wrapping by d.w if wrap=true)
+    let lead = utf16_lead_bytes(raw)
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
@@ -608,7 +638,7 @@ fn encode_words(
       while end < n {
         let adv = advs[end] + spacing
         let loc = locs[end]
-        let cu = if loc >= 0 && loc < raw.length() { raw.code_unit_at(loc) } else { 0 }
+        let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
         let is_space = cu == 32 || cu == 9
         if wrap && end > start && line_w + adv > d.w {
           if !is_space && last_break_end > start {
@@ -679,7 +709,7 @@ fn encode_words(
       if wrapped {
         while start < n {
           let sloc = locs[start]
-          let scu = if sloc >= 0 && sloc < raw.length() { raw.code_unit_at(sloc) } else { 0 }
+          let scu = if sloc >= 0 && sloc < lead.length() { lead[sloc] } else { 0 }
           if scu == 32 || scu == 9 {
             start += 1
           } else {
@@ -759,19 +789,13 @@ fn layout_runs(
         if n > 0 {
           shaped_any = true
           resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
+          let lead = utf16_lead_bytes(seg)
           let mut k = 0
           while k < n {
             let loc = sbuf[k * 4].to_int()
             let adv = sbuf[k * 4 + 2] + spacing
             let gkey = sbuf[k * 4 + 3].to_int()
-            let sub = utf16_slice(seg, loc, loc + 1)
-            let cu = if sub.length() > 0 {
-              sub.code_unit_at(0)
-            } else if loc >= 0 && loc < seg.length() {
-              seg.code_unit_at(loc)
-            } else {
-              0
-            }
+            let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
             clusters.push(RunsCluster::{ adv, gkey, cu, rink, run_bg: run.bg })
             k += 1
           }
@@ -895,9 +919,10 @@ fn encode_runs(
     while k < vl.end {
       let cl = layout.clusters[k]
       if (cl.run_bg & 0xFFL) != 0L && cl.adv > 0.0 {
+        let bg_pad = dmin(1.5, dmax(0.0, (line_h - base_sz) * 0.35))
         let _ = scene.push_inst(
-          pen_x, line_y, cl.adv, line_h,
-          0.0, 0.0, 0.0, 0.0, cl.run_bg, d.alpha, 0.0, 0.0, 0.0, 0.0,
+          pen_x, line_y + bg_pad, cl.adv, dmax(1.0, line_h - bg_pad * 2.0),
+          3.0, 0.0, 0.0, 0.0, cl.run_bg, d.alpha, 0.0, 0.0, 0.0, 0.0,
           clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
         )
       }
@@ -966,6 +991,7 @@ pub fn host_words_measure(
     }
     shaped_any = true
     resolve_ligatures(raw, n, sbuf, sz, weight, style_bits)
+    let lead = utf16_lead_bytes(raw)
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
@@ -979,7 +1005,7 @@ pub fn host_words_measure(
       while end < n {
         let adv = sbuf[end * 4 + 2] + spacing
         let loc = sbuf[end * 4].to_int()
-        let cu = if loc >= 0 && loc < raw.length() { raw.code_unit_at(loc) } else { 0 }
+        let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
         let is_space = cu == 32 || cu == 9
         if wrap && end > start && line_w + adv > max_w {
           if !is_space && last_break_end > start {
@@ -1012,7 +1038,7 @@ pub fn host_words_measure(
       if wrapped {
         while start < n {
           let sloc = sbuf[start * 4].to_int()
-          let scu = if sloc >= 0 && sloc < raw.length() { raw.code_unit_at(sloc) } else { 0 }
+          let scu = if sloc >= 0 && sloc < lead.length() { lead[sloc] } else { 0 }
           if scu == 32 || scu == 9 {
             start += 1
           } else {
@@ -1118,11 +1144,12 @@ pub fn host_runs_least_measure(
     if n > 0 {
       shaped_any = true
     }
+    let lead = utf16_lead_bytes(run.text)
     let mut k = 0
     while k < n {
       let loc = sbuf[k * 4].to_int()
       let adv = sbuf[k * 4 + 2] + spacing
-      let cu = if loc >= 0 && loc < run.text.length() { run.text.code_unit_at(loc) } else { 0 }
+      let cu = if loc >= 0 && loc < lead.length() { lead[loc] } else { 0 }
       if cu == 32 || cu == 9 || cu == 10 {
         if word_w > widest {
           widest = word_w
