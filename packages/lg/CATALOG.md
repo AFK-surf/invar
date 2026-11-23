@@ -10,7 +10,8 @@
 ## Standard Apple App Shells, Vector Icons & Composer (Start Here)
 
 ### 00a. `lg::page_shell_node` / `<lg::PageShell>`
-- **适用场景**：全高（100%）滚动穿透式苹果页面壳：干净实色底面（`surface().canvas` / `grouped_bg`）+ 唯一全高 `ui::scroll_box`（自动加 `top_inset` / `bottom_inset`）+ 自动挂载 `liquid_scroll_edge_node` 渐进模糊卷边（`UIScrollEdgeEffect.soft`）+ 悬浮顶/底槽（`leading` / `title` / `subtitle` / `trailing` / `bottom`）。零实色顶栏、零横贯硬分割线，内容滚动直接穿过玻璃岛下方产生真实折射。
+- **适用场景**：全高（100%）滚动穿透式苹果页面壳：干净实色底面（`surface().canvas` / `grouped_bg`）+ 唯一全高 `ui::scroll_box`（自动加 `top_inset` / `bottom_inset`）+ 悬浮顶/底槽（`leading` / `title` / `subtitle` / `trailing` / `bottom`）。零实色顶栏、零横贯硬分割线，内容滚动直接穿过玻璃岛下方产生真实折射。
+- **无裸文字不加卷边模糊**：顶/底栏只有自包含玻璃岛（`<lg::BackButton>`、频道胶囊、`<lg::BarPillGroup>`、`<lg::ComposerBar>`、`<lg::BottomTabs>`）时默认零模糊，清晰内容直接穿过玻璃岛折射；只有裸露 `title` / `subtitle` 文字压在内容上时，顶部才自动挂紧凑的全高 `smoothstep` 渐隐（`liquid_scroll_edge_node`，高 `header_height + 22`，默认 66pt）。`top_edge_blur=true/false` 可强制开关；底栏带裸文字时传 `bottom_edge_blur=true`，挂 `bottom_height + 8`（默认 64pt）的底部渐隐。
 
 ### 00b. `lg::split_shell_node` / `<lg::SplitShell>`
 - **适用场景**：响应式双栏 `NavigationSplitView`（`breakpoint=760.0`、`sidebar_width=264.0`）：宽屏渲染固定宽实色 `surface().sidebar` + `0.5pt` `surface().separator` 竖细线 + `.fill()` 详情区；窄屏按 `show_detail()` 自动全屏切换侧栏或详情，绝不挤压截断。

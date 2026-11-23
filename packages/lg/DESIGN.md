@@ -24,14 +24,14 @@ All primary reading surfaces and structured page content **MUST NOT** use `paint
 Reserve single-layer `paint::Glass::liquid` exclusively for floating navigation, floating controls, transient overlays, and active optical lenses:
 
 - **Standard Apple App Shells & Chrome (Start Here)**:
-  - `page_shell_node` / `<lg::PageShell>`: full-height (100%) `ui::scroll_box` over a solid canvas with automatic top/bottom content insets, automatic `liquid_scroll_edge_node` (`UIScrollEdgeEffect.soft`) progressive blur veils, and floating top/bottom slots — guaranteeing scrolled content glides underneath floating glass chrome.
+  - `page_shell_node` / `<lg::PageShell>`: full-height (100%) `ui::scroll_box` over a solid canvas with automatic top/bottom content insets, and floating top/bottom slots — guaranteeing scrolled content glides underneath floating glass chrome. **No bare text over content, no scroll-edge blur**: bars made only of self-contained glass islands (`<lg::BackButton>`, channel pills, `<lg::BarPillGroup>`, `<lg::ComposerBar>`, `<lg::BottomTabs>`) get no blur veil, so crisp content refracts straight through the islands. Only when bare `title` / `subtitle` text sits over the content does the shell mount a compact full-height `smoothstep` fade (`liquid_scroll_edge_node`, `UIScrollEdgeEffect.soft`) of `header_height + 22` (66pt by default); `top_edge_blur` overrides the choice, and `bottom_edge_blur=true` opts into a `bottom_height + 8` (64pt) bottom fade for a bottom bar that carries bare text.
   - `split_shell_node` / `<lg::SplitShell>`: responsive two-column `NavigationSplitView` (`>= 760pt` fixed solid sidebar + `0.5pt` hairline + `.fill()` detail; `< 760pt` full-screen sidebar/detail switch).
   - `composer_bar_node` / `<lg::ComposerBar>`: Apple Messages-grade single-layer adaptive floating glass composer (`min_height=44`, `r=22`, flat circular leading icons, borderless transparent `ui::field`, `34pt` circular `ArrowUp` send button with `36pt` hit area).
   - `liquid_back_button_node` / `<lg::BackButton>` + `icon_node` / `<lg::Icon>` (`31+` pure-vector `paint::shape_of` icons, zero emoji/Unicode font dependency).
 - **Floating navigation chrome**:
   - `liquid_nav_bar_node` (transparent layout chrome `glass=false` hosting floating glass islands in `leading`/`trailing`), `liquid_bar_pill_group_node`, `liquid_bottom_tabs_node`, `liquid_collapsible_tabs_node`, `liquid_search_bar_node`, `liquid_search_morph_node`.
 - **Anti-Pattern Red Lines (Strictly Forbidden)**:
-  1. **No solid top-bar backdrop or full-width horizontal divider** cutting off the scroll viewport (use `<lg::PageShell>` with `UIScrollEdgeEffect.soft`).
+  1. **No solid top-bar backdrop or full-width horizontal divider** cutting off the scroll viewport (use `<lg::PageShell>`; blur the scroll edge only behind bare text, never behind glass-island-only bars).
   2. **No plain-text top-bar capsules** like `"Back"` or `"Search"` (use `<lg::BackButton>` and `<lg::BarPillGroup>` with `<lg::Icon>`).
   3. **No box-in-box composer bars** or rectangular `"Send"` text buttons (use `<lg::ComposerBar>`).
   4. **No three-box opaque stack (`[header] / [scroll_box] / [footer]`)** that prevents content from scrolling beneath floating Liquid Glass chrome.
