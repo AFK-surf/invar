@@ -5532,7 +5532,6 @@
     el.setAttribute('autocapitalize', 'off');
     el.setAttribute('autocorrect', 'off');
     el.setAttribute('spellcheck', 'false');
-    el.setAttribute('aria-hidden', 'true');
     el.tabIndex = -1;
     el.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:20px;opacity:0;padding:0;border:0;overflow:hidden;' +
       'font-size:16px;caret-color:transparent;color:transparent;background:transparent;outline:none;pointer-events:none';

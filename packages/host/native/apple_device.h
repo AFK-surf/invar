@@ -311,6 +311,8 @@ void mb_host_keep_awake(int32_t on) {
 // (ios_app.m returnKeyType), the keyboard told again as it changes; nothing on a Mac
 static int32_t ime_action_kind;
 void mb_host_ime_action(int32_t kind) {
+  // (said before every set_ime, each frame a field is focused: only a change reloads the keyboard)
+  if (kind == ime_action_kind) return;
   ime_action_kind = kind;
 #if TARGET_OS_IOS
   dispatch_async(dispatch_get_main_queue(), ^{

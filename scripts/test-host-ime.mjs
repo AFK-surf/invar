@@ -226,7 +226,7 @@ assert.ok(pw, "a password input set up beside the textarea");
 assert.equal(pw.type, "password", "the hidden input is a password input");
 assert.equal(pw.value, "", "the password input starts empty");
 assert.equal(doc.body.children.indexOf(pw), doc.body.children.indexOf(ta) + 1, "placed right after the textarea");
-assert.equal(pw.getAttribute("aria-hidden"), "true", "hidden from assistive technology");
+assert.equal(pw.getAttribute("aria-hidden"), null, "no aria-hidden on a focusable input (as the textarea)");
 assert.equal(pw.getAttribute("autocomplete"), "off", "no autofill");
 assert.equal(pw.tabIndex, -1, "out of the Tab order");
 
@@ -272,4 +272,27 @@ assert.equal(pw.value, "", "the secret not kept once its field lets go");
 assert.notEqual(doc.activeElement, pw, "the password input lets go of the focus");
 assert.notEqual(doc.activeElement, ta, "nor the textarea holds it");
 
-console.log("test-host-ime: OK (4 cases)");
+// 5. a secret's field as the UI says it each frame (ime_action before every set_ime): focus kept, no blur or
+// refocus, the textarea empty; then a plain field: the password input emptied, the textarea focused again
+H.imeAction(4);
+H.setIme(true, 10, 20, 100, 24, "s3cr3t", 6, 6);
+assert.equal(doc.activeElement, pw, "password input focused for the secret");
+let pwBlurs = 0, pwFocuses = 0;
+pw.addEventListener("blur", () => pwBlurs++);
+pw.addEventListener("focus", () => pwFocuses++);
+for (let frame = 0; frame < 3; frame++) {
+  H.imeAction(4);
+  H.setIme(true, 10, 20, 100, 24, "s3cr3t", 6, 6);
+  assert.equal(doc.activeElement, pw, `frame ${frame}: the password input keeps the focus`);
+  assert.equal(pw.value, "s3cr3t", `frame ${frame}: the secret in the password input`);
+  assert.equal(ta.value, "", `frame ${frame}: the textarea holds no secret`);
+}
+assert.equal(pwBlurs, 0, `no blur over repeated frames: ${pwBlurs}`);
+assert.equal(pwFocuses, 0, `no refocus over repeated frames: ${pwFocuses}`);
+H.imeAction(0);
+H.setIme(true, 10, 50, 100, 24, "alice", 5, 5);
+assert.equal(pw.value, "", "the password input emptied for the plain field");
+assert.equal(doc.activeElement, ta, "the textarea has the focus again");
+assert.equal(ta.value, "alice", "the plain field's words in the textarea");
+
+console.log("test-host-ime: OK (5 cases)");
