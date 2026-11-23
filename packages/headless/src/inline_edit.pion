@@ -1,6 +1,7 @@
 // Inline in-place editing: preview/edit toggle, Enter commit & focus return,
-// Escape cancel/restore & focus return, and optional submit_on_blur.
+// Escape cancel/restore & focus return, outside-press commit, and optional submit_on_blur.
 
+import "headless_core"
 import "signals"
 import "view"
 
@@ -12,6 +13,9 @@ pub struct InlineEdit {
   on_cancel : Option[() -> Unit]
   submit_on_blur : Bool
   trim : Bool
+  cancel_if_empty : Bool
+  cancel_if_unchanged : Bool
+  commit_on_outside_press : Bool
   off : () -> Bool
   editing_sig : signals::Signal[Bool]
   draft_sig : signals::Signal[String]
@@ -19,6 +23,40 @@ pub struct InlineEdit {
   input_node : view::Ref[Option[view::View]]
   focus_input_pending : view::Ref[Bool]
   focus_preview_pending : view::Ref[Bool]
+}
+
+/// Construct a standalone `InlineEdit` controller.
+pub fn InlineEdit::new(
+  value : () -> String,
+  on_commit : (String) -> Unit,
+  label~ : () -> String = fn() { "" },
+  on_cancel? : () -> Unit,
+  submit_on_blur~ : Bool = false,
+  trim~ : Bool = false,
+  cancel_if_empty~ : Bool = false,
+  cancel_if_unchanged~ : Bool = false,
+  start_editing~ : Bool = false,
+  commit_on_outside_press~ : Bool = true,
+  disabled~ : () -> Bool = fn() { false },
+) -> InlineEdit {
+  InlineEdit::{
+    label_: label,
+    value_: value,
+    on_commit,
+    on_cancel,
+    submit_on_blur,
+    trim,
+    cancel_if_empty,
+    cancel_if_unchanged,
+    commit_on_outside_press,
+    off: disabled,
+    editing_sig: signals::signal(start_editing),
+    draft_sig: signals::signal(signals::untracked(value)),
+    preview_node: view::ref_new(None),
+    input_node: view::ref_new(None),
+    focus_input_pending: view::ref_new(start_editing),
+    focus_preview_pending: view::ref_new(false),
+  }
 }
 
 pub fn InlineEdit::editing(self : InlineEdit) -> Bool {
@@ -79,12 +117,34 @@ fn InlineEdit::finish_commit(self : InlineEdit, refocus : Bool) -> Unit {
     return
   }
   let raw = self.draft_sig.untracked()
-  let next = if self.trim { str_trim(raw) } else { raw }
-  self.editing_sig.set(false)
-  self.focus_input_pending.v = false
-  (self.on_commit)(next)
-  if refocus {
-    self.return_focus_to_preview()
+  let was = signals::untracked(self.value_)
+  match headless_core::inline_edit_normalize(
+    raw,
+    was,
+    trim=self.trim,
+    cancel_if_empty=self.cancel_if_empty,
+    cancel_if_unchanged=self.cancel_if_unchanged,
+  ) {
+    Some(next) => {
+      self.editing_sig.set(false)
+      self.focus_input_pending.v = false
+      (self.on_commit)(next)
+      if refocus {
+        self.return_focus_to_preview()
+      }
+    }
+    None => {
+      self.draft_sig.set(was)
+      self.editing_sig.set(false)
+      self.focus_input_pending.v = false
+      match self.on_cancel {
+        Some(f) => f()
+        None => ()
+      }
+      if refocus {
+        self.return_focus_to_preview()
+      }
+    }
   }
 }
 
@@ -118,25 +178,27 @@ pub fn inline_edit(
   on_cancel? : () -> Unit,
   submit_on_blur~ : Bool = false,
   trim~ : Bool = false,
+  cancel_if_empty~ : Bool = false,
+  cancel_if_unchanged~ : Bool = false,
+  start_editing~ : Bool = false,
+  commit_on_outside_press~ : Bool = true,
   disabled~ : () -> Bool = fn() { false },
   made_for? : String,
   loc~ : String = "",
 ) -> view::View {
-  let ie = InlineEdit::{
-    label_: label,
-    value_: value,
+  let ie = InlineEdit::new(
+    value,
     on_commit,
-    on_cancel,
-    submit_on_blur,
-    trim,
-    off: disabled,
-    editing_sig: signals::signal(false),
-    draft_sig: signals::signal(signals::untracked(value)),
-    preview_node: view::ref_new(None),
-    input_node: view::ref_new(None),
-    focus_input_pending: view::ref_new(false),
-    focus_preview_pending: view::ref_new(false),
-  }
+    label=label,
+    on_cancel?=on_cancel,
+    submit_on_blur=submit_on_blur,
+    trim=trim,
+    cancel_if_empty=cancel_if_empty,
+    cancel_if_unchanged=cancel_if_unchanged,
+    start_editing=start_editing,
+    commit_on_outside_press=commit_on_outside_press,
+    disabled=disabled,
+  )
   parent.box(fn(v : view::View) {
     look(v, ie)
     v.reacts(disabled, fn(off : Bool) {
@@ -242,6 +304,21 @@ pub fn InlineEdit::input(
         }
       }
     })
+    window_downs_while(
+      v,
+      fn() -> Bool { self.editing_sig.get() && self.commit_on_outside_press },
+      fn(x : Double, y : Double) {
+        if !press_on(v, x, y) {
+          self.finish_commit(false)
+        }
+      },
+    )
+    v.reacts(fn() -> Bool { v.takes_input() }, fn(live : Bool) {
+      if live && self.focus_input_pending.v && v.alive() && !v.leaving() && self.editing_sig.untracked() {
+        self.focus_input_pending.v = false
+        let _ = v.ask_focus(visible=true)
+      }
+    }, at_start=false)
     if self.focus_input_pending.v {
       let _ = v.at_moment(v.cause_at(), fn() {
         if self.focus_input_pending.v && v.alive() && !v.leaving() && self.editing_sig.untracked() {
@@ -257,4 +334,17 @@ pub fn InlineEdit::input(
   } else {
     parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
   }
+}
+
+/// Register the editor node (alias of `InlineEdit::input`, with outside-press commit and
+/// `takes_input()` rising-edge delayed focus).
+pub fn InlineEdit::editor(
+  self : InlineEdit,
+  parent : view::View,
+  look : (view::View, InlineEdit) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  self.input(parent, look, in_node=in_node, made_for?=made_for, loc=loc)
 }

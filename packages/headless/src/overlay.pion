@@ -16,10 +16,12 @@ struct OverlayEntry {
   id : view::NodeId
   node : view::View
   dismiss : (OverlayDismiss) -> Unit
+  before_dismiss : Option[(OverlayDismiss) -> Bool]
   inert : () -> Bool
   escape : Bool
   outside : Bool
   anchor : () -> Option[view::View]
+  keeps : Option[() -> Array[view::View]]
 }
 
 struct OverlayStack {
@@ -95,8 +97,24 @@ fn OverlayStack::escape(self : OverlayStack, how : OverlayDismiss) -> Bool {
   if i < 0 {
     return false
   }
-  (self.entries[i].dismiss)(how)
+  let e = self.entries[i]
+  match e.before_dismiss {
+    Some(f) => if f(how) { return true }
+    None => ()
+  }
+  (e.dismiss)(how)
   true
+}
+
+fn press_hits_keep(k : view::View, x : Double, y : Double) -> Bool {
+  if !k.alive() || k.leaving() {
+    return false
+  }
+  if press_on(k, x, y) {
+    return true
+  }
+  let (kx, ky, kw, kh) = k.placed_window_now()
+  kw > 0.0 && kh > 0.0 && x >= kx && x <= kx + kw && y >= ky && y <= ky + kh
 }
 
 fn OverlayStack::press(self : OverlayStack, count : Int, x : Double, y : Double) -> Unit {
@@ -118,6 +136,20 @@ fn OverlayStack::press(self : OverlayStack, count : Int, x : Double, y : Double)
   }
   match (top.anchor)() {
     Some(a) => if press_on(a, x, y) { return }
+    None => ()
+  }
+  match top.keeps {
+    Some(ks) => {
+      for k in ks() {
+        if press_hits_keep(k, x, y) {
+          return
+        }
+      }
+    }
+    None => ()
+  }
+  match top.before_dismiss {
+    Some(f) => if f(OverlayDismiss::Outside) { return }
     None => ()
   }
   (top.dismiss)(OverlayDismiss::Outside)
@@ -194,6 +226,8 @@ fn join_overlay(
   dismiss_on_outside : Bool,
   inert : () -> Bool,
   anchor : () -> Option[view::View],
+  before_dismiss? : (OverlayDismiss) -> Bool,
+  keeps? : () -> Array[view::View],
 ) -> (Overlay, () -> Bool, () -> Bool) {
   let stack = overlay_stack_for(v)
   let off = fn() -> Bool { inert() || v.leaving() }
@@ -202,10 +236,12 @@ fn join_overlay(
     id: v.id(),
     node: v,
     dismiss: fn(how : OverlayDismiss) { if !signals::untracked(off) { on_dismiss(how) } },
+    before_dismiss,
     inert: off,
     escape: dismiss_on_escape,
     outside: dismiss_on_outside,
     anchor,
+    keeps,
   }
   stack.entries.push(entry)
   stack.changed.set(stack.changed.untracked() + 1)
@@ -234,11 +270,20 @@ fn wire_overlay(
   first_takes : Option[((view::Said) -> Bool)],
   return_focus : Bool,
   escape_gate : Option[(() -> Bool)],
+  leaves_typing~ : Bool = false,
+  initial_focus? : view::View,
 ) -> Unit {
   let v = ov.entry.node
   let stack = ov.stack
   if do_auto_focus {
-    let _ = v.focus_opens_first(takes?=first_takes).focusable(view::Live::By(live), keys=0, tab=false)
+    match initial_focus {
+      Some(target) => {
+        let _ = v.focus_opens(target).focusable(view::Live::By(live), keys=0, tab=false)
+      }
+      None => {
+        let _ = v.focus_opens_first(takes?=first_takes).focusable(view::Live::By(live), keys=0, tab=false)
+      }
+    }
   } else {
     let _ = v.focus_returns()
   }
@@ -253,6 +298,9 @@ fn wire_overlay(
     }
   }
   if modal {
+    if leaves_typing {
+      let _ = v.leaves_typing()
+    }
     let _ = v.modal(view::Live::By(live))
   }
   let _ = v
@@ -294,8 +342,21 @@ fn attach_overlay(
   first_takes : Option[((view::Said) -> Bool)],
   return_focus : Bool,
   escape_gate : Option[(() -> Bool)],
+  before_dismiss? : (OverlayDismiss) -> Bool,
+  keeps? : () -> Array[view::View],
+  leaves_typing~ : Bool = false,
+  initial_focus? : view::View,
 ) -> Overlay {
-  let (ov, off, live) = join_overlay(v, on_dismiss, dismiss_on_escape, dismiss_on_outside, inert, anchor)
+  let (ov, off, live) = join_overlay(
+    v,
+    on_dismiss,
+    dismiss_on_escape,
+    dismiss_on_outside,
+    inert,
+    anchor,
+    before_dismiss?=before_dismiss,
+    keeps?=keeps,
+  )
   wire_overlay(
     ov,
     off,
@@ -309,11 +370,13 @@ fn attach_overlay(
     first_takes,
     return_focus,
     escape_gate,
+    leaves_typing=leaves_typing,
+    initial_focus?=initial_focus,
   )
   ov
 }
 
-/// An overlay in `parent`, joining its tree's stack above all there.
+/// An overlay in `parent` (`parent` itself when `in_node=true`), joining its tree's stack above all there.
 pub fn overlay(
   parent : view::View,
   on_dismiss : (OverlayDismiss) -> Unit,
@@ -321,10 +384,16 @@ pub fn overlay(
   modal~ : Bool = false,
   dismiss_on_escape~ : Bool = true,
   dismiss_on_outside~ : Bool = true,
+  before_dismiss? : (OverlayDismiss) -> Bool,
   inert~ : () -> Bool = fn() { false },
   anchor? : view::View,
+  keeps? : () -> Array[view::View],
+  leaves_typing~ : Bool = false,
   auto_focus? : Bool,
+  first_takes? : (view::Said) -> Bool,
+  initial_focus? : view::View,
   return_focus~ : Bool = true,
+  in_node~ : Bool = false,
   label? : () -> String,
   made_for? : String,
   loc~ : String = "",
@@ -333,9 +402,18 @@ pub fn overlay(
     Some(b) => b
     None => modal
   }
-  parent.box(fn(v : view::View) {
+  let setup = fn(v : view::View) {
     let anchor_fn = fn() -> Option[view::View] { anchor }
-    let (ov, off, live) = join_overlay(v, on_dismiss, dismiss_on_escape, dismiss_on_outside, inert, anchor_fn)
+    let (ov, off, live) = join_overlay(
+      v,
+      on_dismiss,
+      dismiss_on_escape,
+      dismiss_on_outside,
+      inert,
+      anchor_fn,
+      before_dismiss?=before_dismiss,
+      keeps?=keeps,
+    )
     look(v, ov)
     wire_overlay(
       ov,
@@ -347,9 +425,11 @@ pub fn overlay(
       anchor_fn,
       None,
       do_auto_focus,
-      None,
+      first_takes,
       return_focus,
       None,
+      leaves_typing=leaves_typing,
+      initial_focus?=initial_focus,
     )
     match label {
       Some(name) => {
@@ -357,5 +437,11 @@ pub fn overlay(
       }
       None => ()
     }
-  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
 }

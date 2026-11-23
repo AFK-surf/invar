@@ -1,0 +1,538 @@
+// Comprehensive pure-Pion unit tests for Wave 4 headless upgrades:
+// overlay/dialog, drawer, slider, menu, submenu, hover_card, tooltip, inline_edit.
+
+import "dmath"
+import "signals"
+import "view"
+
+fn w4_approx(a : Double, b : Double, eps~ : Double = 1.0e-4) -> Bool {
+  dmath::abs(a - b) <= eps
+}
+
+test "w4-01 overlay & dialog: before_dismiss, keeps, leaves_typing, initial_focus, in_node" {
+  let dismissed = view::ref_new(0)
+  let block_dismiss = signals::signal(true)
+  let keep_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let ov_node_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(300.0)))
+    let keep = root.box(fn(k : view::View) {
+      let _ = k
+        .over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+        .width(view::Live::Is(Some(60.0)))
+        .height(view::Live::Is(Some(30.0)))
+        .presses(view::Live::Is(true))
+    })
+    keep_ref.v = Some(keep)
+
+    let host = root.box(fn(h : view::View) {
+      let _ = h
+        .over_at(view::Live::Is((Some(150.0), Some(100.0), None, None)))
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(80.0)))
+    })
+    let returned = overlay(
+      host,
+      fn(_how : OverlayDismiss) { dismissed.v = dismissed.v + 1 },
+      fn(v : view::View, _ov : Overlay) {
+        let _ = v.box(fn(b1 : view::View) {
+          let _ = b1.focusable(view::Live::Is(true))
+        })
+      },
+      modal=true,
+      leaves_typing=true,
+      in_node=true,
+      before_dismiss=fn(_how : OverlayDismiss) -> Bool { block_dismiss.get() },
+      keeps=fn() -> Array[view::View] {
+        match keep_ref.v {
+          Some(k) => [k]
+          None => []
+        }
+      },
+    )
+    ov_node_ref.v = Some(returned)
+    assert(returned.id() == host.id(), "in_node=true reuses parent node")
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+
+  // Clicking on keep node does NOT dismiss even when before_dismiss allows it
+  block_dismiss.set(false)
+  tree.went_down(10.0, x=20.0, y=20.0)
+  tree.went_up(20.0)
+  let _ = tree.frame(400.0, 300.0, now=30.0)
+  assert(dismissed.v == 0, "click on keeps node treated as inside")
+
+  // When before_dismiss returns true, Escape and Outside press are swallowed
+  block_dismiss.set(true)
+  let _ = tree.key_at(menu_key_escape, 0, 35.0)
+  tree.went_down(40.0, x=350.0, y=250.0)
+  tree.went_up(50.0)
+  let _ = tree.frame(400.0, 300.0, now=60.0)
+  assert(dismissed.v == 0, "before_dismiss=true blocks escape and outside")
+
+  // Once before_dismiss returns false, Outside press dismisses
+  block_dismiss.set(false)
+  tree.went_down(70.0, x=350.0, y=250.0)
+  tree.went_up(80.0)
+  let _ = tree.frame(400.0, 300.0, now=90.0)
+  assert(dismissed.v == 1, "outside press dismisses when before_dismiss=false")
+  tree.dispose()
+
+  // dialog forwards before_dismiss
+  let dlg_open = signals::signal(true)
+  let dlg_closed = view::ref_new(0)
+  let dlg_block = signals::signal(true)
+  let tree2 = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(300.0)))
+    let _ = dialog(
+      root,
+      fn() { "Confirm" },
+      fn() { dlg_open.get() },
+      fn() {
+        dlg_closed.v = dlg_closed.v + 1
+        dlg_open.set(false)
+      },
+      fn(v : view::View, _d : Dialog) {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+      },
+      before_dismiss=fn(_how : OverlayDismiss) -> Bool { dlg_block.get() },
+    )
+  })
+  let _ = tree2.frame(400.0, 300.0, now=0.0)
+  let _ = tree2.key_at(menu_key_escape, 0, 10.0)
+  assert(dlg_closed.v == 0 && dlg_open.get(), "dialog before_dismiss blocks Escape")
+  dlg_block.set(false)
+  let _ = tree2.key_at(menu_key_escape, 0, 20.0)
+  assert(dlg_closed.v == 1 && !dlg_open.get(), "dialog Escape closes once before_dismiss=false")
+  tree2.dispose()
+}
+
+test "w4-02 drawer: overpull_max, on_release, last_velocity, drag_surface=false, handle(extent_by, slop)" {
+  let open = signals::signal(true)
+  let releases : Array[(Double, Double, Bool)] = []
+  let dr_ref : view::Ref[Option[Drawer]] = view::ref_new(None)
+  let body_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let handle_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(400.0)))
+    let body = drawer(
+      root,
+      fn() { "Sheet" },
+      fn() { open.get() },
+      fn() { open.set(false) },
+      fn(v : view::View, dr : Drawer) {
+        dr_ref.v = Some(dr)
+        let _ = v
+          .over_at(view::Live::Is((Some(0.0), Some(100.0), None, None)))
+          .width(view::Live::Is(Some(400.0)))
+          .height(view::Live::Is(Some(300.0)))
+        let h = dr.handle(
+          v,
+          fn(hv : view::View, _d : Drawer) {
+            let _ = hv.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(60.0)))
+          },
+          extent_by=fn() -> Double { 200.0 },
+          slop=8.0,
+        )
+        handle_ref.v = Some(h)
+      },
+      edge=DrawerEdge::Bottom,
+      overpull_max=40.0,
+      drag_surface=false,
+      on_release=fn(off : Double, vel : Double, will_close : Bool) {
+        releases.push((off, vel, will_close))
+      },
+    )
+    body_ref.v = Some(body)
+  })
+  let _ = tree.frame(400.0, 400.0, now=0.0)
+
+  // Dragging on body does nothing because drag_surface=false
+  match body_ref.v {
+    Some(b) => {
+      let _ = tree.drag_at(b.id(), view::DragIs::Down, 200.0, 250.0, 10.0)
+      let _ = tree.drag_at(b.id(), view::DragIs::Moved, 200.0, 320.0, 20.0)
+      match dr_ref.v {
+        Some(dr) => assert(!dr.dragging(), "drag_surface=false does not drag body")
+        None => panic("missing drawer")
+      }
+      let _ = tree.drag_at(b.id(), view::DragIs::Up, 200.0, 320.0, 30.0)
+    }
+    None => panic("missing body")
+  }
+
+  // Movement within slop on handle does NOT start dragging
+  match handle_ref.v {
+    Some(h) => {
+      let _ = tree.drag_at(h.id(), view::DragIs::Down, 200.0, 130.0, 50.0)
+      let _ = tree.drag_at(h.id(), view::DragIs::Moved, 200.0, 134.0, 60.0)
+      match dr_ref.v {
+        Some(dr) => assert(!dr.dragging(), "movement within slop stays non-dragging")
+        None => panic("missing drawer")
+      }
+      let _ = tree.drag_at(h.id(), view::DragIs::Up, 200.0, 134.0, 70.0)
+
+      // Dragging handle upward past slop applies overpull_max rubber resistance
+      let _ = tree.drag_at(h.id(), view::DragIs::Down, 200.0, 130.0, 100.0)
+      let _ = tree.drag_at(h.id(), view::DragIs::Moved, 200.0, 50.0, 120.0)
+      match dr_ref.v {
+        Some(dr) => {
+          assert(dr.dragging(), "handle past slop starts dragging")
+          // over = 80, max_pull = 40 -> -20.0
+          assert(w4_approx(dr.drag_offset(), -20.0), "overpull damped to -20")
+        }
+        None => panic("missing drawer")
+      }
+      let _ = tree.drag_at(h.id(), view::DragIs::Up, 200.0, 50.0, 140.0)
+      assert(releases.length() == 1 && !releases[0].2, "on_release fired with will_close=false")
+      match dr_ref.v {
+        Some(dr) => assert(w4_approx(dr.last_offset(), -20.0), "last_offset exposed on Drawer")
+        None => panic("missing drawer")
+      }
+    }
+    None => panic("missing handle")
+  }
+  tree.dispose()
+}
+
+test "w4-03 slider: on_commit and focus_on_press" {
+  let cur_val = signals::signal(50.0)
+  let commits : Array[Double] = []
+  let sl_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(60.0)))
+    let s = slider(
+      root,
+      fn() { "Volume" },
+      fn() { cur_val.get() },
+      min=0.0,
+      max=100.0,
+      step=10.0,
+      fn(v : Double) { cur_val.set(v) },
+      fn(v : view::View, _sl : Slider) {
+        let _ = v.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(40.0)))
+      },
+      on_commit=fn(v : Double) { commits.push(v) },
+      focus_on_press=true,
+    )
+    sl_ref.v = Some(s)
+  })
+  let _ = tree.frame(200.0, 60.0, now=0.0)
+
+  // Dragging focuses slider on Down and fires on_commit on Up (not on Moved)
+  match sl_ref.v {
+    Some(s) => {
+      let _ = tree.drag_at(s.id(), view::DragIs::Down, 140.0, 20.0, 10.0)
+      assert(s.focused(), "focus_on_press focuses slider on Down")
+      let _ = tree.drag_at(s.id(), view::DragIs::Moved, 160.0, 20.0, 20.0)
+      assert(commits.length() == 0, "on_commit not fired mid-drag")
+      let _ = tree.drag_at(s.id(), view::DragIs::Up, 160.0, 20.0, 30.0)
+      assert(commits.length() == 1 && w4_approx(commits[0], 80.0), "on_commit fired on drag Up")
+
+      // Keyboard arrow fires on_commit
+      let _ = tree.key_at(4, 0, 40.0)
+      assert(commits.length() == 2 && w4_approx(commits[1], 90.0), "on_commit fired on keyboard step")
+
+      // a11y step_at fires on_commit
+      let _ = tree.step_at(s.id(), -1, 50.0)
+      assert(commits.length() == 3 && w4_approx(commits[2], 80.0), "on_commit fired on step_at")
+    }
+    None => panic("missing slider")
+  }
+  tree.dispose()
+}
+
+test "w4-04 menu: handle_key, keep_field, captures_unfocused" {
+  let menu_ref : view::Ref[Option[Menu]] = view::ref_new(None)
+  let first_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let closed = view::ref_new(0)
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(200.0)))
+    let _ = root.box(fn(fld : view::View) {
+      let _ = fld.focusable(view::Live::Is(true))
+    })
+    let _ = menu(
+      root,
+      fn(_v : view::View, m : Menu) {
+        menu_ref.v = Some(m)
+        first_ref.v = Some(m.item(root, fn() { "Alpha" }, fn(_n) { () }, fn(_n, _i) { () }))
+        let _ = m.item(root, fn() { "Beta" }, fn(_n) { () }, fn(_n, _i) { () })
+      },
+      on_close=fn() { closed.v = closed.v + 1 },
+      keep_field=true,
+      captures_unfocused=true,
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+
+  match menu_ref.v {
+    Some(m) => {
+      // keep_field=true suppresses typeahead ('b' does not get consumed)
+      assert(!m.handle_key(view::Key::{ code: 1000 + 98, mods: 0 }), "keep_field suppresses typeahead")
+      // captures_unfocused=true allows Down arrow navigation even when menu is not focused
+      assert(m.handle_key(view::Key::{ code: menu_key_down, mods: 0 }), "captures_unfocused handles Down")
+      match first_ref.v {
+        Some(n) => assert(n.focused(), "Down focuses first menu item")
+        None => panic("missing first item")
+      }
+      assert(m.handle_key(view::Key::{ code: menu_key_escape, mods: 0 }), "handle_key handles Escape")
+      assert(closed.v == 1, "on_close called")
+    }
+    None => panic("missing menu")
+  }
+  tree.dispose()
+}
+
+test "w4-05 submenu: open_touch, corridor_ms, and in_corridor" {
+  let sub_open = signals::signal(false)
+  let sub = Submenu::new(
+    fn() { sub_open.get() },
+    fn(v : Bool) { sub_open.set(v) },
+    open_delay_ms=100.0,
+    close_delay_ms=100.0,
+    corridor_ms=350.0,
+  )
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(300.0)))
+    let _ = menu(root, fn(mv : view::View, m : Menu) {
+      let _ = m.sub_trigger(
+        mv,
+        sub,
+        fn() { "More" },
+        fn(tv : view::View, _it : MenuItem) {
+          let _ = tv
+            .over_at(view::Live::Is((Some(10.0), Some(100.0), None, None)))
+            .width(view::Live::Is(Some(90.0)))
+            .height(view::Live::Is(Some(30.0)))
+        },
+      )
+    })
+    root.show(fn() { sub_open.get() }, fn(s : view::View) {
+      let _ = sub.menu(s, fn(sv : view::View, sm : Menu) {
+        let _ = sv
+          .over_at(view::Live::Is((Some(150.0), Some(60.0), None, None)))
+          .width(view::Live::Is(Some(120.0)))
+          .height(view::Live::Is(Some(160.0)))
+        let _ = sm.item(sv, fn() { "Sub A" }, fn(_n) { () }, fn(_n, _i) { () })
+      })
+    }, at_once=true)
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+
+  // open_touch opens immediately
+  sub.open_touch()
+  assert(sub.open(), "open_touch opens immediately")
+  let _ = tree.frame(400.0, 300.0, now=10.0)
+
+  // Hover trigger, then move diagonally toward submenu (inside aiming corridor)
+  tree.at(20.0)
+  tree.point_at(80.0, 115.0)
+  let _ = tree.frame(400.0, 300.0, now=20.0)
+  tree.at(30.0)
+  tree.point_at(125.0, 120.0)
+  let _ = tree.frame(400.0, 300.0, now=30.0)
+  assert(sub.in_corridor(), "pointer moving toward submenu is in_corridor")
+
+  // After close_delay_ms (100ms), submenu is STILL open because corridor_ms is 350ms
+  let _ = tree.frame(400.0, 300.0, now=180.0)
+  assert(sub.open(), "corridor_ms keeps submenu open past close_delay_ms")
+
+  // After corridor_ms (30 + 350 = 380ms), submenu closes
+  let _ = tree.frame(400.0, 300.0, now=400.0)
+  assert(!sub.open(), "submenu closes after corridor_ms expires")
+  tree.dispose()
+}
+
+test "w4-06 HoverCard: held, hold, close, close_on_outside, keeps" {
+  let open = signals::signal(false)
+  let is_held = signals::signal(false)
+  let keep_ref : view::Ref[Option[view::View]] = view::ref_new(None)
+  let hc = HoverCard::new(
+    fn() { open.get() },
+    fn(v : Bool) { open.set(v) },
+    open_delay_ms=0.0,
+    close_delay_ms=100.0,
+    held=fn() { is_held.get() },
+    close_on_outside=true,
+    keeps=fn() -> Array[view::View] {
+      match keep_ref.v {
+        Some(k) => [k]
+        None => []
+      }
+    },
+  )
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(400.0))).height(view::Live::Is(Some(300.0)))
+    let keep = root.box(fn(k : view::View) {
+      let _ = k
+        .over_at(view::Live::Is((Some(250.0), Some(10.0), None, None)))
+        .width(view::Live::Is(Some(60.0)))
+        .height(view::Live::Is(Some(30.0)))
+        .presses(view::Live::Is(true))
+        .on_press(fn() { () })
+    })
+    keep_ref.v = Some(keep)
+    let trig = root.box(fn(t : view::View) {
+      let _ = t
+        .over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(30.0)))
+        .presses(view::Live::Is(true))
+        .on_press(fn() { () })
+    })
+    hc.trigger(trig)
+    let _ = hc.card(root, fn() { "Preview" }, fn(c : view::View) {
+      let _ = c
+        .over_at(view::Live::Is((Some(10.0), Some(50.0), None, None)))
+        .width(view::Live::Is(Some(140.0)))
+        .height(view::Live::Is(Some(80.0)))
+    })
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+
+  // Hover trigger -> opens immediately (open_delay_ms=0)
+  tree.at(10.0)
+  tree.point_at(30.0, 20.0)
+  let _ = tree.frame(400.0, 300.0, now=10.0)
+  if !hc.open() { panic("w4-06 step 1: hover card opens on hover") }
+
+  // With held=true, leaving hover does not close
+  is_held.set(true)
+  tree.at(20.0)
+  tree.point_at(380.0, 280.0)
+  let _ = tree.frame(400.0, 300.0, now=200.0)
+  if !hc.open() { panic("w4-06 step 2: held=true keeps hover card open") }
+
+  // Clicking on keep node does not close
+  tree.went_down(210.0, x=270.0, y=20.0)
+  tree.went_up(220.0)
+  let _ = tree.frame(400.0, 300.0, now=230.0)
+  if !hc.open() { panic("w4-06 step 3: click on keep node does not close") }
+
+  // Clicking outside closes
+  tree.went_down(240.0, x=380.0, y=280.0)
+  tree.went_up(250.0)
+  let _ = tree.frame(400.0, 300.0, now=260.0)
+  if hc.open() { panic("w4-06 step 4: outside press closes hover card") }
+
+  // Reopen, leave hover, call hold() to cancel pending close, then close() explicitly
+  is_held.set(false)
+  tree.at(300.0)
+  tree.point_at(30.0, 20.0)
+  let _ = tree.frame(400.0, 300.0, now=300.0)
+  if !hc.open() { panic("w4-06 step 5: reopened") }
+  tree.at(310.0)
+  tree.point_at(380.0, 280.0)
+  let _ = tree.frame(400.0, 300.0, now=310.0)
+  hc.hold()
+  let _ = tree.frame(400.0, 300.0, now=500.0)
+  if !hc.open() { panic("w4-06 step 6: hold() cancelled pending close timer") }
+  hc.close()
+  if hc.open() { panic("w4-06 step 7: close() closes immediately") }
+  tree.dispose()
+}
+
+test "w4-07 tooltip: window_tooltip_group and within=true" {
+  let g1_ref : view::Ref[Option[TooltipGroup[Int]]] = view::ref_new(None)
+  let g2_ref : view::Ref[Option[TooltipGroup[Int]]] = view::ref_new(None)
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(100.0)))
+    let a = root.box(fn(v : view::View) {
+      let _ = v
+        .over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+        .width(view::Live::Is(Some(60.0)))
+        .height(view::Live::Is(Some(30.0)))
+    })
+    let b = root.box(fn(v : view::View) {
+      let _ = v
+        .over_at(view::Live::Is((Some(100.0), Some(10.0), None, None)))
+        .width(view::Live::Is(Some(60.0)))
+        .height(view::Live::Is(Some(30.0)))
+    })
+    let g1 = window_tooltip_group(a)
+    let g2 = window_tooltip_group(b)
+    g1_ref.v = Some(g1)
+    g2_ref.v = Some(g2)
+    g1.trigger(a, 1, within=true)
+    g2.trigger(b, 2, within=true)
+  })
+  let _ = tree.frame(300.0, 100.0, now=0.0)
+
+  // Hover non-pressable node `a` using within=true -> opens after default delay (400ms)
+  tree.at(10.0)
+  tree.point_at(30.0, 20.0)
+  let _ = tree.frame(300.0, 100.0, now=420.0)
+  match g1_ref.v {
+    Some(g) => assert(g.is_open(1), "within=true opens tooltip on non-pressable node")
+    None => panic("missing g1")
+  }
+
+  // Move to `b` within warmup window -> opens immediately via shared window_tooltip_group!
+  tree.at(450.0)
+  tree.point_at(120.0, 20.0)
+  let _ = tree.frame(300.0, 100.0, now=450.0)
+  match g2_ref.v {
+    Some(g) => assert(g.is_open(2), "window_tooltip_group shares warmup across triggers")
+    None => panic("missing g2")
+  }
+  tree.dispose()
+}
+
+test "w4-08 InlineEdit: new, editor, trim, cancel_if_empty, cancel_if_unchanged, start_editing, outside press" {
+  let committed : Array[String] = []
+  let cancelled = view::ref_new(0)
+  let cur_val = signals::signal("Title")
+
+  let ie = InlineEdit::new(
+    fn() { cur_val.get() },
+    fn(s : String) {
+      committed.push(s)
+      cur_val.set(s)
+    },
+    on_cancel=fn() { cancelled.v = cancelled.v + 1 },
+    trim=true,
+    cancel_if_empty=true,
+    cancel_if_unchanged=true,
+    start_editing=true,
+    commit_on_outside_press=true,
+  )
+  assert(ie.editing(), "start_editing=true starts in editing mode")
+
+  let tree = make_tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(200.0)))
+    let _ = ie.editor(root, fn(ed : view::View, _c : InlineEdit) {
+      let _ = ed
+        .over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(30.0)))
+    })
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+
+  // Unchanged whitespace-padded draft cancels instead of committing
+  ie.set_draft("  Title  ")
+  ie.commit()
+  assert(!ie.editing() && committed.length() == 0 && cancelled.v == 1, "cancel_if_unchanged cancels")
+
+  // Empty/whitespace draft cancels instead of committing
+  ie.start()
+  ie.set_draft("   ")
+  ie.commit()
+  assert(!ie.editing() && committed.length() == 0 && cancelled.v == 2, "cancel_if_empty cancels")
+
+  // Changed draft committed via outside press
+  ie.start()
+  let _ = tree.frame(300.0, 200.0, now=20.0)
+  ie.set_draft("  Renamed  ")
+  tree.went_down(30.0, x=250.0, y=150.0)
+  tree.went_up(40.0)
+  let _ = tree.frame(300.0, 200.0, now=50.0)
+  assert(!ie.editing() && committed.length() == 1 && committed[0] == "Renamed", "outside press commits trimmed draft")
+  tree.dispose()
+}

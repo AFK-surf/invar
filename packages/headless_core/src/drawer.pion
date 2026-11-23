@@ -40,18 +40,30 @@ pub fn drawer_edge_velocity(edge : DrawerEdge, vx : Double, vy : Double) -> Doub
   }
 }
 
+/// Rubber-band resistance curve for overpulling past the maximum snap point.
+pub fn drawer_rubber_pull(over : Double, max_pull : Double) -> Double {
+  if over <= 0.0 || max_pull <= 0.0 {
+    0.0
+  } else {
+    over * max_pull / (over + max_pull * 2.0)
+  }
+}
+
 /// Pure reactive state machine for drawer drag & multi-point snap resolution.
 pub struct DrawerSnapCore {
   edge_ : DrawerEdge
   snap_points : Array[Double]
   close_threshold : Double
   velocity_threshold : Double
+  overpull_max : Double
   can_drag : () -> Bool
   dragging_sig : signals::Signal[Bool]
   drag_offset_sig : signals::Signal[Double]
   active : Ref[Bool]
   start_x : Ref[Double]
   start_y : Ref[Double]
+  last_vel : Ref[Double]
+  last_off : Ref[Double]
 }
 
 pub fn DrawerSnapCore::new(
@@ -59,6 +71,7 @@ pub fn DrawerSnapCore::new(
   snap_points~ : Array[Double] = [1.0],
   close_threshold~ : Double = 0.35,
   velocity_threshold~ : Double = 0.5,
+  overpull_max~ : Double = 0.0,
   can_drag~ : () -> Bool = fn() { true },
 ) -> DrawerSnapCore {
   let snaps = if snap_points.length() > 0 { snap_points.copy() } else { [1.0] }
@@ -67,12 +80,15 @@ pub fn DrawerSnapCore::new(
     snap_points: snaps,
     close_threshold,
     velocity_threshold,
+    overpull_max,
     can_drag,
     dragging_sig: signals::signal(false),
     drag_offset_sig: signals::signal(0.0),
     active: ref_new(false),
     start_x: ref_new(0.0),
     start_y: ref_new(0.0),
+    last_vel: ref_new(0.0),
+    last_off: ref_new(0.0),
   }
 }
 
@@ -86,6 +102,18 @@ pub fn DrawerSnapCore::dragging(self : DrawerSnapCore) -> Bool {
 
 pub fn DrawerSnapCore::drag_offset(self : DrawerSnapCore) -> Double {
   self.drag_offset_sig.get()
+}
+
+pub fn DrawerSnapCore::last_velocity(self : DrawerSnapCore) -> Double {
+  self.last_vel.v
+}
+
+pub fn DrawerSnapCore::last_offset(self : DrawerSnapCore) -> Double {
+  self.last_off.v
+}
+
+pub fn DrawerSnapCore::snap_count(self : DrawerSnapCore) -> Int {
+  self.snap_points.length()
 }
 
 pub fn DrawerSnapCore::clamp_snap_index(self : DrawerSnapCore, idx : Int) -> Int {
@@ -125,7 +153,13 @@ pub fn DrawerSnapCore::on_down(self : DrawerSnapCore, x : Double, y : Double) ->
 }
 
 /// Update edge-directed drag offset for pointer position `(x, y)`.
-pub fn DrawerSnapCore::on_move(self : DrawerSnapCore, x : Double, y : Double) -> Double {
+/// When `at_max=true` and `overpull_max > 0.0`, negative (overpull) deltas are rubber-band damped.
+pub fn DrawerSnapCore::on_move(
+  self : DrawerSnapCore,
+  x : Double,
+  y : Double,
+  at_max~ : Bool = true,
+) -> Double {
   if !self.active.v {
     return 0.0
   }
@@ -133,7 +167,12 @@ pub fn DrawerSnapCore::on_move(self : DrawerSnapCore, x : Double, y : Double) ->
     self.reset_drag()
     return 0.0
   }
-  let delta = drawer_edge_delta(self.edge_, x - self.start_x.v, y - self.start_y.v)
+  let raw = drawer_edge_delta(self.edge_, x - self.start_x.v, y - self.start_y.v)
+  let delta = if raw < 0.0 && at_max && self.overpull_max > 0.0 {
+    -drawer_rubber_pull(-raw, self.overpull_max)
+  } else {
+    raw
+  }
   self.drag_offset_sig.set(delta)
   delta
 }
@@ -154,13 +193,16 @@ pub fn DrawerSnapCore::on_up(
   self.dragging_sig.set(false)
   self.drag_offset_sig.set(0.0)
   let close_vel = drawer_edge_velocity(self.edge_, vx, vy)
+  self.last_vel.v = close_vel
+  self.last_off.v = offset
   if close_vel >= self.velocity_threshold {
     return Some(DrawerResolution::Close)
   }
   let eff_extent = if extent > 0.0 { extent } else { 300.0 }
   let cur_frac = self.snap_fraction(current_snap_idx)
   let next_frac = cur_frac - offset / eff_extent
-  if next_frac < self.close_threshold {
+  let reverse_flick = close_vel <= -self.velocity_threshold
+  if !reverse_flick && next_frac < self.close_threshold {
     return Some(DrawerResolution::Close)
   }
   let n = self.snap_points.length()
