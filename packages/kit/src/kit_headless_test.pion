@@ -1,0 +1,262 @@
+// Wave 4 Stage 2 (W4-I1) headless integration regression tests for packages/kit.
+// Verifies keyboard focus/activation, roving focus, overlay stack unification,
+// menu navigation, tooltip warmup, hover_card pointer bridging, text_field & toaster.
+
+import "headless"
+import "signals"
+import "ui"
+import "view"
+
+test "kit_headless_button_tab_focus_enter_space" {
+  let clicks = ui::ref_new(0)
+  let disabled = signals::signal(false)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = button(root, "Action", fn() -> Unit { clicks.v = clicks.v + 1 }, disabled=fn() -> Bool { disabled.get() })
+  })
+  t.key(ui::key_tab)
+  t.key(ui::key_enter)
+  debug_assert(clicks.v == 1, "Tab + Enter must activate kit::button")
+  t.key(ui::key_space)
+  debug_assert(clicks.v == 2, "Space must activate focused kit::button")
+
+  disabled.set(true)
+  t.frame()
+  t.key(ui::key_enter)
+  t.key(ui::key_space)
+  debug_assert(clicks.v == 2, "disabled kit::button must ignore Enter and Space")
+  t.dispose()
+}
+
+test "kit_headless_radio_group_roving_focus_and_arrows" {
+  let sel = signals::signal("a")
+  let entries = [item("a", "Alpha"), item("b", "Beta", disabled=true), item("c", "Gamma")]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = radio_group(root, entries, fn() -> String { sel.get() }, fn(v : String) -> Unit { sel.set(v) })
+    let _ = button(root, "After", fn() -> Unit {})
+  })
+  // Single Tab stop into radio_group (Alpha is selected)
+  t.key(ui::key_tab)
+  // Arrow Right skips disabled Beta and selects Gamma
+  t.key(ui::key_code_right)
+  debug_assert(sel.get() == "c", "Arrow Right in kit::radio_group skips disabled Beta and selects Gamma")
+  // Home returns to Alpha
+  t.key(ui::key_code_home)
+  debug_assert(sel.get() == "a", "Home in kit::radio_group selects first enabled item Alpha")
+  // End moves to Gamma
+  t.key(ui::key_code_end)
+  debug_assert(sel.get() == "c", "End in kit::radio_group selects last enabled item Gamma")
+  // Single Tab moves focus out of radio_group onto After button (roving focus)
+  t.key(ui::key_tab)
+  t.key(ui::key_code_left)
+  debug_assert(sel.get() == "c", "Tab leaves radio_group in a single stop so Left no longer changes selection")
+  t.dispose()
+}
+
+test "kit_headless_toggle_group_roving_focus_and_role" {
+  let sel = signals::signal("day")
+  let entries = [item("day", "Day"), item("week", "Week", disabled=true), item("month", "Month")]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = toggle_group(root, entries, fn() -> String { sel.get() }, fn(v : String) -> Unit { sel.set(v) })
+  })
+  // Verify toggle_group items expose Role::Button (not Role::Tab)
+  debug_assert(t.get("Day", role=view::Role::Button).is_some(), "toggle_group item must expose Role::Button")
+  debug_assert(t.get("Day", role=view::Role::Tab).is_none(), "toggle_group item must not expose Role::Tab")
+
+  // Tab focuses active toggle ("Day"), Right skips disabled "Week" to "Month", Space activates
+  t.key(ui::key_tab)
+  t.key(ui::key_code_right)
+  t.key(ui::key_space)
+  debug_assert(sel.get() == "month", "Roving Focus Right + Space skips disabled Week and activates Month")
+  t.dispose()
+}
+
+test "kit_headless_overlays_stack_escape_outside_and_focus_return" {
+  let dlg_open = signals::signal(false)
+  let pop_open = signals::signal(false)
+  let sh_open = signals::signal(false)
+  let opener_clicks = ui::ref_new(0)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = button(root, "Opener", fn() -> Unit {
+      opener_clicks.v = opener_clicks.v + 1
+      dlg_open.set(true)
+    })
+    let _ = dialog(root, fn() -> Bool { dlg_open.get() }, fn() -> Unit { dlg_open.set(false) }, title="ModalDlg", fn(p : view::View) -> Unit {
+      let _ = button(p, "InnerDlgBtn", fn() -> Unit {})
+    })
+    let _ = popover(root, fn() -> Bool { pop_open.get() }, fn() -> Unit { pop_open.set(false) }, fn(p : view::View) -> Unit {
+      let _ = button(p, "InnerPopBtn", fn() -> Unit {})
+    })
+    let _ = in_room(root, max_w=400.0, max_h=400.0, fn(r : view::View) -> Unit {
+      let _ = sheet(r, "stack-sheet", fn() -> Bool { sh_open.get() }, fn() -> Unit { sh_open.set(false) }, height=160.0, fn(s : view::View) -> Unit {
+        let _ = button(s, "InnerSheetBtn", fn() -> Unit {})
+      })
+    })
+  })
+  let tree = match ui::view_tree() {
+    Some(tr) => tr
+    None => { debug_assert(false, "tree must exist"); return }
+  }
+  debug_assert(headless::overlays_open(tree) == 0, "no overlays open initially")
+
+  // Focus Opener via Tab and open dialog with Enter
+  t.key(ui::key_tab)
+  t.key(ui::key_enter)
+  debug_assert(dlg_open.get() && headless::overlays_open(tree) == 1, "dialog registers in headless::overlays_open")
+  // Escape closes dialog
+  t.key(ui::key_escape)
+  debug_assert(!dlg_open.get(), "Escape closes dialog")
+  t.run_shown(250.0)
+  debug_assert(headless::overlays_open(tree) == 0, "closed dialog leaves overlay stack")
+
+  // Popover registers in overlay stack and closes on outside click
+  pop_open.set(true)
+  t.frame()
+  debug_assert(headless::overlays_open(tree) == 1, "popover registers in headless::overlays_open")
+  t.click(380.0, 280.0)
+  debug_assert(!pop_open.get(), "outside click closes popover")
+  t.run_shown(250.0)
+  debug_assert(headless::overlays_open(tree) == 0, "closed popover leaves overlay stack")
+
+  // Sheet registers in overlay stack and closes on Escape
+  sh_open.set(true)
+  t.frame()
+  debug_assert(headless::overlays_open(tree) == 1, "sheet registers in headless::overlays_open")
+  t.key(ui::key_escape)
+  debug_assert(!sh_open.get(), "Escape closes sheet")
+  t.run_shown(250.0)
+  debug_assert(headless::overlays_open(tree) == 0, "closed sheet leaves overlay stack")
+  t.dispose()
+}
+
+test "kit_headless_dropdown_menu_keyboard_skips_disabled" {
+  let open = signals::signal(true)
+  let picked = ui::ref_new("")
+  let entries = [
+    menu_item("cut", "Cut", disabled=true),
+    menu_item("copy", "Copy"),
+    menu_item("paste", "Paste", disabled=true),
+    menu_radio("dark", "Dark Mode", checked=true),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = dropdown_menu(
+      root,
+      entries,
+      fn() -> Bool { open.get() },
+      fn(id : String) -> Unit { picked.v = id },
+      fn() -> Unit { open.set(false) },
+    )
+  })
+  // Down focuses first enabled item ("Copy"), second Down skips disabled "Paste" to "Dark Mode", Enter picks it
+  t.key(ui::key_code_down)
+  t.key(ui::key_code_down)
+  t.key(ui::key_enter)
+  debug_assert(picked.v == "dark", "Down + Down + Enter in dropdown_menu skips disabled items and selects Dark Mode")
+  debug_assert(!open.get(), "picking menu item via keyboard closes dropdown_menu")
+  t.dispose()
+}
+
+test "kit_headless_tooltip_delay_warmup_and_role" {
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = root.row(view::Live::Is(true)).gap(view::Live::Is(20.0))
+    let _ = tooltip(root, "First Tip", fn(trig : view::View) -> Unit {
+      let _ = button(trig, "BtnOne", fn() -> Unit {})
+    })
+    let _ = tooltip(root, "Second Tip", fn(trig : view::View) -> Unit {
+      let _ = button(trig, "BtnTwo", fn() -> Unit {})
+    })
+  })
+  let b1 = match t.get("BtnOne") {
+    Some(d) => d
+    None => { debug_assert(false, "BtnOne must be drawn"); return }
+  }
+  let b2 = match t.get("BtnTwo") {
+    Some(d) => d
+    None => { debug_assert(false, "BtnTwo must be drawn"); return }
+  }
+  // Hover BtnOne: should NOT open immediately (open delay = 400ms)
+  t.move_to(b1.x + b1.w * 0.5, b1.y + b1.h * 0.5)
+  debug_assert(t.get("First Tip", role=view::Role::Tooltip).is_none(), "tooltip must wait for open delay before showing")
+  // After 450ms, First Tip opens with Role::Tooltip
+  t.frame(ms=450.0)
+  debug_assert(t.get("First Tip", role=view::Role::Tooltip).is_some(), "tooltip opens after delay with Role::Tooltip")
+  // Move to BtnTwo within warmup window -> Second Tip opens immediately without waiting 400ms
+  t.move_to(b2.x + b2.w * 0.5, b2.y + b2.h * 0.5)
+  debug_assert(t.get("Second Tip", role=view::Role::Tooltip).is_some(), "second tooltip opens immediately via shared window_tooltip_group warmup")
+  t.dispose()
+}
+
+test "kit_headless_hover_card_bridge_delay_and_outside_close" {
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = hover_card(
+      root,
+      fn(trig : view::View) -> Unit {
+        let _ = button(trig, "Profile", fn() -> Unit {})
+      },
+      fn(c : view::View) -> Unit {
+        let _ = c.width(view::Live::Is(Some(140.0))).height(view::Live::Is(Some(60.0)))
+          .words(view::Live::Is("User Bio"))
+      },
+    )
+  })
+  let trig = match t.get("Profile") {
+    Some(d) => d
+    None => { debug_assert(false, "Profile trigger must be drawn"); return }
+  }
+  // Hover trigger: waits for open delay (300ms)
+  t.move_to(trig.x + trig.w * 0.5, trig.y + trig.h * 0.5)
+  debug_assert(t.find("User Bio").is_none(), "hover_card waits for open delay")
+  t.frame(ms=350.0)
+  t.run_shown(200.0)
+  let card_pos = match t.find("User Bio") {
+    Some(p) => p
+    None => { debug_assert(false, "hover_card opens after open delay"); return }
+  }
+  // Move pointer onto the card itself -> stays open past close_delay_ms
+  t.move_to(card_pos.0, card_pos.1)
+  t.frame(ms=250.0)
+  debug_assert(t.find("User Bio").is_some(), "moving pointer into hover_card keeps it open")
+  // Move pointer away -> stays open briefly, then closes after close_delay_ms (150ms) + exit
+  t.move_to(380.0, 280.0)
+  t.frame(ms=200.0)
+  t.run_shown(250.0)
+  debug_assert(t.find("User Bio").is_none(), "leaving hover_card closes after close delay")
+
+  // Reopen via hover, then outside click closes immediately
+  t.move_to(trig.x + trig.w * 0.5, trig.y + trig.h * 0.5)
+  t.frame(ms=350.0)
+  debug_assert(t.find("User Bio").is_some(), "hover_card reopens on hover")
+  t.click(380.0, 280.0)
+  t.run_shown(250.0)
+  debug_assert(t.find("User Bio").is_none(), "outside click closes hover_card")
+  t.dispose()
+}
+
+test "kit_headless_text_field_semantics_and_toaster_status" {
+  let f = Field::new(text="alice")
+  let is_invalid = signals::signal(true)
+  let dismissed = ui::ref_new("")
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let _ = text_field(
+      root,
+      f,
+      placeholder="Username",
+      label="User",
+      description="Public handle",
+      error="Already taken",
+      invalid=fn() -> Bool { is_invalid.get() },
+    )
+    let _ = toaster(
+      root,
+      "status-toaster",
+      fn() -> Array[(String, String)] { [("n1", "Synced")] },
+      fn(id : String) -> Unit { dismissed.v = id },
+    )
+  })
+  debug_assert(t.get("User", role=view::Role::TextField).is_some(), "text_field exposes Role::TextField with label")
+  debug_assert(t.find("Already taken").is_some(), "text_field shows error when invalid")
+  debug_assert(t.get("Synced", role=view::Role::Status).is_some(), "toaster card exposes Role::Status")
+  // Wait past default toast duration (4000ms) -> auto-dismisses
+  t.frame(ms=4200.0)
+  debug_assert(dismissed.v == "n1", "toaster auto-dismisses toast after duration")
+  t.dispose()
+}
