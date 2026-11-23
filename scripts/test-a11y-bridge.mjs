@@ -172,6 +172,55 @@ check("nested Tab inside TabList: one click / Enter activates only the Tab", () 
   assert.deepEqual(posted.map(([, p]) => [p.action, p.id]), [["activate", 1]], "the TabList itself still activates");
 });
 
+check("Enter / Space on a Button inside a Group activates only the Button", () => {
+  send(tree(true, [
+    node(0, "Region", { kids: [1] }),
+    node(1, "Group", { actions: "a", kids: [2] }),
+    node(2, "Button", { actions: "a" }),
+  ]));
+  const btn = elOf(2);
+  assert.equal(btn.tagName, "BUTTON");
+  assert.equal(btn.parentNode, elOf(1));
+  for (const key of ["Enter", " "]) {
+    posted.length = 0;
+    const ev = btn.dispatch("keydown", { key });
+    assert.deepEqual(posted.map(([, p]) => [p.action, p.id]), [["activate", 2]], `key ${JSON.stringify(key)}`);
+    assert.ok(ev.defaultPrevented, "no native click follows");
+  }
+});
+
+check("a click on a Text inside a Button activates the Button", () => {
+  send(tree(true, [
+    node(0, "Region", { kids: [1] }),
+    node(1, "Button", { actions: "a", kids: [2] }),
+    node(2, "Text", { label: "OK", actions: "" }),
+  ]));
+  assert.equal(elOf(2).parentNode, elOf(1));
+  posted.length = 0;
+  elOf(2).dispatch("click");
+  assert.deepEqual(posted.map(([, p]) => [p.action, p.id]), [["activate", 1]]);
+});
+
+check("a Tab turning into a Button stays inside its Group", () => {
+  send(tree(true, [
+    node(0, "Region", { kids: [1] }),
+    node(1, "Group", { kids: [2, 3] }),
+    node(2, "Tab", { actions: "a" }),
+    node(3, "Button", { actions: "a" }),
+  ]));
+  assert.equal(elOf(2).parentNode, elOf(1));
+  send(tree(false, [node(2, "Button", { actions: "a" })]));
+  const el = elOf(2);
+  assert.equal(el.tagName, "BUTTON");
+  assert.equal(el.parentNode, elOf(1), "not left under the root");
+  assert.deepEqual(elOf(1).children.map((c) => Number(c.dataset.a11yId)), [2, 3]);
+  // and a parent whose tag changes keeps its children
+  send(tree(false, [node(1, "Button", { actions: "a", kids: [2, 3] })]));
+  assert.equal(elOf(1).tagName, "BUTTON");
+  assert.equal(elOf(1).parentNode, root());
+  assert.deepEqual(elOf(1).children.map((c) => Number(c.dataset.a11yId)), [2, 3]);
+});
+
 check("reordered kids reorder the DOM", () => {
   const ids = (el) => el.children.map((c) => Number(c.dataset.a11yId));
   send(tree(true, [

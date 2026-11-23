@@ -224,15 +224,22 @@ static void mb_a11y_obj_class_init(MBA11yObjClass *k) {
 
 static void mb_a11y_obj_init(MBA11yObj *o) { (void)o; }
 
-// what node `n` is, set on its accessible: its name, description, value and range, its state
+// what node `n` is, set on its accessible: its name, description, value and range, its state (a
+// value or state it no longer has is reset, as the same accessible is told again)
 static void a11y_obj_said(A11yNode *n) {
   GtkAccessible *a = GTK_ACCESSIBLE(n->obj);
   gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_LABEL, n->label, GTK_ACCESSIBLE_PROPERTY_DESCRIPTION,
                                  n->help, -1);
-  if (n->range)
+  if (n->range) {
     gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_MIN, n->low, GTK_ACCESSIBLE_PROPERTY_VALUE_MAX,
                                    n->high, GTK_ACCESSIBLE_PROPERTY_VALUE_NOW, n->at, -1);
+  } else {
+    gtk_accessible_reset_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_MIN);
+    gtk_accessible_reset_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_MAX);
+    gtk_accessible_reset_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_NOW);
+  }
   if (*n->value) gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_TEXT, n->value, -1);
+  else gtk_accessible_reset_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_TEXT);
   gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_DISABLED, a11y_has(n->flags, 'd'), -1);
   if (a11y_has(n->flags, 'c'))
     gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_CHECKED,
@@ -240,12 +247,16 @@ static void a11y_obj_said(A11yNode *n) {
                                 : a11y_has(n->flags, 'M') ? GTK_ACCESSIBLE_TRISTATE_MIXED
                                                           : GTK_ACCESSIBLE_TRISTATE_FALSE,
                                 -1);
+  else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_CHECKED);
   if (a11y_has(n->flags, 'p'))
     gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_PRESSED,
                                 a11y_has(n->flags, 'P') ? GTK_ACCESSIBLE_TRISTATE_TRUE : GTK_ACCESSIBLE_TRISTATE_FALSE,
                                 -1);
+  else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_PRESSED);
   if (a11y_has(n->flags, 'e')) gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_EXPANDED, a11y_has(n->flags, 'E'), -1);
+  else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_EXPANDED);
   if (a11y_has(n->flags, 's')) gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_SELECTED, TRUE, -1);
+  else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_SELECTED);
 }
 
 static GObject *a11y_obj(int nid) {

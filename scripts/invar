@@ -8,6 +8,7 @@ import argparse
 from collections import deque
 import functools
 import gzip
+import hashlib
 import http.server
 import json
 import math
@@ -1181,13 +1182,6 @@ _SIGNAL_ALIAS_RE = re.compile(
 )
 
 
-def _scan_signal_aliases(cleaned_text, aliases):
-    for m in _SIGNAL_ALIAS_RE.finditer(cleaned_text):
-        lhs, rhs = m.group(1), m.group(2)
-        if lhs != rhs and rhs not in ("true", "false", "None"):
-            aliases[lhs] = rhs
-
-
 def _resolve_alias_root(name, aliases):
     cur = name
     seen = set()
@@ -1209,25 +1203,47 @@ def _collect_signal_aliases(lines, start_line):
             break
     prefix_src = "\n".join(lines[fn_start : start_line - 1])
     cleaned_prefix = _strip_pion_comments_and_strings(prefix_src)
-    # A `let` holds only to the end of its block: keep one alias table per open `{` and drop it at
-    # its `}`, so an inner block's `let ro = b.read()` never outlives the block.
-    scope_stack = [{}]
-    events = [(m.start(), "let", m) for m in _SIGNAL_ALIAS_RE.finditer(cleaned_prefix)]
-    events += [(k, ch, None) for k, ch in enumerate(cleaned_prefix) if ch in "{}"]
-    events.sort(key=lambda e: e[0])
+    aliases = {}
+    _walk_scoped_aliases(cleaned_prefix, [{}], None, aliases)
+    return aliases
+
+
+def _scoped_alias_view(scope_stack):
+    view = {}
+    for layer in scope_stack:
+        view.update(layer)
+    return view
+
+
+def _walk_scoped_aliases(cleaned, scope_stack, on_call, out_aliases=None):
+    """Walk `cleaned` in source order keeping one alias table per open `{`, dropped at its `}`: a
+    `let` holds only to the end of its block, so an inner block's `let ro = b.read()` never
+    outlives the block. `on_call(recv, meth, aliases)` sees each `recv.meth(` with the aliases in
+    force right there; `out_aliases` gets the aliases still in force at the end."""
+    events = [(m.start(), "let", m) for m in _SIGNAL_ALIAS_RE.finditer(cleaned)]
+    events += [(k, ch, None) for k, ch in enumerate(cleaned) if ch in "{}"]
+    if on_call is not None:
+        events += [(m.start(), "call", m) for m in _SIGNAL_CALL_RE.finditer(cleaned)]
+    # (at one place a `let` comes first: it is in force for the calls after it)
+    order = {"{": 0, "}": 0, "let": 1, "call": 2}
+    events.sort(key=lambda e: (e[0], order[e[1]]))
     for _, kind, m in events:
         if kind == "{":
             scope_stack.append({})
         elif kind == "}":
             if len(scope_stack) > 1:
                 scope_stack.pop()
-        else:
+        elif kind == "let":
             lhs, rhs = m.group(1), m.group(2)
             if lhs != rhs and rhs not in ("true", "false", "None"):
                 scope_stack[-1][lhs] = rhs
-    for layer in scope_stack:
-        aliases.update(layer)
-    return aliases
+        else:
+            on_call(m.group(1), m.group(2), _scoped_alias_view(scope_stack))
+    if out_aliases is not None:
+        out_aliases.update(_scoped_alias_view(scope_stack))
+
+
+_SIGNAL_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(")
 
 
 def _analyze_effect_signal_identity(file_lines_cache, fpath, line, col, captures, rchain_len, wchain_len):
@@ -1236,20 +1252,22 @@ def _analyze_effect_signal_identity(file_lines_cache, fpath, line, col, captures
     if not body:
         return ("unknown", [])
     cleaned = _strip_pion_comments_and_strings(body)
-    aliases = _collect_signal_aliases(lines, line)
-    _scan_signal_aliases(cleaned, aliases)
     cap_names = {c.get("name", "") for c in captures if c.get("name")}
     read_roots = set()
     write_roots = set()
-    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(", cleaned):
-        recv, meth = m.group(1), m.group(2)
+
+    def on_call(recv, meth, aliases):
         root = _resolve_alias_root(recv, aliases)
         if recv not in cap_names and root not in cap_names:
-            continue
+            return
         if meth in _EFFECT_READ_METHODS:
             read_roots.add(root)
         elif meth in _EFFECT_WRITE_METHODS:
             write_roots.add(root)
+
+    # The aliases in force where the effect is made sit at the bottom; the body's own blocks
+    # stack over them.
+    _walk_scoped_aliases(cleaned, [_collect_signal_aliases(lines, line)], on_call)
     shared = sorted(read_roots & write_roots)
     if shared:
         return ("same", shared)
@@ -2497,28 +2515,52 @@ def _web_dist_state_load():
         return {}
 
 
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _web_dist_reconcile(out_dir, managed):
     """Remove from `out_dir` only the files an earlier build here wrote and this one did not, then
-    record what this build wrote. The record lives under target/, never in `out_dir`, so files the
-    caller keeps there (their own .wasm, headers, ...) are never touched."""
+    record what this build wrote, with each file's SHA-256. The record lives under target/, never
+    in `out_dir`, and a file is removed only while its bytes are still the ones that build wrote:
+    files the caller keeps there (their own .wasm, headers, ... even under a name an earlier build
+    used, as in a directory made again) are never touched."""
     key = os.path.realpath(out_dir)
     state = _web_dist_state_load()
-    prev = state.get(key, [])
+    prev = state.get(key, {})
     removed = []
-    if isinstance(prev, list):
-        for name in prev:
+    # (a record of names alone, from before the hashes, claims nothing: those files stay)
+    if isinstance(prev, dict):
+        for name, digest in prev.items():
             if not isinstance(name, str) or name in managed or os.path.basename(name) != name or name in ("", ".", ".."):
                 continue
+            if not isinstance(digest, str) or not digest:
+                continue
             path = os.path.join(out_dir, name)
-            if os.path.isfile(path) or os.path.islink(path):
-                try:
-                    os.unlink(path)
-                    removed.append(name)
-                except OSError:
-                    pass
+            if not os.path.isfile(path) or os.path.islink(path):
+                continue
+            try:
+                if _file_sha256(path) != digest:
+                    continue
+                os.unlink(path)
+                removed.append(name)
+            except OSError:
+                pass
     # (records of output dirs that no longer exist, such as temporary ones, are dropped)
     state = {d: files for d, files in state.items() if d != key and os.path.isdir(d)}
-    state[key] = sorted(managed)
+    written = {}
+    for name in sorted(managed):
+        path = os.path.join(out_dir, name)
+        try:
+            if os.path.isfile(path) and not os.path.islink(path):
+                written[name] = _file_sha256(path)
+        except OSError:
+            pass
+    state[key] = written
     os.makedirs(os.path.dirname(WEB_DIST_STATE), exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".invar-web-dist-state.", dir=os.path.dirname(WEB_DIST_STATE))
     try:

@@ -248,9 +248,18 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (spec.tag === "button") el.type = "button";
       el.dataset.a11yId = node.id;
       const nid = node.id;
-      // Each mirror element handles its own activation: stop the event here so a
-      // nested control (Tab inside TabList) never also activates its ancestors.
+      // An activatable mirror element handles its own activation and stops the
+      // event, so a nested control (Tab inside TabList) never also activates its
+      // ancestors; a click on a part that does not activate (a Text inside a
+      // Button) goes on to the element that does.
       el.addEventListener("click", (e) => {
+        const cur = a11yNodes.get(nid);
+        if (!cur || cur.flags.includes("d")) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (!cur.actions.includes("a")) return;
         e.preventDefault();
         e.stopPropagation();
         activateA11yNode(nid);
@@ -263,7 +272,13 @@ export function attachHostBridge(rt, perfHooks = {}) {
       });
       el.addEventListener("keydown", (e) => {
         const cur = a11yNodes.get(nid);
-        if (!cur || cur.flags.includes("d")) return;
+        if (!cur || cur.flags.includes("d")) {
+          if (cur && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          return;
+        }
         if ((e.key === "ArrowUp" || e.key === "ArrowRight") && cur.actions.includes("i")) {
           e.preventDefault();
           e.stopPropagation();
@@ -276,12 +291,21 @@ export function attachHostBridge(rt, perfHooks = {}) {
           deliverA11yAction({ op: "dec", action: "decrement", id: Number(nid) });
           return;
         }
-        if (spec.tag !== "button" && (e.key === "Enter" || e.key === " ")) {
+        // Handled here for every tag, <button> included: left to the browser,
+        // the key would also reach the ancestors' listeners first.
+        if ((e.key === "Enter" || e.key === " ") && (cur.actions.includes("a") || spec.tag === "button")) {
           e.preventDefault();
           e.stopPropagation();
           activateA11yNode(nid);
         }
       });
+      if (node.el && node.el !== el) {
+        // The old element's children move into the new one (in kids order below).
+        for (const k of node.kids || []) {
+          const c = a11yNodes.get(k);
+          if (c && c.el) el.appendChild(c.el);
+        }
+      }
       node.el = el;
       root.appendChild(el);
       created = true;
@@ -518,28 +542,37 @@ export function attachHostBridge(rt, perfHooks = {}) {
     }
 
     let anySemanticOrStruct = structuralChanged;
+    // Parents whose children must be mounted again: all of the batch on a
+    // structural change, and around every element made anew (a role whose tag
+    // changed), which starts out under the root.
+    const remount = new Set();
     for (let i = 0; i < batch.length; i++) {
-      if (syncA11yElement(batch[i], root, structuralChanged)) {
+      const n = batch[i];
+      const hadEl = n.el;
+      if (syncA11yElement(n, root, structuralChanged)) {
         anySemanticOrStruct = true;
+      }
+      if (structuralChanged) remount.add(n.id);
+      if (n.el && n.el !== hadEl) {
+        remount.add(n.id);
+        remount.add(n.parent || "0");
       }
     }
 
     // Mount children under their real semantic parent DOM element in kids order
-    if (structuralChanged) {
-      for (let i = 0; i < batch.length; i++) {
-        const p = batch[i];
-        const parentEl = p.id === "0" ? root : p.el;
-        if (!parentEl || !p.kids.length) continue;
-        // Keep DOM (reading) order equal to the semantic kids order, also when
-        // existing children are only reordered.
-        let pos = 0;
-        for (const k of p.kids) {
-          const c = a11yNodes.get(k);
-          if (!c || !c.el || c.el === parentEl) continue;
-          const at = parentEl.children[pos] || null;
-          if (at !== c.el) parentEl.insertBefore(c.el, at);
-          pos++;
-        }
+    for (const pid of remount) {
+      const p = a11yNodes.get(pid);
+      const parentEl = pid === "0" ? root : p && p.el;
+      if (!p || !parentEl || !p.kids.length) continue;
+      // Keep DOM (reading) order equal to the semantic kids order, also when
+      // existing children are only reordered.
+      let pos = 0;
+      for (const k of p.kids) {
+        const c = a11yNodes.get(k);
+        if (!c || !c.el || c.el === parentEl) continue;
+        const at = parentEl.children[pos] || null;
+        if (at !== c.el) parentEl.insertBefore(c.el, at);
+        pos++;
       }
     }
 

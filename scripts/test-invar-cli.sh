@@ -159,6 +159,31 @@ assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web.wasm rebuilt'
 assert os.path.isfile(os.path.join(out, 'decoder.wasm')), 'decoder.wasm still kept'
 print('OK: rebuilding lg_web removes my_web_app.wasm and still keeps decoder.wasm')
 " "$SHARED_OUT"
+# The caller makes the output dir again and puts their own _headers there: a file under a name an
+# earlier build wrote, but not its bytes, is the caller's and stays.
+rm -rf "$SHARED_OUT"
+mkdir -p "$SHARED_OUT"
+printf '/*\n  X-Mine: 1\n' > "$SHARED_OUT/_headers"
+"$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+assert_py "
+import os, sys
+out = sys.argv[1]
+assert open(os.path.join(out, '_headers'), 'rb').read() == b'/*\\n  X-Mine: 1\\n', 'caller _headers in a remade dir kept byte for byte'
+assert os.path.isfile(os.path.join(out, 'my_web_app.wasm')), 'custom wasm built'
+print('OK: a caller _headers in a remade output dir is kept')
+" "$SHARED_OUT"
+# The same when the caller only rewrites a file invar wrote there.
+"$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+printf '/*\n  X-Mine: 2\n' > "$SHARED_OUT/_headers"
+"$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+assert_py "
+import os, sys
+out = sys.argv[1]
+assert open(os.path.join(out, '_headers'), 'rb').read() == b'/*\\n  X-Mine: 2\\n', 'rewritten _headers kept'
+assert not os.path.exists(os.path.join(out, '_redirects')), 'untouched stale _redirects still removed'
+assert not os.path.exists(os.path.join(out, 'lg_web.wasm')), 'untouched stale lg_web.wasm still removed'
+print('OK: a rewritten _headers is kept; untouched stale files are removed')
+" "$SHARED_OUT"
 
 echo "=== 9. invar diff --json --out --sbs (synthetic PNGs) ==="
 python3 - "$TMP" << 'PYEOF'

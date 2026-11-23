@@ -455,4 +455,27 @@ pub fn char_quote_alias_self_write() -> () -> Unit {
 ')"
 run_case "pos_e009_char_quote_literal" "$PKG_E009_CHAR_QUOTE" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
 
+# 18. Positive E009: inside the effect too, an inner block's `let ro = b.read()` ends with its
+#     block; after it `ro` is the outer `a.read()` again, and the effect writes `a`
+PKG_E009_INNER_BLOCK_SHADOW="$(make_pkg "pos_e009_inner_block_shadow_alias" '
+import "signals"
+
+pub fn inner_block_shadow_alias_self_write() -> () -> Unit {
+  let a = signals::signal(0)
+  let b = signals::signal(0)
+  let ro = a.read()
+  signals::effect(fn() -> Unit {
+    if true {
+      let ro = b.read()
+      let _ = ro
+    }
+    let v = ro.get()
+    if v < 5 {
+      a.set(v + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_inner_block_shadow_alias" "$PKG_E009_INNER_BLOCK_SHADOW" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="
