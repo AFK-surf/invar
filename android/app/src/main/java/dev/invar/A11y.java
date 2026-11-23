@@ -6,15 +6,13 @@ import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
-import android.system.Os;
 import android.view.MotionEvent;
+import android.view.View;
 import android.view.ViewParent;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityManager;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeProvider;
-
-import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -24,12 +22,16 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Android AccessibilityNodeProvider virtual node tree bridge for Invar widgets.
- * Syncs screen-reader active state to the C atomic via Native.a11yEnabled so
- * per-frame queries incur zero JNI overhead.
+ * The app's widgets for Android's accessibility (TalkBack, and any service reading the screen), as Compose gives its
+ * semantics: the view's virtual nodes, one a node the app told (src/ui/a11y.mbt's updates, @hostapi.a11y_tree: what
+ * changed, kept by its number; those of no use of their own, flags v, none: what they hold their holder's), with their roles as Android's widgets' classes, their words, state and actions. A finger exploring the screen
+ * (hover events) lands on the node under it; what a node is asked (a double tap: click) goes to the app on its
+ * channel (@hostapi.a11y_channel) for its next frame. The accessibility focus is kept here, by node, as the app's
+ * nodes keep their numbers from frame to frame.
  */
 @SuppressWarnings("deprecation")
 final class A11y extends AccessibilityNodeProvider {
+    /** A node as the app told it (where it is from where its holder is), and what holds it. */
     static final class Node {
         int id, parent, widget;
         String role = "", flags = "", label = "", value = "", description = "", actions = "";
@@ -41,6 +43,7 @@ final class A11y extends AccessibilityNodeProvider {
 
     private final MBView view;
     private final Map<Integer, Node> nodes = new HashMap<>();
+    /** The node with the keyboard's focus, as the app told it (0: none); `focused` is the accessibility focus. */
     private int inputFocus;
     private int focused = HOST_VIEW_ID;
     private int hovered = HOST_VIEW_ID;
@@ -60,16 +63,19 @@ final class A11y extends AccessibilityNodeProvider {
         this.view = view;
     }
 
+    /** Cached screen-reader state (TalkBack / Braille / MBUI_A11Y=1); excludes generic accessibility utilities. */
     static boolean isScreenReaderOn() {
         return screenReaderOn;
     }
 
+    /** Whether a service reads the screen (@hostapi.a11y_on): cached, updated by AccessibilityManager listeners. */
     static boolean on() {
         return screenReaderOn;
     }
 
+    /** Computes whether an actual screen reader (spoken or braille feedback, touch exploration, or MBUI_A11Y=1) is on. */
     static boolean computeScreenReaderOn(Context ctx) {
-        if ("1".equals(Os.getenv("INVAR_A11Y"))) return true;
+        if ("1".equals(android.system.Os.getenv("MBUI_A11Y"))) return true;
         if (ctx == null) return false;
         AccessibilityManager am = (AccessibilityManager) ctx.getSystemService(Context.ACCESSIBILITY_SERVICE);
         if (am == null || !am.isEnabled()) return false;
@@ -79,6 +85,7 @@ final class A11y extends AccessibilityNodeProvider {
         return services != null && !services.isEmpty();
     }
 
+    /** Recomputes screen-reader state, updates C atomic, and requests full resend/frame on transitions. */
     static void refresh(Context ctx) {
         boolean next = computeScreenReaderOn(ctx);
         boolean prev = screenReaderOn;
@@ -90,6 +97,7 @@ final class A11y extends AccessibilityNodeProvider {
         }
     }
 
+    /** Registers process-wide AccessibilityManager listeners once and syncs initial state. */
     static void attach(Context ctx) {
         if (ctx == null) return;
         Context app = ctx.getApplicationContext();
@@ -109,6 +117,12 @@ final class A11y extends AccessibilityNodeProvider {
         refresh(app);
     }
 
+    /**
+     * What the app told of its widgets now (main thread): an update (src/ui/a11y.mbt's head: the nodes that changed,
+     * each whole, and which has the keyboard's focus), kept; one in nothing that holds it gone with what it holds; the
+     * services told the view changed. One that is not whole coming to none kept (the view made again under an app that
+     * told it all before) asks for all of it again.
+     */
     void set(String update) {
         String[] lines = update.split("\n");
         String[] head = lines.length > 0 ? lines[0].split("\u001f", -1) : new String[0];
@@ -151,9 +165,7 @@ final class A11y extends AccessibilityNodeProvider {
                 }
                 n.actions = f[14];
                 n.widget = Integer.parseInt(f[15]);
-                if (!f[16].isEmpty()) {
-                    for (String k : f[16].split(",")) n.kids.add(Integer.parseInt(k));
-                }
+                if (!f[16].isEmpty()) for (String k : f[16].split(",")) n.kids.add(Integer.parseInt(k));
                 Node was = nodes.get(n.id);
                 if (was != null) {
                     n.parent = was.parent;
@@ -168,15 +180,14 @@ final class A11y extends AccessibilityNodeProvider {
                 nodes.put(n.id, n);
                 told.add(n);
             } catch (NumberFormatException e) {
-                Host.log("a11y: parse error: " + e);
+                Host.log("a11y: a line not read: " + e);
             }
         }
-        for (Node n : told) {
-            for (int k : n.kids) {
-                Node c = nodes.get(k);
-                if (c != null) c.parent = n.id;
-            }
+        for (Node n : told) for (int k : n.kids) {
+            Node c = nodes.get(k);
+            if (c != null) c.parent = n.id;
         }
+        // (one in nothing told holds: gone, with what it holds)
         while (!letGo.isEmpty()) {
             int k = letGo.remove(letGo.size() - 1);
             if (held.contains(k)) continue;
@@ -192,7 +203,7 @@ final class A11y extends AccessibilityNodeProvider {
             if (elapsed < SCROLL_EVENT_THROTTLE_MS) {
                 if (!contentEventPending) {
                     contentEventPending = true;
-                    view.postDelayed(sendContentEvent, SCROLL_EVENT_THROTTLE_MS - elapsed);
+                    view.postDelayed(sendContentEvent, SCROLL_EVENT_THROTTLE_MS - elapsed); // det-ok(host-delay): 100ms scroll-only a11y event throttle matching Jetpack Compose
                 }
                 return;
             }
@@ -221,6 +232,7 @@ final class A11y extends AccessibilityNodeProvider {
         if (parent != null) parent.requestSendAccessibilityEvent(view, e);
     }
 
+    /** What node `id` holds as virtual nodes: those of no use of their own (flags v) left out, what they hold in place. */
     private List<Integer> shownKids(int id) {
         List<Integer> out = new ArrayList<>();
         Node n = nodes.get(id);
@@ -234,12 +246,14 @@ final class A11y extends AccessibilityNodeProvider {
         return out;
     }
 
+    /** The virtual node that holds `n`: its nearest holder of use of its own (0: the view). */
     private int shownHolder(Node n) {
         Node p = nodes.get(n.parent);
         while (p != null && p.id != 0 && has(p.flags, 'v')) p = nodes.get(p.parent);
         return p == null ? 0 : p.id;
     }
 
+    /** Where `n` is in the view (points): its holders' places and its own, each from where its holder is. */
     private float[] placeOf(Node n) {
         float x = n.x, y = n.y;
         for (Node p = nodes.get(n.parent); p != null && p.id != 0; p = nodes.get(p.parent)) {
@@ -257,6 +271,7 @@ final class A11y extends AccessibilityNodeProvider {
         return s.indexOf(c) >= 0;
     }
 
+    /** Android's widget class for a role, what TalkBack names it by ("button", "checkbox", …). */
     private static String classOf(String role) {
         switch (role) {
             case "Button":
@@ -339,24 +354,15 @@ final class A11y extends AccessibilityNodeProvider {
         } else if (!n.label.isEmpty()) {
             info.setContentDescription(n.label);
         }
-        if ((n.role.equals("Heading") || n.role.equals("ColumnHeader")) && Build.VERSION.SDK_INT >= 28) {
-            info.setHeading(true);
-        }
-        if (!n.value.isEmpty() && !n.role.equals("TextField") && Build.VERSION.SDK_INT >= 30) {
-            info.setStateDescription(n.value);
-        }
-        if (!n.description.isEmpty() && Build.VERSION.SDK_INT >= 30) {
-            info.setTooltipText(n.description);
-        }
+        if ((n.role.equals("Heading") || n.role.equals("ColumnHeader")) && Build.VERSION.SDK_INT >= 28) info.setHeading(true);
+        if (!n.value.isEmpty() && !n.role.equals("TextField") && Build.VERSION.SDK_INT >= 30) info.setStateDescription(n.value);
+        if (!n.description.isEmpty() && Build.VERSION.SDK_INT >= 30) info.setTooltipText(n.description);
         info.setCheckable(has(n.flags, 'c'));
         info.setChecked(has(n.flags, 'C'));
         info.setSelected(has(n.flags, 's'));
         info.setEnabled(!has(n.flags, 'd'));
         info.setFocused(inputFocus == id);
-        if (n.range) {
-            info.setRangeInfo(AccessibilityNodeInfo.RangeInfo.obtain(
-                    AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT, n.low, n.high, n.at));
-        }
+        if (n.range) info.setRangeInfo(AccessibilityNodeInfo.RangeInfo.obtain(AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT, n.low, n.high, n.at));
         boolean click = has(n.actions, 'a');
         info.setClickable(click);
         if (click || has(n.actions, 'f') || n.role.equals("TextField")) info.setFocusable(true);
@@ -372,17 +378,14 @@ final class A11y extends AccessibilityNodeProvider {
             info.addAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_TEXT);
         }
         info.setAccessibilityFocused(focused == id);
-        info.addAction(focused == id
-                ? AccessibilityNodeInfo.AccessibilityAction.ACTION_CLEAR_ACCESSIBILITY_FOCUS
+        info.addAction(focused == id ? AccessibilityNodeInfo.AccessibilityAction.ACTION_CLEAR_ACCESSIBILITY_FOCUS
                 : AccessibilityNodeInfo.AccessibilityAction.ACTION_ACCESSIBILITY_FOCUS);
         return info;
     }
 
     @Override
     public AccessibilityNodeInfo findFocus(int focus) {
-        if (focus == AccessibilityNodeInfo.FOCUS_ACCESSIBILITY && focused != HOST_VIEW_ID) {
-            return createAccessibilityNodeInfo(focused);
-        }
+        if (focus == AccessibilityNodeInfo.FOCUS_ACCESSIBILITY && focused != HOST_VIEW_ID) return createAccessibilityNodeInfo(focused);
         return null;
     }
 
@@ -420,11 +423,12 @@ final class A11y extends AccessibilityNodeProvider {
             case AccessibilityNodeInfo.ACTION_FOCUS:
                 return ask(n, "focus", 'f');
             case AccessibilityNodeInfo.ACTION_SET_TEXT: {
+                // words put in the field in place of what it held (the app's next frame, as typed)
                 CharSequence t = arguments == null ? null
                         : arguments.getCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE);
                 if (!has(n.actions, 't') || n.widget == 0) return false;
                 Native.post("a11y", "{\"id\":" + n.widget + ",\"action\":\"set_text\",\"text\":"
-                        + JSONObject.quote(t == null ? "" : t.toString()) + "}");
+                        + org.json.JSONObject.quote(t == null ? "" : t.toString()) + "}");
                 return true;
             }
             default:
@@ -432,6 +436,7 @@ final class A11y extends AccessibilityNodeProvider {
         }
     }
 
+    /** An action the node takes, asked of its widget for the app's next frame. */
     private boolean ask(Node n, String action, char letter) {
         if (!has(n.actions, letter) || n.widget == 0) return false;
         Native.post("a11y", "{\"id\":" + n.widget + ",\"action\":\"" + action + "\"}");
@@ -452,6 +457,10 @@ final class A11y extends AccessibilityNodeProvider {
         if (parent != null) parent.requestSendAccessibilityEvent(view, e);
     }
 
+    /**
+     * A finger exploring the screen (touch exploration's hover events, in the view's pixels): the node under it, the
+     * innermost that is read out (one that takes an action or has words), entered; false where there is none.
+     */
     boolean hover(MotionEvent e) {
         if (nodes.isEmpty()) return false;
         float x = e.getX() / view.density, y = e.getY() / view.density;

@@ -4231,6 +4231,33 @@
     v.grab = undefined;
     return g;
   };
+  H.viewStill = (id) => {
+    const v = views.get(id);
+    if (!v || !v.el || typeof document === 'undefined') return new Uint8Array(0);
+    const el = v.el;
+    const tag = (el.tagName || '').toUpperCase();
+    if (tag !== 'VIDEO' && tag !== 'CANVAS') return new Uint8Array(0);
+    const w = tag === 'VIDEO' ? (el.videoWidth | 0) : (el.width | 0);
+    const h = tag === 'VIDEO' ? (el.videoHeight | 0) : (el.height | 0);
+    if (w <= 0 || h <= 0) return new Uint8Array(0);
+    try {
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext('2d');
+      if (!ctx) return new Uint8Array(0);
+      ctx.drawImage(el, 0, 0, w, h);
+      const url = c.toDataURL('image/png');
+      const idx = url.indexOf(',');
+      if (idx < 0) return new Uint8Array(0);
+      const bin = atob(url.slice(idx + 1));
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    } catch {
+      return new Uint8Array(0);
+    }
+  };
   H.viewInfo = (id, out) => {
     const v = views.get(id);
     if (!v) return -1;
