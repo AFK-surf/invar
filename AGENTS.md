@@ -72,35 +72,45 @@ pub fn main(world : World) -> Int {
 ### 1.3 Upstream missing primitives to `AFK-surf/invar` first
 - If `packages/lg` lacks a desktop size, variant, or reusable glass primitive, **add it to `AFK-surf/invar` (`packages/lg`) first** with full unit tests and offscreen verification. Never degrade or hand-roll a one-off glass surface in downstream business code.
 
-### 1.4 Scrolling & Flex Container Rules
-- Default to `ui::scroll_box(parent, fn(body) { ... })` (vertical) or `ui::scroll_row(parent, fn(body) { ... })` (horizontal) — or `kit::scroll_area` — to create a dedicated child scroller with `.fill()`, `ui::tree_scroll_bar()`, and `ui::touch_slop()` drag-claim takeover wired automatically.
-- **Every flex ancestor from `root` down to a scroller must bound its main-axis size** via `.fill()` (i.e. `.grow(Is(1.0)).shrink(Is(1.0)).basis(Is(Some(0.0))).min_width(Is(Some(0.0))).min_height(Is(Some(0.0)))`) or an explicit `.height(Is(Some(h)))` / `.width(Is(Some(w)))`.
-- Golden "header + scrollable body + footer" skeleton (copy-paste ready):
+### 1.4 Scrolling, Apple Scroll-Under Page Shell & Flex Container Rules
+- **Default to `<lg::PageShell>` / `lg::page_shell_node` (and `<lg::SplitShell>` for two-column apps)** instead of a rigid `[header] / [scroll_box] / [footer]` three-box stack. `<lg::PageShell>` mounts a single **100%-height `ui::scroll_box`** with automatic top/bottom content insets and `liquid_scroll_edge_node` (`UIScrollEdgeEffect.soft`) progressive blur veils so content glides directly underneath floating Liquid Glass top/bottom chrome — delivering genuine optical refraction with zero solid header backdrop and zero full-width hairline divider.
+- Golden Apple scroll-under page skeleton (copy-paste ready):
 
 ```pion
-pub fn build_page(root : view::View) -> Unit {
-  let _ = root.box(fn(header : view::View) {
-    let _ = header.height(view::Live::Is(Some(48.0))).rigid()
-    let _ = header.words(view::Live::Is("Title"), look=view::words_plain)
-  })
-  let _ = ui::scroll_box(root, fn(body : view::View) {
-    // Long content here — automatically fills remaining space, clips, scrolls, and shows a scrollbar.
-    let _ = body.box(fn(content : view::View) {
-      let _ = content.height(view::Live::Is(Some(1200.0)))
-    })
-  })
-  let _ = root.box(fn(footer : view::View) {
-    let _ = footer.height(view::Live::Is(Some(44.0))).rigid()
-  })
+pub fn build_page(root : view::View, field : ui::Field, on_send : () -> Unit) -> Unit {
+  <lg::PageShell
+    in={root}
+    title="Messages"
+    trailing={fn(tr : view::View) -> Unit {
+      <lg::BarPillGroup in={tr} label="Actions">
+        <lg::Button flat ghost height={30.0} pad_x={7.0} label="Search" on_press=>{ () }>
+          <lg::Icon kind={.Search} size={15.0} />
+        </lg::Button>
+        <lg::Button flat ghost height={30.0} pad_x={7.0} label="Info" on_press=>{ () }>
+          <lg::Icon kind={.Info} size={15.0} />
+        </lg::Button>
+      </lg::BarPillGroup>
+    }}
+    bottom={fn(bot : view::View) -> Unit {
+      <lg::ComposerBar in={bot} field={field} on_send={on_send} placeholder="Message" />
+    }}
+  >
+    <ui::Col pad={16.0} gap={12.0}>
+      <lg::SurfaceCard pad={16.0} gap={8.0}>
+        <ui::Text text="Clean solid Apple Content Layer — glides under floating glass chrome." size={14.0} wrap />
+      </lg::SurfaceCard>
+    </ui::Col>
+  </lg::PageShell>
 }
 ```
 
+- **Low-level flex scrolling rule**: when building custom scroll containers with `ui::scroll_box`, `ui::scroll_row`, or `kit::scroll_area`, **every flex ancestor from `root` down to the scroller must bound its main-axis size** via `.fill()` (i.e. `.grow(Is(1.0)).shrink(Is(1.0)).basis(Is(Some(0.0))).min_width(Is(Some(0.0))).min_height(Is(Some(0.0)))`) or an explicit `.height(Is(Some(h)))` / `.width(Is(Some(w)))`.
 - **Four anti-patterns to avoid**:
-  1. **Unbounded flex ancestor**: wrapping a scroller in `parent.box(...)` without `.fill()` or `.min_height(Is(Some(0.0)))` lets the ancestor expand to full content height, leaving `reach == 0` (silent non-scrolling).
-  2. **Calling `.scrolls(...)` on a container that already has sibling children**: mutating `parent` into a scroller after adding headers/footers breaks layout and clipping; always wrap the scrollable region in its own child box (`ui::scroll_box` / `View::scroll_box`).
-  3. **Using `clips(true)` alone**: clipping does not scroll; use `ui::scroll_box` / `kit::scroll_area` / `View::scrolls`.
-  4. **Omitting `bar` / `slop` on raw `View::scrolls`**: manual `View::scrolls` calls without `bar=ui::tree_scroll_bar(), slop=ui::touch_slop()` drop scrollbars and touch-slop ergonomics; prefer `ui::scroll_box`.
-- **Mandatory test gate**: every UI test suite with scrollable views must assert `t.scroll_faults().length() == 0` (or call `t.assert_scrollable(label="...")`).
+  1. **Three-box opaque stack (`[solid header] / [scroll_box] / [solid footer]`)**: cuts off scrolled content before it can pass underneath floating glass chrome, destroying Liquid Glass refraction and leaving an outdated solid hairline divider. Use `<lg::PageShell>`.
+  2. **Unbounded flex ancestor**: wrapping a scroller in `parent.box(...)` without `.fill()` or `.min_height(Is(Some(0.0)))` lets the ancestor expand to full content height, leaving `reach == 0` (silent non-scrolling).
+  3. **Calling `.scrolls(...)` on a container that already has sibling children**: mutating `parent` into a scroller after adding headers/footers breaks layout and clipping; always wrap the scrollable region in its own child box (`ui::scroll_box` / `View::scroll_box`).
+  4. **Using `clips(true)` alone or raw `View::scrolls` without `bar` / `slop`**: clipping does not scroll, and raw `View::scrolls` without `bar=ui::tree_scroll_bar(), slop=ui::touch_slop()` drops scrollbars and touch-slop ergonomics; prefer `<lg::PageShell>` or `ui::scroll_box`.
+- **Mandatory test gate**: every UI test suite must run `lg::assert_apple_ui(t, label="...")` (which checks zero nested glass, content-layer glass limits, `t.scroll_faults().length() == 0`, and `t.assert_ui_craft()`).
 
 ### 1.5 Keep all 4 GPU renderers in lockstep
 - Any shader, optical transfer model (including 15-tap trimmed-mean temporal adaptive liquid glass and 9-tap small-sigma progressive blur), or instance-layout change in the GPU renderer **MUST** be updated simultaneously across all 4 backends:

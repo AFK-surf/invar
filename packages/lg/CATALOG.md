@@ -1,8 +1,25 @@
 # `packages/lg` Component Catalog (一页纸速查目录)
 
 > **铁律**：
-> 1. **内容层零玻璃**：页面底色、消息流、列表、内容卡片、表单与代码块**一律使用 Content Surfaces（实色纸面 `lg::surface()` / `SurfaceCard` / `SurfaceSection` / `CodeBlock`）**，严禁对页面内容套 `Glass::liquid`。
-> 2. **悬浮层单层玻璃**：下游业务代码严禁直接调用 `paint::Glass::liquid(...)`，所有悬浮导航、工具栏、弹层与交互控件必须 100% 从本目录选用 `lg::*` 组件，并在单测中调用 `lg::assert_apple_ui(t, label="...")`（或 `lg::assert_no_nested_glass`）。
+> 1. **全高滚动穿透页面壳优先**：建任何页面直接用 `<lg::PageShell>` / `<lg::SplitShell>` + `<lg::BackButton>` + `<lg::BarPillGroup>` + `<lg::Icon>` + `<lg::ComposerBar>`；**严禁手写三段式实色死盒（`[实色顶栏] / [scroll_box] / [实色底栏]`）、严禁实色顶栏横贯分割线、严禁纯文字顶栏胶囊（如 `"Back"`）、严禁框套框输入栏**！
+> 2. **内容层零玻璃**：页面底色、消息流、列表、内容卡片、表单与代码块**一律使用 Content Surfaces（实色纸面 `lg::surface()` / `SurfaceCard` / `SurfaceSection` / `CodeBlock`）**，严禁对页面内容套 `Glass::liquid`。
+> 3. **悬浮层单层玻璃**：下游业务代码严禁直接调用 `paint::Glass::liquid(...)`，所有悬浮导航、工具栏、弹层与交互控件必须 100% 从本目录选用 `lg::*` 组件，并在单测中调用 `lg::assert_apple_ui(t, label="...")`。
+
+---
+
+## Standard Apple App Shells, Vector Icons & Composer (Start Here)
+
+### 00a. `lg::page_shell_node` / `<lg::PageShell>`
+- **适用场景**：全高（100%）滚动穿透式苹果页面壳：干净实色底面（`surface().canvas` / `grouped_bg`）+ 唯一全高 `ui::scroll_box`（自动加 `top_inset` / `bottom_inset`）+ 自动挂载 `liquid_scroll_edge_node` 渐进模糊卷边（`UIScrollEdgeEffect.soft`）+ 悬浮顶/底槽（`leading` / `title` / `subtitle` / `trailing` / `bottom`）。零实色顶栏、零横贯硬分割线，内容滚动直接穿过玻璃岛下方产生真实折射。
+
+### 00b. `lg::split_shell_node` / `<lg::SplitShell>`
+- **适用场景**：响应式双栏 `NavigationSplitView`（`breakpoint=760.0`、`sidebar_width=264.0`）：宽屏渲染固定宽实色 `surface().sidebar` + `0.5pt` `surface().separator` 竖细线 + `.fill()` 详情区；窄屏按 `show_detail()` 自动全屏切换侧栏或详情，绝不挤压截断。
+
+### 00c. `lg::composer_bar_node` / `<lg::ComposerBar>`
+- **适用场景**：苹果 Messages 级极简悬浮单层自适应液态玻璃输入胶囊（`min_height=44, r=22`，左侧扁平无框圆形 `+`/`Paperclip` 图标钮、中间透明无框 `ui::field`、右侧 `34pt` 正圆 `ArrowUp` 发送钮 + `36pt` 热区），零框套框、零矩形 `"Send"` 文字按钮。
+
+### 00d. `lg::icon_node` / `<lg::Icon>` & `lg::liquid_back_button_node` / `<lg::BackButton>`
+- **适用场景**：31 个 100% `paint::shape_of` 几何矢量图标（`ChevronLeft`、`Search`、`Plus`、`Paperclip`、`ArrowUp`、`Pin`、`Users`、`Info`、`Settings`、`Sparkles`、`Refresh` 等，1.6–1.8pt 线宽，零 emoji/字体依赖），以及单层悬浮自适应液态玻璃返回岛 `<lg::BackButton>`（`36×36` 正圆 `<` 岛或 `< Label` 胶囊岛，36pt 热区）。
 
 ---
 
