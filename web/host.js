@@ -4377,23 +4377,85 @@
   // ---- images ----
   // Decoded by the browser off the main thread (createImageBitmap, which
   // also applies the EXIF orientation), scaled to the size asked for, kept
-  // as premultiplied textures.
+  // as premultiplied textures. SVG, which createImageBitmap does not decode
+  // from a Blob, goes through an <img> drawn into a canvas of the size asked
+  // for (decodeViaImage), as does whatever createImageBitmap refuses.
   const images = new Map();
   let nextImage = 0;
+  const SVG_SNIFF = [/^<svg[\s>]/i, /^<\?xml[\s\S]*?<svg[\s>]/i, /^<!DOCTYPE\s+svg[\s>]/i];
+  // an SVG by its type, else by its first bytes (raw bytes from imageLoadBytes have no type; a server may leave it out)
+  async function looksLikeSvg(blob) {
+    if (blob.type && /svg/i.test(blob.type)) return true;
+    if (!(blob.size > 0 && blob.size <= 16 * 1024 * 1024)) return false;
+    const head = (await blob.slice(0, 512).text()).replace(/^\uFEFF/, '').replace(/^\s+/, '');
+    return SVG_SNIFF.some((re) => re.test(head));
+  }
+  // an SVG with no width or height of its own: its viewBox's, else a stand-in
+  async function svgFallbackSize(blob, maxPx) {
+    const head = (await blob.slice(0, 4096).text()).slice(0, 4096);
+    const m = /viewBox\s*=\s*["']\s*([-+.\deE]+)[\s,]+([-+.\deE]+)[\s,]+([-+.\deE]+)[\s,]+([-+.\deE]+)\s*["']/i.exec(head);
+    if (m) {
+      const w = parseFloat(m[3]), h = parseFloat(m[4]);
+      if (w > 0 && h > 0) return [w, h];
+    }
+    const fb = maxPx > 0 ? Math.min(maxPx, 300) : 300;
+    return [fb, fb];
+  }
+  async function decodeViaImage(blob, maxPx) {
+    const svg = await looksLikeSvg(blob);
+    const typed = svg && !/svg/i.test(blob.type || '') ? new Blob([blob], { type: 'image/svg+xml' }) : blob;
+    const url = URL.createObjectURL(typed);
+    try {
+      const img = new Image();
+      img.decoding = 'async';
+      await new Promise((ok, fail) => {
+        img.onload = ok;
+        img.onerror = () => fail(new Error('image did not load'));
+        img.src = url;
+      });
+      if (typeof img.decode === 'function') { try { await img.decode(); } catch (_) { /* loaded already */ } }
+      let ow = img.naturalWidth || img.width || 0, oh = img.naturalHeight || img.height || 0;
+      if (!(ow > 0 && oh > 0)) {
+        if (!svg) throw new Error('image has no size');
+        [ow, oh] = await svgFallbackSize(typed, maxPx);
+      }
+      const k = maxPx > 0 ? Math.min(1, maxPx / Math.max(ow, oh)) : 1;
+      const tw = Math.max(1, Math.round(ow * k)), th = Math.max(1, Math.round(oh * k));
+      const c = document.createElement('canvas');
+      c.width = tw;
+      c.height = th;
+      c.getContext('2d').drawImage(img, 0, 0, tw, th);
+      const bmp = await createImageBitmap(c);
+      return { bmp, ow: Math.round(ow), oh: Math.round(oh), blob: typed };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
   async function decodeImage(id, blob, maxPx) {
     const im = images.get(id);
     try {
-      let bmp = await createImageBitmap(blob);
-      const ow = bmp.width, oh = bmp.height;
-      const k = Math.min(1, maxPx / Math.max(ow, oh));
-      if (k < 1) {
-        const small = await createImageBitmap(bmp, {
-          resizeWidth: Math.max(1, Math.round(ow * k)),
-          resizeHeight: Math.max(1, Math.round(oh * k)),
-          resizeQuality: 'high',
-        });
-        bmp.close();
-        bmp = small;
+      let bmp, ow, oh, storedBlob = blob;
+      if (blob.type && /svg/i.test(blob.type)) {
+        ({ bmp, ow, oh, blob: storedBlob } = await decodeViaImage(blob, maxPx));
+      } else {
+        let raw = null;
+        try { raw = await createImageBitmap(blob); } catch (e) { raw = null; }
+        if (raw) {
+          bmp = raw;
+          ow = bmp.width; oh = bmp.height;
+          const k = maxPx > 0 ? Math.min(1, maxPx / Math.max(ow, oh)) : 1;
+          if (k < 1) {
+            const small = await createImageBitmap(bmp, {
+              resizeWidth: Math.max(1, Math.round(ow * k)),
+              resizeHeight: Math.max(1, Math.round(oh * k)),
+              resizeQuality: 'high',
+            });
+            bmp.close();
+            bmp = small;
+          }
+        } else {
+          ({ bmp, ow, oh, blob: storedBlob } = await decodeViaImage(blob, maxPx));
+        }
       }
       if (!images.has(id)) return bmp.close();
       // (the page's canvas's: a window beside it takes a copy of its own as it first draws it, slotTex)
@@ -4407,7 +4469,7 @@
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      Object.assign(im, { state: 1, tex, w: bmp.width, h: bmp.height, ow, oh, blob, maxPx });
+      Object.assign(im, { state: 1, tex, w: bmp.width, h: bmp.height, ow, oh, blob: storedBlob, maxPx });
       bmp.close();
     } catch (e) {
       if (!images.has(id)) return;
