@@ -91,13 +91,13 @@ if [ -n "$NDK_CC" ]; then
   rm -f "$OBJ_DIR"/*.o "$LIB"
 
   echo "  NDK CC: $NDK_CC"
-  "$NDK_CC" -O2 -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native \
+  "$NDK_CC" -O2 -fPIC -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native \
     -c packages/hostapi/native/wake_bridge.c -o "$OBJ_DIR/wake_bridge.o"
-  "$NDK_CC" -O2 -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native \
+  "$NDK_CC" -O2 -fPIC -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native \
     -c packages/host/compat/pion_mb_compat.c -o "$OBJ_DIR/pion_mb_compat.o"
-  "$NDK_CC" -O2 -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native \
+  "$NDK_CC" -O2 -fPIC -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native \
     -c packages/host/native/film_none.c -o "$OBJ_DIR/film_none.o"
-  "$NDK_CC" -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Ipackages/host/compat -Ipackages/host/native \
+  "$NDK_CC" -O2 -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Ipackages/host/compat -Ipackages/host/native \
     -c packages/host/native/android_host.c -o "$OBJ_DIR/android_host.o"
 
   "$NDK_AR" rcs "$LIB" \

@@ -487,23 +487,22 @@ int32_t pion_host_text_key(const char *utf8, int64_t utf8_len, double size, int3
   return r;
 }
 
-int32_t pion_host_glyph_picture(int32_t key, int64_t *out_slots, int32_t out_len) {
-  if (!out_slots || out_len <= 0) return 0;
+// `Array[Byte]` is a packed `uint8_t` buffer (element stride 1), not 8-byte slots.
+int32_t pion_host_glyph_picture(int32_t key, uint8_t *out, int32_t out_len) {
+  if (!out || out_len <= 0) return 0;
   moonbit_bytes_t mb_out = moonbit_make_bytes(out_len, 0);
   if (!mb_out) return 0;
   int32_t ok = mb_host_glyph_picture(key, mb_out);
-  if (ok == 1) {
-    for (int32_t i = 0; i < out_len; i++) out_slots[i] = (int64_t)mb_out[i];
-  }
+  if (ok == 1) memcpy(out, mb_out, (size_t)out_len);
   moonbit_decref(mb_out);
   return ok;
 }
 
-int32_t pion_host_atlas_put(int32_t x, int32_t y, int32_t w, int32_t h, const int64_t *px_slots, int32_t px_len) {
-  if (!px_slots || px_len <= 0) return 0;
+int32_t pion_host_atlas_put(int32_t x, int32_t y, int32_t w, int32_t h, const uint8_t *px, int32_t px_len) {
+  if (!px || px_len <= 0) return 0;
   moonbit_bytes_t mb_px = moonbit_make_bytes(px_len, 0);
   if (!mb_px) return 0;
-  for (int32_t i = 0; i < px_len; i++) mb_px[i] = (uint8_t)(px_slots[i] & 0xFF);
+  memcpy(mb_px, px, (size_t)px_len);
   int32_t ok = mb_host_atlas_put(x, y, w, h, mb_px);
   moonbit_decref(mb_px);
   return ok;
@@ -779,43 +778,37 @@ int32_t pion_host_image_load_bytes(const uint8_t *data, int64_t len, int32_t max
   return r;
 }
 
-int32_t pion_host_image_pixels(int32_t id, int64_t *out_slots, int32_t out_len) {
-  if (!out_slots || out_len <= 0) return 0;
+int32_t pion_host_image_pixels(int32_t id, uint8_t *out, int32_t out_len) {
+  if (!out || out_len <= 0) return 0;
   moonbit_bytes_t mb_out = moonbit_make_bytes(out_len, 0);
   if (!mb_out) return 0;
   int32_t ok = mb_host_image_pixels(id, mb_out);
-  if (ok == 1) {
-    for (int32_t i = 0; i < out_len; i++) out_slots[i] = (int64_t)mb_out[i];
-  }
+  if (ok == 1) memcpy(out, mb_out, (size_t)out_len);
   moonbit_decref(mb_out);
   return ok;
 }
 
-int32_t pion_host_drawn_pixels(int32_t x, int32_t y, int32_t w, int32_t h, int64_t *out_slots, int32_t out_len) {
-  if (!out_slots || out_len <= 0 || w <= 0 || h <= 0) return 0;
+int32_t pion_host_drawn_pixels(int32_t x, int32_t y, int32_t w, int32_t h, uint8_t *out, int32_t out_len) {
+  if (!out || out_len <= 0 || w <= 0 || h <= 0) return 0;
   int64_t need = (int64_t)w * (int64_t)h * 4;
   if ((int64_t)out_len < need) return 0;
   moonbit_bytes_t mb_out = moonbit_make_bytes((int32_t)need, 0);
   if (!mb_out) return 0;
   int32_t ok = mb_render_drawn_pixels(x, y, w, h, mb_out);
-  if (ok == 1) {
-    for (int64_t i = 0; i < need; i++) out_slots[i] = (int64_t)mb_out[i];
-  }
+  if (ok == 1) memcpy(out, mb_out, (size_t)need);
   moonbit_decref(mb_out);
   return ok;
 }
 
 int32_t pion_host_drawn_pixels_of(const double *inst, int32_t count, double r, double g, double b,
-                                  double scale, int32_t w, int32_t h, int64_t *out_slots, int32_t out_len) {
-  if (!out_slots || out_len <= 0 || w <= 0 || h <= 0) return 0;
+                                  double scale, int32_t w, int32_t h, uint8_t *out, int32_t out_len) {
+  if (!out || out_len <= 0 || w <= 0 || h <= 0) return 0;
   int64_t need = (int64_t)w * (int64_t)h * 4;
   if ((int64_t)out_len < need) return 0;
   moonbit_bytes_t mb_out = moonbit_make_bytes((int32_t)need, 0);
   if (!mb_out) return 0;
   int32_t ok = mb_render_pixels_of(inst, count, r, g, b, scale, w, h, mb_out);
-  if (ok == 1) {
-    for (int64_t i = 0; i < need; i++) out_slots[i] = (int64_t)mb_out[i];
-  }
+  if (ok == 1) memcpy(out, mb_out, (size_t)need);
   moonbit_decref(mb_out);
   return ok;
 }

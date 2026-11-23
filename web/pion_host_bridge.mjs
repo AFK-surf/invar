@@ -1325,11 +1325,8 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const tmp = new Uint8Array(n);
       const ok = H.imagePixels(id | 0, tmp);
       if (ok !== 1) return 0;
-      const dv = new DataView(mem.buffer);
-      for (let i = 0; i < n; i++) {
-        dv.setUint32(p + i * 8, tmp[i], true);
-        dv.setUint32(p + i * 8 + 4, 0, true);
-      }
+      // `Array[Byte]` is a packed byte buffer (element stride 1).
+      new Uint8Array(mem.buffer, p, n).set(tmp);
       return 1;
     },
     mb_web_open_url(urlPtr, urlLen) {
