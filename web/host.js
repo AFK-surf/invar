@@ -1254,6 +1254,7 @@
       float isPlatter = 0.0;
       float isBarTab = 0.0;
       float menAA = 0.0;
+      float menN = 0.0;
       float barIconGate = 0.0;
       vec2 barCaDisp = vec2(0.0, 0.0);
       vec2 centered = vec2(0.0, 0.0);
@@ -1276,7 +1277,8 @@
         float compactScale = clamp(v_rect.w / 38.33, 0.70, 1.15);
         vec2 compactPinch = vec2(centered.x * 0.72, centered.y * endYScale) * pinchRamp * pinchRimGate * (15.5 * compactScale);
         float cMenBand = smoothstep(0.30, 0.85, inward) * (1.0 - smoothstep(1.15, 1.85, inward));
-        vec2 compactMeniscus = -surfaceNormal * (4.8 * cMenBand);
+        float menLobe = smoothstep(0.15, 0.85, dot(surfaceNormal, normalize(vec2(0.55, 0.83))));
+        vec2 compactMeniscus = -surfaceNormal * (4.8 * cMenBand * menLobe) + surfaceNormal * (0.9 * cMenBand * (1.0 - menLobe));
         float tipDist = (0.5 - abs(centered.x)) * v_rect.z;
         float capAbsX = clamp(1.0 - tipDist / max(v_rect.w * 0.6514, 1.0), 0.0, 1.0);
         float barPinchHoriz = 1.0 - smoothstep(0.30, 0.94, capAbsX);
@@ -1288,6 +1290,7 @@
         float endCapX = smoothstep(0.32, 0.70, capAbsX);
         float pMenBand = smoothstep(0.22, 0.55, inward) * (1.0 - smoothstep(0.95, 1.35, inward));
         menAA = max(cMenBand, pMenBand) * pressAmt * pinchWeight;
+        menN = cMenBand * pressAmt * pinchWeight;
         vec2 pMenReach = vec2(3.9 + 1.2 * endCapX, 3.9 * endCapX);
         vec2 platterMeniscus = -surfaceNormal * pMenReach * pMenBand;
         float capPinchBand = smoothstep(1.35, 4.40, inward) * (1.0 - smoothstep(5.40, 7.80, inward));
@@ -1297,11 +1300,11 @@
         float tabPinchVert = smoothstep(0.42, 0.74, absC.y) * smoothstep(1.35, 5.2, inward);
         vec2 tabPinch = vec2(0.0, centered.y * tabPinchHoriz * tabPinchVert * (0.245 * v_rect.w) * 0.28);
         float iconBandY = 1.0 - smoothstep(0.66, 0.79, absC.y);
-        barIconGate = iconBandY * endCapX * pressAmt * isBarTab;
+        barIconGate = iconBandY * endCapX * pressAmt * pinchWeight * isBarTab;
         float iconBevelX = smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward));
         float iconBevelY = smoothstep(0.45, 1.25, inward) * (1.0 - smoothstep(2.20, 9.00, inward));
         float signX = centered.x >= 0.0 ? 1.0 : -1.0;
-        barCaDisp = vec2(-signX * 5.6 * iconBevelX, -centered.y * 2.0 * 5.2 * iconBevelY) * barIconGate;
+        barCaDisp = vec2(-signX * 5.2 * iconBevelX, -centered.y * 2.0 * 4.8 * iconBevelY) * barIconGate;
         dropHairline = (1.0 - smoothstep(0.25, 0.68, inward)) * pressAmt;
         vec2 effPlatterPinch = mix(platterPinch, tabPinch, isBarTab);
         vec2 effPlatterMen = mix(platterMeniscus + capOutward, (platterMeniscus + barCapOutward) * (1.0 - dropHairline), isBarTab);
@@ -1337,6 +1340,12 @@
         ) * 0.25;
         refractColor = mix(refractColor, aaCol, menAA);
       }
+      if (menN > 0.001) {
+        float menY = luma(refractColor);
+        float outerBgY = luma(backdrop(p + surfaceNormal * 3.0));
+        float lightCard = smoothstep(0.35, 0.65, outerBgY);
+        refractColor = mix(refractColor, mix(vec3(menY), vec3(1.0), 0.45 * lightCard), 0.60 * menN);
+      }
       if (is_drop && isBarTab > 0.01) {
         float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - dropHairline);
         if (barBevelGate > 0.001) {
@@ -1348,12 +1357,11 @@
           vec3 iconG = backdrop(p + barCaDisp);
           float iconDiffG = length(iconG - refPlatter);
           float iconPeakG = max(iconG.r, max(iconG.g, iconG.b));
-          float iconChromaG = iconPeakG - min(iconG.r, min(iconG.g, iconG.b));
-          float lightIconMask = max(smoothstep(0.24, 0.42, iconDiffG), smoothstep(0.08, 0.18, iconChromaG));
-          float darkIconMask = max(smoothstep(0.38, 0.55, iconPeakG), smoothstep(0.08, 0.18, iconChromaG));
+          float lightIconMask = smoothstep(0.24, 0.42, iconDiffG);
+          float darkIconMask = smoothstep(0.38, 0.55, iconPeakG);
           float isInsidePlatter = mix(lightIconMask, darkIconMask * smoothstep(0.05, 0.12, platterLuma), isDarkPlatter);
-          float iconCaGate = mix(max(smoothstep(0.22, 0.40, iconDiffG), smoothstep(0.05, 0.14, iconChromaG)), darkIconMask, isDarkPlatter);
-          float iconDisp = 0.085 * iconCaGate;
+          float iconCaGate = mix(smoothstep(0.22, 0.40, iconDiffG), darkIconMask, isDarkPlatter);
+          float iconDisp = 0.035 * iconCaGate;
           vec3 iconRGB = iconG;
           if (iconDisp > 0.002) {
             vec3 iconR = backdrop(p + barCaDisp * (1.0 + iconDisp));
@@ -1405,9 +1413,9 @@
           fogT = brightT;
           float dens = max(baseDens, mix(baseDens, 0.64, brightT));
           float extra = clamp((dens - 0.30) / (1.0 - 0.30), 0.0, 1.0);
-          emission = mix(vec3(42.0 / 255.0, 42.0 / 255.0, 42.0 / 255.0), vec3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);
+          emission = mix(vec3(48.0 / 255.0, 48.0 / 255.0, 48.0 / 255.0), vec3(22.0 / 255.0, 22.0 / 255.0, 22.0 / 255.0), extra);
           transmittance = mix(0.54, 0.0, extra);
-          lift = mix(0.36, 0.0, extra);
+          lift = mix(0.30, 0.0, extra);
           chromaGain = mix(0.92, 0.0, extra);
           contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;
           glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;
@@ -1418,11 +1426,11 @@
           float darkDens = max(baseDens, mix(baseDens, 0.52, darkMix));
           float darkExtra = clamp((darkDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);
           vec3 lightEm = vec3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * baseDens;
-          vec3 darkEm = mix(vec3(42.0 / 255.0, 42.0 / 255.0, 42.0 / 255.0), vec3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), darkExtra);
+          vec3 darkEm = mix(vec3(48.0 / 255.0, 48.0 / 255.0, 48.0 / 255.0), vec3(22.0 / 255.0, 22.0 / 255.0, 22.0 / 255.0), darkExtra);
           emission = mix(lightEm, darkEm, darkMix);
           transmittance = mix(mix(0.70, 0.0, extra), mix(0.54, 0.0, darkExtra), darkMix);
-          lift = mix(mix(0.16, 0.0, extra), mix(0.36, 0.0, darkExtra), darkMix);
-          chromaGain = mix(mix(1.18, 0.0, extra), mix(0.92, 0.0, darkExtra), darkMix);
+          lift = mix(mix(0.16, 0.0, extra), mix(0.30, 0.0, darkExtra), darkMix);
+          chromaGain = mix(mix(0.85, 0.0, extra), mix(0.92, 0.0, darkExtra), darkMix);
           contourStr = mix(0.43, 0.88, darkMix);
           contourDirAmt = mix(0.77, 1.0, darkMix);
           bevelShadowStr = 0.036;
@@ -1431,9 +1439,9 @@
       } else if (is_dark) {
         float darkDens = (col.a > 0.41) ? col.a : 0.30;
         float extra = clamp((darkDens - 0.30) / (1.0 - 0.30), 0.0, 1.0);
-        emission = mix(vec3(42.0 / 255.0, 42.0 / 255.0, 42.0 / 255.0), vec3(34.0 / 255.0, 34.0 / 255.0, 34.0 / 255.0), extra);
+        emission = mix(vec3(48.0 / 255.0, 48.0 / 255.0, 48.0 / 255.0), vec3(22.0 / 255.0, 22.0 / 255.0, 22.0 / 255.0), extra);
         transmittance = mix(0.54, 0.0, extra);
-        lift = mix(0.36, 0.0, extra);
+        lift = mix(0.30, 0.0, extra);
         chromaGain = mix(0.92, 0.0, extra);
         contourStr = 0.88; contourDirAmt = 1.0; bevelShadowStr = 0.036;
         glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;
@@ -1443,7 +1451,7 @@
         emission = vec3(253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0) * lightDens;
         transmittance = mix(0.70, 0.0, extra);
         lift = mix(0.16, 0.0, extra);
-        chromaGain = mix(1.18, 0.0, extra);
+        chromaGain = mix(0.85, 0.0, extra);
         contourStr = 0.43; contourDirAmt = 0.77; bevelShadowStr = 0.036;
         glintLum = 1.6; glintFaceGain = 0.0; glintVib = 2.85;
       }
@@ -1460,41 +1468,39 @@
         glintVib = mix(1.5, glintVib, regMix);
       }
       if (fogT > 0.001) {
-        float r1 = fogT * 2.6;
-        float r2 = fogT * 3.6;
+        float r1 = fogT * 1.1;
+        float r2 = fogT * 1.6;
         vec2 fc = sampleBase + disp;
         vec3 fBlur = (refractColor * 2.0
           + (backdrop(fc + vec2(r1, 0.0)) + backdrop(fc - vec2(r1, 0.0))
            + backdrop(fc + vec2(0.0, r1)) + backdrop(fc - vec2(0.0, r1))) * 1.5
           + (backdrop(fc + vec2(r2, r2)) + backdrop(fc + vec2(-r2, r2))
            + backdrop(fc + vec2(r2, -r2)) + backdrop(fc + vec2(-r2, -r2)))) * (1.0 / 12.0);
-        refractColor = mix(refractColor, fBlur, fogT);
+        refractColor = mix(refractColor, fBlur, fogT * 0.45);
       }
       float Y = luma(refractColor);
       float transLum = clamp(Y * (1.0 + lift * (1.0 - Y)), 0.0, 1.0);
-      vec3 chromaVec = (refractColor - vec3(Y)) * (chromaGain * v_p.z);
+      float regChromaAtten = mix(1.0, 1.0 - clamp(luma(emission), 0.0, 0.85), regMix);
+      vec3 chromaVec = (refractColor - vec3(Y)) * (chromaGain * v_p.z * regChromaAtten);
       float baseLum = clamp(transLum * transmittance, 0.0, 1.0);
       vec3 transmittedColor = vec3(baseLum) + chromaVec;
       vec3 rawBase = emission + vec3(baseLum) + chromaVec;
       float maxC = max(rawBase.r, max(rawBase.g, rawBase.b));
       vec3 baseColor = rawBase;
       if (maxC > 1.0) {
-        float lumR = clamp(luma(emission) + baseLum, 0.0, 1.0);
+        float lumR = clamp(luma(emission) + baseLum, 0.0, 0.999);
         float s = clamp((1.0 - lumR) / max(maxC - lumR, 0.0001), 0.0, 1.0);
         baseColor = clamp(vec3(lumR) + (rawBase - vec3(lumR)) * s, 0.0, 1.0);
       } else {
         baseColor = clamp(rawBase, 0.0, 1.0);
       }
-      if (is_dark && regMix > 0.001) {
-        float sl = luma(baseColor);
-        baseColor *= 1.0 - 0.28 * regMix * sl * sl;
-      }
+
       // Honor explicit chromatic tints (non-neutral) if a caller requests colored liquid glass
       float colChroma = max(max(col.r, col.g), col.b) - min(min(col.r, col.g), col.b);
       if (colChroma > 0.08 && col.a > 0.001) {
         float tintW = col.a <= 0.45
           ? col.a * 0.5
-          : mix(0.225, 0.86, clamp((col.a - 0.45) / 0.45, 0.0, 1.0));
+          : mix(0.225, 1.0, smoothstep(0.45, 0.80, col.a));
         baseColor = mix(baseColor, col.rgb, tintW);
       }
       float spot = 0.0;
@@ -1542,27 +1548,28 @@
         vec3 glintTarget = vec3(glintLum) + result * glintFaceGain + (result - vec3(resLum)) * glintVib;
         result = clamp(mix(result, glintTarget, glint), 0.0, 1.0);
       }
-      float regHairline = (1.0 - smoothstep(0.25, 0.70, inward)) * step(0.01, materialAlpha) * regMix;
+      float regHw = min(0.50, 1.15 / max(u_scale, 1.0));
+      float regHairline = (1.0 - smoothstep(regHw * 0.35, regHw, inward)) * materialAlpha * regMix;
       float regAcross = pow(max(1.0 - rn.y * rn.y, 0.0), 1.75);
-      float regShadeMask = is_dark ? regAcross : mix(0.20, 1.0, regAcross);
+      float regShadeMask = regAcross;
       if (regMix > 0.001 && v_c2.x > 0.01 && inward < 12.0) {
         float along = is_dark ? rn.y : -rn.y;
         float lit = max(along, 0.0);
         float opp = max(-along, 0.0);
         float lit2 = lit * lit;
         float opp2 = opp * opp;
-        float regLobe = (is_dark ? 0.95 : 1.0) * (lit2 * lit2) + (is_dark ? 0.95 : 0.85) * (opp2 * opp2) + 0.06;
-        float regInset = max(0.0, inward - 0.55);
-        float regCore = exp(-regInset / 0.50);
+        float regLobe = (is_dark ? 0.95 : 1.0) * (lit2 * lit2) + (is_dark ? 0.95 : 0.85) * (opp2 * opp2) + 0.08;
+        float regInset = max(0.0, inward - 0.10);
+        float regCore = exp(-regInset / 0.80);
         float regTail = exp(-regInset / 2.67);
         float regEase = pow(max(1.0 - luma(result), 0.0), 0.3);
         float regRimGain = (is_dark ? 1.15 : 1.0) * clamp(v_c2.x / 0.6, 0.0, 1.5);
         float regRim = (regRimGain * regLobe * regEase * (0.185 * regCore + 0.035 * regTail) * (1.0 - regHairline * regShadeMask) + spot * 0.10 * regCore) * regMix;
-        result = clamp(result + vec3(regRim), 0.0, 1.0);
+        result = mix(result, vec3(1.0), clamp(regRim, 0.0, 1.0));
       }
       if (regHairline > 0.001) {
-        float regShade = (is_dark ? 0.24 : 0.22) * regShadeMask;
-        result = max(result - vec3(regShade * regHairline), vec3(0.0));
+        float regShade = (is_dark ? 0.10 : 0.07) * regShadeMask;
+        result *= (1.0 - regShade * regHairline);
       }
       if (is_drop) {
         float pressAmt = clamp(v_c2.x, 0.0, 1.0);
@@ -1591,16 +1598,14 @@
           float bodyLuma = clamp(luma(result), 0.0, 1.0);
           float ease = pow(max(1.0 - bodyLuma, 0.0), 0.30);
           float rimLight = pressAmt * 1.32 * lobe * ease * (0.175 * core + 0.055 * tail) * (1.0 - dropHairline);
-          result = clamp(result + vec3(rimLight), 0.0, 1.0);
+          result = mix(result, vec3(1.0), clamp(rimLight, 0.0, 1.0));
         }
-        float prismBand = smoothstep(0.65, 1.45, inward) * (1.0 - smoothstep(2.2, 4.2, inward)) * (1.0 - dropHairline) * isPlatter * pressAmt;
+        float prismBand = smoothstep(0.55, 1.05, inward) * (1.0 - smoothstep(1.30, 2.00, inward)) * (1.0 - dropHairline) * isPlatter * pressAmt;
         if (prismBand > 0.001) {
           float prismPhase = surfaceNormal.x * 0.65 - surfaceNormal.y * 0.75;
-          float coolW = smoothstep(-0.15, 0.85, prismPhase);
-          float warmW = smoothstep(-0.15, 0.85, -prismPhase);
-          vec3 prismGoal = mix(result, vec3(0.76, 0.90, 1.0), coolW * 0.22);
-          prismGoal = mix(prismGoal, vec3(1.0, 0.86, 0.78), warmW * 0.16);
-          result = mix(result, prismGoal, prismBand);
+          vec3 sp = 0.5 + 0.5 * cos(6.2831853 * (prismPhase * 1.2 + vec3(0.0, 0.3333, 0.6667)));
+          float spY = luma(sp);
+          result = clamp(result + (sp - vec3(spY)) * (0.045 * prismBand), 0.0, 1.0);
         }
         if (dropHairline > 0.001) {
           vec2 ld = vec2(0.0, 1.0);
