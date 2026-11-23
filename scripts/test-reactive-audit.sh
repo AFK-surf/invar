@@ -82,7 +82,10 @@ else:
         exp_code, exp_substr = mode, ""
     assert rc != 0, f"{label}: expected non-zero exit code for {exp_code}"
     assert data.get("ok") is False, f"{label}: expected ok=False"
-    assert ra.get("ran") is True, f"{label}: expected reactive_audit.ran=True, got {ra}"
+    if exp_code == "INVAR_E007_REACTIVE_AUDIT_SKIPPED":
+        assert ra.get("ran") is False, f"{label}: expected reactive_audit.ran=False, got {ra}"
+    else:
+        assert ra.get("ran") is True, f"{label}: expected reactive_audit.ran=True, got {ra}"
     matching = [d for d in diags if d.get("code") == exp_code and d.get("severity") == "error"]
     assert len(matching) >= 1, f"{label}: expected {exp_code}, got codes={codes}, diags={diags}"
     if exp_substr:
@@ -272,5 +275,22 @@ exit 1
 SH
 chmod +x "$FAKE_PIONC"
 PIONC="$FAKE_PIONC" run_case "degrade_legacy_pionc" "$PKG_E007_DIRECT" "degraded"
+
+# 7c. --require-reactive fails when reactive audit is skipped (--no-reactive or legacy pionc)
+run_case "require_reactive_no_reactive" "$PKG_E007_DIRECT" "INVAR_E007_REACTIVE_AUDIT_SKIPPED" --no-reactive --require-reactive
+PIONC="$FAKE_PIONC" run_case "require_reactive_legacy_pionc" "$PKG_E007_DIRECT" "INVAR_E007_REACTIVE_AUDIT_SKIPPED" --require-reactive
+
+# 8. Negative E009: effect reading ReadSignal A and writing distinct Signal B must pass clean
+PKG_E009_CROSS="$(make_pkg "neg_e009_cross_signal" '
+import "signals"
+
+pub fn cross_signal_effect(src : signals::ReadSignal[Int]) -> () -> Unit {
+  let dst = signals::signal(0)
+  signals::effect(fn() -> Unit {
+    dst.set(src.get() + 1)
+  })
+}
+')"
+run_case "neg_e009_cross_signal" "$PKG_E009_CROSS" "clean"
 
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="

@@ -25,19 +25,67 @@ import zlib
 
 INVAR_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
-DEFAULT_CHECK_PKGS = [
-    "headless_core", "hostapi", "host", "host_web", "film", "view", "damage", "headless",
-    "ui", "kit", "icons", "lg", "lg_pages", "lg_shots", "lg_web", "bench", "site",
-    "editor", "nav", "code_field", "terminal", "media", "figure",
-    "webpage", "updater", "player", "textdiff", "runfs", "examples/worker_app",
-]
+WASM32_ONLY_PKGS = {"host_web", "lg_web"}
+GPU_DISPLAY_TEST_PKGS = {"host", "film"}
 
-DEFAULT_TEST_PKGS = [
-    "headless_core", "layer0_check", "layer1a_check", "layer1b_check", "view", "damage",
-    "headless", "hostapi", "ui", "kit", "icons", "lg", "bench", "site",
-    "editor", "nav", "code_field", "terminal", "media", "figure",
-    "webpage", "updater", "player", "textdiff", "runfs", "examples/worker_app",
-]
+
+def _pkg_has_tests(pkg_dir):
+    src_dir = os.path.join(pkg_dir, "src")
+    scan_root = src_dir if os.path.isdir(src_dir) else pkg_dir
+    for _r_d, _ds, fs in os.walk(scan_root):
+        for fn in fs:
+            if fn.endswith("_test.pion"):
+                return True
+    return False
+
+
+def discover_workspace_pkgs(mode):
+    """Discover packages from packages/*/pion.toml and examples/*/pion.toml."""
+    discovered = []
+    for base, prefix in (("packages", ""), ("examples", "examples/")):
+        base_dir = os.path.join(INVAR_ROOT, base)
+        if not os.path.isdir(base_dir):
+            continue
+        for name in sorted(os.listdir(base_dir)):
+            pdir = os.path.join(base_dir, name)
+            if os.path.isfile(os.path.join(pdir, "pion.toml")):
+                spec = f"{prefix}{name}"
+                discovered.append((spec, name, pdir))
+
+    sys_os = platform.system().lower()
+    pkgs = []
+    skipped = []
+    for spec, name, pdir in discovered:
+        if name in WASM32_ONLY_PKGS:
+            skipped.append({
+                "pkg": spec,
+                "reason": "wasm32-only package (verified via `invar web check`)",
+            })
+            continue
+        if mode == "check":
+            pkgs.append(spec)
+        elif mode == "test":
+            if not _pkg_has_tests(pdir):
+                continue
+            if name in GPU_DISPLAY_TEST_PKGS:
+                if sys_os == "linux" and not (
+                    os.environ.get("DISPLAY")
+                    or os.environ.get("WAYLAND_DISPLAY")
+                    or os.environ.get("LIBGL_ALWAYS_SOFTWARE")
+                ):
+                    skipped.append({
+                        "pkg": spec,
+                        "reason": "requires GPU/display or llvmpipe on Linux (run via `scripts/check-linux-host.sh`)",
+                    })
+                    continue
+                if sys_os not in ("darwin", "linux"):
+                    skipped.append({
+                        "pkg": spec,
+                        "reason": f"requires native GPU/display environment on {sys_os}",
+                    })
+                    continue
+            pkgs.append(spec)
+    return pkgs, skipped
 
 WEB_RUNTIME_FILES = [
     "host.js",
@@ -613,7 +661,10 @@ def cmd_check(args):
         emit_json(err) if args.json else print(err["error"], file=sys.stderr)
         return 1
     env = build_pion_env(pionc)
-    pkgs = args.pkg if args.pkg else default_pkg_list(DEFAULT_CHECK_PKGS)
+    if args.pkg:
+        pkgs, skipped = list(args.pkg), []
+    else:
+        pkgs, skipped = discover_workspace_pkgs("check")
     t_all = time.monotonic()
     results = []
     all_ok = True
@@ -669,6 +720,7 @@ def cmd_check(args):
         "elapsed_ms": total_ms,
         "fmt_checked": do_fmt,
         "packages": results,
+        "skipped": skipped,
     }
     if args.json:
         emit_json(res)
@@ -678,7 +730,9 @@ def cmd_check(args):
             print(f"[{status}] {r['pkg']} ({r['elapsed_ms']} ms)")
             if r["error"]:
                 print("  " + r["error"].replace("\n", "\n  "))
-        print(f"invar check: {'OK' if all_ok else 'FAILED'} ({len(results)} packages, {total_ms} ms)")
+        for sk in skipped:
+            print(f"[SKIP] {sk['pkg']} ({sk['reason']})")
+        print(f"invar check: {'OK' if all_ok else 'FAILED'} ({len(results)} packages, {len(skipped)} skipped, {total_ms} ms)")
     return 0 if all_ok else 1
 
 
@@ -693,7 +747,10 @@ def cmd_test(args):
         emit_json(err) if args.json else print(err["error"], file=sys.stderr)
         return 1
     env = build_pion_env(pionc)
-    pkgs = args.pkg if args.pkg else default_pkg_list(DEFAULT_TEST_PKGS)
+    if args.pkg:
+        pkgs, skipped = list(args.pkg), []
+    else:
+        pkgs, skipped = discover_workspace_pkgs("test")
     t_all = time.monotonic()
     results = []
     total_passed = 0
@@ -733,6 +790,7 @@ def cmd_test(args):
         "total_passed": total_passed,
         "total_failed": total_failed,
         "packages": results,
+        "skipped": skipped,
     }
     if args.json:
         emit_json(res)
@@ -742,7 +800,9 @@ def cmd_test(args):
             print(f"[{status}] {r['pkg']}: {r['passed']} passed, {r['failed']} failed ({r['elapsed_ms']} ms)")
             if r["error"]:
                 print(r["error"])
-        print(f"invar test: {'OK' if all_ok else 'FAILED'} ({total_passed} passed, {total_failed} failed, {total_ms} ms)")
+        for sk in skipped:
+            print(f"[SKIP] {sk['pkg']} ({sk['reason']})")
+        print(f"invar test: {'OK' if all_ok else 'FAILED'} ({total_passed} passed, {total_failed} failed, {len(skipped)} skipped, {total_ms} ms)")
     return 0 if all_ok else 1
 
 
@@ -784,6 +844,21 @@ REACTIVE_SIGNAL_READS = {
     "signals::KeyedList::keys",
 }
 
+# Read methods on writable signal handles (used by E009 so reading ReadSignal/Computed A
+# while writing a separate Signal B does not trigger a false positive).
+REACTIVE_READONLY_SIGNAL_READS = {
+    "signals::ReadSignal::get",
+    "signals::Computed::get",
+}
+REACTIVE_WRITABLE_SIGNAL_READS = {
+    "signals::Signal::get",
+    "signals::DerivedSignal::get",
+    "signals::Optimistic::get",
+    "signals::Keyed::has",
+    "signals::KeyedList::get",
+    "signals::KeyedList::keys",
+}
+
 REACTIVE_EFFECT_CALLEES = {
     "signals::effect",
     "signals::effect_at",
@@ -801,6 +876,8 @@ REACTIVE_GETTER_CALLEES = {
     "signals::computed_scoped",
     "signals::computed_scoped_by",
     "signals::computed_following",
+    "signals::memo",
+    "signals::memo_by",
     "signals::derived_signal",
     "signals::derived_signal_ref",
     "signals::derived_signal_by",
@@ -816,7 +893,7 @@ REACTIVE_GETTER_CALLEES = {
     "view::View::each_of",
 }
 
-REACTIVE_GETTER_ARGS = {"0", "getter", "authority", "f", "when", "keys", "cond", "by"}
+REACTIVE_GETTER_ARGS = {"0", "getter", "authority", "f", "when", "keys", "cond", "by", "input"}
 
 # Engine-internal call nodes that the E007 BFS does not expand. Empty: a reactive read that reaches
 # view::View::laid_size or ui::add_image is reported like any other write; do that work in View::reacts instead.
@@ -907,6 +984,8 @@ def _is_reactive_read_closure(cl):
     cc = cl.get("context_callee", "")
     ca = cl.get("context_arg", "")
     if cc in REACTIVE_GETTER_CALLEES and ca in REACTIVE_GETTER_ARGS:
+        return True
+    if cc in ("view::View::reacts", "view::View::reacts_by") and ca in ("0", "read"):
         return True
     if cc == "ui::Show" and ca in ("when", "0"):
         return True
@@ -1169,7 +1248,8 @@ def _run_reactive_audit(target_dir, no_reactive, add_diag):
                     rchain = _bfs_find_call_chain(
                         cl.get("calls", []),
                         fn_calls,
-                        lambda tgt: tgt in REACTIVE_SIGNAL_READS,
+                        lambda tgt: tgt in REACTIVE_WRITABLE_SIGNAL_READS,
+                        opaque_nodes=REACTIVE_READONLY_SIGNAL_READS,
                     )
                     wchain = _bfs_find_call_chain(
                         cl.get("calls", []),
@@ -1192,6 +1272,166 @@ def _run_reactive_audit(target_dir, no_reactive, add_diag):
         "ran": True,
         "closures_checked": closures_checked,
         "fns_checked": len(fn_calls),
+    }
+
+
+def _unescape_c_str(raw):
+    out = []
+    i = 0
+    n = len(raw)
+    esc_map = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
+    while i < n:
+        ch = raw[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = raw[i + 1]
+            out.append(esc_map.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _extract_c_string_concat(text, start_pos, macros=None):
+    """Parse concatenated C string literals (and macro identifiers in `macros`) until `;`."""
+    macros = macros or {}
+    parts = []
+    i = start_pos
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\r\n\\":
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i + 2)
+            i = n if nl == -1 else nl + 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end_c = text.find("*/", i + 2)
+            i = n if end_c == -1 else end_c + 2
+            continue
+        if ch == ";":
+            break
+        if ch == '"':
+            i += 1
+            buf = []
+            while i < n:
+                c2 = text[i]
+                if c2 == "\\" and i + 1 < n:
+                    buf.append(c2)
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c2 == '"':
+                    i += 1
+                    break
+                buf.append(c2)
+                i += 1
+            parts.append(_unescape_c_str("".join(buf)))
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            ident = text[i:j]
+            if ident in macros:
+                parts.append(macros[ident])
+            i = j
+            continue
+        i += 1
+    return "".join(parts)
+
+
+def _win_shader_fnv(data_bytes, h=1469598103934665603):
+    for b in data_bytes:
+        h ^= b
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def _check_win_baked_shaders():
+    win_render_path = os.path.join(INVAR_ROOT, "packages", "host", "native", "win_render.cpp")
+    corner_sl_path = os.path.join(INVAR_ROOT, "packages", "host", "native", "corner_sl.h")
+    baked_h_path = os.path.join(INVAR_ROOT, "packages", "host", "native", "win_shaders_baked.h")
+
+    if not os.path.isfile(baked_h_path):
+        return {
+            "baked_file_exists": False,
+            "baked_keys_matched": 0,
+            "baked_keys_expected": [],
+            "baked_keys_missing": [],
+            "error": "missing win_shaders_baked.h",
+        }
+    if not os.path.isfile(win_render_path) or not os.path.isfile(corner_sl_path):
+        return {
+            "baked_file_exists": True,
+            "baked_keys_matched": 0,
+            "baked_keys_expected": [],
+            "baked_keys_missing": [],
+            "error": "missing win_render.cpp or corner_sl.h",
+        }
+
+    # Parse MB_CORNER_SL macro from corner_sl.h
+    corner_lines = open(corner_sl_path, "r", encoding="utf-8", errors="replace").read().splitlines()
+    macro_body_lines = []
+    in_macro = False
+    for line in corner_lines:
+        if not in_macro:
+            if line.startswith("#define MB_CORNER_SL"):
+                in_macro = True
+                rest = line[len("#define MB_CORNER_SL"):]
+                macro_body_lines.append(rest.rstrip("\\"))
+                if not line.rstrip().endswith("\\"):
+                    break
+        else:
+            macro_body_lines.append(line.rstrip("\\"))
+            if not line.rstrip().endswith("\\"):
+                break
+    mb_corner_sl = _extract_c_string_concat("\n".join(macro_body_lines) + ";", 0)
+
+    # Parse shader_src from win_render.cpp
+    win_src = open(win_render_path, "r", encoding="utf-8", errors="replace").read()
+    m_src = re.search(r"static\s+const\s+char\s*\*\s*shader_src\s*=", win_src)
+    if not m_src:
+        return {
+            "baked_file_exists": True,
+            "baked_keys_matched": 0,
+            "baked_keys_expected": [],
+            "baked_keys_missing": [],
+            "error": "could not locate shader_src in win_render.cpp",
+        }
+    shader_src_str = _extract_c_string_concat(win_src, m_src.end(), macros={"MB_CORNER_SL": mb_corner_sl})
+    shader_src_bytes = shader_src_str.encode("utf-8")
+
+    # Read baked keys from win_shaders_baked.h
+    baked_text = open(baked_h_path, "r", encoding="utf-8", errors="replace").read()
+    baked_keys = {int(hx, 16) for hx in re.findall(r"\{0x([0-9a-fA-F]+)ULL\b", baked_text)}
+
+    # Cold-start shaders: D3D_COMPILER_VERSION=47, D3DCOMPILE_OPTIMIZATION_LEVEL3=32768
+    made_by = struct.pack("<II", 47, 32768)
+    base_h = _win_shader_fnv(shader_src_bytes, 1469598103934665603)
+    expected = []
+    missing = []
+    matched = 0
+    for entry, target in (("vmain", "vs_4_0"), ("fmain", "ps_4_0"), ("fflat", "ps_4_0")):
+        h = _win_shader_fnv(entry.encode("utf-8") + b"\x00", base_h)
+        h = _win_shader_fnv(target.encode("utf-8") + b"\x00", h)
+        h = _win_shader_fnv(made_by, h)
+        key_hex = f"0x{h:016x}"
+        hit = h in baked_keys
+        if hit:
+            matched += 1
+        else:
+            missing.append(f"{entry}/{target} ({key_hex})")
+        expected.append({"entry": entry, "target": target, "key": key_hex, "matched": hit})
+
+    return {
+        "baked_file_exists": True,
+        "baked_keys_matched": matched,
+        "baked_keys_expected": expected,
+        "baked_keys_missing": missing,
+        "baked_total_in_header": len(baked_keys),
     }
 
 
@@ -1327,6 +1567,26 @@ def cmd_audit(args):
             "Missing baked Windows shaders header win_shaders_baked.h",
             "Rebake shaders with packages/host/tools/bake_win_shaders.c.",
         )
+    elif not is_external_app:
+        win_baked = _check_win_baked_shaders()
+        if win_baked.get("error"):
+            add_diag(
+                "INVAR_W002_WIN_BAKED_STALE",
+                "warning",
+                "packages/host/native/win_shaders_baked.h",
+                1,
+                f"Could not verify Windows baked shader keys: {win_baked['error']}",
+                "Check packages/host/native/win_render.cpp and corner_sl.h.",
+            )
+        elif win_baked["baked_keys_matched"] < len(win_baked["baked_keys_expected"]):
+            add_diag(
+                "INVAR_W002_WIN_BAKED_STALE",
+                "warning",
+                "packages/host/native/win_shaders_baked.h",
+                1,
+                f"Windows baked shaders stale ({win_baked['baked_keys_matched']}/{len(win_baked['baked_keys_expected'])} cold-start keys matched); missing: {', '.join(win_baked['baked_keys_missing'])}",
+                "Rebake win_shaders_baked.h on Windows with packages/host/tools/bake_win_shaders.c.",
+            )
 
     # E003: JS syntax check via node --check
     node = shutil.which("node")
@@ -1489,9 +1749,9 @@ def cmd_audit(args):
                                     "Move IO to `ui::Worker` and remove `World` from view files.",
                                 )
                     if fn.endswith("_test.pion"):
-                        if "assert_no_nested_glass" in txt:
+                        if "assert_no_nested_glass" in txt or "assert_apple_ui" in txt:
                             has_glass_audit = True
-                        if "scroll_faults" in txt or "assert_scrollable" in txt:
+                        if "scroll_faults" in txt or "assert_scrollable" in txt or "assert_apple_ui" in txt:
                             has_scroll_audit = True
         if not has_glass_audit:
             add_diag(
@@ -1518,6 +1778,15 @@ def cmd_audit(args):
         bool(getattr(args, "no_reactive", False)),
         add_diag,
     )
+    if bool(getattr(args, "require_reactive", False)) and not reactive_report.get("ran"):
+        add_diag(
+            "INVAR_E007_REACTIVE_AUDIT_SKIPPED",
+            "error",
+            args.target_dir or ".",
+            1,
+            f"Typed reactive audit did not run (required by --require-reactive): {reactive_report.get('reason', 'unavailable')}",
+            "Ensure pionc supports `query analyze`, omit `--no-reactive`, and fix any analyze errors.",
+        )
 
     err_cnt = sum(1 for d in diags if d["severity"] == "error")
     warn_cnt = sum(1 for d in diags if d["severity"] == "warning")
@@ -1578,7 +1847,21 @@ def cmd_new(args):
         return 1
 
     invar_path = os.path.realpath(args.invar) if args.invar else INVAR_ROOT
-    pkgs_path = os.path.join(invar_path, "packages")
+    pkgs_abs = os.path.join(invar_path, "packages")
+    use_rel = bool(getattr(args, "relative", False))
+    if not use_rel:
+        try:
+            if os.path.commonpath([os.path.realpath(out_dir), invar_path]) == invar_path:
+                use_rel = True
+        except ValueError:
+            use_rel = False
+    if use_rel:
+        try:
+            pkgs_path = os.path.relpath(pkgs_abs, out_dir).replace(os.sep, "/")
+        except ValueError:
+            pkgs_path = pkgs_abs
+    else:
+        pkgs_path = pkgs_abs
     tpl = args.template
 
     files = {}
@@ -1624,18 +1907,18 @@ pub fn build_view(root : view::View, worker : ui::Worker[Cmd, Ev]) -> Unit {
     title="Invar App"
     subtitle_by=>{ status.get() }
     trailing={fn(tr : view::View) -> Unit {
-      <lg::BarPillGroup in={tr} label="Toolbar">
-        <lg::Button flat ghost height={30.0} pad_x={10.5} label="Refresh" on_press=>{ let _ = worker.send(Cmd::Refresh) }>
+      <lg::BarPillGroup in={tr} height={36.0} label="Toolbar">
+        <lg::Button flat ghost height={36.0} pad_x={10.5} label="Refresh" on_press=>{ let _ = worker.send(Cmd::Refresh) }>
           <lg::Icon kind={.Refresh} size={15.0} />
         </lg::Button>
-        <lg::Button flat ghost height={30.0} pad_x={10.5} label="Settings" on_press=>{ () }>
+        <lg::Button flat ghost height={36.0} pad_x={10.5} label="Settings" on_press=>{ () }>
           <lg::Icon kind={.Settings} size={15.0} />
         </lg::Button>
       </lg::BarPillGroup>
     }}
   >
     <ui::Col pad={16.0} gap={12.0}>
-      <lg::SurfaceCard pad={16.0} gap={10.0} label="Status">
+      <lg::SurfaceCard radius={28.0} pad={12.0} gap={10.0} label="Status">
         <ui::Row gap={8.0} align={.Middle}>
           <lg::Icon kind={.Sparkles} size={16.0} color_by=>{ lg::surface().accent } />
           <ui::Text text="Apple Two-Layer Surface" size={15.0} weight={600} color_by=>{ lg::surface().ink } />
@@ -2345,9 +2628,26 @@ def cmd_host_check(args):
             ok = rc == 0
             checks.append({"platform": "linux", "ok": ok, "elapsed_ms": ms, "error": "" if ok else (out + err).strip()[-800:]})
         elif t == "windows":
-            baked = os.path.isfile(os.path.join(INVAR_ROOT, "packages", "host", "native", "win_shaders_baked.h"))
-            ok = baked
-            checks.append({"platform": "windows", "ok": ok, "elapsed_ms": 0, "error": "" if ok else "missing win_shaders_baked.h"})
+            win_baked = _check_win_baked_shaders()
+            ok = bool(win_baked.get("baked_file_exists"))
+            matched = win_baked.get("baked_keys_matched", 0)
+            expected = win_baked.get("baked_keys_expected", [])
+            entry = {
+                "platform": "windows",
+                "ok": ok,
+                "elapsed_ms": 0,
+                "baked_keys_matched": matched,
+                "baked_keys_expected": expected,
+                "error": "" if ok else "missing win_shaders_baked.h",
+            }
+            if ok and matched < len(expected):
+                entry["warning"] = (
+                    f"win_shaders_baked.h stale ({matched}/{len(expected)} cold-start keys matched); "
+                    f"missing: {', '.join(win_baked.get('baked_keys_missing', []))}"
+                )
+            elif win_baked.get("error") and ok:
+                entry["warning"] = win_baked["error"]
+            checks.append(entry)
         if not checks[-1]["ok"]:
             all_ok = False
 
@@ -2407,6 +2707,7 @@ def build_parser():
     sp.add_argument("--wasm", default="", help="Path to an existing .wasm file to verify imports")
     sp.add_argument("--reactive", action="store_true", help="Enable typed reactive static audit (default: auto when pionc supports query analyze)")
     sp.add_argument("--no-reactive", action="store_true", help="Disable typed reactive static audit")
+    sp.add_argument("--require-reactive", action="store_true", help="Fail with INVAR_E007_REACTIVE_AUDIT_SKIPPED if typed reactive audit cannot run")
     sp.add_argument("target_dir", nargs="?", default="", help="Optional target directory to audit")
     sp.set_defaults(func=cmd_audit)
 
@@ -2415,6 +2716,7 @@ def build_parser():
     sp.add_argument("--template", choices=["jsx-app", "worker-app", "web-app"], default="jsx-app")
     sp.add_argument("--invar", default="", help="Path to Invar repository root")
     sp.add_argument("--name", default="", help="Package name (defaults to directory basename)")
+    sp.add_argument("--relative", action="store_true", help="Use relative paths to Invar packages in pion.toml")
     sp.add_argument("--json", action="store_true", help="Output structured JSON")
     sp.add_argument("dir", help="Target directory for new app")
     sp.set_defaults(func=cmd_new)
@@ -2468,8 +2770,11 @@ def build_parser():
 
 
 def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "bench":
+        return cmd_bench(argparse.Namespace(bench_args=raw_argv[1:]))
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     if not getattr(args, "command", None):
         parser.print_help()
         return 0
