@@ -233,6 +233,43 @@ pub fn A11yTold::new() -> A11yTold {
   A11yTold::{ mirror: A11yMirror::new(), initialized: false }
 }
 
+/// Reversible field escaping for the `\x1f`-delimited, `\n`-terminated a11y wire format.
+/// Escapes `\` -> `\\`, `\n` -> `\n`, `\r` -> `\r`, `\x1f` -> `\u001f`.
+pub fn escape_sem_field(s : String) -> String {
+  let n = s.length()
+  let mut needs = false
+  let mut i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 92 || b == 10 || b == 13 || b == 31 {
+      needs = true
+      break
+    }
+    i += 1
+  }
+  if !needs {
+    return s
+  }
+  let sb = StringBuilder::new()
+  i = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    if b == 92 {
+      sb.write_string("\\\\")
+    } else if b == 10 {
+      sb.write_string("\\n")
+    } else if b == 13 {
+      sb.write_string("\\r")
+    } else if b == 31 {
+      sb.write_string("\\u001f")
+    } else {
+      sb.write_byte(b as Byte)
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
 fn encode_sem_wire(full : Bool, focus : Int, changed : Array[SemNode]) -> String {
   let sb = StringBuilder::new()
   let fflag = if full { "1" } else { "0" }
@@ -245,9 +282,65 @@ fn encode_sem_wire(full : Bool, focus : Int, changed : Array[SemNode]) -> String
       kids_sb.write_string("\{n.kids[i]}")
       i += 1
     }
-    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{n.label}\{a11y_sep}\{n.value}\{a11y_sep}\{n.description}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}\n")
+    let lbl = escape_sem_field(n.label)
+    let val_s = escape_sem_field(n.value)
+    let desc = escape_sem_field(n.description)
+    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{lbl}\{a11y_sep}\{val_s}\{a11y_sep}\{desc}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}\n")
   }
   sb.to_string()
+}
+
+/// Dispatch an incoming accessibility semantic action JSON on `hostapi::a11y_channel`
+/// (`{"id": N, "action"|"op": "press"|"activate"|"inc"|"increment"|"dec"|"decrement"|"focus"|...}`)
+/// directly to the matching node in the active `view_tree()` by node identity (`sn.id.at + 1 == id`).
+pub fn a11y_handle_action(json : String) -> Bool {
+  let obj = match hostapi::json_parse(json) {
+    Some(hostapi::JsonValue::JObject(m)) => m
+    _ => return false
+  }
+  let nid = match obj.get("id") {
+    Some(hostapi::JsonValue::JNumber(v)) => v.to_int()
+    _ => return false
+  }
+  if nid <= 0 {
+    return false
+  }
+  let op = match obj.get("action") {
+    Some(hostapi::JsonValue::JString(s)) => s
+    _ => match obj.get("op") {
+      Some(hostapi::JsonValue::JString(s)) => s
+      _ => return false
+    }
+  }
+  let tree = match view_tree() {
+    Some(t) => t
+    None => return false
+  }
+  let mut target : Option[view::NodeId] = None
+  for sn in tree.said_order() {
+    if sn.id.at + 1 == nid {
+      target = Some(sn.id)
+      break
+    }
+  }
+  let node_id = match target {
+    Some(id) => id
+    None => return false
+  }
+  let now = hostapi::now()
+  if op == "press" || op == "activate" || op == "expand" || op == "collapse" {
+    return tree.activate_at(node_id, now)
+  }
+  if op == "inc" || op == "increment" {
+    return tree.step_at(node_id, 1, now)
+  }
+  if op == "dec" || op == "decrement" {
+    return tree.step_at(node_id, -1, now)
+  }
+  if op == "focus" {
+    return tree.focus_to(Some(node_id), visible=true)
+  }
+  false
 }
 
 /// Compute and send incremental a11y update for `tree` against `told`.

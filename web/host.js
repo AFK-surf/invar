@@ -5736,8 +5736,7 @@
       if ((e.defaultPrevented && !keptEsc) || e.target === ta || imeActive || e.isComposing || e.keyCode === 229) return;
       if (e.target?.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName)) return;
       if (!catching && e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey && e.key === 'ArrowLeft') {
-        goBack(e);
-        return;
+        if (goBack(e)) return;
       }
       const mods = modsOf(e);
       const code = keymap[e.key];
@@ -5937,7 +5936,12 @@
   let back = null, backOn = false;
   H.setBack = (b) => { back = b; };
   H.backEnabled = (on) => { backOn = on; };
-  const goBack = (e) => { if (back && backOn) { e.preventDefault(); back(2, 0, 1, 0); } };
+  const goBack = (e) => {
+    if (!back || !backOn) return false;
+    e.preventDefault();
+    back(2, 0, 1, 0);
+    return true;
+  };
 
   // A context lost (the GPU's process gone; a phone's browser takes it from a page sent behind): without
   // preventDefault the browser never gives it back, and paints the canvas white with its broken-canvas mark, over the
@@ -6026,9 +6030,17 @@
           } catch (_) {}
           return vt;
         })
-        .catch(() => null);
+        .then((loaded) => {
+          if (!loaded) vtAsked = null;
+          return loaded;
+        })
+        .catch(() => {
+          vtAsked = null;
+          return null;
+        });
       return vtAsked;
     } catch (_) {
+      vtAsked = null;
       return Promise.resolve(null);
     }
   }
@@ -6057,31 +6069,28 @@
     return m;
   }
 
-  H.termOpen = (cols, rows) => {
-    if (!vt) {
-      ensureVt();
-      return 0;
-    }
+  function initVtTermObj(cols, rows) {
+    if (!vt) return null;
     const c = cols > 0 ? cols : 1;
     const r = rows > 0 ? rows : 1;
-    if (vt.ghostty_terminal_new(0, vtScratch, c, r) !== 0) return 0;
+    if (vt.ghostty_terminal_new(0, vtScratch, c, r) !== 0) return null;
     const term = new DataView(vt.memory.buffer).getUint32(vtScratch, true);
     if (vt.ghostty_render_state_new(0, vtScratch) !== 0) {
       vt.ghostty_terminal_free(term);
-      return 0;
+      return null;
     }
     const render = new DataView(vt.memory.buffer).getUint32(vtScratch, true);
     if (vt.ghostty_render_state_row_iterator_new(0, vtScratch) !== 0) {
       vt.ghostty_render_state_free(render);
       vt.ghostty_terminal_free(term);
-      return 0;
+      return null;
     }
     const rowIt = new DataView(vt.memory.buffer).getUint32(vtScratch, true);
     if (vt.ghostty_render_state_row_cells_new(0, vtScratch) !== 0) {
       vt.ghostty_render_state_row_iterator_free(rowIt);
       vt.ghostty_render_state_free(render);
       vt.ghostty_terminal_free(term);
-      return 0;
+      return null;
     }
     const cells = new DataView(vt.memory.buffer).getUint32(vtScratch, true);
     new DataView(vt.memory.buffer).setUint32(vtScratch, 16 * 1024 * 1024, true);
@@ -6095,19 +6104,10 @@
     if (vt.ghostty_mouse_event_new(0, vtScratch) === 0) {
       mouseEv = new DataView(vt.memory.buffer).getUint32(vtScratch, true);
     }
-    const id = nextTermId++;
-    terms.set(id, {
-      term, render, rowIt, cells, mouse, mouseEv,
-      dragActive: false, dragX0: 0, dragY0: 0, dragScreenX0: 0, dragScreenY0: 0,
-      mouseSynced: false, mouseButtons: 0,
-      buf: new Uint8Array(8192),
-    });
-    return id;
-  };
+    return { term, render, rowIt, cells, mouse, mouseEv };
+  }
 
-  H.termWrite = (id, data) => {
-    const t = terms.get(id);
-    if (!t || !vt || !data || !data.length) return;
+  function vtWriteNow(t, data) {
     const n = data.length;
     if (n <= 2816) {
       new Uint8Array(vt.memory.buffer).set(data, vtScratch + 1280);
@@ -6120,23 +6120,98 @@
       vt.ghostty_free(0, p, n);
     }
     t.mouseSynced = false;
+  }
+
+  H.termOpen = (cols, rows) => {
+    const c = cols > 0 ? cols : 1;
+    const r = rows > 0 ? rows : 1;
+    if (!vt) {
+      const id = nextTermId++;
+      const entry = {
+        term: 0, render: 0, rowIt: 0, cells: 0, mouse: 0, mouseEv: 0,
+        pending: true, closed: false, cols: c, rows: r, pendingOps: [],
+        dragActive: false, dragX0: 0, dragY0: 0, dragScreenX0: 0, dragScreenY0: 0,
+        mouseSynced: false, mouseButtons: 0,
+        buf: new Uint8Array(8192),
+      };
+      terms.set(id, entry);
+      ensureVt().then((loaded) => {
+        const cur = terms.get(id);
+        if (!cur || !cur.pending) return;
+        const objs = loaded ? initVtTermObj(cur.cols, cur.rows) : null;
+        if (!objs) {
+          cur.pending = false;
+          cur.closed = true;
+          cur.pendingOps.length = 0;
+          H.requestFrame();
+          return;
+        }
+        Object.assign(cur, objs);
+        cur.pending = false;
+        const ops = cur.pendingOps;
+        cur.pendingOps = [];
+        for (let i = 0; i < ops.length; i++) {
+          const op = ops[i];
+          if (op.op === 'write') vtWriteNow(cur, op.data);
+          else if (op.op === 'resize') {
+            vt.ghostty_terminal_resize(cur.term, op.cols, op.rows, op.cw, op.ch);
+            cur.mouseSynced = false;
+          }
+        }
+        H.requestFrame();
+      });
+      return id;
+    }
+    const objs = initVtTermObj(c, r);
+    if (!objs) return 0;
+    const id = nextTermId++;
+    terms.set(id, {
+      ...objs,
+      pending: false, closed: false, cols: c, rows: r, pendingOps: [],
+      dragActive: false, dragX0: 0, dragY0: 0, dragScreenX0: 0, dragScreenY0: 0,
+      mouseSynced: false, mouseButtons: 0,
+      buf: new Uint8Array(8192),
+    });
+    return id;
+  };
+
+  H.termWrite = (id, data) => {
+    const t = terms.get(id);
+    if (!t || t.closed || !data || !data.length) return;
+    if (t.pending) {
+      t.pendingOps.push({ op: 'write', data: new Uint8Array(data) });
+      return;
+    }
+    if (!vt) return;
+    vtWriteNow(t, data);
   };
 
   H.termResize = (id, cols, rows, cw, ch) => {
     const t = terms.get(id);
-    if (!t || !vt) return;
-    vt.ghostty_terminal_resize(t.term, cols > 0 ? cols : 1, rows > 0 ? rows : 1, cw > 0 ? cw : 8, ch > 0 ? ch : 16);
+    if (!t || t.closed) return;
+    const c = cols > 0 ? cols : 1;
+    const r = rows > 0 ? rows : 1;
+    const w = cw > 0 ? cw : 8;
+    const h = ch > 0 ? ch : 16;
+    if (t.pending) {
+      t.cols = c;
+      t.rows = r;
+      t.pendingOps.push({ op: 'resize', cols: c, rows: r, cw: w, ch: h });
+      return;
+    }
+    if (!vt) return;
+    vt.ghostty_terminal_resize(t.term, c, r, w, h);
     t.mouseSynced = false;
   };
 
   H.termModes = (id) => {
     const t = terms.get(id);
-    return t && vt ? vtModes(t) : 0;
+    return t && !t.pending && !t.closed && vt ? vtModes(t) : 0;
   };
 
   H.termFrame = (id, flags) => {
     const t = terms.get(id);
-    if (!t || !vt || vt.ghostty_render_state_update(t.render, t.term) !== 0) return new Uint8Array(0);
+    if (!t || t.pending || t.closed || !vt || vt.ghostty_render_state_update(t.render, t.term) !== 0) return new Uint8Array(0);
     let dv = new DataView(vt.memory.buffer);
     let m8 = new Uint8Array(vt.memory.buffer);
     if (flags & 1) {
@@ -6347,7 +6422,7 @@
 
   H.termScroll = (id, kind, value) => {
     const t = terms.get(id);
-    if (!t || !vt) return;
+    if (!t || t.pending || t.closed || !vt) return;
     const svAt = vtScratch + 88;
     const dv = new DataView(vt.memory.buffer);
     new Uint8Array(vt.memory.buffer).fill(0, svAt, svAt + 24);
@@ -6369,7 +6444,7 @@
 
   H.termSelect = (id, kind, x0, y0, x1, y1) => {
     const t = terms.get(id);
-    if (!t || !vt) return 0;
+    if (!t || t.pending || t.closed || !vt) return 0;
     const selAt = vtScratch + 112;
     if (kind === 0) {
       t.dragActive = false;
@@ -6484,7 +6559,7 @@
 
   H.termText = (id, sel) => {
     const t = terms.get(id);
-    if (!t || !vt) return '';
+    if (!t || t.pending || t.closed || !vt) return '';
     const selAt = vtScratch + 112;
     if (sel !== 0 && vt.ghostty_terminal_get(t.term, 31, selAt) !== 0) return '';
     // Use formatter for selections if compiled into Wasm; for sel===0 (current viewport) or prebuilt wasm32 without
@@ -6514,7 +6589,7 @@
 
   H.termMouse = (id, action, button, mods, x, y, w, h, cw, ch) => {
     const t = terms.get(id);
-    if (!t || !vt || !t.mouse || !t.mouseEv) return new Uint8Array(0);
+    if (!t || t.pending || t.closed || !vt || !t.mouse || !t.mouseEv) return new Uint8Array(0);
     if (action !== 2 || !t.mouseSynced) {
       vt.ghostty_mouse_encoder_set_from_terminal(t.mouse, t.term);
       t.mouseSynced = true;
@@ -6556,7 +6631,9 @@
 
   H.termClose = (id) => {
     const t = terms.get(id);
-    if (!t || !vt) return;
+    if (!t) return;
+    terms.delete(id);
+    if (t.pending || t.closed || !vt) return;
     if (t.mouseEv) vt.ghostty_mouse_event_free(t.mouseEv);
     if (t.mouse) vt.ghostty_mouse_encoder_free(t.mouse);
     vt.ghostty_render_state_row_cells_free(t.cells);

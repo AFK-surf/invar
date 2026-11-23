@@ -25,6 +25,73 @@ function u8ToB64url(buf) {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+export function unescapeSemField(s) {
+  if (!s || s.indexOf("\\") === -1) return s || "";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\" && i + 1 < s.length) {
+      const nxt = s[i + 1];
+      if (nxt === "\\") { out += "\\"; i++; continue; }
+      if (nxt === "n") { out += "\n"; i++; continue; }
+      if (nxt === "r") { out += "\r"; i++; continue; }
+      if (nxt === "u" && s.slice(i + 2, i + 6).toLowerCase() === "001f") {
+        out += "\x1f";
+        i += 5;
+        continue;
+      }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+export function a11yRoleSpec(role) {
+  switch (role) {
+    case "Text": return { tag: "span", role: null };
+    case "Group": return { tag: "div", role: "group" };
+    case "Button": return { tag: "button", role: null };
+    case "Link": return { tag: "div", role: "link" };
+    case "Checkbox": return { tag: "div", role: "checkbox" };
+    case "Switch":
+    case "Toggle": return { tag: "div", role: "switch" };
+    case "Radio": return { tag: "div", role: "radio" };
+    case "RadioGroup": return { tag: "div", role: "radiogroup" };
+    case "Slider": return { tag: "div", role: "slider" };
+    case "ProgressBar": return { tag: "div", role: "progressbar" };
+    case "Tab": return { tag: "div", role: "tab" };
+    case "TabList": return { tag: "div", role: "tablist" };
+    case "TabPanel": return { tag: "div", role: "tabpanel" };
+    case "Dialog": return { tag: "div", role: "dialog" };
+    case "AlertDialog": return { tag: "div", role: "alertdialog" };
+    case "Tooltip": return { tag: "div", role: "tooltip" };
+    case "Menu": return { tag: "div", role: "menu" };
+    case "MenuBar": return { tag: "div", role: "menubar" };
+    case "MenuItem": return { tag: "div", role: "menuitem" };
+    case "MenuItemCheckbox": return { tag: "div", role: "menuitemcheckbox" };
+    case "MenuItemRadio": return { tag: "div", role: "menuitemradio" };
+    case "Listbox": return { tag: "div", role: "listbox" };
+    case "Option": return { tag: "div", role: "option" };
+    case "Combobox": return { tag: "div", role: "combobox" };
+    case "Toolbar": return { tag: "div", role: "toolbar" };
+    case "Separator": return { tag: "div", role: "separator" };
+    case "Image": return { tag: "div", role: "img" };
+    case "TextField":
+    case "SearchField": return { tag: "div", role: "textbox" };
+    case "Status": return { tag: "div", role: "status" };
+    case "Region": return { tag: "div", role: "region" };
+    case "Navigation": return { tag: "nav", role: "navigation" };
+    case "Form": return { tag: "div", role: "form" };
+    case "Heading": return { tag: "div", role: "heading" };
+    case "ScrollArea": return { tag: "div", role: "region" };
+    case "Table": return { tag: "div", role: "table" };
+    case "Row": return { tag: "div", role: "row" };
+    case "ColumnHeader": return { tag: "div", role: "columnheader" };
+    case "Cell": return { tag: "div", role: "cell" };
+    default: return { tag: "span", role: null };
+  }
+}
+
 export function attachHostBridge(rt, perfHooks = {}) {
   const host = () => globalThis.__mbhost;
   const f64View = (ptr, count) => {
@@ -72,6 +139,9 @@ export function attachHostBridge(rt, perfHooks = {}) {
   // Accessibility live DOM mirror (lazily created on first tree sync)
   let a11yEl = null;
   const a11yNodes = new Map();
+  let a11ySyncingFocus = false;
+  const pendingA11yGeom = new Set();
+  let a11yGeomTimer = null;
 
   function ensureA11yRoot() {
     if (a11yEl && a11yEl.isConnected) return a11yEl;
@@ -85,43 +155,54 @@ export function attachHostBridge(rt, perfHooks = {}) {
     return a11yEl;
   }
 
-  function a11yRoleSpec(role) {
-    switch (role) {
-      case "Button": return { tag: "button", role: null };
-      case "Checkbox": return { tag: "div", role: "checkbox" };
-      case "Switch":
-      case "Toggle": return { tag: "div", role: "switch" };
-      case "Radio": return { tag: "div", role: "radio" };
-      case "Tab": return { tag: "div", role: "tab" };
-      case "MenuItem": return { tag: "div", role: "menuitem" };
-      case "Link": return { tag: "div", role: "link" };
-      case "TextField":
-      case "SearchField": return { tag: "div", role: "textbox" };
-      case "Slider": return { tag: "div", role: "slider" };
-      case "Dialog": return { tag: "div", role: "dialog" };
-      case "Heading": return { tag: "div", role: "heading" };
-      default: return { tag: "span", role: "region" };
+  function deliverA11yAction(payload) {
+    const json = JSON.stringify(payload);
+    const H = host();
+    if (H && H.post) {
+      H.post("a11y", json);
     }
+    if (H && H.requestFrame) H.requestFrame();
   }
 
   function activateA11yNode(id) {
     const cur = a11yNodes.get(id);
     if (!cur || cur.flags.includes("d")) return;
-    const cx = cur.x + cur.w * 0.5;
-    const cy = cur.y + cur.h * 0.5;
-    const mb = globalThis.__mb;
-    if (mb && mb.pointer) {
-      mb.pointer(0, cx, cy, 0);
-      mb.pointer(2, cx, cy, 0);
-    }
-    const H = host();
-    if (H && H.requestFrame) H.requestFrame();
+    deliverA11yAction({ op: "press", action: "activate", id: Number(id) });
   }
 
-  function syncA11yElement(node, root) {
+  function applyA11yGeometry(el, node) {
+    el.style.cssText =
+      `position:fixed;left:${node.x}px;top:${node.y}px;width:${node.w}px;height:${node.h}px;` +
+      "margin:0;padding:0;border:0;background:transparent;pointer-events:none;";
+    if (node._last) {
+      node._last.x = node.x;
+      node._last.y = node.y;
+      node._last.w = node.w;
+      node._last.h = node.h;
+    }
+  }
+
+  function flushA11yGeom() {
+    a11yGeomTimer = null;
+    for (const id of pendingA11yGeom) {
+      const n = a11yNodes.get(id);
+      if (n && n.el) applyA11yGeometry(n.el, n);
+    }
+    pendingA11yGeom.clear();
+  }
+
+  function scheduleA11yGeom(id) {
+    pendingA11yGeom.add(id);
+    if (a11yGeomTimer === null) {
+      a11yGeomTimer = setTimeout(flushA11yGeom, 200);
+    }
+  }
+
+  function syncA11yElement(node, root, structuralChanged) {
     if (node.id === "0") return;
     const spec = a11yRoleSpec(node.role);
     let el = node.el;
+    let created = false;
     if (!el || el.tagName.toLowerCase() !== spec.tag) {
       if (el && el.parentNode) el.parentNode.removeChild(el);
       el = document.createElement(spec.tag);
@@ -131,6 +212,12 @@ export function attachHostBridge(rt, perfHooks = {}) {
       el.addEventListener("click", (e) => {
         e.preventDefault();
         activateA11yNode(nid);
+      });
+      el.addEventListener("focus", () => {
+        if (a11ySyncingFocus) return;
+        const cur = a11yNodes.get(nid);
+        if (!cur || cur.flags.includes("d")) return;
+        deliverA11yAction({ op: "focus", action: "focus", id: Number(nid) });
       });
       if (spec.tag !== "button") {
         el.addEventListener("keydown", (e) => {
@@ -142,42 +229,85 @@ export function attachHostBridge(rt, perfHooks = {}) {
       }
       node.el = el;
       root.appendChild(el);
+      created = true;
     }
-    if (spec.role) el.setAttribute("role", spec.role);
-    else el.removeAttribute("role");
+
+    const last = created ? null : node._last;
+    let semanticChanged = created || structuralChanged;
+
+    if (!last || last.role !== spec.role) {
+      if (spec.role) el.setAttribute("role", spec.role);
+      else el.removeAttribute("role");
+      semanticChanged = true;
+    }
 
     const label = node.label || node.value || node.description || "";
-    if (label) el.setAttribute("aria-label", label);
-    else el.removeAttribute("aria-label");
-    if (el.textContent !== label) el.textContent = label;
+    if (!last || last.label !== label) {
+      if (label) el.setAttribute("aria-label", label);
+      else el.removeAttribute("aria-label");
+      if (el.textContent !== label) el.textContent = label;
+      semanticChanged = true;
+    }
 
     const flags = node.flags;
-    if (flags.includes("C")) el.setAttribute("aria-checked", "true");
-    else if (flags.includes("c")) el.setAttribute("aria-checked", "false");
-    else if (flags.includes("M")) el.setAttribute("aria-checked", "mixed");
-    else el.removeAttribute("aria-checked");
+    if (!last || last.flags !== flags) {
+      if (flags.includes("C")) el.setAttribute("aria-checked", "true");
+      else if (flags.includes("c")) el.setAttribute("aria-checked", "false");
+      else if (flags.includes("M")) el.setAttribute("aria-checked", "mixed");
+      else el.removeAttribute("aria-checked");
 
-    if (flags.includes("E")) el.setAttribute("aria-expanded", "true");
-    else if (flags.includes("e")) el.setAttribute("aria-expanded", "false");
-    else el.removeAttribute("aria-expanded");
+      if (flags.includes("E")) el.setAttribute("aria-expanded", "true");
+      else if (flags.includes("e")) el.setAttribute("aria-expanded", "false");
+      else el.removeAttribute("aria-expanded");
 
-    if (flags.includes("s")) el.setAttribute("aria-selected", "true");
-    else el.removeAttribute("aria-selected");
+      if (flags.includes("s")) el.setAttribute("aria-selected", "true");
+      else el.removeAttribute("aria-selected");
+
+      const disabled = flags.includes("d");
+      if (disabled) el.setAttribute("aria-disabled", "true");
+      else el.removeAttribute("aria-disabled");
+      if (spec.tag === "button") el.disabled = disabled;
+      semanticChanged = true;
+    }
+
+    if (!last || last.value !== node.value) {
+      if (node.value) el.setAttribute("aria-valuetext", node.value);
+      else el.removeAttribute("aria-valuetext");
+      semanticChanged = true;
+    }
 
     const disabled = flags.includes("d");
-    if (disabled) el.setAttribute("aria-disabled", "true");
-    else el.removeAttribute("aria-disabled");
-    if (spec.tag === "button") el.disabled = disabled;
+    const focusable = node.actions.includes("a") && !disabled;
+    if (!last || last.actions !== node.actions || last.disabled !== disabled) {
+      if (focusable) el.tabIndex = 0;
+      else el.removeAttribute("tabindex");
+      semanticChanged = true;
+    }
 
-    if (node.value) el.setAttribute("aria-valuetext", node.value);
-    else el.removeAttribute("aria-valuetext");
+    const geomChanged =
+      !last || last.x !== node.x || last.y !== node.y || last.w !== node.w || last.h !== node.h;
 
-    if (node.actions.includes("a") && !disabled) el.tabIndex = 0;
-    else el.removeAttribute("tabindex");
+    node._last = {
+      role: spec.role,
+      label,
+      value: node.value,
+      flags,
+      actions: node.actions,
+      disabled,
+      x: last ? last.x : node.x,
+      y: last ? last.y : node.y,
+      w: last ? last.w : node.w,
+      h: last ? last.h : node.h,
+    };
 
-    el.style.cssText =
-      `position:fixed;left:${node.x}px;top:${node.y}px;width:${node.w}px;height:${node.h}px;` +
-      "margin:0;padding:0;border:0;background:transparent;pointer-events:none;";
+    if (geomChanged) {
+      if (semanticChanged) {
+        pendingA11yGeom.delete(node.id);
+        applyA11yGeometry(el, node);
+      } else {
+        scheduleA11yGeom(node.id);
+      }
+    }
   }
 
   function applyA11yTree(wire) {
@@ -205,9 +335,9 @@ export function attachHostBridge(rt, perfHooks = {}) {
           y: Number(parts[5]) || 0,
           w: Number(parts[6]) || 0,
           h: Number(parts[7]) || 0,
-          label: parts[8] || "",
-          value: parts[9] || "",
-          description: parts[10] || "",
+          label: unescapeSemField(parts[8] || ""),
+          value: unescapeSemField(parts[9] || ""),
+          description: unescapeSemField(parts[10] || ""),
           actions: parts[14] || "",
           widget: Number(parts[15]) || 0,
           kids,
@@ -215,7 +345,13 @@ export function attachHostBridge(rt, perfHooks = {}) {
       }
     }
 
+    let structuralChanged = full;
     if (full) {
+      if (a11yGeomTimer !== null) {
+        clearTimeout(a11yGeomTimer);
+        a11yGeomTimer = null;
+      }
+      pendingA11yGeom.clear();
       for (const n of a11yNodes.values()) {
         if (n.el && n.el.parentNode) n.el.parentNode.removeChild(n.el);
       }
@@ -237,8 +373,11 @@ export function attachHostBridge(rt, perfHooks = {}) {
           if (!nextKids.has(k)) letGo.push(k);
         }
         n.el = prev.el || null;
+        n._last = prev._last || null;
       } else {
         n.el = null;
+        n._last = null;
+        structuralChanged = true;
       }
       a11yNodes.set(n.id, n);
     }
@@ -250,19 +389,26 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (gone) {
         if (gone.el && gone.el.parentNode) gone.el.parentNode.removeChild(gone.el);
         a11yNodes.delete(k);
+        pendingA11yGeom.delete(k);
+        structuralChanged = true;
         for (const c of gone.kids) letGo.push(c);
       }
     }
 
     for (let i = 0; i < batch.length; i++) {
-      syncA11yElement(batch[i], root);
+      syncA11yElement(batch[i], root, structuralChanged);
     }
     root.dataset.treeLen = String(wire.length);
 
     if (focusId && focusId !== "0" && document.activeElement && root.contains(document.activeElement)) {
       const target = a11yNodes.get(focusId)?.el;
       if (target && target !== document.activeElement && typeof target.focus === "function") {
-        target.focus({ preventScroll: true });
+        a11ySyncingFocus = true;
+        try {
+          target.focus({ preventScroll: true });
+        } finally {
+          a11ySyncingFocus = false;
+        }
       }
     }
   }

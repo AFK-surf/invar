@@ -3191,10 +3191,12 @@ test "67 CJK kinsoku line-breaking keeps punctuation off forbidden edges and mat
   debug_assert(is_cjk_no_line_end(0xFF08), "fullwidth left paren cannot end line")
   debug_assert(is_cjk_no_line_end(0x3010), "black lenticular left bracket cannot end line")
   debug_assert(is_cjk_no_line_end(0x201C), "left double quote cannot end line")
-  debug_assert(!can_break_after_cp(0x4E2D, 0xFF0C), "no break before fullwidth comma")
-  debug_assert(!can_break_after_cp(0xFF08, 0x4E2D), "no break after fullwidth left paren")
-  debug_assert(can_break_after_cp(0x4E2D, 0x6587), "break allowed between CJK ideographs")
-  debug_assert(can_break_after_cp(0x4E2D, 0), "break allowed at end of line")
+  let br1 = utf16_break_table("中，", utf16_codepoints("中，"))
+  debug_assert(!br1[1], "no break before fullwidth comma")
+  let br2 = utf16_break_table("（中", utf16_codepoints("（中"))
+  debug_assert(!br2[1], "no break after fullwidth left paren")
+  let br3 = utf16_break_table("中文", utf16_codepoints("中文"))
+  debug_assert(br3[1], "break allowed between CJK ideographs")
 
   // Install a UTF-16-accurate shaper (10pt per CJK char, 6pt per ASCII char) on FakeHost
   let t = Tester::tree(fn(_root : view::View) {})
@@ -3305,6 +3307,208 @@ test "67 CJK kinsoku line-breaking keeps punctuation off forbidden edges and mat
     k += 1
   }
   debug_assert(ys.length() == measured_lines, "encode_words rows (\{ys.length()}) must match host_words_measure lines (\{measured_lines})")
+  t2.dispose()
+  t.dispose()
+}
+
+test "a11y wire escapes multiline fields and a11y channel dispatches press, step, and focus by node id" {
+  let pressed = signals::signal(0)
+  let stepped = signals::signal(0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(col : view::View) {
+      let _ = col
+        .box(fn(_v : view::View) { () })
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .says(view::Live::Is(Some(view::said(
+          view::Role::TextField,
+          label="Note\nLine2",
+          value="Row1\nRow2\r\nRow3\\end\u{1F}tail",
+          description="Desc\n2",
+        ))))
+      let _ = col
+        .box(fn(_v : view::View) { () })
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(32.0)))
+        .says(view::Live::Is(Some(view::said(view::Role::Button, label="Submit"))))
+        .focusable(view::Live::Is(true))
+        .on_press(fn() { pressed.set(pressed.untracked() + 1) })
+      let _ = col
+        .box(fn(_v : view::View) { () })
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(32.0)))
+        .says(view::Live::Is(Some(view::said(view::Role::Slider, label="Volume"))))
+        .on_step(fn(by : Int) { stepped.set(stepped.untracked() + by) })
+    })
+  })
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => {
+      debug_assert(false, "view_tree must be live")
+      return
+    }
+  }
+  let told = A11yTold::new()
+  let (wire, changed_n, full) = a11y_sync(tree, told, force_full=true)
+  debug_assert(full, "first a11y_sync is full")
+  debug_assert(changed_n >= 4, "root + 3 semantic nodes")
+  debug_assert(wire.contains("Note\\nLine2"), "multiline label escaped")
+  debug_assert(wire.contains("Row1\\nRow2\\r\\nRow3\\\\end\\u001ftail"), "multiline value + backslash + unit sep escaped")
+  debug_assert(wire.contains("Desc\\n2"), "multiline description escaped")
+  // Count non-empty lines: must equal 1 header + changed_n nodes (no broken lines!)
+  let raw_lines = split_lines(wire)
+  let mut non_empty = 0
+  for ln in raw_lines {
+    if ln.length() > 0 {
+      non_empty += 1
+    }
+  }
+  debug_assert(non_empty == 1 + changed_n, "wire line count (\{non_empty}) must equal 1 + changed_n (\{1 + changed_n})")
+
+  // Locate Button and Slider node ids from said_order
+  let mut btn_nid = 0
+  let mut slider_nid = 0
+  for sn in tree.said_order() {
+    match sn.said {
+      Some(sd) => {
+        if sd.label == "Submit" {
+          btn_nid = sn.id.at + 1
+        } else if sd.label == "Volume" {
+          slider_nid = sn.id.at + 1
+        }
+      }
+      None => ()
+    }
+  }
+  debug_assert(btn_nid > 0 && slider_nid > 0, "button and slider semantic ids found")
+
+  // Dispatch via a11y channel without any pointer coordinates
+  hand_on_message(hostapi::a11y_channel, "{\"op\":\"press\",\"id\":\{btn_nid}}", None)
+  debug_assert(pressed.untracked() == 1, "a11y press triggered on_press by node id")
+
+  hand_on_message(hostapi::a11y_channel, "{\"action\":\"increment\",\"id\":\{slider_nid}}", None)
+  hand_on_message(hostapi::a11y_channel, "{\"op\":\"dec\",\"id\":\{slider_nid}}", None)
+  hand_on_message(hostapi::a11y_channel, "{\"op\":\"inc\",\"id\":\{slider_nid}}", None)
+  debug_assert(stepped.untracked() == 1, "a11y inc/dec triggered on_step (+1 -1 +1 = 1)")
+
+  hand_on_message(hostapi::a11y_channel, "{\"op\":\"focus\",\"id\":\{btn_nid}}", None)
+  let (foc, vis) = tree.focused_now()
+  let foc_ok = match foc {
+    Some(fid) => fid.at + 1 == btn_nid
+    None => false
+  }
+  debug_assert(foc_ok && vis, "a11y focus moved visible focus to button node")
+  t.dispose()
+}
+
+test "UAX #14 line breaking preserves Cyrillic, Greek, accented Latin words and enforces CJK kinsoku" {
+  let t = Tester::tree(fn(_r : view::View) { () })
+  let h = hostapi::host()
+  // Deterministic mock shaper: every code point is 10pt wide (except space = 6pt)
+  h.shape = fn(s : String, _size : Double, _weight : Int, _style : Int, out : Array[Double]) -> Int {
+    let cps = utf16_codepoints(s)
+    let mut u = 0
+    let mut c = 0
+    while u < cps.length() && c * 4 + 3 < out.length() {
+      let cp = cps[u]
+      let ulen = if cp >= 0x10000 { 2 } else { 1 }
+      let adv = if cp == 32 { 6.0 } else { 10.0 }
+      out[c * 4] = u.to_double()
+      out[c * 4 + 1] = ulen.to_double()
+      out[c * 4 + 2] = if cp == 10 { 0.0 } else { adv }
+      out[c * 4 + 3] = if cp == 10 || cp == 32 || cp == 9 { -1.0 } else { (cp & 0x7FFF).to_double() }
+      u += ulen
+      c += 1
+    }
+    c
+  }
+  h.font_metrics = fn(_size : Double, _weight : Int, _style : Int, out : Array[Double]) {
+    out[0] = 16.0
+    out[1] = 4.0
+  }
+  reset_glyph_atlas()
+  let look = view::WordsLook::{ ..view::words_plain, size: 16.0, line: 20.0, wrap: true }
+
+  // 1. Cyrillic / Greek / accented Latin must NOT split mid-word!
+  // "Привет мир": "Привет" = 60pt, " " = 6pt, "мир" = 30pt. At max_w = 70pt -> 2 lines ("Привет", "мир").
+  let (_, cyr_h) = host_words_measure("Привет мир", look, 70.0, 1.0)
+  debug_assert((cyr_h / 20.0).round().to_int() == 2, "Cyrillic wraps at space into 2 lines, not mid-word")
+  // Single Cyrillic word "Привет" (60pt) at max_w = 70pt stays 1 line; break table has no interior break!
+  let cyr_cps = utf16_codepoints("Привет")
+  let cyr_br = utf16_break_table("Привет", cyr_cps)
+  let mut cyr_inner = false
+  for i in 1..<cyr_cps.length() {
+    if cyr_br[i] { cyr_inner = true }
+  }
+  debug_assert(!cyr_inner, "no interior break inside Cyrillic word")
+
+  let acc_cps = utf16_codepoints("café naïve über")
+  let acc_br = utf16_break_table("café naïve über", acc_cps)
+  // Accented word "café" (indices 0..4) must have no interior breaks at 1,2,3
+  debug_assert(!acc_br[1] && !acc_br[2] && !acc_br[3], "no interior break inside café")
+  // Break allowed after space (before 'n' at index 5)
+  debug_assert(acc_br[5], "break allowed after space before naïve")
+
+  // 2. CJK kinsoku: small kana, prolonged sound mark, dash, ellipsis, and "甲乙 ，丙" space + comma boundary
+  let kana_s = "カービィぁ—…测试"
+  let kana_cps = utf16_codepoints(kana_s)
+  let kana_br = utf16_break_table(kana_s, kana_cps)
+  debug_assert(!kana_br[1], "no break before ー")
+  debug_assert(!kana_br[3], "no break before ィ")
+  debug_assert(!kana_br[4], "no break before ぁ")
+  debug_assert(!kana_br[5], "no break before —")
+  debug_assert(!kana_br[6], "no break before …")
+
+  // "甲乙 ，丙" (10+10+6+10+10 = 46pt): at max_w = 30pt, space before `，` must NOT break there;
+  // it breaks after `甲` so line 1 = "甲" (10pt), line 2 = "乙 ，" (26pt), line 3 = "丙" (10pt) -> 3 lines,
+  // and `，` never starts a line.
+  let sp_comma = "甲乙 ，丙"
+  let (_, spc_h) = host_words_measure(sp_comma, look, 30.0, 1.0)
+  debug_assert((spc_h / 20.0).round().to_int() == 3, "space+comma wraps without stranding comma")
+
+  // 3. host_runs_least_measure on CJK long sentence returns single-char width (<= 12pt), not full sentence (150pt)
+  let cjk_runs : Array[text::Run] = [text::plain("中文长句测试不需要整段当成单词")]
+  let least_w = host_runs_least_measure(cjk_runs, look, view::runs_plain, 1.0)
+  debug_assert(least_w > 0.0 && least_w <= 15.0, "host_runs_least_measure CJK returns char width, got \{least_w}")
+
+  // 4. host_words_measure and encode_words produce identical row counts
+  let mix2 = "Привет мир 中文—测试 café naïve"
+  let (_, m_h) = host_words_measure(mix2, look, 75.0, 1.0)
+  let m_lines = (m_h / 20.0).round().to_int()
+  let t2 = Tester::tree(fn(r : view::View) {
+    let _ = r.box(fn(b : view::View) {
+      let _ = b.words(view::Live::Is(mix2), look=look).width(view::Live::Is(Some(75.0)))
+    }).width(view::Live::Is(Some(75.0)))
+  })
+  let h2 = hostapi::host()
+  h2.shape = h.shape
+  h2.font_metrics = h.font_metrics
+  h2.glyph = fn(_key : Int, out : Array[Double]) {
+    out[2] = 8.0
+    out[3] = 12.0
+    out[4] = 0.0
+    out[5] = -10.0
+    out[6] = 0.0
+  }
+  reset_glyph_atlas()
+  let sc = Scene::new()
+  for d in t2.drawn() {
+    if d.words == mix2 {
+      let _ = encode_words(sc, d, 1.0, 0.0, 0.0, 1000.0, 1000.0)
+    }
+  }
+  let row_ys : Array[Int] = []
+  let mut idx = 0
+  while idx < sc.ninst {
+    let row = (sc.inst[idx * inst_size + 1] / 20.0).to_int()
+    let mut seen = false
+    for ry in row_ys {
+      if ry == row { seen = true; break }
+    }
+    if !seen { row_ys.push(row) }
+    idx += 1
+  }
+  debug_assert(row_ys.length() == m_lines, "encode_words rows (\{row_ys.length()}) == host_words_measure lines (\{m_lines})")
   t2.dispose()
   t.dispose()
 }

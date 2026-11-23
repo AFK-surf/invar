@@ -1538,7 +1538,8 @@ static int make_own_chain(HWND hwnd) {
   return SUCCEEDED(dxgi_factory->CreateSwapChainForHwnd(dev, hwnd, &sd, NULL, NULL, &chain));
 }
 
-static void make_pipeline(void);
+static bool make_pipeline(void);
+static void release_pipeline(void);
 
 // The device, with its video side where the GPU has one (a remote screen decoded and shown by the GPU, win_stream.cpp),
 // else without, else WARP's.
@@ -1556,8 +1557,18 @@ static HANDLE warm_thread;
 static bool warm_made;
 static DWORD WINAPI warm_make(LPVOID) {
   if (make_any_device()) {
-    make_pipeline();
-    warm_made = true;
+    if (make_pipeline()) {
+      warm_made = true;
+    } else {
+      if (ctx) {
+        ctx->Release();
+        ctx = NULL;
+      }
+      if (dev) {
+        dev->Release();
+        dev = NULL;
+      }
+    }
   }
   return 0;
 }
@@ -1600,8 +1611,42 @@ int mb_render_init(void *hwnd) {
   dxgi_factory->MakeWindowAssociation((HWND)hwnd, DXGI_MWA_NO_ALT_ENTER);
   adapter->Release();
   xdev->Release();
-  if (!warm) make_pipeline();
-  return chain != NULL;
+  if (!warm && !make_pipeline()) {
+    if (chain) {
+      chain->Release();
+      chain = NULL;
+    }
+    if (dxgi_factory) {
+      dxgi_factory->Release();
+      dxgi_factory = NULL;
+    }
+    if (ctx) {
+      ctx->Release();
+      ctx = NULL;
+    }
+    if (dev) {
+      dev->Release();
+      dev = NULL;
+    }
+    return 0;
+  }
+  if (!chain) {
+    release_pipeline();
+    if (dxgi_factory) {
+      dxgi_factory->Release();
+      dxgi_factory = NULL;
+    }
+    if (ctx) {
+      ctx->Release();
+      ctx = NULL;
+    }
+    if (dev) {
+      dev->Release();
+      dev = NULL;
+    }
+    return 0;
+  }
+  return 1;
 }
 
 // Window `wid` of the run beside the first (win_app.c win_open), its HWND made: its swap chain as the first's is (in the
@@ -1711,44 +1756,46 @@ static ID3D11Buffer *bl_comp_vbuf;
 static ID3D11Buffer *layer_vbuf;
 static size_t layer_vbuf_cap;
 
-static void make_pipeline(void) {
-  // (those of a device before, if there was one, let go once made)
-  if (bl_comp_vbuf) {
-    bl_comp_vbuf->Release();
-    bl_comp_vbuf = NULL;
-  }
-  if (layer_vbuf) {
-    layer_vbuf->Release();
-    layer_vbuf = NULL;
-    layer_vbuf_cap = 0;
-  }
-  if (rect_ps) {
-    rect_ps->Release();
-    rect_ps = NULL;
-  }
-  if (prog_ps) {
-    prog_ps->Release();
-    prog_ps = NULL;
-  }
-  if (ad_ps) {
-    ad_ps->Release();
-    ad_ps = NULL;
-  }
-  if (ad_cb) {
-    ad_cb->Release();
-    ad_cb = NULL;
-  }
+static void release_pipeline(void) {
   if (kinds_thread) {
     WaitForSingleObject(kinds_thread, INFINITE);
     CloseHandle(kinds_thread);
     kinds_thread = NULL;
   }
   kinds_ready = 0;
-  for (int k = 0; k < MB_KINDS; k++)
+  for (int k = 0; k < MB_KINDS; k++) {
     if (kps[k]) {
       kps[k]->Release();
       kps[k] = NULL;
     }
+  }
+  if (bl_comp_vbuf) { bl_comp_vbuf->Release(); bl_comp_vbuf = NULL; }
+  if (layer_vbuf) { layer_vbuf->Release(); layer_vbuf = NULL; layer_vbuf_cap = 0; }
+  if (rect_ps) { rect_ps->Release(); rect_ps = NULL; }
+  if (prog_ps) { prog_ps->Release(); prog_ps = NULL; }
+  if (ad_ps) { ad_ps->Release(); ad_ps = NULL; }
+  if (edge_ps) { edge_ps->Release(); edge_ps = NULL; }
+  if (pps) { pps->Release(); pps = NULL; }
+  if (pvs) { pvs->Release(); pvs = NULL; }
+  if (raster_cut) { raster_cut->Release(); raster_cut = NULL; }
+  if (raster) { raster->Release(); raster = NULL; }
+  if (blend) { blend->Release(); blend = NULL; }
+  if (sampler) { sampler->Release(); sampler = NULL; }
+  if (atlas_srv) { atlas_srv->Release(); atlas_srv = NULL; }
+  if (atlas) { atlas->Release(); atlas = NULL; }
+  if (ad_cb) { ad_cb->Release(); ad_cb = NULL; }
+  if (gbuf) { gbuf->Release(); gbuf = NULL; }
+  if (pbuf) { pbuf->Release(); pbuf = NULL; }
+  if (ubuf) { ubuf->Release(); ubuf = NULL; }
+  if (layout) { layout->Release(); layout = NULL; }
+  if (ps_flat) { ps_flat->Release(); ps_flat = NULL; }
+  if (ps) { ps->Release(); ps = NULL; }
+  if (vs) { vs->Release(); vs = NULL; }
+}
+
+static bool make_pipeline(void) {
+  // (those of a device before, if there was one, let go once made)
+  release_pipeline();
   ID3DBlob *vcode = compile("vmain", "vs_4_0"), *pcode = compile("fmain", "ps_4_0"), *fcode = compile("fflat", "ps_4_0");
   if (!vcode || !pcode || !fcode) {
     fprintf(stderr, "win_render: core shader compile failed (vmain=%p fmain=%p fflat=%p)\n",
@@ -1756,11 +1803,11 @@ static void make_pipeline(void) {
     if (vcode) vcode->Release();
     if (pcode) pcode->Release();
     if (fcode) fcode->Release();
-    return;
+    return false;
   }
-  dev->CreateVertexShader(vcode->GetBufferPointer(), vcode->GetBufferSize(), NULL, &vs);
-  dev->CreatePixelShader(pcode->GetBufferPointer(), pcode->GetBufferSize(), NULL, &ps);
-  dev->CreatePixelShader(fcode->GetBufferPointer(), fcode->GetBufferSize(), NULL, &ps_flat);
+  HRESULT hr_vs = dev->CreateVertexShader(vcode->GetBufferPointer(), vcode->GetBufferSize(), NULL, &vs);
+  HRESULT hr_ps = dev->CreatePixelShader(pcode->GetBufferPointer(), pcode->GetBufferSize(), NULL, &ps);
+  HRESULT hr_pf = dev->CreatePixelShader(fcode->GetBufferPointer(), fcode->GetBufferSize(), NULL, &ps_flat);
   fcode->Release();
   // the instance's fifteen float4s (scene.mbt): rect, p, color, c2, clip, pad, the clip's corners' radii, how smooth,
   // how it is turned, a box's corners' radii, the outer clip's rect, corners' radii and how smooth, how it fades down
@@ -1768,10 +1815,15 @@ static void make_pipeline(void) {
   D3D11_INPUT_ELEMENT_DESC el[15];
   for (UINT i = 0; i < 15; i++)
     el[i] = {"INST", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, i * 16, D3D11_INPUT_PER_INSTANCE_DATA, 1};
-  dev->CreateInputLayout(el, 15, vcode->GetBufferPointer(), vcode->GetBufferSize(), &layout);
+  HRESULT hr_il = dev->CreateInputLayout(el, 15, vcode->GetBufferPointer(), vcode->GetBufferSize(), &layout);
   vcode->Release();
   pcode->Release();
-  kinds_thread = CreateThread(NULL, 0, make_kinds, dev, 0, NULL);
+  if (FAILED(hr_vs) || !vs || FAILED(hr_ps) || !ps || FAILED(hr_pf) || !ps_flat || FAILED(hr_il) || !layout) {
+    fprintf(stderr, "win_render: core shader/input-layout creation failed (vs=0x%lx ps=0x%lx flat=0x%lx layout=0x%lx)\n",
+            (unsigned long)hr_vs, (unsigned long)hr_ps, (unsigned long)hr_pf, (unsigned long)hr_il);
+    release_pipeline();
+    return false;
+  }
   ID3DBlob *pv = compile("vpost", "vs_4_0", post_src), *pp = compile("fpost", "ps_4_0", post_src);
   ID3DBlob *ep = compile("fedge", "ps_4_0", edge_src);
   ID3DBlob *gp = compile("fprog", "ps_4_0", prog_src);
@@ -1818,13 +1870,18 @@ static void make_pipeline(void) {
   }
 
   D3D11_BUFFER_DESC ud = {32, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
-  dev->CreateBuffer(&ud, NULL, &ubuf);
+  HRESULT hr_ub = dev->CreateBuffer(&ud, NULL, &ubuf);
   D3D11_BUFFER_DESC pd = {32 + sizeof(MBContained), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
-  dev->CreateBuffer(&pd, NULL, &pbuf);
+  HRESULT hr_pb = dev->CreateBuffer(&pd, NULL, &pbuf);
   D3D11_BUFFER_DESC gd = {(UINT)sizeof(GU), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
-  dev->CreateBuffer(&gd, NULL, &gbuf);
+  HRESULT hr_gb = dev->CreateBuffer(&gd, NULL, &gbuf);
   D3D11_BUFFER_DESC adbd = {64, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
-  dev->CreateBuffer(&adbd, NULL, &ad_cb);
+  HRESULT hr_ab = dev->CreateBuffer(&adbd, NULL, &ad_cb);
+  if (FAILED(hr_ub) || !ubuf || FAILED(hr_pb) || !pbuf || FAILED(hr_gb) || !gbuf || FAILED(hr_ab) || !ad_cb) {
+    fprintf(stderr, "win_render: constant buffer creation failed\n");
+    release_pipeline();
+    return false;
+  }
 
   D3D11_TEXTURE2D_DESC td = {};
   td.Width = td.Height = (UINT)mb_atlas_size;
@@ -1833,14 +1890,19 @@ static void make_pipeline(void) {
   td.SampleDesc.Count = 1;
   td.Usage = D3D11_USAGE_DEFAULT;
   td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  dev->CreateTexture2D(&td, NULL, &atlas);
-  dev->CreateShaderResourceView(atlas, NULL, &atlas_srv);
+  HRESULT hr_at = dev->CreateTexture2D(&td, NULL, &atlas);
+  HRESULT hr_srv = SUCCEEDED(hr_at) && atlas ? dev->CreateShaderResourceView(atlas, NULL, &atlas_srv) : E_FAIL;
+  if (FAILED(hr_at) || !atlas || FAILED(hr_srv) || !atlas_srv) {
+    fprintf(stderr, "win_render: glyph atlas texture/SRV creation failed\n");
+    release_pipeline();
+    return false;
+  }
 
   D3D11_SAMPLER_DESC smp = {};
   smp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
   smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
   smp.MaxLOD = D3D11_FLOAT32_MAX;
-  dev->CreateSamplerState(&smp, &sampler);
+  HRESULT hr_smp = dev->CreateSamplerState(&smp, &sampler);
 
   // premultiplied alpha, as on Metal and GLES
   D3D11_BLEND_DESC bd = {};
@@ -1851,16 +1913,23 @@ static void make_pipeline(void) {
   b.DestBlendAlpha = D3D11_BLEND_INV_SRC1_ALPHA;
   b.BlendOp = b.BlendOpAlpha = D3D11_BLEND_OP_ADD;
   b.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-  dev->CreateBlendState(&bd, &blend);
+  HRESULT hr_bl = dev->CreateBlendState(&bd, &blend);
 
   D3D11_RASTERIZER_DESC rd = {};
   rd.FillMode = D3D11_FILL_SOLID;
   rd.CullMode = D3D11_CULL_NONE;
   rd.DepthClipEnable = TRUE;
-  dev->CreateRasterizerState(&rd, &raster);
+  HRESULT hr_rs = dev->CreateRasterizerState(&rd, &raster);
   // (a part drawn again: cut to it)
   rd.ScissorEnable = TRUE;
-  dev->CreateRasterizerState(&rd, &raster_cut);
+  HRESULT hr_rc = dev->CreateRasterizerState(&rd, &raster_cut);
+  if (FAILED(hr_smp) || !sampler || FAILED(hr_bl) || !blend || FAILED(hr_rs) || !raster || FAILED(hr_rc) || !raster_cut) {
+    fprintf(stderr, "win_render: sampler/blend/rasterizer state creation failed\n");
+    release_pipeline();
+    return false;
+  }
+  kinds_thread = CreateThread(NULL, 0, make_kinds, dev, 0, NULL);
+  return true;
 }
 
 void *mb_render_device(void) { return dev; }
@@ -3475,38 +3544,9 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
   // (the start's device let go of: drawn here by WARP's alone; what its pipeline holds of it is left, a run's)
   if (warm_taken()) {
-    if (kinds_thread) {
-      WaitForSingleObject(kinds_thread, INFINITE);
-      CloseHandle(kinds_thread);
-      kinds_thread = NULL;
-    }
     blur_layers_release();
     win_layers_release();
-    if (bl_comp_vbuf) {
-      bl_comp_vbuf->Release();
-      bl_comp_vbuf = NULL;
-    }
-    if (layer_vbuf) {
-      layer_vbuf->Release();
-      layer_vbuf = NULL;
-      layer_vbuf_cap = 0;
-    }
-    if (rect_ps) {
-      rect_ps->Release();
-      rect_ps = NULL;
-    }
-    if (prog_ps) {
-      prog_ps->Release();
-      prog_ps = NULL;
-    }
-    if (ad_ps) {
-      ad_ps->Release();
-      ad_ps = NULL;
-    }
-    if (ad_cb) {
-      ad_cb->Release();
-      ad_cb = NULL;
-    }
+    release_pipeline();
     ctx->Release();
     dev->Release();
     ctx = NULL;
@@ -3520,7 +3560,18 @@ extern "C" void mb_render_init_offscreen(double w, double h, double scale) {
   HMODULE warp = GetModuleHandleW(L"d3d10warp.dll");
   wchar_t warp_path[MAX_PATH];
   if (warp && GetModuleFileNameW(warp, warp_path, MAX_PATH)) fwprintf(stderr, L"WARP %ls\n", warp_path);
-  make_pipeline();
+  if (!make_pipeline()) {
+    fprintf(stderr, "win_render: offscreen pipeline creation failed\n");
+    if (ctx) {
+      ctx->Release();
+      ctx = NULL;
+    }
+    if (dev) {
+      dev->Release();
+      dev = NULL;
+    }
+    return;
+  }
   // (with every kind's pixel shader: what is drawn here is what a window draws once they are made)
   if (kinds_thread) WaitForSingleObject(kinds_thread, INFINITE);
   vw = w;

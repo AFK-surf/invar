@@ -103,7 +103,7 @@ WEB_DIST_RUNTIME_FILES = [
 
 # Non-JS files the page fetches at boot or Cloudflare static assets config; kept
 # apart from WEB_RUNTIME_FILES so E003 does not run `node --check` on them.
-WEB_STATIC_ASSETS = ["inter.woff2", "_headers"]
+WEB_STATIC_ASSETS = ["inter.woff2"]
 
 
 def emit_json(obj):
@@ -840,8 +840,11 @@ REACTIVE_SIGNAL_READS = {
     "signals::DerivedSignal::get",
     "signals::Optimistic::get",
     "signals::Keyed::has",
+    "signals::Keyed::count",
     "signals::KeyedList::get",
     "signals::KeyedList::keys",
+    "signals::KeyedList::count",
+    "view::View::laid_size_told",
 }
 
 # Read methods on writable signal handles (used by E009 so reading ReadSignal/Computed A
@@ -855,8 +858,11 @@ REACTIVE_WRITABLE_SIGNAL_READS = {
     "signals::DerivedSignal::get",
     "signals::Optimistic::get",
     "signals::Keyed::has",
+    "signals::Keyed::count",
     "signals::KeyedList::get",
     "signals::KeyedList::keys",
+    "signals::KeyedList::count",
+    "view::View::laid_size_told",
 }
 
 REACTIVE_EFFECT_CALLEES = {
@@ -1025,9 +1031,16 @@ def _is_writable_signal_ty(ty):
     return False
 
 
-def _has_inline_allow(file_lines_cache, file_path, line, code):
-    if not file_path or line <= 0:
-        return False
+_EFFECT_READ_METHODS = {"get", "has", "keys", "count", "laid_size_told"}
+_EFFECT_WRITE_METHODS = {
+    "set", "update", "set_at", "update_at", "push", "remove", "clear",
+    "insert", "insert_at", "swap", "replace", "mark", "notify", "dispatch",
+    "put", "drop", "begin", "clear_error", "succeed", "succeed_if_latest",
+    "fail", "fail_if_latest", "cancel",
+}
+
+
+def _get_cached_file_lines(file_lines_cache, file_path):
     lines = file_lines_cache.get(file_path)
     if lines is None:
         try:
@@ -1036,6 +1049,105 @@ def _has_inline_allow(file_lines_cache, file_path, line, code):
         except OSError:
             lines = []
         file_lines_cache[file_path] = lines
+    return lines
+
+
+def _extract_closure_body(lines, start_line, start_col):
+    if not lines or start_line <= 0 or start_line > len(lines):
+        return ""
+    # Join from start_line onward (capped to 250 lines for safety)
+    chunk_lines = lines[start_line - 1 : min(len(lines), start_line - 1 + 250)]
+    if not chunk_lines:
+        return ""
+    col0 = max(0, int(start_col or 1) - 1)
+    text = chunk_lines[0][col0:] + "".join(chunk_lines[1:])
+    # Find opening '{' of closure body
+    open_idx = text.find("{")
+    if open_idx == -1:
+        return ""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i + 2)
+            i = n if nl == -1 else nl + 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : i]
+        i += 1
+    return ""
+
+
+def _collect_readonly_signal_aliases(lines, start_line):
+    aliases = {}
+    if not lines or start_line <= 1:
+        return aliases
+    # Walk backward to enclosing fn header (bounded to 120 lines)
+    lo = max(0, start_line - 121)
+    fn_start = lo
+    for idx in range(start_line - 2, lo - 1, -1):
+        if re.match(r"^\s*(?:pub\s+)?fn\s+[A-Za-z_]", lines[idx]):
+            fn_start = idx
+            break
+    alias_re = re.compile(r"\blet\s+([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*([A-Za-z_]\w*)\.read\s*\(\s*\)")
+    for idx in range(fn_start, start_line - 1):
+        for m in alias_re.finditer(lines[idx]):
+            aliases[m.group(1)] = m.group(2)
+    return aliases
+
+
+def _analyze_effect_signal_identity(file_lines_cache, fpath, line, col, captures, rchain_len, wchain_len):
+    lines = _get_cached_file_lines(file_lines_cache, fpath)
+    body = _extract_closure_body(lines, line, col)
+    if not body:
+        return ("unknown", [])
+    # Strip line comments and string literals before scanning receiver.method(
+    cleaned = re.sub(r"//[^\n]*", "", body)
+    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
+    aliases = _collect_readonly_signal_aliases(lines, line)
+    cap_names = {c.get("name", "") for c in captures if c.get("name")}
+    read_roots = set()
+    write_roots = set()
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(", cleaned):
+        recv, meth = m.group(1), m.group(2)
+        if recv not in cap_names:
+            continue
+        root = aliases.get(recv, recv)
+        if meth in _EFFECT_READ_METHODS:
+            read_roots.add(root)
+        elif meth in _EFFECT_WRITE_METHODS:
+            write_roots.add(root)
+    shared = sorted(read_roots & write_roots)
+    if shared:
+        return ("same", shared)
+    if read_roots and write_roots and read_roots.isdisjoint(write_roots) and rchain_len == 1 and wchain_len == 1:
+        return ("distinct", [])
+    return ("unknown", [])
+
+
+def _has_inline_allow(file_lines_cache, file_path, line, code):
+    if not file_path or line <= 0:
+        return False
+    lines = _get_cached_file_lines(file_lines_cache, file_path)
     short_code = _AUDIT_SHORT_CODES.get(code, code)
     for ln in (line, line - 1):
         if 1 <= ln <= len(lines):
@@ -1237,19 +1349,19 @@ def _run_reactive_audit(target_dir, no_reactive, add_diag):
                         "Never perform IO or spawn threads inside reactive getters or render bindings; move IO into `ui::Worker`.",
                     )
 
-        # E009: signals::effect reading and writing captured signal(s) in the same effect
+        # E009: signals::effect reading and writing the same captured signal (or its .read() alias)
         if cc in REACTIVE_EFFECT_CALLEES and ca in ("0", "f"):
             if not _has_inline_allow(file_lines_cache, fpath, line, "INVAR_E009_EFFECT_SELF_WRITE"):
+                captures = cl.get("captures", [])
                 writable_caps = [
-                    cap for cap in cl.get("captures", [])
+                    cap for cap in captures
                     if _is_writable_signal_ty(cap.get("ty", ""))
                 ]
                 if writable_caps:
-                    rchain = _bfs_find_call_chain(
+                    rchain_any = _bfs_find_call_chain(
                         cl.get("calls", []),
                         fn_calls,
-                        lambda tgt: tgt in REACTIVE_WRITABLE_SIGNAL_READS,
-                        opaque_nodes=REACTIVE_READONLY_SIGNAL_READS,
+                        lambda tgt: tgt in REACTIVE_SIGNAL_READS,
                     )
                     wchain = _bfs_find_call_chain(
                         cl.get("calls", []),
@@ -1257,16 +1369,38 @@ def _run_reactive_audit(target_dir, no_reactive, add_diag):
                         lambda tgt: tgt in REACTIVE_SIGNAL_WRITES,
                         opaque_nodes=REACTIVE_E007_OPAQUE_INTERNALS,
                     )
-                    if rchain and wchain:
-                        cap_names = ", ".join(c.get("name", "") for c in writable_caps)
-                        add_diag(
-                            "INVAR_E009_EFFECT_SELF_WRITE",
-                            "error",
-                            rel,
-                            line,
-                            f"`{cc}` both reads ({' -> '.join(rchain)}) and writes ({' -> '.join(wchain)}) with captured signal(s) [{cap_names}]",
-                            "Avoid reading and writing signals inside the same `signals::effect` (risk of cross-frame self-trigger loops); use `signals::computed` / `signals::derived_signal` for derived state or move writes into event handlers.",
+                    if rchain_any and wchain:
+                        col = int(cl.get("col", 1) or 1)
+                        id_kind, shared_sigs = _analyze_effect_signal_identity(
+                            file_lines_cache, fpath, line, col, captures, len(rchain_any), len(wchain)
                         )
+                        if id_kind == "same":
+                            cap_names = ", ".join(shared_sigs)
+                            add_diag(
+                                "INVAR_E009_EFFECT_SELF_WRITE",
+                                "error",
+                                rel,
+                                line,
+                                f"`{cc}` both reads ({' -> '.join(rchain_any)}) and writes ({' -> '.join(wchain)}) the same signal(s) [{cap_names}]",
+                                "Avoid reading and writing the same signal inside `signals::effect` (risk of cross-frame self-trigger loops); use `signals::computed` / `signals::derived_signal` for derived state or move writes into event handlers.",
+                            )
+                        elif id_kind == "unknown":
+                            rchain_w = _bfs_find_call_chain(
+                                cl.get("calls", []),
+                                fn_calls,
+                                lambda tgt: tgt in REACTIVE_WRITABLE_SIGNAL_READS,
+                                opaque_nodes=REACTIVE_READONLY_SIGNAL_READS,
+                            )
+                            if rchain_w:
+                                cap_names = ", ".join(c.get("name", "") for c in writable_caps)
+                                add_diag(
+                                    "INVAR_E009_EFFECT_SELF_WRITE",
+                                    "error",
+                                    rel,
+                                    line,
+                                    f"`{cc}` both reads ({' -> '.join(rchain_w)}) and writes ({' -> '.join(wchain)}) with captured signal(s) [{cap_names}]",
+                                    "Avoid reading and writing signals inside the same `signals::effect` (risk of cross-frame self-trigger loops); use `signals::computed` / `signals::derived_signal` for derived state or move writes into event handlers.",
+                                )
 
     return {
         "ran": True,
@@ -1292,7 +1426,7 @@ def _unescape_c_str(raw):
     return "".join(out)
 
 
-def _extract_c_string_concat(text, start_pos, macros=None):
+def _extract_c_string_concat(text, start_pos, macros=None, unknown_macros=None):
     """Parse concatenated C string literals (and macro identifiers in `macros`) until `;`."""
     macros = macros or {}
     parts = []
@@ -1337,6 +1471,8 @@ def _extract_c_string_concat(text, start_pos, macros=None):
             ident = text[i:j]
             if ident in macros:
                 parts.append(macros[ident])
+            elif unknown_macros is not None and re.fullmatch(r"[A-Z][A-Z0-9_]+", ident):
+                unknown_macros.append(ident)
             i = j
             continue
         i += 1
@@ -1401,7 +1537,21 @@ def _check_win_baked_shaders():
             "baked_keys_missing": [],
             "error": "could not locate shader_src in win_render.cpp",
         }
-    shader_src_str = _extract_c_string_concat(win_src, m_src.end(), macros={"MB_CORNER_SL": mb_corner_sl})
+    unknown_macros = []
+    shader_src_str = _extract_c_string_concat(
+        win_src, m_src.end(), macros={"MB_CORNER_SL": mb_corner_sl}, unknown_macros=unknown_macros
+    )
+    if unknown_macros:
+        uniq_unknown = sorted(set(unknown_macros))
+        return {
+            "baked_file_exists": True,
+            "baked_keys_matched": 0,
+            "baked_keys_expected": [],
+            "baked_keys_missing": [],
+            "unverified": True,
+            "unknown_macros": uniq_unknown,
+            "error": f"unverified shader_src: unknown C macro(s) {', '.join(uniq_unknown)}",
+        }
     shader_src_bytes = shader_src_str.encode("utf-8")
 
     # Read baked keys from win_shaders_baked.h
@@ -2264,12 +2414,20 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
 
     required_files = list(WEB_DIST_RUNTIME_FILES) + list(WEB_STATIC_ASSETS)
     if pkg_name == "lg_web":
-        required_files.append("_redirects")
+        required_files.extend(["_headers", "_redirects"])
     for wf in required_files:
         src = os.path.join(INVAR_ROOT, "web", wf)
         if not os.path.isfile(src):
             return {"ok": False, "error": f"Missing required web asset: web/{wf}", "wasm_opt_ran": wasm_opt_ran}
         shutil.copy2(src, os.path.join(out_dir, wf))
+    if pkg_name != "lg_web":
+        for cf in ("_headers", "_redirects"):
+            custom_src = os.path.join(pkg_dir, cf)
+            if os.path.isfile(custom_src):
+                shutil.copy2(custom_src, os.path.join(out_dir, cf))
+    vt_src = os.path.join(INVAR_ROOT, "web", "ghostty-vt.wasm")
+    if os.path.isfile(vt_src):
+        shutil.copy2(vt_src, os.path.join(out_dir, "ghostty-vt.wasm"))
 
     # Write clean index.html tailored to wasm_name & title
     tpl_path = os.path.join(INVAR_ROOT, "web", "index.html")
@@ -2640,7 +2798,11 @@ def cmd_host_check(args):
                 "baked_keys_expected": expected,
                 "error": "" if ok else "missing win_shaders_baked.h",
             }
-            if ok and matched < len(expected):
+            if win_baked.get("unverified"):
+                entry["unverified"] = True
+                entry["unknown_macros"] = win_baked.get("unknown_macros", [])
+                entry["warning"] = win_baked.get("error", "unverified win_shaders_baked.h")
+            elif ok and matched < len(expected):
                 entry["warning"] = (
                     f"win_shaders_baked.h stale ({matched}/{len(expected)} cold-start keys matched); "
                     f"missing: {', '.join(win_baked.get('baked_keys_missing', []))}"
@@ -2656,7 +2818,15 @@ def cmd_host_check(args):
         emit_json(res)
     else:
         for c in checks:
-            print(f"[{'PASS' if c['ok'] else 'FAIL'}] host-check:{c['platform']} ({c['elapsed_ms']} ms)")
+            if not c["ok"]:
+                tag = "FAIL"
+            elif c.get("warning"):
+                tag = "WARN"
+            else:
+                tag = "PASS"
+            print(f"[{tag}] host-check:{c['platform']} ({c['elapsed_ms']} ms)")
+            if c.get("warning"):
+                print(f"  warning: {c['warning']}")
             if c["error"]:
                 print(c["error"])
     return 0 if all_ok else 1

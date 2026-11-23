@@ -293,4 +293,51 @@ pub fn cross_signal_effect(src : signals::ReadSignal[Int]) -> () -> Unit {
 ')"
 run_case "neg_e009_cross_signal" "$PKG_E009_CROSS" "clean"
 
+# 9. Negative E009: effect reading writable Signal A and writing distinct writable Signal B must pass clean
+PKG_E009_TWO_WRITABLE="$(make_pkg "neg_e009_two_writable" '
+import "signals"
+
+pub fn two_writable_signals_effect() -> () -> Unit {
+  let a = signals::signal(1)
+  let b = signals::signal(0)
+  signals::effect(fn() -> Unit {
+    b.set(a.get() + 1)
+  })
+}
+')"
+run_case "neg_e009_two_writable" "$PKG_E009_TWO_WRITABLE" "clean"
+
+# 10. Positive E009: effect reading readonly alias `let ro = s.read()` and writing `s` must fail E009
+PKG_E009_RO_ALIAS="$(make_pkg "pos_e009_ro_alias" '
+import "signals"
+
+pub fn ro_alias_self_write() -> () -> Unit {
+  let s = signals::signal(0)
+  let ro = s.read()
+  signals::effect(fn() -> Unit {
+    let v = ro.get()
+    if v < 5 {
+      s.set(v + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_ro_alias" "$PKG_E009_RO_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
+# 11. Positive E009: effect reading and writing the same writable Signal via Keyed::count/set
+PKG_E009_SAME_SIG="$(make_pkg "pos_e009_same_signal" '
+import "signals"
+
+pub fn same_signal_self_write() -> () -> Unit {
+  let counter = signals::signal(0)
+  signals::effect(fn() -> Unit {
+    let cur = counter.get()
+    if cur < 3 {
+      counter.set(cur + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_same_signal" "$PKG_E009_SAME_SIG" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="
