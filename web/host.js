@@ -908,6 +908,7 @@
     return texture(u_bd, clamp(p * u_map.xy + u_map.zw, u_uvc.xy, u_uvc.zw)).rgb;
   }
   float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+  float mb_ink_luma(vec3 c) { return dot(c * c, vec3(0.2126, 0.7152, 0.0722)); }
   #endif
   #if ONE_KIND < 0 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
   float mb_backdrop_luma_rect(vec2 c, vec2 h) {
@@ -918,7 +919,7 @@
       float py = c.y + float(iy) * (h.y * 0.60);
       for (int ix = -2; ix <= 2; ix++) {
         float px = c.x + float(ix) * (h.x * 0.38);
-        float y = luma(backdrop(vec2(px, py)));
+        float y = mb_ink_luma(backdrop(vec2(px, py)));
         sum += y;
         if (y > mx1) { mx2 = mx1; mx1 = y; } else if (y > mx2) { mx2 = y; }
         if (y < mn1) { mn2 = mn1; mn1 = y; } else if (y < mn2) { mn2 = y; }
@@ -1003,11 +1004,11 @@
       if (u_uvc.z > u_uvc.x && u_uvc.w > u_uvc.y && guv.x >= u_uvc.x && guv.x <= u_uvc.z && guv.y >= u_uvc.y && guv.y <= u_uvc.w) {
         float rx = clamp(rect.z * 0.35, 6.0, 14.0);
         float ry = clamp(rect.w * 0.35, 5.0, 10.0);
-        float localL = (luma(backdrop(gc)) * 2.0
-          + luma(backdrop(gc + vec2(-rx, -ry)))
-          + luma(backdrop(gc + vec2(rx, -ry)))
-          + luma(backdrop(gc + vec2(-rx, ry)))
-          + luma(backdrop(gc + vec2(rx, ry)))) / 6.0;
+        float localL = (mb_ink_luma(backdrop(gc)) * 2.0
+          + mb_ink_luma(backdrop(gc + vec2(-rx, -ry)))
+          + mb_ink_luma(backdrop(gc + vec2(rx, -ry)))
+          + mb_ink_luma(backdrop(gc + vec2(-rx, ry)))
+          + mb_ink_luma(backdrop(gc + vec2(rx, ry)))) / 6.0;
         float localDarkT = 1.0 - smoothstep(0.24, 0.40, localL);
         float localW = max(smoothstep(0.35, 0.44, capsuleBgL), smoothstep(0.08, 0.20, capsuleBgL - localL));
         float localEff = localDarkT * localW;
@@ -1724,6 +1725,7 @@
   uniform vec4 u_param;
   out vec4 o;
   float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+  float mb_ink_luma(vec3 c) { return dot(c * c, vec3(0.2126, 0.7152, 0.0722)); }
   float mb_unpack16(vec2 rg) {
     float hi = floor(clamp(rg.x, 0.0, 1.0) * 255.0 + 0.5);
     float lo = floor(clamp(rg.y, 0.0, 1.0) * 255.0 + 0.5);
@@ -1743,7 +1745,7 @@
       for (int ix = -2; ix <= 2; ix++) {
         float px = c.x + float(ix) * (h.x * 0.38);
         vec2 uv = clamp(vec2(px, py) * u_map.xy + u_map.zw, u_uvc.xy, u_uvc.zw);
-        float y = luma(texture(u_bd, uv).rgb);
+        float y = mb_ink_luma(texture(u_bd, uv).rgb);
         sum += y;
         if (y > mx1) { mx2 = mx1; mx1 = y; } else if (y > mx2) { mx2 = y; }
         if (y < mn1) { mn2 = mn1; mn1 = y; } else if (y < mn2) { mn2 = y; }
