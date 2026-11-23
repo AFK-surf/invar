@@ -144,6 +144,7 @@ struct GlyphAtlasState {
   mut mono : hostapi::Atlas
   mut colour : hostapi::Atlas
   mut gen : Int
+  mut epoch : Int
   mut scale : Double
   mut initialized : Bool
   glyphs : Map[Int, GlyphSlot]
@@ -153,6 +154,7 @@ let glyph_state : GlyphAtlasState = GlyphAtlasState::{
   mono: hostapi::Atlas::new(0),
   colour: hostapi::Atlas::new(0),
   gen: -1,
+  epoch: 0,
   scale: 0.0,
   initialized: false,
   glyphs: Map::new(),
@@ -205,9 +207,11 @@ pub fn reset_glyph_atlas() -> Unit {
   glyph_state.colour.clear()
   glyph_state.glyphs.clear()
   glyph_state.gen = -1
+  glyph_state.epoch = glyph_state.epoch + 1
   glyph_state.scale = 0.0
   glyph_state.initialized = false
   clear_text_cache()
+  view_blocks_reset()
 }
 
 fn ensure_glyph_atlas(scale : Double) -> Unit {
@@ -215,14 +219,15 @@ fn ensure_glyph_atlas(scale : Double) -> Unit {
   let mono_side = hostapi::atlas_size(false)
   let col_side = hostapi::atlas_size(true)
   let need_reset = !glyph_state.initialized ||
-    glyph_state.gen != gen ||
-    (glyph_state.scale - scale).abs() > 0.001 ||
-    (mono_side > 0 && !glyph_state.mono.sized())
+  glyph_state.gen != gen ||
+  (glyph_state.scale - scale).abs() > 0.001 ||
+  (mono_side > 0 && !glyph_state.mono.sized())
   if need_reset {
     glyph_state.mono = hostapi::Atlas::new(if mono_side > 0 { mono_side } else { 1024 })
     glyph_state.colour = hostapi::Atlas::new(if col_side > 0 { col_side } else { 512 })
     glyph_state.glyphs.clear()
     glyph_state.gen = gen
+    glyph_state.epoch = glyph_state.epoch + 1
     glyph_state.scale = scale
     glyph_state.initialized = true
     clear_text_cache()
@@ -266,7 +271,10 @@ fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
       if !atlas.holds(pw, ph) {
         return None
       }
-      match atlas.place(key, pw, ph, fn(evicted : Int) { glyph_state.glyphs.remove(evicted) }) {
+      match atlas.place(key, pw, ph, fn(evicted : Int) {
+        glyph_state.glyphs.remove(evicted)
+        glyph_state.epoch = glyph_state.epoch + 1
+      }) {
         Some((plot, ax, ay)) => {
           hostapi::glyph_put(key, ax + across, ay)
           let slot = GlyphSlot::{
@@ -334,9 +342,9 @@ let shared_metrics_buf : Array[Double] = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
 
 fn measure_metrics(size : Double, weight : Int, style : Int) -> (Double, Double) {
   if text_cache.metrics_valid &&
-    text_cache.metrics_size == size &&
-    text_cache.metrics_weight == weight &&
-    text_cache.metrics_style == style {
+  text_cache.metrics_size == size &&
+  text_cache.metrics_weight == weight &&
+  text_cache.metrics_style == style {
     return (text_cache.metrics_asc, text_cache.metrics_desc)
   }
   shared_metrics_buf[0] = -1.0
@@ -356,9 +364,9 @@ fn measure_metrics(size : Double, weight : Int, style : Int) -> (Double, Double)
 fn shape_line_cached(raw : String, sz : Double, weight : Int, style_bits : Int) -> ShapedLine {
   let can_cache = raw.length() <= 96
   if can_cache &&
-    text_cache.shape_size == sz &&
-    text_cache.shape_weight == weight &&
-    text_cache.shape_style == style_bits {
+  text_cache.shape_size == sz &&
+  text_cache.shape_weight == weight &&
+  text_cache.shape_style == style_bits {
     match text_cache.shapes.get(raw) {
       Some(sl) => return sl
       None => ()
@@ -384,9 +392,9 @@ fn shape_line_cached(raw : String, sz : Double, weight : Int, style_bits : Int) 
   let sl = ShapedLine::{ n, locs, advs, gkeys }
   if can_cache {
     if text_cache.shape_size != sz ||
-      text_cache.shape_weight != weight ||
-      text_cache.shape_style != style_bits ||
-      text_cache.shapes.length() >= 2048 {
+    text_cache.shape_weight != weight ||
+    text_cache.shape_style != style_bits ||
+    text_cache.shapes.length() >= 2048 {
       text_cache.shapes.clear()
       text_cache.shape_size = sz
       text_cache.shape_weight = weight
@@ -628,25 +636,25 @@ fn encode_words(
         let gkey = gkeys[k]
         match resolve_glyph(gkey, scale) {
           Some(slot) =>
-            scene.push_glyph_inst(
-              pen_x + pad + slot.ox,
-              baseline_y + slot.oy,
-              slot.gw,
-              slot.gh,
-              if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
-              ink_r,
-              ink_g,
-              ink_b,
-              ink_a,
-              slot.u,
-              slot.v,
-              slot.gw * scale,
-              slot.gh * scale,
-              eff_clip_x,
-              eff_clip_y,
-              eff_clip_x1,
-              eff_clip_y1,
-            )
+          scene.push_glyph_inst(
+            pen_x + pad + slot.ox,
+            baseline_y + slot.oy,
+            slot.gw,
+            slot.gh,
+            if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
+            ink_r,
+            ink_g,
+            ink_b,
+            ink_a,
+            slot.u,
+            slot.v,
+            slot.gw * scale,
+            slot.gh * scale,
+            eff_clip_x,
+            eff_clip_y,
+            eff_clip_x1,
+            eff_clip_y1,
+          )
           None => ()
         }
         pen_x = pen_x + adv
@@ -668,6 +676,167 @@ fn encode_words(
     }
   }
   square_clip
+}
+
+struct RunsCluster {
+  adv : Double
+  gkey : Int
+  cu : Int
+  rink : Int64
+  run_bg : Int64
+}
+
+struct RunsVisualLine {
+  start : Int
+  end : Int
+  width : Double
+}
+
+struct RunsLayout {
+  clusters : Array[RunsCluster]
+  lines : Array[RunsVisualLine]
+  widest : Double
+  shaped_any : Bool
+  had_text : Bool
+}
+
+fn layout_runs(
+  runs : Array[text::Run],
+  base_sz : Double,
+  base_w : Int,
+  spacing : Double,
+  lig_bit : Int,
+  default_ink : Int64,
+  wrap : Bool,
+  max_w : Double,
+  max_lines : Int,
+) -> RunsLayout {
+  let clusters : Array[RunsCluster] = []
+  let para_ranges : Array[(Int, Int)] = []
+  let mut para_start = 0
+  let mut shaped_any = false
+  let mut had_text = false
+
+  for run in runs {
+    if run.text.length() == 0 {
+      continue
+    }
+    had_text = true
+    let rsz = if run.scale > 0.0 { base_sz * run.scale } else { base_sz }
+    let rweight = if run.weight > 0 { run.weight } else { base_w }
+    let face_bits = match run.face {
+      Some(f) if f > 0 && f < 16 => (f & 15) << 8
+      _ => 0
+    }
+    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | lig_bit
+    let rink = if (run.color & 0xFFL) != 0L { run.color } else { default_ink }
+    let sub_lines = split_lines(run.text)
+    let mut si = 0
+    while si < sub_lines.length() {
+      if si > 0 {
+        para_ranges.push((para_start, clusters.length()))
+        para_start = clusters.length()
+      }
+      let seg = sub_lines[si]
+      if seg.length() > 0 {
+        let cap = (seg.length() + 4) * 4
+        let sbuf = ensure_shape_buf(cap)
+        let n = hostapi::shape(seg, rsz, rweight, rstyle, sbuf)
+        if n > 0 {
+          shaped_any = true
+          resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
+          let mut k = 0
+          while k < n {
+            let loc = sbuf[k * 4].to_int()
+            let adv = sbuf[k * 4 + 2] + spacing
+            let gkey = sbuf[k * 4 + 3].to_int()
+            let sub = utf16_slice(seg, loc, loc + 1)
+            let cu = if sub.length() > 0 {
+              sub.code_unit_at(0)
+            } else if loc >= 0 && loc < seg.length() {
+              seg.code_unit_at(loc)
+            } else {
+              0
+            }
+            clusters.push(RunsCluster::{ adv, gkey, cu, rink, run_bg: run.bg })
+            k += 1
+          }
+        }
+      }
+      si += 1
+    }
+  }
+  if had_text {
+    para_ranges.push((para_start, clusters.length()))
+  }
+
+  let lines : Array[RunsVisualLine] = []
+  let mut widest = 0.0
+  for pr in para_ranges {
+    if max_lines > 0 && lines.length() >= max_lines {
+      break
+    }
+    let (p_start, p_end) = pr
+    if p_start >= p_end {
+      lines.push(RunsVisualLine::{ start: p_start, end: p_start, width: 0.0 })
+      continue
+    }
+    let mut start = p_start
+    while start < p_end {
+      if max_lines > 0 && lines.length() >= max_lines {
+        break
+      }
+      let mut end = start
+      let mut line_w = 0.0
+      let mut last_break_end = -1
+      let mut break_line_w = 0.0
+      let mut wrapped = false
+      while end < p_end {
+        let cl = clusters[end]
+        let adv = cl.adv
+        let cu = cl.cu
+        let is_space = cu == 32 || cu == 9
+        if wrap && end > start && line_w + adv > max_w {
+          if !is_space && last_break_end > start {
+            end = last_break_end
+            line_w = break_line_w
+          }
+          wrapped = true
+          break
+        }
+        if is_space {
+          last_break_end = end
+          break_line_w = line_w
+        }
+        line_w = line_w + adv
+        end += 1
+        if !is_space && (cu == 45 || cu >= 128) {
+          last_break_end = end
+          break_line_w = line_w
+        }
+      }
+      if end == start {
+        line_w = clusters[start].adv
+        end = start + 1
+      }
+      if line_w > widest {
+        widest = line_w
+      }
+      lines.push(RunsVisualLine::{ start, end, width: line_w })
+      start = end
+      if wrapped {
+        while start < p_end {
+          let scu = clusters[start].cu
+          if scu == 32 || scu == 9 {
+            start += 1
+          } else {
+            break
+          }
+        }
+      }
+    }
+  }
+  RunsLayout::{ clusters, lines, widest, shaped_any, had_text }
 }
 
 /// Shape and emit real glyph quads (and inline run backgrounds) for `d.runs`.
@@ -693,64 +862,34 @@ fn encode_runs(
   let line_h = if d.words_look.line > 0.0 { d.words_look.line } else { base_asc + base_desc }
   let base_off = (line_h - (base_asc + base_desc)) * 0.5 + base_asc
   let wrap = d.words_look.wrap && d.w > 0.0
+  let layout = layout_runs(d.runs, base_sz, base_w, spacing, lig_bit, d.ink, wrap, d.w, d.words_look.max_lines)
 
   let mut line_idx = 0
-  let mut pen_x = d.x
-  for run in d.runs {
-    if run.text.length() == 0 {
-      continue
-    }
-    let rsz = if run.scale > 0.0 { base_sz * run.scale } else { base_sz }
-    let rweight = if run.weight > 0 { run.weight } else { base_w }
-    let face_bits = match run.face {
-      Some(f) if f > 0 && f < 16 => (f & 15) << 8
-      _ => 0
-    }
-    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | lig_bit
-    let rink = if (run.color & 0xFFL) != 0L { run.color } else { d.ink }
-    let sub_lines = split_lines(run.text)
-    let mut si = 0
-    while si < sub_lines.length() {
-      if si > 0 {
-        line_idx += 1
-        pen_x = d.x
+  while line_idx < layout.lines.length() {
+    let vl = layout.lines[line_idx]
+    let line_y = d.y + line_idx.to_double() * line_h
+    let baseline_y = line_y + base_off
+    let mut pen_x = d.x
+    let mut k = vl.start
+    while k < vl.end {
+      let cl = layout.clusters[k]
+      if (cl.run_bg & 0xFFL) != 0L && cl.adv > 0.0 {
+        let _ = scene.push_inst(
+          pen_x, line_y, cl.adv, line_h,
+          0.0, 0.0, 0.0, 0.0, cl.run_bg, d.alpha, 0.0, 0.0, 0.0, 0.0,
+          clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+        )
       }
-      let seg = sub_lines[si]
-      if seg.length() > 0 {
-        let cap = (seg.length() + 4) * 4
-        let sbuf = ensure_shape_buf(cap)
-        let n = hostapi::shape(seg, rsz, rweight, rstyle, sbuf)
-        if n > 0 {
-          resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
-        }
-        let mut k = 0
-        while k < n {
-          let adv = sbuf[k * 4 + 2] + spacing
-          if wrap && pen_x > d.x && (pen_x - d.x) + adv > d.w {
-            line_idx += 1
-            pen_x = d.x
-          }
-          let baseline_y = d.y + line_idx.to_double() * line_h + base_off
-          if (run.bg & 0xFFL) != 0L && adv > 0.0 {
-            let _ = scene.push_inst(
-              pen_x, d.y + line_idx.to_double() * line_h, adv, line_h,
-              0.0, 0.0, 0.0, 0.0, run.bg, d.alpha, 0.0, 0.0, 0.0, 0.0,
-              clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
-            )
-          }
-          let gkey = sbuf[k * 4 + 3].to_int()
-          if (rink & 0xFFL) != 0L {
-            match resolve_glyph(gkey, scale) {
-              Some(slot) => emit_glyph_quad(scene, pen_x + pad, baseline_y, slot, rink, d.alpha, scale, clip_x, clip_y, clip_x1, clip_y1)
-              None => ()
-            }
-          }
-          pen_x = pen_x + adv
-          k += 1
+      if (cl.rink & 0xFFL) != 0L {
+        match resolve_glyph(cl.gkey, scale) {
+          Some(slot) => emit_glyph_quad(scene, pen_x + pad, baseline_y, slot, cl.rink, d.alpha, scale, clip_x, clip_y, clip_x1, clip_y1)
+          None => ()
         }
       }
-      si += 1
+      pen_x = pen_x + cl.adv
+      k += 1
     }
+    line_idx += 1
   }
 }
 
@@ -875,7 +1014,8 @@ pub fn host_words_measure(
   (out_w, out_lines.to_double() * line_h)
 }
 
-/// Measure styled `text::Run` paragraphs using real `hostapi::shape` advances.
+/// Measure styled `text::Run` paragraphs using real `hostapi::shape` advances and
+/// cross-run word-boundary wrapping matching `encode_runs`.
 /// Falls back to `view::runs_measure` when the host has no shaper.
 pub fn host_runs_measure(
   runs : Array[text::Run],
@@ -901,76 +1041,18 @@ pub fn host_runs_measure(
     asc + desc
   }
   let wrap = look.wrap && max_w > 0.0
-  let mut line_idx = 0
-  let mut cur_w = 0.0
-  let mut widest = 0.0
-  let mut shaped_any = false
-  let mut had_text = false
-
-  for run in runs {
-    if run.text.length() == 0 {
-      continue
-    }
-    had_text = true
-    let rsz = if run.scale > 0.0 { base_sz * run.scale } else { base_sz }
-    let rweight = if run.weight > 0 { run.weight } else { base_w }
-    let face_bits = match run.face {
-      Some(f) if f > 0 && f < 16 => (f & 15) << 8
-      _ => 0
-    }
-    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | lig_bit
-    let sub_lines = split_lines(run.text)
-    let mut si = 0
-    while si < sub_lines.length() {
-      if si > 0 {
-        if cur_w > widest {
-          widest = cur_w
-        }
-        line_idx += 1
-        cur_w = 0.0
-      }
-      let seg = sub_lines[si]
-      if seg.length() > 0 {
-        let cap = (seg.length() + 4) * 4
-        let sbuf = ensure_shape_buf(cap)
-        let n = hostapi::shape(seg, rsz, rweight, rstyle, sbuf)
-        if n <= 0 && !shaped_any {
-          return view::runs_measure(runs, look, set, max_w, scale)
-        }
-        if n > 0 {
-          shaped_any = true
-          resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
-        }
-        let mut k = 0
-        while k < n {
-          let adv = sbuf[k * 4 + 2] + spacing
-          if wrap && cur_w > 0.0 && cur_w + adv > max_w {
-            if cur_w > widest {
-              widest = cur_w
-            }
-            line_idx += 1
-            cur_w = 0.0
-          }
-          cur_w = cur_w + adv
-          k += 1
-        }
-      }
-      si += 1
-    }
-  }
-  if had_text && !shaped_any {
+  let layout = layout_runs(runs, base_sz, base_w, spacing, lig_bit, 0L, wrap, max_w, look.max_lines)
+  if layout.had_text && !layout.shaped_any {
     return view::runs_measure(runs, look, set, max_w, scale)
   }
-  if cur_w > widest {
-    widest = cur_w
-  }
+  let widest = layout.widest
   let out_w = if widest > 0.0 {
     let padded = (widest + 0.5).ceil()
     if wrap && widest <= max_w && padded > max_w { max_w } else { padded }
   } else {
     0.0
   }
-  let out_lines = line_idx + 1
+  let out_lines = if layout.lines.length() > 0 { layout.lines.length() } else { 1 }
   (out_w, out_lines.to_double() * line_h)
 }
 

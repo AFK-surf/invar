@@ -2569,3 +2569,219 @@ test "59 view_frame refreshes text measurement, layout, and full dirty on atlas_
   view_forget()
   hostapi::set_host(prev_host)
 }
+
+test "60 host switch with same atlas_generation=0 invalidates ViewBlock via epoch and avoids stale UVs" {
+  let fake_a = FakeHost::new(width=400.0, height=300.0, scale=2.0)
+  let prev_host = fake_a.install()
+  let ha = hostapi::host()
+  ha.atlas_generation = fn() -> Int { 0 }
+
+  set_view_app(fn(root : view::View) {
+    let _ = root.transitions_only().lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(badge : view::View) {
+      let _ = badge
+      .width(view::Live::Is(Some(28.0)))
+      .height(view::Live::Is(Some(28.0)))
+      .words(view::Live::Is("M"), ink=0x111111FFL, look=view::words_plain)
+    })
+    let _ = root.box(fn(title : view::View) {
+      let _ = title
+      .width(view::Live::Is(Some(400.0)))
+      .words(view::Live::Is("Confirm Component Baseline"), ink=0x111111FFL, look=view::words_plain)
+    })
+  })
+
+  // Frame 1 on Host A: populates ViewBlocks and places "M" first at (0, 0) in Host A's atlas
+  let _ = view_frame(400.0, 300.0, 2.0, 0.0)
+  let sc_a1 = view_scene_last()
+  let mut m_u_a = -1.0
+  let mut m_v_a = -1.0
+  let mut i = 0
+  while i < sc_a1.ninst {
+    let b = i * inst_size
+    if (sc_a1.inst[b + 5] - 1.0).abs() < 0.01 {
+      m_u_a = sc_a1.inst[b + 12]
+      m_v_a = sc_a1.inst[b + 13]
+      break
+    }
+    i += 1
+  }
+  debug_assert(m_u_a >= 0.0 && m_v_a >= 0.0, "Host A emitted glyph M with valid UV")
+
+  // Frame 2 on Host A: confirms ViewBlock cache hits when atlas epoch is unchanged
+  view_paint_work_reset()
+  let _ = view_frame(400.0, 300.0, 2.0, 16.0)
+  let work_a2 = view_paint_work_now()
+  debug_assert(work_a2.copied >= 2, "Frame 2 on Host A must hit cached ViewBlocks (copied=\{work_a2.copied})")
+
+  // Switch to Host B whose atlas_generation() is STILL 0, reset atlas, and pre-occupy (0, 0) with another glyph
+  let fake_b = FakeHost::new(width=400.0, height=300.0, scale=2.0)
+  let _ = fake_b.install()
+  let hb = hostapi::host()
+  hb.atlas_generation = fn() -> Int { 0 }
+  reset_glyph_atlas()
+  let pre_sc = Scene::new()
+  pre_sc.clear(400.0, 300.0, 2.0)
+  let _ = pre_sc.draw_text_run(0.0, 20.0, "WXYZ", 15.0)
+
+  // Re-render the exact same tree on Host B: must NOT hit stale ViewBlocks and must use Host B's new UVs
+  view_paint_work_reset()
+  let _ = view_frame(400.0, 300.0, 2.0, 32.0)
+  let work_b = view_paint_work_now()
+  debug_assert(work_b.copied == 0, "Host B after reset_glyph_atlas must not replay stale ViewBlocks, got copied=\{work_b.copied}")
+
+  let sc_b = view_scene_last()
+  let mut glyph_idx = 0
+  let mut m_u_b = -1.0
+  let mut m_v_b = -1.0
+  let expected_str = "MConfirmComponentBaseline"
+  let mut bi = 0
+  while bi < sc_b.ninst {
+    let b = bi * inst_size
+    if (sc_b.inst[b + 5] - 1.0).abs() < 0.01 {
+      let u = sc_b.inst[b + 12]
+      let v = sc_b.inst[b + 13]
+      if glyph_idx == 0 {
+        m_u_b = u
+        m_v_b = v
+      }
+      debug_assert(glyph_idx < expected_str.length(), "unexpected extra glyph at index \{glyph_idx}")
+      let ch = expected_str.code_unit_at(glyph_idx)
+      match glyph_state.glyphs.get(ch) {
+        Some(slot) =>
+        debug_assert(
+          (u - slot.u).abs() < 0.01 && (v - slot.v).abs() < 0.01,
+          "glyph \{glyph_idx} UV (\{u}, \{v}) must strictly match Host B atlas slot (\{slot.u}, \{slot.v})",
+        )
+        None => debug_assert(false, "Host B atlas must contain slot for glyph \{glyph_idx}")
+      }
+      glyph_idx += 1
+    }
+    bi += 1
+  }
+  debug_assert(glyph_idx == expected_str.length(), "expected \{expected_str.length()} glyphs, got \{glyph_idx}")
+  debug_assert(
+    (m_u_b - m_u_a).abs() > 0.5 || (m_v_b - m_v_a).abs() > 0.5,
+    "M UV on Host B (\{m_u_b}, \{m_v_b}) must shift away from Host A (\{m_u_a}, \{m_v_a})",
+  )
+
+  view_forget()
+  hostapi::set_host(prev_host)
+}
+
+test "61 encode_runs and host_runs_measure wrap on cross-run word boundaries without splitting words" {
+  let runs = [
+    text::plain("All surfaces follow "),
+    text::Run::{ ..text::plain("42 -> 26"), weight: 700 },
+    text::plain(" with "),
+    text::Run::{ ..text::plain("linked specs"), color: 0x0A84FFFFL },
+    text::plain(" and "),
+    text::Run::{ ..text::plain("0.5pt"), code: true, bg: 0x00000018L },
+    text::plain(" hairlines and decision card."),
+  ]
+  // FakeHost at 15pt => 9.0pt/char. Pick widths that would mid-word split "linked" and "decision" under char wrapping.
+  // "All surfaces follow 42 -> 26 with linked" -> at max_w=175.0 (19 chars = 171pt):
+  //   Line 1: "All surfaces follow" (19)
+  //   Line 2: "42 -> 26 with" (13; + " linked" = 20 > 19, so "linked" wraps intact to line 3!)
+  //   Line 3: "linked specs and" (16; + " 0.5pt" = 22 > 19)
+  //   Line 4: "0.5pt hairlines and" (19; + " decision" > 19, so "decision" wraps intact to line 5!)
+  //   Line 5: "decision card." (14)
+  let look = view::WordsLook::{ ..view::words_plain, size: 15.0, line: 20.0, wrap: true }
+  let box_w = 175.0
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+      .width(view::Live::Is(Some(box_w)))
+      .words_runs(view::Live::Is(runs), ink=0x111111FFL, look=look)
+    })
+  }, width=300.0, height=300.0)
+
+  let (_, mh) = host_runs_measure(runs, look, view::runs_plain, box_w, 1.0)
+  let measured_lines = (mh / 20.0).round().to_int()
+
+  let sc = t.scene()
+  let glyph_ys : Array[Double] = []
+  let distinct_ys : Array[Double] = []
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    if (sc.inst[b + 5] - 1.0).abs() < 0.01 {
+      let gy = sc.inst[b + 1]
+      glyph_ys.push(gy)
+      let mut seen = false
+      for dy in distinct_ys {
+        if (dy - gy).abs() < 1.0 {
+          seen = true
+          break
+        }
+      }
+      if !seen {
+        distinct_ys.push(gy)
+      }
+    }
+    i += 1
+  }
+  debug_assert(
+    distinct_ys.length() == measured_lines,
+    "encode_runs visual line count (\{distinct_ys.length()}) must equal host_runs_measure (\{measured_lines})",
+  )
+
+  // Non-space character stream:
+  // "Allsurfacesfollow" (0..17), "42->26" (17..23), "with" (23..27),
+  // "linked" (27..33), "specs" (33..38), "and" (38..41), "0.5pt" (41..46),
+  // "hairlines" (46..55), "and" (55..58), "decision" (58..66), "card." (66..71)
+  debug_assert(glyph_ys.length() == 71, "expected 71 non-space glyphs, got \{glyph_ys.length()}")
+  let linked_y = glyph_ys[27]
+  let mut li = 28
+  while li < 33 {
+    debug_assert((glyph_ys[li] - linked_y).abs() < 0.5, "all 6 glyphs of 'linked' must stay on one line")
+    li += 1
+  }
+  let decision_y = glyph_ys[58]
+  let mut di = 59
+  while di < 66 {
+    debug_assert((glyph_ys[di] - decision_y).abs() < 0.5, "all 8 glyphs of 'decision' must stay on one line")
+    di += 1
+  }
+  t.dispose()
+
+  // Cross-run unbroken word ("in" + "var"), over-wide single word hard-break, and CJK wrapping
+  let cross_runs = [
+    text::plain("hello "),
+    text::Run::{ ..text::plain("in"), weight: 700 },
+    text::plain("var"),
+  ]
+  let tc = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      // 8 chars = 72pt fits "hello in" (8) but not "hello invar" (11) -> "invar" must wrap intact to line 2
+      let _ = v.width(view::Live::Is(Some(75.0))).words_runs(view::Live::Is(cross_runs), ink=0x111111FFL, look=look)
+    })
+  }, width=200.0, height=200.0)
+  let scc = tc.scene()
+  let cys : Array[Double] = []
+  let mut ci = 0
+  while ci < scc.ninst {
+    let b = ci * inst_size
+    if (scc.inst[b + 5] - 1.0).abs() < 0.01 {
+      cys.push(scc.inst[b + 1])
+    }
+    ci += 1
+  }
+  debug_assert(cys.length() == 10, "expected 10 glyphs for 'hello invar', got \{cys.length()}")
+  let invar_y = cys[5]
+  debug_assert(invar_y > cys[0] + 10.0, "'invar' wraps to second line")
+  let mut ii = 6
+  while ii < 10 {
+    debug_assert((cys[ii] - invar_y).abs() < 0.5, "cross-run word 'invar' must not split between 'in' and 'var'")
+    ii += 1
+  }
+
+  let long_runs = [text::plain("Supercalifragilistic")]
+  let (_, long_h) = host_runs_measure(long_runs, look, view::runs_plain, 60.0, 1.0)
+  debug_assert((long_h / 20.0).round().to_int() >= 3, "over-wide single word must hard-break across multiple lines")
+
+  let cjk_runs = [text::plain("中文排版支持按字折行")]
+  let (_, cjk_h) = host_runs_measure(cjk_runs, look, view::runs_plain, 60.0, 1.0)
+  debug_assert((cjk_h / 20.0).round().to_int() >= 2, "CJK runs must wrap cleanly across lines")
+  tc.dispose()
+}
