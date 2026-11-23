@@ -9,83 +9,73 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
-import android.util.DisplayMetrics;
 import android.view.HapticFeedbackConstants;
 import android.view.KeyEvent;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.Arrays;
-import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Device capabilities beyond the window: screen metrics & density, safe-area
- * insets, key catcher mode, soft keyboard inset, clipboard read/write,
- * keep-awake, IME action hints, and haptic feedback.
+ * The device beyond the window (src/hostapi/device.mbt; android_device.h calls these): a key catcher's keyboard (the
+ * focus with no text of its own: MBView asks catchKey while `catching`), the soft keyboard's height, the clipboard
+ * read (its words, its picture made a PNG, asPng, encodePng) and written
+ * (words with a label; a PNG kept as a file of the cache's screen-clips, the newest KEEP, that the clip points at
+ * through Shares.Files), the screen kept on, haptics.
  */
 final class Device {
+    /** The focus is a key catcher's (@hostapi.key_catch): MBView's keys and input connection are the catcher's. */
     static volatile boolean catching;
-    static volatile float safeTop, safeBottom, safeLeft, safeRight;
 
+    // A pasted picture is an attachment (device.mbt's clip_*_max); a screen checks its transport's own bound.
     static final int PNG_MAX = 1 << 30;
     static final int SOURCE_MAX = 32 * 1024 * 1024;
     static final long PIXELS_MAX = 16L * 1024 * 1024;
+    /** What a picture on the clipboard is (device.mbt's clip_*). */
     static final int NONE = 0, PNG = 1, TOO_LARGE = 2, UNREADABLE = 3;
-
-    static float density(Context c) {
-        DisplayMetrics dm = c.getResources().getDisplayMetrics();
-        return dm.density > 0 ? dm.density : 1f;
-    }
-
-    static int screenWidthPx(Context c) {
-        return c.getResources().getDisplayMetrics().widthPixels;
-    }
-
-    static int screenHeightPx(Context c) {
-        return c.getResources().getDisplayMetrics().heightPixels;
-    }
-
-    static void updateSafeInsets(float top, float bottom, float left, float right) {
-        safeTop = top;
-        safeBottom = bottom;
-        safeLeft = left;
-        safeRight = right;
-    }
 
     static void keyCatch(boolean on) {
         if (catching == on) return;
         catching = on;
-        if (Host.imeActive) {
-            Host.main.post(() -> {
-                MBView v = Host.view;
-                if (v == null) return;
-                InputMethodManager imm = (InputMethodManager) v.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-                if (imm != null) imm.restartInput(v);
-            });
-        }
+        // the input method's connection made again, as the catcher's (or the field's) now
+        if (Host.imeActive) Host.main.post(() -> {
+            MBView v = Host.view;
+            if (v == null) return;
+            InputMethodManager imm = (InputMethodManager) v.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            imm.restartInput(v);
+        });
     }
 
+    /** The soft keyboard over the view's foot, in points (MainActivity's keyboardAt). */
     static double imeInset() {
         MBView v = Host.view;
         return v == null ? 0 : Host.imeBottom / v.density;
     }
 
+    /** Android 13 and later show what was put on the clipboard themselves, with a preview. */
     static boolean copyShown() {
         return Build.VERSION.SDK_INT >= 33;
     }
 
+    /** What is held with a key, as the framework's modifiers (src/ui/desktop.mbt: Shift 1, Ctrl 2, Alt 4, Meta 8). */
     static int keyMods(KeyEvent e) {
         int meta = e.getMetaState();
-        return ((meta & KeyEvent.META_SHIFT_ON) != 0 ? 1 : 0)
-                | ((meta & KeyEvent.META_CTRL_ON) != 0 ? 2 : 0)
-                | ((meta & KeyEvent.META_ALT_ON) != 0 ? 4 : 0)
-                | ((meta & KeyEvent.META_META_ON) != 0 ? 8 : 0);
+        return ((meta & KeyEvent.META_SHIFT_ON) != 0 ? 1 : 0) | ((meta & KeyEvent.META_CTRL_ON) != 0 ? 2 : 0)
+                | ((meta & KeyEvent.META_ALT_ON) != 0 ? 4 : 0) | ((meta & KeyEvent.META_META_ON) != 0 ? 8 : 0);
     }
 
+    /**
+     * A key with the focus a catcher's (from a keyboard, or the input method's sendKeyEvent): the framework's code and
+     * modifiers (src/ui/desktop.mbt: Shift 1, Ctrl 2, Alt 4, Meta 8), or null for a character typed as text. As
+     * the app's Input.kt domKey: the named keys; a letter or digit with Ctrl, Alt or Meta held as its key (1000 +
+     * the character, lower case), another character with them by itself.
+     */
     static int[] catchKey(KeyEvent e) {
         int mods = keyMods(e);
         int code;
@@ -105,7 +95,7 @@ final class Device {
             case KeyEvent.KEYCODE_ESCAPE: code = 17; break;
             case KeyEvent.KEYCODE_TAB: code = 18; break;
             case KeyEvent.KEYCODE_SPACE: code = 1032; break;
-            default: code = 0; break;
+            default: code = 0;
         }
         if (code != 0) return new int[] {code, mods};
         if ((mods & (2 | 4 | 8)) == 0) return null;
@@ -116,8 +106,9 @@ final class Device {
         return ch > 0 ? new int[] {1000 + ch, mods} : null;
     }
 
-    // ---- Clipboard read ----
+    // ---- the clipboard read ----
 
+    /** A read: 0 reading, 1 read; its words and its picture. */
     static final class Read {
         volatile int state;
         String text = "";
@@ -128,6 +119,7 @@ final class Device {
     static final ConcurrentHashMap<Integer, Read> reads = new ConcurrentHashMap<>();
     private static final AtomicInteger nextRead = new AtomicInteger(1);
 
+    /** The clipboard read: the primary clip taken on the main thread (as the app in front), the rest off it. */
     static int clipRead() {
         int id = nextRead.getAndIncrement();
         Read r = new Read();
@@ -146,18 +138,18 @@ final class Device {
                 if (got != null && c != null) readClip(c, got, r);
                 r.state = 1;
                 Native.tell(Native.OUTSIDE_CLIP, id, 1);
-            }, "invar-clip-read").start();
+            }, "mbui-clip-read").start();
         });
         return id;
     }
 
+    /** As the app's ScreenViewer.kt paste: the first item's picture (its URI, an image as the clip or its provider
+     * says), its words (its text; else, with no picture, what it says as text). */
     private static void readClip(Context c, ClipData clip, Read r) {
         ClipData.Item item = clip.getItemAt(0);
         ClipDescription d = clip.getDescription();
         boolean described = false;
-        if (d != null) {
-            for (int i = 0; i < d.getMimeTypeCount(); i++) described |= isImage(d.getMimeType(i));
-        }
+        if (d != null) for (int i = 0; i < d.getMimeTypeCount(); i++) described |= isImage(d.getMimeType(i));
         ContentResolver cr = c.getContentResolver();
         Uri uri = item.getUri();
         Uri image = null;
@@ -181,7 +173,7 @@ final class Device {
     }
 
     private static boolean isImage(String type) {
-        return type != null && type.trim().toLowerCase(Locale.ROOT).startsWith("image/");
+        return type != null && type.trim().toLowerCase().startsWith("image/");
     }
 
     private static void readyImage(ContentResolver cr, Uri uri, Read r) {
@@ -197,6 +189,7 @@ final class Device {
             int max = SOURCE_MAX;
             for (int n; (n = in.read(buf)) >= 0; ) {
                 out.write(buf, 0, n);
+                // A PNG is handed over as it is; the smaller source bound is for pictures that need decoding.
                 if (!kindRead && out.size() >= 8) {
                     kindRead = true;
                     if (isPng(out.toByteArray())) max = PNG_MAX;
@@ -220,6 +213,7 @@ final class Device {
             if (r.picture == PNG) r.png = bytes;
             return;
         }
+        // another kind (JPEG, WebP, HEIF, a GIF's first frame…) made a PNG; too many pixels are not decoded
         BitmapFactory.Options bounds = new BitmapFactory.Options();
         bounds.inJustDecodeBounds = true;
         BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
@@ -281,18 +275,69 @@ final class Device {
         reads.remove(id);
     }
 
+    // ---- the clipboard written ----
+
+    /** What was last put there: a PNG still being kept is not put there once another came after it. */
+    private static final AtomicInteger copies = new AtomicInteger();
+
+    /** Words (`png` empty) or a PNG put on the clipboard, `label` the clip's. */
     static void clipSet(String text, byte[] png, String label) {
         Context c = Host.activity;
         if (c == null) return;
-        Host.main.post(() -> {
+        int n = copies.incrementAndGet();
+        if (png == null || png.length == 0) {
+            Host.main.post(() -> setClip(c, ClipData.newPlainText(label, text)));
+            return;
+        }
+        new Thread(() -> {
+            File f;
             try {
-                ClipboardManager cm = (ClipboardManager) c.getSystemService(Context.CLIPBOARD_SERVICE);
-                if (cm != null) cm.setPrimaryClip(ClipData.newPlainText(label != null ? label : "text", text != null ? text : ""));
+                f = keep(new File(c.getCacheDir(), Shares.CLIPS), png, System.currentTimeMillis());
             } catch (Exception e) {
                 Host.log("clipboard: " + e);
+                return;
             }
-        });
+            Uri uri = new Uri.Builder().scheme("content").authority(c.getPackageName() + ".shared")
+                    .appendPath(Shares.CLIPS).appendPath(f.getName()).build();
+            Host.main.post(() -> {
+                if (n == copies.get()) setClip(c, new ClipData(label, new String[] {"image/png"}, new ClipData.Item(uri)));
+            });
+        }, "mbui-clip-keep").start();
     }
+
+    private static void setClip(Context c, ClipData clip) {
+        try {
+            ((ClipboardManager) c.getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(clip);
+        } catch (Exception e) {
+            Host.log("clipboard: " + e);
+        }
+    }
+
+    /** How many are kept: the one on the clipboard and a couple before it (another app may still be reading one). */
+    static final int KEEP = 3;
+    private static long last;
+
+    /** `png` kept as a new file in `dir`, named so the newest sorts last; those beyond KEEP deleted, oldest first
+     * (the app's ScreenClips.keep). */
+    static synchronized File keep(File dir, byte[] png, long now) throws java.io.IOException {
+        dir.mkdirs();
+        // each later than the one before, however quickly they come
+        last = Math.max(now, last + 1);
+        String stamp = Long.toString(last);
+        while (stamp.length() < 15) stamp = "0" + stamp;
+        File file = new File(dir, "copied-" + stamp + ".png");
+        try (FileOutputStream out = new FileOutputStream(file)) {
+            out.write(png);
+        }
+        File[] all = dir.listFiles(File::isFile);
+        if (all != null && all.length > KEEP) {
+            Arrays.sort(all, (a, b) -> a.getName().compareTo(b.getName()));
+            for (int i = 0; i < all.length - KEEP; i++) all[i].delete();
+        }
+        return file;
+    }
+
+    // ---- the screen and haptics ----
 
     static void keepAwake(boolean on) {
         Host.main.post(() -> {
@@ -303,6 +348,10 @@ final class Device {
         });
     }
 
+    /**
+     * The input method's action for the field about to type (hostapi ime_action: 0 none, 1 search, 2 an address's go, 3 a number's done, 4 a secret's, 5 an email address's, 6 words taken as typed), read as the view
+     * makes its input connection (MBView); another than before, the input method is started again with it.
+     */
     static volatile int imeAction;
 
     static void imeAction(int kind) {
@@ -312,10 +361,11 @@ final class Device {
             MBView v = Host.view;
             if (v == null) return;
             InputMethodManager imm = (InputMethodManager) v.getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
-            if (imm != null) imm.restartInput(v);
+            imm.restartInput(v);
         });
     }
 
+    /** device.mbt's haptic_* as the constants Compose's AndroidHapticFeedback performs for them. */
     static void haptic(int kind) {
         int constant;
         switch (kind) {

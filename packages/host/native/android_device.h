@@ -1,10 +1,12 @@
-// Device capabilities beyond the window on Android: dev.invar.Device handles
-// key catching, soft keyboard inset, clipboard, keep-awake, haptics, and IME action.
-// Included at the end of android_host.c (uses env_, jstr, jbytes, mstr).
+// The device beyond the window on Android (src/hostapi/device.mbt): dev.invar.Device does it, these call it. Included at
+// the end of android_host.c (its env_, jstr, jbytes, mstr); device_init runs in its JNI_OnLoad.
 
 static jclass device_cls;
 static jmethodID m_dv_catch, m_dv_inset, m_dv_copy_shown, m_dv_read, m_dv_state, m_dv_picture, m_dv_text, m_dv_png,
     m_dv_end, m_dv_set, m_dv_awake, m_dv_haptic, m_dv_ime_action;
+static jclass natives_cls;
+// (m_na_: android_host.c has m_nt_ for Notices; one file, a name of both was one variable, Natives' state called on Notices)
+static jmethodID m_na_call, m_na_state, m_na_result, m_na_end;
 
 static void device_init(JNIEnv *env) {
   device_cls = (*env)->NewGlobalRef(env, (*env)->FindClass(env, "dev/invar/Device"));
@@ -21,47 +23,45 @@ static void device_init(JNIEnv *env) {
   m_dv_awake = (*env)->GetStaticMethodID(env, device_cls, "keepAwake", "(Z)V");
   m_dv_haptic = (*env)->GetStaticMethodID(env, device_cls, "haptic", "(I)V");
   m_dv_ime_action = (*env)->GetStaticMethodID(env, device_cls, "imeAction", "(I)V");
+  natives_cls = (*env)->NewGlobalRef(env, (*env)->FindClass(env, "dev/invar/Natives"));
+  m_na_call = (*env)->GetStaticMethodID(env, natives_cls, "call", "(Ljava/lang/String;Ljava/lang/String;)I");
+  m_na_state = (*env)->GetStaticMethodID(env, natives_cls, "state", "(I)I");
+  m_na_result = (*env)->GetStaticMethodID(env, natives_cls, "result", "(I)Ljava/lang/String;");
+  m_na_end = (*env)->GetStaticMethodID(env, natives_cls, "end", "(I)V");
 }
 
 void mb_host_key_catch(int32_t on) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return;
   (*env)->CallStaticVoidMethod(env, device_cls, m_dv_catch, on ? JNI_TRUE : JNI_FALSE);
 }
 
 double mb_host_ime_inset(void) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return 0.0;
   return (*env)->CallStaticDoubleMethod(env, device_cls, m_dv_inset);
 }
 
 int32_t mb_host_copy_shown(void) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return 0;
   return (*env)->CallStaticBooleanMethod(env, device_cls, m_dv_copy_shown) ? 1 : 0;
 }
 
 int32_t mb_host_clip_read(void) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return 0;
   return (*env)->CallStaticIntMethod(env, device_cls, m_dv_read);
 }
 
 int32_t mb_host_clip_state(int32_t id) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return -1;
   return (*env)->CallStaticIntMethod(env, device_cls, m_dv_state, id);
 }
 
 int32_t mb_host_clip_picture(int32_t id) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return 0;
   return (*env)->CallStaticIntMethod(env, device_cls, m_dv_picture, id);
 }
 
 moonbit_string_t mb_host_clip_text(int32_t id) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return moonbit_make_string_raw(0);
   jstring s = (jstring)(*env)->CallStaticObjectMethod(env, device_cls, m_dv_text, id);
   moonbit_string_t out = s ? mstr(env, s) : moonbit_make_string_raw(0);
   if (s) (*env)->DeleteLocalRef(env, s);
@@ -70,7 +70,6 @@ moonbit_string_t mb_host_clip_text(int32_t id) {
 
 moonbit_bytes_t mb_host_clip_png(int32_t id) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return moonbit_make_bytes(0, 0);
   jbyteArray a = (jbyteArray)(*env)->CallStaticObjectMethod(env, device_cls, m_dv_png, id);
   jsize n = a ? (*env)->GetArrayLength(env, a) : 0;
   moonbit_bytes_t out = moonbit_make_bytes(n, 0);
@@ -79,32 +78,29 @@ moonbit_bytes_t mb_host_clip_png(int32_t id) {
   return out;
 }
 
+// No files read off the clipboard here (a clip's first item is its words or its picture).
 int32_t mb_host_clip_files(int32_t id) {
   (void)id;
   return 0;
 }
 
 moonbit_string_t mb_host_clip_file_name(int32_t id, int32_t i) {
-  (void)id;
-  (void)i;
+  (void)id, (void)i;
   return moonbit_make_string_raw(0);
 }
 
 moonbit_bytes_t mb_host_clip_file(int32_t id, int32_t i) {
-  (void)id;
-  (void)i;
+  (void)id, (void)i;
   return moonbit_make_bytes(0, 0);
 }
 
 void mb_host_clip_end(int32_t id) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return;
   (*env)->CallStaticVoidMethod(env, device_cls, m_dv_end, id);
 }
 
 void mb_host_clip_set(moonbit_string_t text, moonbit_bytes_t png, moonbit_string_t label) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return;
   jstring t = jstr(env, text), l = jstr(env, label);
   jbyteArray b = jbytes(env, png);
   (*env)->CallStaticVoidMethod(env, device_cls, m_dv_set, t, b, l);
@@ -115,39 +111,45 @@ void mb_host_clip_set(moonbit_string_t text, moonbit_bytes_t png, moonbit_string
 
 void mb_host_keep_awake(int32_t on) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return;
   (*env)->CallStaticVoidMethod(env, device_cls, m_dv_awake, on ? JNI_TRUE : JNI_FALSE);
 }
 
 void mb_host_haptic(int32_t kind) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return;
   (*env)->CallStaticVoidMethod(env, device_cls, m_dv_haptic, kind);
 }
 
+// the input method's action for the field about to type (hostapi ime_action): Device.imeAction
 void mb_host_ime_action(int32_t kind) {
   JNIEnv *env = env_();
-  if (!env || !device_cls) return;
   (*env)->CallStaticVoidMethod(env, device_cls, m_dv_ime_action, kind);
 }
 
-// Generic native call extension points (no app-specific native bridge in base host).
+// ---- an app's own native calls (src/hostapi/native.mbt): dev.invar.Natives answers them ----
+
 int32_t mb_host_native_call(moonbit_string_t name, moonbit_string_t params) {
-  (void)name;
-  (void)params;
-  return 0;
+  JNIEnv *env = env_();
+  jstring n = jstr(env, name), p = jstr(env, params);
+  int32_t id = (*env)->CallStaticIntMethod(env, natives_cls, m_na_call, n, p);
+  (*env)->DeleteLocalRef(env, n);
+  (*env)->DeleteLocalRef(env, p);
+  return id;
 }
 
 int32_t mb_host_native_state(int32_t id) {
-  (void)id;
-  return -1;
+  JNIEnv *env = env_();
+  return (*env)->CallStaticIntMethod(env, natives_cls, m_na_state, id);
 }
 
 moonbit_string_t mb_host_native_result(int32_t id) {
-  (void)id;
-  return moonbit_make_string_raw(0);
+  JNIEnv *env = env_();
+  jstring s = (jstring)(*env)->CallStaticObjectMethod(env, natives_cls, m_na_result, id);
+  moonbit_string_t out = s ? mstr(env, s) : moonbit_make_string_raw(0);
+  if (s) (*env)->DeleteLocalRef(env, s);
+  return out;
 }
 
 void mb_host_native_end(int32_t id) {
-  (void)id;
+  JNIEnv *env = env_();
+  (*env)->CallStaticVoidMethod(env, natives_cls, m_na_end, id);
 }
