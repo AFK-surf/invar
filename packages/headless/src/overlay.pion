@@ -1,5 +1,5 @@
 // The overlay: one layer of a window's stack of what floats over the rest.
-// Ported 1:1 from libs/mbui/src/headless/overlay.mbt.
+// Shared stack for overlay, dialog, and popover (Escape, Back, Outside press, focus return, modal).
 
 import "signals"
 import "view"
@@ -19,7 +19,7 @@ struct OverlayEntry {
   inert : () -> Bool
   escape : Bool
   outside : Bool
-  anchor : Option[view::View]
+  anchor : () -> Option[view::View]
 }
 
 struct OverlayStack {
@@ -58,6 +58,26 @@ fn OverlayStack::drop(self : OverlayStack, id : view::NodeId) -> Unit {
   self.changed.set(self.changed.untracked() + 1)
 }
 
+fn OverlayStack::bring_to_top(self : OverlayStack, id : view::NodeId) -> Unit {
+  let n = self.entries.length()
+  if n <= 1 {
+    return
+  }
+  let mut i = 0
+  while i < n {
+    if self.entries[i].id == id {
+      if i < n - 1 {
+        let e = self.entries[i]
+        let _ = view::array_remove(self.entries, i)
+        self.entries.push(e)
+        self.changed.set(self.changed.untracked() + 1)
+      }
+      return
+    }
+    i += 1
+  }
+}
+
 fn OverlayStack::top_where(self : OverlayStack, takes : (OverlayEntry) -> Bool) -> Int {
   let mut i = self.entries.length() - 1
   while i >= 0 {
@@ -91,12 +111,12 @@ fn OverlayStack::press(self : OverlayStack, count : Int, x : Double, y : Double)
   let top = self.entries[i]
   let mut j = i
   while j < self.entries.length() {
-    if press_on(self.entries[j].node, x, y) {
+    if !(self.entries[j].inert)() && press_on(self.entries[j].node, x, y) {
       return
     }
     j += 1
   }
-  match top.anchor {
+  match (top.anchor)() {
     Some(a) => if press_on(a, x, y) { return }
     None => ()
   }
@@ -150,12 +170,147 @@ pub fn Overlay::node(self : Overlay) -> view::View {
   self.entry.node
 }
 
-/// How many overlays `tree`'s stack holds now.
+/// How many active (non-inert) overlays `tree`'s stack holds now.
 pub fn overlays_open(tree : view::Tree) -> Int {
   match tree.root().lent(overlay_stack_key) {
-    Some(s) => s.entries.length()
+    Some(s) => {
+      let mut count = 0
+      for e in s.entries {
+        if !signals::untracked(e.inert) {
+          count += 1
+        }
+      }
+      count
+    }
     None => 0
   }
+}
+
+/// Join `v` to the tree's overlay stack (called before `look` so `look` receives `Overlay`).
+fn join_overlay(
+  v : view::View,
+  on_dismiss : (OverlayDismiss) -> Unit,
+  dismiss_on_escape : Bool,
+  dismiss_on_outside : Bool,
+  inert : () -> Bool,
+  anchor : () -> Option[view::View],
+) -> (Overlay, () -> Bool, () -> Bool) {
+  let stack = overlay_stack_for(v)
+  let off = fn() -> Bool { inert() || v.leaving() }
+  let live = fn() -> Bool { !off() }
+  let entry = OverlayEntry::{
+    id: v.id(),
+    node: v,
+    dismiss: fn(how : OverlayDismiss) { if !signals::untracked(off) { on_dismiss(how) } },
+    inert: off,
+    escape: dismiss_on_escape,
+    outside: dismiss_on_outside,
+    anchor,
+  }
+  stack.entries.push(entry)
+  stack.changed.set(stack.changed.untracked() + 1)
+  v.reacts(live, fn(on : Bool) {
+    if on {
+      stack.bring_to_top(entry.id)
+    } else {
+      stack.changed.set(stack.changed.untracked() + 1)
+    }
+  }, at_start=false)
+  let _ = v.owns(fn() { stack.drop(entry.id) })
+  (Overlay::{ stack, entry }, off, live)
+}
+
+/// Wire headless overlay behaviors onto `v` (must be called AFTER `look` so `look` cannot overwrite headless props).
+fn wire_overlay(
+  ov : Overlay,
+  off : () -> Bool,
+  live : () -> Bool,
+  modal : Bool,
+  dismiss_on_escape : Bool,
+  dismiss_on_outside : Bool,
+  anchor : () -> Option[view::View],
+  return_to : Option[view::View],
+  do_auto_focus : Bool,
+  first_takes : Option[((view::Said) -> Bool)],
+  return_focus : Bool,
+  escape_gate : Option[(() -> Bool)],
+) -> Unit {
+  let v = ov.entry.node
+  let stack = ov.stack
+  if do_auto_focus {
+    let _ = v.focus_opens_first(takes?=first_takes).focusable(view::Live::By(live), keys=0, tab=false)
+  } else {
+    let _ = v.focus_returns()
+  }
+  if return_focus {
+    let opener = match return_to {
+      Some(r) => Some(r)
+      None => anchor()
+    }
+    match opener {
+      Some(a) => { let _ = v.opened_by(view::Opener::ByNode(a.id())) }
+      None => ()
+    }
+  }
+  if modal {
+    let _ = v.modal(view::Live::By(live))
+  }
+  let _ = v
+    .hides(view::Live::By(off))
+    .presses(view::Live::By(live))
+    .on_drag(fn(_d : view::Drag) { () })
+  if dismiss_on_escape {
+    let _ = v
+      .on_key(fn(k : view::Key) -> Bool {
+        if k.code != menu_key_escape || k.mods != 0 {
+          return false
+        }
+        let ok = match escape_gate {
+          Some(g) => g()
+          None => true
+        }
+        ok && stack.escape(OverlayDismiss::Escape)
+      })
+      .takes_back(fn() { let _ = stack.escape(OverlayDismiss::Back) })
+  }
+  if dismiss_on_outside {
+    window_downs_while(v, live, fn(x : Double, y : Double) {
+      stack.press(signals::untracked(fn() -> Int { v.window_downs() }), x, y)
+    })
+  }
+}
+
+/// Shared overlay stack wiring for `dialog` and `popover` (called after `look`).
+fn attach_overlay(
+  v : view::View,
+  on_dismiss : (OverlayDismiss) -> Unit,
+  modal : Bool,
+  dismiss_on_escape : Bool,
+  dismiss_on_outside : Bool,
+  inert : () -> Bool,
+  anchor : () -> Option[view::View],
+  return_to : Option[view::View],
+  do_auto_focus : Bool,
+  first_takes : Option[((view::Said) -> Bool)],
+  return_focus : Bool,
+  escape_gate : Option[(() -> Bool)],
+) -> Overlay {
+  let (ov, off, live) = join_overlay(v, on_dismiss, dismiss_on_escape, dismiss_on_outside, inert, anchor)
+  wire_overlay(
+    ov,
+    off,
+    live,
+    modal,
+    dismiss_on_escape,
+    dismiss_on_outside,
+    anchor,
+    return_to,
+    do_auto_focus,
+    first_takes,
+    return_focus,
+    escape_gate,
+  )
+  ov
 }
 
 /// An overlay in `parent`, joining its tree's stack above all there.
@@ -179,55 +334,28 @@ pub fn overlay(
     None => modal
   }
   parent.box(fn(v : view::View) {
-    let stack = overlay_stack_for(v)
-    let off = fn() -> Bool { inert() || v.leaving() }
-    let live = fn() -> Bool { !off() }
-    let entry = OverlayEntry::{
-      id: v.id(),
-      node: v,
-      dismiss: fn(how : OverlayDismiss) { if !signals::untracked(off) { on_dismiss(how) } },
-      inert: off,
-      escape: dismiss_on_escape,
-      outside: dismiss_on_outside,
-      anchor,
-    }
-    stack.entries.push(entry)
-    stack.changed.set(stack.changed.untracked() + 1)
-    let _ = v.owns(fn() { stack.drop(entry.id) })
-    look(v, Overlay::{ stack, entry })
-    if do_auto_focus {
-      let _ = v.focus_opens_first().focusable(view::Live::By(live), keys=0, tab=false)
-    } else {
-      let _ = v.focus_returns()
-    }
-    if return_focus {
-      match anchor {
-        Some(a) => { let _ = v.opened_by(view::Opener::ByNode(a.id())) }
-        None => ()
-      }
-    }
-    if modal {
-      let _ = v.modal(view::Live::By(live))
-    }
+    let anchor_fn = fn() -> Option[view::View] { anchor }
+    let (ov, off, live) = join_overlay(v, on_dismiss, dismiss_on_escape, dismiss_on_outside, inert, anchor_fn)
+    look(v, ov)
+    wire_overlay(
+      ov,
+      off,
+      live,
+      modal,
+      dismiss_on_escape,
+      dismiss_on_outside,
+      anchor_fn,
+      None,
+      do_auto_focus,
+      None,
+      return_focus,
+      None,
+    )
     match label {
       Some(name) => {
         let _ = v.says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Dialog, label=name())) }))
       }
       None => ()
-    }
-    let _ = v
-      .hides(view::Live::By(off))
-      .presses(view::Live::By(live))
-      .on_drag(fn(_d : view::Drag) { () })
-    if dismiss_on_escape {
-      let _ = v
-        .on_key(fn(k : view::Key) -> Bool { k.code == menu_key_escape && k.mods == 0 && stack.escape(OverlayDismiss::Escape) })
-        .takes_back(fn() { let _ = stack.escape(OverlayDismiss::Back) })
-    }
-    if dismiss_on_outside {
-      window_downs_while(v, live, fn(x : Double, y : Double) {
-        stack.press(signals::untracked(fn() -> Int { v.window_downs() }), x, y)
-      })
     }
   }, made_for=resolve_made_for(made_for, loc), loc=loc)
 }

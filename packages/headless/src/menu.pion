@@ -1,7 +1,5 @@
 // The menu: a list of things to do, with item, check_item, radio_item, roving focus, and typeahead.
-// Ported 1:1 from libs/mbui/src/headless/menu.mbt.
 
-import "signals"
 import "view"
 
 struct MenuEntry {
@@ -10,18 +8,13 @@ struct MenuEntry {
   text : () -> String
 }
 
-struct MenuStop {
-  last : signals::Signal[Option[view::NodeId]]
-  made : signals::Signal[Int]
-}
-
 /// A menu as its look reads it and makes its items by (`Menu::item`, `Menu::check_item`, `Menu::radio_item`).
 pub struct Menu {
   node : view::View
   off : () -> Bool
   items : Array[MenuEntry]
-  stop : Option[MenuStop]
-  typed : view::Ref[(String, Double)]
+  focus : RovingFocus
+  ta : Typeahead
 }
 
 pub fn Menu::node(self : Menu) -> view::View {
@@ -37,48 +30,23 @@ fn Menu::live(self : Menu) -> Array[MenuEntry] {
     let empty : Array[MenuEntry] = []
     return empty
   }
-  view::array_filter(self.items, fn(e : MenuEntry) -> Bool { e.node.takes_input() && !(e.off)() })
-}
-
-fn Menu::stop_at(self : Menu) -> Option[view::NodeId] {
-  let st = match self.stop {
-    Some(s) => s
-    None => return None
-  }
-  let _ = st.made.get()
-  let live = view::array_filter(self.items, fn(e : MenuEntry) -> Bool { e.node.takes_input() && !(e.off)() })
-  match st.last.get() {
-    Some(id) => {
-      if view::array_any(live, fn(e : MenuEntry) -> Bool { e.node.id() == id }) {
-        return Some(id)
-      }
-    }
-    None => ()
-  }
-  if live.length() > 0 {
-    Some(live[0].node.id())
-  } else {
-    None
-  }
+  view::array_filter(self.items, fn(e : MenuEntry) -> Bool {
+    e.node.alive() && !e.node.leaving() && e.node.takes_input() && !(e.off)()
+  })
 }
 
 pub fn Menu::focus_first(self : Menu, visible~ : Bool = true) -> Bool {
-  let live = self.live()
-  if live.length() > 0 {
-    live[0].node.ask_focus(visible=visible)
-  } else {
-    false
+  if (self.off)() {
+    return false
   }
+  self.focus.focus_first(visible=visible)
 }
 
 pub fn Menu::focus_last(self : Menu, visible~ : Bool = true) -> Bool {
-  let live = self.live()
-  let n = live.length()
-  if n > 0 {
-    live[n - 1].node.ask_focus(visible=visible)
-  } else {
-    false
+  if (self.off)() {
+    return false
   }
+  self.focus.focus_last(visible=visible)
 }
 
 /// An item of a `Menu` as its look reads it.
@@ -148,12 +116,9 @@ pub fn menu(
   loc~ : String = "",
 ) -> view::View {
   let setup = fn(v : view::View) {
-    let stop : Option[MenuStop] = if roving {
-      Some(MenuStop::{ last: signals::signal_by(None, same_node_id_opt), made: signals::signal(0) })
-    } else {
-      None
-    }
-    let m = Menu::{ node: v, off: disabled, items: [], stop, typed: view::ref_new(("", 0.0)) }
+    let focus = RovingFocus::new(axis=GroupAxis::Vertical, roving=roving, wraps=wraps)
+    let ta = Typeahead::new(window_ms=typeahead_ms)
+    let m = Menu::{ node: v, off: disabled, items: [], focus, ta }
     look(v, m)
     if takes_focus {
       let _ = v.focusable(view::Live::Is(true), keys=0)
@@ -183,9 +148,8 @@ pub fn menu(
             return false
           }
           let live = m.live()
-          let c = (k.code - listbox_key_char).unsafe_to_char()
           let nodes : Array[view::View] = view::array_map(live, fn(e : MenuEntry) -> view::View { e.node })
-          return type_ahead(m.typed, c, k.at, typeahead_ms, nodes, fn(i : Int) -> String { (live[i].text)() })
+          return m.ta.handle_key(k, nodes, fn(i : Int) -> String { (live[i].text)() })
         }
         if k.mods != 0 {
           return false
@@ -209,36 +173,7 @@ pub fn menu(
         if !focus_in(v, !takes_focus) {
           return false
         }
-        let live = m.live()
-        let n = live.length()
-        if n == 0 {
-          return false
-        }
-        let at = view::array_search_by(live, fn(e : MenuEntry) -> Bool { e.node.focused() })
-        let to : Option[Int] = if k.code == menu_key_down {
-          match at {
-            None => Some(0)
-            Some(i) => if i + 1 < n { Some(i + 1) } else if wraps { Some(0) } else { Some(n - 1) }
-          }
-        } else if k.code == menu_key_up {
-          match at {
-            None => Some(n - 1)
-            Some(i) => if i > 0 { Some(i - 1) } else if wraps { Some(n - 1) } else { Some(0) }
-          }
-        } else if k.code == menu_key_home {
-          Some(0)
-        } else if k.code == menu_key_end {
-          Some(n - 1)
-        } else {
-          None
-        }
-        match to {
-          Some(j) => {
-            let _ = live[j].node.ask_focus(visible=true)
-            true
-          }
-          None => false
-        }
+        m.focus.step(k.code, from_none=true) is Some(_)
       })
   }
   if in_node {
@@ -275,16 +210,8 @@ fn Menu::part(
       None => fn() -> Bool { false }
     }
     self.items.push(MenuEntry::{ node: v, off, text: label })
-    let made = fn() {
-      match self.stop {
-        Some(st) => st.made.set(st.made.untracked() + 1)
-        None => ()
-      }
-    }
-    made()
     let _ = v.owns(fn() {
       view::array_retain(self.items, fn(e : MenuEntry) -> Bool { e.node.id() != v.id() })
-      made()
     })
     look(v, MenuItem::{ node: v, on, off, open: open_fn })
     let _ = v
@@ -305,22 +232,7 @@ fn Menu::part(
           act(v)
         }
       })
-    match self.stop {
-      Some(st) => {
-        let _ = v.tab_stop(view::Live::By(fn() -> Bool {
-          match self.stop_at() {
-            Some(id) => id == v.id()
-            None => false
-          }
-        }))
-        v.reacts(fn() -> Bool { v.focused() }, fn(f : Bool) {
-          if f {
-            st.last.set(Some(v.id()))
-          }
-        })
-      }
-      None => ()
-    }
+    self.focus.add(v, off=off)
   }
   if in_node {
     setup(parent)
