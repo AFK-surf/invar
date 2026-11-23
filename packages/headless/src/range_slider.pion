@@ -1,0 +1,344 @@
+// Dual-thumb range slider: independent `RangeThumb::Low` and `RangeThumb::High` Role::Slider nodes,
+// `min_gap` anti-crossing clamp, LTR/RTL keyboard stepping, and pointer drag.
+
+import "dmath"
+import "signals"
+import "view"
+
+/// Which thumb of a `RangeSlider`.
+#derive(Eq)
+pub enum RangeThumb {
+  Low
+  High
+}
+
+/// Dual-thumb range slider controller handed to its look to mount `RangeSlider::thumb`.
+pub struct RangeSlider {
+  node : view::View
+  low_fn : () -> Double
+  high_fn : () -> Double
+  min : Double
+  max : Double
+  step : Double
+  min_gap : Double
+  vertical : Bool
+  rtl : Bool
+  on_change : (Double, Double) -> Unit
+  off : () -> Bool
+  text_of : (Double) -> String
+}
+
+/// Per-thumb reactive state passed to `RangeSlider::thumb`'s look.
+pub struct RangeThumbState {
+  node : view::View
+  which_ : RangeThumb
+  val_fn : () -> Double
+  part_fn : () -> Double
+  off : () -> Bool
+}
+
+pub fn RangeThumbState::which(self : RangeThumbState) -> RangeThumb {
+  self.which_
+}
+
+pub fn RangeThumbState::value(self : RangeThumbState) -> Double {
+  (self.val_fn)()
+}
+
+pub fn RangeThumbState::part(self : RangeThumbState) -> Double {
+  (self.part_fn)()
+}
+
+pub fn RangeThumbState::disabled(self : RangeThumbState) -> Bool {
+  (self.off)()
+}
+
+pub fn RangeThumbState::pressed(self : RangeThumbState) -> Bool {
+  self.node.pressed()
+}
+
+pub fn RangeThumbState::hovered(self : RangeThumbState) -> Bool {
+  self.node.pointed()
+}
+
+pub fn RangeThumbState::focused(self : RangeThumbState) -> Bool {
+  self.node.focused()
+}
+
+pub fn RangeThumbState::focus_shown(self : RangeThumbState) -> Bool {
+  self.node.focus_shown()
+}
+
+fn range_norm_pair(lo_in : Double, hi_in : Double, min : Double, max : Double, min_gap : Double) -> (Double, Double) {
+  let gap = slider_clamp(min_gap, 0.0, max - min)
+  let lo = slider_clamp(lo_in, min, max - gap)
+  let hi = slider_clamp(hi_in, lo + gap, max)
+  (lo, hi)
+}
+
+pub fn RangeSlider::low(self : RangeSlider) -> Double {
+  let (lo, _) = range_norm_pair((self.low_fn)(), (self.high_fn)(), self.min, self.max, self.min_gap)
+  lo
+}
+
+pub fn RangeSlider::high(self : RangeSlider) -> Double {
+  let (_, hi) = range_norm_pair((self.low_fn)(), (self.high_fn)(), self.min, self.max, self.min_gap)
+  hi
+}
+
+pub fn RangeSlider::low_part(self : RangeSlider) -> Double {
+  let span = self.max - self.min
+  if span <= 0.0 { 0.0 } else { slider_clamp((self.low() - self.min) / span, 0.0, 1.0) }
+}
+
+pub fn RangeSlider::high_part(self : RangeSlider) -> Double {
+  let span = self.max - self.min
+  if span <= 0.0 { 0.0 } else { slider_clamp((self.high() - self.min) / span, 0.0, 1.0) }
+}
+
+pub fn RangeSlider::disabled(self : RangeSlider) -> Bool {
+  (self.off)()
+}
+
+/// Move `which` thumb toward `target`, snapping to `step` and enforcing `min_gap` anti-crossing bounds.
+pub fn RangeSlider::set_thumb(self : RangeSlider, which : RangeThumb, target : Double) -> Unit {
+  if signals::untracked(self.off) {
+    return
+  }
+  let (cur_lo, cur_hi) = range_norm_pair(
+    signals::untracked(self.low_fn),
+    signals::untracked(self.high_fn),
+    self.min,
+    self.max,
+    self.min_gap,
+  )
+  let gap = slider_clamp(self.min_gap, 0.0, self.max - self.min)
+  let (next_lo, next_hi) = match which {
+    Low => {
+      let max_lo = cur_hi - gap
+      let snapped = slider_snap(target, self.min, max_lo, self.step)
+      (slider_clamp(snapped, self.min, max_lo), cur_hi)
+    }
+    High => {
+      let min_hi = cur_lo + gap
+      let snapped = slider_snap(target, min_hi, self.max, self.step)
+      (cur_lo, slider_clamp(snapped, min_hi, self.max))
+    }
+  }
+  if next_lo != cur_lo || next_hi != cur_hi {
+    (self.on_change)(next_lo, next_hi)
+  }
+}
+
+fn RangeSlider::value_from_track_point(self : RangeSlider, wx : Double, wy : Double) -> Option[Double] {
+  let (rx, ry, rw, rh) = self.node.rect()
+  if !self.vertical {
+    if rw <= 0.0 {
+      return None
+    }
+    let raw = slider_clamp((wx - rx) / rw, 0.0, 1.0)
+    let frac = if self.rtl { 1.0 - raw } else { raw }
+    Some(self.min + frac * (self.max - self.min))
+  } else {
+    if rh <= 0.0 {
+      return None
+    }
+    let frac = slider_clamp(1.0 - (wy - ry) / rh, 0.0, 1.0)
+    Some(self.min + frac * (self.max - self.min))
+  }
+}
+
+/// Mount a dual-thumb range slider container in `parent`.
+pub fn range_slider(
+  parent : view::View,
+  label : () -> String,
+  low : () -> Double,
+  high : () -> Double,
+  min~ : Double,
+  max~ : Double,
+  step~ : Double,
+  on_change : (Double, Double) -> Unit,
+  look : (view::View, RangeSlider) -> Unit,
+  min_gap~ : Double = 0.0,
+  vertical~ : Bool = false,
+  rtl~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  value_text? : (Double) -> String,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let lo = if min <= max { min } else { max }
+  let hi = if min <= max { max } else { min }
+  let whole = step >= 1.0 && step == dmath::round(step) && lo == dmath::round(lo)
+  let text_of : (Double) -> String = match value_text {
+    Some(f) => f
+    None =>
+      fn(v : Double) -> String {
+        if whole {
+          dmath::round(v).to_int().to_string()
+        } else {
+          v.to_string()
+        }
+      }
+  }
+  parent.box(fn(v : view::View) {
+    let rs = RangeSlider::{
+      node: v,
+      low_fn: low,
+      high_fn: high,
+      min: lo,
+      max: hi,
+      step,
+      min_gap,
+      vertical,
+      rtl,
+      on_change,
+      off: disabled,
+      text_of,
+    }
+    look(v, rs)
+    let active_thumb : view::Ref[RangeThumb] = view::ref_new(RangeThumb::Low)
+    let able = fn() -> Bool { !disabled() }
+    let _ = v
+      .presses(view::Live::By(able))
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Group, label=label()))
+      }))
+      .on_drag(fn(d : view::Drag) {
+        if signals::untracked(disabled) {
+          return
+        }
+        match d.kind {
+          Down => {
+            match rs.value_from_track_point(d.wx, d.wy) {
+              Some(v_num) => {
+                let d_lo = dmath::abs(v_num - rs.low())
+                let d_hi = dmath::abs(v_num - rs.high())
+                active_thumb.v = if d_lo <= d_hi { RangeThumb::Low } else { RangeThumb::High }
+                rs.set_thumb(active_thumb.v, v_num)
+              }
+              None => ()
+            }
+          }
+          Moved => {
+            match rs.value_from_track_point(d.wx, d.wy) {
+              Some(v_num) => rs.set_thumb(active_thumb.v, v_num)
+              None => ()
+            }
+          }
+          _ => ()
+        }
+      }, captures=true)
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// Mount an independent `Role::Slider` thumb node (`RangeThumb::Low` or `RangeThumb::High`).
+pub fn RangeSlider::thumb(
+  self : RangeSlider,
+  parent : view::View,
+  which : RangeThumb,
+  label : () -> String,
+  look : (view::View, RangeThumbState) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let step_by = if self.step > 0.0 { self.step } else { (self.max - self.min) / 100.0 }
+  let setup = fn(v : view::View) {
+    let able = fn() -> Bool { !(self.off)() }
+    let val_fn = fn() -> Double {
+      match which {
+        Low => self.low()
+        High => self.high()
+      }
+    }
+    let part_fn = fn() -> Double {
+      match which {
+        Low => self.low_part()
+        High => self.high_part()
+      }
+    }
+    let bounds_fn = fn() -> (Double, Double) {
+      let gap = slider_clamp(self.min_gap, 0.0, self.max - self.min)
+      match which {
+        Low => (self.min, self.high() - gap)
+        High => (self.low() + gap, self.max)
+      }
+    }
+    look(v, RangeThumbState::{ node: v, which_: which, val_fn, part_fn, off: self.off })
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        let now = val_fn()
+        let (b_lo, b_hi) = bounds_fn()
+        let acts : Array[view::Action] = if (self.off)() {
+          []
+        } else {
+          [view::Action::Increment, view::Action::Decrement]
+        }
+        Some(view::said(
+          view::Role::Slider,
+          label=label(),
+          value=(self.text_of)(now),
+          range=(b_lo, now, b_hi),
+          actions=acts,
+        ))
+      }))
+      .on_step(fn(by : Int) {
+        if !signals::untracked(self.off) {
+          self.set_thumb(which, val_fn() + by.to_double() * step_by)
+        }
+      })
+      .on_drag(fn(d : view::Drag) {
+        if signals::untracked(self.off) {
+          return
+        }
+        match d.kind {
+          Down | Moved =>
+            match self.value_from_track_point(d.wx, d.wy) {
+              Some(v_num) => self.set_thumb(which, v_num)
+              None => ()
+            }
+          _ => ()
+        }
+      }, captures=true)
+      .on_key(fn(k : view::Key) -> Bool {
+        if (self.off)() || !v.focused() || k.mods != 0 {
+          return false
+        }
+        let cur = val_fn()
+        let (b_lo, b_hi) = bounds_fn()
+        let dec_h = if !self.vertical && self.rtl { 4 } else { 3 }
+        let inc_h = if !self.vertical && self.rtl { 3 } else { 4 }
+        let to : Option[Double] = if k.code == dec_h || k.code == 6 {
+          Some(cur - step_by)
+        } else if k.code == inc_h || k.code == 5 {
+          Some(cur + step_by)
+        } else if k.code == 15 {
+          Some(cur + step_by * 10.0)
+        } else if k.code == 16 {
+          Some(cur - step_by * 10.0)
+        } else if k.code == 8 {
+          Some(b_lo)
+        } else if k.code == 9 {
+          Some(b_hi)
+        } else {
+          None
+        }
+        match to {
+          Some(t) => {
+            self.set_thumb(which, t)
+            true
+          }
+          None => false
+        }
+      })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

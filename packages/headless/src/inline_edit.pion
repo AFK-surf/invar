@@ -1,0 +1,260 @@
+// Inline in-place editing: preview/edit toggle, Enter commit & focus return,
+// Escape cancel/restore & focus return, and optional submit_on_blur.
+
+import "signals"
+import "view"
+
+/// Headless controller for inline in-place editing.
+pub struct InlineEdit {
+  label_ : () -> String
+  value_ : () -> String
+  on_commit : (String) -> Unit
+  on_cancel : Option[() -> Unit]
+  submit_on_blur : Bool
+  trim : Bool
+  off : () -> Bool
+  editing_sig : signals::Signal[Bool]
+  draft_sig : signals::Signal[String]
+  preview_node : view::Ref[Option[view::View]]
+  input_node : view::Ref[Option[view::View]]
+  focus_input_pending : view::Ref[Bool]
+  focus_preview_pending : view::Ref[Bool]
+}
+
+pub fn InlineEdit::editing(self : InlineEdit) -> Bool {
+  self.editing_sig.get()
+}
+
+pub fn InlineEdit::draft(self : InlineEdit) -> String {
+  self.draft_sig.get()
+}
+
+pub fn InlineEdit::set_draft(self : InlineEdit, s : String) -> Unit {
+  self.draft_sig.set(s)
+}
+
+pub fn InlineEdit::value(self : InlineEdit) -> String {
+  (self.value_)()
+}
+
+pub fn InlineEdit::disabled(self : InlineEdit) -> Bool {
+  (self.off)()
+}
+
+/// Enter edit mode, seeding draft from `value()` and focusing the input node.
+pub fn InlineEdit::start(self : InlineEdit) -> Unit {
+  if signals::untracked(self.off) || self.editing_sig.untracked() {
+    return
+  }
+  self.draft_sig.set(signals::untracked(self.value_))
+  self.focus_preview_pending.v = false
+  self.editing_sig.set(true)
+  match self.input_node.v {
+    Some(inp) =>
+      if inp.alive() && !inp.leaving() {
+        self.focus_input_pending.v = false
+        let _ = inp.ask_focus(visible=true)
+      } else {
+        self.focus_input_pending.v = true
+      }
+    None => self.focus_input_pending.v = true
+  }
+}
+
+fn InlineEdit::return_focus_to_preview(self : InlineEdit) -> Unit {
+  match self.preview_node.v {
+    Some(prev) =>
+      if prev.alive() && !prev.leaving() {
+        self.focus_preview_pending.v = false
+        let _ = prev.ask_focus(visible=true)
+      } else {
+        self.focus_preview_pending.v = true
+      }
+    None => self.focus_preview_pending.v = true
+  }
+}
+
+fn InlineEdit::finish_commit(self : InlineEdit, refocus : Bool) -> Unit {
+  if !self.editing_sig.untracked() {
+    return
+  }
+  let raw = self.draft_sig.untracked()
+  let next = if self.trim { str_trim(raw) } else { raw }
+  self.editing_sig.set(false)
+  self.focus_input_pending.v = false
+  (self.on_commit)(next)
+  if refocus {
+    self.return_focus_to_preview()
+  }
+}
+
+/// Commit the current draft, exit edit mode, and return focus to preview.
+pub fn InlineEdit::commit(self : InlineEdit) -> Unit {
+  self.finish_commit(true)
+}
+
+/// Cancel editing, restore draft to `value()`, exit edit mode, and return focus to preview.
+pub fn InlineEdit::cancel(self : InlineEdit) -> Unit {
+  if !self.editing_sig.untracked() {
+    return
+  }
+  self.draft_sig.set(signals::untracked(self.value_))
+  self.editing_sig.set(false)
+  self.focus_input_pending.v = false
+  match self.on_cancel {
+    Some(f) => f()
+    None => ()
+  }
+  self.return_focus_to_preview()
+}
+
+/// Mount an inline-edit container in `parent`.
+pub fn inline_edit(
+  parent : view::View,
+  label : () -> String,
+  value : () -> String,
+  on_commit : (String) -> Unit,
+  look : (view::View, InlineEdit) -> Unit,
+  on_cancel? : () -> Unit,
+  submit_on_blur~ : Bool = false,
+  trim~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let ie = InlineEdit::{
+    label_: label,
+    value_: value,
+    on_commit,
+    on_cancel,
+    submit_on_blur,
+    trim,
+    off: disabled,
+    editing_sig: signals::signal(false),
+    draft_sig: signals::signal(signals::untracked(value)),
+    preview_node: view::ref_new(None),
+    input_node: view::ref_new(None),
+    focus_input_pending: view::ref_new(false),
+    focus_preview_pending: view::ref_new(false),
+  }
+  parent.box(fn(v : view::View) {
+    look(v, ie)
+    v.reacts(disabled, fn(off : Bool) {
+      if off && ie.editing_sig.untracked() {
+        ie.cancel()
+      }
+    }, at_start=false)
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// Register the preview trigger node; click or Enter/Space enters edit mode.
+pub fn InlineEdit::preview(
+  self : InlineEdit,
+  parent : view::View,
+  look : (view::View, InlineEdit) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let able = fn() -> Bool { !(self.off)() }
+    self.preview_node.v = Some(v)
+    let _ = v.owns(fn() {
+      if same_node(self.preview_node.v, Some(v)) {
+        self.preview_node.v = None
+      }
+    })
+    look(v, self)
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Button, label=(self.label_)(), value=(self.value_)()))
+      }))
+      .on_press(fn() {
+        if able() {
+          self.start()
+        }
+      })
+    if self.focus_preview_pending.v {
+      let _ = v.at_moment(v.cause_at(), fn() {
+        if self.focus_preview_pending.v && v.alive() && !v.leaving() && !self.editing_sig.untracked() {
+          self.focus_preview_pending.v = false
+          let _ = v.ask_focus(visible=true)
+        }
+      })
+    }
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Register the editor input node; Enter commits, Escape cancels, and blur commits when `submit_on_blur=true`.
+pub fn InlineEdit::input(
+  self : InlineEdit,
+  parent : view::View,
+  look : (view::View, InlineEdit) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let able = fn() -> Bool { !(self.off)() }
+    self.input_node.v = Some(v)
+    let _ = v.owns(fn() {
+      if same_node(self.input_node.v, Some(v)) {
+        self.input_node.v = None
+      }
+    })
+    look(v, self)
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=0)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::TextField, label=(self.label_)(), value=self.draft_sig.get()))
+      }))
+      .on_key(fn(k : view::Key) -> Bool {
+        if !self.editing_sig.untracked() || k.mods != 0 || !v.focused() {
+          return false
+        }
+        if k.code == listbox_key_enter {
+          self.commit()
+          return true
+        }
+        if k.code == menu_key_escape {
+          self.cancel()
+          return true
+        }
+        false
+      })
+    let had_focus = view::ref_new(signals::untracked(fn() -> Bool { v.focused() }))
+    v.reacts(fn() -> Bool { v.focused() }, fn(f : Bool) {
+      if f {
+        had_focus.v = true
+      } else if had_focus.v {
+        had_focus.v = false
+        if self.submit_on_blur && self.editing_sig.untracked() {
+          self.finish_commit(false)
+        }
+      }
+    })
+    if self.focus_input_pending.v {
+      let _ = v.at_moment(v.cause_at(), fn() {
+        if self.focus_input_pending.v && v.alive() && !v.leaving() && self.editing_sig.untracked() {
+          self.focus_input_pending.v = false
+          let _ = v.ask_focus(visible=true)
+        }
+      })
+    }
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

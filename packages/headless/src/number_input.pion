@@ -1,0 +1,400 @@
+// Numeric stepper input: min/max/step/large_step/precision, keyboard stepping,
+// text parsing/clamping (`commit_text`), and hold-to-repeat increment/decrement buttons (`repeat_hold`).
+
+import "dmath"
+import "signals"
+import "view"
+
+fn num_pow10(p : Int) -> Double {
+  let mut r = 1.0
+  let mut i = 0
+  while i < p {
+    r = r * 10.0
+    i += 1
+  }
+  r
+}
+
+fn num_clamp(x : Double, lo : Double, hi : Double) -> Double {
+  if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+/// Round `x` to `precision` decimal places (`precision <= 0` rounds to nearest integer).
+pub fn number_round(x : Double, precision : Int) -> Double {
+  if precision <= 0 {
+    dmath::round(x)
+  } else {
+    let scale = num_pow10(if precision > 9 { 9 } else { precision })
+    dmath::round(x * scale) / scale
+  }
+}
+
+/// Format `x` with fixed `precision` decimal places.
+pub fn number_format(x : Double, precision : Int) -> String {
+  let p = if precision < 0 { 0 } else if precision > 9 { 9 } else { precision }
+  let rounded = number_round(x, p)
+  if p == 0 {
+    let iv = dmath::round(rounded).to_int()
+    return iv.to_string()
+  }
+  let neg = rounded < 0.0
+  let abs_v = if neg { -rounded } else { rounded }
+  let scale = num_pow10(p)
+  let total_units = dmath::round(abs_v * scale).to_int64()
+  let scale_i = scale.to_int64()
+  let int_part = total_units / scale_i
+  let frac_part = total_units % scale_i
+  let sb = StringBuilder::new()
+  if neg && total_units != 0.to_int64() {
+    sb.write_char('-')
+  }
+  sb.write_string(int_part.to_string())
+  sb.write_char('.')
+  let frac_str = frac_part.to_string()
+  let mut pad = p - frac_str.length()
+  while pad > 0 {
+    sb.write_char('0')
+    pad -= 1
+  }
+  sb.write_string(frac_str)
+  sb.to_string()
+}
+
+/// Parse a decimal number from `raw` (trimming ASCII whitespace, supporting leading `+`/`-`).
+pub fn number_parse(raw : String) -> Option[Double] {
+  let s = str_trim(raw)
+  let n = s.length()
+  if n == 0 {
+    return None
+  }
+  let mut i = 0
+  let mut neg = false
+  let c0 = s.code_unit_at(0)
+  if c0 == 45 {
+    neg = true
+    i = 1
+  } else if c0 == 43 {
+    i = 1
+  }
+  if i >= n {
+    return None
+  }
+  let mut acc = 0.0
+  let mut saw_digit = false
+  let mut saw_dot = false
+  let mut frac = 0.1
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      saw_digit = true
+      let d = (c - 48).to_double()
+      if saw_dot {
+        acc = acc + d * frac
+        frac = frac * 0.1
+      } else {
+        acc = acc * 10.0 + d
+      }
+    } else if c == 46 && !saw_dot {
+      saw_dot = true
+    } else {
+      return None
+    }
+    i += 1
+  }
+  if !saw_digit {
+    return None
+  }
+  Some(if neg { -acc } else { acc })
+}
+
+/// Headless numeric stepper input controller.
+pub struct NumberInput {
+  label_ : () -> String
+  now : () -> Double
+  on_change : (Double) -> Unit
+  min : Double
+  max : Double
+  step : Double
+  large_step : Double
+  precision : Int
+  off : () -> Bool
+  ro : () -> Bool
+  repeat_delay_ms : Double
+  repeat_interval_ms : Double
+}
+
+pub fn NumberInput::value(self : NumberInput) -> Double {
+  number_round(num_clamp((self.now)(), self.min, self.max), self.precision)
+}
+
+pub fn NumberInput::formatted(self : NumberInput) -> String {
+  number_format(self.value(), self.precision)
+}
+
+pub fn NumberInput::disabled(self : NumberInput) -> Bool {
+  (self.off)()
+}
+
+pub fn NumberInput::read_only(self : NumberInput) -> Bool {
+  (self.ro)()
+}
+
+pub fn NumberInput::can_increment(self : NumberInput) -> Bool {
+  !(self.off)() && !(self.ro)() && self.value() < self.max
+}
+
+pub fn NumberInput::can_decrement(self : NumberInput) -> Bool {
+  !(self.off)() && !(self.ro)() && self.value() > self.min
+}
+
+fn NumberInput::set_clamped(self : NumberInput, target : Double) -> Unit {
+  if signals::untracked(self.off) || signals::untracked(self.ro) {
+    return
+  }
+  let next = number_round(num_clamp(target, self.min, self.max), self.precision)
+  let cur = number_round(num_clamp(signals::untracked(self.now), self.min, self.max), self.precision)
+  if next != cur {
+    (self.on_change)(next)
+  }
+}
+
+pub fn NumberInput::step_by(self : NumberInput, delta : Double) -> Unit {
+  let cur = signals::untracked(self.now)
+  self.set_clamped(cur + delta)
+}
+
+pub fn NumberInput::increment(self : NumberInput) -> Unit {
+  self.step_by(self.step)
+}
+
+pub fn NumberInput::decrement(self : NumberInput) -> Unit {
+  self.step_by(-self.step)
+}
+
+pub fn NumberInput::increment_large(self : NumberInput) -> Unit {
+  self.step_by(self.large_step)
+}
+
+pub fn NumberInput::decrement_large(self : NumberInput) -> Unit {
+  self.step_by(-self.large_step)
+}
+
+/// Parse `raw`, clamp to `[min, max]`, round to `precision`, and emit `on_change` if valid.
+pub fn NumberInput::commit_text(self : NumberInput, raw : String) -> Bool {
+  if signals::untracked(self.off) || signals::untracked(self.ro) {
+    return false
+  }
+  match number_parse(raw) {
+    Some(v) => {
+      let next = number_round(num_clamp(v, self.min, self.max), self.precision)
+      let cur = number_round(num_clamp(signals::untracked(self.now), self.min, self.max), self.precision)
+      if next != cur {
+        (self.on_change)(next)
+      }
+      true
+    }
+    None => false
+  }
+}
+
+/// Mount a headless numeric input container in `parent`.
+pub fn number_input(
+  parent : view::View,
+  label : () -> String,
+  value : () -> Double,
+  on_change : (Double) -> Unit,
+  look : (view::View, NumberInput) -> Unit,
+  min~ : Double = -1.0e12,
+  max~ : Double = 1.0e12,
+  step~ : Double = 1.0,
+  large_step~ : Double = 10.0,
+  precision~ : Int = 0,
+  disabled~ : () -> Bool = fn() { false },
+  read_only~ : () -> Bool = fn() { false },
+  repeat_delay_ms~ : Double = 400.0,
+  repeat_interval_ms~ : Double = 70.0,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let lo = if min <= max { min } else { max }
+  let hi = if min <= max { max } else { min }
+  let st = if step > 0.0 { step } else { 1.0 }
+  let lst = if large_step > 0.0 { large_step } else { st * 10.0 }
+  let ni = NumberInput::{
+    label_: label,
+    now: value,
+    on_change,
+    min: lo,
+    max: hi,
+    step: st,
+    large_step: lst,
+    precision,
+    off: disabled,
+    ro: read_only,
+    repeat_delay_ms,
+    repeat_interval_ms,
+  }
+  parent.box(fn(v : view::View) {
+    look(v, ni)
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}
+
+/// Mount the numeric input's focusable field node with keyboard stepping and screen-reader actions.
+pub fn NumberInput::input(
+  self : NumberInput,
+  parent : view::View,
+  look : (view::View, NumberInput) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let able = fn() -> Bool { !(self.off)() }
+    look(v, self)
+    let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=0)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        let cur = self.value()
+        let acts : Array[view::Action] = if (self.off)() || (self.ro)() {
+          []
+        } else {
+          [view::Action::Increment, view::Action::Decrement]
+        }
+        Some(view::said(
+          view::Role::TextField,
+          label=(self.label_)(),
+          value=self.formatted(),
+          range=(self.min, cur, self.max),
+          actions=acts,
+        ))
+      }))
+      .on_step(fn(by : Int) {
+        self.step_by(by.to_double() * self.step)
+      })
+      .on_key(fn(k : view::Key) -> Bool {
+        if (self.off)() || (self.ro)() || !v.focused() || k.mods != 0 {
+          return false
+        }
+        if k.code == group_key_up {
+          self.increment()
+          true
+        } else if k.code == group_key_down {
+          self.decrement()
+          true
+        } else if k.code == 15 {
+          self.increment_large()
+          true
+        } else if k.code == 16 {
+          self.decrement_large()
+          true
+        } else if k.code == group_key_home {
+          self.set_clamped(self.min)
+          true
+        } else if k.code == group_key_end {
+          self.set_clamped(self.max)
+          true
+        } else {
+          false
+        }
+      })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount an increment stepper button that reuses `repeat_hold` for hold-to-repeat.
+pub fn NumberInput::increment_button(
+  self : NumberInput,
+  parent : view::View,
+  look : (view::View, Button) -> Unit,
+  label~ : () -> String = fn() { "Increment" },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let off = fn() -> Bool { !self.can_increment() }
+  let repeated = view::ref_new(false)
+  let v = button(
+    parent,
+    label,
+    fn(_n : view::View) {
+      if repeated.v {
+        repeated.v = false
+      } else {
+        self.increment()
+      }
+    },
+    look,
+    disabled=off,
+    in_node=in_node,
+    made_for=resolve_made_for(made_for, loc),
+    loc=loc,
+  )
+  v.reacts(fn() -> Bool { v.pressed() }, fn(down : Bool) {
+    if down {
+      repeated.v = false
+    }
+  }, at_start=false)
+  let _ = repeat_hold(
+    v,
+    fn() {
+      repeated.v = true
+      self.increment()
+    },
+    delay_ms=self.repeat_delay_ms,
+    interval_ms=self.repeat_interval_ms,
+    disabled=off,
+  )
+  v
+}
+
+/// Mount a decrement stepper button that reuses `repeat_hold` for hold-to-repeat.
+pub fn NumberInput::decrement_button(
+  self : NumberInput,
+  parent : view::View,
+  look : (view::View, Button) -> Unit,
+  label~ : () -> String = fn() { "Decrement" },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let off = fn() -> Bool { !self.can_decrement() }
+  let repeated = view::ref_new(false)
+  let v = button(
+    parent,
+    label,
+    fn(_n : view::View) {
+      if repeated.v {
+        repeated.v = false
+      } else {
+        self.decrement()
+      }
+    },
+    look,
+    disabled=off,
+    in_node=in_node,
+    made_for=resolve_made_for(made_for, loc),
+    loc=loc,
+  )
+  v.reacts(fn() -> Bool { v.pressed() }, fn(down : Bool) {
+    if down {
+      repeated.v = false
+    }
+  }, at_start=false)
+  let _ = repeat_hold(
+    v,
+    fn() {
+      repeated.v = true
+      self.decrement()
+    },
+    delay_ms=self.repeat_delay_ms,
+    interval_ms=self.repeat_interval_ms,
+    disabled=off,
+  )
+  v
+}
