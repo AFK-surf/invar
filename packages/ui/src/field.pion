@@ -386,6 +386,18 @@ pub fn Field::take(self : Field) -> String {
   out
 }
 
+/// Tell the host IME where the caret is and what the text and selection are (UTF-16 offsets).
+fn Field::sync_ime(self : Field) -> Unit {
+  let cp = self.caret_pos()
+  let sz = if self.last_font_size > 0.0 { self.last_font_size } else { 15.0 }
+  let cx = self.last_win_x + cp.x
+  let cy = self.last_win_y + cp.y + 1.0
+  let ch = dmax(cp.height - 2.0, sz)
+  let txt = self.text_sig.untracked()
+  let (sel_lo, sel_hi) = self.editor.selection_range()
+  hostapi::set_ime(true, cx, cy, 1.5, ch, txt, utf8_to_utf16_off(txt, sel_lo), utf8_to_utf16_off(txt, sel_hi))
+}
+
 pub fn Field::focus(self : Field) -> Unit {
   match focused_field_ref.v {
     Some(prev) if prev.phys_id != self.phys_id => prev.editor.blur()
@@ -393,13 +405,49 @@ pub fn Field::focus(self : Field) -> Unit {
   }
   focused_field_ref.v = Some(self)
   self.editor.focus()
+  match (view_app.tree, self.tree_node) {
+    (Some(tree), Some(nid)) => {
+      let held = match tree.focused_now().0 {
+        Some(cur) => cur == nid
+        None => false
+      }
+      if !held {
+        let _ = tree.focus_to(Some(nid), visible=false)
+      }
+    }
+    _ => ()
+  }
+  // Within the press itself: hosts only raise a keyboard inside a user gesture.
+  self.sync_ime()
+  hostapi::request_frame()
 }
 
 pub fn Field::let_go(self : Field) -> Unit {
+  let was_focused = self.focused_sig.untracked()
   self.editor.blur()
+  let mut cleared = false
   match focused_field_ref.v {
-    Some(cur) if cur.phys_id == self.phys_id => focused_field_ref.v = None
+    Some(cur) if cur.phys_id == self.phys_id => {
+      focused_field_ref.v = None
+      cleared = true
+    }
     _ => ()
+  }
+  match (view_app.tree, self.tree_node) {
+    (Some(tree), Some(nid)) => {
+      let held = match tree.focused_now().0 {
+        Some(cur) => cur == nid
+        None => false
+      }
+      if held {
+        let _ = tree.focus_to(None)
+      }
+    }
+    _ => ()
+  }
+  if cleared || was_focused {
+    hostapi::set_ime(false, 0.0, 0.0, 0.0, 0.0, "", 0, 0)
+    hostapi::request_frame()
   }
 }
 
@@ -412,9 +460,10 @@ pub fn Field::insert(self : Field, ins : String) -> Unit {
   if self.editor.is_composing() {
     self.editor.compose_commit(ins, now=now)
   } else {
-    if ins.length() == 0 {
+    if ins.length() == 0 && !self.editor.has_selection() {
       return
     }
+    // An empty insert over a selection deletes it (hosts send a range pick, then "").
     self.editor.insert_text(ins, now=now)
   }
   if self.editor.text != was {

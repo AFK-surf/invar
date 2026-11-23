@@ -2927,3 +2927,116 @@ test "62 UTF-16 locs wrapping never drops characters or splits words after em-da
   debug_assert(least_w >= 63.0 && least_w <= 65.0, "host_runs_least_measure with CJK+em-dash prefix must equal 'approve' width (~64pt), got \{least_w}")
   t2.dispose()
 }
+
+fn same_node_opt(x : Option[view::NodeId], y : Option[view::NodeId]) -> Bool {
+  match (x, y) {
+    (Some(p), Some(q)) => p == q
+    (None, None) => true
+    _ => false
+  }
+}
+
+test "63 Field focus and blur sync host IME, frame request and tree focus at once" {
+  let a = Field::new(text="abc")
+  let b = Field::new(text="xyz")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(col : view::View) {
+      let _ = col.width(view::Live::Is(Some(300.0)))
+      let _ = field(col, a, max_lines=1, label="A")
+      let _ = field(col, b, max_lines=1, label="B")
+    })
+  })
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => { debug_assert(false, "tree must exist"); return }
+  }
+  let ra = match t.get("A") {
+    Some(d) => d
+    None => { debug_assert(false, "field A must exist"); return }
+  }
+  let rb = match t.get("B") {
+    Some(d) => d
+    None => { debug_assert(false, "field B must exist"); return }
+  }
+  t.frame()
+  t.fake.frame_requested = false
+  t.fake.ime_active = false
+
+  // Press on A while idle: IME, frame request and tree focus follow within the gesture, before any frame.
+  view_pointer(1, ra.x + ra.w * 0.5, ra.y + ra.h * 0.5, t.fake.now_ms)
+  view_pointer(2, ra.x + ra.w * 0.5, ra.y + ra.h * 0.5, t.fake.now_ms)
+  debug_assert(a.focused(), "A focused on press")
+  debug_assert(t.fake.ime_active, "host IME active right on press")
+  debug_assert(t.fake.frame_requested, "frame requested right on press")
+  debug_assert(t.fake.ime_text == "abc", "host IME text is A's, got \{t.fake.ime_text}")
+  debug_assert(t.fake.ime_sel.0 == 3 && t.fake.ime_sel.1 == 3, "host IME selection at end of A")
+  debug_assert(same_node_opt(tree.focused_now().0, a.tree_node), "tree focus on A")
+  t.frame()
+
+  // Straight from A to B: IME stays on and takes B's text at once.
+  t.fake.frame_requested = false
+  view_pointer(1, rb.x + rb.w * 0.5, rb.y + rb.h * 0.5, t.fake.now_ms)
+  view_pointer(2, rb.x + rb.w * 0.5, rb.y + rb.h * 0.5, t.fake.now_ms)
+  debug_assert(!a.focused() && b.focused(), "A blurred, B focused")
+  debug_assert(t.fake.ime_active, "host IME stays active from A to B")
+  debug_assert(t.fake.ime_text == "xyz", "host IME text is B's at once, got \{t.fake.ime_text}")
+  debug_assert(same_node_opt(tree.focused_now().0, b.tree_node), "tree focus on B")
+  t.frame()
+
+  // Press on blank space: IME off, frame requested, tree focus cleared at once.
+  t.fake.frame_requested = false
+  view_pointer(1, 700.0, 550.0, t.fake.now_ms)
+  view_pointer(2, 700.0, 550.0, t.fake.now_ms)
+  debug_assert(!b.focused(), "B blurred on blank press")
+  debug_assert(!t.fake.ime_active, "host IME off right on blank press")
+  debug_assert(t.fake.frame_requested, "frame requested on blank press")
+  debug_assert(tree.focused_now().0 is None, "tree focus cleared")
+  t.frame()
+  t.dispose()
+}
+
+test "64 view_text kinds: UTF-16 range replace and delete, cancel composition, host keyboard hidden" {
+  let fld = Field::new(text="hello")
+  let edits = ref_new(0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=1, label="Msg", edited=fn(_s) { edits.v = edits.v + 1 })
+  })
+  t.press("Msg")
+  debug_assert(fld.focused(), "focused")
+
+  // ASCII range replace: kind=3 (1, 4) then kind=0 "a".
+  view_text(3, "", a=1, b=4)
+  view_text(0, "a")
+  debug_assert(fld.text() == "hao", "range replace gives hao, got \{fld.text()}")
+  debug_assert(edits.v == 1, "edited once for replace, got \{edits.v}")
+
+  // Pure delete: kind=3 (3, 5) then kind=0 "" on "hello".
+  fld.set("hello")
+  let before = edits.v
+  view_text(3, "", a=3, b=5)
+  view_text(0, "")
+  debug_assert(fld.text() == "hel", "range delete gives hel, got \{fld.text()}")
+  debug_assert(edits.v == before + 1, "edited once for delete")
+
+  // CJK + astral emoji: UTF-16 (1, 3) is the emoji.
+  fld.set("你😀好")
+  view_text(3, "", a=1, b=3)
+  t.type_text("世")
+  debug_assert(fld.text() == "你世好", "emoji replaced by 世, got \{fld.text()}")
+  debug_assert(t.fake.ime_sel.0 == 2 && t.fake.ime_sel.1 == 2, "host IME selection in UTF-16 (2, 2), got (\{t.fake.ime_sel.0}, \{t.fake.ime_sel.1})")
+
+  // kind=2 cancels composition without changing text.
+  t.compose("ni")
+  debug_assert(fld.composing(), "composing")
+  view_text(2, "")
+  debug_assert(!fld.composing(), "composition cancelled")
+  debug_assert(fld.text() == "你世好", "text unchanged by cancel, got \{fld.text()}")
+
+  // kind=7: host hid its keyboard.
+  t.frame()
+  debug_assert(t.fake.ime_active, "IME active before hide")
+  view_text(7, "")
+  debug_assert(!fld.focused(), "field let go on kind=7")
+  debug_assert(!t.fake.ime_active, "host IME off on kind=7")
+  t.dispose()
+}
