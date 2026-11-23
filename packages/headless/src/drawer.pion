@@ -33,6 +33,7 @@ pub struct Drawer {
   close_fn : () -> Unit
   active_snap : () -> Int
   on_snap : Option[(Int) -> Unit]
+  on_release : Option[(Double, Double, Bool) -> Unit]
   core : headless_core::DrawerSnapCore
 }
 
@@ -54,6 +55,14 @@ pub fn Drawer::dragging(self : Drawer) -> Bool {
 
 pub fn Drawer::drag_offset(self : Drawer) -> Double {
   self.core.drag_offset()
+}
+
+pub fn Drawer::last_velocity(self : Drawer) -> Double {
+  self.core.last_velocity()
+}
+
+pub fn Drawer::last_offset(self : Drawer) -> Double {
+  self.core.last_offset()
 }
 
 pub fn Drawer::snap_index(self : Drawer) -> Int {
@@ -78,7 +87,97 @@ pub fn Drawer::close(self : Drawer) -> Unit {
   (self.close_fn)()
 }
 
-fn Drawer::attach_drag(self : Drawer, target : view::View) -> Unit {
+fn Drawer::resolve_extent(self : Drawer, d : view::Drag, extent_by : Option[() -> Double]) -> Double {
+  match extent_by {
+    Some(f) => {
+      let e = f()
+      if e > 0.0 {
+        return e
+      }
+    }
+    None => ()
+  }
+  let (_, _, rw, rh) = self.node.rect()
+  match self.edge_ {
+    Bottom | Top => if rh > 0.0 { rh } else if d.h > 0.0 { d.h } else { 300.0 }
+    Left | Right => if rw > 0.0 { rw } else if d.w > 0.0 { d.w } else { 300.0 }
+  }
+}
+
+fn Drawer::handle_release(self : Drawer, d : view::Drag, extent_by : Option[() -> Double]) -> Unit {
+  let extent = self.resolve_extent(d, extent_by)
+  match self.core.on_up(d.vx(), d.vy(), extent, self.snap_index()) {
+    Some(headless_core::DrawerResolution::Close) => {
+      match self.on_release {
+        Some(f) => f(self.core.last_offset(), self.core.last_velocity(), true)
+        None => ()
+      }
+      self.close()
+    }
+    Some(headless_core::DrawerResolution::Snap(idx)) => {
+      match self.on_release {
+        Some(f) => f(self.core.last_offset(), self.core.last_velocity(), false)
+        None => ()
+      }
+      self.snap_to(idx)
+    }
+    None => ()
+  }
+}
+
+fn Drawer::attach_drag(
+  self : Drawer,
+  target : view::View,
+  extent_by~ : Option[() -> Double] = None,
+  slop~ : Double = 0.0,
+) -> Unit {
+  let at_max = fn() -> Bool { self.core.is_at_max(self.snap_index()) }
+  if slop > 0.0 {
+    let down_pt : view::Ref[Option[(Double, Double)]] = view::ref_new(None)
+    let _ = target.gesture(
+      slop,
+      press=fn(d : view::Drag) {
+        if signals::untracked(self.now) {
+          down_pt.v = Some((d.wx, d.wy))
+        }
+      },
+      drag=fn(d : view::Drag) {
+        if !signals::untracked(self.now) {
+          down_pt.v = None
+          return
+        }
+        match d.kind {
+          Down => {
+            let (sx, sy) = match down_pt.v {
+              Some(pt) => pt
+              None => (d.wx, d.wy)
+            }
+            let _ = self.core.on_down(sx, sy)
+            let _ = self.core.on_move(d.wx, d.wy, at_max=at_max())
+          }
+          Moved => {
+            if !self.core.dragging() {
+              let (sx, sy) = match down_pt.v {
+                Some(pt) => pt
+                None => (d.wx, d.wy)
+              }
+              let _ = self.core.on_down(sx, sy)
+            }
+            let _ = self.core.on_move(d.wx, d.wy, at_max=at_max())
+          }
+          Up => {
+            down_pt.v = None
+            self.handle_release(d, extent_by)
+          }
+          Off => {
+            down_pt.v = None
+            self.core.on_cancel()
+          }
+        }
+      },
+    )
+    return
+  }
   let _ = target.on_drag(fn(d : view::Drag) {
     if !signals::untracked(self.now) {
       return
@@ -88,20 +187,9 @@ fn Drawer::attach_drag(self : Drawer, target : view::View) -> Unit {
         let _ = self.core.on_down(d.wx, d.wy)
       }
       Moved => {
-        let _ = self.core.on_move(d.wx, d.wy)
+        let _ = self.core.on_move(d.wx, d.wy, at_max=at_max())
       }
-      Up => {
-        let (_, _, rw, rh) = self.node.rect()
-        let extent = match self.edge_ {
-          Bottom | Top => if rh > 0.0 { rh } else if d.h > 0.0 { d.h } else { 300.0 }
-          Left | Right => if rw > 0.0 { rw } else if d.w > 0.0 { d.w } else { 300.0 }
-        }
-        match self.core.on_up(d.vx(), d.vy(), extent, self.snap_index()) {
-          Some(headless_core::DrawerResolution::Close) => self.close()
-          Some(headless_core::DrawerResolution::Snap(idx)) => self.snap_to(idx)
-          None => ()
-        }
-      }
+      Up => self.handle_release(d, extent_by)
       Off => self.core.on_cancel()
     }
   }, captures=true)
@@ -112,6 +200,8 @@ pub fn Drawer::handle(
   self : Drawer,
   parent : view::View,
   look : (view::View, Drawer) -> Unit,
+  extent_by? : () -> Double,
+  slop~ : Double = 0.0,
   in_node~ : Bool = false,
   made_for? : String,
   loc~ : String = "",
@@ -119,7 +209,7 @@ pub fn Drawer::handle(
   let setup = fn(v : view::View) {
     look(v, self)
     let _ = v.presses(view::Live::By(self.now))
-    self.attach_drag(v)
+    self.attach_drag(v, extent_by=extent_by, slop=slop)
   }
   if in_node {
     setup(parent)
@@ -140,11 +230,14 @@ pub fn drawer(
   snap_points~ : Array[Double] = [1.0],
   active_snap~ : () -> Int = fn() { 0 },
   on_snap? : (Int) -> Unit,
+  on_release? : (Double, Double, Bool) -> Unit,
   modal~ : Bool = true,
   close_on_escape~ : Bool = true,
   close_on_outside~ : Bool = true,
   close_threshold~ : Double = 0.35,
   velocity_threshold~ : Double = 0.5,
+  overpull_max~ : Double = 0.0,
+  drag_surface~ : Bool = true,
   can_drag~ : () -> Bool = fn() { true },
   first_takes? : (view::Said) -> Bool,
   return_focus? : view::View,
@@ -157,6 +250,7 @@ pub fn drawer(
     snap_points=snap_points,
     close_threshold=close_threshold,
     velocity_threshold=velocity_threshold,
+    overpull_max=overpull_max,
     can_drag=can_drag,
   )
   parent.box(fn(v : view::View) {
@@ -182,6 +276,7 @@ pub fn drawer(
       close_fn: close,
       active_snap,
       on_snap,
+      on_release,
       core,
     }
     look(v, dr)
@@ -199,7 +294,9 @@ pub fn drawer(
       return_focus is Some(_),
       Some(fn() -> Bool { open() && focus_in(v, true) }),
     )
-    dr.attach_drag(v)
+    if drag_surface {
+      dr.attach_drag(v)
+    }
     let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
       Some(view::said(view::Role::Dialog, label=label(), description=description()))
     }))

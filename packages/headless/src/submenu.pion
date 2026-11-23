@@ -1,6 +1,7 @@
 // The submenu: an item of a menu (`Menu::sub_trigger`) that opens a submenu (`Submenu::menu`).
 // Ported 1:1 from libs/mbui/src/headless/submenu.mbt.
 
+import "headless_core"
 import "signals"
 import "view"
 
@@ -10,11 +11,14 @@ pub struct Submenu {
   set : (Bool) -> Unit
   open_delay_ms : Double
   close_delay_ms : Double
+  corridor_ms : Double
   waiting : view::Ref[() -> Unit]
   opener : signals::Signal[Option[view::View]]
   shown : signals::Signal[Option[view::View]]
   inner : view::Ref[Option[Menu]]
   enter : view::Ref[Bool]
+  by_hand : view::Ref[Bool]
+  leave_pt : view::Ref[Option[(Double, Double)]]
 }
 
 pub fn Submenu::new(
@@ -22,17 +26,21 @@ pub fn Submenu::new(
   set_open : (Bool) -> Unit,
   open_delay_ms~ : Double = 180.0,
   close_delay_ms~ : Double = 150.0,
+  corridor_ms~ : Double = 300.0,
 ) -> Submenu {
   Submenu::{
     now: open,
     set: set_open,
     open_delay_ms,
     close_delay_ms,
+    corridor_ms,
     waiting: view::ref_new(fn() { () }),
     opener: signals::signal_by(None, same_node),
     shown: signals::signal_by(None, same_node),
     inner: view::ref_new(None),
     enter: view::ref_new(false),
+    by_hand: view::ref_new(false),
+    leave_pt: view::ref_new(None),
   }
 }
 
@@ -41,7 +49,38 @@ pub fn Submenu::open(self : Submenu) -> Bool {
 }
 
 pub fn Submenu::close(self : Submenu) -> Unit {
+  self.by_hand.v = false
+  self.leave_pt.v = None
   self.now_to(false)
+}
+
+/// Open the submenu immediately for a touch interaction (no keyboard auto-focus, stays open without hover).
+pub fn Submenu::open_touch(self : Submenu) -> Unit {
+  self.by_hand.v = true
+  self.leave_pt.v = None
+  self.open_now(false)
+}
+
+/// Whether the pointer currently lies inside the aiming corridor from the trigger leave point
+/// toward the open submenu panel.
+pub fn Submenu::in_corridor(self : Submenu) -> Bool {
+  if !signals::untracked(self.now) {
+    return false
+  }
+  let (lx, ly) = match self.leave_pt.v {
+    Some(pt) => pt
+    None => return false
+  }
+  let m = match self.shown.untracked() {
+    Some(n) => if n.alive() { n } else { return false }
+    None => return false
+  }
+  let (px, py) = match view_root(m).pointer_here() {
+    Some(pt) => pt
+    None => return false
+  }
+  let (mx, my, mw, mh) = m.placed_window_now()
+  headless_core::submenu_in_aim_corridor(px, py, lx, ly, mx, my, mw, mh)
 }
 
 fn Submenu::call_off(self : Submenu) -> Unit {
@@ -53,6 +92,7 @@ fn Submenu::now_to(self : Submenu, on : Bool) -> Unit {
   self.call_off()
   if !on {
     self.enter.v = false
+    self.by_hand.v = false
   }
   if signals::untracked(self.now) != on {
     (self.set)(on)
@@ -143,6 +183,10 @@ pub fn Menu::sub_trigger(
     loc,
   )
   sub.opener.set(Some(node))
+  let last_on_trigger : view::Ref[Option[(Double, Double)]] = view::ref_new(None)
+  let _ = node.on_pointer_moved(fn() {
+    last_on_trigger.v = view_root(node).pointer_here()
+  })
   let _ = node.on_key(fn(k : view::Key) -> Bool {
     if k.mods == 0 && k.code == eff_open_key && !off() && node.focused() {
       sub.open_now(true)
@@ -153,11 +197,28 @@ pub fn Menu::sub_trigger(
   })
   node.reacts(fn() -> Bool { sub.hovered() }, fn(over : Bool) {
     if over {
+      sub.by_hand.v = false
+      sub.leave_pt.v = None
+      if node.pointed_in() {
+        last_on_trigger.v = view_root(node).pointer_here()
+      }
       if !off() {
         sub.later_to(node, true, sub.open_delay_ms)
       }
-    } else if !sub.focus_inside() {
-      sub.later_to(node, false, sub.close_delay_ms)
+    } else if !sub.focus_inside() && !sub.by_hand.v {
+      sub.leave_pt.v = match last_on_trigger.v {
+        Some(pt) => Some(pt)
+        None => {
+          let (tx, ty, tw, th) = node.placed_window_now()
+          if tw > 0.0 && th > 0.0 {
+            Some((tx + tw * 0.5, ty + th * 0.5))
+          } else {
+            view_root(node).pointer_here()
+          }
+        }
+      }
+      let delay = if sub.in_corridor() { sub.corridor_ms } else { sub.close_delay_ms }
+      sub.later_to(node, false, delay)
     }
   }, at_start=false)
   node.reacts(fn() -> Bool { node.focused() }, fn(on : Bool) {

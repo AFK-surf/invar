@@ -128,7 +128,11 @@ pub struct HoverCard {
   set : (Bool) -> Unit
   open_delay_ms : Double
   close_delay_ms : Double
+  held_fn : () -> Bool
+  close_on_outside : Bool
+  keeps_fn : () -> Array[view::View]
   waiting : view::Ref[() -> Unit]
+  by_hand : view::Ref[Bool]
   opener : signals::Signal[Option[view::View]]
   shown : signals::Signal[Option[view::View]]
 }
@@ -138,13 +142,20 @@ pub fn HoverCard::new(
   set_open : (Bool) -> Unit,
   open_delay_ms~ : Double = 300.0,
   close_delay_ms~ : Double = 150.0,
+  held~ : () -> Bool = fn() { false },
+  close_on_outside~ : Bool = true,
+  keeps~ : () -> Array[view::View] = fn() { [] },
 ) -> HoverCard {
   HoverCard::{
     now: open,
     set: set_open,
     open_delay_ms,
     close_delay_ms,
+    held_fn: held,
+    close_on_outside,
+    keeps_fn: keeps,
     waiting: view::ref_new(fn() { () }),
+    by_hand: view::ref_new(false),
     opener: signals::signal_by(None, same_node),
     shown: signals::signal_by(None, same_node),
   }
@@ -158,6 +169,18 @@ pub fn HoverCard::opener(self : HoverCard) -> Option[view::View] {
   self.opener.get()
 }
 
+/// Open and hold the hover card (e.g. touch long-press) so leaving hover does not schedule close.
+pub fn HoverCard::hold(self : HoverCard) -> Unit {
+  self.by_hand.v = true
+  self.now_to(true)
+}
+
+/// Close the hover card immediately.
+pub fn HoverCard::close(self : HoverCard) -> Unit {
+  self.by_hand.v = false
+  self.now_to(false)
+}
+
 fn HoverCard::call_off(self : HoverCard) -> Unit {
   (self.waiting.v)()
   self.waiting.v = fn() { () }
@@ -165,6 +188,9 @@ fn HoverCard::call_off(self : HoverCard) -> Unit {
 
 fn HoverCard::now_to(self : HoverCard, on : Bool) -> Unit {
   self.call_off()
+  if !on {
+    self.by_hand.v = false
+  }
   if signals::untracked(self.now) != on {
     (self.set)(on)
   }
@@ -207,24 +233,58 @@ fn HoverCard::focus_held(self : HoverCard) -> Bool {
   held(self.opener.untracked()) || held(self.shown.untracked())
 }
 
-pub fn HoverCard::trigger(self : HoverCard, node : view::View, disabled~ : () -> Bool = fn() { false }) -> Unit {
+pub fn HoverCard::trigger(
+  self : HoverCard,
+  node : view::View,
+  disabled~ : () -> Bool = fn() { false },
+  yields_to? : view::View,
+) -> Unit {
   self.opener.set(Some(node))
+  let yielded = fn() -> Bool {
+    match yields_to {
+      Some(y) => y.alive() && !y.leaving() && y.takes_input() && (y.pointed_in() || view_holds_focused(y))
+      None => false
+    }
+  }
+  let can_open = fn() -> Bool {
+    !disabled() && node.takes_input() && !yielded()
+  }
   node.reacts(fn() -> Bool { self.hovered() }, fn(over : Bool) {
     if over {
-      if !disabled() {
+      if can_open() {
         self.later_to(node, true, self.open_delay_ms)
       }
-    } else if !self.focus_held() {
+    } else if !self.focus_held() && !(self.held_fn)() && !self.by_hand.v {
       self.later_to(node, false, self.close_delay_ms)
     }
   }, at_start=false)
+  node.reacts(self.held_fn, fn(h : Bool) {
+    if !h && !self.focus_held() && !self.by_hand.v && !signals::untracked(fn() -> Bool { self.hovered() }) && signals::untracked(self.now) {
+      self.later_to(node, false, self.close_delay_ms)
+    }
+  }, at_start=false)
+  match yields_to {
+    Some(_) => {
+      node.reacts(yielded, fn(y : Bool) {
+        if y {
+          self.now_to(false)
+        }
+      }, at_start=false)
+    }
+    None => ()
+  }
+  node.reacts(fn() -> Bool { node.takes_input() }, fn(live : Bool) {
+    if !live && !(self.held_fn)() {
+      self.now_to(false)
+    }
+  }, at_start=false)
   node.reacts(fn() -> Bool { node.focus_shown() }, fn(on : Bool) {
-    if on && !disabled() {
+    if on && can_open() {
       self.now_to(true)
     }
   }, at_start=false)
   node.reacts(fn() -> Bool { node.focused() }, fn(on : Bool) {
-    if !on && !self.focus_held() && !signals::untracked(fn() -> Bool { self.hovered() }) && signals::untracked(self.now) {
+    if !on && !self.focus_held() && !(self.held_fn)() && !self.by_hand.v && !signals::untracked(fn() -> Bool { self.hovered() }) && signals::untracked(self.now) {
       self.now_to(false)
     }
   }, at_start=false)
@@ -256,12 +316,32 @@ pub fn HoverCard::card(
       Some(o) => { let _ = v.opened_by(view::Opener::ByNode(o.id())) }
       None => ()
     }
+    if self.close_on_outside {
+      window_downs_while(v, self.now, fn(x : Double, y : Double) {
+        if (self.held_fn)() {
+          return
+        }
+        if press_on(v, x, y) {
+          return
+        }
+        match self.opener.untracked() {
+          Some(o) => if press_on(o, x, y) { return }
+          None => ()
+        }
+        for k in (self.keeps_fn)() {
+          if press_hits_keep(k, x, y) {
+            return
+          }
+        }
+        self.now_to(false)
+      })
+    }
     let _ = v
       .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Group, label=label())) }))
       .hides(view::Live::By(fn() -> Bool { !(self.now)() }))
       .presses(view::Live::By(self.now))
       .on_key(fn(k : view::Key) -> Bool {
-        if k.code == menu_key_escape && k.mods == 0 && (self.now)() {
+        if k.code == menu_key_escape && k.mods == 0 && (self.now)() && !(self.held_fn)() {
           self.now_to(false)
           true
         } else {
