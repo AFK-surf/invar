@@ -1,62 +1,73 @@
 # `Invar · Liquid Glass` Design Specification
 
-This specification defines the visual and architectural laws for `packages/lg` (37+ components on Invar's iOS 27 `paint::Glass::liquid` optical model). Every component in `packages/lg/src` and every exhibition page in `packages/lg_pages/src` must uphold all five laws.
+This specification defines the visual and architectural laws for `packages/lg` (40+ components on Invar's iOS 26/27 & macOS Tahoe `paint::Glass::liquid` optical model). Every component in `packages/lg/src` and every exhibition page in `packages/lg_pages/src` must uphold all five laws.
 
 ---
 
-## Law 1 — Strict Single-Layer Liquid Glass Architecture
+## Law 1 — Two-Layer Apple Architecture: Solid Content Layer vs. Floating Liquid Glass Chrome
 
-Liquid Glass is a **single-layer translucent functional material** — never an opaque solid block, and never glass stacked on top of glass. The interface is strictly divided into two roles:
+Following Apple's iOS 26/27 & macOS Tahoe Human Interface Guidelines, every screen is strictly separated into **two distinct layers**: a calm, high-contrast **Solid Content Layer** underneath, and a lightweight **Floating Liquid Glass Chrome Layer** above it. Liquid Glass is a functional floating material — never a wallpaper or a content box, and never glass stacked on glass.
 
-### 1. Single-Layer Translucent `paint::Glass::liquid` Surfaces
-Standalone floating controls, navigation islands, overlays, and surface containers render **one** layer of `paint::Glass::liquid` with high-contrast opaque `solid` fallback so backdrops and colour fields refract cleanly underneath:
+### 1. Solid Content Layer (Zero `paint::Glass::liquid` — Mandatory for Page Content)
+All primary reading surfaces and structured page content **MUST NOT** use `paint::Glass::liquid`. Use the unified semantic palette `lg::surface()` (`packages/lg/src/surface_tokens.pion`) and zero-glass content components:
 
-- **Standalone surface containers** (single-layer `paint::Glass::liquid` shell; **all children inside must be flat non-glass**):
-  - `liquid_list_node`, `liquid_disclosure_node`, `liquid_toolbar_node`, `liquid_bar_pill_group_node`, `liquid_panel_node`, `liquid_card_node`, `liquid_control_tile_node`, `liquid_menu_node`, `liquid_menu_panel_node`, `liquid_menu_button_node`, `liquid_select_node`, `liquid_popover_node`, `liquid_tooltip_node`, `liquid_sheet_node`, `liquid_action_sheet_node`, `liquid_drawer_node`, `liquid_dialog_node`, `liquid_toast_node`, and parameter/telemetry inspector panels (`OPTICAL PARAMETERS`, `CAPILLARY HYSTERESIS`).
-- **Floating-island navigation chrome**:
-  - `liquid_nav_bar_node` is transparent layout chrome by default (`glass=false`) so `leading` and `trailing` slots host floating single-layer Liquid Glass islands (`liquid_bar_pill_group_node`, `liquid_icon_button_node`, `liquid_segmented_node`, `liquid_button_group_node`) without glass-on-glass nesting. Pass `glass=true` only when the bar contains zero inner glass controls.
-- **Standalone floating controls & optical physics**:
-  - `liquid_button_node` (`flat=false`, default `height=32.0`), `liquid_icon_button_node`, `liquid_button_group_node`, `liquid_bar_pill_group_node`, `liquid_segmented_node`, `liquid_stepper_node`, `liquid_chip_node`, `liquid_text_field_node`, `liquid_search_bar_node`, `liquid_search_morph_node`, `liquid_bottom_tabs_node`, `liquid_collapsible_tabs_node`, `liquid_toggle_node` (lens on press), `liquid_slider_node` (lens on press), `lg_glass_lift_surface` (continuous flat-to-glass elevation), `liquid_adaptive_surface_node`, `liquid_magnifier_node`, `liquid_progressive_blur_node`, `liquid_merge_node`.
+- **Forbidden for `Glass::liquid`**:
+  - Page backgrounds / canvases (`surface().canvas`, `surface().grouped_bg`, `surface().sidebar`)
+  - Message feeds, timelines, document bodies, and reading panes
+  - Grouped lists, settings rows, and disclosure sections (`liquid_list_node` / `liquid_disclosure_node` default to `glass=false`)
+  - Content cards, dashboards, and form containers (`surface_card_node` / `<lg::SurfaceCard>`, `surface_section_node` / `<lg::SurfaceSection>`, `liquid_panel_node` / `<lg::Panel>` default `floating=false`, `liquid_card_node` / `<lg::Card>` default `floating=false`)
+  - Code blocks and monospace viewports (`surface_code_block_node` / `<lg::CodeBlock>` with `ui::scroll_row` horizontal scroll so long lines never clip on 320pt narrow viewports)
+- **Inner elements inside floating glass**:
+  - `liquid_button_node(..., flat=true)` / `flat=true, ghost=true`, `liquid_toolbar_divider`, `liquid_control_item_node`, `liquid_checkbox_node`, `liquid_radio_group_node`, `liquid_badge_node`, `liquid_count_badge_node`, `liquid_progress_bar_node`, `liquid_progress_ring_node`, and `liquid_list_node(..., flat=true)` inside sheets/drawers.
 
-### 2. Flat Translucent Inner / Content Elements (Zero `paint::Glass::liquid`)
-Every element placed *inside* a glass container (or alongside glass chrome) uses crisp, airy translucent ink fills (`.ground(...)` + subtle `0.5pt` hairline `.edge(...)`) — never a second layer of `paint::Glass::liquid`:
+### 2. Floating Liquid Glass Chrome Layer (Single-Layer `paint::Glass::liquid`)
+Reserve single-layer `paint::Glass::liquid` exclusively for floating navigation, floating controls, transient overlays, and active optical lenses:
 
-- **Inner glass-surface actions**: `liquid_button_node(..., flat=true)`, `liquid_button_node(..., flat=true, ghost=true)`, `liquid_toolbar_divider`, `liquid_control_item_node`, dialog/sheet/menu/action-sheet/list rows and close buttons.
-- **Form & metadata primitives**: `liquid_checkbox_node`, `liquid_radio_group_node`, `liquid_badge_node`, `liquid_count_badge_node`, `liquid_progress_bar_node`, `liquid_progress_ring_node`, hairlines and slider tracks.
-- **Multi-specimen staging containers**: containers that directly host child `paint::Glass::liquid` specimens (such as `ADAPTIVE LUMINANCE` hosting two `liquid_adaptive_surface_node` lenses) use a light translucent surface rather than `paint::Glass::liquid`.
+- **Floating navigation chrome**:
+  - `liquid_nav_bar_node` (transparent layout chrome `glass=false` hosting floating glass islands in `leading`/`trailing`), `liquid_bar_pill_group_node`, `liquid_bottom_tabs_node`, `liquid_collapsible_tabs_node`, `liquid_search_bar_node`, `liquid_search_morph_node`.
+- **Floating toolbars & controls**:
+  - `liquid_toolbar_node`, `liquid_button_node` (`flat=false`), `liquid_icon_button_node`, `liquid_button_group_node`, `liquid_segmented_node`, `liquid_stepper_node`, `liquid_chip_node`, `liquid_text_field_node` (`flat=false`).
+- **Floating overlays & inspectors**:
+  - `liquid_menu_node`, `liquid_menu_panel_node`, `liquid_menu_button_node`, `liquid_select_node`, `liquid_popover_node`, `liquid_tooltip_node`, `liquid_sheet_node`, `liquid_action_sheet_node`, `liquid_drawer_node`, `liquid_dialog_node`, `liquid_toast_node`, plus opt-in floating inspectors (`liquid_panel_node(..., floating=true)`) and Control Center tiles (`liquid_control_tile_node`, `liquid_card_node(..., floating=true)`).
+- **Refractive interaction lenses & optical physics**:
+  - `liquid_toggle_node` (lens on press), `liquid_slider_node` (lens on press), `lg_glass_lift_surface` (continuous flat-to-glass elevation), `liquid_adaptive_surface_node`, `liquid_magnifier_node`, `liquid_progressive_blur_node`, `liquid_merge_node`.
 
 ---
 
-## Law 2 — Hard Zero Glass-on-Glass Invariant
+## Law 2 — Hard Zero Glass-on-Glass & Content-Coverage Invariant
 
-At rest (non-dragged steady state), no two drawn `paint::Glass::liquid` (`kind == 6`) rectangles may overlap or nest (`overlap_area > 1.0 pt²` beyond `0.5 pt` edge tolerance):
+At rest (non-dragged steady state):
+1. **Zero glass overlap/nesting**: No two drawn `paint::Glass::liquid` (`kind == 6`) rectangles may overlap or nest (`overlap_area > 1.0 pt²` beyond `0.5 pt` edge tolerance).
+2. **Zero content-layer glass misuse**: In non-modal scenes (`allow_large_overlay=false`), total `kind == 6` Liquid Glass coverage must not exceed `45%` of the viewport (`max_glass_coverage=0.45`), and no single glass rectangle may exceed both `65%` viewport width and `55%` viewport height.
 
 - **Allowed exceptions**:
-  1. **Transient modal/anchored overlays** (`Sheet`, `Dialog`, `ActionSheet`, `Menu`, `Popover`, `Tooltip`) floating temporarily above the underlying scene — **provided that zero child `paint::Glass::liquid` rectangles exist inside the overlay panel itself**.
+  1. **Transient modal/anchored overlays** (`Sheet`, `Dialog`, `ActionSheet`, `Menu`, `Popover`, `Tooltip`, `Drawer`) floating temporarily above the scene — pass `allow_large_overlay=true` when auditing full-screen modal viewports, and ensure **zero child `paint::Glass::liquid` rectangles exist inside the overlay panel itself**.
   2. **Intentional capillary fusion pairs** (`LiquidMerge` bonded droplet + capsule, which share a smooth-min merge pass).
   3. **Active press/drag loupe transitions** (`p > 0.001` while a finger holds `liquid_segmented_node` or `liquid_bottom_tabs_node`).
-- **Enforcement**: Automated `lg::audit_glass(t, label~)` and `lg::assert_no_nested_glass(t, label~)` gates exported from `packages/lg/src/audit.pion` over `ui::Tester::drawn_glass()` and `ui::Tester::unasked_faults()`, verified across `packages/lg/src/components_test.pion` and all downstream app test suites in both Light and Dark themes.
+- **Enforcement**: Automated `lg::audit_glass`, `lg::assert_no_nested_glass`, and one-stop `lg::assert_apple_ui` gates exported from `packages/lg/src/audit.pion`.
 
 ---
 
 ## Law 3 — Concentric Corner Ladder
 
-Every nested rounded surface obeys exact concentric geometry:
+Every nested rounded surface obeys exact concentric geometry via `lg::concentric(outer, inset)`:
 
 ```
-R_inner = R_outer - pad
+R_inner = lg::concentric(R_outer, pad) = max(0.0, R_outer - pad)
 ```
 
-- Examples: `Menu` (`r=18, pad=6 -> item r=12`), `List` (`r=24, pad=6 -> row r=18`), `Disclosure` (`r=22, pad=6 -> header r=16`), `ActionSheet` (`r=22, pad=6 -> item r=16`), `Sheet` (`r=28, inset=12 -> close / 32pt footer button r=16`), `Drawer` (`r=28, pad=12 -> close / 32pt button r=16`), `Dialog` (`r=28, inset=12 -> 32pt button r=16`), `Toolbar` (`h=42 r=21, pad=5 -> 32pt button r=16`), `BarPillGroup` (`h=36 r=18, pad=2 -> 32pt button r=16`), `Toast` (`r=20, pad=6 -> 28pt action/close r=14`), `SegmentedControl` (`h=36 r=18, pad=3 -> thumb h=30 r=15`), `BottomTabs` (`h=50 r=25, pad=4 -> lens h=42 r=21`).
-- **Enforcement**: Invar `ui::Tester::audit()` / `unasked_faults()` must report **0 faults** across light and dark themes.
+- **Standard ladder (`packages/lg/src/surface_tokens.pion`)**: `r_sheet = 34.0`, `r_panel = 26.0`, `r_card = 20.0`, `r_row = 12.0`, `r_chip = 8.0`, `hairline_w = 0.5`.
+- **Component examples**: `Menu` (`r=18, pad=6 -> item r=12`), `List` (`r=24, pad=6 -> row r=18`), `Disclosure` (`r=22, pad=6 -> header r=16`), `ActionSheet` (`r=22, pad=6 -> item r=16`), `Sheet` (`r=28, inset=12 -> close / 32pt footer button r=16`), `Drawer` (`r=28, pad=12 -> close / 32pt button r=16`), `Dialog` (`r=28, inset=12 -> 32pt button r=16`), `Toolbar` (`h=36 r=18, pad=3 -> 30pt button r=15`), `BarPillGroup` (`h=34 r=17, pad=2 -> 30pt button r=15`), `SegmentedControl` (`h=30 r=15, pad=2.5 -> thumb h=25 r=12.5`), `BottomTabs` (`h=50 r=25, pad=4 -> lens h=42 r=21`).
+- **Enforcement**: `lg::assert_apple_ui` runs `ui::Tester::assert_ui_craft()` and `unasked_faults()` with **0 faults** across Light and Dark themes.
 
 ---
 
 ## Law 4 — Optical Restraint & Contrast
 
-- **Symmetric light/dark density ladder**: Regular floating controls and capsules use `0x20202067L` (dark) / `0xFDFCFD67L` (light); dense panels and dialogs (`lg_panel_glass`, `liquid_dialog_node`) use `0x202020BFL` (dark) / `0xFDFCFDBFL` (light, 75% veil); detached sheets and floating island drawers (`lg_sheet_glass`, `lg_drawer_glass`) use `0x202020CCL` (dark) / `0xFDFCFDCCL` (light, 80% veil), and responsive two-detent sheets (`lg_sheet_glass_at`) smoothly morph from 80% (`0xCC`, detached island) to 86% (`0xDC`, full-height reading surface) so foreground ink stays legible even over saturated or bright backdrops.
-- **Contrast**: All foreground text and icons maintain **WCAG >= 4.5:1** contrast against both the glass `solid` fallback and Content Layer surfaces in Light and Dark modes (verified by `ui::Tester` audits).
-- **Zero hidden glass instances at rest**: Controls that reveal a clear refraction loupe only while pressed/dragged (`liquid_segmented_node`, `liquid_bottom_tabs_node`, `liquid_toggle_node`, `liquid_slider_node`) must return `None` from `.glass(...)` whenever `p <= 0.001`, submitting `Some(...)` only during active interaction. Never submit `alpha == 0` glass passes to the GPU.
+- **Semantic Content Layer palette (`lg::surface()`)**: Light (`canvas #F5F5F7`, `grouped_bg #F2F2F7`, `card #FFFFFF`, `ink #1C1C1E`, `separator 8% black`) and Dark (`canvas #0B0C0E`, `grouped_bg #000000`, `card #1C1C1E`, `ink #F5F5F7`, `separator 10% white`) automatically follow `lg::is_dark()`.
+- **Symmetric light/dark glass density ladder**: Regular floating controls and capsules use `0x20202067L` (dark) / `0xFDFCFD67L` (light); dense floating panels and dialogs (`lg_panel_glass`, `liquid_dialog_node`) use `0x202020BFL` / `0xFDFCFDBFL` (75% veil) or `0xB3` (70%); detached sheets and floating island drawers (`lg_sheet_glass`, `lg_drawer_glass`) use `0x202020CCL` / `0xFDFCFDCCL` (80% veil), morphing smoothly up to 86% (`0xDC`) on expanded sheets.
+- **Contrast**: All foreground text and icons maintain **WCAG >= 4.5:1** contrast against both Content Layer surfaces and glass `solid` fallbacks in Light and Dark modes.
+- **Zero hidden glass instances at rest**: Controls that reveal a clear refractive loupe only while pressed/dragged (`liquid_segmented_node`, `liquid_bottom_tabs_node`, `liquid_toggle_node`, `liquid_slider_node`) must return `None` from `.glass(...)` whenever `p <= 0.001`. Never submit `alpha == 0` glass passes to the GPU.
 - **No `outside=false` shadows under glass**: Shadows beneath `paint::Glass::liquid` render outside the SDF contour (`shadow_outside(view::Live::Is(true))`) so they never darken the refracted interior.
 
 ---
