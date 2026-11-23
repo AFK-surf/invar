@@ -1182,19 +1182,26 @@ _SIGNAL_ALIAS_RE = re.compile(
 )
 
 
-def _resolve_alias_root(name, aliases):
-    cur = name
-    seen = set()
-    while cur in aliases and cur not in seen:
-        seen.add(cur)
-        cur = aliases[cur]
-    return cur
+_ANY_LET_RE = re.compile(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\b")
+
+
+def _lookup_binding(name, scope_stack):
+    """The lexical identity `(decl_id, root_name)` `name` has in `scope_stack` (innermost block
+    first): what it was bound to as it was declared. A name declared nowhere in view is the
+    binding from outside the scanned code (a parameter, a capture from further out): `(0, name)`."""
+    for layer in reversed(scope_stack):
+        if name in layer:
+            return layer[name]
+    return (0, name)
 
 
 def _collect_signal_aliases(lines, start_line):
-    aliases = {}
+    """The bindings in force where the effect is made (`name -> (decl_id, root_name)`), and the
+    counter of fresh declaration ids to go on with in the closure body."""
+    outer_env = {}
+    next_id = [1]
     if not lines or start_line <= 1:
-        return aliases
+        return outer_env, next_id
     # Walk backward to the true enclosing fn header (no fixed line cap)
     fn_start = 0
     for idx in range(start_line - 2, -1, -1):
@@ -1203,30 +1210,61 @@ def _collect_signal_aliases(lines, start_line):
             break
     prefix_src = "\n".join(lines[fn_start : start_line - 1])
     cleaned_prefix = _strip_pion_comments_and_strings(prefix_src)
-    aliases = {}
-    _walk_scoped_aliases(cleaned_prefix, [{}], None, aliases)
-    return aliases
+    _walk_scoped_aliases(cleaned_prefix, [{}], None, outer_env, next_id)
+    return outer_env, next_id
 
 
-def _scoped_alias_view(scope_stack):
-    view = {}
-    for layer in scope_stack:
-        view.update(layer)
-    return view
+def _let_stmt_end(src, pos):
+    """Index where the initializer of a `let` starting before `pos` ends (at `;`, `\\n`, or an
+    unmatched closing delimiter, with `()`, `[]`, `{}` balanced): a shadowed `let a = a.get()`
+    still resolves `a.get()` against the outer `a` before the new `a` enters scope."""
+    depth = 0
+    n = len(src)
+    i = pos
+    while i < n:
+        ch = src[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif depth == 0 and ch in ";\n":
+            return i
+        i += 1
+    return n
 
 
-def _walk_scoped_aliases(cleaned, scope_stack, on_call, out_aliases=None):
-    """Walk `cleaned` in source order keeping one alias table per open `{`, dropped at its `}`: a
-    `let` holds only to the end of its block, so an inner block's `let ro = b.read()` never
-    outlives the block. `on_call(recv, meth, aliases)` sees each `recv.meth(` with the aliases in
-    force right there; `out_aliases` gets the aliases still in force at the end."""
-    events = [(m.start(), "let", m) for m in _SIGNAL_ALIAS_RE.finditer(cleaned)]
+def _walk_scoped_aliases(cleaned, scope_stack, on_call, out_aliases=None, next_id=None):
+    """Walk `cleaned` in source order keeping one binding table per open `{`, dropped at its `}`:
+    a `let` holds only to the end of its block. Each binding is the lexical identity
+    `(decl_id, root_name)` fixed as it is declared: an alias `let ro = a[.read()]` takes the
+    identity `a` has right there, so a later inner `let a = b` never changes what `ro` is; any
+    other `let x = ...` is a new binding of its own, entering scope once its initializer ends.
+    `on_call(recv, meth, scope_stack)` sees each `recv.meth(` with the bindings in force right
+    there; `out_aliases` gets the bindings still in force at the end."""
+    if next_id is None:
+        next_id = [1]
+    alias_ms = list(_SIGNAL_ALIAS_RE.finditer(cleaned))
+    alias_starts = {m.start() for m in alias_ms}
+    events = [(m.end(), "let", m) for m in alias_ms]
+    events += [
+        (_let_stmt_end(cleaned, m.end()), "newlet", m)
+        for m in _ANY_LET_RE.finditer(cleaned)
+        if m.start() not in alias_starts
+    ]
     events += [(k, ch, None) for k, ch in enumerate(cleaned) if ch in "{}"]
     if on_call is not None:
         events += [(m.start(), "call", m) for m in _SIGNAL_CALL_RE.finditer(cleaned)]
-    # (at one place a `let` comes first: it is in force for the calls after it)
-    order = {"{": 0, "}": 0, "let": 1, "call": 2}
+    # (a binding that ends at `}` belongs to the block about to close; calls after it see it)
+    order = {"let": 0, "newlet": 0, "{": 1, "}": 1, "call": 2}
     events.sort(key=lambda e: (e[0], order[e[1]]))
+
+    def fresh(name):
+        nid = next_id[0]
+        next_id[0] += 1
+        return (nid, name)
+
     for _, kind, m in events:
         if kind == "{":
             scope_stack.append({})
@@ -1235,12 +1273,19 @@ def _walk_scoped_aliases(cleaned, scope_stack, on_call, out_aliases=None):
                 scope_stack.pop()
         elif kind == "let":
             lhs, rhs = m.group(1), m.group(2)
-            if lhs != rhs and rhs not in ("true", "false", "None"):
-                scope_stack[-1][lhs] = rhs
+            if rhs in ("true", "false", "None"):
+                scope_stack[-1][lhs] = fresh(lhs)
+            else:
+                # (resolved before the new binding is in force: `let a = a` is the outer `a`)
+                scope_stack[-1][lhs] = _lookup_binding(rhs, scope_stack)
+        elif kind == "newlet":
+            lhs = m.group(1)
+            scope_stack[-1][lhs] = fresh(lhs)
         else:
-            on_call(m.group(1), m.group(2), _scoped_alias_view(scope_stack))
+            on_call(m.group(1), m.group(2), scope_stack)
     if out_aliases is not None:
-        out_aliases.update(_scoped_alias_view(scope_stack))
+        for layer in scope_stack:
+            out_aliases.update(layer)
 
 
 _SIGNAL_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(")
@@ -1253,24 +1298,27 @@ def _analyze_effect_signal_identity(file_lines_cache, fpath, line, col, captures
         return ("unknown", [])
     cleaned = _strip_pion_comments_and_strings(body)
     cap_names = {c.get("name", "") for c in captures if c.get("name")}
+    outer_env, next_id = _collect_signal_aliases(lines, line)
+    # (what the captured names are bound to where the effect is made: the only signals it can touch)
+    captured_identities = {_lookup_binding(c, [outer_env]) for c in cap_names}
     read_roots = set()
     write_roots = set()
 
-    def on_call(recv, meth, aliases):
-        root = _resolve_alias_root(recv, aliases)
-        if recv not in cap_names and root not in cap_names:
+    def on_call(recv, meth, scope_stack):
+        ident = _lookup_binding(recv, scope_stack)
+        if ident not in captured_identities:
             return
         if meth in _EFFECT_READ_METHODS:
-            read_roots.add(root)
+            read_roots.add(ident)
         elif meth in _EFFECT_WRITE_METHODS:
-            write_roots.add(root)
+            write_roots.add(ident)
 
-    # The aliases in force where the effect is made sit at the bottom; the body's own blocks
+    # The bindings in force where the effect is made sit at the bottom; the body's own blocks
     # stack over them.
-    _walk_scoped_aliases(cleaned, [_collect_signal_aliases(lines, line)], on_call)
-    shared = sorted(read_roots & write_roots)
-    if shared:
-        return ("same", shared)
+    _walk_scoped_aliases(cleaned, [outer_env], on_call, None, next_id)
+    shared_idents = read_roots & write_roots
+    if shared_idents:
+        return ("same", sorted({name for (_, name) in shared_idents}))
     if read_roots and write_roots and read_roots.isdisjoint(write_roots) and rchain_len == 1 and wchain_len == 1:
         return ("distinct", [])
     return ("unknown", [])

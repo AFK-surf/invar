@@ -64,7 +64,7 @@ class FakeElement {
   focus() { doc.activeElement = this; }
   // bubbling dispatch, honouring stopPropagation
   dispatch(type, init) {
-    const ev = new FakeEvent(type, init);
+    const ev = new FakeEvent(type, { target: this, ...init });
     for (let n = this; n && !ev.stopped; n = n.parentNode) {
       for (const fn of n.listeners.get(type) || []) fn(ev);
     }
@@ -187,6 +187,44 @@ check("Enter / Space on a Button inside a Group activates only the Button", () =
     assert.deepEqual(posted.map(([, p]) => [p.action, p.id]), [["activate", 2]], `key ${JSON.stringify(key)}`);
     assert.ok(ev.defaultPrevented, "no native click follows");
   }
+});
+
+check("Enter / Space on a Slider inside a pressable Group activates nothing", () => {
+  send(tree(true, [
+    node(0, "Region", { kids: [1] }),
+    node(1, "Group", { actions: "a", kids: [2] }),
+    node(2, "Slider", { actions: "id" }),
+  ]));
+  const slider = elOf(2);
+  assert.equal(slider.parentNode, elOf(1));
+  for (const key of ["Enter", " "]) {
+    posted.length = 0;
+    const ev = slider.dispatch("keydown", { key });
+    assert.deepEqual(posted, [], `key ${JSON.stringify(key)} reaches no ancestor: ${JSON.stringify(posted)}`);
+    assert.ok(ev.stopped, "kept from the Group");
+  }
+  // its own keys still step it
+  posted.length = 0;
+  slider.dispatch("keydown", { key: "ArrowUp" });
+  assert.deepEqual(posted.map(([, p]) => [p.action, p.id]), [["increment", 2]]);
+});
+
+check("Space keyup on a <button> is kept: no second activation by a synthesized click", () => {
+  send(tree(true, [
+    node(0, "Region", { kids: [1] }),
+    node(1, "Group", { actions: "a", kids: [2] }),
+    node(2, "Button", { actions: "a" }),
+  ]));
+  const btn = elOf(2);
+  assert.equal(btn.tagName, "BUTTON");
+  posted.length = 0;
+  btn.dispatch("keydown", { key: " " });
+  const up = btn.dispatch("keyup", { key: " " });
+  assert.ok(up.defaultPrevented, "keyup's default (the click) prevented");
+  assert.ok(up.stopped, "keyup kept from the ancestors");
+  assert.deepEqual(posted.map(([, p]) => [p.action, p.id]), [["activate", 2]], "activated once");
+  const upEnter = btn.dispatch("keyup", { key: "Enter" });
+  assert.ok(!upEnter.defaultPrevented, "other keys' keyup left alone");
 });
 
 check("a click on a Text inside a Button activates the Button", () => {

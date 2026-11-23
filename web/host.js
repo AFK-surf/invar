@@ -37,7 +37,7 @@
       under: null, underN: 0, whole: 0, picked: 0, grab: null, key: null, valid: false, used: 0,
     }));
   }
-  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta;
+  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta, pw;
   let extParallel = null, bootProgs = null, bootPvs = null, bootReady = true;
   let curW = 0, curH = 0, curScale = 1;
   const rtW = () => curW || canvas.width;
@@ -5522,21 +5522,60 @@
   let imeActive = false, composing = false;
   // what the textarea held after the last edit of it (setIme's, or one the input event below has told the app of)
   let taHad = '';
+  // The hidden password input beside a window's textarea (`ref`), the input method's field for a secret's field
+  // (H.imeAction's 4): a secret's words are never put in a textarea, which the browser and assistive technology read
+  // as plain text. Styled as the textarea is, out of sight and out of the Tab order.
+  function makePasswordInput(d, ref) {
+    const el = d.createElement('input');
+    el.type = 'password';
+    el.setAttribute('autocomplete', 'off');
+    el.setAttribute('autocapitalize', 'off');
+    el.setAttribute('autocorrect', 'off');
+    el.setAttribute('spellcheck', 'false');
+    el.setAttribute('aria-hidden', 'true');
+    el.tabIndex = -1;
+    el.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:20px;opacity:0;padding:0;border:0;overflow:hidden;' +
+      'font-size:16px;caret-color:transparent;color:transparent;background:transparent;outline:none;pointer-events:none';
+    if (ref && ref.parentNode) ref.parentNode.insertBefore(el, ref.nextSibling);
+    else d.body.appendChild(el);
+    return el;
+  }
+  // the input method's field for the field about to type (a secret's: the password input), and whether `el` is one of
+  // the window's two
+  const imeEl = () => (imeKind === 4 && pw ? pw : ta);
+  const isImeEl = (el) => el != null && (el === ta || (pw != null && el === pw));
   H.setIme = (active, x, y, w, h, text, s, e) => {
     imeActive = active;
-    ta.style.left = `${x}px`;
-    ta.style.top = `${y}px`;
-    ta.style.height = `${h}px`;
+    const el = imeEl(), other = el === ta ? pw : ta;
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    el.style.height = `${h}px`;
+    // (the other one holds nothing and has no focus: a secret left in neither)
+    if (other) {
+      if (other.value) other.value = '';
+      if (doc.activeElement === other) {
+        imeRefocus = true;
+        other.blur();
+        imeRefocus = false;
+      }
+    }
     // the field's words and selection in the input method's own field, as the other hosts give theirs (the Mac's
     // NSTextInputClient, Android's InputConnection): an input method reads what is before the caret (WeChat's puts a
     // space between Chinese and Latin by it); left alone while it composes
     if (active && !composing) {
-      if (ta.value !== text) ta.value = text;
-      if (ta.selectionStart !== s || ta.selectionEnd !== e) ta.setSelectionRange(s, e);
+      if (el.value !== text) el.value = text;
+      if (el.selectionStart !== s || el.selectionEnd !== e) el.setSelectionRange(s, e);
       taHad = text;
     }
-    if (active && doc.activeElement !== ta) ta.focus({ preventScroll: true });
-    if (!active && doc.activeElement === ta) ta.blur();
+    if (!active) {
+      // (a secret is not kept once its field lets go)
+      if (pw && pw.value) {
+        pw.value = '';
+        if (el === pw) taHad = '';
+      }
+      if (isImeEl(doc.activeElement)) doc.activeElement.blur();
+    }
+    if (active && doc.activeElement !== el) el.focus({ preventScroll: true });
   };
 
   // The input method's keyboard for the field about to type (@hostapi.ime_action, said before setIme: 0 none, 1 a
@@ -5558,15 +5597,22 @@
   H.imeAction = (k) => {
     const kind = imeKinds[k] ? k : 0;
     if (kind === imeKind) return;
+    const prevEl = imeEl();
     imeKind = kind;
+    const nextEl = imeEl();
     const want = imeKinds[kind];
     for (const name of ['inputmode', 'enterkeyhint', 'autocorrect']) {
-      if (want[name]) ta.setAttribute(name, want[name]);
-      else ta.removeAttribute(name);
+      if (want[name]) nextEl.setAttribute(name, want[name]);
+      else nextEl.removeAttribute(name);
     }
-    if (doc.activeElement === ta) {
+    // (moving between the textarea and the password input: what the one let go held is not kept, a secret's least)
+    if (prevEl !== nextEl) {
+      prevEl.value = '';
+      taHad = '';
+    }
+    if (doc.activeElement === prevEl) {
       imeRefocus = true;
-      ta.blur();
+      prevEl.blur();
       imeRefocus = false;
     }
   };
@@ -5638,8 +5684,8 @@
         (el === canvas ? canvas : under || el).setPointerCapture(e.pointerId);
         if (touch(e)) { ptr(10, e, e.pointerId); if (isIOS()) frameInGesture(); }
         else if (e.button === 0 || e.button === 1 || e.button === 2) ptr(0, e, btnOf(e));
-        // keep the keyboard on the textarea while an editor has focus
-        if (imeActive) ta.focus({ preventScroll: true });
+        // keep the keyboard on the input method's field while an editor has focus
+        if (imeActive) imeEl().focus({ preventScroll: true });
       });
       on(el, 'pointermove', (e) => {
         if (touch(e)) {
@@ -5704,7 +5750,9 @@
       return ({ a: 24, b: 3, d: 2, e: 25, f: 4, h: 1, k: 35, n: 6, p: 5, v: 16,
         ArrowLeft: 22, ArrowRight: 23, ArrowUp: 15, ArrowDown: 16 })[c] || 0;
     };
-    on(ta, 'keydown', (e) => {
+    // (the window's input method fields: its textarea, and its password input for a secret's field)
+    const imeEls = [ta, pw].filter(Boolean);
+    for (const field of imeEls) on(field, 'keydown', (e) => {
       if (e.isComposing || e.keyCode === 229) return;
       const mods = modsOf(e);
       // a key catcher's focus (device, below): Alt too makes a shortcut; select all, copy, cut are its keys
@@ -5733,7 +5781,7 @@
     on(win, 'keydown', (e) => {
       const keptEsc = e === escKept;
       if (keptEsc) escKept = null;
-      if ((e.defaultPrevented && !keptEsc) || e.target === ta || imeActive || e.isComposing || e.keyCode === 229) return;
+      if ((e.defaultPrevented && !keptEsc) || isImeEl(e.target) || imeActive || e.isComposing || e.keyCode === 229) return;
       if (e.target?.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName)) return;
       if (!catching && e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey && e.key === 'ArrowLeft') {
         if (goBack(e)) return;
@@ -5755,11 +5803,11 @@
     // the next over it; another's keyboard may delete it key by key and type the next), corrections and suggestions
     // replace a word, each an event whose data is only the new words. (The textarea is given the field's words again
     // as the app says them, setIme.)
-    on(ta, 'input', (e) => {
+    for (const field of imeEls) on(field, 'input', (e) => {
       if (e.isComposing || composing) return;
-      const was = taHad, now = ta.value;
+      const was = taHad, now = field.value;
       taHad = now;
-      const [from, to, put] = taEdit(was, now, ta.selectionStart);
+      const [from, to, put] = taEdit(was, now, field.selectionStart);
       // (a line's end typed by a keyboard that does not send the key: as the key, ios_app.m's insertText)
       if (from === to && put === '\n') { cb.key(7, 0); return; }
       if (to > from) cb.text(3, '', from, to);
@@ -5768,8 +5816,8 @@
     // The keyboard put away by the person (Safari's Done over it), not by the app: the field lets go of the focus, as
     // the phones' apps' do (or setIme would take the focus back and the keyboard come up again). (The page sent behind
     // blurs the textarea too, and leaves it the focused element.)
-    on(ta, 'blur', () => {
-      if (!imeRefocus && imeActive && keyboardOver() > 0 && doc.activeElement !== ta) {
+    for (const field of imeEls) on(field, 'blur', () => {
+      if (!imeRefocus && imeActive && keyboardOver() > 0 && !isImeEl(doc.activeElement)) {
         cb.text(7, '', 0, 0);
         H.requestFrame();
       }
@@ -5784,19 +5832,21 @@
         cb.key(1000 + 'v'.charCodeAt(0), keysCmd());
       } else {
         const t = e.clipboardData?.getData('text/plain') || '';
-        if (t && e.target === ta) cb.text(0, t, 0, 0);
+        if (t && isImeEl(e.target)) cb.text(0, t, 0, 0);
         else if (t) return;
       }
       e.preventDefault();
     };
-    on(ta, 'paste', pasted);
+    for (const field of imeEls) on(field, 'paste', pasted);
     // (with no field focused, what is pasted goes to the page: a chat's ⌘V of a picture with the composer not focused)
-    on(win, 'paste', (e) => { if (e.target !== ta) pasted(e); });
-    on(ta, 'compositionstart', () => { composing = true; });
-    on(ta, 'compositionupdate', (e) => cb.text(1, e.data || '', (e.data || '').length, 0));
-    on(ta, 'compositionend', (e) => {
+    on(win, 'paste', (e) => { if (!isImeEl(e.target)) pasted(e); });
+    for (const field of imeEls) {
+      on(field, 'compositionstart', () => { composing = true; });
+      on(field, 'compositionupdate', (e) => cb.text(1, e.data || '', (e.data || '').length, 0));
+    }
+    for (const field of imeEls) on(field, 'compositionend', (e) => {
       composing = false;
-      taHad = ta.value;
+      taHad = field.value;
       cb.text(1, '', 0, 0);
       if (e.data) cb.text(0, e.data, 0, 0);
     });
@@ -6648,6 +6698,7 @@
     document.title = title;
     canvas = document.getElementById('c');
     ta = document.getElementById('ime');
+    pw = makePasswordInput(document, ta);
     canvas.addEventListener('webglcontextlost', contextLost);
     canvas.addEventListener('webglcontextrestored', () => inWin(0, contextRestored));
     setupGL();
@@ -6694,7 +6745,7 @@
   const rolesKept = new Map();
   function winSave(s) {
     Object.assign(s, {
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU, ADU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, pw, U, PU, ADU,
       extParallel, bootProgs, bootPvs, bootReady,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
@@ -6705,7 +6756,7 @@
   }
   function winLoad(s) {
     ({
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, U, PU, ADU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, pw, U, PU, ADU,
       extParallel, bootProgs, bootPvs, bootReady,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
@@ -6972,12 +7023,13 @@
     }
     cdoc.body.appendChild(ccanvas);
     cdoc.body.appendChild(cta);
+    const cpw = makePasswordInput(cdoc, cta);
     const s = {
       wid, win: child, role, minW, minH, closed: false, closing: false, pending: false, raf: 0, wake: { at: -1 },
       texs: new Map(),
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
       extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
-      ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta,
+      ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta, pw: cpw,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,

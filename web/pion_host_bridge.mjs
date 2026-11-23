@@ -297,8 +297,21 @@ export function attachHostBridge(rt, perfHooks = {}) {
           e.preventDefault();
           e.stopPropagation();
           activateA11yNode(nid);
+        } else if ((e.key === "Enter" || e.key === " ") && e.target === el) {
+          // A control that does not activate (a Slider inside a pressable Row)
+          // keeps its own Enter and Space from the ancestor that would.
+          e.stopPropagation();
         }
       });
+      if (spec.tag === "button") {
+        // Space activated it on keydown already: no click synthesized on keyup.
+        el.addEventListener("keyup", (e) => {
+          if (e.key === " ") {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        });
+      }
       if (node.el && node.el !== el) {
         // The old element's children move into the new one (in kids order below).
         for (const k of node.kids || []) {

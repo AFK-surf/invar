@@ -478,4 +478,65 @@ pub fn inner_block_shadow_alias_self_write() -> () -> Unit {
 ')"
 run_case "pos_e009_inner_block_shadow_alias" "$PKG_E009_INNER_BLOCK_SHADOW" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
 
+# 19. Positive E009: `ro` is bound to the outer `a` as it is declared; an inner block's `let a = b`
+#     read through `ro` does not make `ro` the inner `b`, so writing the outer `a` after the block
+#     is still a self-write
+PKG_E009_DECL_IDENTITY_POS="$(make_pkg "pos_e009_decl_identity" '
+import "signals"
+
+pub fn decl_identity_self_write() -> () -> Unit {
+  let a = signals::signal(0)
+  let b = signals::signal(0)
+  let ro = a.read()
+  signals::effect(fn() -> Unit {
+    {
+      let a = b
+      let _ = a
+      let _ = ro.get()
+    }
+    a.set(1)
+  })
+}
+')"
+run_case "pos_e009_decl_identity" "$PKG_E009_DECL_IDENTITY_POS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
+# 20. Negative E009: the same effect writing `b` instead reads `a` (through `ro`) and writes `b`:
+#     two signals, no self-write, though the inner block named `b` `a` while `ro` was read
+PKG_E009_DECL_IDENTITY_NEG="$(make_pkg "neg_e009_decl_identity" '
+import "signals"
+
+pub fn decl_identity_cross_write() -> () -> Unit {
+  let a = signals::signal(0)
+  let b = signals::signal(0)
+  let ro = a.read()
+  signals::effect(fn() -> Unit {
+    {
+      let a = b
+      let _ = a
+      let _ = ro.get()
+    }
+    b.set(1)
+  })
+}
+')"
+run_case "neg_e009_decl_identity" "$PKG_E009_DECL_IDENTITY_NEG" "clean"
+
+# 21. Positive E009: `let a = a.get()` reads the outer `a` in its initializer before the shadowed
+#     `a` enters scope, so writing `a` afterwards is still a self-write
+PKG_E009_SELF_SHADOW_RHS="$(make_pkg "pos_e009_self_shadow_rhs" '
+import "signals"
+
+pub fn self_shadow_rhs_write() -> () -> Unit {
+  let a = signals::signal(0)
+  signals::effect(fn() -> Unit {
+    {
+      let a = a.get()
+      let _ = a
+    }
+    a.set(1)
+  })
+}
+')"
+run_case "pos_e009_self_shadow_rhs" "$PKG_E009_SELF_SHADOW_RHS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="
