@@ -191,9 +191,12 @@ fn encode_sem_actions(tree : view::Tree, id : view::NodeId, actions : Array[view
 }
 
 /// Build full SemNode snapshot from a view::Tree, preserving semantic parent-child hierarchy
-/// and parent-relative coordinates expected by native hosts and A11yMirror.
-pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
+/// and parent-relative coordinates expected by native hosts and A11yMirror. Node ids on the wire
+/// come from `told`'s registry (A11yTold::wire_for): one per live node, never reused. Nodes kept
+/// from what is read out (View::hides, their own or an ancestor's) are left out.
+pub fn tree_sem_nodes(tree : view::Tree, told : A11yTold) -> (Array[SemNode], Int) {
   let order = tree.said_order()
+  told.wire_pass += 1
   let n_order = order.length()
   let mut focus_id = 0
   let (focused_nid, _) = tree.focused_now()
@@ -217,15 +220,16 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
     abs_w.push(dw)
     abs_h.push(dh)
     match sn.said {
-      Some(_) => {
-        let nid = sn.id.at + 1
+      Some(_) if !sn.hidden => {
+        let nid = told.wire_for(sn.id)
         nids.push(nid)
         kids_by_nid[nid] = []
       }
-      None => nids.push(0)
+      _ => nids.push(0)
     }
     idx += 1
   }
+  told.prune_wire_ids()
 
   let parent_idx_of : Array[Int] = []
   idx = 0
@@ -259,29 +263,31 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
   idx = 0
   while idx < n_order {
     let sn = order[idx]
+    let nid = nids[idx]
     let sd = match sn.said {
-      Some(v) => v
-      None => {
+      Some(v) if nid != 0 => v
+      _ => {
         idx += 1
         continue
       }
     }
-    let nid = nids[idx]
     match focused_nid {
       Some(fnid) => if fnid == sn.id { focus_id = nid }
       None => ()
     }
     let rname = role_name(sd.role)
     let flags_sb = StringBuilder::new()
+    // State flags as every host reads them: the lowercase letter says the node has the state,
+    // the uppercase one that it is on ("c" / "cC" / "cM", "e" / "eE", "p" / "pP").
     match sd.check {
       Some(view::Check::Off) => flags_sb.write_string("c")
-      Some(view::Check::On) => flags_sb.write_string("C")
-      Some(view::Check::Mixed) => flags_sb.write_string("M")
+      Some(view::Check::On) => flags_sb.write_string("cC")
+      Some(view::Check::Mixed) => flags_sb.write_string("cM")
       None => ()
     }
     match sd.expanded {
       Some(false) => flags_sb.write_string("e")
-      Some(true) => flags_sb.write_string("E")
+      Some(true) => flags_sb.write_string("eE")
       None => ()
     }
     match sd.selected {
@@ -289,8 +295,9 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
       _ => ()
     }
     match sd.pressed {
-      Some(true) => flags_sb.write_string("p")
-      _ => ()
+      Some(false) => flags_sb.write_string("p")
+      Some(true) => flags_sb.write_string("pP")
+      None => ()
     }
     if sn.disabled { flags_sb.write_string("d") }
     let pidx = parent_idx_of[idx]
@@ -350,15 +357,75 @@ pub fn tree_sem_nodes(tree : view::Tree) -> (Array[SemNode], Int) {
   (all, focus_id)
 }
 
-/// Incremental sender state tracking what was last sent to the host.
+/// Incremental sender state tracking what was last sent to the host, and the registry of wire ids:
+/// each live node gets its own id the first time it is told and keeps it while it lives; an id is
+/// never given to another node, so an action naming a node that is gone finds nothing.
 pub struct A11yTold {
   pub mirror : A11yMirror
-  pub node_ids : Map[Int, view::NodeId]
   pub mut initialized : Bool
+  /// tree slot (NodeId::at) -> (its live node's gen, wire id, pass it was last seen in)
+  slot_wire : Map[Int, (Int, Int, Int)]
+  /// wire id -> the node it names
+  pub wire_to_node : Map[Int, view::NodeId]
+  mut wire_pass : Int
 }
 
+/// Next wire id to hand out, shared by every window and app of the process (ids start at 1; 0 is
+/// the root): a new tree never hands out an id an earlier one used.
+let a11y_next_wire_id : Ref[Int] = ref_new(1)
+
 pub fn A11yTold::new() -> A11yTold {
-  A11yTold::{ mirror: A11yMirror::new(), node_ids: Map::new(), initialized: false }
+  A11yTold::{
+    mirror: A11yMirror::new(),
+    initialized: false,
+    slot_wire: Map::new(),
+    wire_to_node: Map::new(),
+    wire_pass: 0,
+  }
+}
+
+/// The wire id of node `id`, handing out a new one when it has none (a new node, or a new node
+/// in a reused slot). Marks it seen in the current pass.
+fn A11yTold::wire_for(self : A11yTold, id : view::NodeId) -> Int {
+  match self.slot_wire.get(id.at) {
+    Some((gen, wire, _)) if gen == id.gen => {
+      self.slot_wire[id.at] = (gen, wire, self.wire_pass)
+      return wire
+    }
+    Some((_, old, _)) => self.wire_to_node.remove(old)
+    None => ()
+  }
+  let wire = a11y_next_wire_id.v
+  a11y_next_wire_id.v = wire + 1
+  self.slot_wire[id.at] = (id.gen, wire, self.wire_pass)
+  self.wire_to_node[wire] = id
+  wire
+}
+
+/// Drop the ids of nodes not seen in the current pass (gone, hidden, or no longer saying anything).
+fn A11yTold::prune_wire_ids(self : A11yTold) -> Unit {
+  let stale : Array[Int] = []
+  for at in self.slot_wire.keys() {
+    match self.slot_wire.get(at) {
+      Some((_, _, pass)) if pass != self.wire_pass => stale.push(at)
+      _ => ()
+    }
+  }
+  for at in stale {
+    match self.slot_wire.get(at) {
+      Some((_, wire, _)) => self.wire_to_node.remove(wire)
+      None => ()
+    }
+    self.slot_wire.remove(at)
+  }
+}
+
+/// The wire id node `id` was last told as (0: none, it was not told).
+pub fn A11yTold::wire_id(self : A11yTold, id : view::NodeId) -> Int {
+  match self.slot_wire.get(id.at) {
+    Some((gen, wire, _)) if gen == id.gen => wire
+    _ => 0
+  }
 }
 
 /// Active window's incremental a11y state.
@@ -429,8 +496,9 @@ fn encode_sem_wire(full : Bool, focus : Int, changed : Array[SemNode]) -> String
 
 /// Dispatch an incoming accessibility semantic action JSON on `hostapi::a11y_channel`
 /// (`{"action":"resend"}` or `{"id": N, "action"|"op": "press"|"activate"|"inc"|"increment"|"dec"|"decrement"|"focus"|"dismiss"|"set_text", ...}`)
-/// directly to the matching node in the active `view_tree()` by node identity (`sn.id.at + 1 == id`)
-/// with generation validation against the last synced tree.
+/// directly to the node the active window's registry gave that wire id (A11yTold::wire_to_node).
+/// Wire ids are never reused, so an id naming a node that is gone (even one whose slot now holds
+/// another node) finds nothing and the action is refused.
 pub fn a11y_handle_action(json : String) -> Bool {
   let obj = match hostapi::json_parse(json) {
     Some(hostapi::JsonValue::JObject(m)) => m
@@ -444,8 +512,8 @@ pub fn a11y_handle_action(json : String) -> Bool {
     }
   }
   if op == "resend" {
+    // (the ids stay: the full tree sent next names every node as before)
     view_app.a11y.initialized = false
-    view_app.a11y.node_ids.clear()
     hostapi::request_frame()
     return true
   }
@@ -460,24 +528,12 @@ pub fn a11y_handle_action(json : String) -> Bool {
     Some(t) => t
     None => return false
   }
-  let mut target : Option[view::NodeId] = None
-  for sn in tree.said_order() {
-    if sn.id.at + 1 == nid {
-      target = Some(sn.id)
-      break
-    }
-  }
-  let node_id = match target {
+  let node_id = match view_app.a11y.wire_to_node.get(nid) {
     Some(id) => id
     None => return false
   }
-  match view_app.a11y.node_ids.get(nid) {
-    Some(expected) => {
-      if expected.gen != node_id.gen {
-        return false
-      }
-    }
-    None => ()
+  if !tree.lives(node_id) {
+    return false
   }
   let now = hostapi::now()
   let mut ok = false
@@ -505,26 +561,32 @@ pub fn a11y_handle_action(json : String) -> Bool {
     }
     match txt_opt {
       Some(txt) => {
-        let _ = tree.focus_to(Some(node_id), visible=true)
-        let already_focused = match focused_field_ref.v {
-          Some(f) if f.focused_sig.untracked() => true
-          _ => false
-        }
-        if !already_focused {
-          let _ = tree.activate_at(node_id, now)
-        }
-        match focused_field_ref.v {
-          Some(f) if f.focused_sig.untracked() => {
-            f.set(txt)
+        match find_tree_field(node_id) {
+          // A standard Field: write into that very Field, whichever one held focus before.
+          Some(tf) => {
+            let _ = tree.focus_to(Some(node_id), visible=true)
+            tf.field.focus()
+            tf.field.set(txt)
             ok = true
           }
-          _ => {
-            match view_app.text_interceptor {
-              Some(_) => {
-                view_text(0, txt)
-                ok = true
+          // Any other control takes text only through the text interceptor, and only once the
+          // node itself holds focus (focused, or activated into it): never into another Field.
+          None => {
+            let holds = fn() -> Bool {
+              match tree.focused_now().0 {
+                Some(cur) => cur == node_id
+                None => false
               }
-              None => ()
+            }
+            let _ = tree.focus_to(Some(node_id), visible=true)
+            if !holds() {
+              let _ = tree.activate_at(node_id, now)
+            }
+            if holds() {
+              match view_app.text_interceptor {
+                Some(f) => ok = f(0, txt, 0, 0)
+                None => ()
+              }
             }
           }
         }
@@ -539,24 +601,10 @@ pub fn a11y_handle_action(json : String) -> Bool {
   ok
 }
 
-fn record_a11y_node_ids(tree : view::Tree, dst : Map[Int, view::NodeId]) -> Unit {
-  dst.clear()
-  for sn in tree.said_order() {
-    match sn.said {
-      Some(_) => {
-        dst[sn.id.at + 1] = sn.id
-      }
-      None => ()
-    }
-  }
-}
-
 /// Compute and send incremental a11y update for `tree` against `told`.
 /// Returns (wire_string, changed_nodes_count, full_sent).
 pub fn a11y_sync(tree : view::Tree, told : A11yTold, force_full~ : Bool = false) -> (String, Int, Bool) {
-  let (all, focus) = tree_sem_nodes(tree)
-  record_a11y_node_ids(tree, told.node_ids)
-  record_a11y_node_ids(tree, view_app.a11y.node_ids)
+  let (all, focus) = tree_sem_nodes(tree, told)
   let full = force_full || !told.initialized
   let changed : Array[SemNode] = []
   if full {

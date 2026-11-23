@@ -3981,7 +3981,9 @@ static void offscreen_lost(void) {
   read_w = read_h = 0;
 }
 
-static void gl_offscreen(double w, double h, double scale) {
+// Draw into a framebuffer of our own of w x h points at scale; 0 when the driver cannot make a complete one (nothing
+// kept of it, so the next call at the same size tries again).
+static int gl_offscreen(double w, double h, double scale) {
   offscreen = 1;
   cur_w = w;
   cur_h = h;
@@ -4004,13 +4006,23 @@ static void gl_offscreen(double w, double h, double scale) {
     glGenFramebuffers(1, &off_fb);
     glBindFramebuffer(GL_FRAMEBUFFER, off_fb);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, off_tex, 0);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) LOG("mbui-render: no framebuffer");
+    canvas_ok = 0;
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      LOG("mbui-render: no framebuffer (%dx%d)", pw, ph);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glDeleteFramebuffers(1, &off_fb);
+      glDeleteTextures(1, &off_tex);
+      off_fb = off_tex = 0;
+      off_pw = off_ph = 0;
+      target_fb = 0;
+      return 0;
+    }
     off_pw = pw;
     off_ph = ph;
-    canvas_ok = 0;
   }
   target_fb = off_fb;
   glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
+  return 1;
 }
 
 // The offscreen framebuffer as its frames left it (not the last frame drawn again: what drawing only the parts that

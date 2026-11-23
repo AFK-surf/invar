@@ -1135,10 +1135,45 @@ def _strip_pion_comments_and_strings(src):
                     if src[i] == "\n":
                         out.append("\n")
                     i += 1
+        elif c == "'":
+            end = _pion_char_literal_end(src, i)
+            if end > 0:
+                out.append("''")
+                i = end
+            else:
+                out.append(c)
+                i += 1
         else:
             out.append(c)
             i += 1
     return "".join(out)
+
+
+def _pion_char_literal_end(src, i):
+    """Index just past the char literal starting at src[i] == "'" ('a', '"', '\\'', '\\x41',
+    '\\u{1F}'), or 0 when no char literal starts there."""
+    n = len(src)
+    j = i + 1
+    if j >= n or src[j] in ("\n", "'"):
+        return 0
+    if src[j] == "\\":
+        j += 1
+        if j >= n:
+            return 0
+        if src[j] == "u" and j + 1 < n and src[j + 1] == "{":
+            close = src.find("}", j + 2, j + 10)
+            if close == -1:
+                return 0
+            j = close + 1
+        elif src[j] == "x":
+            j += 3
+        else:
+            j += 1
+    else:
+        j += 1
+    if j < n and src[j] == "'":
+        return j + 1
+    return 0
 
 
 _SIGNAL_ALIAS_RE = re.compile(
@@ -1174,7 +1209,24 @@ def _collect_signal_aliases(lines, start_line):
             break
     prefix_src = "\n".join(lines[fn_start : start_line - 1])
     cleaned_prefix = _strip_pion_comments_and_strings(prefix_src)
-    _scan_signal_aliases(cleaned_prefix, aliases)
+    # A `let` holds only to the end of its block: keep one alias table per open `{` and drop it at
+    # its `}`, so an inner block's `let ro = b.read()` never outlives the block.
+    scope_stack = [{}]
+    events = [(m.start(), "let", m) for m in _SIGNAL_ALIAS_RE.finditer(cleaned_prefix)]
+    events += [(k, ch, None) for k, ch in enumerate(cleaned_prefix) if ch in "{}"]
+    events.sort(key=lambda e: e[0])
+    for _, kind, m in events:
+        if kind == "{":
+            scope_stack.append({})
+        elif kind == "}":
+            if len(scope_stack) > 1:
+                scope_stack.pop()
+        else:
+            lhs, rhs = m.group(1), m.group(2)
+            if lhs != rhs and rhs not in ("true", "false", "None"):
+                scope_stack[-1][lhs] = rhs
+    for layer in scope_stack:
+        aliases.update(layer)
     return aliases
 
 
@@ -2433,7 +2485,55 @@ def _pkg_name_from_toml(pkg_dir):
     return os.path.basename(pkg_dir)
 
 
-def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
+WEB_DIST_STATE = os.path.join(INVAR_ROOT, "target", ".invar-web-dist-state.json")
+
+
+def _web_dist_state_load():
+    try:
+        with open(WEB_DIST_STATE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _web_dist_reconcile(out_dir, managed):
+    """Remove from `out_dir` only the files an earlier build here wrote and this one did not, then
+    record what this build wrote. The record lives under target/, never in `out_dir`, so files the
+    caller keeps there (their own .wasm, headers, ...) are never touched."""
+    key = os.path.realpath(out_dir)
+    state = _web_dist_state_load()
+    prev = state.get(key, [])
+    removed = []
+    if isinstance(prev, list):
+        for name in prev:
+            if not isinstance(name, str) or name in managed or os.path.basename(name) != name or name in ("", ".", ".."):
+                continue
+            path = os.path.join(out_dir, name)
+            if os.path.isfile(path) or os.path.islink(path):
+                try:
+                    os.unlink(path)
+                    removed.append(name)
+                except OSError:
+                    pass
+    # (records of output dirs that no longer exist, such as temporary ones, are dropped)
+    state = {d: files for d, files in state.items() if d != key and os.path.isdir(d)}
+    state[key] = sorted(managed)
+    os.makedirs(os.path.dirname(WEB_DIST_STATE), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".invar-web-dist-state.", dir=os.path.dirname(WEB_DIST_STATE))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        os.replace(tmp, WEB_DIST_STATE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return sorted(removed)
+
+
+def _web_build_impl(pkg_dir, out_dir, title, release, do_opt, track_dist=True):
     pionc = resolve_pionc()
     if not pionc["found"]:
         return {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
@@ -2474,12 +2574,7 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
         else:
             wasm_opt_skipped = "wasm-opt not found"
 
-    for entry in os.listdir(out_dir):
-        if entry.endswith(".wasm") and entry not in (wasm_name, "ghostty-vt.wasm"):
-            try:
-                os.unlink(os.path.join(out_dir, entry))
-            except OSError:
-                pass
+    managed = {wasm_name, "index.html"}
     required_files = list(WEB_DIST_RUNTIME_FILES) + list(WEB_STATIC_ASSETS)
     if pkg_name == "lg_web":
         required_files.extend(["_headers", "_redirects"])
@@ -2488,17 +2583,17 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
         if not os.path.isfile(src):
             return {"ok": False, "error": f"Missing required web asset: web/{wf}", "wasm_opt_ran": wasm_opt_ran}
         shutil.copy2(src, os.path.join(out_dir, wf))
+        managed.add(wf)
     if pkg_name != "lg_web":
         for cf in ("_headers", "_redirects"):
             custom_src = os.path.join(pkg_dir, cf)
-            dst_cf = os.path.join(out_dir, cf)
             if os.path.isfile(custom_src):
-                shutil.copy2(custom_src, dst_cf)
-            elif os.path.isfile(dst_cf):
-                os.unlink(dst_cf)
+                shutil.copy2(custom_src, os.path.join(out_dir, cf))
+                managed.add(cf)
     vt_src = os.path.join(INVAR_ROOT, "web", "ghostty-vt.wasm")
     if os.path.isfile(vt_src):
         shutil.copy2(vt_src, os.path.join(out_dir, "ghostty-vt.wasm"))
+        managed.add("ghostty-vt.wasm")
 
     # Write clean index.html tailored to wasm_name & title
     tpl_path = os.path.join(INVAR_ROOT, "web", "index.html")
@@ -2509,6 +2604,9 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
     tpl_html = tpl_html.replace("./lg_web.wasm", f"./{wasm_name}").replace('"lg_web.wasm"', f'"{wasm_name}"')
     with open(os.path.join(out_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(tpl_html)
+    # Files an earlier build here wrote and this one did not (another package's .wasm, its
+    # _headers/_redirects): gone; anything else in out_dir is the caller's and stays.
+    stale_removed = _web_dist_reconcile(out_dir, managed) if track_dist else []
 
     # Verify WASM imports
     imp_res = verify_wasm_imports(wasm_file)
@@ -2535,6 +2633,7 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt):
         "imports_total": imp_res["total"],
         "imports_missing": imp_res["missing"],
         "wasm_opt_ran": wasm_opt_ran,
+        "stale_removed": stale_removed,
         "elapsed_ms": build_ms,
     }
     if wasm_opt_skipped:
@@ -2568,7 +2667,7 @@ def cmd_web(args):
                     rc, out, err, _ = run_cmd([node, "--check", os.path.join(INVAR_ROOT, "web", wf)])
                     if rc != 0:
                         js_errors.append(f"web/{wf}: {(out + err).strip()}")
-            res = _web_build_impl(pkg_dir, tmp_dir, title, True, args.opt)
+            res = _web_build_impl(pkg_dir, tmp_dir, title, True, args.opt, track_dist=False)
             res["js_errors"] = js_errors
             if js_errors:
                 res["ok"] = False

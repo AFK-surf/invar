@@ -135,6 +135,8 @@ assert os.path.isfile(os.path.join(out, '_headers')), 'lg_web must emit _headers
 assert os.path.isfile(os.path.join(out, '_redirects')), 'lg_web must emit _redirects'
 assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web must emit lg_web.wasm'
 " "$SHARED_OUT"
+# A file of the caller's own in the output dir: never invar's to remove.
+printf '\0asm\1\0\0\0' > "$SHARED_OUT/decoder.wasm"
 "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
 assert_py "
 import os, sys
@@ -143,7 +145,19 @@ assert not os.path.exists(os.path.join(out, '_headers')), 'stale _headers must b
 assert not os.path.exists(os.path.join(out, '_redirects')), 'stale _redirects must be removed for custom pkg'
 assert not os.path.exists(os.path.join(out, 'lg_web.wasm')), 'stale lg_web.wasm must be removed for custom pkg'
 assert os.path.isfile(os.path.join(out, 'my_web_app.wasm')), 'custom wasm must exist'
-print('OK: shared web out dir cleaned of stale _headers, _redirects, and lg_web.wasm')
+assert os.path.isfile(os.path.join(out, 'decoder.wasm')), 'caller-owned decoder.wasm must be kept'
+assert open(os.path.join(out, 'decoder.wasm'), 'rb').read() == b'\\0asm\\1\\0\\0\\0', 'decoder.wasm untouched'
+assert not any(n.startswith('.invar') for n in os.listdir(out)), 'no build record inside the output dir'
+print('OK: shared web out dir cleaned of stale _headers, _redirects, and lg_web.wasm; decoder.wasm kept')
+" "$SHARED_OUT"
+"$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+assert_py "
+import os, sys
+out = sys.argv[1]
+assert not os.path.exists(os.path.join(out, 'my_web_app.wasm')), 'stale my_web_app.wasm must be removed when lg_web is built again'
+assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web.wasm rebuilt'
+assert os.path.isfile(os.path.join(out, 'decoder.wasm')), 'decoder.wasm still kept'
+print('OK: rebuilding lg_web removes my_web_app.wasm and still keeps decoder.wasm')
 " "$SHARED_OUT"
 
 echo "=== 9. invar diff --json --out --sbs (synthetic PNGs) ==="

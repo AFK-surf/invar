@@ -596,7 +596,7 @@ double mb_host_now(void);
 
 int mb_render_init_offscreen(double w, double h, double scale) {
   JNIEnv *env = env_();
-  gl_offscreen(w, h, scale);
+  if (!gl_offscreen(w, h, scale)) return 0;
   (*env)->CallStaticVoidMethod(env, text_cls, m_text_scale, (jfloat)scale);
   (*env)->CallStaticVoidMethod(env, images_cls, m_img_hold);
   return 1;

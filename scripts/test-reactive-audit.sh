@@ -413,4 +413,46 @@ pub fn inner_alias_self_write() -> () -> Unit {
 ')"
 run_case "pos_e009_inner_alias" "$PKG_E009_INNER_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
 
+# 16. Positive E009: an inner block's `let ro = b.read()` ends with its block; the outer
+#     `let ro = a.read()` is what the effect reads, and it writes `a`
+PKG_E009_BLOCK_SHADOW="$(make_pkg "pos_e009_block_shadow_alias" '
+import "signals"
+
+pub fn block_shadow_alias_self_write() -> () -> Unit {
+  let a = signals::signal(0)
+  let b = signals::signal(0)
+  let ro = a.read()
+  if true {
+    let ro = b.read()
+    let _ = ro
+  }
+  signals::effect(fn() -> Unit {
+    let v = ro.get()
+    if v < 5 {
+      a.set(v + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_block_shadow_alias" "$PKG_E009_BLOCK_SHADOW" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
+# 17. Positive E009: a char literal `'"'` before the alias must not read as a string opening
+PKG_E009_CHAR_QUOTE="$(make_pkg "pos_e009_char_quote_literal" '
+import "signals"
+
+pub fn char_quote_alias_self_write() -> () -> Unit {
+  let q = '\''"'\''
+  let _ = q
+  let s = signals::signal(0)
+  let ro = s.read()
+  signals::effect(fn() -> Unit {
+    let v = ro.get()
+    if v < 5 {
+      s.set(v + 1)
+    }
+  })
+}
+')"
+run_case "pos_e009_char_quote_literal" "$PKG_E009_CHAR_QUOTE" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="

@@ -202,6 +202,21 @@ export function attachHostBridge(rt, perfHooks = {}) {
     }
   }
 
+  // Place `node` and every mirrored descendant now: children are positioned
+  // relative to their parent, so moving a parent moves its whole subtree.
+  function applyA11yGeometryDeep(node) {
+    const stack = [node];
+    const seen = new Set();
+    while (stack.length) {
+      const n = stack.pop();
+      if (!n || seen.has(n.id)) continue;
+      seen.add(n.id);
+      pendingA11yGeom.delete(n.id);
+      if (n.el) applyA11yGeometry(n.el, n);
+      if (n.kids) for (const k of n.kids) stack.push(a11yNodes.get(k));
+    }
+  }
+
   function flushA11yGeom() {
     a11yGeomTimer = null;
     for (const id of pendingA11yGeom) {
@@ -233,8 +248,11 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (spec.tag === "button") el.type = "button";
       el.dataset.a11yId = node.id;
       const nid = node.id;
+      // Each mirror element handles its own activation: stop the event here so a
+      // nested control (Tab inside TabList) never also activates its ancestors.
       el.addEventListener("click", (e) => {
         e.preventDefault();
+        e.stopPropagation();
         activateA11yNode(nid);
       });
       el.addEventListener("focus", () => {
@@ -248,16 +266,19 @@ export function attachHostBridge(rt, perfHooks = {}) {
         if (!cur || cur.flags.includes("d")) return;
         if ((e.key === "ArrowUp" || e.key === "ArrowRight") && cur.actions.includes("i")) {
           e.preventDefault();
+          e.stopPropagation();
           deliverA11yAction({ op: "inc", action: "increment", id: Number(nid) });
           return;
         }
         if ((e.key === "ArrowDown" || e.key === "ArrowLeft") && cur.actions.includes("d")) {
           e.preventDefault();
+          e.stopPropagation();
           deliverA11yAction({ op: "dec", action: "decrement", id: Number(nid) });
           return;
         }
         if (spec.tag !== "button" && (e.key === "Enter" || e.key === " ")) {
           e.preventDefault();
+          e.stopPropagation();
           activateA11yNode(nid);
         }
       });
@@ -289,9 +310,11 @@ export function attachHostBridge(rt, perfHooks = {}) {
 
     const flags = node.flags;
     if (!last || last.flags !== flags) {
+      // Two-letter state flags: lowercase = has the state, uppercase = it is on
+      // ("c" / "cC" / "cM", "e" / "eE", "p" / "pP"). Check the uppercase first.
       if (flags.includes("C")) el.setAttribute("aria-checked", "true");
-      else if (flags.includes("c")) el.setAttribute("aria-checked", "false");
       else if (flags.includes("M")) el.setAttribute("aria-checked", "mixed");
+      else if (flags.includes("c")) el.setAttribute("aria-checked", "false");
       else el.removeAttribute("aria-checked");
 
       if (flags.includes("E")) el.setAttribute("aria-expanded", "true");
@@ -301,7 +324,8 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (flags.includes("s")) el.setAttribute("aria-selected", "true");
       else el.removeAttribute("aria-selected");
 
-      if (flags.includes("p")) el.setAttribute("aria-pressed", "true");
+      if (flags.includes("P")) el.setAttribute("aria-pressed", "true");
+      else if (flags.includes("p")) el.setAttribute("aria-pressed", "false");
       else el.removeAttribute("aria-pressed");
 
       const disabled = flags.includes("d");
@@ -382,8 +406,7 @@ export function attachHostBridge(rt, perfHooks = {}) {
 
     if (geomChanged) {
       if (semanticChanged) {
-        pendingA11yGeom.delete(node.id);
-        applyA11yGeometry(el, node);
+        applyA11yGeometryDeep(node);
       } else {
         scheduleA11yGeom(node.id);
       }
@@ -507,11 +530,15 @@ export function attachHostBridge(rt, perfHooks = {}) {
         const p = batch[i];
         const parentEl = p.id === "0" ? root : p.el;
         if (!parentEl || !p.kids.length) continue;
+        // Keep DOM (reading) order equal to the semantic kids order, also when
+        // existing children are only reordered.
+        let pos = 0;
         for (const k of p.kids) {
           const c = a11yNodes.get(k);
-          if (c && c.el && c.el !== parentEl && c.el.parentNode !== parentEl) {
-            parentEl.appendChild(c.el);
-          }
+          if (!c || !c.el || c.el === parentEl) continue;
+          const at = parentEl.children[pos] || null;
+          if (at !== c.el) parentEl.insertBefore(c.el, at);
+          pos++;
         }
       }
     }
