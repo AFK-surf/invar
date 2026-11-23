@@ -3040,3 +3040,144 @@ test "64 view_text kinds: UTF-16 range replace and delete, cancel composition, h
   debug_assert(!t.fake.ime_active, "host IME off on kind=7")
   t.dispose()
 }
+
+test "65 Scene::emit_quad_bezier tight AABB, exact control point encoding, and adaptive ink" {
+  let sc = Scene::new()
+  // Filtered cases emit nothing
+  sc.emit_quad_bezier(0.0, 0.0, 50.0, 50.0, 100.0, 0.0, 0.0, rgba(0, 0, 0, 255))
+  sc.emit_quad_bezier(0.0, 0.0, 50.0, 50.0, 100.0, 0.0, 4.0, rgba(0, 0, 0, 0))
+  sc.emit_quad_bezier(0.0, 0.0, 50.0, 50.0, 100.0, 0.0, 4.0, rgba(0, 0, 0, 255), alpha=0.0)
+  debug_assert(sc.ninst == 0, "invisible quad bezier must emit 0 instances")
+
+  // Symmetric arch: A=(20, 100), B=(120, 0), C=(220, 100)
+  // Exact vertex at t=0.5 is (120, 50), strictly below control hull y=0.
+  let x0 = 20.0
+  let y0 = 100.0
+  let cx = 120.0
+  let cy = 0.0
+  let x1 = 220.0
+  let y1 = 100.0
+  let width = 6.0
+  sc.emit_quad_bezier(x0, y0, cx, cy, x1, y1, width, rgba(30, 120, 240, 255))
+  debug_assert(sc.ninst == 1, "emit_quad_bezier must emit 1 instance")
+
+  let bx = sc.inst[0]
+  let by = sc.inst[1]
+  let bw = sc.inst[2]
+  let bh = sc.inst[3]
+  let hw = sc.inst[4]
+  let kind = sc.inst[5]
+  let pz = sc.inst[6]
+  debug_assert((kind - 10.0).abs() < 1.0e-9, "kind must be 10.0")
+  debug_assert((pz - 1.0).abs() < 1.0e-9, "p.z must be 1.0 for quad bezier")
+  debug_assert((hw - 3.0).abs() < 1.0e-9, "p.x must be half width")
+
+  // Tight AABB around [20..220] x [50..100] expanded by pad = hw + 1.5 = 4.5
+  let pad = 4.5
+  debug_assert((bx - (20.0 - pad)).abs() < 1.0e-9, "tight AABB bx")
+  debug_assert((by - (50.0 - pad)).abs() < 1.0e-9, "tight AABB by uses vertex y=50, not control y=0")
+  debug_assert((bw - (200.0 + 2.0 * pad)).abs() < 1.0e-9, "tight AABB bw")
+  debug_assert((bh - (50.0 + 2.0 * pad)).abs() < 1.0e-9, "tight AABB bh")
+
+  // Reconstruct (A, B, C) from rect, c2, rr.xy to within 1e-9
+  let ra_x = bx + sc.inst[12] * bw
+  let ra_y = by + sc.inst[13] * bh
+  let rc_x = bx + sc.inst[14] * bw
+  let rc_y = by + sc.inst[15] * bh
+  let rb_x = bx + sc.inst[36] * bw
+  let rb_y = by + sc.inst[37] * bh
+  debug_assert((ra_x - x0).abs() < 1.0e-9 && (ra_y - y0).abs() < 1.0e-9, "reconstructed A matches")
+  debug_assert((rb_x - cx).abs() < 1.0e-9 && (rb_y - cy).abs() < 1.0e-9, "reconstructed B matches")
+  debug_assert((rc_x - x1).abs() < 1.0e-9 && (rc_y - y1).abs() < 1.0e-9, "reconstructed C matches")
+  debug_assert(sc.inst[23] == 0.0, "no adaptive ink when ink_r == 0")
+
+  // Adaptive ink propagation when scene.ink_r > 0
+  sc.ink_x = 128.5
+  sc.ink_y = 64.25
+  sc.ink_r = 32.0
+  sc.emit_quad_bezier(10.0, 20.0, 40.0, 5.0, 80.0, 20.0, 2.0, rgba(20, 20, 20, 255))
+  debug_assert(sc.ninst == 2, "second quad emitted")
+  let b1 = inst_size
+  debug_assert((sc.inst[b1 + 21] - 128.5).abs() < 1.0e-9, "pad.y must carry ink_x")
+  debug_assert((sc.inst[b1 + 22] - 64.25).abs() < 1.0e-9, "pad.z must carry ink_y")
+  debug_assert((sc.inst[b1 + 23] - 32.0).abs() < 1.0e-9, "pad.w must carry ink_r")
+}
+
+test "66 Scene::emit_cubic_bezier adaptive C1 subdivision, instance budget, and tolerance" {
+  let sc = Scene::new()
+  // Typical 400pt S-curve
+  let x0 = 20.0
+  let y0 = 120.0
+  let c1x = 150.0
+  let c1y = 40.0
+  let c2x = 290.0
+  let c2y = 200.0
+  let x1 = 420.0
+  let y1 = 120.0
+  let tol = 0.15
+  sc.emit_cubic_bezier(x0, y0, c1x, c1y, c2x, c2y, x1, y1, 4.0, rgba(240, 80, 40, 255), tol=tol)
+  let n = sc.ninst
+  debug_assert(n >= 2 && n <= 8, "400pt S-curve must emit <= 8 analytic quads, got \{n}")
+
+  let mut prev_bx = 0.0
+  let mut prev_by = 0.0
+  let mut prev_cx = 0.0
+  let mut prev_cy = 0.0
+  let mut max_err = 0.0
+  let mut i = 0
+  while i < n {
+    let base = i * inst_size
+    let rx = sc.inst[base]
+    let ry = sc.inst[base + 1]
+    let rw = sc.inst[base + 2]
+    let rh = sc.inst[base + 3]
+    debug_assert((sc.inst[base + 5] - 10.0).abs() < 1.0e-9, "cubic quad kind == 10")
+    debug_assert((sc.inst[base + 6] - 1.0).abs() < 1.0e-9, "cubic quad p.z == 1")
+    let ax = rx + sc.inst[base + 12] * rw
+    let ay = ry + sc.inst[base + 13] * rh
+    let cx = rx + sc.inst[base + 14] * rw
+    let cy = ry + sc.inst[base + 15] * rh
+    let bx = rx + sc.inst[base + 36] * rw
+    let by = ry + sc.inst[base + 37] * rh
+
+    if i > 0 {
+      // C0 join: C_{i-1} == A_i
+      debug_assert((prev_cx - ax).abs() < 1.0e-9 && (prev_cy - ay).abs() < 1.0e-9, "C0 join at seg \{i}")
+      // C1 tangent continuity: (C_{i-1} - B_{i-1}) collinear & same direction as (B_i - A_i)
+      let t1x = prev_cx - prev_bx
+      let t1y = prev_cy - prev_by
+      let t2x = bx - ax
+      let t2y = by - ay
+      let len1 = dmath::sqrt(t1x * t1x + t1y * t1y)
+      let len2 = dmath::sqrt(t2x * t2x + t2y * t2y)
+      let cross = (t1x * t2y - t1y * t2x).abs()
+      let dotp = t1x * t2x + t1y * t2y
+      debug_assert(cross <= 1.0e-6 * len1 * len2, "C1 tangent collinearity at seg \{i}")
+      debug_assert(dotp > 0.0, "C1 tangent same direction at seg \{i}")
+    }
+
+    // Sample quadratic segment against original cubic curve at matching parameter t = (i + u) / n
+    let mut s = 0
+    while s <= 16 {
+      let u = s.to_double() / 16.0
+      let mu = 1.0 - u
+      let qx = mu * mu * ax + 2.0 * mu * u * bx + u * u * cx
+      let qy = mu * mu * ay + 2.0 * mu * u * by + u * u * cy
+      let t = (i.to_double() + u) / n.to_double()
+      let mt = 1.0 - t
+      let px = mt * mt * mt * x0 + 3.0 * mt * mt * t * c1x + 3.0 * mt * t * t * c2x + t * t * t * x1
+      let py = mt * mt * mt * y0 + 3.0 * mt * mt * t * c1y + 3.0 * mt * t * t * c2y + t * t * t * y1
+      let err = dmath::sqrt((qx - px) * (qx - px) + (qy - py) * (qy - py))
+      if err > max_err {
+        max_err = err
+      }
+      s += 1
+    }
+    prev_bx = bx
+    prev_by = by
+    prev_cx = cx
+    prev_cy = cy
+    i += 1
+  }
+  debug_assert(max_err <= tol, "max cubic-to-quad sampling error \{max_err} must be <= \{tol}")
+}

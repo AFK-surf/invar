@@ -1031,6 +1031,51 @@
     float d = mb_sd_clip(p, c, r, s, 1.0 + 2.0 / scale);
     return clamp(0.5 - d * scale, 0.0, 1.0);
   }
+  #if ONE_KIND < 0 || ONE_KIND == 10
+  float mb_sd_quad_bezier(vec2 pos, vec2 A, vec2 B, vec2 C) {
+    vec2 a = B - A;
+    vec2 b = A - 2.0 * B + C;
+    vec2 c = a * 2.0;
+    vec2 d = A - pos;
+    float bb = dot(b, b);
+    if (bb <= 1e-6 * max(dot(a, a), 1.0)) {
+      vec2 ac = C - A;
+      float h = clamp(dot(pos - A, ac) / max(dot(ac, ac), 1e-8), 0.0, 1.0);
+      return length(pos - A - ac * h);
+    }
+    float kk = 1.0 / bb;
+    float kx = kk * dot(a, b);
+    float ky = kk * (2.0 * dot(a, a) + dot(d, b)) / 3.0;
+    float kz = kk * dot(d, a);
+    float p = ky - kx * kx;
+    float p3 = p * p * p;
+    float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
+    float h = q * q + 4.0 * p3;
+    float res;
+    if (h >= 0.0) {
+      float sh = sqrt(h);
+      vec2 x = (vec2(sh, -sh) - q) * 0.5;
+      vec2 uv = sign(x) * pow(max(abs(x), vec2(1e-20)), vec2(1.0 / 3.0));
+      float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
+      vec2 v = d + (c + b * t) * t;
+      res = dot(v, v);
+    } else {
+      float z = sqrt(-p);
+      float denom = min(p * z * 2.0, -1e-12);
+      float ang = acos(clamp(q / denom, -1.0, 1.0)) / 3.0;
+      float m = cos(ang);
+      float n = sin(ang) * 1.732050808;
+      float t0 = clamp((m + m) * z - kx, 0.0, 1.0);
+      float t1 = clamp((-n - m) * z - kx, 0.0, 1.0);
+      float t2 = clamp((n - m) * z - kx, 0.0, 1.0);
+      vec2 v0 = d + (c + b * t0) * t0;
+      vec2 v1 = d + (c + b * t1) * t1;
+      vec2 v2 = d + (c + b * t2) * t2;
+      res = min(dot(v0, v0), min(dot(v1, v1), dot(v2, v2)));
+    }
+    return sqrt(res);
+  }
+  #endif
   // what it shows at p, as if uncut
   void shade(vec2 p, float fade_r) {
     int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5));
@@ -1060,10 +1105,17 @@
     #endif
     #if ONE_KIND < 0 || ONE_KIND == 10
     if (kind == 10) {
-      // a piece of a line (scene.mbt): from c2.xy to c2.zw (shares of its rect), p.x half its width, its ends round
-      vec2 a = v_rect.xy + v_c2.xy * v_rect.zw, ab = v_rect.xy + v_c2.zw * v_rect.zw - a;
-      float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
-      float d = length(p - a - ab * h) - v_p.x;
+      // a line segment (p.z == 0) or analytic quadratic Bezier stroke (p.z > 0.5, control point in rr.xy)
+      vec2 a = v_rect.xy + v_c2.xy * v_rect.zw, c = v_rect.xy + v_c2.zw * v_rect.zw;
+      float d;
+      if (v_p.z > 0.5) {
+        vec2 b = v_rect.xy + v_rr.xy * v_rect.zw;
+        d = mb_sd_quad_bezier(p, a, b, c) - v_p.x;
+      } else {
+        vec2 ab = c - a;
+        float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
+        d = length(p - a - ab * h) - v_p.x;
+      }
       if (v_pad.w > 0.0) col.rgb = mb_adaptive_ink_at(col.rgb, v_pad.yz, v_pad.w * 0.5, v_rect);
       o = vec4(col.rgb, 1.0) * col.a * clamp(0.5 - d * u_scale, 0.0, 1.0);
       return;

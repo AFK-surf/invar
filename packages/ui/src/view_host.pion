@@ -394,6 +394,183 @@ pub fn Scene::emit_line(
   }
 }
 
+/// Emit an analytic quadratic Bezier stroke (`kind = 10.0`, `p.z = 1.0`) with a tight
+/// extrema-bounded AABB and exact round caps. Control point `(cx, cy)` is encoded in `rr.xy`
+/// as normalized fractions of `rect`.
+pub fn Scene::emit_quad_bezier(
+  self : Scene,
+  x0 : Double,
+  y0 : Double,
+  cx : Double,
+  cy : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Unit {
+  if width <= 0.0 || (color & 0xFFL) == 0L || alpha <= 0.0 {
+    return
+  }
+  let mut min_x = dmin(x0, x1)
+  let mut max_x = dmax(x0, x1)
+  let dx = x0 - 2.0 * cx + x1
+  if dx.abs() > 1.0e-9 {
+    let tx = (x0 - cx) / dx
+    if tx > 0.0 && tx < 1.0 {
+      let mt = 1.0 - tx
+      let qx = mt * mt * x0 + 2.0 * mt * tx * cx + tx * tx * x1
+      min_x = dmin(min_x, qx)
+      max_x = dmax(max_x, qx)
+    }
+  }
+  let mut min_y = dmin(y0, y1)
+  let mut max_y = dmax(y0, y1)
+  let dy = y0 - 2.0 * cy + y1
+  if dy.abs() > 1.0e-9 {
+    let ty = (y0 - cy) / dy
+    if ty > 0.0 && ty < 1.0 {
+      let mt = 1.0 - ty
+      let qy = mt * mt * y0 + 2.0 * mt * ty * cy + ty * ty * y1
+      min_y = dmin(min_y, qy)
+      max_y = dmax(max_y, qy)
+    }
+  }
+  let hw = width * 0.5
+  let pad = hw + 1.5
+  let bx = min_x - pad
+  let by = min_y - pad
+  let bw = max_x - min_x + 2.0 * pad
+  let bh = max_y - min_y + 2.0 * pad
+  let idx = self.push_inst(
+    bx,
+    by,
+    bw,
+    bh,
+    hw,
+    10.0,
+    1.0,
+    0.0,
+    color,
+    alpha,
+    (x0 - bx) / bw,
+    (y0 - by) / bh,
+    (x1 - bx) / bw,
+    (y1 - by) / bh,
+    clip_x=clip_x,
+    clip_y=clip_y,
+    clip_x1=clip_x1,
+    clip_y1=clip_y1,
+  )
+  let b = idx * inst_size
+  self.inst[b + 36] = (cx - bx) / bw
+  self.inst[b + 37] = (cy - by) / bh
+  self.inst[b + 38] = 0.0
+  self.inst[b + 39] = 0.0
+  if self.ink_r > 0.0 {
+    self.inst[b + 21] = self.ink_x
+    self.inst[b + 22] = self.ink_y
+    self.inst[b + 23] = self.ink_r
+  }
+}
+
+fn emit_cubic_bezier_rec(
+  scene : Scene,
+  x0 : Double,
+  y0 : Double,
+  c1x : Double,
+  c1y : Double,
+  c2x : Double,
+  c2y : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  eff_tol : Double,
+  alpha : Double,
+  clip_x : Double,
+  clip_y : Double,
+  clip_x1 : Double,
+  clip_y1 : Double,
+  depth : Int,
+) -> Unit {
+  let ex = x1 - 3.0 * c2x + 3.0 * c1x - x0
+  let ey = y1 - 3.0 * c2y + 3.0 * c1y - y0
+  let err = 0.016037507477489605 * dmath::sqrt(ex * ex + ey * ey)
+  if err <= eff_tol || depth >= 5 {
+    let qax = x0 + 0.75 * (c1x - x0)
+    let qay = y0 + 0.75 * (c1y - y0)
+    let qbx = x1 + 0.75 * (c2x - x1)
+    let qby = y1 + 0.75 * (c2y - y1)
+    let mx = 0.5 * (qax + qbx)
+    let my = 0.5 * (qay + qby)
+    scene.emit_quad_bezier(
+      x0, y0, qax, qay, mx, my, width, color,
+      alpha=alpha, clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+    scene.emit_quad_bezier(
+      mx, my, qbx, qby, x1, y1, width, color,
+      alpha=alpha, clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+  } else {
+    let p01x = 0.5 * (x0 + c1x)
+    let p01y = 0.5 * (y0 + c1y)
+    let p12x = 0.5 * (c1x + c2x)
+    let p12y = 0.5 * (c1y + c2y)
+    let p23x = 0.5 * (c2x + x1)
+    let p23y = 0.5 * (c2y + y1)
+    let p012x = 0.5 * (p01x + p12x)
+    let p012y = 0.5 * (p01y + p12y)
+    let p123x = 0.5 * (p12x + p23x)
+    let p123y = 0.5 * (p12y + p23y)
+    let midx = 0.5 * (p012x + p123x)
+    let midy = 0.5 * (p012y + p123y)
+    emit_cubic_bezier_rec(
+      scene, x0, y0, p01x, p01y, p012x, p012y, midx, midy,
+      width, color, eff_tol, alpha, clip_x, clip_y, clip_x1, clip_y1, depth + 1,
+    )
+    emit_cubic_bezier_rec(
+      scene, midx, midy, p123x, p123y, p23x, p23y, x1, y1,
+      width, color, eff_tol, alpha, clip_x, clip_y, clip_x1, clip_y1, depth + 1,
+    )
+  }
+}
+
+/// Emit a cubic Bezier stroke by adaptive C1 quadratic midpoint subdivision into analytic
+/// GPU quadratic Bezier SDF instances (`kind = 10.0`, `p.z = 1.0`) within `tol` points.
+pub fn Scene::emit_cubic_bezier(
+  self : Scene,
+  x0 : Double,
+  y0 : Double,
+  c1x : Double,
+  c1y : Double,
+  c2x : Double,
+  c2y : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  tol~ : Double = 0.15,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Unit {
+  if width <= 0.0 || (color & 0xFFL) == 0L || alpha <= 0.0 {
+    return
+  }
+  let eff_tol = dmax(tol, 0.01)
+  emit_cubic_bezier_rec(
+    self, x0, y0, c1x, c1y, c2x, c2y, x1, y1,
+    width, color, eff_tol, alpha, clip_x, clip_y, clip_x1, clip_y1, 0,
+  )
+}
+
 /// Push an offscreen Gaussian blur layer (`kind = 14.0`, `slot 7 = sigma`).
 pub fn Scene::push_blur_layer(
   self : Scene,
