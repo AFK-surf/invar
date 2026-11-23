@@ -1252,10 +1252,12 @@
       }
       float dropHairline = 0.0;
       float isPlatter = 0.0;
+      float isBarTab = 0.0;
       if (is_drop) {
         float pressAmt = clamp(v_c2.x, 0.0, 1.0);
         float pinchWeight = smoothstep(4.5, 6.5, rawAmount);
         isPlatter = smoothstep(39.0, 41.5, v_rect.w);
+        isBarTab = smoothstep(54.0, 58.0, v_rect.w);
         vec2 lensCenter = v_rect.xy + v_rect.zw * 0.5;
         vec2 centered = (p - lensCenter) / max(v_rect.zw, vec2(1.0));
         vec2 absC = abs(centered) * 2.0;
@@ -1285,9 +1287,15 @@
         vec2 platterMeniscus = -surfaceNormal * pMenReach * pMenBand;
         float capPinchBand = smoothstep(1.35, 4.40, inward) * (1.0 - smoothstep(5.40, 7.80, inward));
         vec2 capOutward = vec2(surfaceNormal.x, surfaceNormal.y * 0.45) * (2.8 * capPinchBand * endCapX);
+        vec2 barCapOutward = vec2(surfaceNormal.x, surfaceNormal.y * 0.62) * (2.6 * capPinchBand * endCapX);
+        float tabPinchHoriz = 1.0 - smoothstep(0.20, 0.96, capAbsX);
+        float tabPinchVert = smoothstep(0.42, 0.74, absC.y) * smoothstep(1.35, 5.2, inward);
+        vec2 tabPinch = vec2(0.0, centered.y * tabPinchHoriz * tabPinchVert * (0.245 * v_rect.w) * 0.28);
         dropHairline = (1.0 - smoothstep(0.25, 0.68, inward)) * pressAmt;
-        vec2 iosPinch = mix(compactPinch, platterPinch, isPlatter) * (pressAmt * pinchWeight) * (1.0 - dropHairline);
-        vec2 iosMen = mix(compactMeniscus, platterMeniscus + capOutward, isPlatter);
+        vec2 effPlatterPinch = mix(platterPinch, tabPinch, isBarTab);
+        vec2 effPlatterMen = mix(platterMeniscus + capOutward, (platterMeniscus + barCapOutward) * (1.0 - dropHairline), isBarTab);
+        vec2 iosPinch = mix(compactPinch, effPlatterPinch, isPlatter) * (pressAmt * pinchWeight) * (1.0 - dropHairline);
+        vec2 iosMen = mix(compactMeniscus, effPlatterMen, isPlatter);
         vec2 dropDisp = mix(paraxialDisp, iosMen, pressAmt * pinchWeight);
         dropDisp = mix(dropDisp, surfaceNormal * 0.85, dropHairline * (1.0 - isPlatter));
         float dLen = length(dropDisp);
@@ -1415,6 +1423,10 @@
       float transLum = clamp(Y * (1.0 + lift * (1.0 - Y)), 0.0, 1.0);
       vec3 transmittedColor = vec3(transLum * transmittance) + (refractColor - vec3(Y)) * (chromaGain * v_p.z);
       vec3 baseColor = clamp(emission + transmittedColor, 0.0, 1.0);
+      if (is_dark && regMix > 0.001) {
+        float sl = luma(baseColor);
+        baseColor *= 1.0 - 0.28 * regMix * sl * sl;
+      }
       // Honor explicit chromatic tints (non-neutral) if a caller requests colored liquid glass
       float colChroma = max(max(col.r, col.g), col.b) - min(min(col.r, col.g), col.b);
       if (colChroma > 0.08 && col.a > 0.001) {
@@ -1456,17 +1468,39 @@
         float bevelShadow = clamp(bevelLeading * bevelFalloff * bevelDir * bevelShadowStr, 0.0, 1.0);
         result = max(result - transmittedColor * bevelShadow, vec3(0.0));
       }
-      // (b) Glint (1.2pt ramp + 0.21 * 4.8pt bleed, both top & bottom walls, recolors face)
-      if (v_c2.x > 0.01 && inward < 4.8) {
+      // (b) Glint: diagonal glint for clear glass, native 1pt vertical top/bottom rim + 0.5pt inner hairline for regular glass
+      if (v_c2.x > 0.01 && inward < 4.8 && regMix < 0.999) {
         float glintProfile = clamp(1.0 - inward / 1.2, 0.0, 1.0)
                            + 0.21 * clamp(1.0 - inward / 4.8, 0.0, 1.0);
         float dirLobe = pow(max(1.0 - tangency, 0.0), 0.85);
         float lobe = mix(is_clear ? 0.30 : 0.18, 1.0, dirLobe);
         float glintGain = is_clear ? (0.34 * clearVeil) : 0.28;
-        float glint = clamp(v_c2.x * glintGain * lobe * glintProfile + spot * 0.08 * glintProfile, 0.0, 1.0);
+        float glint = clamp(v_c2.x * glintGain * lobe * glintProfile + spot * 0.08 * glintProfile, 0.0, 1.0) * (1.0 - regMix);
         float resLum = luma(result);
         vec3 glintTarget = vec3(glintLum) + result * glintFaceGain + (result - vec3(resLum)) * glintVib;
         result = clamp(mix(result, glintTarget, glint), 0.0, 1.0);
+      }
+      float regHairline = (1.0 - smoothstep(0.25, 0.70, inward)) * step(0.01, materialAlpha) * regMix;
+      float regAcross = pow(max(1.0 - rn.y * rn.y, 0.0), 1.75);
+      float regShadeMask = is_dark ? regAcross : mix(0.20, 1.0, regAcross);
+      if (regMix > 0.001 && v_c2.x > 0.01 && inward < 12.0) {
+        float along = is_dark ? rn.y : -rn.y;
+        float lit = max(along, 0.0);
+        float opp = max(-along, 0.0);
+        float lit2 = lit * lit;
+        float opp2 = opp * opp;
+        float regLobe = (is_dark ? 0.95 : 1.0) * (lit2 * lit2) + (is_dark ? 0.95 : 0.85) * (opp2 * opp2) + 0.06;
+        float regInset = max(0.0, inward - 0.55);
+        float regCore = exp(-regInset / 0.50);
+        float regTail = exp(-regInset / 2.67);
+        float regEase = pow(max(1.0 - luma(result), 0.0), 0.3);
+        float regRimGain = (is_dark ? 1.15 : 1.0) * clamp(v_c2.x / 0.6, 0.0, 1.5);
+        float regRim = (regRimGain * regLobe * regEase * (0.185 * regCore + 0.035 * regTail) * (1.0 - regHairline * regShadeMask) + spot * 0.10 * regCore) * regMix;
+        result = clamp(result + vec3(regRim), 0.0, 1.0);
+      }
+      if (regHairline > 0.001) {
+        float regShade = (is_dark ? 0.24 : 0.22) * regShadeMask;
+        result = max(result - vec3(regShade * regHairline), vec3(0.0));
       }
       if (is_drop) {
         float pressAmt = clamp(v_c2.x, 0.0, 1.0);
@@ -1475,7 +1509,7 @@
         float topTrough = exp(-tt * tt)
                         * smoothstep(0.3, 0.85, -surfaceNormal.y)
                         * smoothstep(1.5, 3.5, inward);
-        float liftGain = mix(0.105, 0.085, isPlatter);
+        float liftGain = mix(mix(0.105, 0.085, isPlatter), 0.035, isBarTab);
         float lensLift = liftGain * (1.0 - 0.45 * topTrough) * pressAmt * (1.0 - backdropLuma) * (1.0 - dropHairline);
         result = clamp(result + vec3(lensLift), 0.0, 1.0);
         float keyShade = 0.025 * topTrough * backdropLuma * pressAmt * (1.0 - dropHairline);
@@ -1509,7 +1543,8 @@
         }
       }
       result = clamp(result + mb_dither(p * u_scale) / 255.0, 0.0, 1.0);
-      // (c) External 0.75pt dark contour (concentrated perpendicular to light axis where glint fades)
+      // (c) External 0.75pt dark contour (clear glass only; regular glass uses inner 0.5pt hairline)
+      contourStr *= (1.0 - regMix);
       float contourDir = mix(1.0, tangency, contourDirAmt);
       float extA = ext_cov * contourStr * contourDir * v_c2.w;
       float visA = materialAlpha * v_c2.w;
