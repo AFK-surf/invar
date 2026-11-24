@@ -1048,15 +1048,70 @@ function buildHtmlPage(programs) {
             }
           }
         }
-        pushVec('V11 3D slim bevel wall & curved-cap AA (V11-AA/Wall/Top)', v11Ok,
+        // V11-Frost-Continuity: Switch ON continuous frost sweep (0.0 -> 0.0001 -> 0.00011 -> 0.01 -> 0.05 -> 0.10 -> 0.13 -> 0.30)
+        {
+          const swDarkBg = (x, y) => {
+            const dx = Math.max(0, Math.abs(x - 50) - 17.5);
+            const dy = Math.abs(y - 32);
+            return (dx * dx + dy * dy <= 14 * 14) ? [48, 209, 88] : [28, 28, 30];
+          };
+          const drawFrost = (f, initBg) => {
+            const active = f > 0.0001;
+            const aFrac = active ? 0.94 * f : 0.0;
+            const blurSlot = aFrac <= 0.12 ? -32.0 : 14.0 * ((aFrac - 0.12) / 0.88) * 0.5;
+            const refr = active ? 9.0 * (1.0 - 0.55 * f) : 9.0;
+            const trgb = active ? 1.0 + (240.0 / 255.0 - 1.0) * (0.5 * f) : 1.0;
+            const ta = Math.round(aFrac * 255.0) / 255.0;
+            return run2D(120, 65, 3, initBg ? swDarkBg : null, {
+              x: 31.58, y: 12.8, w: 59.2, h: 38.4, r: 19.2, blurSlot,
+              col: [trgb, trgb, trgb, ta], rim: 1, bezel: 9, refract: refr, chroma: 0,
+            });
+          };
+          const roiDiff = (a, b) => {
+            let md = 0;
+            for (let py = 38; py <= 154; py++) {
+              for (let px = 95; px <= 272; px++) {
+                const c1 = a.at(px, py), c0 = b.at(px, py);
+                md = Math.max(md, Math.abs(c1[0] - c0[0]), Math.abs(c1[1] - c0[1]), Math.abs(c1[2] - c0[2]));
+              }
+            }
+            return md;
+          };
+          const meanL = (res, x0, x1, y0, y1) => {
+            let s = 0, n = 0;
+            for (let py = y0; py <= y1; py++)
+              for (let px = x0; px <= x1; px++) { s += lumaF(res, px, py); n++; }
+            return s / n;
+          };
+          const b0 = drawFrost(0.0, true);
+          drawFrost(0.0001, false);
+          const b00011 = drawFrost(0.00011, false);
+          drawFrost(0.01, false);
+          drawFrost(0.05, false);
+          const b10 = drawFrost(0.10, false);
+          const b127 = drawFrost(0.127, false);
+          const b128 = drawFrost(0.128, false);
+          const b13 = drawFrost(0.13, false);
+          const b30 = drawFrost(0.30, false);
+          const dEps = roiDiff(b0, b00011);
+          const dBlur = roiDiff(b127, b128);
+          const dCross = roiDiff(b10, b13);
+          const ml10 = meanL(b10, 95, 272, 38, 154), ml13 = meanL(b13, 95, 272, 38, 154);
+          const ml0Roi = meanL(b0, 95, 272, 38, 154), ml30Roi = meanL(b30, 95, 272, 38, 154);
+          const frostOk = dEps <= 2 && dBlur <= 8 && dCross <= 90 && Math.abs(ml13 - ml10) < 15.0 && ml30Roi > ml0Roi + 15.0;
+          v11Summary.frost = { dEps, dBlur, dCross, dMeanL: Number(Math.abs(ml13 - ml10).toFixed(1)), ml0Roi: Number(ml0Roi.toFixed(1)), ml30Roi: Number(ml30Roi.toFixed(1)), frostOk };
+          if (!frostOk) v11Ok = false;
+        }
+        pushVec('V11 3D slim bevel wall, curved-cap AA & frost continuity (V11-AA/Wall/Top/Frost)', v11Ok,
           [
             v11Summary.dark.d2_3x[0], v11Summary.dark.d2_3x[1],
             v11Summary.light.d2_3x[0], v11Summary.light.d2_3x[1],
             v11Summary.dark.d2_2x[0], v11Summary.dark.d2_2x[1],
             v11Summary.light.d2_2x[0], v11Summary.light.d2_2x[1],
             v11Summary.dark.rDeepL, v11Summary.light.rDeepL,
+            v11Summary.frost.dEps, v11Summary.frost.dBlur, v11Summary.frost.dCross,
           ],
-          v11Ok ? '3x<=10/12, 2x<=12/14, wall+emerald, top 5.00/5.20pt' : JSON.stringify(v11Summary));
+          v11Ok ? '3x<=10/12, 2x<=12/14, wall+emerald, top 5.00/5.20pt, frost dEps<=2 dBlur<=8 dCross<=90' : JSON.stringify(v11Summary));
       }
 
       gl.deleteTexture(bdTex);
