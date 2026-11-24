@@ -1670,9 +1670,17 @@ fn Tree::laid_out(self : Tree, upto : Double) -> Unit {
     self.withins_passing = true
     let mut passes = 0
     let seen : Array[PointerStill] = []
-    while self.withins_told() && self.due {
-      self.again_said(6)
-      self.laid_out(upto)
+    while true {
+      self.pointer_again = false
+      let told = self.withins_told()
+      let again = self.pointer_again
+      if !(told && self.due) && !again {
+        break
+      }
+      if self.due {
+        self.again_said(6)
+        self.laid_out(upto)
+      }
       let _ = self.pointer_still_holds()
       passes = passes + 1
       if self.pointer_cycle_seen(passes, seen) {
@@ -1687,9 +1695,21 @@ fn Tree::laid_out(self : Tree, upto : Double) -> Unit {
     self.withins_passing = true
     let mut passes = 0
     let seen : Array[PointerStill] = []
-    while self.bars_near_told() && self.due {
-      self.again_said(7)
-      self.laid_out(upto)
+    let mut run_all = false
+    while true {
+      self.pointer_again = false
+      let told = if run_all { self.withins_told() } else { self.bars_near_told() }
+      let again = self.pointer_again
+      if again {
+        run_all = true
+      }
+      if !(told && self.due) && !again {
+        break
+      }
+      if self.due {
+        self.again_said(7)
+        self.laid_out(upto)
+      }
       let _ = self.pointer_still_holds()
       passes = passes + 1
       if self.pointer_cycle_seen(passes, seen) {
@@ -4422,14 +4442,21 @@ fn Tree::offset_told(self : Tree, at : Int) -> Unit {
   guard at >= 0 && at < self.nodes.length() && self.nodes[at].live else { return }
   let id = NodeId::{ at, gen: self.nodes[at].gen }
   if self.pointer_xy.0 >= 0.0 {
-    let _ = self.pointer_still_holds()
-    self.withins_told()
+    if self.withins_passing {
+      self.pointer_again = true
+    } else {
+      let _ = self.pointer_still_holds()
+      self.withins_tell_guarded()
+    }
   }
-  for b in self.besides_at {
-    match self.nodes[b].beside {
-      Some(s) if self.nodes[b].live && self.alive_id(s.anchor) && self.holds_at(at, s.anchor.at) =>
-      self.place_marked_at(b)
-      _ => ()
+  let bs = self.besides_at.copy()
+  for b in bs {
+    if b >= 0 && b < self.nodes.length() {
+      match self.nodes[b].beside {
+        Some(s) if self.nodes[b].live && self.alive_id(s.anchor) && self.holds_at(at, s.anchor.at) =>
+        self.place_marked_at(b)
+        _ => ()
+      }
     }
   }
   (self.offset_moved)(id)
@@ -5086,6 +5113,29 @@ pub fn Tree::follow_point(self : Tree, x : Double, y : Double, then : (Target) -
 }
 
 ///|
+/// Run `withins_told()` under `withins_passing`, draining any re-entrant `pointer_again` moves/scrolls,
+/// then settle layout/bars only if a pointer observer actually changed or `bars_due` was marked.
+fn Tree::withins_tell_guarded(self : Tree) -> Unit {
+  self.withins_passing = true
+  let mut changed = false
+  let mut passes = 0
+  while passes < 8 {
+    self.pointer_again = false
+    if self.withins_told() {
+      changed = true
+    }
+    passes = passes + 1
+    if !self.pointer_again {
+      break
+    }
+  }
+  self.withins_passing = false
+  if changed || self.bars_due {
+    self.withins_settled()
+  }
+}
+
+///|
 /// The pointer at (x, y) in the window as it is said (none: below 0), what is followed there (Tree::follow_point, the
 /// host's way and Tree::point_at's): where it is kept, and only where it moved, what goes beside its point placed again
 /// (View::beside's `at_pointer`: its place alone, nothing laid out again).
@@ -5095,13 +5145,19 @@ fn Tree::pointer_now(self : Tree, x : Double, y : Double) -> Unit {
     return
   }
   self.pointer_still = None
-  self.pointer_again = false
   self.pointer_xy = p
-  self.withins_told()
-  for at in self.besides_at {
-    match self.nodes[at].beside {
-      Some(b) if b.at_pointer && self.nodes[at].live => self.place_marked_at(at)
-      _ => ()
+  if self.withins_passing {
+    self.pointer_again = true
+  } else {
+    self.withins_tell_guarded()
+  }
+  let bs = self.besides_at.copy()
+  for at in bs {
+    if at >= 0 && at < self.nodes.length() {
+      match self.nodes[at].beside {
+        Some(b) if b.at_pointer && self.nodes[at].live => self.place_marked_at(at)
+        _ => ()
+      }
     }
   }
 }
@@ -5144,14 +5200,33 @@ fn Tree::within(self : Tree, at : Int) -> Bool {
   px >= x && px < x + n.lw * s && py >= y && py < y + n.lh * s
 }
 
+fn has_node_gen(xs : Array[(Int, Int)], at : Int, gen : Int) -> Bool {
+  for p in xs {
+    if p.0 == at && p.1 == gen {
+      return true
+    }
+  }
+  false
+}
+
 ///|
 /// Each node whose being under the pointer is read told it again, as it is now (the pointer moved, or what is placed):
 /// those let go dropped. Whether any was told otherwise.
 fn Tree::withins_told(self : Tree) -> Bool {
-  let keep = []
   let mut changed = self.bars_near_told()
-  for w in self.withins_at {
+  if self.withins_at.length() == 0 {
+    return changed
+  }
+  // Snapshot & clear before calling `cell.set(now)` so synchronous signal effects can safely mount
+  // new pointer_within/pointer_piece views or drop existing ones without OOB or losing new entries.
+  let was = self.withins_at.copy()
+  self.withins_at.clear()
+  let keep : Array[(Int, Int)] = []
+  for w in was {
     let (at, gen) = w
+    if at < 0 || at >= self.nodes.length() {
+      continue
+    }
     let n = self.nodes[at]
     if !n.live || n.gen != gen {
       continue
@@ -5170,7 +5245,11 @@ fn Tree::withins_told(self : Tree) -> Bool {
       }
       None => ()
     }
-    match n.piece_cell {
+    let n2 = self.nodes[at]
+    if !n2.live || n2.gen != gen {
+      continue
+    }
+    match n2.piece_cell {
       Some((cell, piece)) => {
         let now = self.piece_in(at, piece)
         if cell.untracked() != now {
@@ -5180,11 +5259,23 @@ fn Tree::withins_told(self : Tree) -> Bool {
       }
       None => ()
     }
-    if n.within_cell.is_some() || n.piece_cell.is_some() {
+    let n3 = self.nodes[at]
+    if n3.live && n3.gen == gen && (n3.within_cell.is_some() || n3.piece_cell.is_some()) {
       keep.push(w)
     }
   }
-  self.withins_at.clear()
+  if self.withins_at.length() > 0 {
+    for added in self.withins_at {
+      let (at, gen) = added
+      if at >= 0 && at < self.nodes.length() {
+        let na = self.nodes[at]
+        if na.live && na.gen == gen && (na.within_cell.is_some() || na.piece_cell.is_some()) && !has_node_gen(keep, at, gen) {
+          keep.push(added)
+        }
+      }
+    }
+    self.withins_at.clear()
+  }
   array_append(self.withins_at, keep)
   changed
 }
@@ -5268,10 +5359,17 @@ fn Tree::bars_near_told(self : Tree) -> Bool {
   self.bars_due = false
   guard self.bar_cols.length() > 0 else { return false }
   let at = self.bar_near_at()
-  let keep = []
+  // Snapshot & clear before calling `cell.set(now)` so synchronous signal effects can safely mount
+  // new bar_near columns or drop existing ones without OOB or losing newly registered entries.
+  let was = self.bar_cols.copy()
+  self.bar_cols.clear()
+  let keep : Array[(Int, Int)] = []
   let mut changed = false
-  for e in self.bar_cols {
+  for e in was {
     let (i, gen) = e
+    if i < 0 || i >= self.nodes.length() {
+      continue
+    }
     let n = self.nodes[i]
     match n.bar_near_cell {
       Some(cell) if n.live && n.gen == gen => {
@@ -5284,12 +5382,26 @@ fn Tree::bars_near_told(self : Tree) -> Bool {
           changed = true
           cell.set(now)
         }
-        keep.push(e)
+        let n2 = self.nodes[i]
+        if n2.live && n2.gen == gen && n2.bar_near_cell.is_some() {
+          keep.push(e)
+        }
       }
       _ => ()
     }
   }
-  self.bar_cols.clear()
+  if self.bar_cols.length() > 0 {
+    for added in self.bar_cols {
+      let (i, gen) = added
+      if i >= 0 && i < self.nodes.length() {
+        let na = self.nodes[i]
+        if na.live && na.gen == gen && na.bar_near_cell.is_some() && !has_node_gen(keep, i, gen) {
+          keep.push(added)
+        }
+      }
+    }
+    self.bar_cols.clear()
+  }
   array_append(self.bar_cols, keep)
   changed
 }

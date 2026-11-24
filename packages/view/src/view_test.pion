@@ -978,3 +978,210 @@ test "key_when_scoped and Tree::stroke scoped_only/focus_only dispatch" {
   debug_assert(sibling_hit.v == 0 && global_hit.v == 0, "sibling and global untouched")
   tree.dispose()
 }
+
+test "Tree::withins_told handles re-entrant mount, drop, and pointer_is without OOB or losing new observers" {
+  let swap_bar = signals::signal(false)
+  let new_bar_hits = ref_new(0)
+  let new_bar_seen = ref_new(false)
+  let drop_self = signals::signal(true)
+  let reentrant_done = ref_new(false)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(400.0))).height(Is(Some(300.0)))
+    // Node 1: entering pointer_within triggers swap_bar=true (drops old toolbar with multiple pointer_within
+    // nodes and mounts a brand-new toolbar that registers a fresh pointer_within observer).
+    let _ = root.box(fn(trigger : View) {
+      let _ = trigger.over_at(Is((Some(0.0), Some(0.0), None, None))).width(Is(Some(100.0))).height(Is(Some(100.0)))
+      let _ = trigger.reacts(
+        fn() { trigger.pointer_within() },
+        fn(in_now : Bool) {
+          if in_now && !swap_bar.untracked() {
+            swap_bar.set(true)
+            drop_self.set(false)
+          }
+        },
+      )
+    })
+    // Old toolbar with 3 pointer_within observers (gets dropped synchronously during withins_told).
+    let _ = root.show(
+      fn() { !swap_bar.get() },
+      fn(old_tb : View) {
+        for i in 0..<3 {
+          let _ = old_tb.box(fn(btn : View) {
+            let _ = btn.over_at(Is((Some(120.0 + i.to_double() * 40.0), Some(0.0), None, None)))
+              .width(Is(Some(36.0))).height(Is(Some(36.0)))
+            let _ = btn.reacts(fn() { btn.pointer_within() }, fn(_) { () })
+          })
+        }
+      },
+      at_once=true,
+    )
+    // Self-dropping node whose own pointer_within observer exists while swap drops it.
+    let _ = root.show(
+      fn() { drop_self.get() },
+      fn(victim : View) {
+        let _ = victim.over_at(Is((Some(260.0), Some(0.0), None, None))).width(Is(Some(40.0))).height(Is(Some(40.0)))
+        let _ = victim.reacts(fn() { victim.pointer_within() }, fn(_) { () })
+      },
+      at_once=true,
+    )
+    // New toolbar mounted synchronously during withins_told: its pointer_within MUST survive and track later moves!
+    let _ = root.show(
+      fn() { swap_bar.get() },
+      fn(new_tb : View) {
+        let _ = new_tb.over_at(Is((Some(200.0), Some(150.0), None, None))).width(Is(Some(100.0))).height(Is(Some(80.0)))
+        let _ = new_tb.reacts(
+          fn() { new_tb.pointer_within() },
+          fn(in_now : Bool) {
+            new_bar_seen.v = in_now
+            if in_now {
+              new_bar_hits.v = new_bar_hits.v + 1
+            }
+          },
+        )
+      },
+      at_once=true,
+    )
+    // Re-entrant pointer_is inside a pointer_within effect: must defer via pointer_again and converge.
+    let _ = root.box(fn(bounce : View) {
+      let _ = bounce.over_at(Is((Some(0.0), Some(150.0), None, None))).width(Is(Some(100.0))).height(Is(Some(80.0)))
+      let _ = bounce.reacts(
+        fn() { bounce.pointer_within() },
+        fn(in_now : Bool) {
+          if in_now && !reentrant_done.v {
+            reentrant_done.v = true
+            bounce.tree.pointer_is(250.0, 190.0)
+          }
+        },
+      )
+    })
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  // Direct call outside signals batch so `cell.set(now)` runs effects synchronously inside `withins_told`,
+  // dropping old_tb (3 observers) + victim (1 observer) and mounting new_tb mid-iteration.
+  tree.point_at(50.0, 50.0)
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+  debug_assert(swap_bar.untracked(), "entering trigger swapped toolbars without OOB")
+  // Move into the newly mounted new_tb -> proves new_tb's pointer_within was NOT wiped by withins_at.clear().
+  tree.point_at(250.0, 190.0)
+  debug_assert(new_bar_seen.v && new_bar_hits.v >= 1, "newly mounted toolbar pointer_within fired: hits=\{new_bar_hits.v}")
+  // Move out, then into bounce -> re-entrantly calls pointer_is(250, 190) -> must update new_tb again!
+  tree.point_at(380.0, 280.0)
+  debug_assert(!new_bar_seen.v, "moving out cleared new_tb pointer_within")
+  let hits_before = new_bar_hits.v
+  tree.point_at(50.0, 190.0)
+  debug_assert(reentrant_done.v && new_bar_seen.v && new_bar_hits.v == hits_before + 1, "re-entrant pointer_is updated new_tb: hits=\{new_bar_hits.v}")
+  tree.dispose()
+}
+
+test "Tree::bars_near_told handles drop and mount of bar_near columns during cell.set without OOB or losing new columns" {
+  let swap_cols = signals::signal(false)
+  let new_col_near = ref_new(false)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(300.0))).height(Is(Some(200.0)))
+    let _ = root.box(fn(col1 : View) {
+      let _ = col1.over_at(Is((Some(0.0), Some(0.0), None, None))).width(Is(Some(100.0))).height(Is(Some(200.0)))
+      let _ = col1.reacts(
+        fn() { col1.bar_near(20.0) },
+        fn(near : Bool) {
+          if near && !swap_cols.untracked() {
+            swap_cols.set(true)
+          }
+        },
+      )
+    })
+    let _ = root.show(
+      fn() { !swap_cols.get() },
+      fn(old_wrap : View) {
+        for i in 0..<3 {
+          let _ = old_wrap.box(fn(c : View) {
+            let _ = c.over_at(Is((Some(110.0 + i.to_double() * 50.0), Some(0.0), None, None)))
+              .width(Is(Some(40.0))).height(Is(Some(200.0)))
+            let _ = c.reacts(fn() { c.bar_near(16.0) }, fn(_) { () })
+          })
+        }
+      },
+      at_once=true,
+    )
+    let _ = root.show(
+      fn() { swap_cols.get() },
+      fn(new_col : View) {
+        let _ = new_col.over_at(Is((Some(150.0), Some(0.0), None, None))).width(Is(Some(100.0))).height(Is(Some(200.0)))
+        let _ = new_col.reacts(
+          fn() { new_col.bar_near(20.0) },
+          fn(near : Bool) { new_col_near.v = near },
+        )
+      },
+      at_once=true,
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  // Direct call outside signals batch so `cell.set(now)` runs effects synchronously inside `bars_near_told`,
+  // dropping 3 old columns (previously panicking with OOB) and mounting new_col mid-iteration.
+  tree.point_at(90.0, 100.0)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  debug_assert(swap_cols.untracked(), "bar_near swap succeeded without OOB")
+  // Move pointer near new_col's right edge (x=240 in [230, 250)) -> proves new_col survived bar_cols.clear().
+  tree.point_at(240.0, 100.0)
+  debug_assert(new_col_near.v, "newly mounted bar_near column must stay registered and fire")
+  tree.dispose()
+}
+
+test "Tree::withins_told does not panic OOB when dead entries are compacted during re-entrant pointer_is" {
+  let dead_on = signals::signal(true)
+  let jumped = ref_new(false)
+  let tail_seen = ref_new(false)
+  let tree = Tree::new(fn(root : View) {
+    let _ = root.width(Is(Some(400.0))).height(Is(Some(300.0)))
+    // 3 dead entries left in `withins_at` once `dead_on` turns false.
+    let _ = root.show(
+      fn() { dead_on.get() },
+      fn(dead_wrap : View) {
+        for i in 0..<3 {
+          let _ = dead_wrap.box(fn(d : View) {
+            let _ = d.over_at(Is((Some(i.to_double() * 20.0), Some(0.0), None, None)))
+              .width(Is(Some(16.0))).height(Is(Some(16.0)))
+            let _ = d.reacts(fn() { d.pointer_within() }, fn(_) { () })
+          })
+        }
+      },
+      at_once=true,
+    )
+    // Middle observer: entering it re-entrantly calls `pointer_is` to jump onto tail node.
+    // On unfixed code, inner `withins_told` compacts away the 3 dead entries, shortening `withins_at`
+    // while outer `for w in self.withins_at` still iterates to the old length -> pion panic: oob.
+    let _ = root.box(fn(mid : View) {
+      let _ = mid.over_at(Is((Some(100.0), Some(0.0), None, None))).width(Is(Some(60.0))).height(Is(Some(60.0)))
+      let _ = mid.reacts(
+        fn() { mid.pointer_within() },
+        fn(in_now : Bool) {
+          if in_now && !jumped.v {
+            jumped.v = true
+            mid.tree.pointer_is(260.0, 30.0)
+          }
+        },
+      )
+    })
+    // Trailing live observers after `mid`.
+    for i in 0..<3 {
+      let _ = root.box(fn(tail : View) {
+        let _ = tail.over_at(Is((Some(240.0 + i.to_double() * 40.0), Some(0.0), None, None)))
+          .width(Is(Some(36.0))).height(Is(Some(60.0)))
+        let _ = tail.reacts(
+          fn() { tail.pointer_within() },
+          fn(in_now : Bool) {
+            if i == 0 {
+              tail_seen.v = in_now
+            }
+          },
+        )
+      })
+    }
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  // Drop the 3 dead nodes without moving the pointer (leaves 3 dead tuples in `withins_at`).
+  dead_on.set(false)
+  // Move pointer into `mid` -> re-entrant `pointer_is(260, 30)` must NOT OOB and must settle `tail_seen`.
+  tree.point_at(120.0, 30.0)
+  debug_assert(jumped.v && tail_seen.v, "re-entrant pointer_is with dead entries must not OOB and must update tail")
+  tree.dispose()
+}
