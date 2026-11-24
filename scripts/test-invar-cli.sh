@@ -307,4 +307,42 @@ assert d['ok'] is True
 print('OK: installed symlink invar doctor passed')
 " "$SYM_JSON"
 
-echo "=== ALL 10 INVAR CLI E2E TESTS PASSED! ==="
+echo "=== 11. invar shot (--list, fresh output tracking, unknown preset rejection, scale override) ==="
+SHOT_LIST="$("$INVAR" shot --list --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and 'ios27-parity' in d['output'], f'shot --list failed: {d}'
+print('OK: invar shot --list (build %d ms)' % d['build_ms'])
+" "$SHOT_LIST"
+
+SHOT_DIR="$TMP/shots"
+mkdir -p "$SHOT_DIR"
+# Place a stale PNG in SHOT_DIR and verify unknown --only fails and never reports stale PNG as fresh
+cp "$TMP/before.png" "$SHOT_DIR/stale_old.png"
+BOGUS_RC=0
+BOGUS_JSON="$("$INVAR" shot --only __no_such_preset__ --out "$SHOT_DIR" --json)" || BOGUS_RC=$?
+if [ "$BOGUS_RC" -eq 0 ]; then
+  echo "FAIL: invar shot --only __no_such_preset__ must exit non-zero" >&2
+  exit 1
+fi
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is False and d['pngs'] == [] and d['mp4s'] == [], f'stale PNG leaked on failure: {d}'
+print('OK: unknown preset rejected cleanly without leaking stale PNG')
+" "$BOGUS_JSON"
+
+SHOT_OK="$("$INVAR" shot --only ios27-parity-light --scale 1 --out "$SHOT_DIR" --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True, f'ios27-parity-light shot failed: {d}'
+assert len(d['pngs']) == 1 and d['mp4s'] == [], f'unexpected shot outputs: {d}'
+p = d['pngs'][0]
+assert os.path.basename(p['file']) == 'ios27-parity-light.png', f'wrong file: {p}'
+assert p['width'] == 390 and p['height'] == 844, f'scale=1 override failed: {p}'
+print('OK: invar shot fresh output + scale=1 override (%dx%d, build %d ms, run %d ms)' % (p['width'], p['height'], d['build_ms'], d['run_ms']))
+" "$SHOT_OK"
+
+echo "=== ALL 11 INVAR CLI E2E TESTS PASSED! ==="

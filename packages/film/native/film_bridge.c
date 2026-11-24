@@ -1,8 +1,16 @@
-// Thin C bridge between Pion UTF-8 strings/Arrays and packages/host/native/apple_film.m (mbf_*).
+// Thin C bridge between Pion UTF-8 strings/Arrays and native film backends (mbf_*).
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <process.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 typedef uint16_t *moonbit_string_t;
 
@@ -110,4 +118,79 @@ int64_t pion_film_read_file(const char *path, int64_t path_len, uint8_t *out, in
   size_t n = fread(out, 1, (size_t)cap, f);
   fclose(f);
   return (int64_t)n;
+}
+
+int32_t pion_film_pid(void) {
+#ifdef _WIN32
+  return (int32_t)_getpid();
+#else
+  return (int32_t)getpid();
+#endif
+}
+
+int32_t pion_film_remove_file(const char *path, int64_t path_len) {
+  if (!path || path_len <= 0) return 0;
+  char *cpath = (char *)malloc((size_t)path_len + 1);
+  if (!cpath) return 0;
+  memcpy(cpath, path, (size_t)path_len);
+  cpath[path_len] = '\0';
+  int rc = remove(cpath);
+  free(cpath);
+  return rc == 0 ? 1 : 0;
+}
+
+static int film_mkdir_one(const char *dir) {
+#ifdef _WIN32
+  if (_mkdir(dir) == 0) return 1;
+  if (errno == EEXIST) {
+    struct _stat st;
+    return _stat(dir, &st) == 0 && (st.st_mode & _S_IFDIR) != 0;
+  }
+#else
+  if (mkdir(dir, 0755) == 0) return 1;
+  if (errno == EEXIST) {
+    struct stat st;
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+  }
+#endif
+  return 0;
+}
+
+int32_t pion_film_ensure_parent_dir(const char *path, int64_t path_len) {
+  if (!path || path_len <= 0) return 0;
+  char *buf = (char *)malloc((size_t)path_len + 1);
+  if (!buf) return 0;
+  memcpy(buf, path, (size_t)path_len);
+  buf[path_len] = '\0';
+  char *last_sep = strrchr(buf, '/');
+#ifdef _WIN32
+  char *last_bsep = strrchr(buf, '\\');
+  if (last_bsep && (!last_sep || last_bsep > last_sep)) last_sep = last_bsep;
+#endif
+  if (!last_sep || last_sep == buf) {
+    free(buf);
+    return 1;
+  }
+  *last_sep = '\0';
+  for (char *p = buf + 1; *p; p++) {
+    if (*p == '/'
+#ifdef _WIN32
+        || *p == '\\'
+#endif
+    ) {
+#ifdef _WIN32
+      if (p == buf + 2 && buf[1] == ':') continue;
+#endif
+      char saved = *p;
+      *p = '\0';
+      if (buf[0] != '\0' && !film_mkdir_one(buf)) {
+        free(buf);
+        return 0;
+      }
+      *p = saved;
+    }
+  }
+  int ok = film_mkdir_one(buf);
+  free(buf);
+  return ok;
 }

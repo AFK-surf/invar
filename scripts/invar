@@ -3266,6 +3266,21 @@ def cmd_web(args):
 # Subcommand 7: shot
 # ---------------------------------------------------------------------------
 
+def _snapshot_media_dir(out_dir):
+    snap = {}
+    if not os.path.isdir(out_dir):
+        return snap
+    for fn in os.listdir(out_dir):
+        if fn.endswith(".png") or fn.endswith(".mp4"):
+            fp = os.path.join(out_dir, fn)
+            try:
+                st = os.stat(fp)
+                snap[fn] = (st.st_mtime_ns, st.st_size, st.st_ino)
+            except OSError:
+                pass
+    return snap
+
+
 def cmd_shot(args):
     pionc = resolve_pionc()
     if not pionc["found"]:
@@ -3278,6 +3293,8 @@ def cmd_shot(args):
     os.makedirs(out_dir, exist_ok=True)
 
     env["MBUI_LG_OUT"] = out_dir
+    if getattr(args, "list", False):
+        env["MBUI_LG_LIST"] = "1"
     if args.only:
         env["MBUI_LG_ONLY"] = args.only
     if args.w:
@@ -3293,38 +3310,83 @@ def cmd_shot(args):
     fd, bin_path = tempfile.mkstemp(prefix="invar_shot_")
     os.close(fd)
     try:
-        rc, out, err, build_ms = run_cmd([pionc["path"], "build", "--release", pkg_dir, "-o", bin_path], cwd=INVAR_ROOT, env=env)
+        build_cmd = [pionc["path"], "build"]
+        if getattr(args, "release", False):
+            build_cmd.append("--release")
+        build_cmd += [pkg_dir, "-o", bin_path]
+        rc, out, err, build_ms = run_cmd(build_cmd, cwd=INVAR_ROOT, env=env)
         if rc != 0:
             res = {"ok": False, "error": f"build failed: {(out + err).strip()}", "build_ms": build_ms}
             emit_json(res) if args.json else print(res["error"], file=sys.stderr)
             return 1
+        before_snap = _snapshot_media_dir(out_dir)
+        t_run_ns = time.time_ns()
         rc2, out2, err2, run_ms = run_cmd([bin_path], cwd=INVAR_ROOT, env=env)
+        combined = (out2 + "\n" + err2).strip()
+        if getattr(args, "list", False):
+            ok = (rc2 == 0) and ("shots presets:" in combined)
+            res = {
+                "ok": ok,
+                "build_ms": build_ms,
+                "run_ms": run_ms,
+                "output": combined,
+                "error": "" if ok else (combined or "package does not support MBUI_LG_LIST"),
+            }
+            if args.json:
+                emit_json(res)
+            else:
+                if combined:
+                    print(combined)
+            return 0 if ok else 1
+
         pngs = []
+        mp4s = []
         for fn in sorted(os.listdir(out_dir)):
+            if not (fn.endswith(".png") or fn.endswith(".mp4")):
+                continue
+            fp = os.path.join(out_dir, fn)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+            prev_sig = before_snap.get(fn)
+            # Only report files created or updated during this run (never stale leftovers).
+            if prev_sig is not None and sig == prev_sig and st.st_mtime_ns < t_run_ns:
+                continue
             if fn.endswith(".png"):
-                fp = os.path.join(out_dir, fn)
                 dims = read_png_ihdr(fp)
                 pngs.append({
                     "file": fp,
                     "width": dims[0] if dims else 0,
                     "height": dims[1] if dims else 0,
-                    "bytes": os.path.getsize(fp),
+                    "bytes": st.st_size,
                 })
-        ok = rc2 == 0 and len(pngs) > 0
+            else:
+                mp4s.append({
+                    "file": fp,
+                    "bytes": st.st_size,
+                })
+        ok = (rc2 == 0) and (len(pngs) + len(mp4s) > 0)
         res = {
             "ok": ok,
             "out_dir": out_dir,
             "build_ms": build_ms,
             "run_ms": run_ms,
             "pngs": pngs,
-            "error": "" if ok else (out2 + err2).strip(),
+            "mp4s": mp4s,
+            "error": "" if ok else (combined or "no PNG or MP4 outputs produced"),
         }
         if args.json:
             emit_json(res)
         else:
             for p in pngs:
                 print(f"  {p['file']} ({p['width']}x{p['height']}, {p['bytes']} B)")
-            print(f"invar shot: {'OK' if ok else 'FAILED'} ({len(pngs)} PNGs)")
+            for v in mp4s:
+                print(f"  {v['file']} (MP4, {v['bytes']} B)")
+            if not ok and res["error"]:
+                print(res["error"], file=sys.stderr)
+            print(f"invar shot: {'OK' if ok else 'FAILED'} ({len(pngs)} PNGs, {len(mp4s)} MP4s, build {build_ms} ms, run {run_ms} ms)")
         return 0 if ok else 1
     finally:
         if os.path.exists(bin_path):
@@ -3629,13 +3691,15 @@ def build_parser():
     sp.set_defaults(func=cmd_web)
 
     # shot
-    sp = sub.add_parser("shot", help="Render offscreen GPU screenshots via Metal / GLES3")
+    sp = sub.add_parser("shot", help="Render offscreen GPU screenshots/videos via Metal / GLES3")
     sp.add_argument("--pkg", default="", help="Package directory (default: packages/lg_shots)")
     sp.add_argument("--only", default="", help="Shot preset filter (MBUI_LG_ONLY)")
-    sp.add_argument("--out", default="", help="Output directory for PNGs")
+    sp.add_argument("--out", default="", help="Output directory for PNGs/MP4s")
     sp.add_argument("--w", default="", help="Override width in pt")
     sp.add_argument("--h", default="", help="Override height in pt")
     sp.add_argument("--scale", default="", help="Override display scale")
+    sp.add_argument("--release", action="store_true", help="Compile shot binary with --release (default: fast debug CAS build)")
+    sp.add_argument("--list", action="store_true", help="List available shot presets and exit")
     sp.add_argument("--json", action="store_true", help="Output structured JSON")
     sp.set_defaults(func=cmd_shot)
 

@@ -115,13 +115,53 @@ fn settle_images(t : ui::Tester, w : Double, h : Double, scale : Double) -> Unit
   }
 }
 
-fn render_tester_to_metal(t : ui::Tester, w : Double, h : Double, scale : Double, dark : Bool) -> Bool {
+fn instances_equal(a : Array[Double], b : Array[Double], n : Int) -> Bool {
+  if a.length() < n || b.length() < n {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn has_live_stream_instance(inst : Array[Double], count : Int) -> Bool {
+  let lo = hostapi::stream_tex_base.to_double()
+  let hi = hostapi::layer_tex_base.to_double()
+  let mut i = 0
+  while i < count {
+    let base = i * inst_size
+    if base + 20 < inst.length() {
+      let tid = inst[base + 20]
+      if tid > lo && tid <= hi {
+        return true
+      }
+    }
+    i += 1
+  }
+  false
+}
+
+fn render_tester_to_metal(
+  t : ui::Tester,
+  w : Double,
+  h : Double,
+  scale : Double,
+  dark : Bool,
+  already_init~ : Bool = false,
+) -> Bool {
   let (r, g, b) = clear_rgb_from_theme(dark)
   let prev = hostapi::host()
   hostapi::set_host(host::native_host())
-  if !init_offscreen(w, h, scale) {
-    hostapi::set_host(prev)
-    return false
+  if !already_init {
+    if !init_offscreen(w, h, scale) {
+      hostapi::set_host(prev)
+      return false
+    }
   }
   settle_images(t, w, h, scale)
   let scene = match ui::view_tree() {
@@ -135,7 +175,9 @@ fn render_tester_to_metal(t : ui::Tester, w : Double, h : Double, scale : Double
   true
 }
 
-/// Render a pure-tree `view::View` scene offscreen via Apple Metal to a PNG file at `path`.
+let picture_bytes_seq : ui::Ref[Int] = ui::ref_new(0)
+
+/// Render a pure-tree `view::View` scene offscreen via native GPU (Metal / EGL-GLES3) to a PNG file at `path`.
 pub fn picture(
   tree : (view::View) -> Unit,
   path~ : String,
@@ -153,14 +195,14 @@ pub fn picture(
   fps~ : Int = film_fps,
   max~ : Int = 3000,
   transparent~ : Bool = false,
-  corners_held~ : Bool = true,
+  corners_held~ : Bool = false,
   corner_faults_ok~ : (Array[String]) -> Bool = fn(faults : Array[String]) -> Bool { faults.length() == 0 },
-  words_over_held~ : Bool = true,
+  words_over_held~ : Bool = false,
   theme? : () -> ui::Theme,
   transitions_only~ : Bool = true,
   solid_glass~ : Bool = false,
 ) -> Bool {
-  let _ = (inset, window_corner, corners_held, corner_faults_ok, words_over_held)
+  let _ = inset
   if !is_supported() || path == "" || w <= 0.0 || h <= 0.0 || scale <= 0.0 ||
      is_nan_d(w) || is_nan_d(h) || is_nan_d(scale) || is_inf_d(w) || is_inf_d(h) || is_inf_d(scale) ||
      at < 0.0 || is_nan_d(at) || is_inf_d(at) || fps <= 0 || max <= 0 {
@@ -174,10 +216,18 @@ pub fn picture(
     }
     None => ()
   }
+  if !ensure_parent_dir(path) {
+    say("picture: could not create parent directory for \{path}")
+    return false
+  }
   if solid_glass {
     ui::set_glass_solid(Some(true))
   }
-  if !init_offscreen(w, h, scale) {
+  let prev_init = hostapi::host()
+  hostapi::set_host(host::native_host())
+  let ok_init = init_offscreen(w, h, scale)
+  hostapi::set_host(prev_init)
+  if !ok_init {
     if solid_glass {
       ui::set_glass_solid(None)
     }
@@ -188,33 +238,77 @@ pub fn picture(
     Some(tf) => ui::Tester::tree(tree, width=w, height=h, scale=scale, theme=tf, transitions_only=transitions_only, platform=platform, dark=dark)
     None => ui::Tester::tree(tree, width=w, height=h, scale=scale, transitions_only=transitions_only, platform=platform, dark=dark)
   }
+  if window_corner > 0.0 {
+    t.fake.window_corner_r = window_corner
+  }
   attach_native_text_and_images(t, w, h)
   t.period_ms = 1000.0 / fps.to_double()
   let frame_idx = ui::ref_new(0)
   let noop_cb = fn(_k : Int) -> Bool { true }
+  let mut ok_drive = true
   if prepare != "" {
-    let _ = run_drive_script(t, prepare, max, noop_cb, frame_idx)
+    match run_drive_script_ex(t, prepare, max, noop_cb, frame_idx) {
+      DriveEnd::Done => ()
+      DriveEnd::Stopped => ()
+      DriveEnd::Failed(msg) => {
+        say(msg)
+        ok_drive = false
+      }
+    }
   }
-  if script != "" {
+  if ok_drive && script != "" {
     match frame {
       Some(target_k) => {
         let script_idx = ui::ref_new(0)
         let stop_at = fn(k : Int) -> Bool { k < target_k }
-        let _ = run_drive_script(t, script, target_k + 1, stop_at, script_idx)
+        match run_drive_script_ex(t, script, target_k + 1, stop_at, script_idx) {
+          DriveEnd::Done => ()
+          DriveEnd::Stopped => ()
+          DriveEnd::Failed(msg) => {
+            say(msg)
+            ok_drive = false
+          }
+        }
       }
       None => {
-        let _ = run_drive_script(t, script, max, noop_cb, frame_idx)
+        match run_drive_script_ex(t, script, max, noop_cb, frame_idx) {
+          DriveEnd::Done => ()
+          DriveEnd::Stopped => ()
+          DriveEnd::Failed(msg) => {
+            say(msg)
+            ok_drive = false
+          }
+        }
       }
     }
   }
-  if at > 0.0 {
+  if ok_drive && at > 0.0 {
     t.run_shown(at)
   }
-  let rendered = render_tester_to_metal(t, w, h, scale, dark)
+  let mut gates_ok = ok_drive
+  if gates_ok && corners_held {
+    let cf = t.corner_faults()
+    if !corner_faults_ok(cf) {
+      let detail = if cf.length() > 0 { cf[0] } else { "custom corner_faults_ok returned false" }
+      say("picture: corner_faults failed (\{cf.length()}): \{detail}")
+      gates_ok = false
+    }
+  }
+  if gates_ok && words_over_held {
+    let wf = t.words_over_faults()
+    if wf.length() > 0 {
+      say("picture: words_over_faults failed (\{wf.length()}): \{wf[0]}")
+      gates_ok = false
+    }
+  }
+  let rendered = if gates_ok { render_tester_to_metal(t, w, h, scale, dark, already_init=true) } else { false }
   let saved = if rendered { save_snapshot(path, transparent=transparent) } else { false }
   t.dispose()
   if solid_glass {
     ui::set_glass_solid(None)
+  }
+  if !gates_ok {
+    return false
   }
   if !saved {
     say("picture: could not write \{path}")
@@ -241,9 +335,9 @@ pub fn picture_tree(
   fps~ : Int = film_fps,
   max~ : Int = 3000,
   transparent~ : Bool = false,
-  corners_held~ : Bool = true,
+  corners_held~ : Bool = false,
   corner_faults_ok~ : (Array[String]) -> Bool = fn(faults : Array[String]) -> Bool { faults.length() == 0 },
-  words_over_held~ : Bool = true,
+  words_over_held~ : Bool = false,
   theme? : () -> ui::Theme,
   transitions_only~ : Bool = true,
   solid_glass~ : Bool = false,
@@ -291,7 +385,8 @@ pub fn picture_bytes(
   transitions_only~ : Bool = true,
   solid_glass~ : Bool = false,
 ) -> Option[Bytes] {
-  let tmp_path = "/tmp/invar_film_picture_bytes.png"
+  picture_bytes_seq.v = picture_bytes_seq.v + 1
+  let tmp_path = "/tmp/invar_film_bytes_\{process_id()}_\{picture_bytes_seq.v}.png"
   let ok = picture(
     tree,
     path=tmp_path,
@@ -309,13 +404,12 @@ pub fn picture_bytes(
     transitions_only=transitions_only,
     solid_glass=solid_glass,
   )
-  if !ok {
-    return None
-  }
-  read_file_bytes(tmp_path)
+  let res = if ok { read_file_bytes(tmp_path) } else { None }
+  let _ = remove_file(tmp_path)
+  res
 }
 
-/// Record a scripted pure-tree `view::View` run offscreen via Apple Metal into an H.264 MP4 at `out`.
+/// Record a scripted pure-tree `view::View` run offscreen via native GPU into an H.264 MP4 at `out`.
 pub fn film(
   tree : (view::View) -> Unit,
   script~ : String,
@@ -333,18 +427,32 @@ pub fn film(
   last~ : String = "",
   copied~ : String = "",
   allow_incomplete~ : Bool = false,
-  corners_held~ : Bool = true,
+  corners_held~ : Bool = false,
   theme? : () -> ui::Theme,
   transitions_only~ : Bool = true,
 ) -> Bool {
-  let _ = (inset, window_corner, copied, allow_incomplete, corners_held)
-  if !is_supported() || out == "" || w <= 0.0 || h <= 0.0 || scale <= 0.0 || fps <= 0 || max <= 0 {
+  let _ = (inset, copied, allow_incomplete)
+  if !is_supported() || out == "" || w <= 0.0 || h <= 0.0 || scale <= 0.0 ||
+     is_nan_d(w) || is_nan_d(h) || is_nan_d(scale) || is_inf_d(w) || is_inf_d(h) || is_inf_d(scale) ||
+     fps <= 0 || max <= 0 {
     say("film: invalid arguments or unsupported host")
+    return false
+  }
+  if !ensure_parent_dir(out) {
+    say("film: could not create parent directory for \{out}")
+    return false
+  }
+  if last != "" && !ensure_parent_dir(last) {
+    say("film: could not create parent directory for \{last}")
     return false
   }
   let pw = (w * scale).round().to_int()
   let ph = (h * scale).round().to_int()
-  if !init_offscreen(w, h, scale) {
+  let prev_init = hostapi::host()
+  hostapi::set_host(host::native_host())
+  let ok_init = init_offscreen(w, h, scale)
+  hostapi::set_host(prev_init)
+  if !ok_init {
     say("film: offscreen renderer initialization failed")
     return false
   }
@@ -352,26 +460,30 @@ pub fn film(
     Some(tf) => ui::Tester::tree(tree, width=w, height=h, scale=scale, theme=tf, transitions_only=transitions_only, platform=platform, dark=dark)
     None => ui::Tester::tree(tree, width=w, height=h, scale=scale, transitions_only=transitions_only, platform=platform, dark=dark)
   }
+  if window_corner > 0.0 {
+    t.fake.window_corner_r = window_corner
+  }
   attach_native_text_and_images(t, w, h)
   t.period_ms = 1000.0 / fps.to_double()
   let prep_idx = ui::ref_new(0)
   if prepare != "" {
-    let _ = run_drive_script(t, prepare, max, fn(_k : Int) -> Bool { true }, prep_idx)
-  }
-  let prev = hostapi::host()
-  hostapi::set_host(host::native_host())
-  let ok_init = init_offscreen(w, h, scale)
-  hostapi::set_host(prev)
-  if !ok_init {
-    t.dispose()
-    say("film: offscreen renderer re-initialization failed")
-    return false
+    if !run_drive_script(t, prepare, max, fn(_k : Int) -> Bool { true }, prep_idx) {
+      t.dispose()
+      return false
+    }
   }
   if !film_open(out, pw, ph, fps) {
     t.dispose()
     return false
   }
   let written = ui::ref_new(0)
+  let has_drawn = ui::ref_new(false)
+  let last_inst : ui::Ref[Array[Double]] = ui::ref_new([])
+  let last_count = ui::ref_new(0)
+  let last_r = ui::ref_new(-1.0)
+  let last_g = ui::ref_new(-1.0)
+  let last_b = ui::ref_new(-1.0)
+  let last_light_angle = ui::ref_new(0.0)
   let emit_frame = fn(k : Int) -> Bool {
     let (r, g, b) = clear_rgb_from_theme(dark)
     let prev_h = hostapi::host()
@@ -381,7 +493,30 @@ pub fn film(
       None => t.scene()
     }
     let (inst, count) = prepare_metal_instances(scene)
-    let ok_draw = film_draw(inst, count, r, g, b)
+    let light_angle = ui::glass_light_angle()
+    let same = has_drawn.v &&
+      !has_live_stream_instance(inst, count) &&
+      count == last_count.v &&
+      r == last_r.v &&
+      g == last_g.v &&
+      b == last_b.v &&
+      light_angle == last_light_angle.v &&
+      instances_equal(inst, last_inst.v, count * inst_size)
+    let ok_draw = if same {
+      true
+    } else {
+      let drawn = film_draw(inst, count, r, g, b)
+      if drawn {
+        has_drawn.v = true
+        last_inst.v = inst
+        last_count.v = count
+        last_r.v = r
+        last_g.v = g
+        last_b.v = b
+        last_light_angle.v = light_angle
+      }
+      drawn
+    }
     hostapi::set_host(prev_h)
     if !ok_draw {
       return false
@@ -400,17 +535,28 @@ pub fn film(
   } else {
     false
   }
-  let ok_last = if ok_run && last != "" {
+  let ok_corners = if ok_run && corners_held {
+    let cf = t.corner_faults()
+    if cf.length() > 0 {
+      say("film: corner_faults failed (\{cf.length()}): \{cf[0]}")
+      false
+    } else {
+      true
+    }
+  } else {
+    ok_run
+  }
+  let ok_last = if ok_corners && last != "" {
     // (the last frame saved only when it was drawn: never a stale or empty framebuffer)
-    let ok_render = render_tester_to_metal(t, w, h, scale, dark)
+    let ok_render = render_tester_to_metal(t, w, h, scale, dark, already_init=true)
     ok_render && save_snapshot(last)
   } else {
-    true
+    ok_corners
   }
   let closed = film_close(written.v)
-  let published = film_finish(ok_run && ok_last && closed)
+  let published = film_finish(ok_corners && ok_last && closed)
   t.dispose()
-  ok_run && ok_last && closed && published
+  ok_corners && ok_last && closed && published
 }
 
 /// Compatibility alias for `film`.
@@ -431,7 +577,7 @@ pub fn film_tree(
   last~ : String = "",
   copied~ : String = "",
   allow_incomplete~ : Bool = false,
-  corners_held~ : Bool = true,
+  corners_held~ : Bool = false,
   theme? : () -> ui::Theme,
   transitions_only~ : Bool = true,
 ) -> Bool {

@@ -4026,10 +4026,17 @@ int mb_render_init_offscreen(double w, double h, double scale) {
   dispatch_group_wait(kinds_made, DISPATCH_TIME_FOREVER);
   mb_render_set_size(w, h, scale);
   mb_text_set_scale(scale);
+  NSUInteger pw = (NSUInteger)round(w * scale);
+  NSUInteger ph = (NSUInteger)round(h * scale);
+  if (pw == 0 || ph == 0) return 0;
+  off_ok = 0;
+  if (off_target && off_target.width == pw && off_target.height == ph) {
+    return 1;
+  }
   MTLTextureDescriptor *td = [MTLTextureDescriptor
       texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                   width:(NSUInteger)round(w * scale)
-                                  height:(NSUInteger)round(h * scale)
+                                   width:pw
+                                  height:ph
                                mipmapped:NO];
   td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   td.storageMode = MTLStorageModePrivate;
