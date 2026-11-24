@@ -25,12 +25,7 @@ mb_callbacks mb_cb;
 // Back (host_native.mbt `set_back`): a mouse's back button and Alt+Left, while the app takes it.
 typedef void (*mb_back_fn)(int32_t, double, double, int32_t);
 static mb_back_fn back_cb;
-static int back_on;
-static int go_back(void) {
-  if (!back_cb || !back_on) return 0;
-  back_cb(2, 0, 1, 0);
-  return 1;
-}
+static int go_back(void);
 
 static double wake_at = -1;  // mb_now_ms() of the earliest wake_after, or -1
 
@@ -77,10 +72,16 @@ typedef struct WinSlot {
   int opened;
   double min_w, min_h;
   int inset;
+  int back_on;
 } WinSlot;
 static WinSlot win_slots[MB_WINS] = {{.scale = 1}};
 static WinSlot *ws = &win_slots[0];
 static int win_active;  // the window in place (0, the first, between frames and input)
+static int go_back(void) {
+  if (!back_cb || !ws || !ws->back_on) return 0;
+  back_cb(2, 0, 1, 0);
+  return 1;
+}
 static int win_of_area(GtkWidget *a) {
   for (int k = 0; k < MB_WINS; k++)
     if (a && win_slots[k].area == a) return k;
@@ -630,7 +631,9 @@ static gboolean on_key_here(GtkEventControllerKey *k, guint keyval, guint keycod
   int mods = mods_of(state);
   // a key catcher's focus (linux_device.h): its keys (a composition under way keeps them)
   if (key_catching && ws->ime_active && ws->marked_len == 0 && catch_key(keyval, mods)) return TRUE;
-  if ((mods & 4) && !(mods & 2) && keyval == GDK_KEY_Left && go_back()) return TRUE;
+  if ((mods & 4) && !(mods & 2) && keyval == GDK_KEY_Left) {
+    return go_back() ? TRUE : FALSE;
+  }
   // Alt+Right: forward, the app's key (key_forward)
   if ((mods & 4) && !(mods & 2) && keyval == GDK_KEY_Right) {
     mb_cb.key(40, 0);
@@ -844,7 +847,7 @@ static gboolean on_event_here(GtkEventControllerLegacy *c, GdkEvent *ev, gpointe
         ws->right_down = 0;
         mb_cb.pointer(2, x, y, 2);
       } else if (b == 8) {
-        go_back();
+        return go_back() ? TRUE : FALSE;
       } else if (b == 9) {
         mb_cb.key(40, 0);
       }
@@ -1655,7 +1658,12 @@ int32_t mb_host_bench_mode(void) {
 void mb_host_exit(int32_t code) { exit(code); }
 
 void mb_host_set_back(mb_back_fn f) { back_cb = f; }
-void mb_host_back_enabled(int32_t on) { back_on = on; }
+void mb_host_back_enabled(int32_t on) { if (ws) ws->back_on = on ? 1 : 0; }
+void mb_host_back_enabled_for(int32_t wid, int32_t on) {
+  if (wid >= 0 && wid < MB_WINS && (wid == 0 || win_slots[wid].opened)) {
+    win_slots[wid].back_on = on ? 1 : 0;
+  }
+}
 
 void mb_host_set_app_state(void (*f)(int32_t)) {
   state_cb = f;

@@ -1931,6 +1931,7 @@ static mb_back_fn back_cb;
 static int back_on;
 void mb_host_set_back(mb_back_fn f) { back_cb = f; }
 void mb_host_back_enabled(int32_t on) { back_on = on; }
+void mb_host_back_enabled_for(int32_t wid, int32_t on) { if (wid == 0) mb_host_back_enabled(on); }
 
 // The app in front or not (@hostapi.set_app_state): 1 while its scene is on screen (in front, or behind the app switcher or
 // a system sheet), | 2 while it is also active; told as that changes.

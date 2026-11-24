@@ -1822,6 +1822,11 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const H = host();
       if (H && H.backEnabled) H.backEnabled(!!on);
     },
+    mb_web_back_enabled_for(wid, on) {
+      if ((wid | 0) !== 0) return;
+      const H = host();
+      if (H && H.backEnabled) H.backEnabled(!!on);
+    },
     mb_web_set_app_state() {
       const H = host();
       if (!H || !H.setAppState) return;

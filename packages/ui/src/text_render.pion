@@ -523,18 +523,51 @@ fn ensure_glyph_atlas(scale : Double) -> Unit {
   }
 }
 
+let bypass_glyph_atlas_writes : signals::Ref[Bool] = ref_new(false)
+let frame_atlas_rejected_glyphs : Map[Int, Bool] = Map::new()
+let block_glyph_missed : signals::Ref[Bool] = ref_new(false)
+let block_glyph_plots : signals::Ref[Option[(Array[Int], Array[Int])]] = ref_new(None)
+
+fn record_block_glyph_plot(in_colour : Bool, plot : Int) -> Unit {
+  if plot < 0 {
+    return
+  }
+  match block_glyph_plots.v {
+    Some((mono_plots, col_plots)) => {
+      let dst = if in_colour { col_plots } else { mono_plots }
+      if !dst.contains(plot) {
+        dst.push(plot)
+      }
+    }
+    None => ()
+  }
+}
+
+fn touch_block_glyph_plots(mono_plots : Array[Int], col_plots : Array[Int]) -> Unit {
+  if bypass_glyph_atlas_writes.v {
+    return
+  }
+  for p in mono_plots {
+    glyph_state.mono.drawn(p)
+  }
+  for p in col_plots {
+    glyph_state.colour.drawn(p)
+  }
+}
+
 fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
   if key < 0 {
     return None
   }
   match glyph_state.glyphs.get(key) {
     Some(slot) => {
-      if slot.plot >= 0 {
+      if !bypass_glyph_atlas_writes.v && slot.plot >= 0 {
         if slot.in_colour {
           glyph_state.colour.drawn(slot.plot)
         } else {
           glyph_state.mono.drawn(slot.plot)
         }
+        record_block_glyph_plot(slot.in_colour, slot.plot)
       }
       Some(slot)
     }
@@ -560,12 +593,30 @@ fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
       if !atlas.holds(pw, ph) {
         return None
       }
+      if bypass_glyph_atlas_writes.v {
+        if frame_atlas_rejected_glyphs.contains(key) {
+          return None
+        }
+        return Some(GlyphSlot::{
+          u: -1000.0 - key.to_double() - across.to_double(),
+          v: -1000.0,
+          gw,
+          gh,
+          ox,
+          oy,
+          color: is_color,
+          plot: -1,
+          in_colour: use_col,
+          scale,
+        })
+      }
       match atlas.place(key, pw, ph, fn(evicted : Int) {
         glyph_state.glyphs.remove(evicted)
         glyph_state.epoch = glyph_state.epoch + 1
       }) {
         Some((plot, ax, ay)) => {
           hostapi::glyph_put(key, ax + across, ay)
+          record_block_glyph_plot(use_col, plot)
           let slot = GlyphSlot::{
             u: (ax + across).to_double(),
             v: ay.to_double(),
@@ -581,7 +632,11 @@ fn resolve_glyph(key : Int, scale : Double) -> Option[GlyphSlot] {
           glyph_state.glyphs[key] = slot
           Some(slot)
         }
-        None => None
+        None => {
+          frame_atlas_rejected_glyphs[key] = true
+          block_glyph_missed.v = true
+          None
+        }
       }
     }
   }
