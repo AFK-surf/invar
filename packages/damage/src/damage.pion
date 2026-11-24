@@ -186,76 +186,6 @@ fn remove_rect_at(a : Array[Rect], idx : Int) -> Rect {
   r
 }
 
-// Lightweight associative tables for group maps (Int -> Rect, Int -> (Bool, Array[Int]))
-fn groups_get(m : Array[(Int, Rect)], id : Int) -> Option[Rect] {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      return Some(m[i].1)
-    }
-  }
-  None
-}
-
-fn groups_contains(m : Array[(Int, Rect)], id : Int) -> Bool {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      return true
-    }
-  }
-  false
-}
-
-fn groups_set(m : Array[(Int, Rect)], id : Int, r : Rect) -> Unit {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      m[i] = (id, r)
-      return
-    }
-  }
-  m.push((id, r))
-}
-
-fn groups_remove(m : Array[(Int, Rect)], id : Int) -> Unit {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      let last = m.length() - 1
-      m[i] = m[last]
-      let _ = m.pop()
-      return
-    }
-  }
-}
-
-fn reads_get(m : Array[(Int, (Bool, Array[Int]))], id : Int) -> Option[(Bool, Array[Int])] {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      return Some(m[i].1)
-    }
-  }
-  None
-}
-
-fn reads_set(m : Array[(Int, (Bool, Array[Int]))], id : Int, v : (Bool, Array[Int])) -> Unit {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      m[i] = (id, v)
-      return
-    }
-  }
-  m.push((id, v))
-}
-
-fn reads_remove(m : Array[(Int, (Bool, Array[Int]))], id : Int) -> Unit {
-  for i in 0..<m.length() {
-    if m[i].0 == id {
-      let last = m.length() - 1
-      m[i] = m[last]
-      let _ = m.pop()
-      return
-    }
-  }
-}
-
 /// The frame presented last, as the next is compared with it.
 pub struct Damage {
   mut prev : Array[Double]
@@ -266,15 +196,22 @@ pub struct Damage {
   mut r : Double
   mut g : Double
   mut b : Double
+  mut light_angle : Double
   mut has : Bool
   mut why : Int
   mut seen : Array[String]
   mut telling : Bool
-  mut groups : Array[(Int, Rect)]
-  mut group_reads : Array[(Int, (Bool, Array[Int]))]
+  /// What is known of each group a host keeps (`Damage::group_set`), what it holds of others asked as it is asked.
+  mut groups : Map[Int, GroupInfo]
+  /// What was known, as the kept frame was drawn, of each group set or let go since (None: nothing).
+  mut stale : Map[Int, Option[GroupInfo]]
   mut covers : Array[Double]
   mut unit_at : Array[Int]
   mut hidden : Array[Bool]
+  /// Which units are inside an offscreen blur layer (kind 14 to 15).
+  mut layered : Array[Bool]
+  /// What each unit that is a header says of its group: its 12, 13 and 14.
+  mut head_said : Array[Double]
   mut shown : Array[Double]
   mut occ_ok : Bool
   mut occ_count : Int
@@ -300,7 +237,8 @@ pub struct Damage {
   mut heads_at : Array[(Int, Int)]
   mut kept_read : Bool
   mut kept_streams : Bool
-  mut kept_glass : Array[Rect]
+  mut kept_glass : Array[GlassBox]
+  mut kept_layers : Array[Rect]
   mut kept_seg : Int
   mut seg_now : Int
   mut step_far : Double
@@ -327,15 +265,18 @@ pub fn Damage::new() -> Damage {
     r: 0.0,
     g: 0.0,
     b: 0.0,
+    light_angle: 0.0,
     has: false,
     why: 0,
     seen: [],
     telling: false,
-    groups: [],
-    group_reads: [],
+    groups: Map::new(),
+    stale: Map::new(),
     covers: make_doubles(cover_most * 4, 0.0),
     unit_at: [],
     hidden: [],
+    layered: [],
+    head_said: [],
     shown: [],
     occ_ok: false,
     occ_count: 0,
@@ -362,6 +303,7 @@ pub fn Damage::new() -> Damage {
     kept_read: false,
     kept_streams: false,
     kept_glass: [],
+    kept_layers: [],
     kept_seg: -1,
     seg_now: -1,
     step_far: 0.0,
@@ -397,6 +339,7 @@ pub fn Damage::next(
   b : Double,
   groups~ : Bool = false,
   known? : Array[(Double, Double, Double, Double)],
+  light_angle~ : Double = 0.0,
 ) -> Array[(Double, Double, Double, Double)] {
   let known_arr : Array[(Double, Double, Double, Double)] = match known {
     Some(a) => a
@@ -408,12 +351,13 @@ pub fn Damage::next(
   self.given_n = given
   self.stamp += 1
   let same_frame = self.has &&
-    w == self.w &&
-    h == self.h &&
-    scale == self.scale &&
-    r == self.r &&
-    g == self.g &&
-    b == self.b
+  w == self.w &&
+  h == self.h &&
+  scale == self.scale &&
+  r == self.r &&
+  g == self.g &&
+  b == self.b
+  let light_changed = self.has && light_angle != self.light_angle
   self.why = if !self.has {
     1
   } else if !same_frame {
@@ -424,41 +368,30 @@ pub fn Damage::next(
   self.seg_now = -1
   self.step_far = 0.0
   self.step_ink = 0.0
-  self.step_known = same_frame && known_arr.length() == 0
+  self.step_known = same_frame && known_arr.length() == 0 && !light_changed
   let out = if same_frame {
-    self.changed(inst, count, w, h, known_arr)
+    self.changed(inst, count, w, h, known_arr, light_changed)
   } else {
     [(0.0, 0.0, -1.0, -1.0)]
   }
-  if !(same_frame && out.length() == 0 && count == self.n) {
-    self.keep(inst, count, w, h, scale, r, g, b)
+  self.stale_clear()
+  if !(same_frame && !light_changed && out.length() == 0 && count == self.n) {
+    self.keep(inst, count, w, h, scale, r, g, b, light_angle)
   }
   out
 }
 
 /// Group `id` of a host's (`n` instances in `inst`) kept, as far as it reaches wherever it is moved.
 pub fn Damage::group_set(self : Damage, id : Int, inst : Array[Double], n : Int) -> Unit {
-  let r = Rect::none()
-  let mut glass = false
-  let heads : Array[Int] = []
-  for k in 0..<n {
-    if kind_at(inst, k) == 13 {
-      self.reach_of(inst, k, r)
-      heads.push(inst[k * inst_size + 12].to_int())
-    } else {
-      reach(inst, k, r, cut=false)
-      glass = glass || is_glass(kind_at(inst, k))
-    }
-  }
-  groups_set(self.groups, id, r)
-  reads_set(self.group_reads, id, (glass, heads))
+  self.set_aside(id)
+  self.groups.set(id, group_info(inst, n))
   self.occ_ok = false
 }
 
 /// Group `id` let go.
 pub fn Damage::group_drop(self : Damage, id : Int) -> Unit {
-  groups_remove(self.groups, id)
-  reads_remove(self.group_reads, id)
+  self.set_aside(id)
+  let _ = self.groups.remove(id)
   self.occ_ok = false
 }
 
@@ -480,7 +413,12 @@ fn Damage::units_of(self : Damage, inst : Array[Double], count : Int) -> (Array[
     n += run
     if e < count {
       self.heads_at.push((e, n - 1))
-      k = e + inst[e * inst_size + 14].to_int()
+      // (a header stands for itself at least, and no more than the frame has left, as the renderers draw it out)
+      let span = span_of(inst, e)
+      let room = count - e
+      let take = if span > room { room } else { span }
+      u[(n - 1) * inst_size + 14] = take.to_double()
+      k = e + take
     } else {
       k = e
     }
@@ -501,32 +439,39 @@ pub fn Damage::moved(
   b : Double,
   moved : Array[Int],
   known? : Array[(Double, Double, Double, Double)],
+  light_angle~ : Double = 0.0,
 ) -> Option[Array[(Double, Double, Double, Double)]] {
   let known_arr : Array[(Double, Double, Double, Double)] = match known {
     Some(a) => a
     None => []
   }
   guard self.has &&
-    count == self.given_n &&
-    w == self.w &&
-    h == self.h &&
-    scale == self.scale &&
-    r == self.r &&
-    g == self.g &&
-    b == self.b else {
+  count == self.given_n &&
+  w == self.w &&
+  h == self.h &&
+  scale == self.scale &&
+  r == self.r &&
+  g == self.g &&
+  b == self.b &&
+  light_angle == self.light_angle else {
     return None
   }
   let units : Array[Int] = []
   for k in moved {
-    let mut u = -1
+    let u = self.head_unit(k)
+    guard u >= 0 && u < self.n && kind_at(inst, k) == 13 else { return None }
+    // (one that stands for as many as before, as units_of kept it: else what was in its room, or is now, is of the
+    // frame)
+    guard inst[k * inst_size + 14] == self.prev[u * inst_size + 14] else { return None }
+    units.push(u)
+  }
+  // (a group of another header set or let go since: compared whole)
+  if self.stale.length() > 0 {
     for p in self.heads_at {
-      if p.0 == k {
-        u = p.1
-        break
+      if !self.group_same(self.prev, p.1) && !moved.contains(p.0) {
+        return None
       }
     }
-    guard u >= 0 && u < self.n && kind_at(inst, k) == 13 else { return None }
-    units.push(u)
   }
   let prev = self.prev
   if !self.kept_read {
@@ -541,7 +486,11 @@ pub fn Damage::moved(
         break
       }
     }
-    self.kept_glass = glass_groups(prev, self.kept_seg)
+    self.kept_glass = []
+    for k in 0..<self.kept_seg {
+      glass_put(self.kept_glass, prev, k)
+    }
+    self.kept_layers = blur_layers(prev, self.kept_seg)
     self.kept_read = true
   }
   if self.kept_streams {
@@ -564,16 +513,19 @@ pub fn Damage::moved(
   }
   let was = Rect::none()
   let now = Rect::none()
+  // (the layers of the moved headers' groups where they were)
+  let layers_were : Array[Rect] = []
   for i, k in moved {
     let u = units[i]
-    if same_pair(prev, u, inst, k) {
+    if same_pair(prev, u, inst, k) && self.group_same(prev, u) {
       continue
     }
     self.pair_step(prev, u, inst, k)
     was.clear()
     now.clear()
-    self.reach_of(prev, u, was)
+    self.reach_of(prev, u, was, old=true)
     was.cut_to(window)
+    self.group_layers(prev, u, layers_were, true)
     blit_doubles(inst, k * inst_size, prev, u * inst_size, inst_size)
     if u < self.prev_at.length() {
       self.prev_at[u] = -1
@@ -588,10 +540,29 @@ pub fn Damage::moved(
       let _ = add_part(parts, now)
     }
   }
+  self.stale_clear()
   if parts.length() == 0 {
     return Some([])
   }
-  let groups = self.kept_glass
+  // (what glass and layers read, as Damage::changed takes it in: those of the frame, which no header changes, with
+  // those of the groups, where their headers are now and, the layers, were)
+  let glass : Array[GlassBox] = []
+  for g in self.kept_glass {
+    glass.push(g.copy())
+  }
+  for p in self.heads_at {
+    self.group_glass(prev, p.1, glass, false)
+  }
+  let groups = glass_rects(glass)
+  for br in self.kept_layers {
+    groups.push(br)
+  }
+  for p in self.heads_at {
+    self.group_layers(prev, p.1, groups, false)
+  }
+  for br in layers_were {
+    groups.push(br)
+  }
   let mut grew = true
   while grew {
     grew = false
@@ -621,31 +592,37 @@ pub fn Damage::moved(
   Some(res)
 }
 
-/// As far as any pixel of unit `k` of `a` reaches.
-fn Damage::reach_of(self : Damage, a : Array[Double], k : Int, into : Rect) -> Unit {
-  let o = k * inst_size
+/// The unit of the kept frame that is the header given as instance `k` (they were given in order); -1 where none is.
+fn Damage::head_unit(self : Damage, k : Int) -> Int {
+  let mut lo = 0
+  let mut hi = self.heads_at.length()
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    let (at, u) = self.heads_at[mid]
+    if at == k {
+      return u
+    }
+    if at < k {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  -1
+}
+
+/// As far as any pixel of unit `k` of `a` reaches; `old`: its groups as the kept frame was drawn.
+fn Damage::reach_of(self : Damage, a : Array[Double], k : Int, into : Rect, old~ : Bool = false) -> Unit {
   if kind_at(a, k) != 13 {
     reach(a, k, into)
     return
   }
-  match groups_get(self.groups, a[o + 12].to_int()) {
-    Some(g) => {
-      if !g.empty() {
-        if !(a[o + 16] == 0.0 && a[o + 17] == 0.0 && a[o + 18] == 0.0 && a[o + 19] == 0.0) {
-          let x0 = dmax(g.x0 + a[o], a[o + 16] - reach_pad)
-          let y0 = dmax(g.y0 + a[o + 1], a[o + 17] - reach_pad)
-          let x1 = dmin(g.x1 + a[o], a[o + 18] + reach_pad)
-          let y1 = dmin(g.y1 + a[o + 1], a[o + 19] + reach_pad)
-          if x0 < x1 && y0 < y1 {
-            into.add(x0, y0, x1, y1)
-          }
-        } else {
-          into.add(g.x0 + a[o], g.y0 + a[o + 1], g.x1 + a[o], g.y1 + a[o + 1])
-        }
-      }
+  self.each_group(group_at(a, k), old, [], fn(g : Option[GroupInfo], at : GroupAt) {
+    match g {
+      Some(g) => at.add(g.own, into)
+      None => into.add(-1.0e9, -1.0e9, 1.0e9, 1.0e9)
     }
-    None => into.add(-1.0e9, -1.0e9, 1.0e9, 1.0e9)
-  }
+  })
 }
 
 /// Why the last frame was drawn whole: 0 no, 1 none before it, 3 frame changed, 5 > half window.
@@ -687,6 +664,7 @@ fn Damage::keep(
   r : Double,
   g : Double,
   b : Double,
+  light_angle : Double,
 ) -> Unit {
   let len = count * inst_size
   if self.prev.length() < len {
@@ -709,6 +687,7 @@ fn Damage::keep(
   self.r = r
   self.g = g
   self.b = b
+  self.light_angle = light_angle
   self.has = true
 }
 
@@ -1050,6 +1029,12 @@ fn is_glass(kind : Int) -> Bool {
   kind == 5 || kind == 6 || kind == 7
 }
 
+/// What draws its content into a picture of its own and blurs or bends that: where a part reaches it, all of it is
+/// drawn again (blur_layers).
+fn is_layer(kind : Int) -> Bool {
+  kind == 8 || kind == 14 || kind == 15
+}
+
 fn glass_rim(a : Array[Double], o : Int) -> Double {
   dmax(a[o + 23], 0.0)
 }
@@ -1057,20 +1042,24 @@ fn glass_rim(a : Array[Double], o : Int) -> Double {
 fn glass_margin(a : Array[Double], k : Int) -> Double {
   let o = k * inst_size
   let liquid = kind_at(a, k) == 6
-  if a[o + 7] < 0.0 {
+  // (contained: its own box, its blur said below 0; liquid glass says its zoom there)
+  if !liquid && a[o + 7] < 0.0 {
     return 2.0 + reach_pad
   }
-  3.0 * a[o + 7] +
-  (if liquid { a[o + 21] * (1.0 + a[o + 22]) + glass_rim(a, o) } else { 0.0 }) +
+  3.0 * dmax(a[o + 7], 0.0) +
+  (if liquid { a[o + 21] * (1.0 + a[o + 22].abs()) + glass_rim(a, o) } else { 0.0 }) +
   2.0 +
   reach_pad
 }
 
-fn glass_box(a : Array[Double], k : Int, into : Rect) -> Unit {
+/// `cut`: to its clip (not, for a group: its clip may stay where it is as the group moves).
+fn glass_box(a : Array[Double], k : Int, into : Rect, cut~ : Bool = true) -> Unit {
   let o = k * inst_size
   if kind_at(a, k) == 6 {
     let e = glass_rim(a, o)
     into.add(a[o] - e, a[o + 1] - e, a[o] + a[o + 2] + e, a[o + 1] + a[o + 3] + e)
+  } else if !cut {
+    into.add(a[o], a[o + 1], a[o] + a[o + 2], a[o + 1] + a[o + 3])
   } else {
     into.add(
       dmax(a[o], a[o + 16]),
@@ -1090,13 +1079,23 @@ fn reach(a : Array[Double], k : Int, into : Rect, cut~ : Bool = true) -> Unit {
   if is_glass(kind) {
     let m = glass_margin(a, k)
     let g = Rect::none()
-    glass_box(a, k, g)
+    glass_box(a, k, g, cut=cut)
     if !g.empty() {
       into.add(g.x0 - m, g.y0 - m, g.x1 + m, g.y1 + m)
     }
     return
   }
-  let grow = reach_pad + (if kind == 2 || kind == 14 || kind == 15 { 3.0 * dmax(a[o + 7], 0.0) + 2.0 } else { 0.0 })
+  // (a shadow's blur; a layer's, its sigma by its size as the renderers take it; a content lens's blur and refraction)
+  let grow = reach_pad +
+  (if kind == 2 {
+    3.0 * dmax(a[o + 7], 0.0) + 2.0
+  } else if kind == 14 || kind == 15 {
+    3.0 * a[o + 7].abs() + 2.0
+  } else if kind == 8 {
+    3.0 * dmax(a[o + 7], 0.0) + dmax(a[o + 14], 0.0) + 4.0
+  } else {
+    0.0
+  })
   let mut x0 = a[o] - grow
   let mut y0 = a[o + 1] - grow
   let mut x1 = a[o] + a[o + 2] + grow
@@ -1137,6 +1136,7 @@ fn Damage::changed(
   w : Double,
   h : Double,
   known : Array[(Double, Double, Double, Double)],
+  light_changed : Bool,
 ) -> Array[(Double, Double, Double, Double)] {
   let prev = self.prev
   let n_old = self.n
@@ -1158,6 +1158,8 @@ fn Damage::changed(
   self.seg_now = seg
   let seg_old = if self.kept_seg >= 0 { self.kept_seg } else { pieces_from(prev, n_old) }
   let whole : Array[Bool] = [false]
+  // (the pieces of shapes all the same: no header's bands asked)
+  let tail_same = same_tail(prev, seg_old, n_old, inst, seg, count)
   let same = fn(k_old : Int, k : Int) -> Bool {
     let o = k * inst_size
     if inst[o + 20] >= stream_tex_base && inst[o + 20] < view_tex_base {
@@ -1165,6 +1167,10 @@ fn Damage::changed(
     }
     if !same_pair(prev, k_old, inst, k) {
       return false
+    }
+    if kind_at(inst, k) == 13 {
+      return self.group_same(prev, k_old) &&
+      (tail_same || !self.bands_changed(prev, seg_old, n_old, inst, seg, count, k, None))
     }
     kind_at(inst, k) != 11 ||
     inst[o + 13] <= 0.0 ||
@@ -1186,11 +1192,20 @@ fn Damage::changed(
     }
     was.clear()
     now.clear()
-    if k_old >= 0 {
-      self.reach_of(prev, k_old, was)
+    // (a header the same but for its bands' pieces: those bands alone)
+    let bands_only = k_old >= 0 &&
+    k >= 0 &&
+    kind_at(inst, k) == 13 &&
+    same_pair(prev, k_old, inst, k) &&
+    self.group_same(prev, k_old)
+    if bands_only {
+      let _ = self.bands_changed(prev, seg_old, n_old, inst, seg, count, k, Some(now))
+      now.cut_to(window)
+    } else if k_old >= 0 {
+      self.reach_of(prev, k_old, was, old=true)
       was.cut_to(window)
     }
-    if k >= 0 {
+    if k >= 0 && !bands_only {
       self.reach_of(inst, k, now)
       now.cut_to(window)
     }
@@ -1315,6 +1330,19 @@ fn Damage::changed(
       }
     }
   }
+  if !whole[0] && light_changed {
+    // (the light turned: all glass drawn again, of this frame and of the last)
+    let lit = self.glass_groups(inst, seg, false)
+    for gr in self.glass_groups(prev, seg_old, true) {
+      lit.push(gr)
+    }
+    for gr in lit {
+      if add_part(parts, gr.within(window)) && parts_area(parts) > most_area {
+        whole[0] = true
+        break
+      }
+    }
+  }
   if whole[0] {
     self.why = 5
     self.step_known = false
@@ -1323,12 +1351,18 @@ fn Damage::changed(
   if parts.length() == 0 {
     return []
   }
-  let groups = glass_groups(inst, seg)
+  let groups = self.glass_groups(inst, seg, false)
   for br in blur_layers(inst, seg) {
     groups.push(br)
   }
   for br in blur_layers(prev, seg_old) {
     groups.push(br)
+  }
+  for k in 0..<seg {
+    self.group_layers(inst, k, groups, false)
+  }
+  for k in 0..<seg_old {
+    self.group_layers(prev, k, groups, true)
   }
   let mut grew = true
   while grew {
@@ -1438,46 +1472,71 @@ fn fewer(parts : Array[Rect]) -> Unit {
   }
 }
 
-fn glass_groups(a : Array[Double], seg : Int) -> Array[Rect] {
-  let ids : Array[Double] = []
-  let boxes : Array[Rect] = []
-  let margins : Array[Double] = []
-  for k in 0..<seg {
-    let id = a[k * inst_size + 20]
-    if id >= 0.0 || !is_glass(kind_at(a, k)) {
-      continue
+/// What a capture of glass takes in: the glass sharing `id` (slot 20, negative) together, `margin` round it.
+struct GlassBox {
+  id : Double
+  box : Rect
+  mut margin : Double
+}
+
+fn GlassBox::copy(self : GlassBox) -> GlassBox {
+  let b = self.box
+  GlassBox::{ id: self.id, box: Rect::{ x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 }, margin: self.margin }
+}
+
+/// The one of `out` of capture `id`, put there where none is.
+fn glass_of(out : Array[GlassBox], id : Double) -> GlassBox {
+  for g in out {
+    if g.id == id {
+      return g
     }
-    let mut at = -1
-    for j, x in ids {
-      if x == id {
-        at = j
-        break
-      }
-    }
-    if at < 0 {
-      ids.push(id)
-      boxes.push(Rect::none())
-      margins.push(0.0)
-      at = ids.length() - 1
-    }
-    glass_box(a, k, boxes[at])
-    margins[at] = dmax(margins[at], glass_margin(a, k))
   }
+  let g = GlassBox::{ id, box: Rect::none(), margin: 0.0 }
+  out.push(g)
+  g
+}
+
+/// Instance `k` of `a` put in `out` where it is glass of a capture.
+fn glass_put(out : Array[GlassBox], a : Array[Double], k : Int, cut~ : Bool = true) -> Unit {
+  let id = a[k * inst_size + 20]
+  if id >= 0.0 || !is_glass(kind_at(a, k)) {
+    return
+  }
+  let g = glass_of(out, id)
+  glass_box(a, k, g.box, cut=cut)
+  g.margin = dmax(g.margin, glass_margin(a, k))
+}
+
+/// What each capture copies.
+fn glass_rects(glass : Array[GlassBox]) -> Array[Rect] {
   let out : Array[Rect] = []
-  for j, bx in boxes {
-    if !bx.empty() {
-      let m = margins[j]
-      out.push(Rect::{ x0: bx.x0 - m, y0: bx.y0 - m, x1: bx.x1 + m, y1: bx.y1 + m })
+  for g in glass {
+    let b = g.box
+    let m = g.margin
+    if !b.empty() {
+      out.push(Rect::{ x0: b.x0 - m, y0: b.y0 - m, x1: b.x1 + m, y1: b.y1 + m })
     }
   }
   out
+}
+
+/// What each capture of glass in the frame's first `seg` units copies, its headers' groups' glass with its own.
+fn Damage::glass_groups(self : Damage, a : Array[Double], seg : Int, old : Bool) -> Array[Rect] {
+  let glass : Array[GlassBox] = []
+  for k in 0..<seg {
+    glass_put(glass, a, k)
+  }
+  for k in 0..<seg {
+    self.group_glass(a, k, glass, old)
+  }
+  glass_rects(glass)
 }
 
 fn blur_layers(a : Array[Double], seg : Int) -> Array[Rect] {
   let out : Array[Rect] = []
   for k in 0..<seg {
     let kind = kind_at(a, k)
-    if kind == 14 || kind == 15 {
+    if is_layer(kind) {
       let r = Rect::none()
       reach(a, k, r)
       if !r.empty() {
@@ -1506,15 +1565,18 @@ fn Damage::clone_state(self : Damage) -> Damage {
     r: self.r,
     g: self.g,
     b: self.b,
+    light_angle: self.light_angle,
     has: self.has,
     why: self.why,
     seen: self.seen,
     telling: self.telling,
     groups: self.groups,
-    group_reads: self.group_reads,
+    stale: self.stale,
     covers: self.covers,
     unit_at: self.unit_at,
     hidden: self.hidden,
+    layered: self.layered,
+    head_said: self.head_said,
     shown: self.shown,
     occ_ok: self.occ_ok,
     occ_count: self.occ_count,
@@ -1541,6 +1603,7 @@ fn Damage::clone_state(self : Damage) -> Damage {
     kept_read: self.kept_read,
     kept_streams: self.kept_streams,
     kept_glass: self.kept_glass,
+    kept_layers: self.kept_layers,
     kept_seg: self.kept_seg,
     seg_now: self.seg_now,
     step_far: self.step_far,
@@ -1577,15 +1640,18 @@ fn Damage::window_put(self : Damage, o : Damage) -> Unit {
   self.r = o.r
   self.g = o.g
   self.b = o.b
+  self.light_angle = o.light_angle
   self.has = o.has
   self.why = o.why
   self.seen = o.seen
   self.telling = o.telling
   self.groups = o.groups
-  self.group_reads = o.group_reads
+  self.stale = o.stale
   self.covers = o.covers
   self.unit_at = o.unit_at
   self.hidden = o.hidden
+  self.layered = o.layered
+  self.head_said = o.head_said
   self.shown = o.shown
   self.occ_ok = o.occ_ok
   self.occ_count = o.occ_count
@@ -1612,6 +1678,7 @@ fn Damage::window_put(self : Damage, o : Damage) -> Unit {
   self.kept_read = o.kept_read
   self.kept_streams = o.kept_streams
   self.kept_glass = o.kept_glass
+  self.kept_layers = o.kept_layers
   self.kept_seg = o.kept_seg
   self.seg_now = o.seg_now
   self.step_far = o.step_far
