@@ -1,0 +1,1417 @@
+// Wave P0-1B tests:
+// - Per-window native `back_on_by_wid` gate isolation across two windows
+// - 4-argument `view_back` 3-state machine (`at`, `progress`, split-pane `rel_x`, `Began -> Cancel -> Standalone`)
+// - In-flight back gesture with `held_back_goes_on=true` vs `held_back_goes_on=false` modals
+// - `tree.on_layers_focus` (unfocused focusable `ByNode` restoration, stale opener fallback, nested modals)
+// - Frozen P0-2 hooks (`Tree::bones_of`, `FakeHost.non_clock_requested`, `DamageReport`, `bypass_blocks`, `in_frame_looks_hook`, `field_display_or_hint`)
+
+import "hostapi"
+import "signals"
+import "view"
+
+fn opt_node_is(a : Option[view::NodeId], b : view::NodeId) -> Bool {
+  match a {
+    Some(x) => x == b
+    None => false
+  }
+}
+
+fn opt_bool_is(a : Option[Bool], b : Bool) -> Bool {
+  match a {
+    Some(x) => x == b
+    None => false
+  }
+}
+
+fn opt_str_is(a : Option[String], b : String) -> Bool {
+  match a {
+    Some(x) => x == b
+    None => false
+  }
+}
+
+test "p0-1b: per-window native back_on gate isolation across two windows" {
+  let a_has_taker = signals::signal(false)
+  let b_has_taker = signals::signal(true)
+  let a_hits = ref_new(0)
+  let b_hits = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      root.show(fn() { a_has_taker.get() }, fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+        let _ = v.takes_back(fn() { a_hits.v = a_hits.v + 1 })
+      })
+    },
+    width=800.0,
+    height=600.0,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      root.show(fn() { b_has_taker.get() }, fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+        let _ = v.takes_back(fn() { b_hits.v = b_hits.v + 1 })
+      })
+    }
+  })
+  let wid_b = window_open_here("secondary")
+  debug_assert(wid_b > 0, "secondary window must open")
+  // Draw B (with taker), then draw A (without taker) — A's frame must NOT disable B's back_on!
+  let _ = window_frame(wid_b, 600.0, 400.0, 2.0, 10.0)
+  t.frame()
+  debug_assert(fake_host_dispatch_back(wid_b, 2, 0.0, 1.0, 0), "Back on B must pass native gate")
+  debug_assert(b_hits.v == 1 && a_hits.v == 0, "B receives 1, A receives 0")
+  debug_assert(!fake_host_dispatch_back(0, 2, 0.0, 1.0, 0), "Back on A without taker must be unhandled (false)")
+  debug_assert(a_hits.v == 0 && b_hits.v == 1, "unhandled Back on A must not trigger anything")
+
+  // Swap takers: give A a taker, remove B's taker, redraw both, and verify inverted gate
+  a_has_taker.set(true)
+  b_has_taker.set(false)
+  let _ = window_frame(wid_b, 600.0, 400.0, 2.0, 20.0)
+  t.frame()
+  debug_assert(fake_host_dispatch_back(0, 2, 0.0, 1.0, 0), "Back on A must now pass gate")
+  debug_assert(a_hits.v == 1 && b_hits.v == 1, "A receives 1 after swap")
+  debug_assert(!fake_host_dispatch_back(wid_b, 2, 0.0, 1.0, 0), "Back on B without taker must now return false")
+  t.dispose()
+}
+
+test "p0-1b: in-flight back gesture with held_back_goes_on=true and false modals" {
+  // Case (a): Began(A) -> open held_back_goes_on=true modal (no taker) -> Moved -> Commit reaches A once
+  let modal_open = signals::signal(false)
+  let log_a : Array[String] = []
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(200.0)))
+        let _ = a.follows_back(fn(step : view::BackStep) {
+          let sb = StringBuilder::new()
+          view::backstep_output(step, sb)
+          log_a.push(sb.to_string())
+        })
+      })
+      let _ = root.box(fn(m : view::View) {
+        let _ = m.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = m.held_back_goes_on().modal(view::Live::By(fn() { modal_open.get() }))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t1.fake.now_ms = 500.0
+  t1.back_gesture(0, 10.0, 0.0, 0)
+  modal_open.set(true)
+  t1.frame()
+  // Even though the modal has no back taker, in-flight gesture keeps back_on=true
+  debug_assert(opt_bool_is(t1.fake.back_on_by_wid.get(0), true), "in-flight gesture must keep back_on=true")
+  t1.fake.now_ms = 550.0
+  t1.back_gesture(1, 50.0, 0.25, 0)
+  t1.fake.now_ms = 600.0
+  t1.back_gesture(2, 100.0, 1.0, 0)
+  debug_assert(log_a.length() == 3, "A must receive Began, Moved, Back (got \{log_a.length()})")
+  debug_assert(log_a[0] == "Began(10, 500)", "first step must be Began(10, 500)")
+  debug_assert(log_a[1] == "Moved(50, 550)", "second step must be Moved(50, 550)")
+  debug_assert(log_a[2] == "Back", "commit must deliver Back once")
+  // Returned to Idle while modal (no taker) is still open -> back_on must now be false!
+  debug_assert(opt_bool_is(t1.fake.back_on_by_wid.get(0), false), "returning to Idle with no taker must set back_on=false")
+  t1.dispose()
+
+  // Case (b): Began(A) -> open held_back_goes_on=false modal (with taker B) -> A gets single CalledOff
+  // -> late Commit swallowed -> returns to Idle & recomputes back_on -> next standalone Back reaches B
+  let modal_b = signals::signal(false)
+  let steps_a : Array[String] = []
+  let hits_b = ref_new(0)
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(200.0)))
+        let _ = a.follows_back(fn(step : view::BackStep) {
+          let sb = StringBuilder::new()
+          view::backstep_output(step, sb)
+          steps_a.push(sb.to_string())
+        })
+      })
+      root.show(fn() { modal_b.get() }, fn(m : view::View) {
+        let _ = m.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = m.modal(view::Live::Is(true)).takes_back(fn() { hits_b.v = hits_b.v + 1 })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t2.fake.now_ms = 700.0
+  t2.back_gesture(0, 12.0, 0.0, 0)
+  modal_b.set(true)
+  t2.frame()
+  // Modal cancelled A's gesture via back_lost_in -> A received CalledOff once
+  t2.fake.now_ms = 720.0
+  t2.back_gesture(1, 30.0, 0.2, 0)
+  // Late Commit is swallowed (must NOT hit A or B)
+  t2.fake.now_ms = 740.0
+  t2.back_gesture(2, 80.0, 1.0, 0)
+  debug_assert(steps_a.length() == 2 && steps_a[1] == "CalledOff", "A must receive exactly one CalledOff")
+  debug_assert(hits_b.v == 0, "swallowed Commit must not reach new taker B")
+  // Now Idle -> next standalone Back reaches B!
+  t2.fake.now_ms = 800.0
+  t2.back_gesture(2, 0.0, 1.0, 0)
+  debug_assert(hits_b.v == 1, "next standalone Back after Idle must reach new taker B")
+  t2.dispose()
+}
+
+test "p0-1b: view_back at=1200, progress=0.4, split-pane rel_x, and Began -> Cancel -> Standalone" {
+  let seen : Array[String] = []
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.as_row()
+      let _ = root.box(fn(left : view::View) {
+        let _ = left.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(300.0)))
+      })
+      let _ = root.box(fn(right : view::View) {
+        let _ = right.width(view::Live::Is(Some(360.0))).height(view::Live::Is(Some(300.0)))
+        let _ = right.follows_back(fn(step : view::BackStep) {
+          let sb = StringBuilder::new()
+          view::backstep_output(step, sb)
+          seen.push(sb.to_string())
+        })
+      })
+    },
+    width=600.0,
+    height=300.0,
+  )
+  t.fake.now_ms = 1200.0
+  t.back_gesture(0, 260.0, 0.0, 0)
+  t.back_gesture(1, 300.0, 0.4, 0)
+  debug_assert((back_progress_now() - 0.4).abs() < 1.0e-9, "back_progress_now must equal 0.4")
+  debug_assert(seen.length() == 2, "must have Began and Moved")
+  debug_assert(seen[0] == "Began(20, 1200)", "split-pane rel_x must subtract pane x=240 (got \{seen[0]})")
+  debug_assert(seen[1] == "Moved(60, 1200)", "Moved must carry rel_x=60 and at=1200 (got \{seen[1]})")
+  // Host Cancel (kind=3) -> CalledOff -> Idle -> Standalone Back (kind=2) -> Back
+  t.back_gesture(3, 300.0, 0.0, 0)
+  debug_assert(seen.length() == 3 && seen[2] == "CalledOff", "Cancel must deliver CalledOff")
+  t.back_gesture(2, 0.0, 1.0, 0)
+  debug_assert(seen.length() == 4 && seen[3] == "Back", "Standalone Back after Cancel must deliver Back")
+  t.dispose()
+}
+
+test "p0-1b: on_layers_focus restores unfocused ByNode opener, stale opener fallback, and nested modals" {
+  let show_trigger1 = signals::signal(true)
+  let m1_open = signals::signal(false)
+  let m2_open = signals::signal(false)
+  let trig1_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let trig2_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let fallback_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(fb : view::View) {
+        fallback_ref.v = Some(fb)
+        let _ = fb.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+        let _ = fb.focusable(view::Live::Is(true))
+        let _ = fb.says(view::Live::Is(Some(view::said(view::Role::Button, label="Fallback"))))
+      })
+      root.show(fn() { show_trigger1.get() }, fn(s : view::View) {
+        let _ = s.box(fn(t1 : view::View) {
+          trig1_ref.v = Some(t1)
+          let _ = t1.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+          let _ = t1.focusable(view::Live::Is(true))
+          let _ = t1.says(view::Live::Is(Some(view::said(view::Role::Button, label="Trigger1"))))
+        })
+      })
+      root.show(fn() { m1_open.get() }, fn(m1 : view::View) {
+        let _ = m1.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(200.0)))
+        match trig1_ref.v {
+          Some(t1) => { let _ = m1.opened_by(view::Opener::ByNode(t1.id())) }
+          None => ()
+        }
+        let _ = m1.focus_opens_first().modal(view::Live::Is(true))
+        let _ = m1.box(fn(t2 : view::View) {
+          trig2_ref.v = Some(t2)
+          let _ = t2.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+          let _ = t2.focusable(view::Live::Is(true))
+          let _ = t2.says(view::Live::Is(Some(view::said(view::Role::Button, label="Trigger2"))))
+        })
+      })
+      root.show(fn() { m2_open.get() }, fn(m2 : view::View) {
+        let _ = m2.width(view::Live::Is(Some(150.0))).height(view::Live::Is(Some(150.0)))
+        match trig2_ref.v {
+          Some(t2) => { let _ = m2.opened_by(view::Opener::ByNode(t2.id())) }
+          None => ()
+        }
+        let _ = m2.focus_opens_first().modal(view::Live::Is(true))
+        let _ = m2.box(fn(inner : view::View) {
+          let _ = inner.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+          let _ = inner.focusable(view::Live::Is(true))
+          let _ = inner.says(view::Live::Is(Some(view::said(view::Role::Button, label="Inner"))))
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let tr = match view_tree() {
+    Some(x) => x
+    None => {
+      debug_assert(false, "tree")
+      return
+    }
+  }
+  let t1_id = match trig1_ref.v { Some(v) => v.id(); None => { debug_assert(false, "t1"); return } }
+  let fb_id = match fallback_ref.v { Some(v) => v.id(); None => { debug_assert(false, "fb"); return } }
+  // 1. Trigger1 is NOT focused before modal 1 opens; opening and closing modal 1 must restore focus to Trigger1!
+  debug_assert(tr.focused_now().0 is None, "nothing focused initially")
+  m1_open.set(true)
+  t.frame()
+  let t2_id = match trig2_ref.v { Some(v) => v.id(); None => { debug_assert(false, "t2"); return } }
+  debug_assert(opt_node_is(tr.focused_now().0, t2_id), "Modal 1 must focus Trigger2")
+  // 2. Nested modal 2 opens -> closes -> restores to Trigger2 -> close modal 1 -> restores to Trigger1
+  m2_open.set(true)
+  t.frame()
+  debug_assert(!opt_node_is(tr.focused_now().0, t2_id), "Modal 2 must move focus inside Modal 2")
+  m2_open.set(false)
+  t.frame()
+  debug_assert(opt_node_is(tr.focused_now().0, t2_id), "Closing Modal 2 must restore focus to Trigger2")
+  m1_open.set(false)
+  t.frame()
+  debug_assert(opt_node_is(tr.focused_now().0, t1_id), "Closing Modal 1 must restore focus to unfocused focusable Trigger1")
+
+  // 3. Stale opener fallback: focus Fallback, open Modal 1 (whose opener is Trigger1), unmount Trigger1, close Modal 1 -> restores Fallback!
+  let _ = tr.focus_to(Some(fb_id), visible=true)
+  m1_open.set(true)
+  t.frame()
+  show_trigger1.set(false)
+  t.frame()
+  m1_open.set(false)
+  t.frame()
+  debug_assert(opt_node_is(tr.focused_now().0, fb_id), "Stale opener must fall back to previously focused Fallback")
+  t.dispose()
+}
+
+test "p0-1b: frozen P0-2 hooks (bones_of, non_clock_requested, DamageReport, bypass_blocks, in_frame_looks_hook, field_display_or_hint)" {
+  let color_sig = signals::signal(rgba(255, 0, 0, 255))
+  let bone_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let plain_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let fld = Field::new()
+  let fld_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let underlay_runs = ref_new(0)
+  let hook_runs = ref_new(0)
+  let last_prod_n = ref_new(0)
+  let last_ref_n = ref_new(0)
+  let last_match = ref_new(true)
+
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        plain_id.v = Some(b.id())
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = b.ground(view::Live::By(fn() { color_sig.get() }))
+      })
+      let _ = root.box(fn(sk : view::View) {
+        let _ = sk.bones(view::Live::Is(rgba(200, 200, 200, 255)))
+        let _ = sk.box(fn(child : view::View) {
+          bone_id.v = Some(child.id())
+          let _ = child.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(20.0)))
+        })
+      })
+      let fv = field(root, fld, placeholder="Type here")
+      fld_id.v = Some(fv.id())
+    },
+    width=400.0,
+    height=300.0,
+  )
+  // 1. Tree::bones_of
+  match (view_tree(), bone_id.v, plain_id.v) {
+    (Some(tr), Some(bid), Some(pid)) => {
+      debug_assert(tr.bones_of(bid) == rgba(200, 200, 200, 255), "bones_of must inherit ancestor bones color")
+      debug_assert(tr.bones_of(pid) == 0L, "bones_of on non-bones node must be 0L")
+    }
+    _ => debug_assert(false, "nodes must exist")
+  }
+  // 2. field_display_or_hint
+  match (fld_id.v, plain_id.v) {
+    (Some(fid), Some(pid)) => {
+      debug_assert(opt_str_is(field_display_or_hint(fid), "Type here"), "empty field returns placeholder")
+      fld.set("Hello")
+      debug_assert(opt_str_is(field_display_or_hint(fid), "Hello"), "non-empty field returns text")
+      debug_assert(field_display_or_hint(pid) is None, "non-field returns None")
+    }
+    _ => debug_assert(false, "field id must exist")
+  }
+  // 3. FakeHost.non_clock_requested vs request_frame_on
+  t.fake.frame_requested = false
+  t.fake.non_clock_requested = false
+  hostapi::request_frame_on()
+  debug_assert(t.fake.frame_requested && !t.fake.non_clock_requested, "request_frame_on must NOT set non_clock_requested")
+  hostapi::request_frame()
+  debug_assert(t.fake.non_clock_requested, "request_frame must set non_clock_requested")
+
+  // 4. DamageReport normalization + in_frame_looks_hook + single underlay_painter + bypass_blocks zero work side effects
+  debug_assert(view_last_damage_report() is DamageReport::Full, "frame 1 must normalize to Full")
+  set_underlay_painter(Some(fn(sc : Scene, _w : Double, _h : Double, _s : Double, _now : Double) {
+    underlay_runs.v = underlay_runs.v + 1
+    let _ = sc.push_inst(0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, rgba(10, 20, 30, 255), 1.0, 0.0, 0.0, 0.0, 0.0)
+  }))
+  set_in_frame_looks_hook(Some(fn(prod : Scene, ref_sc : Scene, _rep : DamageReport, _w : Double, _h : Double, _s : Double, _r : Double, _g : Double, _b : Double) {
+    hook_runs.v = hook_runs.v + 1
+    last_prod_n.v = prod.ninst
+    last_ref_n.v = ref_sc.ninst
+    let mut eq = prod.ninst == ref_sc.ninst
+    if eq {
+      let mut i = 0
+      while i < prod.ninst * inst_size {
+        if (prod.inst[i] - ref_sc.inst[i]).abs() > 1.0e-9 {
+          eq = false
+          break
+        }
+        i += 1
+      }
+    }
+    last_match.v = eq
+  }))
+  view_paint_work_reset()
+  t.frame()
+  debug_assert(underlay_runs.v == 1, "underlay_painter must run strictly ONCE per frame")
+  debug_assert(hook_runs.v == 1, "in_frame_looks_hook must fire once")
+  debug_assert(last_match.v && last_prod_n.v == last_ref_n.v, "prod and ref scenes must match identically")
+  let w_with_hook = view_paint_work_now()
+  set_in_frame_looks_hook(None)
+  view_paint_work_reset()
+  t.frame()
+  let w_no_hook = view_paint_work_now()
+  debug_assert(w_with_hook.made == w_no_hook.made && w_with_hook.copied == w_no_hook.copied && w_with_hook.handed == w_no_hook.handed, "bypass_blocks must have zero view_paint_work side effects")
+  debug_assert(view_last_damage_report() is DamageReport::None, "unchanged frame must normalize to DamageReport::None")
+
+  // 5. Poison proof: stale view_blocks causes prod != ref on color change
+  set_in_frame_looks_hook(Some(fn(prod : Scene, ref_sc : Scene, _rep : DamageReport, _w : Double, _h : Double, _s : Double, _r : Double, _g : Double, _b : Double) {
+    let mut eq = prod.ninst == ref_sc.ninst
+    if eq {
+      let mut i = 0
+      while i < prod.ninst * inst_size {
+        if (prod.inst[i] - ref_sc.inst[i]).abs() > 1.0e-9 {
+          eq = false
+          break
+        }
+        i += 1
+      }
+    }
+    last_match.v = eq
+  }))
+  set_view_block_poison(true)
+  color_sig.set(rgba(0, 255, 0, 255))
+  t.frame()
+  debug_assert(!last_match.v, "stale view_block poison must cause prod != ref mismatch")
+  set_view_block_poison(false)
+  set_damage_report_poison(Some(DamageReport::None))
+  color_sig.set(rgba(0, 0, 255, 255))
+  t.frame()
+  debug_assert(view_last_damage_report() is DamageReport::None, "damage_report_poison must override report")
+  set_damage_report_poison(None)
+  t.dispose()
+}
+
+test "p0-1b: cross-window shared signal toggling window 1 modal does not clobber window 0 back_on" {
+  let shared_w1_modal = signals::signal(false)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+        let _ = a.takes_back(fn() { () })
+      })
+    },
+    width=800.0,
+    height=600.0,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      root.show(fn() { shared_w1_modal.get() }, fn(m : view::View) {
+        let _ = m.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+        let _ = m.modal(view::Live::Is(true)).takes_back(fn() { () })
+      })
+    }
+  })
+  let wid1 = window_open_here("win1")
+  debug_assert(wid1 > 0, "secondary window must open")
+  let _ = window_frame(wid1, 500.0, 400.0, 2.0, 10.0)
+  t.frame()
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(0), true), "window 0 has back taker")
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(wid1), false), "window 1 initially has no back taker")
+
+  // Toggle shared signal while window 0 is active -> window 1's on_modals fires and updates wid1 ONLY!
+  shared_w1_modal.set(true)
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(0), true), "window 0 back_on must remain true")
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(wid1), true), "window 1 back_on must become true")
+
+  // Close window 1 modal while window 0 is active -> window 0 back_on must NOT be clobbered to false!
+  shared_w1_modal.set(false)
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(0), true), "window 0 back_on must stay true when window 1 modal closes")
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(wid1), false), "window 1 back_on must become false")
+  t.dispose()
+}
+
+test "p0-1b: nested modals closing in same frame restore focus to outer opener btn0" {
+  let both_open = signals::signal(false)
+  let btn0_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let btn1_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b0 : view::View) {
+        btn0_ref.v = Some(b0)
+        let _ = b0.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+        let _ = b0.focusable(view::Live::Is(true))
+        let _ = b0.says(view::Live::Is(Some(view::said(view::Role::Button, label="Btn0"))))
+      })
+      root.show(fn() { both_open.get() }, fn(dlg1 : view::View) {
+        let _ = dlg1.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(200.0)))
+        match btn0_ref.v {
+          Some(b0) => { let _ = dlg1.opened_by(view::Opener::ByNode(b0.id())) }
+          None => ()
+        }
+        let _ = dlg1.focus_opens_first().modal(view::Live::Is(true))
+        let _ = dlg1.box(fn(b1 : view::View) {
+          btn1_ref.v = Some(b1)
+          let _ = b1.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+          let _ = b1.focusable(view::Live::Is(true))
+          let _ = b1.says(view::Live::Is(Some(view::said(view::Role::Button, label="Btn1"))))
+        })
+        let _ = dlg1.box(fn(dlg2 : view::View) {
+          let _ = dlg2.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(120.0)))
+          match btn1_ref.v {
+            Some(b1) => { let _ = dlg2.opened_by(view::Opener::ByNode(b1.id())) }
+            None => ()
+          }
+          let _ = dlg2.focus_opens_first().modal(view::Live::Is(true))
+          let _ = dlg2.box(fn(b2 : view::View) {
+            let _ = b2.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+            let _ = b2.focusable(view::Live::Is(true))
+            let _ = b2.says(view::Live::Is(Some(view::said(view::Role::Button, label="Btn2"))))
+          })
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let tr = match view_tree() {
+    Some(x) => x
+    None => {
+      debug_assert(false, "tree")
+      return
+    }
+  }
+  let b0_id = match btn0_ref.v { Some(v) => v.id(); None => { debug_assert(false, "b0"); return } }
+  let _ = tr.focus_to(Some(b0_id), visible=true)
+  both_open.set(true)
+  t.frame()
+  debug_assert(!opt_node_is(tr.focused_now().0, b0_id), "nested modals must take focus from btn0")
+  // Close outer dlg1 + inner dlg2 in the same frame -> gone arrives [dlg1, dlg2] -> focus MUST return to btn0!
+  both_open.set(false)
+  t.frame()
+  debug_assert(opt_node_is(tr.focused_now().0, b0_id), "same-frame nested modal close must restore focus to btn0")
+  t.dispose()
+}
+
+test "p0-1b: consecutive kind=0 Began re-entry cancels previous Active owner once" {
+  let steps : Array[String] = []
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(200.0)))
+        let _ = a.follows_back(fn(step : view::BackStep) {
+          let sb = StringBuilder::new()
+          view::backstep_output(step, sb)
+          steps.push(sb.to_string())
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t.fake.now_ms = 100.0
+  t.back_gesture(0, 10.0, 0.0, 0)
+  t.fake.now_ms = 200.0
+  t.back_gesture(0, 15.0, 0.0, 0)
+  t.fake.now_ms = 250.0
+  t.back_gesture(2, 80.0, 1.0, 0)
+  debug_assert(steps.length() == 4, "must deliver Began, CalledOff, Began, Back (got \{steps.length()})")
+  debug_assert(steps[0] == "Began(10, 100)", "first Began")
+  debug_assert(steps[1] == "CalledOff", "re-entrant Began must send single CalledOff to previous owner")
+  debug_assert(steps[2] == "Began(15, 200)", "second Began")
+  debug_assert(steps[3] == "Back", "commit of second gesture")
+  t.dispose()
+}
+
+test "p0-1b: clock animation frame does not set non_clock_requested" {
+  let shifted = signals::signal(false)
+  let start_ms = signals::signal(0.0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+        let _ = b.moved_by(
+          fn(_w : Double, _h : Double, now : Double) {
+            if !shifted.get() {
+              (0.0, 0.0)
+            } else {
+              let p = dclamp((now - start_ms.get()) / 300.0, 0.0, 1.0)
+              (100.0 * p, 0.0)
+            }
+          },
+          fn(_w : Double, _h : Double) {
+            if shifted.get() { start_ms.get() + 300.0 } else { 0.0 }
+          },
+        )
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  view::transition(fn() {
+    start_ms.set(t.time())
+    shifted.set(true)
+  })
+  t.frame(ms=16.0)
+  debug_assert(!t.fake.non_clock_requested, "in-frame clock animation tick must NOT set non_clock_requested")
+  t.dispose()
+}
+
+test "p0-1b: field_display_or_hint masks secrets, shows IME composition, and isolates fields per window" {
+  let f0 = Field::new()
+  let f1 = Field::new()
+  let f0_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let f1_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let v0 = field(root, f0, placeholder="Secret", secret=true)
+      f0_id.v = Some(v0.id())
+    },
+    width=400.0,
+    height=200.0,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      let v1 = field(root, f1, placeholder="Win1Hint")
+      f1_id.v = Some(v1.id())
+    }
+  })
+  let wid1 = window_open_here("field_win1")
+  let _ = window_frame(wid1, 400.0, 200.0, 2.0, 10.0)
+  // Secret masking on window 0
+  let id0 = match f0_id.v { Some(id) => id; None => { debug_assert(false, "id0"); return } }
+  let id1 = match f1_id.v { Some(id) => id; None => { debug_assert(false, "id1"); return } }
+  debug_assert(opt_str_is(field_display_or_hint(id0), "Secret"), "empty secret field returns placeholder")
+  f0.set("hunter2")
+  debug_assert(opt_str_is(field_display_or_hint(id0), f0.editor.display_text()), "secret field must return masked display_text")
+  debug_assert(!opt_str_is(field_display_or_hint(id0), "hunter2"), "secret field must NOT leak plaintext")
+  // IME composition on empty field in window 1 + per-window tree_fields isolation (even with matching NodeId slot!)
+  in_window(wid1, fn() {
+    debug_assert(opt_str_is(field_display_or_hint(id1), "Win1Hint"), "window 1 empty field returns its own placeholder")
+    f1.focus()
+    f1.compose("ni")
+    debug_assert(opt_str_is(field_display_or_hint(id1), "ni"), "empty field with IME composition must return composed text")
+  })
+  // Window 0 still sees its own masked secret, untouched by window 1
+  debug_assert(opt_str_is(field_display_or_hint(id0), f0.editor.display_text()), "window 0 field isolated from window 1")
+  t.dispose()
+}
+
+test "p0-1b: back_enabled deduplicates across unchanged frames and updates background window immediately" {
+  let b_has_taker = signals::signal(false)
+  let b_hits = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      root.show(fn() { b_has_taker.get() }, fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+        let _ = v.takes_back(fn() { b_hits.v = b_hits.v + 1 })
+      })
+    }
+  })
+  let wid1 = window_open_here("bg_win")
+  let _ = window_frame(wid1, 400.0, 200.0, 2.0, 10.0)
+  t.frame()
+  // 10 unchanged frames on window 0 -> 0 redundant back_enabled calls!
+  let calls_before = t.fake.back_enabled_calls
+  let mut k = 0
+  while k < 10 {
+    t.frame(ms=16.0)
+    k += 1
+  }
+  debug_assert(t.fake.back_enabled_calls == calls_before, "10 unchanged frames must issue 0 redundant back_enabled calls")
+  // While window 0 is active, shared signal adds a taker to background window 1 -> back_on_by_wid[1] updates immediately BEFORE window 1 redraws!
+  b_has_taker.set(true)
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(0), false), "window 0 back_on stays false")
+  debug_assert(opt_bool_is(t.fake.back_on_by_wid.get(wid1), true), "background window 1 back_on updated immediately via back_enabled_for")
+  debug_assert(fake_host_dispatch_back(wid1, 2, 0.0, 1.0, 0), "first Back on background window 1 succeeds before redraw")
+  debug_assert(b_hits.v == 1, "window 1 taker received Back")
+  t.dispose()
+}
+
+test "p0-1b: right-edge edge==1 split-pane rel_x and recursive Began inside callback" {
+  let seen : Array[String] = []
+  let reenter = ref_new(false)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.as_row()
+      let _ = root.box(fn(left : view::View) {
+        let _ = left.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(300.0)))
+      })
+      let _ = root.box(fn(right : view::View) {
+        let _ = right.width(view::Live::Is(Some(360.0))).height(view::Live::Is(Some(300.0)))
+        let _ = right.follows_back(fn(step : view::BackStep) {
+          let sb = StringBuilder::new()
+          view::backstep_output(step, sb)
+          seen.push(sb.to_string())
+          if reenter.v {
+            reenter.v = false
+            // Recursive Began inside user Began callback must not be overwritten by outer frame!
+            let _ = fake_host_dispatch_back(0, 0, 580.0, 0.0, 1)
+          }
+        })
+      })
+    },
+    width=600.0,
+    height=300.0,
+  )
+  // Right pane is [240, 600]; edge == 1 at x = 590 -> taker_right - x = 600 - 590 = 10.0
+  t.fake.now_ms = 500.0
+  t.back_gesture(0, 590.0, 0.0, 1)
+  debug_assert(seen.length() == 1 && seen[0] == "Began(10, 500)", "right-edge split-pane rel_x must be 10 (got \{seen[0]})")
+  t.back_gesture(3, 590.0, 0.0, 1)
+  seen.clear()
+  // Recursive Began inside user callback: inner gesture must stay Active and receive subsequent Commit!
+  reenter.v = true
+  t.fake.now_ms = 600.0
+  t.back_gesture(0, 590.0, 0.0, 1)
+  t.back_gesture(2, 500.0, 1.0, 1)
+  debug_assert(seen.length() == 4 && seen[3] == "Back", "inner recursive gesture must survive and commit (got \{seen.length()})")
+  t.dispose()
+}
+
+test "p0-1b: initial-mount open focus layer and same-frame dual-layer stack recovery" {
+  let inner_open = signals::signal(true)
+  let outer_btn_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let inner_btn_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(outer : view::View) {
+        let _ = outer.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(200.0)))
+        let _ = outer.focus_opens_first().modal(view::Live::Is(true))
+        let _ = outer.box(fn(ob : view::View) {
+          outer_btn_ref.v = Some(ob)
+          let _ = ob.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+          let _ = ob.focusable(view::Live::Is(true))
+          let _ = ob.says(view::Live::Is(Some(view::said(view::Role::Button, label="OuterBtn"))))
+        })
+      })
+      root.show(fn() { inner_open.get() }, fn(inner : view::View) {
+        let _ = inner.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(120.0)))
+        let _ = inner.focus_opens_first().modal(view::Live::Is(true))
+        let _ = inner.box(fn(ib : view::View) {
+          inner_btn_ref.v = Some(ib)
+          let _ = ib.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+          let _ = ib.focusable(view::Live::Is(true))
+          let _ = ib.says(view::Live::Is(Some(view::said(view::Role::Button, label="InnerBtn"))))
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let tr = match view_tree() { Some(x) => x; None => { debug_assert(false, "tree"); return } }
+  let ob_id = match outer_btn_ref.v { Some(v) => v.id(); None => { debug_assert(false, "ob"); return } }
+  let ib_id = match inner_btn_ref.v { Some(v) => v.id(); None => { debug_assert(false, "ib"); return } }
+  // Initial-mount open layers must already have focused InnerBtn on frame 0!
+  debug_assert(opt_node_is(tr.focused_now().0, ib_id), "initial-mount stacked modals must focus InnerBtn")
+  // Closing inner layer must restore focus to OuterBtn (not None)!
+  inner_open.set(false)
+  t.frame()
+  debug_assert(opt_node_is(tr.focused_now().0, ob_id), "closing inner of same-frame stacked modals must restore OuterBtn")
+  t.dispose()
+}
+
+test "p0-1b: bypass_blocks reference encode uploads zero glyphs even under poisoned view_blocks" {
+  let word_sig = signals::signal("AAA")
+  let ref_mismatch = ref_new(false)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(48.0)))
+        let _ = b.words(view::Live::By(fn() { word_sig.get() }))
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  set_in_frame_looks_hook(Some(fn(prod : Scene, ref_sc : Scene, _rep : DamageReport, _w : Double, _h : Double, _s : Double, _r : Double, _g : Double, _b : Double) {
+    let mut eq = prod.ninst == ref_sc.ninst
+    if eq {
+      let mut i = 0
+      while i < prod.ninst * inst_size {
+        if (prod.inst[i] - ref_sc.inst[i]).abs() > 1.0e-9 {
+          eq = false
+          break
+        }
+        i += 1
+      }
+    }
+    ref_mismatch.v = !eq
+  }))
+  // Poison view_blocks so prod reuses cached "AAA" while ref encodes fresh uncached "XYZ"
+  set_view_block_poison(true)
+  let puts_before = t.fake.glyphs_put.length()
+  word_sig.set("XYZ")
+  t.frame()
+  let puts_after = t.fake.glyphs_put.length()
+  debug_assert(ref_mismatch.v, "poisoned view_blocks must still be detected by ref_scene != prod_scene")
+  debug_assert(puts_after == puts_before, "bypass_blocks must upload 0 glyphs to host (got \{puts_after - puts_before})")
+  set_view_block_poison(false)
+  set_in_frame_looks_hook(None)
+  t.dispose()
+}
+
+test "p0-1b: secondary window room_faults uses its own width and 400-button grid stays fast" {
+  // 1. Wide main window (800pt) + narrow secondary window (390pt) on iOS with large_from=768
+  set_press_rules(PressRules::{ finger: 44.0, mouse: 36.0, large_from: Some(768.0) })
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+        let _ = b.on_press(fn() { () })
+      })
+    },
+    width=800.0,
+    height=600.0,
+    platform=1,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      let _ = root.box(fn(pill : view::View) {
+        let _ = pill.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(40.0)))
+        let _ = pill.on_press(fn() { () })
+        let _ = pill.box(fn(b : view::View) {
+          let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+          let _ = b.on_press(fn() { () })
+          let _ = b.says(view::Live::Is(Some(view::said(view::Role::Button, label="NarrowPill40"))))
+        })
+      })
+    }
+  })
+  let wid1 = window_open_here("ios_narrow")
+  let _ = window_frame(wid1, 390.0, 844.0, 2.0, 10.0)
+  in_window(wid1, fn() {
+    let f = t.room_faults()
+    debug_assert(f.length() == 1 && str_has_prefix(f[0], "room:"), "narrow 390pt secondary window on iOS must enforce 44pt rule")
+  })
+  t.dispose()
+
+  // 2. 400-button grid room_faults completes cleanly with 0 faults (occlusion pre-filter fast path)
+  let t400 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.gap(view::Live::Is(2.0))
+      let mut r = 0
+      while r < 20 {
+        let _ = root.box(fn(row : view::View) {
+          let _ = row.as_row().gap(view::Live::Is(2.0))
+          let mut c = 0
+          while c < 20 {
+            let _ = row.box(fn(btn : view::View) {
+              let _ = btn.width(view::Live::Is(Some(36.0))).height(view::Live::Is(Some(36.0)))
+              let _ = btn.on_press(fn() { () })
+            })
+            c += 1
+          }
+        })
+        r += 1
+      }
+    },
+    width=800.0,
+    height=800.0,
+    platform=0,
+  )
+  debug_assert(t400.room_faults().length() == 0, "400-button grid must pass room_faults with 0 faults")
+  t400.dispose()
+}
+
+test "p0-1b: reactive secondary-window field registers to its owning tree and activates IME on click" {
+  let show_b = signals::signal(false)
+  let fld = Field::new()
+  let fid : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+      })
+    },
+    width=800.0,
+    height=600.0,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      root.show(fn() { show_b.get() }, fn(s : view::View) {
+        let fv = field(s, fld, placeholder="SecondaryHint")
+        let _ = fv.width(view::Live::Is(Some(200.0)))
+        fid.v = Some(fv.id())
+      })
+    }
+  })
+  let wid_b = window_open_here("reactive_field_b")
+  let _ = window_frame(wid_b, 600.0, 400.0, 1.0, 10.0)
+  t.frame()
+  // Flip shared signal while window 0 is active, then frame window 0 and window B.
+  show_b.set(true)
+  t.frame()
+  let _ = window_frame(wid_b, 600.0, 400.0, 1.0, 30.0)
+  let id_b = match fid.v { Some(id) => id; None => { debug_assert(false, "fid"); return } }
+  debug_assert(field_display_or_hint(id_b) is None, "window 0 must not see secondary-window field")
+  in_window(wid_b, fn() {
+    debug_assert(opt_str_is(field_display_or_hint(id_b), "SecondaryHint"), "window B must see its reactively mounted field")
+    view_pointer(1, 20.0, 10.0, 40.0)
+    view_pointer(2, 20.0, 10.0, 41.0)
+  })
+  let _ = window_frame(wid_b, 600.0, 400.0, 1.0, 50.0)
+  debug_assert(fld.focused_sig.untracked(), "clicking reactively mounted field in window B must focus it")
+  t.fake.ime_active = false
+  let _ = window_frame(wid_b, 600.0, 400.0, 1.0, 70.0)
+  debug_assert(t.fake.ime_active, "focused reactively mounted field in window B must activate IME")
+  t.dispose()
+}
+
+test "p0-1b: first frame in run forces back_enabled sync after native slot creation" {
+  let f = FakeHost::new()
+  let old = f.install()
+  let h = hostapi::host()
+  let has_slot = ref_new(false)
+  let gate = ref_new(false)
+  let hits = ref_new(0)
+  let ran = ref_new(false)
+  h.back_enabled = fn(want : Bool) {
+    if has_slot.v {
+      gate.v = want
+    }
+  }
+  h.run = fn(_title, frame, _ptr, _wheel, _key, _text) {
+    has_slot.v = true
+    frame(640.0, 400.0, 1.0, 0.0)
+    frame(640.0, 400.0, 1.0, 16.0)
+    if gate.v {
+      view_back(2, 0.0, 1.0, 0)
+    }
+    ran.v = true
+  }
+  run("ColdStartBack", fn(root : view::View) {
+    let _ = root.takes_back(fn() { hits.v = hits.v + 1 })
+  })
+  view_forget()
+  let _ = hostapi::set_host(old)
+  debug_assert(ran.v && gate.v && hits.v == 1, "first frame must re-sync back_enabled once host slot exists")
+}
+
+test "p0-1b: explicit underlay request_frame sets non_clock_requested while tree clock frame keeps it false" {
+  // 1. Explicit request_frame() from underlay painter sets non_clock_requested = true.
+  let t1 = Tester::tree(fn(_root : view::View) { () }, width=400.0, height=200.0)
+  set_underlay_painter(Some(fn(_sc, _w, _h, _s, _now) { hostapi::request_frame() }))
+  t1.frame()
+  let req1 = t1.fake.frame_requested
+  let non_clock1 = t1.fake.non_clock_requested
+  set_underlay_painter(None)
+  t1.dispose()
+  debug_assert(req1 && non_clock1, "underlay hostapi::request_frame must set non_clock_requested")
+
+  // 2. Clock-driven animation frame keeps non_clock_requested = false.
+  let shifted = signals::signal(false)
+  let start_ms = signals::signal(0.0)
+  let dur = 300.0
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(48.0)))
+        let _ = b.moved_by(
+          fn(_w : Double, _h : Double, now : Double) {
+            if !shifted.get() {
+              (0.0, 0.0)
+            } else {
+              let p = dclamp((now - start_ms.get()) / dur, 0.0, 1.0)
+              (120.0 * p, 0.0)
+            }
+          },
+          fn(_w : Double, _h : Double) {
+            if shifted.get() { start_ms.get() + dur } else { 0.0 }
+          },
+        )
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  view::transition(fn() {
+    start_ms.set(t2.time())
+    shifted.set(true)
+  })
+  t2.run_for(50.0)
+  let mid1 = t2.fake.non_clock_requested
+  t2.run_for(50.0)
+  let mid2 = t2.fake.non_clock_requested
+  t2.dispose()
+  debug_assert(!mid1 && !mid2, "clock-driven animation frame must keep non_clock_requested false")
+}
+
+test "p0-1b: nested Began inside Commit callback survives and receives Moved and Commit" {
+  let restart = ref_new(true)
+  let moved = ref_new(0)
+  let commits = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.follows_back(fn(step : view::BackStep) {
+        match step {
+          view::BackStep::Back => {
+            commits.v = commits.v + 1
+            if restart.v {
+              restart.v = false
+              let _ = fake_host_dispatch_back(0, 0, 20.0, 0.0, 0)
+            }
+          }
+          view::BackStep::Moved(_, _) => moved.v = moved.v + 1
+          _ => ()
+        }
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t.back_gesture(0, 5.0, 0.0, 0)
+  t.back_gesture(2, 10.0, 1.0, 0)
+  t.back_gesture(1, 25.0, 0.4, 0)
+  t.back_gesture(2, 35.0, 1.0, 0)
+  t.dispose()
+  debug_assert(moved.v == 1 && commits.v == 2, "nested gesture started in Commit must receive Moved and second Commit")
+}
+
+test "p0-1b: unpoisoned looks hook parity when glyph exceeds atlas plot size" {
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(view::Live::Is("A"))
+    },
+    width=400.0,
+    height=200.0,
+  )
+  let h = hostapi::host()
+  let orig_glyph = h.glyph
+  h.glyph = fn(key : Int, out : Array[Double]) {
+    orig_glyph(key, out)
+    out[2] = 1200.0
+    out[3] = 1200.0
+  }
+  reset_glyph_atlas()
+  let prod_n = ref_new(-1)
+  let ref_n = ref_new(-1)
+  set_in_frame_looks_hook(Some(fn(p : Scene, r : Scene, _rep, _w, _h, _s, _br, _bg, _bb) {
+    prod_n.v = p.ninst
+    ref_n.v = r.ninst
+  }))
+  t.frame()
+  set_in_frame_looks_hook(None)
+  t.dispose()
+  debug_assert(prod_n.v == ref_n.v, "oversized glyph must be skipped identically in prod and reference encode")
+}
+
+test "p0-1b: same-frame dual modal open with prior focus restores lower modal focus when top closes" {
+  let both = signals::signal(false)
+  let top_open = signals::signal(false)
+  let b0_ref : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let b1_ref : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b0 : view::View) {
+        b0_ref.v = Some(b0.id())
+        let _ = b0.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+      })
+      root.show(fn() { both.get() }, fn(d1 : view::View) {
+        let _ = d1.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(200.0)))
+        let _ = d1.focus_opens_first().modal(view::Live::Is(true))
+        let _ = d1.box(fn(b1 : view::View) {
+          b1_ref.v = Some(b1.id())
+          let _ = b1.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+        })
+      })
+      root.show(fn() { top_open.get() }, fn(d2 : view::View) {
+        let _ = d2.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(120.0)))
+        let _ = d2.focus_opens_first().modal(view::Live::Is(true))
+        let _ = d2.box(fn(b2 : view::View) {
+          let _ = b2.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let tr = match view_tree() { Some(x) => x; None => { debug_assert(false, "tree"); return } }
+  let b0 = match b0_ref.v { Some(x) => x; None => { debug_assert(false, "b0"); return } }
+  let _ = tr.focus_to(Some(b0), visible=true)
+  signals::batch(fn() {
+    both.set(true)
+    top_open.set(true)
+  })
+  t.frame()
+  top_open.set(false)
+  t.frame()
+  let b1 = match b1_ref.v { Some(x) => x; None => { debug_assert(false, "b1"); return } }
+  debug_assert(opt_node_is(tr.focused_now().0, b1), "closing top of batch-opened dual modals must focus lower modal b1")
+  t.dispose()
+}
+
+test "p0-1b: standalone tree encode isolates field lookup by tree_id" {
+  let f = Field::new(text="main")
+  let t = Tester::tree(fn(root : view::View) { let _ = field(root, f) }, width=400.0, height=200.0)
+  f.focus()
+  t.frame()
+  // Plain rectangle in a separate Tree must not collide with the focused field in window 0.
+  let off = view::Tree::new(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(90.0))).height(view::Live::Is(Some(22.0))).bg(0x660000FFL)
+    })
+  })
+  let before = t.fake.ime_trace.length()
+  let sc = encode_tree_scene(off, 120.0, 40.0, 1.0, 0.0)
+  let extra = t.fake.ime_trace.length() - before
+  off.dispose()
+  debug_assert(sc.ninst == 1 && extra == 0, "plain standalone tree must emit 1 inst and 0 IME updates")
+
+  // A standalone tree with its own focused field must still paint its caret.
+  let f2 = Field::new()
+  let solo = view::Tree::new(fn(root : view::View) { let _ = field(root, f2) })
+  let before_focus = encode_tree_scene(solo, 250.0, 80.0, 1.0, 0.0).ninst
+  f2.focus()
+  let after_focus = encode_tree_scene(solo, 250.0, 80.0, 1.0, 1.0).ninst
+  solo.dispose()
+  t.dispose()
+  debug_assert(after_focus > before_focus, "standalone tree focused field must paint caret instance")
+}
+
+test "p0-1b: Began re-entered inside CalledOff keeps ownership and balances terminal events" {
+  let began = ref_new(0)
+  let cancel = ref_new(0)
+  let committed = ref_new(0)
+  let restart = ref_new(true)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.follows_back(fn(step : view::BackStep) {
+        match step {
+          view::BackStep::Began(_, _) => began.v = began.v + 1
+          view::BackStep::CalledOff => {
+            cancel.v = cancel.v + 1
+            if restart.v {
+              restart.v = false
+              let _ = fake_host_dispatch_back(0, 0, 75.0, 0.0, 0)
+            }
+          }
+          view::BackStep::Back => committed.v = committed.v + 1
+          _ => ()
+        }
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t.back_gesture(0, 5.0, 0.0, 0)
+  t.back_gesture(0, 25.0, 0.0, 0)
+  t.back_gesture(2, 80.0, 1.0, 0)
+  t.dispose()
+  debug_assert(began.v == 2 && cancel.v == 1 && committed.v == 1, "re-entrant Began in CalledOff must balance events")
+}
+
+test "p0-1b: full glyph atlas frame keeps prod and reference encode parity with zero extra uploads" {
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(view::Live::Is("AB"))
+    },
+    width=400.0,
+    height=200.0,
+    scale=1.0,
+  )
+  let h = hostapi::host()
+  h.atlas_size = fn(_) { 12 }
+  reset_glyph_atlas()
+  let pn = ref_new(-1)
+  let rn = ref_new(-1)
+  set_in_frame_looks_hook(Some(fn(p : Scene, r : Scene, _rep, _w, _h, _s, _br, _bg, _bb) {
+    pn.v = p.ninst
+    rn.v = r.ninst
+  }))
+  let uploads_before = t.fake.glyphs_put.length()
+  t.frame()
+  let uploads_delta = t.fake.glyphs_put.length() - uploads_before
+  set_in_frame_looks_hook(None)
+  t.dispose()
+  debug_assert(pn.v == 1 && rn.v == 1 && uploads_delta == 1, "full atlas must keep prod=1 ref=1 uploads_delta=1")
+}
+
+test "p0-1b: same-frame lower non-modal and upper modal restore focus to lower layer when upper closes" {
+  let both = signals::signal(false)
+  let top_open = signals::signal(false)
+  let b0_ref : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let b1_ref : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b0 : view::View) {
+        b0_ref.v = Some(b0.id())
+        let _ = b0.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+      })
+      root.show(fn() { both.get() }, fn(d1 : view::View) {
+        let _ = d1.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(200.0)))
+        let _ = d1.focus_opens_first()
+        let _ = d1.box(fn(b1 : view::View) {
+          b1_ref.v = Some(b1.id())
+          let _ = b1.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+        })
+      })
+      root.show(fn() { top_open.get() }, fn(d2 : view::View) {
+        let _ = d2.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(120.0)))
+        let _ = d2.focus_opens_first().modal(view::Live::Is(true))
+        let _ = d2.box(fn(b2 : view::View) {
+          let _ = b2.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let tr = match view_tree() { Some(x) => x; None => { debug_assert(false, "tree"); return } }
+  let b0 = match b0_ref.v { Some(x) => x; None => { debug_assert(false, "b0"); return } }
+  let _ = tr.focus_to(Some(b0), visible=true)
+  signals::batch(fn() {
+    both.set(true)
+    top_open.set(true)
+  })
+  t.frame()
+  top_open.set(false)
+  t.frame()
+  let b1 = match b1_ref.v { Some(x) => x; None => { debug_assert(false, "b1"); return } }
+  debug_assert(opt_node_is(tr.focused_now().0, b1), "closing upper modal over non-modal lower layer must restore b1")
+  t.dispose()
+}
+
+fn focus_opens_first_pick(setup : (view::View, signals::Ref[Option[view::NodeId]], signals::Ref[Option[view::NodeId]]) -> Unit) -> String {
+  let open = signals::signal(false)
+  let first_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let second_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      root.show(fn() { open.get() }, fn(d : view::View) {
+        let _ = d.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(200.0)))
+        let _ = d.focus_opens_first().modal(view::Live::Is(true))
+        setup(d, first_id, second_id)
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  open.set(true)
+  t.frame()
+  let tr = match view_tree() { Some(x) => x; None => return "no_tree" }
+  let cur = tr.focused_now().0
+  let res = match (cur, first_id.v, second_id.v) {
+    (Some(x), Some(a), _) if x == a => "first"
+    (Some(x), _, Some(b)) if x == b => "second"
+    (None, _, _) => "none"
+    _ => "other"
+  }
+  t.dispose()
+  res
+}
+
+test "p0-1b: focus_opens_first skips non-tab, inert, and non-in-use targets" {
+  // 1. Skip tab=false
+  let r_tab = focus_opens_first_pick(fn(d, a, b) {
+    let _ = d.box(fn(x : view::View) {
+      a.v = Some(x.id())
+      let _ = x.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true), tab=false)
+    })
+    let _ = d.box(fn(y : view::View) {
+      b.v = Some(y.id())
+      let _ = y.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+  })
+  debug_assert(r_tab == "second", "must skip tab=false child (got \{r_tab})")
+
+  // 2. Skip presses(false)
+  let r_inert = focus_opens_first_pick(fn(d, a, b) {
+    let _ = d.box(fn(x : view::View) {
+      a.v = Some(x.id())
+      let _ = x.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true)).presses(view::Live::Is(false))
+    })
+    let _ = d.box(fn(y : view::View) {
+      b.v = Some(y.id())
+      let _ = y.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+  })
+  debug_assert(r_inert == "second", "must skip presses(false) child (got \{r_inert})")
+
+  // 3. Skip in_use(false) directly on child
+  let r_direct_behind = focus_opens_first_pick(fn(d, a, b) {
+    let _ = d.box(fn(x : view::View) {
+      a.v = Some(x.id())
+      let _ = x.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true)).in_use(view::Live::Is(false))
+    })
+    let _ = d.box(fn(y : view::View) {
+      b.v = Some(y.id())
+      let _ = y.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+  })
+  debug_assert(r_direct_behind == "second", "must skip direct in_use(false) child (got \{r_direct_behind})")
+
+  // 4. Skip child inside nested in_use(false) container
+  let r_nested_behind = focus_opens_first_pick(fn(d, a, b) {
+    let _ = d.box(fn(wrap : view::View) {
+      let _ = wrap.in_use(view::Live::Is(false))
+      let _ = wrap.box(fn(x : view::View) {
+        a.v = Some(x.id())
+        let _ = x.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+      })
+    })
+    let _ = d.box(fn(y : view::View) {
+      b.v = Some(y.id())
+      let _ = y.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+  })
+  debug_assert(r_nested_behind == "second", "must skip child inside in_use(false) container (got \{r_nested_behind})")
+}
+
+test "p0-1b: full glyph atlas skips caching dropped-glyph block across frames and recovers when space frees" {
+  // 1. Two consecutive frames on the same full 12x12 atlas keep prod and ref parity on both frames.
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(view::Live::Is("AB"))
+    },
+    width=400.0,
+    height=200.0,
+    scale=1.0,
+  )
+  hostapi::host().atlas_size = fn(_) { 12 }
+  reset_glyph_atlas()
+  let pn = ref_new(-1)
+  let rn = ref_new(-1)
+  set_in_frame_looks_hook(Some(fn(p : Scene, r : Scene, _rep, _w, _h, _s, _br, _bg, _bb) {
+    pn.v = p.ninst
+    rn.v = r.ninst
+  }))
+  t1.frame()
+  let p1 = pn.v
+  let r1 = rn.v
+  t1.frame(ms=16.0)
+  let p2 = pn.v
+  let r2 = rn.v
+  set_in_frame_looks_hook(None)
+  t1.dispose()
+  debug_assert(p1 == 1 && r1 == 1 && p2 == r2, "two full-atlas frames must match: f1=\{p1}/\{r1} f2=\{p2}/\{r2}")
+
+  // 2. Removing the occupying text on frame 2 lets the previously omitted node paint immediately with block cache on.
+  let first = signals::signal("A")
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(24.0))).words(view::Live::By(fn() { first.get() }))
+      })
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(24.0))).words(view::Live::Is("B"))
+      })
+    },
+    width=400.0,
+    height=200.0,
+    scale=1.0,
+  )
+  hostapi::host().atlas_size = fn(_) { 12 }
+  reset_glyph_atlas()
+  t2.frame()
+  first.set("")
+  t2.frame(ms=16.0)
+  let cached_n = view_app.scene.ninst
+  set_view_blocks_enabled(false)
+  t2.frame(ms=16.0)
+  let uncached_n = view_app.scene.ninst
+  set_view_blocks_enabled(true)
+  t2.dispose()
+  debug_assert(cached_n == 1 && uncached_n == 1, "previously omitted glyph must paint with block cache enabled: cached=\{cached_n} uncached=\{uncached_n}")
+}
+
+test "p0-1b: cached text ViewBlock keeps mono and colour atlas shelves live on warm frames" {
+  // 1. Monochrome atlas: warm hit on A protects its shelf from eviction by B, and removing A lets B paint.
+  let a_text = signals::signal("A")
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.words(view::Live::By(fn() { a_text.get() }))
+      })
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.words(view::Live::Is("B"))
+      })
+    },
+    width=400.0,
+    height=200.0,
+    scale=1.0,
+  )
+  hostapi::host().atlas_size = fn(_) { 12 }
+  reset_glyph_atlas()
+  let prod = ref_new(-1)
+  let uv_agree = ref_new(false)
+  set_in_frame_looks_hook(Some(fn(p : Scene, r : Scene, _rep, _w, _h, _s, _br, _bg, _bb) {
+    prod.v = p.ninst
+    uv_agree.v = p.ninst > 0 && r.ninst > 0 && p.inst[12] == r.inst[12] && p.inst[13] == r.inst[13]
+  }))
+  t1.frame()
+  let cold = prod.v
+  let uploads = t1.fake.glyphs_put.length()
+  t1.frame(ms=16.0)
+  let warm = prod.v
+  let same_uv = uv_agree.v
+  let after = t1.fake.glyphs_put.length()
+  set_in_frame_looks_hook(None)
+  debug_assert(cold == 1 && warm == 1 && after == uploads && same_uv, "warm mono block must protect its atlas shelf")
+  a_text.set("")
+  t1.frame(ms=16.0)
+  let b_painted = view_app.scene.ninst
+  t1.dispose()
+  debug_assert(b_painted == 1, "removing A must allow B to place and paint on the next frame")
+
+  // 2. Colour atlas: warm hit on colour glyph A protects its colour shelf from eviction by colour glyph B.
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(a : view::View) {
+        let _ = a.words(view::Live::Is("A"))
+      })
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.words(view::Live::Is("B"))
+      })
+    },
+    width=400.0,
+    height=200.0,
+    scale=1.0,
+  )
+  let h2 = hostapi::host()
+  let orig_glyph = h2.glyph
+  h2.glyph = fn(key : Int, out : Array[Double]) {
+    orig_glyph(key, out)
+    out[6] = 1.0
+  }
+  h2.atlas_size = fn(_) { 12 }
+  reset_glyph_atlas()
+  let col_prod = ref_new(-1)
+  let col_uv_agree = ref_new(false)
+  set_in_frame_looks_hook(Some(fn(p : Scene, r : Scene, _rep, _w, _h, _s, _br, _bg, _bb) {
+    col_prod.v = p.ninst
+    col_uv_agree.v = p.ninst > 0 && r.ninst > 0 && p.inst[12] == r.inst[12] && p.inst[13] == r.inst[13]
+  }))
+  t2.frame()
+  let col_cold = col_prod.v
+  let col_uploads = t2.fake.glyphs_put.length()
+  t2.frame(ms=16.0)
+  let col_warm = col_prod.v
+  let col_same_uv = col_uv_agree.v
+  let col_after = t2.fake.glyphs_put.length()
+  set_in_frame_looks_hook(None)
+  t2.dispose()
+  debug_assert(col_cold == 1 && col_warm == 1 && col_after == col_uploads && col_same_uv, "warm colour block must protect its colour atlas shelf")
+}

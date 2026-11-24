@@ -55,7 +55,22 @@ struct RoomTarget {
   vy0 : Double
   vx1 : Double
   vy1 : Double
+  layer : Int
+  held_idx : Int
   label : String
+}
+
+fn rect_within(
+  ax0 : Double,
+  ay0 : Double,
+  ax1 : Double,
+  ay1 : Double,
+  bx0 : Double,
+  by0 : Double,
+  bx1 : Double,
+  by1 : Double,
+) -> Bool {
+  ax0 >= bx0 - 0.5 && ay0 >= by0 - 0.5 && ax1 <= bx1 + 0.5 && ay1 <= by1 + 0.5
 }
 
 fn room_label(tree : view::Tree, d : view::Drawn) -> String {
@@ -106,83 +121,195 @@ fn clipped_visible_rect(
   (x0, y0, x1, y1)
 }
 
-/// Inspect all visible clickable targets in the last frame for size (`room:`) and overlap (`apart:`) faults.
+fn target_is_occluded(
+  tree : view::Tree,
+  held : Array[(view::Drawn, Int, Bool)],
+  idx : Int,
+  id : view::NodeId,
+  part : (Double, Double, Double, Double),
+) -> Bool {
+  let n = held.length()
+  let (px0, py0, px1, py1) = part
+  let mut j = idx + 1
+  while j < n {
+    let dj = held[j].0
+    if (dj.glass.is_some() || (dj.alpha >= 1.0 && (dj.ground & 0xFFL) == 0xFFL)) &&
+    dj.x <= px0 + 0.5 &&
+    dj.y <= py0 + 0.5 &&
+    dj.x + dj.w >= px1 - 0.5 &&
+    dj.y + dj.h >= py1 - 0.5 &&
+    !tree.holds_in_order(id, dj.id) &&
+    !tree.holds_in_order(dj.id, id) &&
+    tree.covered_under(id, dj.id, part) {
+      return true
+    }
+    j += 1
+  }
+  false
+}
+
+/// Inspect all visible interactive targets in the last frame for expandable hit-room (`room:`) and overlap (`apart:`) faults.
+/// Policy: `room:` enforces per-target expandable room `>= least` against window/clip/short-holder bounds (`view::press_room`);
+/// adjacent siblings share the gap by nearest-edge midpoint split (`Tree::reached`) and are guarded against visual overlap by `apart:`.
 pub fn Tester::room_faults(self : Tester) -> Array[String] {
   let tree = match view_tree() {
     Some(tr) => tr
     None => return []
   }
+  let (rw, rh) = tree.room_signal().untracked()
+  let win_w = if rw > 0.0 { rw } else { self.fake.width }
+  let win_h = if rh > 0.0 { rh } else { self.fake.height }
   let held = tree.drawn_held()
   let n = held.length()
+  let held_idx_by_at : Map[Int, Int] = Map::new()
+  let mut hi = 0
+  while hi < n {
+    held_idx_by_at[held[hi].0.id.at] = hi
+    hi += 1
+  }
   let targets : Array[RoomTarget] = []
+  let seen : Map[Int, Bool] = Map::new()
+  // 1. Collect targets from `tree.press_boxes()` using real `tree.over_all_of(id)` layer
+  let pboxes = tree.press_boxes()
+  for pb in pboxes {
+    let id = pb.0
+    if tree.claims_scroll(id) {
+      continue
+    }
+    let box = pb.1
+    let idx = match held_idx_by_at.get(id.at) {
+      Some(k) if held[k].0.id == id => k
+      _ => -1
+    }
+    let (vx0, vy0, vx1, vy1) = if idx >= 0 {
+      clipped_visible_rect(held, idx, win_w, win_h)
+    } else {
+      (dmax(0.0, box.0), dmax(0.0, box.1), dmin(win_w, box.2), dmin(win_h, box.3))
+    }
+    let vw = vx1 - vx0
+    let vh = vy1 - vy0
+    if vw > 0.5 && vh > 0.5 {
+      seen[id.at] = true
+      let occluded = if idx >= 0 {
+        target_is_occluded(tree, held, idx, id, (vx0, vy0, vx1, vy1))
+      } else {
+        false
+      }
+      if !occluded {
+        let lbl = if idx >= 0 { room_label(tree, held[idx].0) } else { "node#\{id.at}" }
+        targets.push(RoomTarget::{
+          id,
+          vx0,
+          vy0,
+          vx1,
+          vy1,
+          layer: tree.over_all_of(id),
+          held_idx: idx,
+          label: lbl,
+        })
+      }
+    }
+  }
+  // 2. Collect partially-visible interactive targets (pressable, draggable, or hold-only)
   let mut i = 0
   while i < n {
-    let entry = held[i]
-    if entry.2 {
-      let d = entry.0
-      if d.w > 0.0 && d.h > 0.0 {
-        let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, self.fake.width, self.fake.height)
-        let vw = vx1 - vx0
-        let vh = vy1 - vy0
-        if vw > 0.5 && vh > 0.5 {
-          let mut occluded = false
-          let mut j = i + 1
-          while j < n {
-            let dj = held[j].0
-            if !tree.holds_in_order(d.id, dj.id) &&
-            !tree.holds_in_order(dj.id, d.id) &&
-            tree.covered_under(d.id, dj.id, (vx0, vy0, vx1, vy1)) {
-              occluded = true
-              break
-            }
-            j += 1
-          }
-          if !occluded {
-            targets.push(RoomTarget::{
-              id: d.id,
-              vx0,
-              vy0,
-              vx1,
-              vy1,
-              label: room_label(tree, d),
-            })
-          }
+    let d = held[i].0
+    if !seen.contains(d.id.at) &&
+    !tree.claims_scroll(d.id) &&
+    d.alpha > 0.01 &&
+    d.w > 0.0 &&
+    d.h > 0.0 &&
+    tree.press_or_drag_of(d.id) {
+      let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, win_w, win_h)
+      let vw = vx1 - vx0
+      let vh = vy1 - vy0
+      if vw > 0.5 && vh > 0.5 {
+        seen[d.id.at] = true
+        if !target_is_occluded(tree, held, i, d.id, (vx0, vy0, vx1, vy1)) {
+          targets.push(RoomTarget::{
+            id: d.id,
+            vx0,
+            vy0,
+            vx1,
+            vy1,
+            layer: tree.over_all_of(d.id),
+            held_idx: i,
+            label: room_label(tree, d),
+          })
         }
       }
     }
     i += 1
   }
   let faults : Array[String] = []
-  let min_room = room_least(platform=self.fake.platform_id, width=self.fake.width)
+  let least = room_least(platform=self.fake.platform_id, width=win_w)
   let nt = targets.length()
-  // Rule 1 (`room:`): visible hit-target must meet minimum dimension
+  // Rule 1 (`room:`): expandable hit-room via `view::press_room` must meet `least`
   let mut a = 0
   while a < nt {
     let ta = targets[a]
     if !tree.pressed_as_drawn(ta.id) {
-      let vw = ta.vx1 - ta.vx0
-      let vh = ta.vy1 - ta.vy0
-      if vw < min_room - 0.5 || vh < min_room - 0.5 {
-        faults.push("room: \{ta.label} (\{vw}x\{vh} < \{min_room}pt)")
+      let (bx0, by0, bx1, by1) = tree.input_bounds(ta.id)
+      let edge = (
+        dmax(0.0, bx0),
+        dmax(0.0, by0),
+        dmin(win_w, bx1),
+        dmin(win_h, by1),
+      )
+      // Narrow `cut` along interactive ancestors shorter than `least`
+      let mut cx0 = edge.0
+      let mut cy0 = edge.1
+      let mut cx1 = edge.2
+      let mut cy1 = edge.3
+      if ta.held_idx >= 0 {
+        let mut p = held[ta.held_idx].1
+        while p >= 0 {
+          let anc = held[p].0
+          if tree.press_or_drag_of(anc.id) {
+            let (ax0, ay0, ax1, ay1) = clipped_visible_rect(held, p, win_w, win_h)
+            if ax1 - ax0 < least {
+              cx0 = dmax(cx0, ax0)
+              cx1 = dmin(cx1, ax1)
+            }
+            if ay1 - ay0 < least {
+              cy0 = dmax(cy0, ay0)
+              cy1 = dmin(cy1, ay1)
+            }
+          }
+          p = held[p].1
+        }
+      }
+      let cut = (cx0, cy0, cx1, cy1)
+      let (rx0, ry0, rx1, ry1) = view::press_room(ta.vx0, ta.vy0, ta.vx1, ta.vy1, cut, edge, least)
+      let rw = rx1 - rx0
+      let rh = ry1 - ry0
+      if rw < least - 0.5 || rh < least - 0.5 {
+        faults.push("room: \{ta.label} (\{rw}x\{rh} < \{least}pt)")
       }
     }
     a += 1
   }
-  // Rule 2 (`apart:`): sibling/unrelated visible hit-targets must not overlap
+  // Rule 2 (`apart:`): pairwise on drawn visible boxes in the same `over_all_of` layer
   a = 0
   while a < nt {
     let ta = targets[a]
     let mut b = a + 1
     while b < nt {
       let tb = targets[b]
-      if !tree.holds_in_order(ta.id, tb.id) && !tree.holds_in_order(tb.id, ta.id) {
+      if ta.layer == tb.layer &&
+      !tree.holds_in_order(ta.id, tb.id) &&
+      !tree.holds_in_order(tb.id, ta.id) &&
+      !rect_within(ta.vx0, ta.vy0, ta.vx1, ta.vy1, tb.vx0, tb.vy0, tb.vx1, tb.vy1) &&
+      !rect_within(tb.vx0, tb.vy0, tb.vx1, tb.vy1, ta.vx0, ta.vy0, ta.vx1, ta.vy1) {
+        let gx = dmax(tb.vx0 - ta.vx1, ta.vx0 - tb.vx1)
+        let gy = dmax(tb.vy0 - ta.vy1, ta.vy0 - tb.vy1)
         let ix0 = dmax(ta.vx0, tb.vx0)
         let iy0 = dmax(ta.vy0, tb.vy0)
         let ix1 = dmin(ta.vx1, tb.vx1)
         let iy1 = dmin(ta.vy1, tb.vy1)
         let ow = ix1 - ix0
         let oh = iy1 - iy0
-        if ow > 0.5 && oh > 0.5 && ow * oh > 1.0 {
+        if gx < -0.5 && gy < -0.5 && ow * oh > 1.0 {
           let part = (ix0, iy0, ix1, iy1)
           if !tree.covered_under(ta.id, tb.id, part) && !tree.covered_under(tb.id, ta.id, part) {
             faults.push("apart: \{ta.label} overlaps \{tb.label} (\{ow}x\{oh})")

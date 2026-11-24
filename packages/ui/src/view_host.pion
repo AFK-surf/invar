@@ -938,6 +938,10 @@ fn view_forget_inner(clear_hooks : Bool) -> Bool {
   reset_glyph_atlas()
   view_blocks_reset()
   view_pictures_reset()
+  last_damage_report.v = DamageReport::None
+  damage_report_poison.v = None
+  in_frame_looks_hook.v = None
+  view_block_poison.v = false
   if !messages_reset_checked(my_epoch) {
     replacing_app.v = prev_replacing
     return false
@@ -1016,8 +1020,15 @@ pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
   }
   primary_building_saved_slot.remove(my_epoch)
   tree.drawn_by(image_ready=image_ready_at, image_ask=image_ask_at)
-  tree.on_due(fn() { hostapi::request_frame() })
+  tree.on_due(fn() {
+    if in_tree_frame.v {
+      hostapi::request_frame_on()
+    } else {
+      hostapi::request_frame()
+    }
+  })
   tree.on_cursor(fn() { view_cursor_tell() })
+  install_tree_hooks(tree, 0, 0)
   view_app.tree = Some(tree)
   primary_view_tree.v = Some(tree)
 }
@@ -1517,6 +1528,8 @@ struct ViewBlock {
   words_start : Int
   words_end : Int
   words_square_clip : Bool
+  mono_glyph_plots : Array[Int]
+  colour_glyph_plots : Array[Int]
   inst : Array[Double]
 }
 
@@ -1559,10 +1572,79 @@ pub fn set_view_blocks_enabled(on : Bool) -> Unit {
   }
 }
 
+pub enum DamageReport {
+  Full
+  None
+  Rects(Array[(Double, Double, Double, Double)])
+}
+
+let last_damage_report : signals::Ref[DamageReport] = ref_new(DamageReport::None)
+let damage_report_poison : signals::Ref[Option[DamageReport]] = ref_new(None)
+let view_block_poison : signals::Ref[Bool] = ref_new(false)
+let in_frame_looks_hook : signals::Ref[Option[(Scene, Scene, DamageReport, Double, Double, Double, Double, Double, Double) -> Unit]] = ref_new(None)
+
+/// Return the normalized `DamageReport` captured by the last `view_frame` in the active window.
+pub fn view_last_damage_report() -> DamageReport {
+  last_damage_report.v
+}
+
+/// Test-only hook: force `view_frame` to report a poisoned `DamageReport` (`None` disables poison).
+pub fn set_damage_report_poison(p : Option[DamageReport]) -> Unit {
+  damage_report_poison.v = p
+}
+
+/// Test-only hook: force `view_blocks` to reuse stale cached blocks on cacheable nodes.
+pub fn set_view_block_poison(on : Bool) -> Unit {
+  view_block_poison.v = on
+}
+
+/// Install or clear the in-frame reference-vs-production scene & damage parity hook.
+pub fn set_in_frame_looks_hook(
+  f : Option[(Scene, Scene, DamageReport, Double, Double, Double, Double, Double, Double) -> Unit],
+) -> Unit {
+  in_frame_looks_hook.v = f
+}
+
+/// Return the current display text (respecting secret masking and IME composition) or placeholder hint
+/// for a `ui::field` node, if `id` is a field in the active window.
+pub fn field_display_or_hint(id : view::NodeId) -> Option[String] {
+  match find_tree_field(id) {
+    Some(tf) => {
+      let txt = tf.field.text_sig.untracked()
+      let comp = signals::untracked(fn() { tf.field.composed_said() })
+      if txt.length() > 0 || comp.length() > 0 {
+        Some(tf.field.editor.display_text())
+      } else {
+        Some(signals::untracked(tf.hint))
+      }
+    }
+    None => None
+  }
+}
+
+fn normalize_damage_report(
+  dirty : Array[(Double, Double, Double, Double)],
+  force_full : Bool,
+) -> DamageReport {
+  if force_full {
+    return DamageReport::Full
+  }
+  if dirty.length() == 0 {
+    return DamageReport::None
+  }
+  for r in dirty {
+    if r.2 < 0.0 || r.3 < 0.0 {
+      return DamageReport::Full
+    }
+  }
+  DamageReport::Rects(dirty.copy())
+}
+
 fn view_blocks_reset() -> Unit {
   view_blocks_state.blocks.clear()
   view_blocks_state.atlas_gen = -1
   view_blocks_state.solid = false
+  view_block_poison.v = false
 }
 
 fn view_blocks_sync_frame() -> Unit {
@@ -2053,6 +2135,7 @@ fn encode_view_magnified(
 
 fn encode_drawn_node_direct(
   scene : Scene,
+  tree_id : Int,
   d : view::Drawn,
   gd : view::GroundShape,
   node_scale : Double,
@@ -2065,6 +2148,7 @@ fn encode_drawn_node_direct(
   mag : Option[(Double, Double, Double)],
   mag_own : Int,
   shadow_out : Bool,
+  bypass_blocks~ : Bool = false,
 ) -> (Int, Int, Int, Bool, Bool) {
   let (clip_x, clip_y, clip_x1, clip_y1) = clip
   // Drawn `ns` times its laid-out size (View::scale, page zoom): Tree::drawn_held has its box and corners that size
@@ -2272,7 +2356,9 @@ fn encode_drawn_node_direct(
   // 5. Tree stream node (kind 4 with stream_tex_base + stream.id)
   match find_tree_stream(d.id) {
     Some(ts) => {
-      ts.drawn_this_frame = true
+      if !bypass_blocks {
+        ts.drawn_this_frame = true
+      }
       match ts.stream.size {
         Some((pw, ph)) if !ts.stream.closed && ts.stream.id > 0 && pw > 0 && ph > 0 => {
           let idx = scene.push_inst(
@@ -2292,13 +2378,15 @@ fn encode_drawn_node_direct(
   // 6. Tree native view node
   match find_tree_native(d.id) {
     Some(tn) => {
-      tn.drawn_this_frame = true
-      if !tn.view.closed && tn.view.id > 0 {
-        hostapi::view_place(
-          tn.view.id, d.x, d.y, d.w, d.h,
-          clip_x, clip_y, clip_x1, clip_y1,
-          rc.0, rc.1, rc.2, rc.3, true,
-        )
+      if !bypass_blocks {
+        tn.drawn_this_frame = true
+        if !tn.view.closed && tn.view.id > 0 {
+          hostapi::view_place(
+            tn.view.id, d.x, d.y, d.w, d.h,
+            clip_x, clip_y, clip_x1, clip_y1,
+            rc.0, rc.1, rc.2, rc.3, true,
+          )
+        }
       }
     }
     None => ()
@@ -2307,18 +2395,20 @@ fn encode_drawn_node_direct(
   // 6b. Tree native terminal node
   match find_tree_terminal(d.id) {
     Some(tt) => {
-      tt.drawn_this_frame = true
-      if !tt.term.closed && tt.term.id > 0 {
-        let cell_w = tt.cell_w * ns
-        let cell_h = tt.cell_h * ns
-        let cols_f = d.w / cell_w
-        let rows_f = d.h / cell_h
-        let cols = if cols_f >= 1.0 { cols_f.to_int() } else { 1 }
-        let rows = if rows_f >= 1.0 { rows_f.to_int() } else { 1 }
-        let cw_px = if cell_w * scale >= 1.0 { (cell_w * scale).to_int() } else { 1 }
-        let ch_px = if cell_h * scale >= 1.0 { (cell_h * scale).to_int() } else { 1 }
-        tt.term.resize(cols, rows, cw_px, ch_px)
-        let _ = tt.term.frame(full=!tt.term.visible)
+      if !bypass_blocks {
+        tt.drawn_this_frame = true
+        if !tt.term.closed && tt.term.id > 0 {
+          let cell_w = tt.cell_w * ns
+          let cell_h = tt.cell_h * ns
+          let cols_f = d.w / cell_w
+          let rows_f = d.h / cell_h
+          let cols = if cols_f >= 1.0 { cols_f.to_int() } else { 1 }
+          let rows = if rows_f >= 1.0 { rows_f.to_int() } else { 1 }
+          let cw_px = if cell_w * scale >= 1.0 { (cell_w * scale).to_int() } else { 1 }
+          let ch_px = if cell_h * scale >= 1.0 { (cell_h * scale).to_int() } else { 1 }
+          tt.term.resize(cols, rows, cw_px, ch_px)
+          let _ = tt.term.frame(full=!tt.term.visible)
+        }
       }
     }
     None => ()
@@ -2337,7 +2427,9 @@ fn encode_drawn_node_direct(
   // 7b. Vector shapes + vector pictures (kind = 11.0 bands + kind = 12.0 frame-tail segment packs)
   let pic_shapes : Array[paint::Shape] = match d.picture {
     None => {
-      let _ = view_pictures.map.remove(d.id)
+      if !bypass_blocks {
+        let _ = view_pictures.map.remove(d.id)
+      }
       []
     }
     Some(p) => {
@@ -2420,7 +2512,7 @@ fn encode_drawn_node_direct(
   let words_end_idx = scene.ninst
 
   // 10. Focused field caret indicator (true multi-line layout coordinates via packages/editor)
-  match find_tree_field(d.id) {
+  match find_tree_field_in(tree_id, d.id) {
     Some(tf) => {
       tf.field.last_win_x = d.x
       tf.field.last_win_y = d.y
@@ -2445,8 +2537,10 @@ fn encode_drawn_node_direct(
           0.0, 0.0, 0.0, 0.0,
           clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
         )
-        hostapi::ime_action(tf.field.ime_kind())
-        hostapi::set_ime(true, cx, cy, caret_w, ch, txt, utf8_to_utf16_off(txt, sel_lo), utf8_to_utf16_off(txt, sel_hi))
+        if !bypass_blocks {
+          hostapi::ime_action(tf.field.ime_kind())
+          hostapi::set_ime(true, cx, cy, caret_w, ch, txt, utf8_to_utf16_off(txt, sel_lo), utf8_to_utf16_off(txt, sel_hi))
+        }
       }
     }
     None => ()
@@ -2496,6 +2590,7 @@ fn encode_drawn_node_direct(
 
 fn encode_drawn_node(
   scene : Scene,
+  tree_id : Int,
   d : view::Drawn,
   gd : view::GroundShape,
   node_scale : Double,
@@ -2508,8 +2603,29 @@ fn encode_drawn_node(
   mag : Option[(Double, Double, Double)],
   mag_own : Int,
   shadow_out : Bool,
+  bypass_blocks~ : Bool = false,
 ) -> Unit {
   if d.alpha <= 0.0 || (d.w <= 0.0 && gd.dw <= 0.0) || (d.h <= 0.0 && gd.dh <= 0.0) {
+    return
+  }
+  if bypass_blocks {
+    let _ = encode_drawn_node_direct(
+      scene,
+      tree_id,
+      d,
+      gd,
+      node_scale,
+      frame_no,
+      now,
+      scale,
+      clip,
+      rc,
+      deferred_shadows,
+      mag,
+      mag_own,
+      shadow_out,
+      bypass_blocks=true,
+    )
     return
   }
   let cacheable = view_blocks_state.enabled &&
@@ -2522,14 +2638,14 @@ fn encode_drawn_node(
   d.runs.length() == 0 &&
   d.blur <= 0.0 &&
   scene.ink_r <= 0.0 &&
-  find_tree_field(d.id).is_none() &&
+  find_tree_field_in(tree_id, d.id).is_none() &&
   find_tree_stream(d.id).is_none() &&
   find_tree_native(d.id).is_none() &&
   find_tree_terminal(d.id).is_none()
   if !cacheable {
     let before = scene.ninst
     let _ = encode_drawn_node_direct(
-      scene, d, gd, node_scale, frame_no, now, scale, clip, rc, deferred_shadows, mag, mag_own, shadow_out,
+      scene, tree_id, d, gd, node_scale, frame_no, now, scale, clip, rc, deferred_shadows, mag, mag_own, shadow_out,
     )
     view_blocks_state.work.made = view_blocks_state.work.made + 1
     view_blocks_state.work.handed = view_blocks_state.work.handed + (scene.ninst - before)
@@ -2550,7 +2666,10 @@ fn encode_drawn_node(
     (0.0, 0.0)
   }
   match blocks[slot] {
-    Some(blk) if view_block_matches(blk, d, gd, eff_font_size, node_scale, scale, sub_x, sub_y, atlas_gen, shadow_out) => {
+    Some(blk) if view_block_poison.v || view_block_matches(blk, d, gd, eff_font_size, node_scale, scale, sub_x, sub_y, atlas_gen, shadow_out) => {
+      if blk.atlas_gen == atlas_gen {
+        touch_block_glyph_plots(blk.mono_glyph_plots, blk.colour_glyph_plots)
+      }
       compose_view_block(scene, blk, d, gd, node_scale, clip, rc)
       view_blocks_state.work.copied = view_blocks_state.work.copied + 1
       view_blocks_state.work.handed = view_blocks_state.work.handed + blk.ninst
@@ -2562,8 +2681,15 @@ fn encode_drawn_node(
   scratch.clear(scene.width, scene.height, scale)
   let d_local = view::Drawn::{ ..d, x: sub_x, y: sub_y, turn: 0.0 }
   let empty_deferred : Array[DeferredGlassShadow] = []
+  let prev_block_glyph_missed = block_glyph_missed.v
+  let prev_block_glyph_plots = block_glyph_plots.v
+  let mono_plots : Array[Int] = []
+  let col_plots : Array[Int] = []
+  block_glyph_missed.v = false
+  block_glyph_plots.v = Some((mono_plots, col_plots))
   let (after_ground_n, words_start, words_end, words_square_clip, image_settled) = encode_drawn_node_direct(
     scratch,
+    tree_id,
     d_local,
     gd,
     node_scale,
@@ -2577,6 +2703,9 @@ fn encode_drawn_node(
     0,
     shadow_out,
   )
+  let glyphs_settled = !block_glyph_missed.v
+  block_glyph_missed.v = prev_block_glyph_missed
+  block_glyph_plots.v = prev_block_glyph_plots
   let blk_len = scratch.ninst * inst_size
   let blk_inst : Array[Double] = []
   let mut bi = 0
@@ -2635,10 +2764,13 @@ fn encode_drawn_node(
     words_start,
     words_end,
     words_square_clip,
+    mono_glyph_plots: mono_plots,
+    colour_glyph_plots: col_plots,
     inst: blk_inst,
   }
-  // Do not cache a pending (not-yet-decoded) image block so the next frame retries primary decode.
-  if image_settled {
+  // Do not cache a pending (not-yet-decoded) image block or a block that dropped glyphs due to a full atlas,
+  // so the next frame retries decode / glyph placement while keeping same-frame reference bypass zero-write.
+  if image_settled && glyphs_settled {
     blocks[slot] = Some(blk)
   } else {
     blocks[slot] = None
@@ -2771,15 +2903,29 @@ fn pop_blur_frame(
   expand_blur_stack(scene, blur_stack, pop_idx, pop_idx + 1)
 }
 
-fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Double, scale : Double) -> Unit {
-  let atlas_was_init = glyph_state.initialized
-  ensure_glyph_atlas(scale)
-  glyph_state.mono.next_frame()
-  glyph_state.colour.next_frame()
-  if !atlas_was_init {
-    view_blocks_reset()
+fn encode_held_tree(
+  scene : Scene,
+  tree : view::Tree,
+  frame_no : Int,
+  now : Double,
+  scale : Double,
+  bypass_blocks~ : Bool = false,
+) -> Unit {
+  let prev_bypass_glyph = bypass_glyph_atlas_writes.v
+  if bypass_blocks {
+    bypass_glyph_atlas_writes.v = true
+  } else {
+    let atlas_was_init = glyph_state.initialized
+    ensure_glyph_atlas(scale)
+    frame_atlas_rejected_glyphs.clear()
+    glyph_state.mono.next_frame()
+    glyph_state.colour.next_frame()
+    if !atlas_was_init {
+      view_blocks_reset()
+    }
+    view_blocks_sync_frame()
   }
-  view_blocks_sync_frame()
+  let tree_id = tree.phys_id()
   let scales : Array[Double] = []
   let held = tree.drawn_held(scales=scales)
   let n = held.length()
@@ -2893,7 +3039,23 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
     let mag = tree.magnifies_of(d.id)
     let shadow_out = tree.shadow_outside_of(d.id)
     let k0 = scene.ninst
-    encode_drawn_node(scene, d, gd, node_scale, frame_no, now, scale, draw_clip, draw_rc, deferred_shadows, mag, k0, shadow_out)
+    encode_drawn_node(
+      scene,
+      tree_id,
+      d,
+      gd,
+      node_scale,
+      frame_no,
+      now,
+      scale,
+      draw_clip,
+      draw_rc,
+      deferred_shadows,
+      mag,
+      k0,
+      shadow_out,
+      bypass_blocks=bypass_blocks,
+    )
     if !glass_solid() {
       match d.glass {
         Some(gl) if gl.liquid && gl.layer > 0 && gl.strength > 0.001 => {
@@ -3064,6 +3226,7 @@ fn encode_held_tree(scene : Scene, tree : view::Tree, frame_no : Int, now : Doub
   if glass_slots.length() >= 2 {
     scene.merge_liquid_layers(n0, glass_slots)
   }
+  bypass_glyph_atlas_writes.v = prev_bypass_glyph
 }
 
 /// Encode `tree.drawn_held()` into a standalone 60-Double `Scene` using the currently active `hostapi`
@@ -3116,6 +3279,8 @@ fn scene_hash(scene : Scene) -> Int64 {
   h
 }
 
+let in_tree_frame : signals::Ref[Bool] = ref_new(false)
+
 /// Execute one pure-tree frame: poll streams, update signals/layout, encode scene, compute damage, present, sync a11y.
 /// Returns true if the rendered scene changed compared to the previous frame.
 pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool {
@@ -3147,8 +3312,15 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   if atlas_changed {
     tree.words_again()
   }
+  let prev_in_tree_frame = in_tree_frame.v
+  in_tree_frame.v = true
   let _ = tree.frame(w, h, now=now)
+  in_tree_frame.v = prev_in_tree_frame
   view_cursor_tell()
+  if view_app.frame_no == 1 {
+    back_enabled_sent.v = None
+  }
+  sync_back_enabled(tree)
   let t1 = work_clock_now()
   let la = glass_light_angle_now()
   let light_changed = view_app.frame_no > 1 && (la - view_app.last_light_angle).abs() > 1.0e-6
@@ -3159,6 +3331,10 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
     Some(painter) => painter(view_app.scene, w, h, scale, now)
     None => ()
   }
+  let ref_scene_opt : Option[Scene] = match in_frame_looks_hook.v {
+    Some(_) => Some(view_app.scene.copy())
+    None => None
+  }
   encode_held_tree(view_app.scene, tree, view_app.frame_no, now, scale)
   view_app.scene.emit_segs()
   let t2 = work_clock_now()
@@ -3168,6 +3344,10 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   let bg_b = ((bg >> 8) & 0xFFL).to_double() / 255.0
   if view_app.fast_present {
     view_app.scene.dirty_count = 0
+    last_damage_report.v = match damage_report_poison.v {
+      Some(p) => p
+      None => DamageReport::Full
+    }
     hostapi::present(view_app.scene.inst, view_app.scene.ninst, bg_r, bg_g, bg_b)
     let t3 = work_clock_now()
     view_app.scene.perf.layout_ms = dmax(0.0, t1 - t0)
@@ -3183,11 +3363,23 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
     natives_frame_end()
     terminals_frame_end()
     shots_after_present(now, bg_r, bg_g, bg_b)
+    match (in_frame_looks_hook.v, ref_scene_opt) {
+      (Some(hook), Some(ref_scene)) => {
+        encode_held_tree(ref_scene, tree, view_app.frame_no, now, scale, bypass_blocks=true)
+        ref_scene.emit_segs()
+        hook(view_app.scene, ref_scene, last_damage_report.v, w, h, scale, bg_r, bg_g, bg_b)
+      }
+      _ => ()
+    }
     frame_running.v = false
     drain_after_frame()
     return true
   }
   let dirty = view_app.dmg.next(view_app.scene.inst, view_app.scene.ninst, w, h, scale, bg_r, bg_g, bg_b)
+  last_damage_report.v = match damage_report_poison.v {
+    Some(p) => p
+    None => normalize_damage_report(dirty, view_app.frame_no == 1 || light_changed || atlas_changed)
+  }
   if light_changed || atlas_changed {
     hostapi::render_dirty(0.0, 0.0, -1.0, -1.0)
   } else if dirty.length() == 0 {
@@ -3215,6 +3407,14 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   natives_frame_end()
   terminals_frame_end()
   shots_after_present(now, bg_r, bg_g, bg_b)
+  match (in_frame_looks_hook.v, ref_scene_opt) {
+    (Some(hook), Some(ref_scene)) => {
+      encode_held_tree(ref_scene, tree, view_app.frame_no, now, scale, bypass_blocks=true)
+      ref_scene.emit_segs()
+      hook(view_app.scene, ref_scene, last_damage_report.v, w, h, scale, bg_r, bg_g, bg_b)
+    }
+    _ => ()
+  }
   frame_running.v = false
   drain_after_frame()
   view_app.frame_no == 1 || dirty.length() > 0 || light_changed || atlas_changed
@@ -3874,6 +4074,122 @@ pub fn view_host_pointer(host_kind : Int, x : Double, y : Double, btn : Int, now
   }
 }
 
+/// Dispatch a 4-argument host Back gesture/event (`kind`: 0=Began, 1=Moved, 2=Commit/Standalone, 3=Cancel)
+/// on the host's currently selected window (`hostapi::window_current()`).
+pub fn view_back(kind : Int, x : Double, progress : Double, edge : Int) -> Unit {
+  let wid = hostapi::window_current()
+  in_window(wid, fn() -> Unit {
+    let tree = match window_tree_of(wid) {
+      Some(t) => t
+      None => return
+    }
+    let at = hostapi::now()
+    let (win_w, _) = signals::untracked(fn() { tree_window_size_sig.v.get() })
+    let rel_x_for = fn(owner : view::NodeId) -> Double {
+      if edge == 1 {
+        let taker_right = match tree.drawn_of(owner) {
+          Some(d) => d.x + d.w
+          None => win_w
+        }
+        taker_right - x
+      } else {
+        let taker_left = match tree.drawn_of(owner) {
+          Some(d) => d.x
+          None => 0.0
+        }
+        x - taker_left
+      }
+    }
+    back_progress_sig.v.set(progress)
+    if kind == 0 {
+      match back_gesture_state.v {
+        BackGestureState::Active(prev_owner) => {
+          back_gesture_seq.v = back_gesture_seq.v + 1
+          let cancel_seq = back_gesture_seq.v
+          back_gesture_state.v = BackGestureState::Idle
+          let _ = tree.back_step(prev_owner, view::BackStep::CalledOff, at)
+          if back_gesture_seq.v != cancel_seq {
+            sync_back_enabled(tree)
+            return
+          }
+        }
+        _ => ()
+      }
+      match tree.back_taker() {
+        Some(owner) => {
+          let rx = rel_x_for(owner)
+          back_gesture_seq.v = back_gesture_seq.v + 1
+          let my_seq = back_gesture_seq.v
+          back_gesture_state.v = BackGestureState::Active(owner)
+          let ok = tree.back_step(owner, view::BackStep::Began(rx, at), at)
+          if back_gesture_seq.v == my_seq && !ok {
+            back_gesture_state.v = BackGestureState::CancelledByFramework
+          }
+        }
+        None => {
+          back_gesture_seq.v = back_gesture_seq.v + 1
+          back_gesture_state.v = BackGestureState::CancelledByFramework
+        }
+      }
+      sync_back_enabled(tree)
+    } else if kind == 1 {
+      match back_gesture_state.v {
+        BackGestureState::Active(owner) => {
+          let rx = rel_x_for(owner)
+          if !tree.back_step(owner, view::BackStep::Moved(rx, at), at) {
+            back_gesture_seq.v = back_gesture_seq.v + 1
+            back_gesture_state.v = BackGestureState::CancelledByFramework
+            let _ = tree.back_step(owner, view::BackStep::CalledOff, at)
+            sync_back_enabled(tree)
+          }
+        }
+        _ => ()
+      }
+    } else if kind == 2 {
+      match back_gesture_state.v {
+        BackGestureState::Active(owner) => {
+          back_gesture_seq.v = back_gesture_seq.v + 1
+          back_gesture_state.v = BackGestureState::Idle
+          back_progress_sig.v.set(0.0)
+          let _ = tree.back_done(owner, at)
+          sync_back_enabled(tree)
+        }
+        BackGestureState::Idle => {
+          back_progress_sig.v.set(0.0)
+          match tree.back_taker() {
+            Some(taker) => {
+              let _ = tree.back_step(taker, view::BackStep::Back, at)
+            }
+            None => ()
+          }
+          sync_back_enabled(tree)
+        }
+        BackGestureState::CancelledByFramework => {
+          back_gesture_state.v = BackGestureState::Idle
+          back_progress_sig.v.set(0.0)
+          sync_back_enabled(tree)
+        }
+      }
+    } else {
+      match back_gesture_state.v {
+        BackGestureState::Active(owner) => {
+          back_gesture_seq.v = back_gesture_seq.v + 1
+          back_gesture_state.v = BackGestureState::Idle
+          back_progress_sig.v.set(0.0)
+          let _ = tree.back_step(owner, view::BackStep::CalledOff, at)
+          sync_back_enabled(tree)
+        }
+        BackGestureState::CancelledByFramework => {
+          back_gesture_state.v = BackGestureState::Idle
+          back_progress_sig.v.set(0.0)
+          sync_back_enabled(tree)
+        }
+        BackGestureState::Idle => ()
+      }
+    }
+  })
+}
+
 /// Open a pure-tree window and run `tree` until it closes.
 /// `transitions_only` defaults to true so changes outside `view::transition` settle immediately.
 pub fn run(
@@ -3895,10 +4211,17 @@ pub fn run(
     Some(tf) => set_view_app(made, theme=tf)
     None => set_view_app(made)
   }
+  hostapi::set_back(view_back)
   // A host that draws only when asked (Windows, Linux) hears of every change marked in the tree (an input's, a
   // signal's, a moment come), and after each frame of what is moving or due next.
   match view_app.tree {
-    Some(tree) => tree.on_due(fn() { hostapi::request_frame() })
+    Some(tree) => tree.on_due(fn() {
+      if in_tree_frame.v {
+        hostapi::request_frame_on()
+      } else {
+        hostapi::request_frame()
+      }
+    })
     None => ()
   }
   // Deliver asynchronous host events between frames (MB_OUTSIDE_IMAGE = 1, MB_OUTSIDE_POSTED = 11, MB_OUTSIDE_WINDOW = 17).

@@ -83,6 +83,264 @@ let tree_narrow_enabled_sig : signals::Ref[signals::Signal[Bool]] = ref_new(
 )
 let over_scrim_floor_stack : signals::Ref[Array[(Int, (Double, Double) -> Option[(Double, Double)])]] = ref_new([])
 
+enum BackGestureState {
+  Idle
+  Active(view::NodeId)
+  CancelledByFramework
+}
+
+let back_gesture_state : signals::Ref[BackGestureState] = ref_new(BackGestureState::Idle)
+let back_gesture_seq : signals::Ref[Int] = ref_new(0)
+let back_enabled_sent : signals::Ref[Option[Bool]] = ref_new(None)
+let back_progress_sig : signals::Ref[signals::Signal[Double]] = ref_new(signals::signal(0.0))
+let layer_prev_focus : signals::Ref[Array[(view::NodeId, Option[view::NodeId], Bool, Option[view::Opener])]] = ref_new([])
+
+/// Current reactive back-gesture progress (`0.0..1.0`) for the active window.
+pub fn back_progress_now() -> Double {
+  back_progress_sig.v.get()
+}
+
+fn sync_back_enabled(tree : view::Tree) -> Unit {
+  let active_or_pending = !(back_gesture_state.v is BackGestureState::Idle)
+  let want = tree.back_taker().is_some() || active_or_pending
+  let changed = match back_enabled_sent.v {
+    Some(prev) => prev != want
+    None => true
+  }
+  if !changed {
+    return
+  }
+  back_enabled_sent.v = Some(want)
+  if hostapi::window_current() == window_now.v {
+    hostapi::back_enabled(want)
+  } else {
+    hostapi::back_enabled_for(window_now.v, want)
+  }
+}
+
+fn run_for_window(wid : Int, gen : Int, f : () -> Unit) -> Unit {
+  if window_switching.v || view::tree_disposing() {
+    return
+  }
+  if wid > 0 && !window_gen_is(wid, gen) {
+    return
+  }
+  if window_now.v == wid {
+    f()
+  } else {
+    in_window(wid, f)
+  }
+}
+
+fn first_focusable_in_layer(tree : view::Tree, layer : view::NodeId) -> Option[view::NodeId] {
+  let pred = tree.opens_first_takes(layer)
+  for fa in tree.focus_order() {
+    if fa.id != layer && tree.holds_in_order(layer, fa.id) && tree.focus_back_takes(fa.id) {
+      let ok = match pred {
+        Some(p) => match tree.said_of(fa.id) {
+          Some(s) => p(s)
+          None => false
+        }
+        None => true
+      }
+      if ok {
+        return Some(fa.id)
+      }
+    }
+  }
+  if tree.focus_back_takes(layer) {
+    Some(layer)
+  } else {
+    None
+  }
+}
+
+fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
+  tree.on_layers_focus(fn(gone : Array[view::NodeId], opened : Array[(view::NodeId, Option[view::NodeId])]) -> Unit {
+    run_for_window(wid, gen, fn() -> Unit {
+      let (cur_focus, cur_vis) = tree.focused_now()
+      let mut restore : Option[(Option[view::NodeId], Bool)] = None
+      if gone.length() > 0 {
+        let need_restore = match cur_focus {
+          None => true
+          Some(cf) => {
+            if !tree.focus_back_takes(cf) {
+              true
+            } else {
+              let mut hit = false
+              for l in gone {
+                if cf == l || tree.holds_in_order(l, cf) {
+                  hit = true
+                  break
+                }
+              }
+              hit
+            }
+          }
+        }
+        // Pop all entries matching `gone` from top to bottom (newest -> oldest).
+        // If an open layer `u` above a closed layer `g` had saved `prev_f` inside `g`, `u` inherits `g`'s `(prev_f, prev_vis)`.
+        let popped : Array[(view::NodeId, Option[view::NodeId], Bool, Option[view::Opener])] = []
+        let mut idx = layer_prev_focus.v.length() - 1
+        while idx >= 0 {
+          let entry = layer_prev_focus.v[idx]
+          if gone.contains(entry.0) {
+            array_remove_at(layer_prev_focus.v, idx)
+            let mut k = idx
+            while k < layer_prev_focus.v.length() {
+              let u = layer_prev_focus.v[k]
+              match u.1 {
+                Some(pf) if pf == entry.0 || tree.holds_in_order(entry.0, pf) => {
+                  layer_prev_focus.v[k] = (u.0, entry.1, entry.2, u.3)
+                }
+                _ => ()
+              }
+              k += 1
+            }
+            popped.push(entry)
+          }
+          idx -= 1
+        }
+        if need_restore && popped.length() > 0 {
+          for entry in popped {
+            let (layer, prev_f, prev_vis, saved_opener) = entry
+            let opener = match tree.opener_of(layer) {
+              Some(o) => Some(o)
+              None => saved_opener
+            }
+            let target_opt : Option[view::NodeId] = match opener {
+              Some(view::Opener::ByNode(oid)) if tree.focus_back_takes(oid) => Some(oid)
+              _ => match prev_f {
+                Some(pf) if tree.focus_back_takes(pf) => Some(pf)
+                _ => None
+              }
+            }
+            match target_opt {
+              Some(tid) => {
+                restore = Some((Some(tid), prev_vis || cur_vis))
+                break
+              }
+              None => ()
+            }
+          }
+          if restore is None {
+            // If an underlying layer is still open (e.g. two modals opened in the same frame and the inner closed),
+            // focus the topmost remaining open layer's first focusable target.
+            let mut rem_idx = layer_prev_focus.v.length() - 1
+            while rem_idx >= 0 {
+              let rem_layer = layer_prev_focus.v[rem_idx].0
+              match first_focusable_in_layer(tree, rem_layer) {
+                Some(fid) => {
+                  restore = Some((Some(fid), cur_vis))
+                  break
+                }
+                None => ()
+              }
+              rem_idx -= 1
+            }
+          }
+          if restore is None {
+            restore = Some((None, false))
+          }
+        }
+      }
+      if opened.length() == 0 {
+        match restore {
+          Some((Some(tid), vis)) => {
+            if !tree.focus_to(Some(tid), visible=vis) {
+              let mut moved = false
+              let mut rem_idx = layer_prev_focus.v.length() - 1
+              while rem_idx >= 0 {
+                let rem_layer = layer_prev_focus.v[rem_idx].0
+                match first_focusable_in_layer(tree, rem_layer) {
+                  Some(fid) => {
+                    if tree.focus_to(Some(fid), visible=vis) {
+                      moved = true
+                      break
+                    }
+                  }
+                  None => ()
+                }
+                rem_idx -= 1
+              }
+              if !moved {
+                let _ = tree.focus_to(None, visible=false)
+              }
+            }
+          }
+          Some((None, _)) => {
+            let _ = tree.focus_to(None, visible=false)
+          }
+          None => ()
+        }
+        return
+      }
+      let (base_focus, base_vis) = match restore {
+        Some(pair) => pair
+        None => (cur_focus, cur_vis)
+      }
+      let mut running_prev = base_focus
+      let mut top_target : Option[view::NodeId] = None
+      for o in opened {
+        let (layer, target_opt) = o
+        let mut k = layer_prev_focus.v.length() - 1
+        while k >= 0 {
+          if layer_prev_focus.v[k].0 == layer {
+            array_remove_at(layer_prev_focus.v, k)
+          }
+          k -= 1
+        }
+        let op = tree.opener_of(layer)
+        layer_prev_focus.v.push((layer, running_prev, base_vis, op))
+        let resolved : Option[view::NodeId] = match target_opt {
+          Some(target) =>
+            if tree.opens_first(layer) {
+              let picked = match tree.opens_first_takes(layer) {
+                Some(p) => tree.first_focusable_in(layer, takes=p)
+                None => tree.first_focusable_in(layer)
+              }
+              match picked {
+                Some(fid) => Some(fid)
+                None => if tree.keys_own(target) && tree.focus_back_takes(target) { Some(target) } else { None }
+              }
+            } else if tree.keys_own(target) && tree.focus_back_takes(target) {
+              Some(target)
+            } else {
+              None
+            }
+          None => None
+        }
+        match resolved {
+          Some(t) => {
+            running_prev = Some(t)
+            top_target = Some(t)
+          }
+          None => ()
+        }
+      }
+      match top_target {
+        Some(t) => {
+          let _ = tree.focus_to(Some(t), visible=base_vis)
+        }
+        None => ()
+      }
+    })
+  })
+}
+
+fn install_tree_hooks(tree : view::Tree, wid : Int, gen : Int) -> Unit {
+  tree.press_least(fn() {
+    let (rw, _) = signals::untracked(fn() { tree.room_signal().get() })
+    let w = if rw > 0.0 { rw } else { signals::untracked(fn() { tree_window_size_sig.v.get() }).0 }
+    room_least(platform=platform(), width=w)
+  })
+  install_tree_layers_focus(tree, wid, gen)
+  tree.on_modals(fn() {
+    run_for_window(wid, gen, fn() -> Unit { sync_back_enabled(tree) })
+  })
+  sync_back_enabled(tree)
+}
+
 struct UiCtxSnapshot {
   logical : Option[(Int, Int)]
   win_size : signals::Signal[(Double, Double)]
@@ -143,6 +401,12 @@ fn snapshot_ui_builtin_slot_detached() -> (() -> Unit) {
   let saved_narrow_below = signals::signal(tree_narrow_below_sig.v.untracked())
   let saved_narrow_enabled = signals::signal(tree_narrow_enabled_sig.v.untracked())
   let saved_floor_stack = over_scrim_floor_stack.v.copy()
+  let saved_back_state = back_gesture_state.v
+  let saved_back_seq = 0
+  let saved_back_sent : Option[Bool] = None
+  let saved_back_progress = signals::signal(back_progress_sig.v.untracked())
+  let saved_layer_focus = layer_prev_focus.v.copy()
+  let saved_damage_report = last_damage_report.v
   let saved_tree : Option[view::Tree] = None
   let saved_scene = Scene::new()
   let saved_dmg = damage::Damage::new()
@@ -167,6 +431,11 @@ fn snapshot_ui_builtin_slot_detached() -> (() -> Unit) {
   let saved_light_angle = view_app.last_light_angle
   let saved_atlas_gen = view_app.last_atlas_gen
   let saved_shown_cursor = view_app.shown_cursor
+  let saved_present_hash = 0L
+  let saved_blocks : Array[Option[ViewBlock]] = []
+  let saved_blocks_gen = -1
+  let saved_blocks_solid = false
+  let saved_pictures : Map[view::NodeId, CachedPicture] = Map::new()
   fn() {
     tree_theme_fn.v = saved_theme_fn
     tree_theme_fallback.v = saved_theme_fb
@@ -182,6 +451,12 @@ fn snapshot_ui_builtin_slot_detached() -> (() -> Unit) {
     tree_narrow_below_sig.v = saved_narrow_below
     tree_narrow_enabled_sig.v = saved_narrow_enabled
     over_scrim_floor_stack.v = saved_floor_stack
+    back_gesture_state.v = saved_back_state
+    back_gesture_seq.v = saved_back_seq
+    back_enabled_sent.v = saved_back_sent
+    back_progress_sig.v = saved_back_progress
+    layer_prev_focus.v = saved_layer_focus
+    last_damage_report.v = saved_damage_report
     view_app.tree = saved_tree
     view_app.scene = saved_scene
     view_app.dmg = saved_dmg
@@ -206,6 +481,181 @@ fn snapshot_ui_builtin_slot_detached() -> (() -> Unit) {
     view_app.last_light_angle = saved_light_angle
     view_app.last_atlas_gen = saved_atlas_gen
     view_app.shown_cursor = saved_shown_cursor
+    view_app.last_present_hash = saved_present_hash
+    view_blocks_state.blocks = saved_blocks
+    view_blocks_state.atlas_gen = saved_blocks_gen
+    view_blocks_state.solid = saved_blocks_solid
+    view_pictures.map = saved_pictures
+  }
+}
+
+fn take_ui_builtin_slot() -> (() -> Unit) {
+  let saved_theme_fn = tree_theme_fn.v
+  let saved_theme_fb = tree_theme_fallback.v
+  let saved_corner = tree_window_corner.v
+  let saved_zoom = tree_window_zoom.v
+  let saved_glass = glass_forced_said.v
+  let saved_frost = glass_frost_said.v
+  let saved_field = focused_field_ref.v
+  let saved_inset = inset_said.v
+  let saved_zoomed = zoomed_said.v
+  let saved_snap = snap_said.v
+  let saved_win_size = tree_window_size_sig.v
+  let saved_narrow_below = tree_narrow_below_sig.v
+  let saved_narrow_enabled = tree_narrow_enabled_sig.v
+  let saved_floor_stack = over_scrim_floor_stack.v
+  let saved_back_state = back_gesture_state.v
+  let saved_back_seq = back_gesture_seq.v
+  let saved_back_sent = back_enabled_sent.v
+  let saved_back_progress = back_progress_sig.v
+  let saved_layer_focus = layer_prev_focus.v
+  let saved_damage_report = last_damage_report.v
+  let saved_tree = view_app.tree
+  let saved_scene = view_app.scene
+  let saved_dmg = view_app.dmg
+  let saved_a11y = view_app.a11y
+  let saved_frame_no = view_app.frame_no
+  let saved_last_w = view_app.last_w
+  let saved_last_h = view_app.last_h
+  let saved_last_scale = view_app.last_scale
+  let saved_ptr_x = view_app.pointer_x
+  let saved_ptr_y = view_app.pointer_y
+  let saved_press_x = view_app.press_x
+  let saved_press_y = view_app.press_y
+  let saved_press_down = view_app.press_down
+  let saved_pressed_node = view_app.pressed_node
+  let saved_dragging_node = view_app.dragging_node
+  let saved_claim_chain = view_app.claim_chain
+  let saved_press_events = view_app.press_events
+  let saved_down2 = view_app.down2
+  let saved_touch0 = view_app.active_touch_id
+  let saved_touch1 = view_app.secondary_touch_id
+  let saved_wheel_phase = view_app.last_wheel_phase
+  let saved_light_angle = view_app.last_light_angle
+  let saved_atlas_gen = view_app.last_atlas_gen
+  let saved_shown_cursor = view_app.shown_cursor
+  let saved_present_hash = view_app.last_present_hash
+  let saved_blocks = view_blocks_state.blocks
+  let saved_blocks_gen = view_blocks_state.atlas_gen
+  let saved_blocks_solid = view_blocks_state.solid
+  let saved_pictures = view_pictures.map
+  fn() {
+    tree_theme_fn.v = saved_theme_fn
+    tree_theme_fallback.v = saved_theme_fb
+    tree_window_corner.v = saved_corner
+    tree_window_zoom.v = saved_zoom
+    glass_forced_said.v = saved_glass
+    glass_frost_said.v = saved_frost
+    focused_field_ref.v = saved_field
+    inset_said.v = saved_inset
+    zoomed_said.v = saved_zoomed
+    snap_said.v = saved_snap
+    tree_window_size_sig.v = saved_win_size
+    tree_narrow_below_sig.v = saved_narrow_below
+    tree_narrow_enabled_sig.v = saved_narrow_enabled
+    over_scrim_floor_stack.v = saved_floor_stack
+    back_gesture_state.v = saved_back_state
+    back_gesture_seq.v = saved_back_seq
+    back_enabled_sent.v = saved_back_sent
+    back_progress_sig.v = saved_back_progress
+    layer_prev_focus.v = saved_layer_focus
+    last_damage_report.v = saved_damage_report
+    view_app.tree = saved_tree
+    view_app.scene = saved_scene
+    view_app.dmg = saved_dmg
+    view_app.a11y = saved_a11y
+    view_app.frame_no = saved_frame_no
+    view_app.last_w = saved_last_w
+    view_app.last_h = saved_last_h
+    view_app.last_scale = saved_last_scale
+    view_app.pointer_x = saved_ptr_x
+    view_app.pointer_y = saved_ptr_y
+    view_app.press_x = saved_press_x
+    view_app.press_y = saved_press_y
+    view_app.press_down = saved_press_down
+    view_app.pressed_node = saved_pressed_node
+    view_app.dragging_node = saved_dragging_node
+    view_app.claim_chain = saved_claim_chain
+    view_app.press_events = saved_press_events
+    view_app.down2 = saved_down2
+    view_app.active_touch_id = saved_touch0
+    view_app.secondary_touch_id = saved_touch1
+    view_app.last_wheel_phase = saved_wheel_phase
+    view_app.last_light_angle = saved_light_angle
+    view_app.last_atlas_gen = saved_atlas_gen
+    view_app.shown_cursor = saved_shown_cursor
+    view_app.last_present_hash = saved_present_hash
+    view_blocks_state.blocks = saved_blocks
+    view_blocks_state.atlas_gen = saved_blocks_gen
+    view_blocks_state.solid = saved_blocks_solid
+    view_pictures.map = saved_pictures
+  }
+}
+
+fn fresh_ui_builtin_slot() -> Unit {
+  tree_theme_fn.v = signals::signal_ref(None)
+  tree_theme_fallback.v = signals::signal_ref(Theme::light())
+  tree_window_corner.v = signals::signal(0.0)
+  tree_window_zoom.v = signals::signal(1.0)
+  glass_forced_said.v = signals::signal(-1)
+  glass_frost_said.v = signals::signal(0.0)
+  focused_field_ref.v = None
+  inset_said.v = inset_said_new()
+  zoomed_said.v = zoomed_said_new()
+  snap_said.v = snap_said_new()
+  tree_window_size_sig.v = signals::signal_by((0.0, 0.0), pair_dd_eq)
+  tree_narrow_below_sig.v = signals::signal(700.0)
+  tree_narrow_enabled_sig.v = signals::signal(false)
+  over_scrim_floor_stack.v = []
+  back_gesture_state.v = BackGestureState::Idle
+  back_gesture_seq.v = 0
+  back_enabled_sent.v = None
+  back_progress_sig.v = signals::signal(0.0)
+  layer_prev_focus.v = []
+  last_damage_report.v = DamageReport::None
+  view_app.tree = None
+  view_app.scene = Scene::new()
+  view_app.dmg = damage::Damage::new()
+  view_app.a11y = A11yTold::new()
+  view_app.frame_no = 0
+  view_app.last_w = 0.0
+  view_app.last_h = 0.0
+  view_app.last_scale = 1.0
+  view_app.pointer_x = 0.0
+  view_app.pointer_y = 0.0
+  view_app.press_x = 0.0
+  view_app.press_y = 0.0
+  view_app.press_down = false
+  view_app.pressed_node = None
+  view_app.dragging_node = None
+  view_app.claim_chain = []
+  view_app.press_events = []
+  view_app.down2 = None
+  view_app.active_touch_id = None
+  view_app.secondary_touch_id = None
+  view_app.last_wheel_phase = 0
+  view_app.last_light_angle = 0.0
+  view_app.last_atlas_gen = -1
+  view_app.shown_cursor = -1
+  view_app.last_present_hash = 0L
+  view_blocks_state.blocks = []
+  view_blocks_state.atlas_gen = -1
+  view_blocks_state.solid = false
+  view_pictures.map = Map::new()
+}
+
+fn take_all_window_slots() -> Array[() -> Unit] {
+  let saved : Array[() -> Unit] = [take_ui_builtin_slot()]
+  for k in windows_kept {
+    saved.push((k.take)())
+  }
+  saved
+}
+
+fn fresh_all_window_slots() -> Unit {
+  fresh_ui_builtin_slot()
+  for k in windows_kept {
+    (k.fresh)()
   }
 }
 
@@ -264,144 +714,6 @@ fn register_ui_window_kept() -> Unit {
       }
     }
   })
-  // Per-window signals stored as Ref[Signal] so windows never wake each other.
-  window_kept(
-    fn() {
-      let saved_theme_fn = tree_theme_fn.v
-      let saved_theme_fb = tree_theme_fallback.v
-      let saved_corner = tree_window_corner.v
-      let saved_zoom = tree_window_zoom.v
-      let saved_glass = glass_forced_said.v
-      let saved_frost = glass_frost_said.v
-      let saved_field = focused_field_ref.v
-      let saved_inset = inset_said.v
-      let saved_zoomed = zoomed_said.v
-      let saved_snap = snap_said.v
-      let saved_win_size = tree_window_size_sig.v
-      let saved_narrow_below = tree_narrow_below_sig.v
-      let saved_narrow_enabled = tree_narrow_enabled_sig.v
-      let saved_floor_stack = over_scrim_floor_stack.v
-      let saved_tree = view_app.tree
-      let saved_scene = view_app.scene
-      let saved_dmg = view_app.dmg
-      let saved_a11y = view_app.a11y
-      let saved_frame_no = view_app.frame_no
-      let saved_last_w = view_app.last_w
-      let saved_last_h = view_app.last_h
-      let saved_last_scale = view_app.last_scale
-      let saved_ptr_x = view_app.pointer_x
-      let saved_ptr_y = view_app.pointer_y
-      let saved_press_x = view_app.press_x
-      let saved_press_y = view_app.press_y
-      let saved_press_down = view_app.press_down
-      let saved_pressed_node = view_app.pressed_node
-      let saved_dragging_node = view_app.dragging_node
-      let saved_claim_chain = view_app.claim_chain
-      let saved_press_events = view_app.press_events
-      let saved_down2 = view_app.down2
-      let saved_touch0 = view_app.active_touch_id
-      let saved_touch1 = view_app.secondary_touch_id
-      let saved_wheel_phase = view_app.last_wheel_phase
-      let saved_light_angle = view_app.last_light_angle
-      let saved_atlas_gen = view_app.last_atlas_gen
-      let saved_shown_cursor = view_app.shown_cursor
-      let saved_present_hash = view_app.last_present_hash
-      let saved_blocks = view_blocks_state.blocks
-      let saved_blocks_gen = view_blocks_state.atlas_gen
-      let saved_blocks_solid = view_blocks_state.solid
-      let saved_pictures = view_pictures.map
-      fn() {
-        tree_theme_fn.v = saved_theme_fn
-        tree_theme_fallback.v = saved_theme_fb
-        tree_window_corner.v = saved_corner
-        tree_window_zoom.v = saved_zoom
-        glass_forced_said.v = saved_glass
-        glass_frost_said.v = saved_frost
-        focused_field_ref.v = saved_field
-        inset_said.v = saved_inset
-        zoomed_said.v = saved_zoomed
-        snap_said.v = saved_snap
-        tree_window_size_sig.v = saved_win_size
-        tree_narrow_below_sig.v = saved_narrow_below
-        tree_narrow_enabled_sig.v = saved_narrow_enabled
-        over_scrim_floor_stack.v = saved_floor_stack
-        view_app.tree = saved_tree
-        view_app.scene = saved_scene
-        view_app.dmg = saved_dmg
-        view_app.a11y = saved_a11y
-        view_app.frame_no = saved_frame_no
-        view_app.last_w = saved_last_w
-        view_app.last_h = saved_last_h
-        view_app.last_scale = saved_last_scale
-        view_app.pointer_x = saved_ptr_x
-        view_app.pointer_y = saved_ptr_y
-        view_app.press_x = saved_press_x
-        view_app.press_y = saved_press_y
-        view_app.press_down = saved_press_down
-        view_app.pressed_node = saved_pressed_node
-        view_app.dragging_node = saved_dragging_node
-        view_app.claim_chain = saved_claim_chain
-        view_app.press_events = saved_press_events
-        view_app.down2 = saved_down2
-        view_app.active_touch_id = saved_touch0
-        view_app.secondary_touch_id = saved_touch1
-        view_app.last_wheel_phase = saved_wheel_phase
-        view_app.last_light_angle = saved_light_angle
-        view_app.last_atlas_gen = saved_atlas_gen
-        view_app.shown_cursor = saved_shown_cursor
-        view_app.last_present_hash = saved_present_hash
-        view_blocks_state.blocks = saved_blocks
-        view_blocks_state.atlas_gen = saved_blocks_gen
-        view_blocks_state.solid = saved_blocks_solid
-        view_pictures.map = saved_pictures
-      }
-    },
-    fn() {
-      tree_theme_fn.v = signals::signal_ref(None)
-      tree_theme_fallback.v = signals::signal_ref(Theme::light())
-      tree_window_corner.v = signals::signal(0.0)
-      tree_window_zoom.v = signals::signal(1.0)
-      glass_forced_said.v = signals::signal(-1)
-      glass_frost_said.v = signals::signal(0.0)
-      focused_field_ref.v = None
-      inset_said.v = inset_said_new()
-      zoomed_said.v = zoomed_said_new()
-      snap_said.v = snap_said_new()
-      tree_window_size_sig.v = signals::signal_by((0.0, 0.0), pair_dd_eq)
-      tree_narrow_below_sig.v = signals::signal(700.0)
-      tree_narrow_enabled_sig.v = signals::signal(false)
-      over_scrim_floor_stack.v = []
-      view_app.tree = None
-      view_app.scene = Scene::new()
-      view_app.dmg = damage::Damage::new()
-      view_app.a11y = A11yTold::new()
-      view_app.frame_no = 0
-      view_app.last_w = 0.0
-      view_app.last_h = 0.0
-      view_app.last_scale = 1.0
-      view_app.pointer_x = 0.0
-      view_app.pointer_y = 0.0
-      view_app.press_x = 0.0
-      view_app.press_y = 0.0
-      view_app.press_down = false
-      view_app.pressed_node = None
-      view_app.dragging_node = None
-      view_app.claim_chain = []
-      view_app.press_events = []
-      view_app.down2 = None
-      view_app.active_touch_id = None
-      view_app.secondary_touch_id = None
-      view_app.last_wheel_phase = 0
-      view_app.last_light_angle = 0.0
-      view_app.last_atlas_gen = -1
-      view_app.shown_cursor = -1
-      view_app.last_present_hash = 0L
-      view_blocks_state.blocks = []
-      view_blocks_state.atlas_gen = -1
-      view_blocks_state.solid = false
-      view_pictures.map = Map::new()
-    },
-  )
 }
 
 fn init_ui_window_kept() -> Bool {
@@ -631,11 +943,9 @@ pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
   } else {
     // Save current window's state while window_now.v == prev under prev's room scope
     window_switching.v = true
-    let prev_saved : Array[() -> Unit] = []
+    let mut prev_saved : Array[() -> Unit] = []
     with_room_for(prev, prev_gen, effective_wid, effective_gen, fn() -> Unit {
-      for k in windows_kept {
-        prev_saved.push((k.take)())
-      }
+      prev_saved = take_all_window_slots()
     })
     let prev_is_disposing = prev_gen > 0 && !window_gen_is(prev, prev_gen) && disposing_window_detached.get(prev_gen).is_some()
     let target_is_disposing = target_gen > 0 && !window_gen_is(wid, target_gen) && disposing_window_detached.get(target_gen).is_some()
@@ -676,9 +986,7 @@ pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
           }
         }
         None => {
-          for k in windows_kept {
-            (k.fresh)()
-          }
+          fresh_all_window_slots()
         }
       }
       window_switching.v = false
@@ -689,10 +997,7 @@ pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
       }
       // Save target window's state while window_now.v == wid
       window_switching.v = true
-      let target_saved : Array[() -> Unit] = []
-      for k in windows_kept {
-        target_saved.push((k.take)())
-      }
+      let target_saved = take_all_window_slots()
       if target_is_disposing {
         disposing_window_slots[target_gen] = target_saved
       } else if wid == 0 || target_gen == 0 || window_gen_is(wid, target_gen) {
@@ -843,8 +1148,15 @@ pub fn window_open_here(what : String) -> Int {
           return
         }
         tree.drawn_by(image_ready=image_ready_at, image_ask=image_ask_at)
-        tree.on_due(fn() { hostapi::request_frame() })
+        tree.on_due(fn() {
+          if in_tree_frame.v {
+            hostapi::request_frame_on()
+          } else {
+            hostapi::request_frame()
+          }
+        })
         tree.on_cursor(fn() { if current_window_id() == wid { view_cursor_tell() } })
+        install_tree_hooks(tree, wid, open_gen)
         view_app.tree = Some(tree)
         window_trees[wid] = tree
       })
@@ -977,10 +1289,7 @@ fn dispose_detached_tree(
   let prev_det = host_said_detached.v
   let prev_host_det = window_host_detached.v
   window_switching.v = true
-  let cur_saved : Array[() -> Unit] = []
-  for k in windows_kept {
-    cur_saved.push((k.take)())
-  }
+  let cur_saved = take_all_window_slots()
   let stored_prev0 = prev_w == 0
   if stored_prev0 {
     window_slots[0] = cur_saved
@@ -1088,10 +1397,7 @@ fn dispose_primary_tree(t : view::Tree) -> Unit {
   let prev_det = host_said_detached.v
   let prev_host_det = window_host_detached.v
   window_switching.v = true
-  let prev_saved : Array[() -> Unit] = []
-  for k in windows_kept {
-    prev_saved.push((k.take)())
-  }
+  let prev_saved = take_all_window_slots()
   if prev_w > 0 && window_gen_is(prev_w, prev_g) {
     window_slots[prev_w] = prev_saved
   }
@@ -1114,10 +1420,7 @@ fn dispose_primary_tree(t : view::Tree) -> Unit {
   view::without_tree_room(fn() -> Unit { t.dispose() })
   if ui_ctx_epoch.v == start_epoch {
     window_switching.v = true
-    let updated0 : Array[() -> Unit] = []
-    for k in windows_kept {
-      updated0.push((k.take)())
-    }
+    let updated0 = take_all_window_slots()
     window_slots[0] = updated0
     window_now.v = prev_w
     window_active_gen.v = prev_g
@@ -1356,10 +1659,7 @@ fn windows_reset() -> Bool {
     }
     if is_opening && window_opening_saved_slot.get(active_gen).is_none() {
       window_switching.v = true
-      let snap : Array[() -> Unit] = []
-      for k in windows_kept {
-        snap.push((k.take)())
-      }
+      let snap = take_all_window_slots()
       window_switching.v = false
       window_opening_saved_slot[active_gen] = snap
     }
@@ -1401,9 +1701,7 @@ fn windows_reset() -> Bool {
           }
         }
         None => {
-          for k in windows_kept {
-            (k.fresh)()
-          }
+          fresh_all_window_slots()
         }
       }
     })
@@ -1417,12 +1715,9 @@ fn windows_reset() -> Bool {
       for ep in primary_building_epochs {
         if primary_building_saved_slot.get(ep).is_none() {
           register_ui_window_kept()
-          let snap : Array[() -> Unit] = []
-          snap.push(snapshot_ui_builtin_slot_detached())
-          let mut i = 1
-          while i < windows_kept.length() {
-            snap.push((windows_kept[i].take)())
-            i = i + 1
+          let snap : Array[() -> Unit] = [snapshot_ui_builtin_slot_detached()]
+          for k in windows_kept {
+            snap.push((k.take)())
           }
           primary_building_saved_slot[ep] = snap
         }
@@ -1435,5 +1730,11 @@ fn windows_reset() -> Bool {
     return false
   }
   over_scrim_floor_stack.v.clear()
+  back_gesture_state.v = BackGestureState::Idle
+  back_gesture_seq.v = 0
+  back_enabled_sent.v = None
+  back_progress_sig.v.set(0.0)
+  layer_prev_focus.v.clear()
+  last_damage_report.v = DamageReport::None
   true
 }

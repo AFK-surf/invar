@@ -35,18 +35,12 @@ mb_callbacks mb_cb;
 // nav.back, as Ctrl+[ elsewhere).
 typedef void (*mb_back_fn)(int32_t, double, double, int32_t);
 static mb_back_fn back_cb;
-static int back_on;
+static int back_on_pending;
 static int event_wid(void);
 static void win_use(int wid);
 static int win_active;
 static void window_modifiers(int wid, BOOL active);
-static void go_back(void) {
-  if (!back_cb || !back_on) return;
-  int back = win_active;
-  win_use(event_wid());
-  back_cb(2, 0, 1, 0);
-  win_use(back);
-}
+static int go_back(void);
 
 @interface MBView : NSView <NSTextInputClient>
 @property(nonatomic) BOOL imeActive;
@@ -120,6 +114,7 @@ static NSView *the_box;
 @property(nonatomic) double buttonsDown, buttonsFrom, buttonsTo, buttonsT0, buttonsMs;
 @property(nonatomic, strong) CADisplayLink *buttonsLink;
 @property(nonatomic) int cursorKind;
+@property(nonatomic) int backOn;
 @end
 @implementation MBWinSlot
 @end
@@ -144,6 +139,18 @@ static void win_use(int wid) {
   the_box = to.box;
   mb_views_use(wid);
   mb_render_use(wid);
+}
+
+static int go_back(void) {
+  if (!back_cb) return 0;
+  int wid = event_wid();
+  MBWinSlot *slot = win_slots[@(wid)];
+  if (!slot || !slot.backOn) return 0;
+  int back = win_active;
+  win_use(wid);
+  back_cb(2, 0, 1, 0);
+  win_use(back);
+  return 1;
 }
 
 // App-managed window helpers (borderless floating bars, transparent overlays, rounded panels).
@@ -930,9 +937,12 @@ static NSCursor *cursor_of(int kind) {
 }
 - (void)otherMouseUp:(NSEvent *)e {
   if (e.buttonNumber == 2) mouse_button(2, [self pt:e], e, 3);
-  else if (e.buttonNumber == 3) go_back();
+  else if (e.buttonNumber == 3) {
+    if (!go_back()) [super otherMouseUp:e];
+  }
   // the forward button: the app's key (key_forward), read as its forward
   else if (e.buttonNumber == 4) mb_cb.key(40, 0);
+  else [super otherMouseUp:e];
 }
 - (void)scrollWheel:(NSEvent *)e {
   clear_stale_sleep_if_active(self.window);
@@ -2684,6 +2694,7 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
     first.box = box;
     first.view = the_view;
     first.inset = setup_inset != 0;
+    first.backOn = back_on_pending;
     win_slots[@0] = first;
     making_inset = -1;
     // the wheel's upright scroll over a page that gives it to the canvas (ui's Touch: VerticalOut; a list of messages
@@ -3080,7 +3091,22 @@ int32_t mb_host_bench_mode(void) {
 void mb_host_exit(int32_t code) { exit(code); }
 
 void mb_host_set_back(mb_back_fn f) { back_cb = f; }
-void mb_host_back_enabled(int32_t on) { back_on = on; }
+void mb_host_back_enabled(int32_t on) {
+  MBWinSlot *slot = slot_now();
+  if (slot) {
+    slot.backOn = on ? 1 : 0;
+  } else if (win_active == 0) {
+    back_on_pending = on ? 1 : 0;
+  }
+}
+void mb_host_back_enabled_for(int32_t wid, int32_t on) {
+  MBWinSlot *slot = win_slots[@(wid)];
+  if (slot) {
+    slot.backOn = on ? 1 : 0;
+  } else if (wid == 0) {
+    back_on_pending = on ? 1 : 0;
+  }
+}
 
 moonbit_string_t mb_host_env(moonbit_string_t name) {
   const char *v = getenv(mb_ns_from_string(name).UTF8String);

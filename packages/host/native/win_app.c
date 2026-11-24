@@ -42,12 +42,7 @@ mb_callbacks mb_cb;
 // Back (host_native.mbt `set_back`): a mouse's back button and Alt+Left, while the app takes it.
 typedef void (*mb_back_fn)(int32_t, double, double, int32_t);
 static mb_back_fn back_cb;
-static int back_on;
-static int go_back(void) {
-  if (!back_cb || !back_on) return 0;
-  back_cb(2, 0, 1, 0);
-  return 1;
-}
+static int go_back(void);
 
 // The run's first window: its life (win_life.h: put away, brought back, its icon, its state told), its notifications,
 // what is posted to the run's thread
@@ -114,11 +109,17 @@ typedef struct WinSlot {
   // app's handling of the press is over (WM_MB_DRAG: Windows' move is a loop of its own, which draws frames as it goes)
   DWORD drag_time;
   POINT drag_at;
+  int back_on;
 } WinSlot;
 // (each beside the first made fresh as it opens: win_slot_fresh)
 static WinSlot win_slots[MB_WINS] = {{.scale = 1, .window_content_zoom = 1.0}};
 static WinSlot *ws = &win_slots[0];
 static int win_active;  // the window in place (0, the first, between frames and input)
+static int go_back(void) {
+  if (!back_cb || !ws || !ws->back_on) return 0;
+  back_cb(2, 0, 1, 0);
+  return 1;
+}
 static void win_slot_fresh(WinSlot *w) {
   memset(w, 0, sizeof *w);
   w->scale = 1;
@@ -1200,9 +1201,14 @@ static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       if (wp == VK_SHIFT || wp == VK_CONTROL || wp == VK_MENU) mb_cb.key(0, mods_now());
       break;
     case WM_XBUTTONUP:
-      if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) go_back();
-      else if (GET_XBUTTON_WPARAM(wp) == XBUTTON2) mb_cb.key(40, 0);
-      return TRUE;
+      if (GET_XBUTTON_WPARAM(wp) == XBUTTON1) {
+        if (go_back()) return TRUE;
+        break;
+      } else if (GET_XBUTTON_WPARAM(wp) == XBUTTON2) {
+        mb_cb.key(40, 0);
+        return TRUE;
+      }
+      break;
     case WM_CHAR: char_in((WCHAR)wp); return 0;
     case WM_SETFOCUS:
       mb_cb.key(0, mods_now());
@@ -1943,7 +1949,12 @@ int32_t mb_host_bench_mode(void) {
 void mb_host_exit(int32_t code) { exit(code); }
 
 void mb_host_set_back(mb_back_fn f) { back_cb = f; }
-void mb_host_back_enabled(int32_t on) { back_on = on; }
+void mb_host_back_enabled(int32_t on) { if (ws) ws->back_on = on ? 1 : 0; }
+void mb_host_back_enabled_for(int32_t wid, int32_t on) {
+  if (wid >= 0 && wid < MB_WINS && (wid == 0 || win_slots[wid].h)) {
+    win_slots[wid].back_on = on ? 1 : 0;
+  }
+}
 
 // The app in front or not (@hostapi.set_app_state), whether the system is set to dark (@hostapi.system_dark), the
 // title bar as the app is drawn (@hostapi.set_dark), the app's menus (@hostapi.menu_setup) and its environment

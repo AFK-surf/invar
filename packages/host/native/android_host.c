@@ -1309,6 +1309,10 @@ void mb_host_back_enabled(int32_t on) {
   (*env)->CallStaticVoidMethod(env, host_cls, m_back_enabled, (jboolean)(on != 0));
 }
 
+void mb_host_back_enabled_for(int32_t wid, int32_t on) {
+  if (wid == 0) mb_host_back_enabled(on);
+}
+
 // A scripted run's input (src/ui/drive.mbt), as the system sends it (Host.drive: the view's InputConnection, a
 // KEYCODE_PASTE); 0 for what it has no path for (the window's picture: adb's screencap takes it).
 int32_t mb_host_drive(int32_t kind, moonbit_string_t text) {
