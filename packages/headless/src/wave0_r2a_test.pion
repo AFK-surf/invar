@@ -1,0 +1,772 @@
+// Wave 0 R2-A headless contracts: one key-code table (13 is Copy, never Delete), keys taken only by the control the
+// focus is in, Select's filter-safe active item and keyboard paging, arrays crossing the API as copies, and Form's
+// remount-safe registration and single-snapshot, re-entry-safe submit.
+
+import "headless_core"
+import "signals"
+import "view"
+
+fn r2a_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn r2a_make_tree(make : (view::View) -> Unit) -> view::Tree {
+  view::Tree::new(
+    make,
+    measure=view::words_measure,
+    measure_runs=view::runs_measure,
+    measure_runs_least=view::runs_least_measure,
+  )
+}
+
+fn r2a_active_is(s : Selector[String], want : String) -> Bool {
+  match s.active_key() {
+    Some(k) => k == want
+    None => false
+  }
+}
+
+fn r2a_strs_are(a : Array[String], b : Array[String]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+/// One Selector in `root` over `items` (filtered by its query where `filterable`), its trigger 160x32 and, while open,
+/// its listbox of 28-high options; the selector, its trigger and the options by key put in the refs given.
+fn r2a_selector(
+  root : view::View,
+  label : String,
+  items : Array[String],
+  sel_ref : signals::Ref[Option[Selector[String]]],
+  trig_ref : signals::Ref[Option[view::View]],
+  opts : Map[String, view::View],
+  multiple~ : Bool = false,
+  filterable~ : Bool = false,
+  initial~ : Array[String] = [],
+  disabled_key~ : String = "",
+  on_change~ : (Array[String]) -> Unit = fn(_a : Array[String]) { () },
+) -> Unit {
+  let visible = fn() -> Array[String] {
+    match sel_ref.v {
+      Some(s) => {
+        let q = ascii_lower(s.query())
+        if q == "" { items } else { view::array_filter(items, fn(k : String) -> Bool { ascii_lower(k).contains(q) }) }
+      }
+      None => items
+    }
+  }
+  let _ = selector(
+    root,
+    fn() -> String { label },
+    fn() -> Array[String] { items },
+    visible,
+    fn(k : String) -> String { k },
+    fn(v : view::View, s : Selector[String]) {
+      sel_ref.v = Some(s)
+      trig_ref.v = Some(s.trigger(v, fn(tv : view::View, _s : Selector[String]) {
+        let _ = tv.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(32.0)))
+      }))
+      let _ = v.show(
+        fn() -> Bool { s.is_open() },
+        fn(host : view::View) {
+          let _ = s.listbox(host, fn(lv : view::View) {
+            for k in items {
+              let _ = lv.show(
+                fn() -> Bool { view::array_any(visible(), fn(x : String) -> Bool { x == k }) },
+                fn(oh : view::View) {
+                  opts[k] = s.option(oh, k, fn() -> String { k }, fn(ov : view::View, _a : () -> Bool, _c : () -> Bool) {
+                    let _ = ov.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(28.0)))
+                  })
+                },
+                at_once=true,
+              )
+            }
+          })
+        },
+        at_once=true,
+      )
+    },
+    initial_selected=initial,
+    multiple=multiple,
+    filterable=filterable,
+    key_disabled=fn(k : String) -> Bool { k == disabled_key },
+    on_selection_change=on_change,
+  )
+}
+
+test "r2a-01 headless_core key table: ui's numbers, 13 is Copy" {
+  r2a_assert(headless_core::key_backspace == 1 && headless_core::key_delete == 2, "Backspace 1, Delete 2")
+  r2a_assert(headless_core::key_left == 3 && headless_core::key_right == 4, "Left 3, Right 4")
+  r2a_assert(headless_core::key_up == 5 && headless_core::key_down == 6, "Up 5, Down 6")
+  r2a_assert(headless_core::key_enter == 7 && headless_core::key_home == 8 && headless_core::key_end == 9, "Enter/Home/End")
+  r2a_assert(headless_core::key_select_all == 12 && headless_core::key_copy == 13 && headless_core::key_cut == 14, "SelectAll/Copy/Cut")
+  r2a_assert(headless_core::key_page_up == 15 && headless_core::key_page_down == 16, "PageUp/PageDown")
+  r2a_assert(headless_core::key_escape == 17 && headless_core::key_tab == 18 && headless_core::key_space == 1032, "Esc/Tab/Space")
+  r2a_assert(headless_core::mod_shift == 1 && headless_core::mod_ctrl == 2 && headless_core::mod_alt == 4 && headless_core::mod_cmd == 8, "mods")
+  // the private names headless reads them by are the same numbers
+  r2a_assert(menu_key_escape == headless_core::key_escape && combo_key_enter == headless_core::key_enter, "menu/combo")
+  r2a_assert(listbox_key_space == headless_core::key_space && listbox_key_char == 1000, "listbox")
+  r2a_assert(group_key_backspace == headless_core::key_backspace && group_key_delete == headless_core::key_delete, "group")
+}
+
+test "r2a-02 a closed Select clears on real Backspace/Delete, never on Copy (13)" {
+  let sel_ref : signals::Ref[Option[Selector[String]]] = view::ref_new(None)
+  let trig_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let opts : Map[String, view::View] = Map::new()
+  let tree = r2a_make_tree(fn(root : view::View) {
+    r2a_selector(root, "Fruit", ["Apple", "Banana"], sel_ref, trig_ref, opts, initial=["Banana"])
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let s = match sel_ref.v { Some(x) => x; None => panic("missing selector") }
+  let tr = match trig_ref.v { Some(x) => x; None => panic("missing trigger") }
+  let _ = tr.ask_focus(visible=true)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  let _ = tree.key_at(headless_core::key_copy, 0, 20.0)
+  r2a_assert(r2a_strs_are(s.selected_keys(), ["Banana"]) && !s.is_open(), "Copy (13) neither clears nor opens")
+  r2a_assert(tree.key_at(headless_core::key_delete, 0, 24.0), "Delete taken by the focused closed Select")
+  r2a_assert(s.selected_keys().length() == 0 && !s.is_open(), "Delete clears without opening")
+  s.choose("Apple")
+  r2a_assert(tree.key_at(headless_core::key_backspace, 0, 28.0), "Backspace taken")
+  r2a_assert(s.selected_keys().length() == 0 && !s.is_open(), "Backspace clears without opening")
+  tree.dispose()
+}
+
+test "r2a-03 Select keys are its own only while the focus is in it" {
+  let a_ref : signals::Ref[Option[Selector[String]]] = view::ref_new(None)
+  let a_trig : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let b_ref : signals::Ref[Option[Selector[String]]] = view::ref_new(None)
+  let b_trig : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let a_opts : Map[String, view::View] = Map::new()
+  let b_opts : Map[String, view::View] = Map::new()
+  let tree = r2a_make_tree(fn(root : view::View) {
+    r2a_selector(root, "A", ["A1", "A2"], a_ref, a_trig, a_opts, initial=["A1"])
+    r2a_selector(root, "B", ["B1", "B2"], b_ref, b_trig, b_opts, initial=["B2"])
+  })
+  let _ = tree.frame(400.0, 400.0, now=0.0)
+  let a = match a_ref.v { Some(x) => x; None => panic("missing A") }
+  let b = match b_ref.v { Some(x) => x; None => panic("missing B") }
+  let at = match a_trig.v { Some(x) => x; None => panic("missing A trigger") }
+  // nothing focused: no selector takes a key
+  r2a_assert(!tree.key_at(headless_core::key_down, 0, 8.0), "Down with no focus taken by none")
+  r2a_assert(!a.is_open() && !b.is_open(), "neither opened")
+  let _ = at.ask_focus(visible=true)
+  let _ = tree.frame(400.0, 400.0, now=16.0)
+  r2a_assert(a.owns_focus() && !b.owns_focus(), "focus in A's scope only")
+  r2a_assert(tree.key_at(headless_core::key_down, 0, 20.0) && a.is_open() && !b.is_open(), "Down opens A, never B (drawn later)")
+  let _ = tree.frame(400.0, 400.0, now=24.0)
+  r2a_assert(r2a_active_is(a, "A1"), "A opens on its chosen A1")
+  let _ = tree.key_at(headless_core::key_down, 0, 28.0)
+  r2a_assert(r2a_active_is(a, "A2") && b.active_key().is_none(), "Down moves A's active item only")
+  let _ = tree.key_at(headless_core::key_enter, 0, 32.0)
+  r2a_assert(r2a_strs_are(a.selected_keys(), ["A2"]) && r2a_strs_are(b.selected_keys(), ["B2"]), "Enter chooses in A alone")
+  let _ = tree.key_at(headless_core::key_backspace, 0, 36.0)
+  r2a_assert(a.selected_keys().length() == 0 && r2a_strs_are(b.selected_keys(), ["B2"]), "Backspace clears A alone")
+  tree.dispose()
+}
+
+test "r2a-04 Select: Enter never chooses an item the filter took away; visible-list changes reconcile" {
+  let sel_ref : signals::Ref[Option[Selector[String]]] = view::ref_new(None)
+  let trig_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let opts : Map[String, view::View] = Map::new()
+  let tree = r2a_make_tree(fn(root : view::View) {
+    r2a_selector(root, "Tags", ["Apple", "Apricot", "Banana", "Cherry"], sel_ref, trig_ref, opts, multiple=true, filterable=true)
+  })
+  let _ = tree.frame(300.0, 300.0, now=0.0)
+  let s = match sel_ref.v { Some(x) => x; None => panic("missing selector") }
+  let tr = match trig_ref.v { Some(x) => x; None => panic("missing trigger") }
+  let _ = tr.ask_focus(visible=true)
+  s.set_open(true)
+  let _ = tree.frame(300.0, 300.0, now=16.0)
+  s.choose("Banana")
+  r2a_assert(r2a_active_is(s, "Banana"), "active on Banana")
+  // the query hides Banana: the active item follows the visible list, Enter chooses only what is visible
+  s.set_query("ap")
+  let _ = tree.frame(300.0, 300.0, now=32.0)
+  r2a_assert(r2a_active_is(s, "Apple"), "active reconciled to first visible Apple")
+  r2a_assert(s.is_selected("Banana"), "hidden chosen Banana kept")
+  // an active key gone stale behind the controller's back (set straight) is never chosen by Enter
+  s.active_sig.set(Some("Cherry"))
+  r2a_assert(!s.can_choose("Cherry"), "Cherry not choosable while filtered out")
+  r2a_assert(tree.key_at(headless_core::key_enter, 0, 40.0), "Enter taken")
+  r2a_assert(!s.is_selected("Cherry"), "filtered-out Cherry never chosen")
+  r2a_assert(r2a_active_is(s, "Apple"), "Enter reconciled the stale active item instead")
+  let _ = tree.key_at(headless_core::key_enter, 0, 44.0)
+  r2a_assert(s.is_selected("Apple") && s.is_selected("Banana"), "Enter chooses visible Apple, Banana kept")
+  s.set_query("")
+  let _ = tree.frame(300.0, 300.0, now=48.0)
+  r2a_assert(r2a_strs_are(s.selected_keys(), ["Banana", "Apple"]), "both kept after the filter is cleared")
+  tree.dispose()
+}
+
+test "r2a-05 Select keyboard: Home/End/PageUp/PageDown, opening on the first visible chosen, pointer sets active" {
+  let items = ["k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11", "k12", "k13", "k14"]
+  let sel_ref : signals::Ref[Option[Selector[String]]] = view::ref_new(None)
+  let trig_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let opts : Map[String, view::View] = Map::new()
+  let tree = r2a_make_tree(fn(root : view::View) {
+    r2a_selector(root, "Keys", items, sel_ref, trig_ref, opts, multiple=true, initial=["k07", "k03"], disabled_key="k14")
+  })
+  let _ = tree.frame(300.0, 600.0, now=0.0)
+  let s = match sel_ref.v { Some(x) => x; None => panic("missing selector") }
+  let tr = match trig_ref.v { Some(x) => x; None => panic("missing trigger") }
+  let _ = tr.ask_focus(visible=true)
+  let _ = tree.frame(300.0, 600.0, now=8.0)
+  let _ = tree.key_at(headless_core::key_down, 0, 16.0)
+  let _ = tree.frame(300.0, 600.0, now=20.0)
+  r2a_assert(s.is_open() && r2a_active_is(s, "k03"), "opens on the first visible chosen (k03 before k07 in list order)")
+  let _ = tree.key_at(headless_core::key_end, 0, 24.0)
+  r2a_assert(r2a_active_is(s, "k13"), "End: last enabled (k14 disabled)")
+  let _ = tree.key_at(headless_core::key_home, 0, 28.0)
+  r2a_assert(r2a_active_is(s, "k00"), "Home: first")
+  let _ = tree.key_at(headless_core::key_page_down, 0, 32.0)
+  r2a_assert(r2a_active_is(s, "k10"), "PageDown: ten on")
+  let _ = tree.key_at(headless_core::key_page_down, 0, 36.0)
+  r2a_assert(r2a_active_is(s, "k13"), "PageDown held at the last enabled, no wrap")
+  let _ = tree.key_at(headless_core::key_page_up, 0, 40.0)
+  r2a_assert(r2a_active_is(s, "k03"), "PageUp: ten back")
+  let _ = tree.key_at(headless_core::key_page_up, 0, 44.0)
+  r2a_assert(r2a_active_is(s, "k00"), "PageUp held at the first")
+  // what selected_keys gives is a copy
+  let got = s.selected_keys()
+  got.push("k09")
+  got[0] = "zz"
+  r2a_assert(r2a_strs_are(s.selected_keys(), ["k07", "k03"]), "selected_keys copy: changing it changes nothing")
+  tree.dispose()
+}
+
+test "r2a-06 Select arrays cross the API as copies (initial, getter, callback)" {
+  let initial = ["A"]
+  let seen : signals::Ref[Option[Array[String]]] = view::ref_new(None)
+  let sel_ref : signals::Ref[Option[Selector[String]]] = view::ref_new(None)
+  let trig_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let opts : Map[String, view::View] = Map::new()
+  let tree = r2a_make_tree(fn(root : view::View) {
+    r2a_selector(root, "Copy", ["A", "B", "C"], sel_ref, trig_ref, opts, multiple=true, initial=initial, on_change=fn(
+      a : Array[String],
+    ) {
+      seen.v = Some(a)
+      a.push("C")
+    })
+  })
+  let _ = tree.frame(300.0, 300.0, now=0.0)
+  let s = match sel_ref.v { Some(x) => x; None => panic("missing selector") }
+  initial.push("B")
+  r2a_assert(r2a_strs_are(s.selected_keys(), ["A"]), "caller changing its initial array changes nothing")
+  s.choose("B")
+  r2a_assert(r2a_strs_are(s.selected_keys(), ["A", "B"]), "callback changing its array changes nothing")
+  match seen.v {
+    Some(a) => {
+      a.clear()
+      r2a_assert(r2a_strs_are(s.selected_keys(), ["A", "B"]), "a kept callback array is the caller's own")
+    }
+    None => panic("callback not called")
+  }
+  tree.dispose()
+}
+
+test "r2a-07 DataGrid: keys only while the focus is in it; arrays out are copies" {
+  let rows = ["r1", "r2", "r3"]
+  let cols = ["c1", "c2"]
+  let dg_ref : signals::Ref[Option[DataGrid]] = view::ref_new(None)
+  let cell_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let out_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let told : signals::Ref[Option[Array[String]]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    out_ref.v = Some(root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(20.0))).focusable(view::Live::Is(true))
+    }))
+    let _ = data_grid(
+      root,
+      fn() -> String { "Grid" },
+      fn() -> Array[String] { rows },
+      fn() -> Array[String] { cols },
+      fn(v : view::View, dg : DataGrid) {
+        dg_ref.v = Some(dg)
+        for r in rows {
+          let _ = dg.row(v, r, fn(rv : view::View, _s : () -> Bool) {
+            for c in cols {
+              let cv = dg.cell(rv, r, c, fn() -> String { r + c }, fn(n : view::View, _f : () -> Bool) {
+                let _ = n.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(20.0)))
+              })
+              if r == "r1" && c == "c1" {
+                cell_ref.v = Some(cv)
+              }
+            }
+          })
+        }
+      },
+      on_selection_change=fn(a : Array[String]) {
+        told.v = Some(a)
+        a.push("bogus")
+      },
+    )
+  })
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  let dg = match dg_ref.v { Some(x) => x; None => panic("missing grid") }
+  let cell = match cell_ref.v { Some(x) => x; None => panic("missing cell") }
+  let out = match out_ref.v { Some(x) => x; None => panic("missing outside") }
+  let _ = out.ask_focus(visible=true)
+  let _ = tree.frame(400.0, 300.0, now=8.0)
+  r2a_assert(!dg.owns_focus(), "focus outside the grid")
+  r2a_assert(!tree.key_at(headless_core::key_down, 0, 12.0), "Down outside the grid not taken by it")
+  r2a_assert(!tree.key_at(headless_core::key_char_base + 97, headless_core::mod_ctrl, 14.0), "Ctrl+A outside not taken")
+  r2a_assert(dg.selected_rows().length() == 0 && dg.focus_row().is_none() && out.focused(), "grid untouched, focus kept")
+  let _ = cell.ask_focus(visible=true)
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+  r2a_assert(dg.owns_focus(), "focus in the grid")
+  r2a_assert(tree.key_at(headless_core::key_char_base + 97, headless_core::mod_ctrl, 20.0), "Ctrl+A in the grid taken")
+  r2a_assert(r2a_strs_are(dg.selected_rows(), ["r1", "r2", "r3"]), "all selected")
+  match told.v {
+    Some(a) => {
+      a.clear()
+      r2a_assert(dg.selected_rows().length() == 3, "callback array (changed, kept, cleared) is a copy")
+    }
+    None => panic("selection not told")
+  }
+  let got = dg.selected_rows()
+  got.clear()
+  r2a_assert(dg.selected_rows().length() == 3 && dg.is_selected("r2"), "selected_rows getter is a copy")
+  tree.dispose()
+}
+
+test "r2a-08 TagGroup: Copy (13) removes nothing; Delete removes the focused tag" {
+  let tags = signals::signal_by(["t1", "t2"], fn(a : Array[String], b : Array[String]) -> Bool { r2a_strs_are(a, b) })
+  let t1_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = tag_group(
+      root,
+      fn() -> String { "Tags" },
+      fn(v : view::View, tg : TagGroup[String]) {
+        for k in ["t1", "t2"] {
+          let _ = v.show(
+            fn() -> Bool { view::array_any(tags.get(), fn(x : String) -> Bool { x == k }) },
+            fn(h : view::View) {
+              let tv = tg.tag(h, k, fn() -> String { k }, fn(n : view::View, _s : () -> Bool, _o : () -> Bool) {
+                let _ = n.width(view::Live::Is(Some(48.0))).height(view::Live::Is(Some(24.0)))
+              })
+              if k == "t1" {
+                t1_ref.v = Some(tv)
+              }
+            },
+            at_once=true,
+          )
+        }
+      },
+      on_remove=fn(k : String) { tags.set(view::array_filter(tags.untracked(), fn(x : String) -> Bool { x != k })) },
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let t1 = match t1_ref.v { Some(x) => x; None => panic("missing t1") }
+  let _ = t1.ask_focus(visible=true)
+  let _ = tree.frame(300.0, 200.0, now=8.0)
+  let _ = tree.key_at(headless_core::key_copy, 0, 12.0)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  r2a_assert(tags.get().length() == 2, "Copy (13) removes no tag")
+  let _ = tree.key_at(headless_core::key_delete, 0, 20.0)
+  let _ = tree.frame(300.0, 200.0, now=24.0)
+  r2a_assert(r2a_strs_are(tags.get(), ["t2"]), "Delete removes the focused t1")
+  tree.dispose()
+}
+
+test "r2a-09 DateField: Copy (13) clears no segment; Backspace clears the focused one" {
+  let seg_val : signals::Signal[headless_core::SegmentedDateTime] = signals::signal_by(
+    headless_core::SegmentedDateTime::from_date(headless_core::IsoDate::new(2026, 11, 24)),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let yr_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = date_field(
+      root,
+      fn() -> String { "Day" },
+      fn() -> headless_core::SegmentedDateTime { seg_val.get() },
+      fn(next : headless_core::SegmentedDateTime) { seg_val.set(next) },
+      fn(v : view::View, df : DateField) {
+        yr_ref.v = Some(df.segment(v, headless_core::DateSegmentKind::Year, fn(sv : view::View, _t : () -> String) {
+          let _ = sv.width(view::Live::Is(Some(48.0))).height(view::Live::Is(Some(24.0)))
+        }))
+      },
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let yr = match yr_ref.v { Some(x) => x; None => panic("missing year") }
+  let _ = yr.ask_focus(visible=true)
+  let _ = tree.frame(300.0, 200.0, now=8.0)
+  r2a_assert(!tree.key_at(headless_core::key_copy, 0, 12.0), "Copy (13) not taken by the segment")
+  r2a_assert(seg_val.get().year.is_some(), "Copy (13) clears nothing")
+  r2a_assert(tree.key_at(headless_core::key_backspace, 0, 16.0), "Backspace taken")
+  r2a_assert(seg_val.get().year.is_none() && seg_val.get().month.is_some(), "Backspace clears the year alone")
+  tree.dispose()
+}
+
+test "r2a-10 Form: a field remounted under its name survives its old owner's late unmount" {
+  let form_ref : signals::Ref[Option[Form]] = view::ref_new(None)
+  let show_old = signals::signal(true)
+  let show_new = signals::signal(false)
+  let v1 = signals::signal("old")
+  let v2 = signals::signal("new")
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = form(root, fn() -> String { "F" }, fn(_m : Map[String, String]) { () }, fn(v : view::View, f : Form) {
+      form_ref.v = Some(f)
+      let _ = v.show(fn() -> Bool { show_old.get() }, fn(h : view::View) {
+        let _ = f.register_field("email", fn() -> String { v1.get() }, owner=h)
+      }, at_once=true)
+      let _ = v.show(fn() -> Bool { show_new.get() }, fn(h : view::View) {
+        let _ = f.register_field("email", fn() -> String { v2.get() }, owner=h)
+      }, at_once=true)
+    })
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let f = match form_ref.v { Some(x) => x; None => panic("missing form") }
+  // the new one mounts before the old one is let go (a keyed remount)
+  show_new.set(true)
+  let _ = tree.frame(300.0, 200.0, now=16.0)
+  show_old.set(false)
+  let _ = tree.frame(300.0, 200.0, now=32.0)
+  r2a_assert(f.has_field("email"), "the newer registration survives the old owner's unmount")
+  match f.values().get("email") {
+    Some(x) => r2a_assert(x == "new", "value read from the newer field")
+    None => panic("email missing")
+  }
+  // its own unmount does remove it
+  show_new.set(false)
+  let _ = tree.frame(300.0, 200.0, now=48.0)
+  r2a_assert(!f.has_field("email"), "the newer one's own unmount removes it")
+  tree.dispose()
+}
+
+test "r2a-11 Form submit: one snapshot validated and submitted, re-entry ignored" {
+  let form_ref : signals::Ref[Option[Form]] = view::ref_new(None)
+  let reads = view::ref_new(0)
+  let submitted : Array[String] = []
+  let reentered = view::ref_new(0)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = form(
+      root,
+      fn() -> String { "F" },
+      fn(m : Map[String, String]) {
+        match m.get("code") {
+          Some(x) => submitted.push(x)
+          None => ()
+        }
+        // a submit asked from inside on_submit is ignored
+        match form_ref.v {
+          Some(f) => if !f.submit() { reentered.v = reentered.v + 1 }
+          None => ()
+        }
+      },
+      fn(_v : view::View, f : Form) {
+        form_ref.v = Some(f)
+        // each read gives another value: valid ("ok") on the 1st read, invalid after
+        let _ = f.register_field(
+          "code",
+          fn() -> String {
+            reads.v = reads.v + 1
+            if reads.v == 1 { "ok" } else { "BAD" }
+          },
+          validate=fn(x : String) -> Option[String] { if x == "ok" { None } else { Some("bad") } },
+        )
+      },
+      validate_form=fn(m : Map[String, String]) -> Map[String, String] {
+        m["code"] = "mutated"
+        Map::new()
+      },
+    )
+  })
+  let _ = tree.frame(300.0, 200.0, now=0.0)
+  let f = match form_ref.v { Some(x) => x; None => panic("missing form") }
+  r2a_assert(f.submit(), "first submit valid")
+  r2a_assert(reads.v == 1, "values sampled once per submit")
+  r2a_assert(submitted.length() == 1 && submitted[0] == "ok", "on_submit got the validated snapshot (not a resample, not the validator's change)")
+  r2a_assert(reentered.v == 1, "re-entrant submit ignored")
+  r2a_assert(!f.submit() && submitted.length() == 1, "next submit sees the invalid value and does not submit")
+  r2a_assert(f.error_of("code") == "bad", "its error set")
+  tree.dispose()
+}
+
+test "r3-cal-01 Calendar: PageDown across month remount moves real focus and Enter selects new date" {
+  let sel : signals::Signal[Option[headless_core::IsoDate]] = signals::signal_by(None, fn(a, b) {
+    match (a, b) {
+      (None, None) => true
+      (Some(x), Some(y)) => x == y
+      _ => false
+    }
+  })
+  let nov15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let dec15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let cal_ref : signals::Ref[Option[Calendar]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = calendar(
+      root,
+      fn() -> String { "SingleMonth" },
+      headless_core::IsoDate::new(2026, 11, 15),
+      fn() -> Option[headless_core::IsoDate] { sel.get() },
+      fn(d : headless_core::IsoDate) { sel.set(Some(d)) },
+      fn(v : view::View, cal : Calendar) {
+        cal_ref.v = Some(cal)
+        // Re-mount month grid reactively when visible_month changes (simulating real month swap)
+        let _ = v.show(fn() -> Bool { cal.visible_month() == 11 }, fn(h : view::View) {
+          nov15_ref.v = Some(cal.day_cell(h, headless_core::IsoDate::new(2026, 11, 15), fn(cv, _s, _o) {
+            let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+          }))
+        }, at_once=true)
+        let _ = v.show(fn() -> Bool { cal.visible_month() == 12 }, fn(h : view::View) {
+          dec15_ref.v = Some(cal.day_cell(h, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+            let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+          }))
+        }, at_once=true)
+      },
+    )
+  })
+  let _ = tree.frame(320.0, 240.0, now=0.0)
+  let nov15 = match nov15_ref.v { Some(x) => x; None => panic("missing nov15") }
+  let _ = nov15.ask_focus(visible=true)
+  let _ = tree.frame(320.0, 240.0, now=8.0)
+  r2a_assert(nov15.focused(), "nov15 initially focused")
+  r2a_assert(tree.key_at(headless_core::key_page_down, 0, 12.0), "PageDown handled")
+  let _ = tree.frame(320.0, 240.0, now=16.0)
+  let dec15 = match dec15_ref.v { Some(x) => x; None => panic("missing dec15 after remount") }
+  r2a_assert(dec15.focused(), "real focus transferred to newly mounted dec15 cell")
+  let _ = tree.key_at(headless_core::key_enter, 0, 20.0)
+  let _ = tree.frame(320.0, 240.0, now=24.0)
+  r2a_assert(opt_iso_date_eq(sel.get(), Some(headless_core::IsoDate::new(2026, 12, 15))), "Enter activates dec15, not old nov15")
+  tree.dispose()
+}
+
+test "r3-cal-02 Calendar: dual-month view PageDown moves real focus to 2nd month so Enter selects new date" {
+  let sel : signals::Signal[Option[headless_core::IsoDate]] = signals::signal_by(None, fn(a, b) {
+    match (a, b) {
+      (None, None) => true
+      (Some(x), Some(y)) => x == y
+      _ => false
+    }
+  })
+  let nov15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let dec15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = calendar(
+      root,
+      fn() -> String { "DualMonth" },
+      headless_core::IsoDate::new(2026, 11, 15),
+      fn() -> Option[headless_core::IsoDate] { sel.get() },
+      fn(d : headless_core::IsoDate) { sel.set(Some(d)) },
+      fn(v : view::View, cal : Calendar) {
+        nov15_ref.v = Some(cal.day_cell(v, headless_core::IsoDate::new(2026, 11, 15), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+        dec15_ref.v = Some(cal.day_cell(v, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+      },
+    )
+  })
+  let _ = tree.frame(320.0, 240.0, now=0.0)
+  let nov15 = match nov15_ref.v { Some(x) => x; None => panic("missing nov15") }
+  let dec15 = match dec15_ref.v { Some(x) => x; None => panic("missing dec15") }
+  let _ = nov15.ask_focus(visible=true)
+  let _ = tree.frame(320.0, 240.0, now=8.0)
+  r2a_assert(tree.key_at(headless_core::key_page_down, 0, 12.0), "PageDown handled in dual-month")
+  let _ = tree.frame(320.0, 240.0, now=16.0)
+  r2a_assert(!nov15.focused() && dec15.focused(), "real focus moved immediately from nov15 to dec15")
+  let _ = tree.key_at(headless_core::key_enter, 0, 20.0)
+  let _ = tree.frame(320.0, 240.0, now=24.0)
+  r2a_assert(opt_iso_date_eq(sel.get(), Some(headless_core::IsoDate::new(2026, 12, 15))), "Enter activates dec15 in dual-month view")
+  tree.dispose()
+}
+
+test "r3-rcal-01 RangeCalendar: Right at max date or unavailable date keeps prior model and real focus" {
+  let range_sig : signals::Signal[Option[(headless_core::IsoDate, headless_core::IsoDate)]] = signals::signal_by(None, fn(a, b) {
+    match (a, b) {
+      (None, None) => true
+      (Some((s1, e1)), Some((s2, e2))) => s1 == s2 && e1 == e2
+      _ => false
+    }
+  })
+  let rc_ref : signals::Ref[Option[RangeCalendar]] = view::ref_new(None)
+  let d28_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let d29_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let d30_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let max_d = headless_core::IsoDate::new(2026, 11, 30)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = range_calendar(
+      root,
+      fn() -> String { "Range" },
+      headless_core::IsoDate::new(2026, 11, 28),
+      fn() -> Option[(headless_core::IsoDate, headless_core::IsoDate)] { range_sig.get() },
+      fn(s, e) { range_sig.set(Some((s, e))) },
+      fn(v : view::View, rc : RangeCalendar) {
+        rc_ref.v = Some(rc)
+        d28_ref.v = Some(rc.day_cell(v, headless_core::IsoDate::new(2026, 11, 28), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+        d29_ref.v = Some(rc.day_cell(v, headless_core::IsoDate::new(2026, 11, 29), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+        d30_ref.v = Some(rc.day_cell(v, max_d, fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+      },
+      max=max_d,
+      is_unavailable=fn(d) { d == headless_core::IsoDate::new(2026, 11, 29) },
+    )
+  })
+  let _ = tree.frame(320.0, 240.0, now=0.0)
+  let rc = match rc_ref.v { Some(x) => x; None => panic("missing rc") }
+  let d28 = match d28_ref.v { Some(x) => x; None => panic("missing d28") }
+  let d30 = match d30_ref.v { Some(x) => x; None => panic("missing d30") }
+  let _ = d28.ask_focus(visible=true)
+  let _ = tree.frame(320.0, 240.0, now=8.0)
+  // Right from 28 skips unavailable 29 and lands cleanly on 30 (max)
+  r2a_assert(tree.key_at(headless_core::key_right, 0, 12.0), "Right handled")
+  let _ = tree.frame(320.0, 240.0, now=16.0)
+  r2a_assert(rc.focused_date() == max_d && d30.focused(), "Right skipped unavailable 29 to land on max 30")
+  // Right at max 30 must NOT move model focus past max or lose real focus on d30
+  r2a_assert(tree.key_at(headless_core::key_right, 0, 20.0), "Right at max consumed")
+  let _ = tree.frame(320.0, 240.0, now=24.0)
+  r2a_assert(rc.focused_date() == max_d && d30.focused(), "Right at max retains focused_date=30 and real focus on d30")
+  tree.dispose()
+}
+
+test "r4-cal-retained Calendar: PageDown skips earlier inert same-day cell and focuses visible interactive cell" {
+  let sel : signals::Signal[Option[headless_core::IsoDate]] = signals::signal_by(None, fn(a, b) {
+    match (a, b) {
+      (None, None) => true
+      (Some(x), Some(y)) => x == y
+      _ => false
+    }
+  })
+  let nov15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let dec15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = calendar(
+      root,
+      fn() -> String { "DualMonthRetained" },
+      headless_core::IsoDate::new(2026, 11, 15),
+      fn() -> Option[headless_core::IsoDate] { sel.get() },
+      fn(d : headless_core::IsoDate) { sel.set(Some(d)) },
+      fn(v : view::View, cal : Calendar) {
+        nov15_ref.v = Some(cal.day_cell(v, headless_core::IsoDate::new(2026, 11, 15), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+        let _ = v.box(fn(inert : view::View) {
+          let _ = inert.presses(view::Live::Is(false))
+          let _ = cal.day_cell(inert, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+            let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+          })
+        })
+        dec15_ref.v = Some(cal.day_cell(v, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+      },
+    )
+  })
+  let _ = tree.frame(320.0, 240.0, now=0.0)
+  let nov15 = match nov15_ref.v { Some(x) => x; None => panic("missing nov15") }
+  let dec15 = match dec15_ref.v { Some(x) => x; None => panic("missing dec15") }
+  let _ = nov15.ask_focus(visible=true)
+  let _ = tree.frame(320.0, 240.0, now=8.0)
+  r2a_assert(tree.key_at(headless_core::key_page_down, 0, 12.0), "PageDown handled with inert duplicate")
+  let _ = tree.frame(320.0, 240.0, now=16.0)
+  r2a_assert(!nov15.focused() && dec15.focused(), "real focus skipped inert cell and landed on visible dec15")
+  let _ = tree.key_at(headless_core::key_enter, 0, 20.0)
+  let _ = tree.frame(320.0, 240.0, now=24.0)
+  r2a_assert(opt_iso_date_eq(sel.get(), Some(headless_core::IsoDate::new(2026, 12, 15))), "Enter activates visible dec15")
+  tree.dispose()
+}
+
+test "r4-cal-remount-inert Calendar: remounting inert same-day cell before visible cell preserves pending_focus" {
+  let month_sig = signals::signal(11)
+  let nov15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let dec15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = calendar(
+      root,
+      fn() -> String { "RemountInert" },
+      headless_core::IsoDate::new(2026, 11, 15),
+      fn() -> Option[headless_core::IsoDate] { None },
+      fn(_d : headless_core::IsoDate) {},
+      fn(v : view::View, cal : Calendar) {
+        let _ = v.show(fn() -> Bool { month_sig.get() == 11 }, fn(m11 : view::View) {
+          nov15_ref.v = Some(cal.day_cell(m11, headless_core::IsoDate::new(2026, 11, 15), fn(cv, _s, _o) {
+            let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+          }))
+        })
+        let _ = v.show(fn() -> Bool { month_sig.get() == 12 }, fn(m12 : view::View) {
+          let _ = m12.box(fn(inert : view::View) {
+            let _ = inert.presses(view::Live::Is(false))
+            let _ = cal.day_cell(inert, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+              let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+            })
+          })
+          dec15_ref.v = Some(cal.day_cell(m12, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+            let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+          }))
+        })
+      },
+    )
+  })
+  let _ = tree.frame(320.0, 240.0, now=0.0)
+  let nov15 = match nov15_ref.v { Some(x) => x; None => panic("missing nov15") }
+  let _ = nov15.ask_focus(visible=true)
+  let _ = tree.frame(320.0, 240.0, now=8.0)
+  r2a_assert(tree.key_at(headless_core::key_page_down, 0, 12.0), "PageDown sets pending_focus")
+  month_sig.set(12)
+  let _ = tree.frame(320.0, 240.0, now=16.0)
+  let dec15 = match dec15_ref.v { Some(x) => x; None => panic("missing dec15") }
+  r2a_assert(dec15.focused(), "pending_focus survived inert cell mount and focused visible dec15")
+  tree.dispose()
+}
+
+test "r4-rcal-retained RangeCalendar: PageDown skips earlier inert same-day cell and focuses visible cell" {
+  let range_sig : signals::Signal[Option[(headless_core::IsoDate, headless_core::IsoDate)]] = signals::signal_by(None, fn(a, b) {
+    match (a, b) {
+      (None, None) => true
+      (Some((s1, e1)), Some((s2, e2))) => s1 == s2 && e1 == e2
+      _ => false
+    }
+  })
+  let nov15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let dec15_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let tree = r2a_make_tree(fn(root : view::View) {
+    let _ = range_calendar(
+      root,
+      fn() -> String { "RangeRetained" },
+      headless_core::IsoDate::new(2026, 11, 15),
+      fn() -> Option[(headless_core::IsoDate, headless_core::IsoDate)] { range_sig.get() },
+      fn(s, e) { range_sig.set(Some((s, e))) },
+      fn(v : view::View, rc : RangeCalendar) {
+        nov15_ref.v = Some(rc.day_cell(v, headless_core::IsoDate::new(2026, 11, 15), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+        let _ = v.box(fn(inert : view::View) {
+          let _ = inert.presses(view::Live::Is(false))
+          let _ = rc.day_cell(inert, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+            let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+          })
+        })
+        dec15_ref.v = Some(rc.day_cell(v, headless_core::IsoDate::new(2026, 12, 15), fn(cv, _s, _o) {
+          let _ = cv.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        }))
+      },
+    )
+  })
+  let _ = tree.frame(320.0, 240.0, now=0.0)
+  let nov15 = match nov15_ref.v { Some(x) => x; None => panic("missing nov15") }
+  let dec15 = match dec15_ref.v { Some(x) => x; None => panic("missing dec15") }
+  let _ = nov15.ask_focus(visible=true)
+  let _ = tree.frame(320.0, 240.0, now=8.0)
+  r2a_assert(tree.key_at(headless_core::key_page_down, 0, 12.0), "RangeCalendar PageDown handled")
+  let _ = tree.frame(320.0, 240.0, now=16.0)
+  r2a_assert(!nov15.focused() && dec15.focused(), "RangeCalendar real focus skipped inert cell and landed on visible dec15")
+  tree.dispose()
+}

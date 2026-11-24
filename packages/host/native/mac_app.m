@@ -3198,6 +3198,8 @@ int32_t mb_host_keyboard(void) { return 1; }
 @interface MBA11yNode : NSObject
 @property(nonatomic) int nid, parent, widget;
 @property(nonatomic, copy) NSString *role, *flags, *label, *value, *help, *actions;
+@property(nonatomic, copy) NSString *current, *sort;
+@property(nonatomic) int controls, activeDescendant;
 @property(nonatomic) NSRect rel;
 @property(nonatomic) BOOL range;
 @property(nonatomic) double low, at, high;
@@ -3302,7 +3304,39 @@ static id a11y_hit(NSPoint screen) {
   return best ? a11y_element(best) : nil;
 }
 
-static id a11y_focused_element(void) { return a11y_focus ? a11y_element(a11y_focus) : nil; }
+// The node VoiceOver is told has the focus: the focused node's live active descendant (aria-activedescendant: the item
+// browsed to while the keyboard's focus stays on the input or list), else the focused node itself. Never a selection:
+// selected stays the node's own 's'.
+static int a11y_focus_target(int focus) {
+  MBA11yNode *n = focus ? a11y_nodes[@(focus)] : nil;
+  if (n && n.activeDescendant > 0 && n.activeDescendant != focus && a11y_nodes[@(n.activeDescendant)])
+    return n.activeDescendant;
+  return focus;
+}
+
+static id a11y_focused_element(void) {
+  int f = a11y_focus_target(a11y_focus);
+  return f ? a11y_element(f) : nil;
+}
+
+// The nodes under `nid` said chosen ('s'), in the tree's order: a list's, a grid's, a tree's selected children
+// (aria-selected), never the item merely browsed to (its active descendant). Not into another such holder.
+static void a11y_chosen_under(int nid, NSMutableArray *out, int depth) {
+  if (depth > 64) return;
+  for (NSNumber *k in a11y_nodes[@(nid)].kids) {
+    MBA11yNode *c = a11y_nodes[k];
+    if (!c) continue;
+    if (a11y_has(c.flags, 's')) {
+      MBA11yElement *e = a11y_element(c.nid);
+      if (e) [out addObject:e];
+      continue;
+    }
+    if ([c.role isEqualToString:@"Listbox"] || [c.role isEqualToString:@"Grid"] || [c.role isEqualToString:@"Table"] ||
+        [c.role isEqualToString:@"TabList"])
+      continue;
+    a11y_chosen_under(c.nid, out, depth + 1);
+  }
+}
 
 // what is asked of the node's widget, posted to the app (`text`: the words a set_text puts in it)
 static void a11y_ask(MBA11yNode *n, NSString *action, NSString *text) {
@@ -3339,6 +3373,9 @@ static void a11y_ask(MBA11yNode *n, NSString *action, NSString *text) {
       @"ScrollArea" : NSAccessibilityScrollAreaRole,
       @"Table" : NSAccessibilityTableRole, @"Row" : NSAccessibilityRowRole,
       @"ColumnHeader" : NSAccessibilityCellRole, @"Cell" : NSAccessibilityCellRole,
+      // AppKit equivalents for Meter, Grid, GridCell, SpinButton
+      @"Meter" : NSAccessibilityLevelIndicatorRole, @"Grid" : NSAccessibilityGridRole,
+      @"GridCell" : NSAccessibilityCellRole, @"SpinButton" : NSAccessibilityIncrementorRole,
     };
   return roles[self.node.role] ?: NSAccessibilityGroupRole;
 }
@@ -3378,7 +3415,7 @@ static void a11y_ask(MBA11yNode *n, NSString *action, NSString *text) {
   return !a11y_has(self.node.flags, 'd');
 }
 - (BOOL)isAccessibilityFocused {
-  return self.node && self.nid == a11y_focus;
+  return self.node && self.nid == a11y_focus_target(a11y_focus);
 }
 - (BOOL)isAccessibilitySelected {
   return a11y_has(self.node.flags, 's');
@@ -3410,7 +3447,41 @@ static void a11y_ask(MBA11yNode *n, NSString *action, NSString *text) {
   return out;
 }
 - (NSArray *)accessibilityRows {
-  return [self.node.role isEqualToString:@"Table"] ? [self a11y_kids_said:@"Row"] : nil;
+  return ([self.node.role isEqualToString:@"Table"] || [self.node.role isEqualToString:@"Grid"])
+             ? [self a11y_kids_said:@"Row"]
+             : nil;
+}
+// AppKit equivalent of ARIA aria-controls: linked UI elements pointing to the controlled target
+- (NSArray *)accessibilityLinkedUIElements {
+  MBA11yNode *n = self.node;
+  if (!n || n.controls <= 0 || n.controls == n.nid) return nil;
+  MBA11yElement *ctrl = a11y_element(n.controls);
+  return ctrl ? @[ ctrl ] : nil;
+}
+// AppKit's selected children (ARIA aria-selected) of a list, grid, tree or tab list: those said chosen ('s') alone.
+// The active descendant (aria-activedescendant) is not a selection: it is told as the focus (a11y_focus_target).
+- (NSArray *)accessibilitySelectedChildren {
+  MBA11yNode *n = self.node;
+  if (!n) return nil;
+  NSString *r = n.role;
+  if (![r isEqualToString:@"Listbox"] && ![r isEqualToString:@"Grid"] && ![r isEqualToString:@"Table"] &&
+      ![r isEqualToString:@"TabList"])
+    return nil;
+  NSMutableArray *out = [NSMutableArray array];
+  a11y_chosen_under(n.nid, out, 0);
+  return out;
+}
+// AppKit equivalent of ARIA aria-busy, aria-current, aria-sort, aria-multiselectable via role description
+- (NSString *)accessibilityRoleDescription {
+  MBA11yNode *n = self.node;
+  if (!n) return [super accessibilityRoleDescription];
+  NSMutableArray<NSString *> *parts = [NSMutableArray array];
+  if (a11y_has(n.flags, 'b')) [parts addObject:@"busy"];
+  if (a11y_has(n.flags, 'u')) [parts addObject:@"multiselectable"];
+  if (n.current.length) [parts addObject:[NSString stringWithFormat:@"current %@", n.current]];
+  if (n.sort.length && ![n.sort isEqualToString:@"none"]) [parts addObject:[NSString stringWithFormat:@"sorted %@", n.sort]];
+  if (parts.count) return [parts componentsJoinedByString:@", "];
+  return [super accessibilityRoleDescription];
 }
 - (NSArray *)accessibilityColumnHeaderUIElements {
   NSString *r = self.node.role;
@@ -3527,6 +3598,8 @@ void mb_host_a11y_tree(moonbit_string_t s) {
   if (head.count < 3 || ![head[0] isEqualToString:@"T"]) return;
   BOOL full = [head[1] isEqualToString:@"1"];
   int focus = head[2].intValue;
+  // (the focus VoiceOver was told of, as the nodes were before this update: a11y_focus_target)
+  int was_target = a11y_nodes ? a11y_focus_target(a11y_focus) : a11y_focus;
   if (!a11y_nodes) a11y_nodes = [NSMutableDictionary dictionary];
   if (full) {
     [a11y_nodes removeAllObjects];
@@ -3550,6 +3623,10 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     n.kids = [NSMutableArray array];
     if (f[16].length)
       for (NSString *k in [f[16] componentsSeparatedByString:@","]) [n.kids addObject:@(k.intValue)];
+    n.current = f.count > 17 ? a11y_unescape(f[17]) : @"";
+    n.sort = f.count > 18 ? a11y_unescape(f[18]) : @"";
+    n.controls = (f.count > 19 && f[19].length) ? f[19].intValue : 0;
+    n.activeDescendant = (f.count > 20 && f[20].length) ? f[20].intValue : 0;
     MBA11yNode *o = a11y_nodes[@(n.nid)];
     if (o) {
       n.parent = o.parent;
@@ -3585,8 +3662,11 @@ void mb_host_a11y_tree(moonbit_string_t s) {
       if (a11y_elements[@(n.nid)]) NSAccessibilityPostNotification(a11y_elements[@(n.nid)], NSAccessibilityValueChangedNotification);
   }
   if (a11y_asked && shape) NSAccessibilityPostNotification(the_view, NSAccessibilityLayoutChangedNotification);
-  if (a11y_asked && focus != a11y_focus && focus && a11y_element(focus))
-    NSAccessibilityPostNotification(a11y_element(focus), NSAccessibilityFocusedUIElementChangedNotification);
+  // (the focus told as it moves, and as the focused node's active descendant switches to another live item: the
+  // keyboard's focus staying on the input or list, VoiceOver reads the item browsed to; its selection untouched)
+  int target = a11y_focus_target(focus);
+  if (a11y_asked && (focus != a11y_focus || target != was_target) && target && a11y_element(target))
+    NSAccessibilityPostNotification(a11y_element(target), NSAccessibilityFocusedUIElementChangedNotification);
   a11y_focus = focus;
   if (getenv("MBUI_A11Y_SELFCHECK") && !a11y_selfcheck_done) dispatch_async(dispatch_get_main_queue(), ^{
       a11y_selfcheck();

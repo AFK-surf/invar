@@ -12,7 +12,7 @@ OUT_DIR="${INVAR_LINUX_OUT:-$ROOT/target/linux-host}"
 OBJ_DIR="$OUT_DIR/obj"
 LIB="$OUT_DIR/libinvar_host_linux.a"
 
-PKG_LIBS="gtk4 epoxy pangocairo pangoft2 fontconfig gdk-pixbuf-2.0 libsoup-3.0 zlib"
+PKG_LIBS="gtk4 epoxy pangocairo pangoft2 fontconfig freetype2 gdk-pixbuf-2.0 libsoup-3.0 zlib"
 if ! pkg-config --exists $PKG_LIBS; then
   echo "ERROR: Missing Linux dev libraries. Required pkg-config modules:" >&2
   echo "  $PKG_LIBS" >&2
@@ -100,6 +100,19 @@ fi
 
 ls -lh "$LIB"
 echo "==> Linux EGL/GLES3 host archive check PASSED (${#OBJS[@]} objects)"
+
+# WOFF2 -> SFNT (linux_text.c mb_sfnt_of_face) on the bundled Inter: each table's checksum and the whole file's
+# 0xB1B0AFBA (head.checkSumAdjustment), the tables byte for byte, FreeType reading it back.
+echo "==> Building and running packages/host/tests/linux_sfnt_test.c (web/inter.woff2)"
+$CC -O2 -Wall -Wextra -Wno-unused-function -Ipackages/host/native $(pkg-config --cflags freetype2) \
+  packages/host/tests/linux_sfnt_test.c -o "$OUT_DIR/linux_sfnt_test" $(pkg-config --libs freetype2)
+"$OUT_DIR/linux_sfnt_test" web/inter.woff2
+
+echo "==> Building and running packages/host/tests/linux_gles_fbo_fail_test.c (Mesa llvmpipe)"
+$CC -O2 -Wall -Wextra -Ipackages/host/compat packages/host/tests/linux_gles_fbo_fail_test.c "$LIB" \
+  -o "$OUT_DIR/linux_gles_fbo_fail_test" \
+  $(pkg-config --libs $PKG_LIBS) -lEGL -lm -lpthread -ldl
+LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$OUT_DIR/linux_gles_fbo_fail_test"
 
 echo "==> Kept groups (groups.h) unit test"
 $CC -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all \

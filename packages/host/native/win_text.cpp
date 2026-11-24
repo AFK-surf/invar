@@ -504,7 +504,7 @@ static IDWriteTypography *typographies[16];
 // the typography of a style's features (NULL: none, the font's own)
 static IDWriteTypography *typography_for(int style) {
   int face = face_id(style);
-  int k = ((style & 8) ? 1 : 0) | ((style & 32) ? 2 : 0) | ((style & 64) ? 4 : 0) | (face == 1 || face == 2 ? 8 : 0);
+  int k = ((style & 8) ? 1 : 0) | ((style & 32) ? 2 : 0) | ((style & 64) ? 4 : 0) | (((face == 1 || face == 2) && !(style & 128)) ? 8 : 0);
   if (!k) return NULL;
   if (!typographies[k]) {
     IDWriteTypography *t = NULL;

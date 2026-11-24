@@ -35,6 +35,8 @@ final class A11y extends AccessibilityNodeProvider {
     static final class Node {
         int id, parent, widget;
         String role = "", flags = "", label = "", value = "", description = "", actions = "";
+        String current = "", sort = "";
+        int controls, activeDescendant;
         float x, y, w, h;
         boolean range;
         float low, at, high;
@@ -156,6 +158,8 @@ final class A11y extends AccessibilityNodeProvider {
             return;
         }
         int prevInputFocus = inputFocus;
+        // (the item TalkBack was told has the focus, as the nodes were before this update: focusTarget)
+        int prevTarget = focusTarget(prevInputFocus);
         if (full) nodes.clear();
         try {
             inputFocus = Integer.parseInt(head[2]);
@@ -189,6 +193,10 @@ final class A11y extends AccessibilityNodeProvider {
                 n.actions = f[14];
                 n.widget = Integer.parseInt(f[15]);
                 if (!f[16].isEmpty()) for (String k : f[16].split(",")) n.kids.add(Integer.parseInt(k));
+                if (f.length > 17) n.current = unescape(f[17]);
+                if (f.length > 18) n.sort = unescape(f[18]);
+                if (f.length > 19 && !f[19].isEmpty()) n.controls = Integer.parseInt(f[19]);
+                if (f.length > 20 && !f[20].isEmpty()) n.activeDescendant = Integer.parseInt(f[20]);
                 Node was = nodes.get(n.id);
                 if (was != null) {
                     n.parent = was.parent;
@@ -236,6 +244,25 @@ final class A11y extends AccessibilityNodeProvider {
             view.removeCallbacks(sendContentEvent);
         }
         dispatchContentChanged();
+        // Virtual focus (ARIA aria-activedescendant): while the node with the keyboard's focus has a live active
+        // descendant, that item alone is the public input focus (TYPE_VIEW_FOCUSED, isFocused, findFocus(FOCUS_INPUT));
+        // when it unmounts or clears, focus returns to inputFocus. Selection (isSelected) stays the node's own 's'.
+        int target = focusTarget(inputFocus);
+        if (target != prevTarget && target != 0 && nodes.containsKey(target)) {
+            send(target, AccessibilityEvent.TYPE_VIEW_FOCUSED);
+        }
+    }
+
+    /**
+     * The node TalkBack is told has the input focus: the focused node's live active descendant (the item browsed to
+     * while the keyboard's focus stays on the input or list), else the focused node itself.
+     */
+    private int focusTarget(int focus) {
+        Node n = focus != 0 ? nodes.get(focus) : null;
+        if (n != null && n.activeDescendant > 0 && n.activeDescendant != focus && nodes.containsKey(n.activeDescendant)) {
+            return n.activeDescendant;
+        }
+        return focus;
     }
 
     private static boolean allScrollOnly(List<Node> told) {
@@ -313,6 +340,7 @@ final class A11y extends AccessibilityNodeProvider {
             case "Slider":
                 return "android.widget.SeekBar";
             case "ProgressBar":
+            case "Meter":
                 return "android.widget.ProgressBar";
             case "Image":
                 return "android.widget.ImageView";
@@ -320,12 +348,17 @@ final class A11y extends AccessibilityNodeProvider {
                 return "android.widget.EditText";
             case "Combobox":
                 return "android.widget.Spinner";
+            case "SpinButton":
+                return "android.widget.NumberPicker";
             case "ScrollArea":
                 return "android.widget.ScrollView";
             case "TabList":
                 return "android.widget.TabWidget";
             case "Table":
+            case "Grid":
                 return "android.widget.GridView";
+            case "GridCell":
+                return "android.view.View";
             case "Text":
             case "Heading":
             case "Link":
@@ -378,13 +411,38 @@ final class A11y extends AccessibilityNodeProvider {
             info.setContentDescription(n.label);
         }
         if ((n.role.equals("Heading") || n.role.equals("ColumnHeader")) && Build.VERSION.SDK_INT >= 28) info.setHeading(true);
-        if (!n.value.isEmpty() && !n.role.equals("TextField") && Build.VERSION.SDK_INT >= 30) info.setStateDescription(n.value);
+        if (Build.VERSION.SDK_INT >= 30) {
+            StringBuilder stateDesc = new StringBuilder();
+            if (!n.value.isEmpty() && !n.role.equals("TextField")) stateDesc.append(n.value);
+            if (has(n.flags, 'b')) {
+                if (stateDesc.length() > 0) stateDesc.append(", ");
+                stateDesc.append("busy");
+            }
+            if (!n.current.isEmpty()) {
+                if (stateDesc.length() > 0) stateDesc.append(", ");
+                stateDesc.append("current ").append(n.current);
+            }
+            if (!n.sort.isEmpty() && !n.sort.equals("none")) {
+                if (stateDesc.length() > 0) stateDesc.append(", ");
+                stateDesc.append("sorted ").append(n.sort);
+            }
+            if (stateDesc.length() > 0) info.setStateDescription(stateDesc.toString());
+        }
         if (!n.description.isEmpty() && Build.VERSION.SDK_INT >= 30) info.setTooltipText(n.description);
+        if (has(n.flags, 'u') && (n.role.equals("Listbox") || n.role.equals("Grid") || n.role.equals("Table"))) {
+            info.setCollectionInfo(AccessibilityNodeInfo.CollectionInfo.obtain(
+                    shownKids(id).size(), 1, false, AccessibilityNodeInfo.CollectionInfo.SELECTION_MODE_MULTIPLE));
+        }
         info.setCheckable(has(n.flags, 'c'));
         info.setChecked(has(n.flags, 'C'));
         info.setSelected(has(n.flags, 's'));
         info.setEnabled(!has(n.flags, 'd'));
-        info.setFocused(inputFocus == id);
+        int ft = focusTarget(inputFocus);
+        info.setFocused(ft != 0 && ft == id);
+        // aria-controls: the node it controls (a combobox's popup list) read next after it, while that is live
+        if (n.controls > 0 && n.controls != id && nodes.containsKey(n.controls)) {
+            info.setTraversalBefore(view, n.controls);
+        }
         if (n.range) info.setRangeInfo(AccessibilityNodeInfo.RangeInfo.obtain(AccessibilityNodeInfo.RangeInfo.RANGE_TYPE_FLOAT, n.low, n.high, n.at));
         boolean click = has(n.actions, 'a');
         info.setClickable(click);
@@ -409,6 +467,10 @@ final class A11y extends AccessibilityNodeProvider {
     @Override
     public AccessibilityNodeInfo findFocus(int focus) {
         if (focus == AccessibilityNodeInfo.FOCUS_ACCESSIBILITY && focused != HOST_VIEW_ID) return createAccessibilityNodeInfo(focused);
+        if (focus == AccessibilityNodeInfo.FOCUS_INPUT) {
+            int ft = focusTarget(inputFocus);
+            if (ft != 0 && nodes.containsKey(ft)) return createAccessibilityNodeInfo(ft);
+        }
         return null;
     }
 

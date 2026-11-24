@@ -1,4 +1,4 @@
-// smooth.mbt's corners for the renderers; scripts/chk corner-sl makes corner_sl.h and web/host.js from it.
+// smooth.mbt's corners for the renderers; scripts/sync_corner_sl.py makes corner_sl.h and web/host.js from it.
 //
 // How smooth a corner of radius r is where room is half its box's shorter side: 0 a circle's or a capsule's end, 1
 // superellipse(1.5) over r a quarter longer; between, as far as the room goes.
@@ -106,6 +106,12 @@ float mb_corner_of(float2 p, float4 r) {
 // few points high sharing a frame's corner is cut by the frame's very curve, not by one flattened to its half height.
 // Each corner against its own corner point; the rect's edges straight.
 float mb_clip_corner(float2 p, float2 k, float2 inward, float2 hs, float r, float s, float band) {
+  if (s < -0.5) {
+    float2 hv = max(hs, float2(r, r));
+    float2 cp = max(hv - (p - k) * inward, float2(0.0, 0.0));
+    float2 q = abs(cp) - hv + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+  }
   float R = r * (1.0 + 0.25 * s);
   float2 hv = max(hs, float2(R, R));
   return mb_sd_corner(max(hv - (p - k) * inward, float2(0.0, 0.0)), hv, r, s, band);
@@ -120,8 +126,13 @@ float mb_sd_clip(float2 p, float4 c, float4 r, float4 s, float band) {
   if (r.w > 0.0) d = max(d, mb_clip_corner(p, c.xw, float2(1.0, -1.0), hs, r.w, s.w, band));
   return d;
 }
-// A box's own corners: r at most its shorter half, as smooth as its size has room for (band: mb_sd_corner's).
+// A box's own corners: r >= 0 continuous superellipse/capsule; r < 0 exact CSS circular arc of radius |r|.
 float mb_sd_box(float2 p, float2 hs, float r, float band) {
+  if (r < 0.0) {
+    float rr = min(-r, min(hs.x, hs.y));
+    float2 q = abs(p) - hs + rr;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr;
+  }
   float room = min(hs.x, hs.y);
   float rr = min(r, room);
   return mb_sd_corner(p, hs, rr, mb_smoothness(rr, room), band);
@@ -163,11 +174,12 @@ float mb_contained_dist(float2 p, float4 box, float4 rr, float4 clip, float4 rc,
 // Skip the distance and search entirely along the straight parts of the edges and in the middle of the picture.
 bool mb_contained_corner(float2 p, float4 c, float4 r, float pad) {
   // A capsule's easing can reach two radii along its long edge.
-  float4 R = r * 2.5 + float4(pad, pad, pad, pad);
-  return (r.x > 0.0 && p.x < c.x + R.x && p.y < c.y + R.x) ||
-         (r.y > 0.0 && p.x > c.z - R.y && p.y < c.y + R.y) ||
-         (r.z > 0.0 && p.x > c.z - R.z && p.y > c.w - R.z) ||
-         (r.w > 0.0 && p.x < c.x + R.w && p.y > c.w - R.w);
+  float4 ar = abs(r);
+  float4 R = ar * 2.5 + float4(pad, pad, pad, pad);
+  return (ar.x > 0.0 && p.x < c.x + R.x && p.y < c.y + R.x) ||
+         (ar.y > 0.0 && p.x > c.z - R.y && p.y < c.y + R.y) ||
+         (ar.z > 0.0 && p.x > c.z - R.z && p.y > c.w - R.z) ||
+         (ar.w > 0.0 && p.x < c.x + R.w && p.y > c.w - R.w);
 }
 float2 mb_contained_point(float2 p, float4 box, float4 rr, float4 clip, float4 rc, float4 rs,
                           float4 outer, float4 orc, float4 ors, float pixel) {
@@ -223,7 +235,7 @@ float mb_shadow_row(float x, float y, float sigma, float r, float2 hs) {
   return 0.5 * (mb_erf((x + curved) * k) - mb_erf((x - curved) * k));
 }
 float mb_shadow(float2 p, float2 hs, float r, float sigma) {
-  float rr = min(r, min(hs.x, hs.y));
+  float rr = min(abs(r), min(hs.x, hs.y));
   float lo = clamp(-3.0 * sigma, p.y - hs.y, p.y + hs.y);
   float hi = clamp(3.0 * sigma, p.y - hs.y, p.y + hs.y);
   float st = (hi - lo) / 4.0;

@@ -4,6 +4,14 @@
 // atlas.mbt). Unhinted, positions not rounded to pixels, plain coverage: as Core Text and DirectWrite draw them for the
 // other hosts. The words' face is the system's (GTK's gtk-font-name, told by linux_app.c), else fontconfig's
 // sans-serif.
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_TRUETYPE_TABLES_H
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifndef MB_SFNT_ONLY  // (packages/host/tests/linux_sfnt_test.c takes the SFNT writer alone: mb_sfnt_of_face)
 #include <cairo.h>
 #include <fontconfig/fontconfig.h>
 #include <glib.h>
@@ -11,11 +19,104 @@
 #include <math.h>
 #include <pango/pangocairo.h>
 #include <pango/pangofc-fontmap.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "linux.h"
+#endif
+
+// ---- a face's tables as a plain SFNT ----
+
+static void put32(unsigned char *p, uint32_t v) {
+  p[0] = (unsigned char)(v >> 24), p[1] = (unsigned char)(v >> 16), p[2] = (unsigned char)(v >> 8), p[3] = (unsigned char)v;
+}
+static void put16(unsigned char *p, uint32_t v) { p[0] = (unsigned char)(v >> 8), p[1] = (unsigned char)v; }
+
+// OpenType's checksum of n bytes at p (n a multiple of 4: tables are padded with zeros to 4): their big-endian
+// uint32s summed, wrapping.
+static uint32_t mb_sfnt_sum(const unsigned char *p, size_t n) {
+  uint32_t sum = 0;
+  for (size_t k = 0; k + 3 < n; k += 4)
+    sum += (uint32_t)p[k] << 24 | (uint32_t)p[k + 1] << 16 | (uint32_t)p[k + 2] << 8 | (uint32_t)p[k + 3];
+  return sum;
+}
+
+// The tables of `face` (FreeType's: a WOFF / WOFF2 file's unwrapped, its glyf/loca rebuilt) written out again as a
+// plain SFNT, in ascending tag order (OpenType's rule) each padded to 4, and checksummed as OpenType says
+// (https://learn.microsoft.com/typography/opentype/spec/otff#calculating-checksums): each table's in the directory,
+// head's with its checkSumAdjustment (offset 8) taken as 0, then that adjustment set so the whole file sums to
+// 0xB1B0AFBA. Malloc'd, its length in *out_len; NULL where a table cannot be read, there are none or too many, or the
+// file would pass 32-bit offsets.
+static unsigned char *mb_sfnt_of_face(FT_Face face, size_t *out_len) {
+  *out_len = 0;
+  FT_ULong count = 0, tag = 0, len = 0;
+  while (count < 0x10000 && FT_Sfnt_Table_Info(face, (FT_UInt)count, &tag, &len) == 0) count++;
+  if (count == 0 || count > 0xFFFF) return NULL;
+  FT_ULong *tags = calloc(count, sizeof(FT_ULong)), *lens = calloc(count, sizeof(FT_ULong));
+  unsigned char *buf = NULL;
+  if (!tags || !lens) goto fail;
+  int has_cff = 0;
+  for (FT_ULong i = 0; i < count; i++) {
+    if (FT_Sfnt_Table_Info(face, (FT_UInt)i, &tags[i], &lens[i]) != 0) goto fail;
+    has_cff |= tags[i] == FT_MAKE_TAG('C', 'F', 'F', ' ') || tags[i] == FT_MAKE_TAG('C', 'F', 'F', '2');
+  }
+  for (FT_ULong i = 1; i < count; i++)  // the table directory in ascending tag order
+    for (FT_ULong j = i; j > 0 && tags[j - 1] > tags[j]; j--) {
+      FT_ULong t = tags[j], l = lens[j];
+      tags[j] = tags[j - 1], lens[j] = lens[j - 1], tags[j - 1] = t, lens[j - 1] = l;
+    }
+  // (every offset and length a uint32: the whole file kept under 4 GiB, each step checked before it is added)
+  const uint64_t most = 0xFFFFFFFFULL;
+  uint64_t total = 12 + 16 * (uint64_t)count;
+  for (FT_ULong i = 0; i < count; i++) {
+    uint64_t l = (uint64_t)lens[i];
+    if (l > most - 3) goto fail;
+    uint64_t padded = (l + 3) & ~(uint64_t)3;
+    if (padded > most - total) goto fail;
+    total += padded;
+  }
+  if ((uint64_t)(size_t)total != total) goto fail;
+  buf = calloc(1, (size_t)total);
+  if (!buf) goto fail;
+  put32(buf, has_cff ? 0x4F54544FU : 0x00010000U);
+  uint32_t sel = 0;
+  while ((2U << sel) <= count) sel++;
+  put16(buf + 4, (uint32_t)count);
+  put16(buf + 6, 16U << sel);
+  put16(buf + 8, sel);
+  put16(buf + 10, (uint32_t)count * 16 - (16U << sel));
+  size_t at = 12 + 16 * (size_t)count, head_at = 0;
+  int has_head = 0;
+  for (FT_ULong i = 0; i < count; i++) {
+    FT_ULong l = lens[i];
+    size_t padded = ((size_t)lens[i] + 3) & ~(size_t)3;
+    if (FT_Load_Sfnt_Table(face, tags[i], 0, buf + at, &l) != 0 || l != lens[i]) goto fail;
+    if (tags[i] == FT_MAKE_TAG('h', 'e', 'a', 'd')) {
+      // (its checksum is of head with checkSumAdjustment 0: set once the whole file is summed, below)
+      if (lens[i] < 12) goto fail;
+      memset(buf + at + 8, 0, 4);
+      head_at = at;
+      has_head = 1;
+    }
+    unsigned char *d = buf + 12 + 16 * i;
+    put32(d, (uint32_t)tags[i]);
+    put32(d + 4, mb_sfnt_sum(buf + at, padded));
+    put32(d + 8, (uint32_t)at);
+    put32(d + 12, (uint32_t)lens[i]);
+    at += padded;
+  }
+  if (has_head) put32(buf + head_at + 8, 0xB1B0AFBAU - mb_sfnt_sum(buf, (size_t)total));
+  free(tags);
+  free(lens);
+  *out_len = (size_t)total;
+  return buf;
+fail:
+  free(buf);
+  free(tags);
+  free(lens);
+  return NULL;
+}
+
+#ifndef MB_SFNT_ONLY
 
 static char family_ui[128] = "sans-serif";
 static const char *MONO = "monospace";  // the code face (style & 2)
@@ -154,10 +255,123 @@ static void faces_changed(void) {
   generation++;
 }
 
-// The file at `path` (fontconfig reads it) made part of face `f`: its family's name kept.
-static int face_take(int f, const char *path) {
+// The files fonts given as bytes, or unwrapped from WOFF / WOFF2, were written to (removed as the run ends), and the
+// web fonts already unwrapped (by path, as the file was then: its size and time), their files taken again rather than
+// written once more each time a face takes the same file. One lock over both (faces may be added from any thread).
+static GMutex font_files_lock;
+static char **font_files;
+static int n_font_files;
+typedef struct {
+  char *from;
+  gint64 size, mtime;
+  char *to;
+} unwrapped_font;
+static unwrapped_font *unwrapped;
+static int n_unwrapped;
+static void font_files_remove(void) {
+  g_mutex_lock(&font_files_lock);
+  for (int i = 0; i < n_font_files; i++) {
+    g_unlink(font_files[i]);
+    g_free(font_files[i]);
+  }
+  free(font_files);
+  font_files = NULL;
+  n_font_files = 0;
+  for (int i = 0; i < n_unwrapped; i++) {
+    g_free(unwrapped[i].from);
+    g_free(unwrapped[i].to);
+  }
+  free(unwrapped);
+  unwrapped = NULL;
+  n_unwrapped = 0;
+  g_mutex_unlock(&font_files_lock);
+}
+
+// A file of this run's holding `data` (fontconfig and FreeType read files, and open them again whenever they draw).
+static char *font_file_write(const void *data, size_t len) {
+  static int n;
+  g_mutex_lock(&font_files_lock);
+  if (!n) atexit(font_files_remove);
+  int k = n++;
+  g_mutex_unlock(&font_files_lock);
+  char *dir = g_build_filename(g_get_user_runtime_dir(), "mbui-fonts", NULL);
+  g_mkdir_with_parents(dir, 0700);
+  char name[64];
+  snprintf(name, sizeof name, "%d-%d.font", (int)getpid(), k);
+  char *path = g_build_filename(dir, name, NULL);
+  g_free(dir);
+  if (len > (size_t)G_MAXSSIZE || !g_file_set_contents(path, (const char *)data, (gssize)len, NULL)) {
+    g_free(path);
+    return NULL;
+  }
+  g_mutex_lock(&font_files_lock);
+  char **more = realloc(font_files, sizeof(char *) * (size_t)(n_font_files + 1));
+  if (more) {
+    font_files = more;
+    font_files[n_font_files++] = g_strdup(path);
+  }
+  g_mutex_unlock(&font_files_lock);
+  if (!more) {  // (not kept to remove: removed now, not handed out)
+    g_unlink(path);
+    g_free(path);
+    return NULL;
+  }
+  return path;
+}
+
+// A WOFF or WOFF2 file (a web font, as web/inter.woff2) as the plain SFNT it wraps (mb_sfnt_of_face), written to a
+// file of this run's (g_free it); NULL for any other file. fontconfig takes WOFF2 (FreeType unwraps it) but Pango
+// shapes and draws with HarfBuzz, which reads only plain SFNT: a WOFF2 face given as is matched no font and the words
+// fell back to sans-serif. The same file (path, size and time) unwrapped once a run.
+static char *sfnt_of_web_font(const char *path) {
+  unsigned char magic[4] = {0};
+  FILE *fp = fopen(path, "rb");
+  if (!fp) return NULL;
+  size_t got = fread(magic, 1, 4, fp);
+  fclose(fp);
+  if (got != 4 || magic[0] != 'w' || magic[1] != 'O' || magic[2] != 'F' || (magic[3] != 'F' && magic[3] != '2')) return NULL;
+  GStatBuf st;
+  if (g_stat(path, &st) != 0) return NULL;
+  gint64 size = (gint64)st.st_size, mtime = (gint64)st.st_mtime;
+  g_mutex_lock(&font_files_lock);
+  for (int i = 0; i < n_unwrapped; i++)
+    if (unwrapped[i].size == size && unwrapped[i].mtime == mtime && strcmp(unwrapped[i].from, path) == 0) {
+      char *to = g_strdup(unwrapped[i].to);
+      g_mutex_unlock(&font_files_lock);
+      return to;
+    }
+  g_mutex_unlock(&font_files_lock);
+  FT_Library lib;
+  if (FT_Init_FreeType(&lib)) return NULL;
+  FT_Face face;
+  char *out = NULL;
+  if (FT_New_Face(lib, path, 0, &face) == 0) {
+    size_t total = 0;
+    unsigned char *buf = mb_sfnt_of_face(face, &total);
+    if (buf) out = font_file_write(buf, total);
+    free(buf);
+    FT_Done_Face(face);
+  }
+  FT_Done_FreeType(lib);
+  if (out) {
+    g_mutex_lock(&font_files_lock);
+    unwrapped_font *more = realloc(unwrapped, sizeof(unwrapped_font) * (size_t)(n_unwrapped + 1));
+    if (more) {
+      unwrapped = more;
+      unwrapped[n_unwrapped++] = (unwrapped_font){g_strdup(path), size, mtime, g_strdup(out)};
+    }
+    g_mutex_unlock(&font_files_lock);
+  }
+  return out;
+}
+
+// The file at `path` (fontconfig reads it) made part of face `f`: its family's name kept. A WOFF / WOFF2 file is
+// taken as the SFNT it wraps (sfnt_of_web_font).
+static int face_take(int f, const char *given) {
   init();
   if (f <= 0 || f >= MB_FACES) return 0;
+  char *unwrapped = sfnt_of_web_font(given);
+  const char *path = unwrapped ? unwrapped : given;
   int count = 0;
   FcPattern *p = FcFreeTypeQuery((const FcChar8 *)path, 0, NULL, &count);
   FcChar8 *family = NULL;
@@ -168,6 +382,7 @@ static int face_take(int f, const char *path) {
     faces[f].has = 1;
   }
   if (p) FcPatternDestroy(p);
+  g_free(unwrapped);
   if (ok) faces_changed();
   return ok;
 }
@@ -186,38 +401,12 @@ int32_t mb_host_face_add(int32_t f, moonbit_string_t path, int32_t weight) {
   return ok;
 }
 
-// The files fonts given as bytes were written to, removed as the run ends (atexit): not before, fontconfig and FreeType
-// opening them again whenever they draw in them.
-static char **font_files;
-static int n_font_files;
-static void font_files_remove(void) {
-  for (int i = 0; i < n_font_files; i++) {
-    g_unlink(font_files[i]);
-    g_free(font_files[i]);
-  }
-  free(font_files);
-  font_files = NULL;
-  n_font_files = 0;
-}
-
 // A font as bytes: written to a file of this run's (fontconfig reads files), then as a file.
 int32_t mb_host_face_add_bytes(int32_t f, moonbit_bytes_t data, int32_t weight) {
   (void)weight;
-  static int n;
-  if (!n) atexit(font_files_remove);
-  char *dir = g_build_filename(g_get_user_runtime_dir(), "mbui-fonts", NULL);
-  g_mkdir_with_parents(dir, 0700);
-  char name[64];
-  snprintf(name, sizeof name, "%d-%d.font", (int)getpid(), n++);
-  char *path = g_build_filename(dir, name, NULL);
-  int written = g_file_set_contents(path, (const char *)data, Moonbit_array_length(data), NULL);
-  if (written) {
-    font_files = realloc(font_files, sizeof(char *) * (size_t)(n_font_files + 1));
-    font_files[n_font_files++] = g_strdup(path);
-  }
-  int ok = written && face_take(f, path);
+  char *path = font_file_write((const char *)data, (size_t)Moonbit_array_length(data));
+  int ok = path && face_take(f, path);
   g_free(path);
-  g_free(dir);
   return ok;
 }
 
@@ -292,22 +481,33 @@ static PangoFontDescription *desc_for(double size, int weight, int style) {
   pango_font_description_set_weight(d, (PangoWeight)weight);
   pango_font_description_set_style(d, (style & 1) ? PANGO_STYLE_ITALIC : PANGO_STYLE_NORMAL);
   pango_font_description_set_absolute_size(d, size * PANGO_SCALE);
+  // A face with an optical-size axis (Inter's opsz 14..32) drawn at the size it is drawn at, as Core Text and browsers
+  // (font-optical-sizing: auto) draw it; Pango leaves the axis at its default (opsz 14: wider, looser display sizes).
+  // A face without the axis ignores it.
+  // (its number written with a point whatever the locale: de_DE's "opsz=14,5" is no variation Pango reads)
+  char num[G_ASCII_DTOSTR_BUF_SIZE], v[G_ASCII_DTOSTR_BUF_SIZE + 8];
+  snprintf(v, sizeof v, "opsz=%s", g_ascii_formatd(num, sizeof num, "%g", size));
+  pango_font_description_set_variations(d, v);
   return d;
 }
 
 // style & 8: no ligatures (words with letter spacing, each cluster spaced on its own); style & 32: digits all one
-// width (style.mbt style_tabular); style & 64: a CJK face's marks narrow among Latin letters (style_proportional)
+// width (style.mbt style_tabular); style & 64: a CJK face's marks narrow among Latin letters (style_proportional);
+// style & 128: opt out of stylistic alternates (cv11/ss01) on faces 1 and 2 (style_no_alternates).
 static PangoLayout *make_layout(const char *s, int n, double size, int weight, int style) {
   PangoLayout *l = pango_layout_new(ctx);
   PangoFontDescription *d = desc_for(size, weight, style);
   pango_layout_set_font_description(l, d);
   pango_font_description_free(d);
-  if (style & (8 | 32 | 64)) {
+  int face = face_id(style);
+  int alts = (face == 1 || face == 2) && !(style & 128);
+  if ((style & (8 | 32 | 64)) || alts) {
     PangoAttrList *a = pango_attr_list_new();
-    char f[48] = "";
+    char f[64] = "";
     if (style & 8) strcat(f, "liga=0,clig=0,");
     if (style & 32) strcat(f, "tnum=1,");
     if (style & 64) strcat(f, "pwid=1,");
+    if (alts) strcat(f, "cv11=1,ss01=1,");
     f[strlen(f) - 1] = 0;
     pango_attr_list_insert(a, pango_attr_font_features_new(f));
     pango_layout_set_attributes(l, a);
@@ -731,3 +931,4 @@ int32_t mb_host_ref_frame(moonbit_string_t name) {
   ref_path(name, path, sizeof path);
   return mb_render_snapshot(path);
 }
+#endif  // MB_SFNT_ONLY

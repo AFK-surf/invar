@@ -2184,6 +2184,8 @@ int32_t mb_host_keyboard(void) {
 @interface MBA11yNode : NSObject
 @property(nonatomic) int nid, parent, widget;
 @property(nonatomic, copy) NSString *role, *flags, *label, *value, *help, *actions;
+@property(nonatomic, copy) NSString *current, *sort;
+@property(nonatomic) int controls, activeDescendant;
 @property(nonatomic) CGRect rel;
 @property(nonatomic) BOOL range;
 @property(nonatomic) double low, at, high;
@@ -2199,6 +2201,17 @@ int32_t mb_host_keyboard(void) {
 static NSMutableDictionary<NSNumber *, MBA11yNode *> *a11y_nodes;
 static NSMutableDictionary<NSNumber *, MBA11yElement *> *a11y_elements;
 static BOOL a11y_watched;
+static int a11y_input_focus;  // the node with the keyboard's focus, as the app told it (0: none)
+
+// The node VoiceOver is moved to as the focus: the focused node's live active descendant (aria-activedescendant: the item
+// browsed to while the keyboard's focus stays on the input or list), else the focused node itself. Never a selection:
+// the Selected trait stays the node's own 's'.
+static int a11y_focus_target(int focus) {
+  MBA11yNode *n = focus ? a11y_nodes[@(focus)] : nil;
+  if (n && n.activeDescendant > 0 && n.activeDescendant != focus && a11y_nodes[@(n.activeDescendant)])
+    return n.activeDescendant;
+  return focus;
+}
 
 static BOOL a11y_has(NSString *letters, unichar c) {
   return [letters rangeOfString:[NSString stringWithCharacters:&c length:1]].location != NSNotFound;
@@ -2237,7 +2250,8 @@ static BOOL a11y_groups(MBA11yNode *n) {
   if (!groups)
     groups = [NSSet setWithArray:@[
       @"Group", @"RadioGroup", @"TabList", @"TabPanel", @"Dialog", @"AlertDialog", @"Menu", @"MenuBar", @"Listbox",
-      @"Toolbar", @"Region", @"Navigation", @"Form", @"ScrollArea", @"Table", @"Row", @"Cell", @"ColumnHeader"
+      @"Toolbar", @"Region", @"Navigation", @"Form", @"ScrollArea", @"Table", @"Grid", @"Row", @"Cell", @"GridCell",
+      @"ColumnHeader"
     ]];
   return [groups containsObject:n.role] && a11y_shown_kids(n.nid).count > 0;
 }
@@ -2293,7 +2307,7 @@ static void a11y_ask(MBA11yNode *n, NSString *action) {
     return UIAccessibilityContainerTypeList;
   if ([r isEqualToString:@"Navigation"] || [r isEqualToString:@"Region"] || [r isEqualToString:@"Form"])
     return UIAccessibilityContainerTypeLandmark;
-  if ([r isEqualToString:@"Table"]) return UIAccessibilityContainerTypeDataTable;
+  if ([r isEqualToString:@"Table"] || [r isEqualToString:@"Grid"]) return UIAccessibilityContainerTypeDataTable;
   return UIAccessibilityContainerTypeSemanticGroup;
 }
 - (NSString *)accessibilityLabel {
@@ -2303,13 +2317,37 @@ static void a11y_ask(MBA11yNode *n, NSString *action) {
 - (NSString *)accessibilityValue {
   MBA11yNode *n = self.node;
   if (!n) return nil;
-  if (n.value.length) return n.value;
-  if (n.range && n.high > n.low) return [NSString stringWithFormat:@"%.0f%%", (n.at - n.low) / (n.high - n.low) * 100.0];
-  return nil;
+  // UIKit VoiceOver exposes ARIA busy/current/sort states alongside value text
+  NSMutableArray<NSString *> *parts = [NSMutableArray array];
+  if (n.value.length) [parts addObject:n.value];
+  else if (n.range && n.high > n.low)
+    [parts addObject:[NSString stringWithFormat:@"%.0f%%", (n.at - n.low) / (n.high - n.low) * 100.0]];
+  if (a11y_has(n.flags, 'b')) [parts addObject:@"busy"];
+  if (n.current.length) [parts addObject:[NSString stringWithFormat:@"current %@", n.current]];
+  if (n.sort.length && ![n.sort isEqualToString:@"none"]) [parts addObject:[NSString stringWithFormat:@"sorted %@", n.sort]];
+  return parts.count ? [parts componentsJoinedByString:@", "] : nil;
 }
 - (NSString *)accessibilityHint {
   NSString *h = self.node.help;
   return h.length ? h : nil;
+}
+// aria-controls: what the node controls (a combobox's popup list), while live, reached by a custom action that moves
+// VoiceOver there (iOS has no relation of its own for it)
+- (NSArray<UIAccessibilityCustomAction *> *)accessibilityCustomActions {
+  MBA11yNode *n = self.node;
+  if (!n || n.controls <= 0 || n.controls == n.nid || !a11y_nodes[@(n.controls)]) return nil;
+  int to = n.controls;
+  NSString *name = a11y_nodes[@(to)].label.length ? a11y_nodes[@(to)].label : @"Controlled list";
+  UIAccessibilityCustomAction *go = [[UIAccessibilityCustomAction alloc]
+      initWithName:name
+      actionHandler:^BOOL(UIAccessibilityCustomAction *action) {
+        (void)action;
+        MBA11yElement *e = a11y_nodes[@(to)] ? a11y_element(to) : nil;
+        if (!e) return NO;
+        UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, e);
+        return YES;
+      }];
+  return @[ go ];
 }
 - (UIAccessibilityTraits)accessibilityTraits {
   MBA11yNode *n = self.node;
@@ -2327,9 +2365,10 @@ static void a11y_ask(MBA11yNode *n, NSString *action) {
   if ([r isEqualToString:@"Heading"] || [r isEqualToString:@"ColumnHeader"]) t |= UIAccessibilityTraitHeader;
   if ([r isEqualToString:@"Image"]) t |= UIAccessibilityTraitImage;
   if ([r isEqualToString:@"Text"] || [r isEqualToString:@"Status"]) t |= UIAccessibilityTraitStaticText;
-  if ([r isEqualToString:@"ProgressBar"]) t |= UIAccessibilityTraitUpdatesFrequently;
+  if ([r isEqualToString:@"ProgressBar"] || [r isEqualToString:@"Meter"]) t |= UIAccessibilityTraitUpdatesFrequently;
   if ([r isEqualToString:@"TabList"]) t |= UIAccessibilityTraitTabBar;
-  if ([r isEqualToString:@"Slider"] || a11y_has(n.actions, 'i') || a11y_has(n.actions, 'd')) t |= UIAccessibilityTraitAdjustable;
+  if ([r isEqualToString:@"Slider"] || [r isEqualToString:@"SpinButton"] || a11y_has(n.actions, 'i') || a11y_has(n.actions, 'd'))
+    t |= UIAccessibilityTraitAdjustable;
   // (one checked or not: a toggle, on as it is checked)
   if (a11y_has(n.flags, 'c')) {
     t |= UIAccessibilityTraitToggleButton;
@@ -2368,7 +2407,7 @@ static void a11y_ask(MBA11yNode *n, NSString *action) {
 // a table (its container type DataTable) as UIKit reads one: its kids said Row its rows, each row's kids its cells
 - (NSArray<NSNumber *> *)a11y_rows {
   NSMutableArray<NSNumber *> *out = [NSMutableArray array];
-  if (![self.node.role isEqualToString:@"Table"]) return out;
+  if (![self.node.role isEqualToString:@"Table"] && ![self.node.role isEqualToString:@"Grid"]) return out;
   for (NSNumber *k in a11y_shown_kids(self.nid))
     if ([a11y_nodes[k].role isEqualToString:@"Row"]) [out addObject:k];
   return out;
@@ -2488,6 +2527,7 @@ void mb_host_a11y_tree(moonbit_string_t s) {
   NSArray<NSString *> *head = [lines.firstObject componentsSeparatedByString:@"\x1f"];
   if (head.count < 3 || ![head[0] isEqualToString:@"T"]) return;
   BOOL full = [head[1] isEqualToString:@"1"];
+  int focus = head[2].intValue;
   if (!a11y_nodes) a11y_nodes = [NSMutableDictionary dictionary];
   // (a part told to a host that has none: all of it asked for again)
   if (!full && !a11y_nodes.count) {
@@ -2495,6 +2535,8 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     mb_post("a11y", resend, sizeof resend - 1, NULL, 0);
     return;
   }
+  // (the item VoiceOver was moved to, as the nodes were before this update: a11y_focus_target)
+  int was_target = a11y_focus_target(a11y_input_focus);
   if (full) {
     [a11y_nodes removeAllObjects];
     [a11y_elements removeAllObjects];
@@ -2516,6 +2558,10 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     n.kids = [NSMutableArray array];
     if (f[16].length)
       for (NSString *k in [f[16] componentsSeparatedByString:@","]) [n.kids addObject:@(k.intValue)];
+    n.current = f.count > 17 ? a11y_unescape(f[17]) : @"";
+    n.sort = f.count > 18 ? a11y_unescape(f[18]) : @"";
+    n.controls = (f.count > 19 && f[19].length) ? f[19].intValue : 0;
+    n.activeDescendant = (f.count > 20 && f[20].length) ? f[20].intValue : 0;
     MBA11yNode *o = a11y_nodes[@(n.nid)];
     if (o) {
       n.parent = o.parent;
@@ -2550,8 +2596,15 @@ void mb_host_a11y_tree(moonbit_string_t s) {
   if (getenv("MBUI_A11Y_SELFCHECK") && !a11y_selfcheck_done) dispatch_async(dispatch_get_main_queue(), ^{
       a11y_selfcheck();
     });
+  a11y_input_focus = focus;
+  // Virtual focus (ARIA aria-activedescendant): only as the focused node's active descendant switches to another live
+  // item is VoiceOver moved there (a layout change naming it), the keyboard's focus staying on the input or list; the
+  // item is read with its own Selected trait (its 's'), never made selected by being browsed to.
+  int target = a11y_focus_target(focus);
+  MBA11yElement *moved = (target != was_target && target != focus && target) ? a11y_element(target) : nil;
   if (!UIAccessibilityIsVoiceOverRunning() && !UIAccessibilityIsSwitchControlRunning()) return;
   if (modal) UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification, nil);
+  else if (moved) UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, moved);
   else if (shape || changed) UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, nil);
 }
 

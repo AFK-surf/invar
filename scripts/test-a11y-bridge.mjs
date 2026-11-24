@@ -100,10 +100,19 @@ const { bridge } = attachHostBridge(rt);
 const send = (wire) => bridge.mb_web_a11y_tree(wire, wire.length);
 
 const US = "\x1f";
-// N id role flags x y w h label value desc low at high actions widget kids
-const node = (id, role, { flags = "", x = 0, y = 0, w = 10, h = 10, label = "", actions = "", kids = [] } = {}) =>
-  ["N", id, role, flags, x, y, w, h, label, "", "", "", "", "", actions, id, kids.join(",")].join(US);
-const tree = (full, nodes) => [`T${US}${full ? 1 : 0}${US}0`, ...nodes].join("\n") + "\n";
+// N id role flags x y w h label value desc low at high actions widget kids [current sort controls activeDescendant]
+const node = (
+  id,
+  role,
+  { flags = "", x = 0, y = 0, w = 10, h = 10, label = "", actions = "", kids = [], current = "", sort = "", controls = "", activeDescendant = "" } = {},
+) => {
+  const base = ["N", id, role, flags, x, y, w, h, label, "", "", "", "", "", actions, id, kids.join(",")];
+  if (current || sort || controls || activeDescendant) {
+    base.push(current, sort, String(controls || ""), String(activeDescendant || ""));
+  }
+  return base.join(US);
+};
+const tree = (full, nodes, focus = 0) => [`T${US}${full ? 1 : 0}${US}${focus}`, ...nodes].join("\n") + "\n";
 
 const root = () => doc.getElementById("a11y");
 const elOf = (id) => {
@@ -293,6 +302,31 @@ check("a parent changing meaning and place at once moves its children with it", 
   assert.equal(top(elOf(2)), "226");
   assert.equal(left(elOf(3)), "116", "grandchild placed again at once");
   assert.equal(top(elOf(3)), "227");
+});
+
+check("virtual focus A->B->filter unmount B->return to A keeps single input focus and never conflates selection", () => {
+  // Input A (id=10) focused, controls ListBox (id=20) with Option B (id=21, active) and Option C (id=22, selected)
+  send(tree(true, [
+    node(0, "Region", { kids: [10, 20] }),
+    node(10, "ComboBox", { label: "City", actions: "ft", controls: 20, activeDescendant: 21 }),
+    node(20, "Listbox", { label: "Cities", kids: [21, 22] }),
+    node(21, "Option", { label: "Beta", actions: "a" }),
+    node(22, "Option", { label: "Gamma", flags: "s", actions: "a" }),
+  ], 10));
+  assert.equal(doc.activeElement, elOf(10), "DOM focus stays on input A");
+  assert.equal(elOf(10).getAttribute("aria-controls"), "mb-a11y-20", "aria-controls points to popup");
+  assert.equal(elOf(10).getAttribute("aria-activedescendant"), "mb-a11y-21", "aria-activedescendant points to B");
+  assert.notEqual(elOf(21).getAttribute("aria-selected"), "true", "browsed active descendant B is not marked selected");
+  assert.equal(elOf(22).getAttribute("aria-selected"), "true", "actually selected option C keeps aria-selected=true");
+
+  // Filter removes B (id=21): activeDescendant clears, focus remains on input A
+  send(tree(false, [
+    node(10, "ComboBox", { label: "City", actions: "ft", controls: 20, activeDescendant: 0 }),
+    node(20, "Listbox", { label: "Cities", kids: [22] }),
+  ], 10));
+  assert.equal(doc.activeElement, elOf(10), "DOM focus stays on input A after B unmounts");
+  assert.equal(elOf(10).getAttribute("aria-activedescendant"), null, "aria-activedescendant cleared when B unmounts");
+  assert.equal(elOf(22).getAttribute("aria-selected"), "true", "selected option C remains selected");
 });
 
 if (failures) {

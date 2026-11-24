@@ -1222,6 +1222,94 @@ function buildHtmlPage(programs) {
       gl.deleteShader(fs);
     }
 
+    // Real web/host.js WebGL2 readPixels gate for kind 16/17 (group_alpha overlap, empty capture rect bskip, depth 9)
+    if (passed === programs.length) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = '/host.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('Failed to load /host.js'));
+        document.head.appendChild(s);
+      });
+      const H = globalThis.__mbhost;
+      const HW = 64, HH = 64, INST = 60;
+      H.renderInit(HW, HH, 1);
+      const makeInst = (x, y, w, h, kind, r, g, b, a) => {
+        const o = new Float64Array(INST);
+        o[0] = x; o[1] = y; o[2] = w; o[3] = h;
+        o[5] = kind;
+        o[8] = r; o[9] = g; o[10] = b; o[11] = a;
+        o[16] = 0; o[17] = 0; o[18] = 1e9; o[19] = 1e9;
+        return o;
+      };
+      const pack = (list) => {
+        const buf = new Float64Array(list.length * INST);
+        for (let i = 0; i < list.length; i++) buf.set(list[i], i * INST);
+        return buf;
+      };
+      const sampleAt = (img, x, y) => {
+        const idx = (y * img.w + x) * 4;
+        return [img.px[idx], img.px[idx + 1], img.px[idx + 2], img.px[idx + 3]];
+      };
+      const near = (a, b, tol = 2) =>
+        Math.abs(a[0] - b[0]) <= tol &&
+        Math.abs(a[1] - b[1]) <= tol &&
+        Math.abs(a[2] - b[2]) <= tol &&
+        Math.abs(a[3] - b[3]) <= tol;
+
+      // 1. Overlapping opaque red rects inside kind 16/17 group_alpha=0.5 -> exact [128, 0, 0, 255], NOT [191, 0, 0, 255]
+      {
+        const list = [
+          makeInst(0, 0, 64, 64, 16, 0, 0, 0, 1),
+          makeInst(8, 8, 48, 48, 0, 1, 0, 0, 1),
+          makeInst(8, 8, 48, 48, 0, 1, 0, 0, 1),
+          makeInst(0, 0, 64, 64, 17, 1, 1, 1, 0.5),
+        ];
+        H.present(pack(list), list.length, 0, 0, 0);
+        const center = sampleAt(H.renderPixels(), 32, 32);
+        const expected = [128, 0, 0, 255];
+        const ok = near(center, expected, 2);
+        if (ok) drawPassed++;
+        drawChecks.push({ name: 'draw:host:group_alpha_overlap', ok, center, expected });
+      }
+
+      // 2. Empty capture rect (outside viewport) suppresses all child & nested draws (0 leaked pixels), sibling draws cleanly
+      {
+        const list = [
+          makeInst(-100, 0, 50, 50, 16, 0, 0, 0, 1),
+          makeInst(0, 0, 64, 64, 0, 1, 0, 0, 1),
+          makeInst(0, 0, 64, 64, 16, 0, 0, 0, 1),
+          makeInst(0, 0, 64, 64, 0, 0, 1, 0, 1),
+          makeInst(0, 0, 64, 64, 17, 1, 1, 1, 0.5),
+          makeInst(-100, 0, 50, 50, 17, 1, 1, 1, 0.5),
+          makeInst(48, 48, 16, 16, 0, 0, 0, 1, 1),
+        ];
+        H.present(pack(list), list.length, 0, 0, 0);
+        const img = H.renderPixels();
+        const leaked = sampleAt(img, 16, 16);
+        const sibling = sampleAt(img, 56, 56);
+        const ok = near(leaked, [0, 0, 0, 255], 0) && near(sibling, [0, 0, 255, 255], 2);
+        if (ok) drawPassed++;
+        drawChecks.push({ name: 'draw:host:group_alpha_empty_capture', ok, center: leaked, corner: sibling });
+      }
+
+      // 3. Depth 9 nested group_alpha layers (dynamic blTex/blFb > 8) with overlapping opaque children -> exact [128, 0, 0, 255]
+      {
+        const list = [];
+        for (let d = 0; d < 9; d++) list.push(makeInst(0, 0, 64, 64, 16, 0, 0, 0, 1));
+        list.push(makeInst(8, 8, 48, 48, 0, 1, 0, 0, 1));
+        list.push(makeInst(8, 8, 48, 48, 0, 1, 0, 0, 1));
+        list.push(makeInst(0, 0, 64, 64, 17, 1, 1, 1, 0.5));
+        for (let d = 1; d < 9; d++) list.push(makeInst(0, 0, 64, 64, 17, 1, 1, 1, 1.0));
+        H.present(pack(list), list.length, 0, 0, 0);
+        const center = sampleAt(H.renderPixels(), 32, 32);
+        const expected = [128, 0, 0, 255];
+        const ok = near(center, expected, 2);
+        if (ok) drawPassed++;
+        drawChecks.push({ name: 'draw:host:group_alpha_depth9', ok, center, expected });
+      }
+    }
+
     report = {
       ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 12,
       passed,
@@ -1266,6 +1354,11 @@ async function runCheck() {
     if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(html);
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/host.js') {
+      res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' });
+      res.end(fs.readFileSync(HOST_JS_PATH, 'utf8'));
       return;
     }
     if (req.method === 'POST' && req.url === '/result') {

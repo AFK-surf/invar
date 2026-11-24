@@ -1,0 +1,383 @@
+// Layer-0 floating-point color engine: sRGB, OKLab, OKLCH, CSS Color 5 color-mix subset,
+// gamut/clip sRGB conversion, RGBA8 packing, and Porter-Duff source-over compositing.
+
+import "dmath"
+import "halt"
+
+let pi : Double = 3.14159265358979323846
+let chroma_eps : Double = 0.000001
+
+/// Floating-point sRGB color with straight alpha in [0.0, 1.0].
+#derive(Eq)
+pub struct Srgba {
+  pub r : Double
+  pub g : Double
+  pub b : Double
+  pub alpha : Double
+}
+
+/// Construct an `Srgba` color.
+pub fn Srgba::new(r : Double, g : Double, b : Double, alpha~ : Double = 1.0) -> Srgba {
+  Srgba::{ r, g, b, alpha }
+}
+
+/// Fully transparent sRGB color `(0, 0, 0, 0)`.
+pub fn Srgba::transparent() -> Srgba {
+  Srgba::{ r: 0.0, g: 0.0, b: 0.0, alpha: 0.0 }
+}
+
+/// Floating-point OKLab color with straight alpha in [0.0, 1.0].
+#derive(Eq)
+pub struct Oklab {
+  pub l : Double
+  pub a : Double
+  pub b : Double
+  pub alpha : Double
+}
+
+/// Construct an `Oklab` color.
+pub fn Oklab::new(l : Double, a : Double, b : Double, alpha~ : Double = 1.0) -> Oklab {
+  Oklab::{ l, a, b, alpha }
+}
+
+/// Fully transparent OKLab color `(0, 0, 0, 0)`.
+pub fn Oklab::transparent() -> Oklab {
+  Oklab::{ l: 0.0, a: 0.0, b: 0.0, alpha: 0.0 }
+}
+
+/// Floating-point OKLCH color with straight alpha in [0.0, 1.0] and explicit powerless-hue flag.
+#derive(Eq)
+pub struct Oklch {
+  pub l : Double
+  pub c : Double
+  pub h : Double
+  pub alpha : Double
+  pub hue_powerless : Bool
+}
+
+/// Construct an `Oklch` color.
+/// Per CSS Color 4 / Chromium, literal `oklch(L 0 H)` keeps its specified hue during `color-mix(in oklch, ...)`;
+/// only converted achromatic colors (such as `oklab_to_oklch` output) or explicit `hue_powerless=true` carry a missing hue.
+pub fn Oklch::new(
+  l : Double,
+  c : Double,
+  h : Double,
+  alpha~ : Double = 1.0,
+  hue_powerless~ : Bool = false,
+) -> Oklch {
+  Oklch::{ l, c, h, alpha, hue_powerless }
+}
+
+/// Fully transparent OKLCH color `(0, 0, 0, 0)` with powerless hue.
+pub fn Oklch::transparent() -> Oklch {
+  Oklch::{ l: 0.0, c: 0.0, h: 0.0, alpha: 0.0, hue_powerless: true }
+}
+
+fn cbrt(x : Double) -> Double {
+  if x == 0.0 {
+    0.0
+  } else if x < 0.0 {
+    -dmath::pow(-x, 1.0 / 3.0)
+  } else {
+    dmath::pow(x, 1.0 / 3.0)
+  }
+}
+
+fn norm_hue(h : Double) -> Double {
+  if dmath::is_nan(h) || (h - h) != 0.0 {
+    return 0.0
+  }
+  let m = h - (h / 360.0).floor() * 360.0
+  if m < 0.0 {
+    m + 360.0
+  } else if m >= 360.0 {
+    m - 360.0
+  } else {
+    m
+  }
+}
+
+fn srgb_to_linear(c : Double) -> Double {
+  let sign = if c < 0.0 { -1.0 } else { 1.0 }
+  let a = dmath::abs(c)
+  if a <= 0.04045 {
+    c / 12.92
+  } else {
+    sign * dmath::pow((a + 0.055) / 1.055, 2.4)
+  }
+}
+
+fn linear_to_srgb_clip(v : Double) -> Double {
+  let c = dmath::clamp(v, 0.0, 1.0)
+  if c <= 0.0031308 {
+    12.92 * c
+  } else {
+    1.055 * dmath::pow(c, 1.0 / 2.4) - 0.055
+  }
+}
+
+fn oklab_to_linear_srgb(l : Double, a : Double, b : Double) -> (Double, Double, Double) {
+  let l_ = l + 0.3963377774 * a + 0.2158037573 * b
+  let m_ = l - 0.1055613458 * a - 0.0638541728 * b
+  let s_ = l - 0.0894841775 * a - 1.2914855480 * b
+  let l3 = l_ * l_ * l_
+  let m3 = m_ * m_ * m_
+  let s3 = s_ * s_ * s_
+  (
+    4.0767416621 * l3 - 3.3077115913 * m3 + 0.2309699292 * s3,
+    -1.2684380046 * l3 + 2.6097574011 * m3 - 0.3413193965 * s3,
+    -0.0041960863 * l3 - 0.7034186147 * m3 + 1.7076147010 * s3,
+  )
+}
+
+/// Convert sRGB to OKLab (Bjorn Ottosson / CSS Color 4 exact matrices).
+pub fn srgb_to_oklab(c : Srgba) -> Oklab {
+  let lr = srgb_to_linear(c.r)
+  let lg = srgb_to_linear(c.g)
+  let lb = srgb_to_linear(c.b)
+  let l = 0.4122214708 * lr + 0.5363325363 * lg + 0.0514459929 * lb
+  let m = 0.2119034982 * lr + 0.6806995451 * lg + 0.1073969566 * lb
+  let s = 0.0883024619 * lr + 0.2817188376 * lg + 0.6299787005 * lb
+  let l_ = cbrt(l)
+  let m_ = cbrt(m)
+  let s_ = cbrt(s)
+  Oklab::{
+    l: 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    a: 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    b: 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+    alpha: dmath::clamp(c.alpha, 0.0, 1.0),
+  }
+}
+
+/// Convert OKLab to sRGB with per-channel `[0.0, 1.0]` clipping (matches Chromium sRGB output).
+pub fn oklab_to_srgb_clip(c : Oklab) -> Srgba {
+  let (r, g, b) = oklab_to_linear_srgb(c.l, c.a, c.b)
+  Srgba::{
+    r: linear_to_srgb_clip(r),
+    g: linear_to_srgb_clip(g),
+    b: linear_to_srgb_clip(b),
+    alpha: dmath::clamp(c.alpha, 0.0, 1.0),
+  }
+}
+
+/// Convert OKLab to sRGB using chroma-stepping gamut reduction (matches `ui::oklch`).
+pub fn oklab_to_srgb_gamut(c : Oklab) -> Srgba {
+  let chroma = dmath::sqrt(c.a * c.a + c.b * c.b)
+  if chroma <= 0.0 {
+    return oklab_to_srgb_clip(c)
+  }
+  let ux = c.a / chroma
+  let uy = c.b / chroma
+  let mut ch = chroma
+  while ch > 0.0 {
+    let (r, g, b) = oklab_to_linear_srgb(c.l, ch * ux, ch * uy)
+    if r >= -0.0001 && r <= 1.0001 && g >= -0.0001 && g <= 1.0001 && b >= -0.0001 && b <= 1.0001 {
+      break
+    }
+    ch = ch - 0.005
+  }
+  let ch2 = if ch < 0.0 { 0.0 } else { ch }
+  let (r, g, b) = oklab_to_linear_srgb(c.l, ch2 * ux, ch2 * uy)
+  Srgba::{
+    r: linear_to_srgb_clip(r),
+    g: linear_to_srgb_clip(g),
+    b: linear_to_srgb_clip(b),
+    alpha: dmath::clamp(c.alpha, 0.0, 1.0),
+  }
+}
+
+/// Convert OKLCH to OKLab.
+pub fn oklch_to_oklab(c : Oklch) -> Oklab {
+  if c.hue_powerless || c.c <= 0.0 {
+    return Oklab::{ l: c.l, a: 0.0, b: 0.0, alpha: dmath::clamp(c.alpha, 0.0, 1.0) }
+  }
+  let rad = c.h * pi / 180.0
+  Oklab::{
+    l: c.l,
+    a: c.c * dmath::cos(rad),
+    b: c.c * dmath::sin(rad),
+    alpha: dmath::clamp(c.alpha, 0.0, 1.0),
+  }
+}
+
+/// Convert OKLab to OKLCH, marking hue powerless when chroma `< 1e-6`.
+pub fn oklab_to_oklch(c : Oklab) -> Oklch {
+  let chroma = dmath::sqrt(c.a * c.a + c.b * c.b)
+  let a = dmath::clamp(c.alpha, 0.0, 1.0)
+  if chroma < chroma_eps {
+    Oklch::{ l: c.l, c: 0.0, h: 0.0, alpha: a, hue_powerless: true }
+  } else {
+    let h = norm_hue(dmath::atan2(c.b, c.a) * 180.0 / pi)
+    Oklch::{ l: c.l, c: chroma, h, alpha: a, hue_powerless: false }
+  }
+}
+
+/// Pack `Srgba` channels in `[0.0, 1.0]` into `0xRRGGBBAA`.
+pub fn pack_rgba8(c : Srgba) -> Int64 {
+  let byte = fn(v : Double) -> Int64 {
+    (dmath::clamp(v, 0.0, 1.0) * 255.0).round().to_int64() & 0xFFL
+  }
+  (byte(c.r) << 24) | (byte(c.g) << 16) | (byte(c.b) << 8) | byte(c.alpha)
+}
+
+/// Unpack `0xRRGGBBAA` into floating-point `Srgba`.
+pub fn unpack_rgba8(rgba : Int64) -> Srgba {
+  Srgba::{
+    r: ((rgba >> 24) & 0xFFL).to_double() / 255.0,
+    g: ((rgba >> 16) & 0xFFL).to_double() / 255.0,
+    b: ((rgba >> 8) & 0xFFL).to_double() / 255.0,
+    alpha: (rgba & 0xFFL).to_double() / 255.0,
+  }
+}
+
+/// Porter-Duff Source-Over compositing of `over` on top of `under` in sRGB space.
+pub fn over_srgb(under : Srgba, over : Srgba) -> Srgba {
+  let ao = dmath::clamp(over.alpha, 0.0, 1.0)
+  let au = dmath::clamp(under.alpha, 0.0, 1.0)
+  let out_a = ao + au * (1.0 - ao)
+  if out_a <= 0.0 {
+    return Srgba::transparent()
+  }
+  let inv = 1.0 / out_a
+  Srgba::{
+    r: dmath::clamp((over.r * ao + under.r * au * (1.0 - ao)) * inv, 0.0, 1.0),
+    g: dmath::clamp((over.g * ao + under.g * au * (1.0 - ao)) * inv, 0.0, 1.0),
+    b: dmath::clamp((over.b * ao + under.b * au * (1.0 - ao)) * inv, 0.0, 1.0),
+    alpha: dmath::clamp(out_a, 0.0, 1.0),
+  }
+}
+
+fn normalize_mix_weights(pct1 : Option[Double], pct2 : Option[Double]) -> Option[(Double, Double, Double)] {
+  match pct1 {
+    Some(p) => if dmath::is_nan(p) || p < 0.0 || p > 100.0 { return None }
+    None => ()
+  }
+  match pct2 {
+    Some(p) => if dmath::is_nan(p) || p < 0.0 || p > 100.0 { return None }
+    None => ()
+  }
+  let (p1, p2) = match pct1 {
+    None =>
+    match pct2 {
+      None => (50.0, 50.0)
+      Some(b) => (100.0 - b, b)
+    }
+    Some(a) =>
+    match pct2 {
+      None => (a, 100.0 - a)
+      Some(b) => (a, b)
+    }
+  }
+  let sum = p1 + p2
+  if sum == 0.0 {
+    return Some((0.0, 0.0, 0.0))
+  }
+  let w1 = p1 / sum
+  let w2 = p2 / sum
+  let alpha_mult = if sum < 100.0 { sum / 100.0 } else { 1.0 }
+  Some((w1, w2, alpha_mult))
+}
+
+/// CSS Color 5 §3.2–3.3 two-color `color-mix(in oklab, ...)` with strict percentage validation.
+/// Returns `None` if any explicit percentage is NaN or outside `[0.0, 100.0]`.
+/// When both percentages are `0%`, returns `Some(Oklab::transparent())` (zero-alpha; visually identical
+/// to Chromium's 50/50 zero-alpha result when composited).
+pub fn try_mix_oklab(
+  c1 : Oklab,
+  pct1 : Option[Double],
+  c2 : Oklab,
+  pct2 : Option[Double],
+) -> Option[Oklab] {
+  let (w1, w2, alpha_mult) = match normalize_mix_weights(pct1, pct2) {
+    Some(w) => w
+    None => return None
+  }
+  if alpha_mult == 0.0 {
+    return Some(Oklab::transparent())
+  }
+  let a1 = dmath::clamp(c1.alpha, 0.0, 1.0)
+  let a2 = dmath::clamp(c2.alpha, 0.0, 1.0)
+  let interp_a = a1 * w1 + a2 * w2
+  if interp_a <= 0.0 {
+    return Some(Oklab::transparent())
+  }
+  let inv = 1.0 / interp_a
+  let l = (c1.l * a1 * w1 + c2.l * a2 * w2) * inv
+  let a = (c1.a * a1 * w1 + c2.a * a2 * w2) * inv
+  let b = (c1.b * a1 * w1 + c2.b * a2 * w2) * inv
+  Some(Oklab::{ l, a, b, alpha: dmath::clamp(interp_a * alpha_mult, 0.0, 1.0) })
+}
+
+/// CSS Color 5 §3.2–3.3 two-color `color-mix(in oklch, ...)` (shorter hue arc, powerless-hue aware)
+/// with strict percentage validation. Returns `None` if any explicit percentage is NaN or outside `[0.0, 100.0]`.
+/// When both percentages are `0%`, returns `Some(Oklch::transparent())` (zero-alpha; visually identical
+/// to Chromium's 50/50 zero-alpha result when composited).
+pub fn try_mix_oklch(
+  c1 : Oklch,
+  pct1 : Option[Double],
+  c2 : Oklch,
+  pct2 : Option[Double],
+) -> Option[Oklch] {
+  let (w1, w2, alpha_mult) = match normalize_mix_weights(pct1, pct2) {
+    Some(w) => w
+    None => return None
+  }
+  if alpha_mult == 0.0 {
+    return Some(Oklch::transparent())
+  }
+  let a1 = dmath::clamp(c1.alpha, 0.0, 1.0)
+  let a2 = dmath::clamp(c2.alpha, 0.0, 1.0)
+  let interp_a = a1 * w1 + a2 * w2
+  if interp_a <= 0.0 {
+    return Some(Oklch::transparent())
+  }
+  let inv = 1.0 / interp_a
+  let l = (c1.l * a1 * w1 + c2.l * a2 * w2) * inv
+  let c = (c1.c * a1 * w1 + c2.c * a2 * w2) * inv
+  let p1_powerless = c1.hue_powerless
+  let p2_powerless = c2.hue_powerless
+  let (h, hue_powerless) = if p1_powerless && p2_powerless {
+    (0.0, true)
+  } else if p1_powerless {
+    (norm_hue(c2.h), false)
+  } else if p2_powerless {
+    (norm_hue(c1.h), false)
+  } else {
+    let h1 = norm_hue(c1.h)
+    let h2 = norm_hue(c2.h)
+    let mut diff = h2 - h1
+    if diff > 180.0 {
+      diff = diff - 360.0
+    } else if diff < -180.0 {
+      diff = diff + 360.0
+    }
+    (norm_hue(h1 + diff * w2), false)
+  }
+  Some(Oklch::{ l, c, h, alpha: dmath::clamp(interp_a * alpha_mult, 0.0, 1.0), hue_powerless })
+}
+
+/// Validated static-constant convenience wrapper for `try_mix_oklab`. Halts on invalid percentage.
+pub fn mix_oklab(
+  c1 : Oklab,
+  pct1 : Option[Double],
+  c2 : Oklab,
+  pct2 : Option[Double],
+) -> Oklab {
+  match try_mix_oklab(c1, pct1, c2, pct2) {
+    Some(v) => v
+    None => halt::saying("color::mix_oklab: percentage must be in [0.0, 100.0]", "")
+  }
+}
+
+/// Validated static-constant convenience wrapper for `try_mix_oklch`. Halts on invalid percentage.
+pub fn mix_oklch(
+  c1 : Oklch,
+  pct1 : Option[Double],
+  c2 : Oklch,
+  pct2 : Option[Double],
+) -> Oklch {
+  match try_mix_oklch(c1, pct1, c2, pct2) {
+    Some(v) => v
+    None => halt::saying("color::mix_oklch: percentage must be in [0.0, 100.0]", "")
+  }
+}

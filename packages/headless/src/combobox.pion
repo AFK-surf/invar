@@ -1,6 +1,8 @@
 // The combobox: a list of options to choose one of, filtered by a field beside it.
 // Ported 1:1 from libs/mbui/src/headless/combobox.mbt.
 
+import "headless_core"
+import "signals"
 import "view"
 
 pub let combobox_next : String = "combobox.next"
@@ -35,6 +37,11 @@ enum ComboStep {
   Close
 }
 
+struct ComboOptionNode[K] {
+  key : () -> K
+  node : view::View
+}
+
 /// A combobox as its look reads it and makes its list and options by (`Combobox::listbox`, `Combobox::option`).
 pub struct Combobox[K] {
   node : view::View
@@ -42,12 +49,17 @@ pub struct Combobox[K] {
   keys : () -> Array[K]
   now : () -> Option[K]
   chosen : () -> Option[K]
+  is_selected : Option[(K) -> Bool]
+  multiple : Bool
   off : () -> Bool
   key_off : (K) -> Bool
   activate : (Option[K]) -> Unit
   moved : (K) -> Unit
   choose : (K) -> Unit
   field : Bool
+  listbox_id : signals::Signal[Option[view::NodeId]]
+  option_nodes : Array[ComboOptionNode[K]]
+  options_rev : signals::Signal[Int]
 }
 
 pub fn Combobox::node[K](self : Combobox[K]) -> view::View {
@@ -60,6 +72,25 @@ pub fn Combobox::disabled[K](self : Combobox[K]) -> Bool {
 
 pub fn Combobox::active[K](self : Combobox[K]) -> Option[K] {
   (self.now)()
+}
+
+pub fn Combobox::controls_id[K](self : Combobox[K]) -> Option[view::NodeId] {
+  self.listbox_id.get()
+}
+
+pub fn Combobox::active_descendant_id[K : view::ViewEq](self : Combobox[K]) -> Option[view::NodeId] {
+  let _ = self.options_rev.get()
+  match (self.now)() {
+    Some(ak) => {
+      for entry in self.option_nodes {
+        if entry.node.alive() && !entry.node.leaving() && (entry.key)().eq(ak) {
+          return Some(entry.node.id())
+        }
+      }
+      None
+    }
+    None => None
+  }
 }
 
 fn active_of[K : view::ViewEq](keys : Array[K], active : Option[K], off : (K) -> Bool) -> Option[K] {
@@ -131,8 +162,8 @@ fn Combobox::step[K : view::ViewEq](
   }
 }
 
-let combo_key_enter : Int = 7
-let combo_key_space : Int = 1032
+let combo_key_enter : Int = headless_core::key_enter
+let combo_key_space : Int = headless_core::key_space
 
 /// A combobox in `parent`.
 pub fn combobox[K : view::ViewEq](
@@ -144,6 +175,8 @@ pub fn combobox[K : view::ViewEq](
   choose : (K) -> Unit,
   look : (view::View, Combobox[K]) -> Unit,
   chosen? : () -> Option[K],
+  is_selected? : (K) -> Bool,
+  multiple~ : Bool = false,
   open~ : () -> Bool = fn() { true },
   key_disabled? : (K) -> Bool,
   disabled~ : () -> Bool = fn() { false },
@@ -175,12 +208,17 @@ pub fn combobox[K : view::ViewEq](
       keys,
       now,
       chosen: chosen_fn,
+      is_selected,
+      multiple,
       off: disabled,
       key_off: key_off_fn,
       activate,
       moved: moved_fn,
       choose,
       field,
+      listbox_id: signals::signal_by(None, same_node_id_opt),
+      option_nodes: [],
+      options_rev: signals::signal(0),
     }
     look(v, cb)
     let takes = fn() -> Bool { !disabled() && open() && focus_in(v, true) }
@@ -188,7 +226,18 @@ pub fn combobox[K : view::ViewEq](
       fn(_a : view::ActionAt) -> Bool { cb.step(step, wraps, on_close) }
     }
     let _ = v
-      .says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Combobox, label=label(), expanded=open())) }))
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        let is_open = open()
+        let ctrl = if is_open { cb.controls_id() } else { None }
+        let ad = if is_open { cb.active_descendant_id() } else { None }
+        Some(view::said(
+          view::Role::Combobox,
+          label=label(),
+          expanded=is_open,
+          controls=ctrl,
+          active_descendant=ad,
+        ))
+      }))
       .key_context(combobox_context)
       .on_action(combobox_next, act(ComboStep::Next), can=takes)
       .on_action(combobox_prev, act(ComboStep::Prev), can=takes)
@@ -240,12 +289,20 @@ pub fn Combobox::listbox[K](
   loc~ : String = "",
 ) -> view::View {
   let setup = fn(v : view::View) {
+    self.listbox_id.set(Some(v.id()))
+    let _ = v.owns(fn() {
+      if same_node_id_opt(self.listbox_id.untracked(), Some(v.id())) {
+        self.listbox_id.set(None)
+      }
+    })
     look(v)
     let lbl = match label {
       Some(f) => f
       None => self.label
     }
-    let _ = v.says(view::Live::By(fn() -> Option[view::Said] { Some(view::said(view::Role::Listbox, label=lbl())) }))
+    let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Listbox, label=lbl(), multiselectable=self.multiple))
+    }))
     if !self.field {
       let able = fn() -> Bool { !(self.off)() }
       let _ = v.presses(view::Live::By(able)).focusable(view::Live::By(able), keys=0)
@@ -312,11 +369,21 @@ pub fn Combobox::option[K : view::ViewEq](
       }
     }
     let is_chosen = fn() -> Bool {
-      match (self.chosen)() {
-        Some(c) => c.eq(key())
-        None => false
+      match self.is_selected {
+        Some(f) => f(key())
+        None =>
+          match (self.chosen)() {
+            Some(c) => c.eq(key())
+            None => false
+          }
       }
     }
+    self.option_nodes.push(ComboOptionNode::{ key, node: v })
+    self.options_rev.set(self.options_rev.untracked() + 1)
+    let _ = v.owns(fn() {
+      view::array_retain(self.option_nodes, fn(e : ComboOptionNode[K]) -> Bool { e.node.id() != v.id() })
+      self.options_rev.set(self.options_rev.untracked() + 1)
+    })
     look(v, ComboOption::{ node: v, is_active, is_chosen, off })
     let _ = v
       .presses(view::Live::By(able))

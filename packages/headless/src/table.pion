@@ -1,6 +1,9 @@
-// The table: rows of cells, read out as one (Table, Row, ColumnHeader, Cell).
-// Ported 1:1 from libs/mbui/src/headless/table.mbt.
+// The table: rows of cells, read out as one (Table, Row, ColumnHeader, Cell),
+// plus interactive 2D `DataGrid` (Role::Grid / Role::GridCell, stable row_key/col_key focus,
+// sort state, single/multi/Shift-range/select-all selection, column resize drag, pagination/load-more).
 
+import "headless_core"
+import "signals"
 import "view"
 
 /// A table as its look reads it, to make its rows by (`Table::row`).
@@ -105,4 +108,405 @@ pub fn TableRow::cell(
 ) -> view::View {
   let _ = self
   table_part(parent, view::Role::Cell, label, in_node, made_for, loc, look)
+}
+
+/// Interactive 2D data grid controller backed by `headless_core::TableGridState`.
+pub struct DataGrid {
+  node : view::View
+  state : headless_core::TableGridState
+  rev : signals::Signal[Int]
+  row_keys : () -> Array[String]
+  col_keys : () -> Array[String]
+  on_sort : Option[(String, headless_core::SortDir) -> Unit]
+  on_selection_change : Option[(Array[String]) -> Unit]
+  on_column_resize : Option[(String, Double) -> Unit]
+  on_load_more : Option[() -> Unit]
+  on_page_change : Option[(Int) -> Unit]
+  cell_nodes : Array[(String, String, view::View)]
+}
+
+fn DataGrid::bump(self : DataGrid) -> Unit {
+  self.rev.set(self.rev.untracked() + 1)
+}
+
+pub fn DataGrid::node(self : DataGrid) -> view::View {
+  self.node
+}
+
+pub fn DataGrid::is_selected(self : DataGrid, row_key : String) -> Bool {
+  let _ = self.rev.get()
+  self.state.is_selected(row_key)
+}
+
+/// The selected row keys (a copy: changing it never changes the grid's own).
+pub fn DataGrid::selected_rows(self : DataGrid) -> Array[String] {
+  let _ = self.rev.get()
+  self.state.selected_rows.copy()
+}
+
+/// Whether the keyboard's focus is in the grid (its cells, headers, or the grid itself), untracked: the grid takes
+/// keys only so.
+pub fn DataGrid::owns_focus(self : DataGrid) -> Bool {
+  signals::untracked(fn() -> Bool { self.node.alive() && self.node.focus_within() })
+}
+
+pub fn DataGrid::focus_row(self : DataGrid) -> Option[String] {
+  let _ = self.rev.get()
+  self.state.focus_row
+}
+
+pub fn DataGrid::focus_col(self : DataGrid) -> Option[String] {
+  let _ = self.rev.get()
+  self.state.focus_col
+}
+
+pub fn DataGrid::sort_of(self : DataGrid, col_key : String) -> headless_core::SortDir {
+  let _ = self.rev.get()
+  self.state.sort_of(col_key)
+}
+
+pub fn DataGrid::column_width(self : DataGrid, col_key : String, default_w~ : Double = 120.0) -> Double {
+  let _ = self.rev.get()
+  self.state.column_width(col_key, default_w=default_w)
+}
+
+fn DataGrid::focus_cell_node(self : DataGrid, rk : String, ck : String) -> Unit {
+  for entry in self.cell_nodes {
+    if entry.0 == rk && entry.1 == ck && entry.2.alive() {
+      let _ = entry.2.ask_focus(visible=true)
+      return
+    }
+  }
+}
+
+pub fn DataGrid::toggle_sort(self : DataGrid, col_key : String) -> headless_core::SortDir {
+  let next = self.state.toggle_sort(col_key)
+  self.bump()
+  match self.on_sort {
+    Some(f) => f(col_key, next)
+    None => ()
+  }
+  next
+}
+
+pub fn DataGrid::select_row(self : DataGrid, row_key : String, shift_range~ : Bool = false) -> Bool {
+  let rows = signals::untracked(self.row_keys)
+  let ok = self.state.select_row(rows, row_key, shift_range=shift_range)
+  if ok {
+    self.bump()
+    match self.on_selection_change {
+      Some(f) => f(self.state.selected_rows.copy())
+      None => ()
+    }
+  }
+  ok
+}
+
+pub fn DataGrid::select_all(self : DataGrid) -> Bool {
+  let rows = signals::untracked(self.row_keys)
+  let ok = self.state.select_all(rows)
+  if ok {
+    self.bump()
+    match self.on_selection_change {
+      Some(f) => f(self.state.selected_rows.copy())
+      None => ()
+    }
+  }
+  ok
+}
+
+pub fn DataGrid::resize_column(self : DataGrid, col_key : String, width : Double, min_w~ : Double = 40.0, max_w~ : Double = 1200.0) -> Double {
+  let next = self.state.resize_column(col_key, width, min_w=min_w, max_w=max_w)
+  self.bump()
+  match self.on_column_resize {
+    Some(f) => f(col_key, next)
+    None => ()
+  }
+  next
+}
+
+pub fn DataGrid::load_more(self : DataGrid) -> Unit {
+  if !self.state.has_more {
+    return
+  }
+  match self.on_load_more {
+    Some(f) => f()
+    None => ()
+  }
+}
+
+pub fn DataGrid::set_page(self : DataGrid, next_page : Int) -> Unit {
+  let p = if next_page < 1 { 1 } else { next_page }
+  self.state.page = p
+  self.bump()
+  match self.on_page_change {
+    Some(f) => f(p)
+    None => ()
+  }
+}
+
+/// Reconcile stable focus/selection keys after external sort or filter updates.
+pub fn DataGrid::reconcile(self : DataGrid, prune_missing_selection~ : Bool = false) -> Unit {
+  self.state.reconcile(
+    signals::untracked(self.row_keys),
+    signals::untracked(self.col_keys),
+    prune_missing_selection=prune_missing_selection,
+  )
+  self.bump()
+}
+
+let grid_key_left : Int = headless_core::key_left
+let grid_key_right : Int = headless_core::key_right
+
+/// Mount an interactive 2D `DataGrid` (`Role::Grid`) in `parent`.
+pub fn data_grid(
+  parent : view::View,
+  label : () -> String,
+  row_keys : () -> Array[String],
+  col_keys : () -> Array[String],
+  look : (view::View, DataGrid) -> Unit,
+  selection_mode~ : headless_core::TableSelectionMode = headless_core::TableSelectionMode::Multiple,
+  has_more~ : Bool = false,
+  on_sort? : (String, headless_core::SortDir) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_column_resize? : (String, Double) -> Unit,
+  on_load_more? : () -> Unit,
+  on_page_change? : (Int) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let dg = DataGrid::{
+      node: v,
+      state: headless_core::TableGridState::new(selection_mode=selection_mode, has_more=has_more),
+      rev: signals::signal(0),
+      row_keys,
+      col_keys,
+      on_sort,
+      on_selection_change,
+      on_column_resize,
+      on_load_more,
+      on_page_change,
+      cell_nodes: [],
+    }
+    look(v, dg)
+    let is_multi = selection_mode == headless_core::TableSelectionMode::Multiple
+    let _ = v
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Grid, label=label(), multiselectable=is_multi))
+    }))
+    .on_key(fn(k : view::Key) -> Bool {
+      // (a key is the grid's only while the focus is in it: a sibling's arrows never move its cells or the focus)
+      if !dg.owns_focus() {
+        return false
+      }
+      let rows = signals::untracked(row_keys)
+      let cols = signals::untracked(col_keys)
+      if k.mods == ctrl_mod || k.mods == cmd_mod {
+        if k.code == listbox_key_char + 97 || k.code == listbox_key_char + 65 {
+          return dg.select_all()
+        }
+        if k.code == group_key_home || k.code == group_key_end {
+          match dg.state.jump_focus(rows, cols, k.code == group_key_end, true) {
+            Some((rk, ck)) => {
+              dg.bump()
+              dg.focus_cell_node(rk, ck)
+              return true
+            }
+            None => return false
+          }
+        }
+      }
+      if k.mods == 0 {
+        let moved : Option[(String, String)] = if k.code == group_key_up {
+          dg.state.move_focus(rows, cols, -1, 0)
+        } else if k.code == group_key_down {
+          dg.state.move_focus(rows, cols, 1, 0)
+        } else if k.code == grid_key_left {
+          dg.state.move_focus(rows, cols, 0, -1)
+        } else if k.code == grid_key_right {
+          dg.state.move_focus(rows, cols, 0, 1)
+        } else if k.code == group_key_home {
+          dg.state.jump_focus(rows, cols, false, false)
+        } else if k.code == group_key_end {
+          dg.state.jump_focus(rows, cols, true, false)
+        } else {
+          None
+        }
+        match moved {
+          Some((rk, ck)) => {
+            dg.bump()
+            dg.focus_cell_node(rk, ck)
+            return true
+          }
+          None => ()
+        }
+      }
+      if k.code == listbox_key_space && (k.mods == 0 || k.mods == shift_mod) {
+        match dg.state.focus_row {
+          Some(rk) => return dg.select_row(rk, shift_range=k.mods == shift_mod)
+          None => return false
+        }
+      }
+      false
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount a sortable column header (`Role::ColumnHeader` with `Said.sort`) in `DataGrid`.
+pub fn DataGrid::column_header(
+  self : DataGrid,
+  parent : view::View,
+  col_key : String,
+  label : () -> String,
+  look : (view::View, () -> headless_core::SortDir) -> Unit,
+  sortable~ : Bool = true,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let sort_fn = fn() -> headless_core::SortDir { self.sort_of(col_key) }
+    look(v, sort_fn)
+    let _ = v
+    .presses(view::Live::Is(sortable))
+    .focusable(view::Live::Is(sortable), keys=view::focus_enter | view::focus_space)
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      let s = if sortable { headless_core::sort_dir_aria(sort_fn()) } else { None }
+      Some(view::said(view::Role::ColumnHeader, label=label(), sort=s))
+    }))
+    .on_press(fn() {
+      if sortable {
+        let _ = self.toggle_sort(col_key)
+      }
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount a column resize drag handle for `col_key`.
+pub fn DataGrid::column_resizer(
+  self : DataGrid,
+  parent : view::View,
+  col_key : String,
+  look : (view::View) -> Unit,
+  default_w~ : Double = 120.0,
+  min_w~ : Double = 40.0,
+  max_w~ : Double = 1200.0,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let start_x = view::ref_new(0.0)
+  let start_w = view::ref_new(default_w)
+  let setup = fn(v : view::View) {
+    look(v)
+    let _ = v
+    .presses(view::Live::Is(true))
+    .gesture(
+      0.0,
+      press=fn(d : view::Drag) {
+        start_x.v = d.wx
+        start_w.v = self.state.column_width(col_key, default_w=default_w)
+      },
+      drag=fn(d : view::Drag) {
+        if d.kind == view::DragIs::Moved {
+          let _ = self.resize_column(col_key, start_w.v + (d.wx - start_x.v), min_w=min_w, max_w=max_w)
+        }
+      },
+    )
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount a data row (`Role::Row`) with reactive `selected` state.
+pub fn DataGrid::row(
+  self : DataGrid,
+  parent : view::View,
+  row_key : String,
+  look : (view::View, () -> Bool) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let is_sel = fn() -> Bool { self.is_selected(row_key) }
+    look(v, is_sel)
+    let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Row, selected=is_sel()))
+    }))
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount a focusable grid cell (`Role::GridCell`) keyed by stable `(row_key, col_key)`.
+pub fn DataGrid::cell(
+  self : DataGrid,
+  parent : view::View,
+  row_key : String,
+  col_key : String,
+  label : () -> String,
+  look : (view::View, () -> Bool) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    self.cell_nodes.push((row_key, col_key, v))
+    let _ = v.owns(fn() {
+      view::array_retain(self.cell_nodes, fn(e : (String, String, view::View)) -> Bool { e.2.id() != v.id() })
+    })
+    let is_foc = fn() -> Bool {
+      let _ = self.rev.get()
+      self.state.is_focused_cell(row_key, col_key)
+    }
+    let is_tab = fn() -> Bool {
+      let _ = self.rev.get()
+      match (self.state.focus_row, self.state.focus_col) {
+        (Some(rk), Some(ck)) => rk == row_key && ck == col_key
+        _ => self.cell_nodes.length() > 0 && self.cell_nodes[0].2.id() == v.id()
+      }
+    }
+    look(v, is_foc)
+    let _ = v
+    .presses(view::Live::Is(true))
+    .focusable(view::Live::Is(true), keys=0, tab=false)
+    .tab_stop(view::Live::By(is_tab))
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::GridCell, label=label(), selected=self.is_selected(row_key)))
+    }))
+    .on_press(fn() {
+      self.state.set_focus(row_key, col_key)
+      self.bump()
+      let _ = v.ask_focus(visible=false)
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
 }

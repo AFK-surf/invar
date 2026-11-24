@@ -1,0 +1,82 @@
+// Unit tests for Layer-0 pure OTP reducer (`packages/headless_core/src/otp.pion`).
+
+fn otp_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+test "otp reducer: init, filter, commit, replace_range, paste, backspace, and completion" {
+  let s0 = otp_init(6)
+  otp_assert(s0.value == "", "init empty")
+  otp_assert(s0.active_index == 0, "init active slot 0")
+  otp_assert(!s0.is_complete, "init not complete")
+
+  // Commit with invalid characters filtered out
+  let st1 = otp_commit_text(s0, "12a-3")
+  otp_assert(st1.state.value == "123", "filtered digits")
+  otp_assert(st1.state.active_index == 3, "active index advances to 3")
+  otp_assert(st1.changed && !st1.completed, "changed but not complete")
+
+  // Mid-segment replacement: replace index [1, 2) ("2") with "9" -> "193"
+  let st2 = otp_replace_range(st1.state, 1, 2, "x9y")
+  otp_assert(st2.state.value == "193", "mid-segment replace keeps digits only")
+  otp_assert(st2.state.active_index == 2, "caret moves after replaced char")
+  otp_assert(st2.changed && !st2.completed, "not yet complete")
+
+  // Backspace from index 2 deletes index 1 ("9") -> "13", active_index 1
+  let st3 = otp_backspace(st2.state)
+  otp_assert(st3.state.value == "13", "backspace removes preceding char")
+  otp_assert(st3.state.active_index == 1, "backspace retreats active index")
+  otp_assert(st3.changed && !st3.completed, "backspace never completes")
+
+  // Full-string paste with extra chars and non-digits -> truncates to 6 and completes
+  let st4 = otp_paste(st3.state, "  48-2910-777  ")
+  otp_assert(st4.state.value == "482910", "paste filters and truncates to max_length")
+  otp_assert(st4.state.active_index == 5, "full otp active index clamps to last slot")
+  otp_assert(st4.state.is_complete, "state is complete")
+  otp_assert(st4.changed && st4.completed, "paste fires completed")
+
+  // Re-committing identical full value does not re-fire completed
+  let st5 = otp_commit_text(st4.state, "482910")
+  otp_assert(!st5.changed && !st5.completed, "unchanged full value does not re-complete")
+
+  // Backspace on a full 6-digit OTP at end caret (6) removes the last digit ('0' -> "48291")
+  let st_full_bs = otp_backspace(st4.state)
+  otp_assert(st_full_bs.state.value == "48291", "backspace on full OTP deletes last digit")
+  otp_assert(st_full_bs.state.active_index == 5 && !st_full_bs.state.is_complete, "active slot waits on slot 5")
+
+  // Selection vs caret semantics on full "123456":
+  let full = otp_init(6, initial="123456")
+  // 1. Selected slot [2, 3) ('3') -> backspace deletes '3' -> "12456"
+  let bs_sel = otp_backspace(otp_select(full, 2, 3))
+  otp_assert(bs_sel.state.value == "12456" && bs_sel.state.sel_start == 2 && bs_sel.state.active_index == 2, "backspace on [2,3) deletes slot 2")
+  // 2. Collapsed caret at 0 -> backspace is no-op
+  let bs_zero = otp_backspace(otp_select(full, 0, 0))
+  otp_assert(!bs_zero.changed && bs_zero.state.value == "123456", "backspace at caret 0 is a no-op")
+  // 3. Collapsed caret at 5 (between '5' and '6') -> backspace deletes '5' -> "12346"
+  let bs_five = otp_backspace(otp_select(full, 5, 5))
+  otp_assert(bs_five.state.value == "12346" && bs_five.state.sel_start == 4 && bs_five.state.active_index == 4, "backspace at caret 5 deletes '5'")
+  // 4. Invalid character typed over selected slot [2, 3) -> rejected, value unchanged
+  let bad_repl = otp_replace_range(full, 2, 3, "x")
+  otp_assert(!bad_repl.changed && bad_repl.state.value == "123456", "invalid char over selection leaves state unchanged")
+  // 5. Full OTP mid-segment collapsed caret replace [2, 2) with "9" -> overwrites slot 2 ("129456")
+  let ov_mid = otp_replace_range(full, 2, 2, "9")
+  otp_assert(ov_mid.changed && ov_mid.state.value == "129456" && ov_mid.state.active_index == 3, "full OTP collapsed caret overwrites slot 2")
+  // 6. Pasting all-invalid characters leaves existing value unchanged
+  let bad_paste = otp_paste(full, "abc-xyz")
+  otp_assert(!bad_paste.changed && bad_paste.state.value == "123456", "pasting all-invalid chars leaves value unchanged")
+
+  // Slots projection & fake caret
+  let focused = otp_set_focused(otp_init(4, initial="78"), true)
+  let slots = otp_slots(focused)
+  otp_assert(slots.length() == 4, "4 slots")
+  otp_assert(slots[0].char == "7" && !slots[0].is_active, "slot 0")
+  otp_assert(slots[1].char == "8" && !slots[1].is_active, "slot 1")
+  otp_assert(slots[2].char == "" && slots[2].is_active && slots[2].has_fake_caret, "slot 2 active with caret")
+  otp_assert(slots[3].char == "" && !slots[3].is_active && !slots[3].has_fake_caret, "slot 3 inactive")
+
+  // Alphanumeric predicate
+  let alnum = otp_init(4, initial="a1-Z9x", allow=otp_is_alnum)
+  otp_assert(alnum.value == "a1Z9" && alnum.is_complete, "alphanumeric filter and truncate")
+}

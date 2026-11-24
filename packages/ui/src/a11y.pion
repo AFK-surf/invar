@@ -23,6 +23,12 @@ pub struct SemNode {
   pub actions : String
   pub widget : Int
   pub kids : Array[Int]
+  pub current : String
+  pub sort : String
+  pub busy : Bool
+  pub multiselectable : Bool
+  pub controls : Int
+  pub active_descendant : Int
 }
 
 fn sem_kids_eq(a : Array[Int], b : Array[Int]) -> Bool {
@@ -58,7 +64,13 @@ fn sem_node_eq(a : SemNode, b : SemNode) -> Bool {
   sem_range_eq(a.range, b.range) &&
   a.actions == b.actions &&
   a.widget == b.widget &&
-  sem_kids_eq(a.kids, b.kids)
+  sem_kids_eq(a.kids, b.kids) &&
+  a.current == b.current &&
+  a.sort == b.sort &&
+  a.busy == b.busy &&
+  a.multiselectable == b.multiselectable &&
+  a.controls == b.controls &&
+  a.active_descendant == b.active_descendant
 }
 
 /// Host-side mirror of the incremental accessibility tree.
@@ -300,6 +312,24 @@ pub fn tree_sem_nodes(tree : view::Tree, told : A11yTold) -> (Array[SemNode], In
       None => ()
     }
     if sn.disabled { flags_sb.write_string("d") }
+    if sd.busy { flags_sb.write_string("b") }
+    if sd.multiselectable { flags_sb.write_string("u") }
+    let current_s = match sd.current {
+      Some(s) => s
+      None => ""
+    }
+    let sort_s = match sd.sort {
+      Some(s) => s
+      None => ""
+    }
+    let controls_id = match sd.controls {
+      Some(cid) => told.wire_id(cid)
+      None => 0
+    }
+    let active_desc_id = match sd.active_descendant {
+      Some(aid) => told.wire_id(aid)
+      None => 0
+    }
     let pidx = parent_idx_of[idx]
     let px = if pidx >= 0 { abs_x[pidx] } else { 0.0 }
     let py = if pidx >= 0 { abs_y[pidx] } else { 0.0 }
@@ -327,6 +357,12 @@ pub fn tree_sem_nodes(tree : view::Tree, told : A11yTold) -> (Array[SemNode], In
       actions: encode_sem_actions(tree, sn.id, sd.actions),
       widget: nid,
       kids,
+      current: current_s,
+      sort: sort_s,
+      busy: sd.busy,
+      multiselectable: sd.multiselectable,
+      controls: controls_id,
+      active_descendant: active_desc_id,
     })
     idx += 1
   }
@@ -349,6 +385,12 @@ pub fn tree_sem_nodes(tree : view::Tree, told : A11yTold) -> (Array[SemNode], In
     actions: "",
     widget: 0,
     kids: root_kids,
+    current: "",
+    sort: "",
+    busy: false,
+    multiselectable: false,
+    controls: 0,
+    active_descendant: 0,
   }
   let all : Array[SemNode] = [root]
   for n in out {
@@ -489,7 +531,15 @@ fn encode_sem_wire(full : Bool, focus : Int, changed : Array[SemNode]) -> String
       Some((lo, at_v, hi)) => ("\{lo}", "\{at_v}", "\{hi}")
       None => ("", "", "")
     }
-    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{lbl}\{a11y_sep}\{val_s}\{a11y_sep}\{desc}\{a11y_sep}\{r_low}\{a11y_sep}\{r_at}\{a11y_sep}\{r_high}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}\n")
+    sb.write_string("N\{a11y_sep}\{n.id}\{a11y_sep}\{n.role}\{a11y_sep}\{n.flags}\{a11y_sep}\{n.x.round().to_int()}\{a11y_sep}\{n.y.round().to_int()}\{a11y_sep}\{n.w.round().to_int()}\{a11y_sep}\{n.h.round().to_int()}\{a11y_sep}\{lbl}\{a11y_sep}\{val_s}\{a11y_sep}\{desc}\{a11y_sep}\{r_low}\{a11y_sep}\{r_at}\{a11y_sep}\{r_high}\{a11y_sep}\{n.actions}\{a11y_sep}\{n.widget}\{a11y_sep}\{kids_sb.to_string()}")
+    if n.current.length() > 0 || n.sort.length() > 0 || n.controls > 0 || n.active_descendant > 0 {
+      let cur_s = escape_sem_field(n.current)
+      let sort_s = escape_sem_field(n.sort)
+      let ctrl_s = if n.controls > 0 { "\{n.controls}" } else { "" }
+      let act_s = if n.active_descendant > 0 { "\{n.active_descendant}" } else { "" }
+      sb.write_string("\{a11y_sep}\{cur_s}\{a11y_sep}\{sort_s}\{a11y_sep}\{ctrl_s}\{a11y_sep}\{act_s}")
+    }
+    sb.write_string("\n")
   }
   sb.to_string()
 }
@@ -639,4 +689,197 @@ pub fn a11y_sync(tree : view::Tree, told : A11yTold, force_full~ : Bool = false)
   let wire = encode_sem_wire(full, focus, changed)
   hostapi::a11y_tree(wire)
   (wire, changed.length(), full)
+}
+
+test "w0b-a11y-01 new roles and extended Said fields encode and diff incrementally" {
+  let busy_sig = signals::signal(false)
+  let sort_sig = signals::signal("ascending")
+  let tree = view::Tree::new(
+    fn(root : view::View) {
+      let _ = root.box(fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(24.0)))
+          .says(view::Live::By(fn() -> Option[view::Said] {
+            Some(view::said(view::Role::Meter, label="Storage", value="70%", range=(0.0, 70.0, 100.0), busy=busy_sig.get()))
+          }))
+      })
+      let _ = root.box(fn(g : view::View) {
+        let _ = g.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(100.0)))
+          .says(view::Live::By(fn() -> Option[view::Said] {
+            Some(view::said(view::Role::Grid, label="Data", multiselectable=true, sort=Some(sort_sig.get())))
+          }))
+        let _ = g.box(fn(c : view::View) {
+          let _ = c.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(24.0)))
+            .says(view::Live::Is(Some(view::said(view::Role::GridCell, label="Cell 1", current=Some("date")))))
+        })
+      })
+      let _ = root.box(fn(s : view::View) {
+        let _ = s.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(24.0)))
+          .says(view::Live::Is(Some(view::said(view::Role::SpinButton, label="Day", value="15", range=(1.0, 15.0, 31.0)))))
+      })
+    },
+    measure=view::words_measure,
+    measure_runs=view::runs_measure,
+    measure_runs_least=view::runs_least_measure,
+  )
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  debug_assert(role_name(view::Role::Meter) == "Meter", "Meter role_name")
+  debug_assert(role_name(view::Role::Grid) == "Grid", "Grid role_name")
+  debug_assert(role_name(view::Role::GridCell) == "GridCell", "GridCell role_name")
+  debug_assert(role_name(view::Role::SpinButton) == "SpinButton", "SpinButton role_name")
+
+  let told = A11yTold::new()
+  let (wire1, _, full1) = a11y_sync(tree, told, force_full=true)
+  debug_assert(full1, "initial sync is full")
+  debug_assert(wire1.contains("\u{1F}Meter\u{1F}"), "wire contains Meter")
+  debug_assert(wire1.contains("\u{1F}Grid\u{1F}u\u{1F}"), "wire contains Grid with multiselectable flag u")
+  debug_assert(wire1.contains("\u{1F}GridCell\u{1F}"), "wire contains GridCell")
+  debug_assert(wire1.contains("\u{1F}SpinButton\u{1F}"), "wire contains SpinButton")
+  debug_assert(wire1.contains("\u{1F}date\u{1F}"), "wire contains current=date")
+  debug_assert(wire1.contains("\u{1F}ascending\u{1F}"), "wire contains sort=ascending")
+
+  // Incremental diff: no changes -> empty wire
+  let (wire_noop, n_noop, _) = a11y_sync(tree, told)
+  debug_assert(n_noop == 0 && wire_noop == "", "no-op sync emits empty wire")
+
+  // Toggle busy and sort -> incremental delta emitted
+  busy_sig.set(true)
+  sort_sig.set("descending")
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+  let (wire2, n2, full2) = a11y_sync(tree, told)
+  debug_assert(!full2 && n2 == 2, "only Meter and Grid changed")
+  debug_assert(wire2.contains("\u{1F}Meter\u{1F}b\u{1F}"), "Meter emits busy flag b")
+  debug_assert(wire2.contains("\u{1F}descending\u{1F}"), "Grid emits sort=descending")
+  tree.dispose()
+}
+
+fn opt_nid_eq(a : Option[view::NodeId], b : Option[view::NodeId]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+test "w0b-a11y-02 virtual focus controls and active_descendant auto-clear on unmount without losing input focus" {
+  let show_list = signals::signal(true)
+  let show_b = signals::signal(true)
+  let active_id : signals::Signal[Option[view::NodeId]] = signals::signal_by(None, opt_nid_eq)
+  let list_id : signals::Signal[Option[view::NodeId]] = signals::signal_by(None, opt_nid_eq)
+  let input_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let opt_a_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let opt_b_id : signals::Ref[Option[view::NodeId]] = ref_new(None)
+
+  let tree = view::Tree::new(
+    fn(root : view::View) {
+      let inp = root.box(fn(v : view::View) {
+        let _ = v
+          .width(view::Live::Is(Some(200.0)))
+          .height(view::Live::Is(Some(32.0)))
+          .presses(view::Live::Is(true))
+          .focusable(view::Live::Is(true), keys=0)
+          .says(view::Live::By(fn() -> Option[view::Said] {
+            Some(view::said(
+              view::Role::Combobox,
+              label="Fruit",
+              expanded=show_list.get(),
+              controls=list_id.get(),
+              active_descendant=active_id.get(),
+            ))
+          }))
+      })
+      input_ref.v = Some(inp)
+      let _ = root.show(
+        fn() -> Bool { show_list.get() },
+        fn(host : view::View) {
+          let lb = host.box(fn(lv : view::View) {
+            let _ = lv.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(80.0)))
+              .says(view::Live::Is(Some(view::said(view::Role::Listbox, label="Fruits"))))
+            let oa = lv.box(fn(ov : view::View) {
+              let _ = ov.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(32.0)))
+                .says(view::Live::Is(Some(view::said(view::Role::Option, label="Apple"))))
+            })
+            opt_a_id.v = Some(oa.id())
+            let _ = lv.show(
+              fn() -> Bool { show_b.get() },
+              fn(bh : view::View) {
+                let ob = bh.box(fn(ov : view::View) {
+                  let _ = ov.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(32.0)))
+                    .says(view::Live::Is(Some(view::said(view::Role::Option, label="Banana"))))
+                })
+                opt_b_id.v = Some(ob.id())
+              },
+              at_once=true,
+            )
+          })
+          list_id.set(Some(lb.id()))
+        },
+      )
+    },
+    measure=view::words_measure,
+    measure_runs=view::runs_measure,
+    measure_runs_least=view::runs_least_measure,
+  )
+  let _ = tree.frame(400.0, 300.0, now=0.0)
+  let inp = match input_ref.v { Some(v) => v; None => panic("missing input") }
+  let _ = inp.ask_focus(visible=true)
+  active_id.set(opt_a_id.v)
+  let _ = tree.frame(400.0, 300.0, now=16.0)
+
+  let told = A11yTold::new()
+  let (wire1, _, _) = a11y_sync(tree, told, force_full=true)
+  let cb_wid = told.wire_id(inp.id())
+  let lb_wid = match list_id.get() { Some(id) => told.wire_id(id); None => 0 }
+  let a_wid = match opt_a_id.v { Some(id) => told.wire_id(id); None => 0 }
+  let b_wid = match opt_b_id.v { Some(id) => told.wire_id(id); None => 0 }
+  debug_assert(cb_wid > 0 && lb_wid > 0 && a_wid > 0 && b_wid > 0, "all nodes have live wire ids")
+  debug_assert(inp.focused(), "input holds keyboard focus")
+  match told.mirror.nodes.get(cb_wid) {
+    Some(n) => {
+      debug_assert(n.controls == lb_wid, "controls resolves to live listbox wire id")
+      debug_assert(n.active_descendant == a_wid, "active_descendant resolves to option A")
+    }
+    None => panic("missing combobox sem node")
+  }
+  debug_assert(wire1.contains("\u{1F}\{lb_wid}\u{1F}\{a_wid}\n"), "wire1 encodes controls and active_descendant A")
+
+  // Arrow down: switch active descendant A -> B while input keeps focus
+  active_id.set(opt_b_id.v)
+  let _ = tree.frame(400.0, 300.0, now=32.0)
+  let (wire2, _, _) = a11y_sync(tree, told)
+  debug_assert(inp.focused(), "input keeps keyboard focus on A->B switch")
+  match told.mirror.nodes.get(cb_wid) {
+    Some(n) => debug_assert(n.active_descendant == b_wid, "active_descendant switches to B")
+    None => panic("missing combobox sem node")
+  }
+  debug_assert(wire2.contains("\u{1F}\{lb_wid}\u{1F}\{b_wid}\n"), "wire2 encodes active_descendant B")
+
+  // Filter unmounts B while active_id still holds stale NodeId of B -> must auto-clear to 0!
+  show_b.set(false)
+  let _ = tree.frame(400.0, 300.0, now=48.0)
+  let (wire3, _, _) = a11y_sync(tree, told)
+  debug_assert(inp.focused(), "input keeps focus after B unmounts")
+  match told.mirror.nodes.get(cb_wid) {
+    Some(n) => {
+      debug_assert(n.controls == lb_wid, "controls still points to live listbox")
+      debug_assert(n.active_descendant == 0, "unmounted B must auto-clear active_descendant to 0 (no dangling ID)")
+    }
+    None => panic("missing combobox sem node")
+  }
+  debug_assert(wire3.contains("\u{1F}\{lb_wid}\u{1F}\n"), "wire3 clears dangling active_descendant")
+
+  // Clear filter & reopen: B remounts with new NodeId, active_descendant resolves cleanly
+  show_b.set(true)
+  let _ = tree.frame(400.0, 300.0, now=64.0)
+  active_id.set(opt_b_id.v)
+  let _ = tree.frame(400.0, 300.0, now=80.0)
+  let (wire4, _, _) = a11y_sync(tree, told)
+  let b2_wid = match opt_b_id.v { Some(id) => told.wire_id(id); None => 0 }
+  debug_assert(b2_wid > 0 && b2_wid != b_wid, "remounted B gets fresh wire id")
+  debug_assert(inp.focused(), "input still holds focus after filter clear")
+  match told.mirror.nodes.get(cb_wid) {
+    Some(n) => debug_assert(n.active_descendant == b2_wid, "active_descendant resolves to remounted B")
+    None => panic("missing combobox sem node")
+  }
+  debug_assert(wire4.contains("\u{1F}\{lb_wid}\u{1F}\{b2_wid}\n"), "wire4 encodes remounted B")
+  tree.dispose()
 }

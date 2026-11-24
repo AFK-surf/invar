@@ -2441,8 +2441,8 @@ def cmd_audit(args):
     if tmp_wasm and os.path.exists(tmp_wasm):
         os.unlink(tmp_wasm)
 
-    # E005: packages/headless_core dependency isolation (only halt, dmath, signals allowed)
-    hc_allowed_deps = {"halt", "dmath", "signals"}
+    # E005: packages/headless_core dependency isolation (only halt, dmath, signals, color allowed)
+    hc_allowed_deps = {"halt", "dmath", "signals", "color"}
     hc_dir = os.path.join(INVAR_ROOT, "packages", "headless_core")
     hc_toml = os.path.join(hc_dir, "pion.toml")
     if os.path.isfile(hc_toml):
@@ -2463,7 +2463,7 @@ def cmd_audit(args):
                             "error",
                             "packages/headless_core/pion.toml",
                             ln,
-                            f"Forbidden dependency `{dep_name}` in packages/headless_core/pion.toml (allowed: halt, dmath, signals)",
+                            f"Forbidden dependency `{dep_name}` in packages/headless_core/pion.toml (allowed: halt, dmath, signals, color)",
                             f"Remove `{dep_name}` from packages/headless_core/pion.toml; keep view/render logic in packages/headless.",
                         )
     hc_src = os.path.join(hc_dir, "src")
@@ -2489,9 +2489,103 @@ def cmd_audit(args):
                                     "error",
                                     rel,
                                     ln,
-                                    f"Forbidden import `\"{imp}\"` in packages/headless_core (allowed: halt, dmath, signals)",
+                                    f"Forbidden import `\"{imp}\"` in packages/headless_core (allowed: halt, dmath, signals, color)",
                                     f"Remove `import \"{imp}\"` from {rel}; keep view/render bindings in packages/headless.",
                                 )
+
+    # E006: packages/headless* must stay strictly look-agnostic across the full transitive dependency closure
+    hl_forbidden_deps = {"ui", "kit", "lg", "aura"}
+    pkgs_root = os.path.join(INVAR_ROOT, "packages")
+
+    def _parse_pion_toml_deps(pkg_dir_path):
+        toml_path = os.path.join(pkg_dir_path, "pion.toml")
+        pkg_name = os.path.basename(pkg_dir_path)
+        deps = []  # list of (dep_key, resolved_pkg_dir_or_none, line_no)
+        if not os.path.isfile(toml_path):
+            return pkg_name, deps
+        section = ""
+        path_pat = re.compile(r'path\s*=\s*"([^"]+)"')
+        name_pat = re.compile(r'^name\s*=\s*"([^"]+)"')
+        with open(toml_path, "r", encoding="utf-8", errors="replace") as f:
+            for ln, raw_line in enumerate(f, 1):
+                line = raw_line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line
+                    continue
+                if section == "[package]":
+                    nm = name_pat.match(line)
+                    if nm:
+                        pkg_name = nm.group(1)
+                elif section == "[dependencies]" and "=" in line:
+                    dep_key, rhs = line.split("=", 1)
+                    dep_key = dep_key.strip().strip('"').strip("'")
+                    pm = path_pat.search(rhs)
+                    dep_dir = os.path.normpath(os.path.join(pkg_dir_path, pm.group(1))) if pm else None
+                    deps.append((dep_key, dep_dir, ln))
+        return pkg_name, deps
+
+    if os.path.isdir(pkgs_root):
+        import_pat = re.compile(r'^\s*import\s+"([^"]+)"')
+        for entry in sorted(os.listdir(pkgs_root)):
+            if not (entry == "headless" or entry.startswith("headless_")):
+                continue
+            hl_dir = os.path.join(pkgs_root, entry)
+            if not os.path.isdir(hl_dir):
+                continue
+            root_rel = os.path.relpath(os.path.join(hl_dir, "pion.toml"), INVAR_ROOT)
+            # BFS transitive dependency closure over pion.toml path dependencies
+            visited = {os.path.normpath(hl_dir)}
+            queue = [(os.path.normpath(hl_dir), [entry], None)]
+            while queue:
+                cur_dir, chain, first_ln = queue.pop(0)
+                _cur_name, cur_deps = _parse_pion_toml_deps(cur_dir)
+                for dep_key, dep_dir, ln in cur_deps:
+                    edge_ln = ln if first_ln is None else first_ln
+                    target_name = dep_key
+                    if dep_dir and os.path.isdir(dep_dir):
+                        target_name, _ = _parse_pion_toml_deps(dep_dir)
+                    if dep_key in hl_forbidden_deps or target_name in hl_forbidden_deps:
+                        bad = target_name if target_name in hl_forbidden_deps else dep_key
+                        via = " -> ".join(chain + [bad])
+                        add_diag(
+                            "INVAR_E006_HEADLESS_NO_LOOK_DEPS",
+                            "error",
+                            root_rel,
+                            edge_ln,
+                            f"Forbidden look-layer dependency `{bad}` in transitive closure of packages/{entry} ({via})",
+                            f"Break the dependency chain `{via}`; keep packages/{entry} strictly look-agnostic.",
+                        )
+                        continue
+                    if dep_dir and os.path.isdir(dep_dir) and dep_dir not in visited:
+                        visited.add(dep_dir)
+                        queue.append((dep_dir, chain + [target_name], edge_ln))
+
+            hl_src = os.path.join(hl_dir, "src")
+            if os.path.isdir(hl_src):
+                for r_d, _ds, fs in os.walk(hl_src):
+                    for fn in sorted(fs):
+                        if not fn.endswith(".pion"):
+                            continue
+                        fp = os.path.join(r_d, fn)
+                        rel = os.path.relpath(fp, INVAR_ROOT)
+                        with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                            for ln, raw_line in enumerate(f, 1):
+                                stripped = raw_line.lstrip()
+                                if stripped.startswith("//"):
+                                    continue
+                                m = import_pat.match(raw_line)
+                                if m and m.group(1) in hl_forbidden_deps:
+                                    imp = m.group(1)
+                                    add_diag(
+                                        "INVAR_E006_HEADLESS_NO_LOOK_DEPS",
+                                        "error",
+                                        rel,
+                                        ln,
+                                        f"Forbidden look-layer import `\"{imp}\"` in packages/{entry}",
+                                        f"Remove `import \"{imp}\"` from {rel}; keep packages/{entry} strictly look-agnostic.",
+                                    )
 
     # W005: Stale brand & internal host leak check across tracked repository files
     w005_skip_dirs = {".git", ".pion", "target", ".pion_cache", "out", "LICENSES", "node_modules", "__pycache__", "build"}
@@ -2591,9 +2685,9 @@ def cmd_audit(args):
                                     "Move IO to `ui::Worker` and remove `World` from view files.",
                                 )
                     if fn.endswith("_test.pion"):
-                        if "assert_no_nested_glass" in txt or "assert_apple_ui" in txt:
+                        if "assert_no_nested_glass" in txt or "assert_apple_ui" in txt or "assert_aura_ui" in txt:
                             has_glass_audit = True
-                        if "scroll_faults" in txt or "assert_scrollable" in txt or "assert_apple_ui" in txt:
+                        if "scroll_faults" in txt or "assert_scrollable" in txt or "assert_apple_ui" in txt or "assert_aura_ui" in txt:
                             has_scroll_audit = True
         if not has_glass_audit:
             add_diag(

@@ -1,0 +1,382 @@
+// Headless Form & Fieldset: field registration/unregistration, name->value collection,
+// sync/submit validation, cross-field error routing to nested FieldError, and group disabled inheritance.
+
+import "signals"
+import "view"
+
+struct FormFieldEntry {
+  reg_id : Int
+  name : String
+  get_value : () -> String
+  validate : (String) -> Option[String]
+}
+
+let form_disabled_key : view::Lent[() -> Bool] = view::Lent::new()
+
+/// Read whether an enclosing `Form` or `Fieldset` disables `v`.
+pub fn form_disabled_inherited(v : view::View) -> Bool {
+  match v.lent(form_disabled_key) {
+    Some(f) => f()
+    None => false
+  }
+}
+
+/// Headless form controller.
+pub struct Form {
+  node : view::View
+  off : () -> Bool
+  fields : Array[FormFieldEntry]
+  errors : Map[String, signals::Signal[String]]
+  errors_rev : signals::Signal[Int]
+  validate_form : Option[(Map[String, String]) -> Map[String, String]]
+  on_submit : (Map[String, String]) -> Unit
+  submitting_ : signals::Signal[Bool]
+  next_reg : signals::Ref[Int]
+  in_submit : signals::Ref[Bool]
+}
+
+fn Form::error_signal(self : Form, name : String) -> signals::Signal[String] {
+  match self.errors.get(name) {
+    Some(sig) => sig
+    None => {
+      let sig = signals::signal("")
+      self.errors[name] = sig
+      sig
+    }
+  }
+}
+
+pub fn Form::node(self : Form) -> view::View {
+  self.node
+}
+
+pub fn Form::disabled(self : Form) -> Bool {
+  (self.off)()
+}
+
+pub fn Form::submitting(self : Form) -> Bool {
+  self.submitting_.get()
+}
+
+pub fn Form::set_submitting(self : Form, v : Bool) -> Unit {
+  self.submitting_.set(v)
+}
+
+/// Register a field by `name`, automatically unregistering when `owner` unmounts (if provided). A later
+/// registration of the same name replaces the earlier one; each registration has its own id, so an earlier owner let
+/// go after a newer one mounted (a field remounted under the same name) removes nothing of the newer one.
+/// Returns the registration's id (`Form::unregister_registration`).
+pub fn Form::register_field(
+  self : Form,
+  name : String,
+  get_value : () -> String,
+  validate~ : (String) -> Option[String] = fn(_v : String) -> Option[String] { None },
+  owner? : view::View,
+) -> Int {
+  let reg_id = self.next_reg.v + 1
+  self.next_reg.v = reg_id
+  // Replace existing entry with same name if present
+  view::array_retain(self.fields, fn(e : FormFieldEntry) -> Bool { e.name != name })
+  self.fields.push(FormFieldEntry::{ reg_id, name, get_value, validate })
+  let _ = self.error_signal(name)
+  match owner {
+    Some(v) => {
+      let _ = v.owns(fn() {
+        let _ = self.unregister_registration(reg_id)
+      })
+    }
+    None => ()
+  }
+  reg_id
+}
+
+/// Unregister the field of registration `reg_id` alone, where it is still the one registered under its name (a newer
+/// one of the same name stays). Whether it was.
+pub fn Form::unregister_registration(self : Form, reg_id : Int) -> Bool {
+  match view::array_find_first(self.fields, fn(e : FormFieldEntry) -> Bool { e.reg_id == reg_id }) {
+    Some(e) => {
+      self.unregister_field(e.name)
+      true
+    }
+    None => false
+  }
+}
+
+/// Whether a field is registered under `name`.
+pub fn Form::has_field(self : Form, name : String) -> Bool {
+  view::array_any(self.fields, fn(e : FormFieldEntry) -> Bool { e.name == name })
+}
+
+/// Unregister field `name` and clear its stored error.
+pub fn Form::unregister_field(self : Form, name : String) -> Unit {
+  view::array_retain(self.fields, fn(e : FormFieldEntry) -> Bool { e.name != name })
+  match self.errors.get(name) {
+    Some(sig) => sig.set("")
+    None => ()
+  }
+  self.errors_rev.set(self.errors_rev.untracked() + 1)
+}
+
+/// Collect current `name -> value` map across all registered fields.
+pub fn Form::values(self : Form) -> Map[String, String] {
+  let out : Map[String, String] = Map::new()
+  for f in self.fields {
+    out[f.name] = (f.get_value)()
+  }
+  out
+}
+
+/// Reactive error string for `name` (`""` when valid).
+pub fn Form::error_of(self : Form, name : String) -> String {
+  self.error_signal(name).get()
+}
+
+/// Whether `name` currently has an error.
+pub fn Form::is_invalid(self : Form, name : String) -> Bool {
+  self.error_of(name) != ""
+}
+
+/// Explicitly set an error for `name`.
+pub fn Form::set_error(self : Form, name : String, msg : String) -> Unit {
+  self.error_signal(name).set(msg)
+  self.errors_rev.set(self.errors_rev.untracked() + 1)
+}
+
+/// Replace errors from a `name -> message` map (routing cross-field or server errors).
+pub fn Form::set_errors(self : Form, errs : Map[String, String]) -> Unit {
+  for k in self.errors.keys() {
+    match self.errors.get(k) {
+      Some(sig) =>
+        match errs.get(k) {
+          Some(msg) => sig.set(msg)
+          None => sig.set("")
+        }
+      None => ()
+    }
+  }
+  for k in errs.keys() {
+    match errs.get(k) {
+      Some(msg) => self.error_signal(k).set(msg)
+      None => ()
+    }
+  }
+  self.errors_rev.set(self.errors_rev.untracked() + 1)
+}
+
+/// Clear all field errors.
+pub fn Form::clear_errors(self : Form) -> Unit {
+  for k in self.errors.keys() {
+    match self.errors.get(k) {
+      Some(sig) => sig.set("")
+      None => ()
+    }
+  }
+  self.errors_rev.set(self.errors_rev.untracked() + 1)
+}
+
+/// Validate a single registered field synchronously, updating its error signal.
+pub fn Form::validate_field(self : Form, name : String) -> Bool {
+  for f in self.fields {
+    if f.name == name {
+      let cur_v = (f.get_value)()
+      match (f.validate)(cur_v) {
+        Some(msg) => {
+          self.set_error(name, msg)
+          return false
+        }
+        None => {
+          self.set_error(name, "")
+          return true
+        }
+      }
+    }
+  }
+  true
+}
+
+/// Validate all fields + optional form-level cross-field validator. Returns `true` iff valid.
+pub fn Form::validate(self : Form) -> Bool {
+  self.validate_values(self.values())
+}
+
+/// Validate the values `vals` (one sample of every field, taken once) against the fields' and the form's validators.
+fn Form::validate_values(self : Form, vals : Map[String, String]) -> Bool {
+  let next_errs : Map[String, String] = Map::new()
+  let mut ok = true
+  for f in self.fields {
+    let cur_v = match vals.get(f.name) {
+      Some(v) => v
+      None => ""
+    }
+    match (f.validate)(cur_v) {
+      Some(msg) if msg != "" => {
+        next_errs[f.name] = msg
+        ok = false
+        ()
+      }
+      _ => ()
+    }
+  }
+  match self.validate_form {
+    Some(vf) => {
+      let cross = vf(map_copy(vals))
+      for k in cross.keys() {
+        match cross.get(k) {
+          Some(msg) if msg != "" => {
+            next_errs[k] = msg
+            ok = false
+            ()
+          }
+          _ => ()
+        }
+      }
+    }
+    None => ()
+  }
+  self.set_errors(next_errs)
+  ok
+}
+
+/// Validate and invoke `on_submit(values)` if valid and not disabled. Returns `true` if submitted. The values are
+/// sampled once: the same snapshot is validated and handed to `on_submit` (a value changed in between is validated
+/// by the next submit, never passed unvalidated). A submit asked while one is under way (from a validator or from
+/// `on_submit` itself) is ignored and returns `false`.
+pub fn Form::submit(self : Form) -> Bool {
+  if self.in_submit.v || signals::untracked(self.off) {
+    return false
+  }
+  self.in_submit.v = true
+  let vals = signals::untracked(fn() -> Map[String, String] { self.values() })
+  let ok = self.validate_values(vals)
+  if ok {
+    (self.on_submit)(vals)
+  }
+  self.in_submit.v = false
+  ok
+}
+
+fn map_copy(m : Map[String, String]) -> Map[String, String] {
+  let out : Map[String, String] = Map::new()
+  for k in m.keys() {
+    match m.get(k) {
+      Some(v) => out[k] = v
+      None => ()
+    }
+  }
+  out
+}
+
+/// Mount a nested `FieldError` (`Role::Status`) automatically subscribed to `Form::error_of(name)`.
+pub fn Form::field_error(
+  self : Form,
+  parent : view::View,
+  name : String,
+  look : (view::View, () -> String) -> Unit,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let get_err = fn() -> String { self.error_of(name) }
+  let setup = fn(v : view::View) {
+    look(v, get_err)
+    let _ = v
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Status, label=get_err()))
+      }))
+      .hides(view::Live::By(fn() -> Bool { get_err() == "" }))
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// A `Fieldset` group inside (or outside) a `Form`, propagating group-level `disabled`.
+pub struct Fieldset {
+  node : view::View
+  off : () -> Bool
+}
+
+pub fn Fieldset::node(self : Fieldset) -> view::View {
+  self.node
+}
+
+pub fn Fieldset::disabled(self : Fieldset) -> Bool {
+  (self.off)()
+}
+
+/// Mount a headless `Fieldset` (`Role::Group`) inheriting any enclosing `Form`/`Fieldset` disabled state.
+pub fn fieldset(
+  parent : view::View,
+  label : () -> String,
+  look : (view::View, Fieldset) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let parent_off : Option[() -> Bool] = parent.lent(form_disabled_key)
+    let eff_off = fn() -> Bool {
+      let inherited = match parent_off {
+        Some(pf) => pf()
+        None => false
+      }
+      inherited || disabled()
+    }
+    let _ = v.lends(form_disabled_key, eff_off)
+    look(v, Fieldset::{ node: v, off: eff_off })
+    let _ = v
+      .presses(view::Live::By(fn() -> Bool { !eff_off() }))
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(view::Role::Group, label=label()))
+      }))
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount a headless `Form` (`Role::Form`).
+pub fn form(
+  parent : view::View,
+  label : () -> String,
+  on_submit : (Map[String, String]) -> Unit,
+  look : (view::View, Form) -> Unit,
+  validate_form? : (Map[String, String]) -> Map[String, String],
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let _ = v.lends(form_disabled_key, disabled)
+    let f = Form::{
+      node: v,
+      off: disabled,
+      fields: [],
+      errors: Map::new(),
+      errors_rev: signals::signal(0),
+      validate_form,
+      on_submit,
+      submitting_: signals::signal(false),
+      next_reg: view::ref_new(0),
+      in_submit: view::ref_new(false),
+    }
+    look(v, f)
+    let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Form, label=label(), busy=f.submitting()))
+    }))
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

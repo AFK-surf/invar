@@ -1,0 +1,248 @@
+// Unit tests for packages/color:
+// - Real Chromium 156.0.8078.108 ground-truth parity across 30+ HeroUI v3.2.8 derived colors
+//   (including light/dark/vibrant, 92% under-sum, 110%/140%/150% over-sum, single-percentage,
+//   OKLCH shorter-arc & powerless hue, and white/black sRGB compositing)
+// - Strict boundary validation (-10%, 110%, NaN, 0%+0%, double-transparent)
+// - Round-trip & gamut-reduction parity with ui::oklch
+
+import "dmath"
+
+fn assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn byte_ch(rgba : Int64, sh : Int) -> Int {
+  ((rgba >> sh) & 0xFFL).to_int()
+}
+
+fn iabs(x : Int) -> Int {
+  if x < 0 { -x } else { x }
+}
+
+fn assert_rgba_near(actual : Srgba, er : Int, eg : Int, eb : Int, ea : Int, tol : Int, label : String) -> Unit {
+  let packed = pack_rgba8(actual)
+  let r = byte_ch(packed, 24)
+  let g = byte_ch(packed, 16)
+  let b = byte_ch(packed, 8)
+  let a = byte_ch(packed, 0)
+  if iabs(r - er) > tol || iabs(g - eg) > tol || iabs(b - eb) > tol || iabs(a - ea) > tol {
+    panic(
+      label + " mismatch: got (" + r.to_string() + "," + g.to_string() + "," + b.to_string() + "," + a.to_string() +
+      ") expected (" + er.to_string() + "," + eg.to_string() + "," + eb.to_string() + "," + ea.to_string() + ")",
+    )
+  }
+}
+
+fn assert_rgba_exact(actual : Srgba, er : Int, eg : Int, eb : Int, ea : Int, label : String) -> Unit {
+  assert_rgba_near(actual, er, eg, eb, ea, 0, label)
+}
+
+fn assert_near(a : Double, b : Double, eps : Double, label : String) -> Unit {
+  if dmath::abs(a - b) > eps {
+    panic(label + ": expected " + b.to_string() + ", got " + a.to_string())
+  }
+}
+
+fn lch(l : Double, c : Double, h : Double) -> Oklab {
+  oklch_to_oklab(Oklch::new(l, c, h))
+}
+
+test "01 HeroUI v3.2.8 Chromium parity: 20+ light, dark, vibrant, OKLCH, and composited derived colors" {
+  // HeroUI v3.2.8 (c3373a1) primitive tokens
+  let c_white = lch(1.0, 0.0, 0.0)
+  let c_snow = lch(0.9911, 0.0, 0.0)
+  let c_eclipse = lch(0.2103, 0.0059, 285.89)
+  let c_accent = lch(0.6204, 0.195, 253.83)
+  let c_success = lch(0.7329, 0.1935, 150.81)
+
+  let l_bg = lch(0.9702, 0.0, 0.0)
+  let l_fg = c_eclipse
+  let l_surf = c_white
+  let l_default = lch(0.94, 0.001, 286.375)
+  let l_warn = lch(0.7819, 0.1585, 72.33)
+  let l_danger = lch(0.6532, 0.2328, 25.74)
+
+  let d_surf = c_eclipse
+  let d_fg = c_snow
+  let d_default = lch(0.274, 0.006, 286.033)
+  let d_warn = lch(0.8203, 0.1388, 76.34)
+  let d_danger = lch(0.594, 0.1967, 24.63)
+
+  let clear_lab = Oklab::transparent()
+  let srgb_white = Srgba::new(1.0, 1.0, 1.0)
+  let srgb_black = Srgba::new(0.0, 0.0, 0.0)
+
+  // Light --danger-hover MUST be exact (255, 85, 81)
+  let light_danger_hover = oklab_to_srgb_clip(mix_oklab(l_danger, Some(90.0), c_snow, Some(10.0)))
+  assert_rgba_exact(light_danger_hover, 255, 85, 81, 255, "light_danger_hover")
+
+  // Light hover & surface/background mixes (Chromium 156.0.8078.108, exact byte parity)
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_accent, Some(90.0), c_snow, Some(10.0))), 53, 146, 249, 255, "light_accent_hover")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_success, Some(90.0), c_eclipse, Some(10.0))), 33, 181, 93, 255, "light_success_hover")
+  // G channel evaluates to 149.491 in float64 (vs 150 in Chromium Skia float32): ±1 at 0.5 boundary
+  assert_rgba_near(oklab_to_srgb_clip(mix_oklab(l_warn, Some(90.0), c_eclipse, Some(10.0))), 220, 150, 42, 255, 1, "light_warning_hover")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_surf, Some(92.0), l_fg, Some(8.0))), 234, 234, 234, 255, "light_surface_hover")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_default, Some(96.0), c_eclipse, Some(4.0))), 225, 225, 226, 255, "light_default_hover")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_bg, Some(96.0), l_fg, Some(4.0))), 235, 235, 235, 255, "light_bg_secondary")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_bg, Some(92.0), l_fg, Some(8.0))), 225, 225, 225, 255, "light_bg_tertiary")
+
+  // Light --field-hover (90% + 2% = 92% under-sum -> alpha = 0.92) + white/black compositing
+  // Note: Chromium 2D Canvas stores 8-bit premultiplied RGBA, introducing ±1 rounding on semi-transparent readbacks.
+  let light_field_hover = oklab_to_srgb_clip(mix_oklab(c_white, Some(90.0), l_fg, Some(2.0)))
+  assert_rgba_near(light_field_hover, 248, 248, 248, 235, 1, "light_field_hover")
+  assert_rgba_near(over_srgb(srgb_white, light_field_hover), 249, 249, 249, 255, 1, "light_field_hover on white")
+  assert_rgba_exact(over_srgb(srgb_black, light_field_hover), 229, 229, 229, 255, "light_field_hover on black")
+
+  // Light soft & over-sum soft-foregrounds (110%, 150%, 140%)
+  let light_accent_soft = oklab_to_srgb_clip(mix_oklab(c_accent, Some(15.0), clear_lab, None))
+  assert_rgba_near(over_srgb(srgb_white, light_accent_soft), 218, 237, 254, 255, 1, "light_accent_soft on white")
+  assert_rgba_exact(over_srgb(srgb_black, light_accent_soft), 1, 20, 37, 255, "light_accent_soft on black")
+
+  let light_danger_soft = oklab_to_srgb_clip(mix_oklab(l_danger, Some(15.0), clear_lab, None))
+  assert_rgba_exact(over_srgb(srgb_white, light_danger_soft), 255, 225, 226, 255, "light_danger_soft on white")
+  assert_rgba_exact(over_srgb(srgb_black, light_danger_soft), 38, 8, 9, 255, "light_danger_soft on black")
+
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_accent, Some(70.0), l_fg, Some(30.0))), 30, 99, 174, 255, "light_accent_soft_fg")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_danger, Some(70.0), l_fg, Some(40.0))), 164, 52, 51, 255, "light_danger_soft_fg (110%)")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_warn, Some(80.0), l_fg, Some(70.0))), 133, 95, 46, 255, "light_warning_soft_fg (150%)")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_success, Some(80.0), l_fg, Some(60.0))), 43, 119, 69, 255, "light_success_soft_fg (140%)")
+
+  // Light Vibrant variants (92% / 8%)
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_accent, Some(92.0), l_fg, Some(8.0))), 17, 124, 227, 255, "light_vibrant_accent_soft_fg")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_danger, Some(92.0), l_fg, Some(8.0))), 234, 56, 58, 255, "light_vibrant_danger_soft_fg")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(l_warn, Some(92.0), l_fg, Some(8.0))), 225, 153, 41, 255, "light_vibrant_warning_soft_fg")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_success, Some(92.0), l_fg, Some(8.0))), 32, 185, 94, 255, "light_vibrant_success_soft_fg")
+
+  // Single percentage on second color (--switch-control-bg-hover: None, Some(20.0) -> 80% / 20%)
+  let light_switch_hover = oklab_to_srgb_clip(mix_oklab(l_default, None, clear_lab, Some(20.0)))
+  assert_rgba_exact(light_switch_hover, 235, 235, 236, 204, "light_switch_ctrl_hover")
+  assert_rgba_exact(over_srgb(srgb_white, light_switch_hover), 239, 239, 240, 255, "light_switch_ctrl_hover on white")
+  assert_rgba_exact(over_srgb(srgb_black, light_switch_hover), 188, 188, 189, 255, "light_switch_ctrl_hover on black")
+
+  // Dark derived colors (including 92% field-hover, 110% soft-fg, vibrant, switch single-pct)
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(d_danger, Some(90.0), c_snow, Some(10.0))), 225, 84, 81, 255, "dark_danger_hover")
+
+  let dark_field_hover = oklab_to_srgb_clip(mix_oklab(d_surf, Some(90.0), d_fg, Some(2.0)))
+  assert_rgba_exact(dark_field_hover, 28, 28, 31, 235, "dark_field_hover")
+  assert_rgba_exact(over_srgb(srgb_white, dark_field_hover), 46, 46, 49, 255, "dark_field_hover on white")
+  assert_rgba_near(over_srgb(srgb_black, dark_field_hover), 26, 26, 29, 255, 1, "dark_field_hover on black")
+
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(d_danger, Some(80.0), d_fg, Some(30.0))), 235, 120, 114, 255, "dark_danger_soft_fg (110%)")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(d_warn, Some(80.0), d_fg, Some(30.0))), 249, 203, 134, 255, "dark_warning_soft_fg (110%)")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(c_success, Some(80.0), d_fg, Some(30.0))), 116, 216, 143, 255, "dark_success_soft_fg (110%)")
+  assert_rgba_exact(oklab_to_srgb_clip(mix_oklab(d_danger, Some(92.0), d_fg, Some(8.0))), 224, 79, 78, 255, "dark_vibrant_danger_soft_fg")
+
+  let dark_accent_soft = oklab_to_srgb_clip(mix_oklab(c_accent, Some(12.0), clear_lab, None))
+  assert_rgba_near(over_srgb(srgb_white, dark_accent_soft), 224, 240, 254, 255, 1, "dark_accent_soft on white")
+  assert_rgba_near(over_srgb(srgb_black, dark_accent_soft), 0, 16, 30, 255, 1, "dark_accent_soft on black")
+
+  let dark_switch_hover = oklab_to_srgb_clip(mix_oklab(d_default, None, clear_lab, Some(20.0)))
+  assert_rgba_exact(dark_switch_hover, 39, 39, 42, 204, "dark_switch_ctrl_hover")
+  assert_rgba_exact(over_srgb(srgb_white, dark_switch_hover), 82, 82, 85, 255, "dark_switch_ctrl_hover on white")
+  assert_rgba_exact(over_srgb(srgb_black, dark_switch_hover), 31, 31, 34, 255, "dark_switch_ctrl_hover on black")
+
+  // OKLCH mixes: --scrollbar-thumb (15% alpha, canvas 8-bit premul ±1) + 50/50 shorter-arc hue wrap (exact)
+  let light_sb = oklab_to_srgb_clip(oklch_to_oklab(mix_oklch(Oklch::new(0.2103, 0.0059, 285.89), Some(15.0), Oklch::transparent(), None)))
+  assert_rgba_near(over_srgb(srgb_white, light_sb), 221, 221, 221, 255, 1, "light_scrollbar_thumb on white")
+  assert_rgba_exact(over_srgb(srgb_black, light_sb), 4, 4, 4, 255, "light_scrollbar_thumb on black")
+
+  let dark_sb = oklab_to_srgb_clip(oklch_to_oklab(mix_oklch(Oklch::new(0.9911, 0.0, 0.0), Some(15.0), Oklch::transparent(), None)))
+  assert_rgba_exact(over_srgb(srgb_white, dark_sb), 255, 255, 255, 255, "dark_scrollbar_thumb on white")
+  assert_rgba_exact(over_srgb(srgb_black, dark_sb), 38, 38, 38, 255, "dark_scrollbar_thumb on black")
+
+  let oklch_mix = mix_oklch(Oklch::new(0.6204, 0.195, 253.83), None, Oklch::new(0.6532, 0.2328, 25.74), None)
+  assert_near(oklch_mix.h, 319.785, 0.001, "oklch shorter-arc hue wrap")
+  assert_rgba_exact(oklab_to_srgb_clip(oklch_to_oklab(oklch_mix)), 193, 84, 218, 255, "oklch_accent_danger_50_50")
+}
+
+test "02 color-mix boundary validation, 0%+0%, double transparent, and powerless hue" {
+  let c1 = oklch_to_oklab(Oklch::new(0.6204, 0.195, 253.83))
+  let c2 = oklch_to_oklab(Oklch::new(0.6532, 0.2328, 25.74))
+  let k1 = Oklch::new(0.6204, 0.195, 253.83)
+  let k2 = Oklch::new(0.6532, 0.2328, 25.74)
+
+  // Invalid percentages -> None
+  assert(try_mix_oklab(c1, Some(-10.0), c2, Some(50.0)).is_none(), "negative pct1 -> None")
+  assert(try_mix_oklab(c1, Some(50.0), c2, Some(-0.1)).is_none(), "negative pct2 -> None")
+  assert(try_mix_oklab(c1, Some(110.0), c2, None).is_none(), "pct1 > 100 -> None")
+  assert(try_mix_oklab(c1, None, c2, Some(100.1)).is_none(), "pct2 > 100 -> None")
+  assert(try_mix_oklab(c1, Some(dmath::nan()), c2, None).is_none(), "NaN pct1 -> None")
+  assert(try_mix_oklch(k1, Some(-10.0), k2, None).is_none(), "oklch negative pct1 -> None")
+  assert(try_mix_oklch(k1, None, k2, Some(110.0)).is_none(), "oklch pct2 > 100 -> None")
+
+  // 0% + 0% -> Some(transparent)
+  match try_mix_oklab(c1, Some(0.0), c2, Some(0.0)) {
+    Some(r) => assert(r.l == 0.0 && r.a == 0.0 && r.b == 0.0 && r.alpha == 0.0, "oklab 0%+0% -> transparent")
+    None => panic("oklab 0%+0% should be Some(transparent)")
+  }
+  match try_mix_oklch(k1, Some(0.0), k2, Some(0.0)) {
+    Some(r) => assert(r.l == 0.0 && r.c == 0.0 && r.alpha == 0.0 && r.hue_powerless, "oklch 0%+0% -> transparent")
+    None => panic("oklch 0%+0% should be Some(transparent)")
+  }
+
+  // Double transparent -> Some(transparent)
+  match try_mix_oklab(Oklab::transparent(), Some(50.0), Oklab::transparent(), Some(50.0)) {
+    Some(r) => assert(r.l == 0.0 && r.a == 0.0 && r.b == 0.0 && r.alpha == 0.0, "oklab double transparent")
+    None => panic("oklab double transparent should be Some")
+  }
+  match try_mix_oklch(Oklch::transparent(), None, Oklch::transparent(), None) {
+    Some(r) => assert(r.l == 0.0 && r.c == 0.0 && r.alpha == 0.0 && r.hue_powerless, "oklch double transparent")
+    None => panic("oklch double transparent should be Some")
+  }
+
+  // CSS Color 4 / Chromium 156 OKLCH hue interpolation rules:
+  // 1. Literal oklch(1 0 0) keeps its explicit hue 0 -> shorter arc to 253.83 is 306.915
+  let lit_white_lch = Oklch::new(1.0, 0.0, 0.0)
+  assert(!lit_white_lch.hue_powerless, "literal oklch(1 0 0) keeps explicit hue")
+  let lit_mix = mix_oklch(lit_white_lch, Some(50.0), k1, Some(50.0))
+  assert(!lit_mix.hue_powerless, "literal oklch mix keeps hue")
+  assert_near(lit_mix.h, 306.915, 0.001, "literal oklch(1 0 0) + accent interpolates hue to 306.915")
+
+  // 2. Literal oklch(0.5 0 200) + oklch(0.6 0.2 60) -> hue 130
+  let lit_zero_c = mix_oklch(Oklch::new(0.5, 0.0, 200.0), Some(50.0), Oklch::new(0.6, 0.2, 60.0), Some(50.0))
+  assert_near(lit_zero_c.h, 130.0, 0.001, "literal zero-chroma oklch still interpolates hue")
+
+  // 3. Literal transparent-alpha oklch(0.5 0.2 200 / 0) + oklch(0.6 0.2 60) -> hue 130
+  let lit_zero_a = mix_oklch(Oklch::new(0.5, 0.2, 200.0, alpha=0.0), Some(50.0), Oklch::new(0.6, 0.2, 60.0), Some(50.0))
+  assert_near(lit_zero_a.h, 130.0, 0.001, "zero-alpha literal oklch still participates in hue interpolation")
+
+  // 4. Converted achromatic color (sRGB white -> OKLab -> OKLCH) has powerless/missing hue -> carries forward 60
+  let conv_white = oklab_to_oklch(srgb_to_oklab(Srgba::new(1.0, 1.0, 1.0)))
+  assert(conv_white.hue_powerless, "converted sRGB white has powerless hue")
+  let conv_mix = mix_oklch(conv_white, Some(50.0), Oklch::new(0.6, 0.2, 60.0), Some(50.0))
+  assert(!conv_mix.hue_powerless, "mix with chromatic color is chromatic")
+  assert_near(conv_mix.h, 60.0, 0.001, "converted powerless hue carries forward chromatic hue")
+}
+
+test "03 round-trip sRGB <-> OKLab <-> OKLCH, pack/unpack, and gamut vs clip" {
+  let orig = Srgba::new(0.25, 0.6, 0.85, alpha=0.75)
+  let lab = srgb_to_oklab(orig)
+  let back = oklab_to_srgb_clip(lab)
+  assert_near(back.r, orig.r, 0.0002, "srgb round-trip r")
+  assert_near(back.g, orig.g, 0.0002, "srgb round-trip g")
+  assert_near(back.b, orig.b, 0.0002, "srgb round-trip b")
+  assert_near(back.alpha, orig.alpha, 0.0001, "srgb round-trip a")
+
+  let lch_v = oklab_to_oklch(lab)
+  let lab2 = oklch_to_oklab(lch_v)
+  assert_near(lab2.l, lab.l, 0.0001, "oklch round-trip l")
+  assert_near(lab2.a, lab.a, 0.0001, "oklch round-trip a")
+  assert_near(lab2.b, lab.b, 0.0001, "oklch round-trip b")
+
+  let packed = pack_rgba8(Srgba::new(1.0, 0.5, 0.0, alpha=1.0))
+  assert(packed == 0xFF8000FFL, "pack_rgba8 exact")
+  let unpacked = unpack_rgba8(packed)
+  assert_near(unpacked.r, 1.0, 0.0001, "unpack r")
+  assert_near(unpacked.g, 128.0 / 255.0, 0.0001, "unpack g")
+  assert_near(unpacked.b, 0.0, 0.0001, "unpack b")
+  assert_near(unpacked.alpha, 1.0, 0.0001, "unpack a")
+
+  // Gamut reduction keeps out-of-gamut color inside [0, 1] and differs from clip on strongly saturated colors
+  let out_of_gamut = oklch_to_oklab(Oklch::new(0.70, 0.30, 25.74))
+  let clipped = oklab_to_srgb_clip(out_of_gamut)
+  let gamut = oklab_to_srgb_gamut(out_of_gamut)
+  assert(clipped.r >= 0.0 && clipped.r <= 1.0 && gamut.r >= 0.0 && gamut.r <= 1.0, "in-range outputs")
+  assert(pack_rgba8(clipped) != pack_rgba8(gamut), "clip and gamut reduction differ on out-of-gamut color")
+}

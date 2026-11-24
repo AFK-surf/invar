@@ -4,6 +4,8 @@
 
 import "host"
 import "hostapi"
+import "paint"
+import "signals"
 import "ui"
 import "view"
 
@@ -508,4 +510,394 @@ test "film_reactive_view_turn_rotates_offscreen_pixels" {
     }
   }
   debug_assert(!same, "reactive View::turn must rotate offscreen rendered pixels between 0ms and 200ms")
+}
+
+test "film_rotated_child_with_fades_preserves_parent_clip" {
+  // Regression for rotated kind-11 paint::Shape with local fade + fades inside a clips(true) parent:
+  // A 20x40 clipped parent holds a 40x40 red kind-11 shape rotated by pi (180 deg) with local fade & fades.
+  // Parent rect clipping must stay in screen/parent coordinates (slot 35 == 2.0 -> cp = at_p, fp = p):
+  //   - (10, 20) inside parent clip [0..20] must be red
+  //   - (30, 20) outside parent clip [0..20] must stay white (not leaked by 180-deg flip)
+  let path = "/tmp/invar_film_rot_clip_fade_\{process_id()}.png"
+  let red_sq : Array[Double] = [0.0, 0.0, 40.0, 0.0, 40.0, 40.0, 0.0, 40.0]
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root
+        .width(view::Live::Is(Some(60.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      let _ = root.box(fn(parent : view::View) -> Unit {
+        let _ = parent
+          .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), None, None))
+          .width(view::Live::Is(Some(20.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .clips(view::Live::Is(true))
+        let _ = parent.box(fn(child : view::View) -> Unit {
+          let _ = child
+            .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), None, None))
+            .width(view::Live::Is(Some(40.0)))
+            .height(view::Live::Is(Some(40.0)))
+            .shapes(view::Live::Is([
+              paint::shape_of([(red_sq, true)], fill=ui::rgba(240, 20, 20, 255), fade=(0.0, 4.0, 40.0, 4.0)),
+            ]))
+            .turn(view::Live::Is(3.141592653589793))
+            .fades(view::Live::Is((4.0, 4.0, 4.0, 4.0)))
+        })
+      })
+    },
+    path=path,
+    w=60.0,
+    h=60.0,
+    scale=1.0,
+    dark=false,
+  )
+  debug_assert(ok, "rotated shape clip+fade snapshot must succeed")
+  let px = decode_png_rgba(path, 60, 60)
+  let _ = remove_file(path)
+  let in_i = (20 * 60 + 10) * 4
+  let out_i = (20 * 60 + 30) * 4
+  let in_r = px[in_i].to_int()
+  let in_g = px[in_i + 1].to_int()
+  let out_r = px[out_i].to_int()
+  let out_g = px[out_i + 1].to_int()
+  let out_b = px[out_i + 2].to_int()
+  debug_assert(
+    in_r > 200 && in_g < 60,
+    "pixel inside parent clip (10,20) must be red, got rgb(\{in_r},\{in_g})",
+  )
+  debug_assert(
+    out_r > 240 && out_g > 240 && out_b > 240,
+    "pixel outside parent clip (30,20) must stay white, got rgb(\{out_r},\{out_g},\{out_b})",
+  )
+}
+
+test "film_turn_place_and_local_shape_fade_rotate_on_screen" {
+  // Regression for live Place-phase View::turn animation + shape-local 1D linear fade at 0/45/90/180 deg:
+  // Draws a 40x40 black disc with local fade (y=0 -> 1.0 opaque black, y=40 -> 0.0 transparent white)
+  // rotating via node.cycle(800.0) * 2*pi on a white 40x40 canvas.
+  let pi2 = 6.28318530717958647692
+  let sq : Array[Double] = [8.0, 8.0, 32.0, 8.0, 32.0, 32.0, 8.0, 32.0]
+  let make_scene = fn(root : view::View) -> Unit {
+    let _ = root
+      .width(view::Live::Is(Some(40.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+    let _ = root.box(fn(rot : view::View) -> Unit {
+      let _ = rot
+        .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), None, None))
+        .width(view::Live::Is(Some(40.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .shapes(view::Live::Is([
+          paint::shape_of([(sq, true)], fill=ui::rgba(0, 0, 0, 255), fade=(0.0, 0.0, 40.0, 40.0)),
+        ]))
+        .turn(view::Live::By(fn() -> Double { rot.cycle(800.0) * pi2 }))
+    })
+  }
+  let sample = fn(at_ms : Double, tag : String) -> Array[Byte] {
+    let path = "/tmp/invar_film_turn_fade_\{tag}_\{process_id()}.png"
+    let ok = picture(make_scene, path=path, w=40.0, h=40.0, scale=1.0, dark=false, at=at_ms)
+    debug_assert(ok, "rotated fade snapshot at \{at_ms}ms must succeed")
+    let px = decode_png_rgba(path, 40, 40)
+    let _ = remove_file(path)
+    px
+  }
+  let luma = fn(px : Array[Byte], x : Int, y : Int) -> Int {
+    px[(y * 40 + x) * 4].to_int()
+  }
+  // 0 deg (t=0ms): local top (20, 12) is dark (~77), bottom (20, 28) is light (~179)
+  let px0 = sample(0.0, "0")
+  debug_assert(luma(px0, 20, 12) < 95 && luma(px0, 20, 28) > 160, "0 deg: top dark, bottom light, got top=\{luma(px0, 20, 12)} bot=\{luma(px0, 20, 28)}")
+
+  // 45 deg (t=100ms): clockwise rotation moves local top (0, -8) to (+5.66, -5.66) => (26, 14) dark, (14, 26) light,
+  // and exact 1D gradient center (20, 20) stays at ~128 (50% alpha; bilinear corner fade would distort it!).
+  let px45 = sample(100.0, "45")
+  let c45 = luma(px45, 20, 20)
+  debug_assert(luma(px45, 26, 14) < 95 && luma(px45, 14, 26) > 160, "45 deg: top-right dark, bottom-left light, got tr=\{luma(px45, 26, 14)} bl=\{luma(px45, 14, 26)}")
+  debug_assert(c45 >= 122 && c45 <= 134, "45 deg: 1D gradient center (20,20) must be ~128, got \{c45}")
+
+  // 90 deg (t=200ms): clockwise rotation moves local top to right (28, 20) dark, left (12, 20) light
+  let px90 = sample(200.0, "90")
+  debug_assert(luma(px90, 28, 20) < 95 && luma(px90, 12, 20) > 160, "90 deg: right dark, left light, got right=\{luma(px90, 28, 20)} left=\{luma(px90, 12, 20)}")
+
+  // 180 deg (t=400ms): local top is now bottom (20, 28) dark, top (20, 12) light
+  let px180 = sample(400.0, "180")
+  debug_assert(luma(px180, 20, 28) < 95 && luma(px180, 20, 12) > 160, "180 deg: bottom dark, top light, got bot=\{luma(px180, 20, 28)} top=\{luma(px180, 20, 12)}")
+}
+
+test "film_legacy_five_field_shape_literal_renders_solid" {
+  // Regression for downstream callers using the original 5-field paint::Shape struct literal
+  // (omitting the scalar fade_* fields): must compile, never segfault, and draw solid red.
+  let path = "/tmp/invar_film_legacy_shape5_\{process_id()}.png"
+  let sq : Array[Double] = [4.0, 4.0, 36.0, 4.0, 36.0, 36.0, 4.0, 36.0]
+  let legacy_shape = paint::Shape::{
+    outlines: [(sq, true)],
+    fill: ui::rgba(240, 20, 20, 255),
+    stroke: 0L,
+    width: 0.0,
+    even_odd: false,
+  }
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root
+        .width(view::Live::Is(Some(40.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      let _ = root.box(fn(box : view::View) -> Unit {
+        let _ = box
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .shapes(view::Live::Is([legacy_shape]))
+      })
+    },
+    path=path,
+    w=40.0,
+    h=40.0,
+    scale=1.0,
+    dark=false,
+  )
+  debug_assert(ok, "legacy 5-field paint::Shape snapshot must succeed")
+  let px = decode_png_rgba(path, 40, 40)
+  let _ = remove_file(path)
+  let ci = (20 * 40 + 20) * 4
+  let r = px[ci].to_int()
+  let g = px[ci + 1].to_int()
+  let b = px[ci + 2].to_int()
+  debug_assert(r > 230 && g < 30 && b < 30, "legacy 5-field shape center must be solid red, got rgb(\{r},\{g},\{b})")
+}
+
+test "film_parent_fades_multiplies_with_child_shape_local_fade" {
+  // Regression for ScrollShadow (parent View::fades) over a child kind-11 shape carrying its own local fade:
+  // Parent applies 40pt top fade over two identical 40x60 red shapes side by side; right shape adds a 4pt
+  // bottom local fade. At 2x y=8 and y=39 (inside parent top fade, outside bottom local fade), left and right
+  // must match identically (parent fade is NOT suppressed!), while at y=118 right is additionally faded.
+  let path = "/tmp/invar_film_parent_x_local_fade_\{process_id()}.png"
+  let rect_pts : Array[Double] = [0.0, 0.0, 40.0, 0.0, 40.0, 60.0, 0.0, 60.0]
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      let _ = root.box(fn(parent : view::View) -> Unit {
+        let _ = parent
+          .row(view::Live::Is(true))
+          .width(view::Live::Is(Some(80.0)))
+          .height(view::Live::Is(Some(60.0)))
+          .fades(view::Live::Is((0.0, 40.0, 0.0, 0.0)))
+        let _ = parent.box(fn(left : view::View) -> Unit {
+          let _ = left
+            .width(view::Live::Is(Some(40.0)))
+            .height(view::Live::Is(Some(60.0)))
+            .shapes(view::Live::Is([
+              paint::shape_of([(rect_pts, true)], fill=ui::rgba(255, 0, 0, 255)),
+            ]))
+        })
+        let _ = parent.box(fn(right : view::View) -> Unit {
+          let _ = right
+            .width(view::Live::Is(Some(40.0)))
+            .height(view::Live::Is(Some(60.0)))
+            .shapes(view::Live::Is([
+              paint::shape_of([(rect_pts, true)], fill=ui::rgba(255, 0, 0, 255), fade=(0.0, 0.0, 60.0, 4.0)),
+            ]))
+        })
+      })
+    },
+    path=path,
+    w=80.0,
+    h=60.0,
+    scale=2.0,
+    dark=false,
+  )
+  debug_assert(ok, "parent View::fades x child local shape fade snapshot must succeed")
+  let px = decode_png_rgba(path, 160, 120)
+  let _ = remove_file(path)
+  let green_at = fn(x : Int, y : Int) -> Int { px[(y * 160 + x) * 4 + 1].to_int() }
+  let l8 = green_at(40, 8)
+  let r8 = green_at(120, 8)
+  let l39 = green_at(40, 39)
+  let r39 = green_at(120, 39)
+  let l118 = green_at(40, 118)
+  let r118 = green_at(120, 118)
+  let diff8 = if l8 >= r8 { l8 - r8 } else { r8 - l8 }
+  let diff39 = if l39 >= r39 { l39 - r39 } else { r39 - l39 }
+  debug_assert(l8 > 210 && diff8 <= 2, "y=8 inside parent top fade must match control: left_g=\{l8} right_g=\{r8}")
+  debug_assert(l39 > 110 && diff39 <= 2, "y=39 inside parent top fade must match control: left_g=\{l39} right_g=\{r39}")
+  debug_assert(l118 < 10 && r118 > 140, "y=118 inside child bottom 4pt local fade must fade right only: left_g=\{l118} right_g=\{r118}")
+}
+
+fn decode_png_bytes_rgba(data : Bytes, w : Int, h : Int) -> Array[Byte] {
+  let prev = hostapi::host()
+  host::install()
+  let img_id = hostapi::image_load_bytes(data, 4096)
+  debug_assert(img_id > 0, "image_load_bytes must succeed")
+  let info = Array::make(4, 0.0)
+  let mut st = hostapi::image_info(img_id, info)
+  let mut tries = 0
+  while st == 0 && tries < 200 {
+    host::pump_main_loop(10.0)
+    st = hostapi::image_info(img_id, info)
+    tries += 1
+  }
+  debug_assert(st == 1, "decoded PNG bytes must reach ready state")
+  debug_assert(info[0].to_int() == w && info[1].to_int() == h, "decoded PNG dims must match \{w}x\{h}, got \{info[0].to_int()}x\{info[1].to_int()}")
+  let px = Array::make(w * h * 4, 0 as Byte)
+  debug_assert(hostapi::image_pixels(img_id, px), "image_pixels must succeed")
+  hostapi::image_free(img_id)
+  hostapi::set_host(prev)
+  px
+}
+
+test "film_stroked_shape_without_fade_renders_opaque" {
+  // Regression for R7 P0: kind-11 stroked shapes without local fade (used by kit::icon and lg icons)
+  // must clear rr slots 36..39 to 0 so stroke half-width `hw` is NOT interpreted as a vertical fade.
+  let path = "/tmp/invar_film_stroked_icon_\{process_id()}.png"
+  let diag1 : Array[Double] = [6.0, 6.0, 34.0, 34.0]
+  let diag2 : Array[Double] = [34.0, 6.0, 6.0, 34.0]
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root
+        .width(view::Live::Is(Some(40.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      let _ = root.box(fn(ic : view::View) -> Unit {
+        let _ = ic
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .shapes(view::Live::Is([
+            paint::shape_of([(diag1, false), (diag2, false)], stroke=ui::rgba(0, 0, 0, 255), width=3.0),
+          ]))
+      })
+    },
+    path=path,
+    w=40.0,
+    h=40.0,
+    scale=2.0,
+    dark=false,
+  )
+  debug_assert(ok, "stroked shape snapshot must succeed")
+  let px = decode_png_rgba(path, 80, 80)
+  let _ = remove_file(path)
+  let mut dark_px = 0
+  let mut i = 0
+  while i < 80 * 80 * 4 {
+    if px[i].to_int() < 245 {
+      dark_px += 1
+    }
+    i += 4
+  }
+  debug_assert(dark_px > 400, "stroked X icon must render opaque pixels (not wiped by rr=hw fade), got dark_px=\{dark_px}")
+}
+
+test "film_tiled_take_picture_preserves_shape_local_fade" {
+  // Regression for R7 P1a: ui::take_picture tiles tall captures in 2048px vertical bands.
+  // Two identical 40x40 red shapes with local top fade at y=4 (band 1) and y=2052 (band 2)
+  // must produce identical ~50% faded centers at y=24 and y=2072.
+  let sq : Array[Double] = [0.0, 0.0, 40.0, 0.0, 40.0, 40.0, 0.0, 40.0]
+  let prev = hostapi::host()
+  debug_assert(init_offscreen(40.0, 40.0, 1.0), "init_offscreen for tiled take_picture")
+  let native = host::native_host()
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+  })
+  let h = hostapi::host()
+  h.drawn_pixels_of = native.drawn_pixels_of
+  let got_png : signals::Ref[Option[Bytes]] = ui::ref_new(None)
+  ui::take_picture(
+    "r8_tiled_fade",
+    40.0,
+    fn(b : view::View) {
+      let _ = b
+        .height(view::Live::Is(Some(2100.0)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      let _ = b.box(fn(top : view::View) {
+        let _ = top
+          .over(view::Live::Is(true), edges=(Some(0.0), Some(4.0), None, None))
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .shapes(view::Live::Is([
+            paint::shape_of([(sq, true)], fill=ui::rgba(255, 0, 0, 255), fade=(0.0, 40.0, 0.0, 0.0)),
+          ]))
+      })
+      let _ = b.box(fn(bot : view::View) {
+        let _ = bot
+          .over(view::Live::Is(true), edges=(Some(0.0), Some(2052.0), None, None))
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .shapes(view::Live::Is([
+            paint::shape_of([(sq, true)], fill=ui::rgba(255, 0, 0, 255), fade=(0.0, 40.0, 0.0, 0.0)),
+          ]))
+      })
+    },
+    fn(png : Option[Bytes]) { got_png.v = png },
+    scale=1.0,
+  )
+  t.frame(ms=16.0)
+  t.dispose()
+  hostapi::set_host(prev)
+  let png = match got_png.v {
+    Some(p) => p
+    None => { debug_assert(false, "tiled take_picture must deliver Some(png)"); return }
+  }
+  let px = decode_png_bytes_rgba(png, 40, 2100)
+  let g1 = px[(24 * 40 + 20) * 4 + 1].to_int()
+  let r1 = px[(24 * 40 + 20) * 4].to_int()
+  let g2 = px[(2072 * 40 + 20) * 4 + 1].to_int()
+  let r2 = px[(2072 * 40 + 20) * 4].to_int()
+  let dg = if g1 >= g2 { g1 - g2 } else { g2 - g1 }
+  debug_assert(r1 > 250 && r2 > 250, "both tiled centers must keep red=255, got r1=\{r1} r2=\{r2}")
+  debug_assert(g1 >= 115 && g1 <= 145 && g2 >= 115 && g2 <= 145 && dg <= 2, "band 1 y=24 (g=\{g1}) and band 2 y=2072 (g=\{g2}) must match ~50% faded red")
+}
+
+test "film_magnifier_preserves_shape_local_fade" {
+  // Regression for R7 P1b: View::magnifies translates and zooms kind-11 instances.
+  // Source 40x40 red local-fade shape at (0,0), 1x translated loupe at (40,0), and 2x zoomed loupe at (80,0)
+  // must all render matching ~50% faded red at their centers (20,20), (60,20), and (100,20).
+  let path = "/tmp/invar_film_magnifier_fade_\{process_id()}.png"
+  let sq : Array[Double] = [0.0, 0.0, 40.0, 0.0, 40.0, 40.0, 0.0, 40.0]
+  let ok = picture(
+    fn(root : view::View) -> Unit {
+      let _ = root
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      let _ = root.box(fn(src : view::View) -> Unit {
+        let _ = src
+          .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), None, None))
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .shapes(view::Live::Is([
+            paint::shape_of([(sq, true)], fill=ui::rgba(255, 0, 0, 255), fade=(0.0, 40.0, 0.0, 0.0)),
+          ]))
+      })
+      let _ = root.box(fn(l1 : view::View) -> Unit {
+        let _ = l1
+          .over(view::Live::Is(true), edges=(Some(40.0), Some(0.0), None, None))
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .magnifies(view::Live::Is(Some((20.0, 20.0, 1.0))))
+      })
+      let _ = root.box(fn(l2 : view::View) -> Unit {
+        let _ = l2
+          .over(view::Live::Is(true), edges=(Some(80.0), Some(0.0), None, None))
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .magnifies(view::Live::Is(Some((20.0, 20.0, 2.0))))
+      })
+    },
+    path=path,
+    w=120.0,
+    h=40.0,
+    scale=1.0,
+    dark=false,
+  )
+  debug_assert(ok, "magnifier local-fade snapshot must succeed")
+  let px = decode_png_rgba(path, 120, 40)
+  let _ = remove_file(path)
+  let g_src = px[(20 * 120 + 20) * 4 + 1].to_int()
+  let g_1x = px[(20 * 120 + 60) * 4 + 1].to_int()
+  let g_2x = px[(20 * 120 + 100) * 4 + 1].to_int()
+  let d1 = if g_src >= g_1x { g_src - g_1x } else { g_1x - g_src }
+  let d2 = if g_src >= g_2x { g_src - g_2x } else { g_2x - g_src }
+  debug_assert(g_src >= 115 && g_src <= 145, "source center must be ~50% faded red, got g=\{g_src}")
+  debug_assert(d1 <= 3 && d2 <= 3, "1x (g=\{g_1x}) and 2x (g=\{g_2x}) magnifier centers must match source (g=\{g_src})")
 }
