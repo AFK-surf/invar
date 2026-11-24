@@ -150,7 +150,7 @@ invar check --json                                 # type-check workspace in one
 invar test --json                                  # run deduplicated workspace unit tests in parallel (--pkg defaults to --only-pkg; pass --with-deps or -j/--jobs)
 invar new my_app --template jsx-app                # scaffold a new Pion-JSX + ui::Worker app
 invar web build|dev|check                          # build/serve/verify wasm32 showcase & JS bridge
-invar shot / invar diff                            # deterministic offscreen PNG render & pixel diff
+invar shot / invar diff / invar compare            # deterministic offscreen PNG render, pixel diff & ROI side-by-side compare
 invar host-check                                   # native iOS Metal / Linux EGL+GLES3 host gates
 invar bench                                        # unified CPU + GPU + wasm32 benchmark suite
 

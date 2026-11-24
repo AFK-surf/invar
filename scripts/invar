@@ -442,6 +442,8 @@ def decode_png_rgba(path):
     bpp = bpp_map[color_type]
     raw = zlib.decompress(bytes(idat))
     stride = w * bpp
+    if len(raw) < h * (stride + 1):
+        raise ValueError("truncated PNG image data")
     recon = bytearray(h * stride)
 
     for y in range(h):
@@ -449,15 +451,16 @@ def decode_png_rgba(path):
         ftype = raw[row_start]
         src_off = row_start + 1
         dst_off = y * stride
+        if ftype == 0:
+            recon[dst_off:dst_off + stride] = raw[src_off:src_off + stride]
+            continue
         prev_off = (y - 1) * stride
         for i in range(stride):
             x = raw[src_off + i]
             a = recon[dst_off + i - bpp] if i >= bpp else 0
             b = recon[prev_off + i] if y > 0 else 0
             c = recon[prev_off + i - bpp] if (y > 0 and i >= bpp) else 0
-            if ftype == 0:
-                v = x
-            elif ftype == 1:
+            if ftype == 1:
                 v = (x + a) & 0xFF
             elif ftype == 2:
                 v = (x + b) & 0xFF
@@ -3522,6 +3525,628 @@ def cmd_diff(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand 8b: compare (pure stdlib ROI side-by-side & luma/diff metrics)
+# ---------------------------------------------------------------------------
+
+_FONT_5X7 = {
+    " ": (0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+    "0": (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E),
+    "1": (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "2": (0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F),
+    "3": (0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E),
+    "4": (0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02),
+    "5": (0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E),
+    "6": (0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E),
+    "7": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    "8": (0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E),
+    "9": (0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C),
+    "A": (0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "B": (0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+    "C": (0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+    "D": (0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+    "E": (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F),
+    "F": (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+    "G": (0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F),
+    "H": (0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "I": (0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "J": (0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C),
+    "K": (0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11),
+    "L": (0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+    "M": (0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11),
+    "N": (0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11),
+    "O": (0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    "P": (0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    "Q": (0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D),
+    "R": (0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+    "S": (0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E),
+    "T": (0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "U": (0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    "V": (0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    "W": (0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11),
+    "X": (0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11),
+    "Y": (0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04),
+    "Z": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    ".": (0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C),
+    ",": (0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08),
+    ":": (0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00),
+    "-": (0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00),
+    "_": (0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F),
+    "/": (0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10),
+    "(": (0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02),
+    ")": (0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08),
+    "=": (0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00),
+    "+": (0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00),
+    ">": (0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10),
+    "<": (0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02),
+    "|": (0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "%": (0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13),
+    "!": (0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04),
+    "?": (0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04),
+}
+
+
+def _draw_text_5x7(buf, bw, bh, x0, y0, text, color=b"\xf2\xf4\xf8\xff"):
+    cx = x0
+    for ch in text.upper():
+        glyph = _FONT_5X7.get(ch, _FONT_5X7["?"])
+        if cx + 5 > bw:
+            break
+        for row_idx, bits in enumerate(glyph):
+            py = y0 + row_idx
+            if py < 0 or py >= bh:
+                continue
+            row_base = (py * bw + cx) * 4
+            for col_idx in range(5):
+                if bits & (1 << (4 - col_idx)):
+                    o = row_base + col_idx * 4
+                    buf[o:o + 4] = color
+        cx += 6
+
+
+def _luma_stats_from_hist(hist, total):
+    if total <= 0:
+        return {"p5": 0.0, "p50": 0.0, "p95": 0.0, "p99_5": 0.0, "spread": 0.0}
+    targets = (
+        max(1, math.ceil(0.05 * total)),
+        max(1, math.ceil(0.50 * total)),
+        max(1, math.ceil(0.95 * total)),
+        max(1, math.ceil(0.995 * total)),
+    )
+    out = [0.0, 0.0, 0.0, 0.0]
+    ti = 0
+    cum = 0
+    for v in range(256):
+        c = hist[v]
+        if c:
+            cum += c
+            while ti < 4 and cum >= targets[ti]:
+                out[ti] = v / 255.0
+                ti += 1
+            if ti == 4:
+                break
+    p5, p50, p95, p99_5 = out
+    return {
+        "p5": round(p5, 6),
+        "p50": round(p50, 6),
+        "p95": round(p95, 6),
+        "p99_5": round(p99_5, 6),
+        "spread": round(p99_5 - p5, 6),
+    }
+
+
+def _extract_crop_rows(buf, img_w, px, py, pw, ph):
+    stride = img_w * 4
+    row_bytes = pw * 4
+    start_x = px * 4
+    mv = memoryview(buf)
+    return [bytes(mv[y * stride + start_x:y * stride + start_x + row_bytes]) for y in range(py, py + ph)]
+
+
+def _analyze_region(b1, w1, b2, w2, px, py, pw, ph, thresh, need_diff_rows=False, grid_size=0, user_rects=None):
+    rows1 = _extract_crop_rows(b1, w1, px, py, pw, ph)
+    rows2 = _extract_crop_rows(b2, w2, px, py, pw, ph)
+    total_pixels = pw * ph
+    hist1 = [0] * 256
+    hist2 = [0] * 256
+    opaque1 = 0
+    opaque2 = 0
+    r1_sum = g1_sum = b1_sum = 0
+    r2_sum = g2_sum = b2_sum = 0
+    changed_pixels = 0
+    max_delta = 0
+    sum_abs = 0
+    sum_sq = 0
+    diff_rows = [] if need_diff_rows else None
+    gcols = (pw + grid_size - 1) // grid_size if grid_size > 0 else 0
+    grows = (ph + grid_size - 1) // grid_size if grid_size > 0 else 0
+    grid_changed = [0] * (gcols * grows) if grid_size > 0 else None
+    grid_changed_covered = [0] * (gcols * grows) if (grid_size > 0 and user_rects) else None
+    grid_sum_abs = [0] * (gcols * grows) if grid_size > 0 else None
+    urects = [(ux, uy, ux + uw, uy + uh) for (ux, uy, uw, uh) in user_rects] if user_rects else []
+
+    for y in range(ph):
+        row1 = rows1[y]
+        row2 = rows2[y]
+        r1 = row1[0::4]
+        g1 = row1[1::4]
+        bl1 = row1[2::4]
+        a1 = row1[3::4]
+        r1_sum += sum(r1)
+        g1_sum += sum(g1)
+        b1_sum += sum(bl1)
+
+        if row1 == row2:
+            r2_sum += sum(r1)
+            g2_sum += sum(g1)
+            b2_sum += sum(bl1)
+            for rv, gv, bv, av in zip(r1, g1, bl1, a1):
+                if av:
+                    lv = (54426 * rv + 183091 * gv + 18483 * bv + 128000) // 256000
+                    hist1[lv] += 1
+                    hist2[lv] += 1
+                    opaque1 += 1
+                    opaque2 += 1
+            if need_diff_rows:
+                diff_rows.append(b"\x00\x00\x00\xff" * pw)
+        else:
+            r2 = row2[0::4]
+            g2 = row2[1::4]
+            bl2 = row2[2::4]
+            a2 = row2[3::4]
+            r2_sum += sum(r2)
+            g2_sum += sum(g2)
+            b2_sum += sum(bl2)
+            drow = bytearray(pw * 4) if need_diff_rows else None
+            gy_off = (y // grid_size) * gcols if grid_size > 0 else 0
+            row_rects = [(ux0, ux1) for (ux0, uy0, ux1, uy1) in urects if uy0 <= (py + y) < uy1] if grid_changed_covered is not None else []
+            idx = 0
+            for rv1, gv1, bv1, av1, rv2, gv2, bv2, av2 in zip(r1, g1, bl1, a1, r2, g2, bl2, a2):
+                if av1:
+                    hist1[(54426 * rv1 + 183091 * gv1 + 18483 * bv1 + 128000) // 256000] += 1
+                    opaque1 += 1
+                if av2:
+                    hist2[(54426 * rv2 + 183091 * gv2 + 18483 * bv2 + 128000) // 256000] += 1
+                    opaque2 += 1
+                dr = rv1 - rv2 if rv1 >= rv2 else rv2 - rv1
+                dg = gv1 - gv2 if gv1 >= gv2 else gv2 - gv1
+                db = bv1 - bv2 if bv1 >= bv2 else bv2 - bv1
+                da = av1 - av2 if av1 >= av2 else av2 - av1
+                dmax = dr if dr >= dg else dg
+                if db > dmax:
+                    dmax = db
+                if da > dmax:
+                    dmax = da
+                sabs = dr + dg + db + da
+                sum_abs += sabs
+                sum_sq += dr * dr + dg * dg + db * db + da * da
+                if dmax > max_delta:
+                    max_delta = dmax
+                if dmax > thresh:
+                    changed_pixels += 1
+                    if grid_changed is not None:
+                        cell_i = gy_off + (idx // grid_size)
+                        grid_changed[cell_i] += 1
+                        if row_rects:
+                            gx_abs = px + idx
+                            for ux0, ux1 in row_rects:
+                                if ux0 <= gx_abs < ux1:
+                                    grid_changed_covered[cell_i] += 1
+                                    break
+                if grid_sum_abs is not None and sabs:
+                    grid_sum_abs[gy_off + (idx // grid_size)] += sabs
+                if need_diff_rows:
+                    o = idx * 4
+                    er = dr * 4
+                    eg = dg * 4
+                    eb = db * 4
+                    if er == 0 and eg == 0 and eb == 0 and da > 0:
+                        ea = da * 4
+                        if ea > 255:
+                            ea = 255
+                        drow[o] = ea
+                        drow[o + 1] = 0
+                        drow[o + 2] = ea
+                    else:
+                        drow[o] = 255 if er > 255 else er
+                        drow[o + 1] = 255 if eg > 255 else eg
+                        drow[o + 2] = 255 if eb > 255 else eb
+                    drow[o + 3] = 255
+                idx += 1
+            if need_diff_rows:
+                diff_rows.append(bytes(drow))
+
+    mae = sum_abs / (total_pixels * 4) if total_pixels else 0.0
+    mse = sum_sq / (total_pixels * 4) if total_pixels else 0.0
+    rmse = math.sqrt(mse)
+    psnr = None if mse == 0.0 else round(10.0 * math.log10((255.0 * 255.0) / mse), 3)
+    changed_ratio = (changed_pixels / total_pixels) if total_pixels else 0.0
+    ref_mean_rgb = [round(r1_sum / total_pixels, 3), round(g1_sum / total_pixels, 3), round(b1_sum / total_pixels, 3)] if total_pixels else [0.0, 0.0, 0.0]
+    cand_mean_rgb = [round(r2_sum / total_pixels, 3), round(g2_sum / total_pixels, 3), round(b2_sum / total_pixels, 3)] if total_pixels else [0.0, 0.0, 0.0]
+    ref_luma = _luma_stats_from_hist(hist1, opaque1)
+    cand_luma = _luma_stats_from_hist(hist2, opaque2)
+    luma_spread_delta = round(cand_luma["spread"] - ref_luma["spread"], 6)
+
+    metrics = {
+        "changed_pixels": changed_pixels,
+        "total_pixels": total_pixels,
+        "changed_ratio": round(changed_ratio, 6),
+        "max_delta": max_delta,
+        "mae": round(mae, 6),
+        "rmse": round(rmse, 6),
+        "psnr": psnr,
+        "ref_mean_rgb": ref_mean_rgb,
+        "cand_mean_rgb": cand_mean_rgb,
+        "ref_luma": ref_luma,
+        "cand_luma": cand_luma,
+        "luma_spread_delta": luma_spread_delta,
+    }
+    grid_info = (gcols, grows, grid_changed, grid_changed_covered, grid_sum_abs) if grid_size > 0 else None
+    return metrics, rows1, rows2, diff_rows, grid_info
+
+
+def _zoom_row(row, pw, zoom):
+    if zoom == 1:
+        return row
+    return b"".join(row[i:i + 4] * zoom for i in range(0, pw * 4, 4))
+
+
+def _render_compare_card(name, px, py, pw, ph, zoom, rows1, rows2, diff_rows, metrics):
+    zw = pw * zoom
+    zh = ph * zoom
+    sep = 2
+    sep_px = b"\xff\x2d\x55\xff" * sep
+    panels = 3 if diff_rows is not None else 2
+    card_w = zw * panels + sep * (panels - 1)
+    header_h = 20
+    card_h = header_h + zh
+
+    canvas = bytearray(card_w * card_h * 4)
+    bg_row = b"\x18\x1a\x20\xff" * card_w
+    border_row = b"\x30\x34\x40\xff" * card_w
+    for y in range(header_h - 1):
+        canvas[y * card_w * 4:(y + 1) * card_w * 4] = bg_row
+    canvas[(header_h - 1) * card_w * 4:header_h * card_w * 4] = border_row
+
+    hdr = (
+        f"{name} ({px},{py} {pw}x{ph}) z{zoom}x "
+        f"MAE={metrics['mae']:.2f} "
+        f"sp={metrics['ref_luma']['spread']:.2f}->{metrics['cand_luma']['spread']:.2f}"
+    )
+    _draw_text_5x7(canvas, card_w, header_h, 4, 6, hdr)
+
+    for y in range(ph):
+        z1 = _zoom_row(rows1[y], pw, zoom)
+        z2 = _zoom_row(rows2[y], pw, zoom)
+        if diff_rows is not None:
+            z3 = _zoom_row(diff_rows[y], pw, zoom)
+            combined = z1 + sep_px + z2 + sep_px + z3
+        else:
+            combined = z1 + sep_px + z2
+        base_y = header_h + y * zoom
+        for zy in range(zoom):
+            off = (base_y + zy) * card_w * 4
+            canvas[off:off + card_w * 4] = combined
+
+    return card_w, card_h, canvas
+
+
+def _parse_roi_spec(spec):
+    if "=" not in spec:
+        raise ValueError(f"Invalid --roi syntax '{spec}': expected name=x,y,w,h")
+    name, coords = spec.split("=", 1)
+    name = name.strip()
+    if not name:
+        raise ValueError(f"Invalid --roi syntax '{spec}': empty ROI name")
+    parts = [p.strip() for p in coords.split(",")]
+    if len(parts) != 4:
+        raise ValueError(f"Invalid --roi syntax '{spec}': expected 4 numbers x,y,w,h")
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError as e:
+        raise ValueError(f"Invalid --roi coordinates in '{spec}': {e}")
+    if any(math.isnan(v) or math.isinf(v) for v in vals):
+        raise ValueError(f"Invalid --roi coordinates in '{spec}': non-finite value")
+    return {"name": name, "x": vals[0], "y": vals[1], "w": vals[2], "h": vals[3]}
+
+
+def _sanitize_roi_name(name):
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_")
+    return s or "roi"
+
+
+def _alloc_unique_slug(base_slug, used_lower):
+    slug = base_slug
+    n = 2
+    while slug.lower() in used_lower:
+        slug = f"{base_slug}_{n}"
+        n += 1
+    used_lower.add(slug.lower())
+    return slug
+
+
+_COMPARE_MAX_CARD_PIXELS = 64_000_000
+
+
+def cmd_compare(args):
+    def fail(msg):
+        res = {"ok": False, "error": msg}
+        emit_json(res) if args.json else print(f"compare error: {msg}", file=sys.stderr)
+        return 1
+
+    if args.zoom is not None and args.zoom < 1:
+        return fail(f"--zoom must be an integer >= 1 (got {args.zoom})")
+    if math.isnan(args.scale) or math.isinf(args.scale) or args.scale <= 0.0:
+        return fail(f"--scale must be a positive finite number (got {args.scale})")
+
+    try:
+        w1, h1, b1 = decode_png_rgba(args.ref)
+        w2, h2, b2 = decode_png_rgba(args.cand)
+    except Exception as e:
+        return fail(str(e))
+
+    same_size = (w1 == w2 and h1 == h2)
+    if not same_size and not args.allow_size_diff:
+        return fail(f"Size mismatch: ref is {w1}x{h1}, cand is {w2}x{h2} (pass --allow-size-diff to compare common overlap)")
+
+    cw = min(w1, w2)
+    ch = min(h1, h2)
+    if cw <= 0 or ch <= 0:
+        return fail(f"Empty overlap region: ref={w1}x{h1}, cand={w2}x{h2}")
+
+    roi_specs = []
+    if args.roi_file:
+        try:
+            with open(args.roi_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, list):
+                return fail(f"--roi-file must contain a JSON list: {args.roi_file}")
+            if len(loaded) == 0:
+                return fail(f"--roi-file '{args.roi_file}' contains an empty ROI list")
+            for idx, item in enumerate(loaded):
+                if not isinstance(item, dict):
+                    return fail(f"--roi-file entry {idx} must be an object")
+                for key in ("name", "x", "y", "w", "h"):
+                    if key not in item:
+                        return fail(f"--roi-file entry {idx} missing '{key}'")
+                name = str(item["name"]).strip()
+                if not name:
+                    return fail(f"--roi-file entry {idx} has empty 'name'")
+                vals = [float(item["x"]), float(item["y"]), float(item["w"]), float(item["h"])]
+                if any(math.isnan(v) or math.isinf(v) for v in vals):
+                    return fail(f"--roi-file entry '{name}' has non-finite coordinates")
+                roi_specs.append({"name": name, "x": vals[0], "y": vals[1], "w": vals[2], "h": vals[3]})
+        except Exception as e:
+            return fail(f"Failed to load --roi-file '{args.roi_file}': {e}")
+
+    for spec in args.roi:
+        try:
+            roi_specs.append(_parse_roi_spec(spec))
+        except ValueError as e:
+            return fail(str(e))
+
+    scale = float(args.scale)
+    default_full = (len(roi_specs) == 0)
+    zoom = (1 if default_full else 2) if args.zoom is None else args.zoom
+    if default_full:
+        roi_specs = [{"name": "full", "x": 0.0, "y": 0.0, "w": cw / scale, "h": ch / scale}]
+
+    # Validate all ROI pixel rects before writing any files
+    resolved_rois = []
+    used_slugs_lower = set()
+    panels = 3 if args.with_diff else 2
+    for item in roi_specs:
+        name = item["name"]
+        x, y, w, h = item["x"], item["y"], item["w"], item["h"]
+        px = math.floor(x * scale + 0.5)
+        py = math.floor(y * scale + 0.5)
+        px1 = math.floor((x + w) * scale + 0.5)
+        py1 = math.floor((y + h) * scale + 0.5)
+        pw = px1 - px
+        ph = py1 - py
+        if pw <= 0 or ph <= 0:
+            return fail(f"ROI '{name}' has non-positive size: rect_pt=({x},{y},{w},{h}) -> rect_px=({px},{py},{pw},{ph})")
+        if px < 0 or py < 0 or px + pw > cw or py + ph > ch:
+            return fail(
+                f"ROI '{name}' out of bounds for {cw}x{ch} image: "
+                f"rect_pt=({x},{y},{w},{h}) -> rect_px=({px},{py},{pw},{ph})"
+            )
+        card_w = pw * zoom * panels + 2 * (panels - 1)
+        card_h = 20 + ph * zoom
+        if card_w * card_h > _COMPARE_MAX_CARD_PIXELS:
+            return fail(
+                f"ROI '{name}' zoomed card ({card_w}x{card_h} = {card_w * card_h} px) exceeds 64 MP limit; "
+                f"reduce --zoom or ROI size"
+            )
+        slug = _alloc_unique_slug(_sanitize_roi_name(name), used_slugs_lower)
+        resolved_rois.append({
+            "name": name,
+            "slug": slug,
+            "rect_pt": [round(x, 4), round(y, 4), round(w, 4), round(h, 4)],
+            "rect_px": [px, py, pw, ph],
+        })
+
+    out_dir = args.out
+    os.makedirs(out_dir, exist_ok=True)
+    thresh = max(0, min(255, args.threshold))
+
+    # Full-image metrics + 64x64 hotspot grid (diff-pixel coverage against user ROIs)
+    grid_sz = 64
+    user_rects = [r["rect_px"] for r in resolved_rois]
+    full_metrics, full_r1, full_r2, full_dr, grid_info = _analyze_region(
+        b1, w1, b2, w2, 0, 0, cw, ch, thresh,
+        need_diff_rows=(default_full and args.with_diff),
+        grid_size=grid_sz,
+        user_rects=user_rects,
+    )
+    full_entry = {
+        "name": "full",
+        "rect_pt": [0.0, 0.0, round(cw / scale, 4), round(ch / scale, 4)],
+        "rect_px": [0, 0, cw, ch],
+        "zoom": zoom,
+        "crop_file": None,
+        **full_metrics,
+    }
+
+    # Extract high-diff 64x64 grid cells (cr > 0.01): sort ALL before splitting uncovered vs covered
+    auto_n = max(0, int(getattr(args, "auto_hotspots", 0) or 0))
+    hotspots = []
+    if grid_info is not None:
+        gcols, grows, grid_changed, grid_changed_covered, grid_sum_abs = grid_info
+        candidates = []
+        for gy in range(grows):
+            ry = gy * grid_sz
+            rh = min(grid_sz, ch - ry)
+            for gx in range(gcols):
+                idx = gy * gcols + gx
+                chg = grid_changed[idx]
+                if chg <= 0:
+                    continue
+                rx = gx * grid_sz
+                rw = min(grid_sz, cw - rx)
+                cell_px = rw * rh
+                cr = chg / cell_px
+                if cr <= 0.01:
+                    continue
+                c_mae = grid_sum_abs[idx] / (cell_px * 4)
+                cov_cnt = grid_changed_covered[idx] if grid_changed_covered is not None else 0
+                covered = (cov_cnt / chg) >= 0.8
+                candidates.append((c_mae, cr, rx, ry, rw, rh, covered))
+        candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        uncovered_hs = []
+        covered_hs = []
+        for c_mae, cr, rx, ry, rw, rh, covered in candidates:
+            entry_hs = {
+                "rect_px": [rx, ry, rw, rh],
+                "rect_pt": [round(rx / scale, 4), round(ry / scale, 4), round(rw / scale, 4), round(rh / scale, 4)],
+                "changed_ratio": round(cr, 6),
+                "mae": round(c_mae, 6),
+                "covered_by_roi": covered,
+            }
+            if covered:
+                covered_hs.append(entry_hs)
+            else:
+                uncovered_hs.append(entry_hs)
+        max_uncov = max(10, auto_n)
+        uncovered_total = len(uncovered_hs)
+        hotspots = uncovered_hs[:max_uncov]
+        if len(hotspots) < 5:
+            hotspots.extend(covered_hs[:5 - len(hotspots)])
+    else:
+        uncovered_total = 0
+
+    # Optionally append top-N uncovered hotspots as auto-cropped ROIs
+    if auto_n > 0:
+        hs_idx = 0
+        for hs in hotspots:
+            if hs["covered_by_roi"]:
+                continue
+            hs_idx += 1
+            if hs_idx > auto_n:
+                break
+            rx, ry, rw, rh = hs["rect_px"]
+            card_w = rw * zoom * panels + 2 * (panels - 1)
+            card_h = 20 + rh * zoom
+            if card_w * card_h > _COMPARE_MAX_CARD_PIXELS:
+                return fail(
+                    f"Hotspot 'hotspot_{hs_idx}' zoomed card ({card_w}x{card_h}) exceeds 64 MP limit; reduce --zoom"
+                )
+            hname = f"hotspot_{hs_idx}"
+            slug = _alloc_unique_slug(_sanitize_roi_name(hname), used_slugs_lower)
+            resolved_rois.append({
+                "name": hname,
+                "slug": slug,
+                "rect_pt": hs["rect_pt"],
+                "rect_px": hs["rect_px"],
+            })
+
+    roi_results = []
+    cards = []
+    for roi in resolved_rois:
+        px, py, pw, ph = roi["rect_px"]
+        if default_full and roi["name"] == "full":
+            metrics, r1, r2, dr = full_metrics, full_r1, full_r2, full_dr
+        else:
+            metrics, r1, r2, dr, _ = _analyze_region(
+                b1, w1, b2, w2, px, py, pw, ph, thresh, need_diff_rows=args.with_diff
+            )
+        crop_name = f"crop_{roi['slug']}.png"
+        crop_path = os.path.join(out_dir, crop_name)
+        card_w, card_h, card_buf = _render_compare_card(
+            roi["name"], px, py, pw, ph, zoom, r1, r2, dr, metrics
+        )
+        encode_png_rgba(crop_path, card_w, card_h, card_buf)
+        cards.append((card_w, card_h, card_buf))
+        entry = {
+            "name": roi["name"],
+            "rect_pt": roi["rect_pt"],
+            "rect_px": roi["rect_px"],
+            "zoom": zoom,
+            "crop_file": crop_path,
+            **metrics,
+        }
+        roi_results.append(entry)
+        if default_full and roi["name"] == "full":
+            full_entry["crop_file"] = crop_path
+
+    sheet_path = None
+    if cards:
+        pad = 8
+        sheet_w = max(cw_i for cw_i, _, _ in cards) + pad * 2
+        sheet_h = sum(ch_i for _, ch_i, _ in cards) + pad * (len(cards) + 1)
+        sheet = bytearray(b"\x10\x12\x16\xff" * (sheet_w * sheet_h))
+        cy = pad
+        for cw_i, ch_i, cbuf in cards:
+            for y in range(ch_i):
+                dst_off = ((cy + y) * sheet_w + pad) * 4
+                src_off = y * cw_i * 4
+                sheet[dst_off:dst_off + cw_i * 4] = cbuf[src_off:src_off + cw_i * 4]
+            cy += ch_i + pad
+        sheet_path = os.path.join(out_dir, "compare_sheet.png")
+        encode_png_rgba(sheet_path, sheet_w, sheet_h, sheet)
+
+    json_path = os.path.join(out_dir, "compare.json")
+    res = {
+        "ok": True,
+        "ref": args.ref,
+        "cand": args.cand,
+        "out_dir": out_dir,
+        "same_size": same_size,
+        "ref_size": [w1, h1],
+        "cand_size": [w2, h2],
+        "compare_size": [cw, ch],
+        "scale": scale,
+        "zoom": zoom,
+        "threshold": thresh,
+        "with_diff": bool(args.with_diff),
+        "sheet_file": sheet_path,
+        "json_file": json_path,
+        "full": full_entry,
+        "hotspots": hotspots,
+        "uncovered_hotspots_total": uncovered_total,
+        "rois": roi_results,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=2)
+        f.write("\n")
+
+    if args.json:
+        emit_json(res)
+    else:
+        print(f"compare {cw}x{ch} (scale={scale}, zoom={zoom}x, thresh={thresh}) -> {out_dir}")
+        print(f"  {'ROI':<18} {'RECT_PX':<18} {'CHG%':>7} {'MAX':>4} {'MAE':>7} {'RMSE':>7} {'PSNR':>7} {'SPREAD(R->C)':>15}")
+        for r in roi_results:
+            rx, ry, rw, rh = r["rect_px"]
+            psnr_s = "inf" if r["psnr"] is None else f"{r['psnr']:.2f}"
+            sp_s = f"{r['ref_luma']['spread']:.3f}->{r['cand_luma']['spread']:.3f}"
+            print(
+                f"  {r['name']:<18} {f'{rx},{ry} {rw}x{rh}':<18} "
+                f"{r['changed_ratio']*100:>6.2f}% {r['max_delta']:>4} "
+                f"{r['mae']:>7.3f} {r['rmse']:>7.3f} {psnr_s:>7} {sp_s:>15}"
+            )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Subcommand 9: host-check & bench
 # ---------------------------------------------------------------------------
 
@@ -3712,6 +4337,22 @@ def build_parser():
     sp.add_argument("--threshold", type=int, default=0, help="Per-channel delta threshold (0..255)")
     sp.add_argument("--json", action="store_true", help="Output structured JSON")
     sp.set_defaults(func=cmd_diff)
+
+    # compare
+    sp = sub.add_parser("compare", help="Side-by-side ROI visual compare & luma/diff metrics (pure Python stdlib)")
+    sp.add_argument("ref", help="Reference PNG path")
+    sp.add_argument("cand", help="Candidate PNG path")
+    sp.add_argument("--out", required=True, help="Output directory for crop PNGs, compare_sheet.png, and compare.json")
+    sp.add_argument("--roi", action="append", default=[], help="ROI spec name=x,y,w,h (repeatable; multiplied by --scale)")
+    sp.add_argument("--roi-file", default="", help="Optional JSON file with list of {name,x,y,w,h} ROIs")
+    sp.add_argument("--scale", type=float, default=1.0, help="Logical-to-pixel scale factor (default: 1.0)")
+    sp.add_argument("--zoom", type=int, default=None, help="Nearest-neighbor zoom factor >= 1 (default: 1 for full image, 2 for explicit ROIs)")
+    sp.add_argument("--threshold", type=int, default=2, help="Per-channel delta threshold 0..255 (default: 2)")
+    sp.add_argument("--with-diff", action="store_true", help="Append 3rd panel with 4x enhanced diff (DIFFx4)")
+    sp.add_argument("--allow-size-diff", action="store_true", help="Allow comparing common overlap when image sizes differ")
+    sp.add_argument("--auto-hotspots", type=int, default=0, help="Auto-crop top-N uncovered 64x64 high-diff hotspots (default: 0)")
+    sp.add_argument("--json", action="store_true", help="Output structured JSON")
+    sp.set_defaults(func=cmd_compare)
 
     # host-check
     sp = sub.add_parser("host-check", help="Compile & verify native host backends")

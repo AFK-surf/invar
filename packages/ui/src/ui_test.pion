@@ -4983,7 +4983,7 @@ test "view_key keeps active Field Enter and Space inside focus chain (no leak to
   t.dispose()
 }
 
-test "set_glass_frost adds global extra blur to blurred liquid glass, skips clear lenses, preserves ViewBlock cache, and isolates per window" {
+test "set_glass_frost aligns with effective_glass curve, auto-solids at 1.0, exempts mag/progressive, preserves ViewBlock cache, and isolates per window" {
   set_glass_solid(None)
   set_glass_frost(0.0)
   debug_assert(glass_frost() == 0.0, "default glass_frost is 0")
@@ -4992,68 +4992,140 @@ test "set_glass_frost adds global extra blur to blurred liquid glass, skips clea
   set_glass_frost(0.0 / 0.0)
   debug_assert(glass_frost() == 0.0, "NaN glass_frost clamps to 0")
   set_glass_frost(500.0)
-  debug_assert(glass_frost() == 128.0, "excessive glass_frost clamps to 128")
+  debug_assert(glass_frost() == 1.0, "excessive glass_frost clamps to 1.0")
+  debug_assert(glass_solid(), "frost >= 0.995 switches glass_solid() to true")
+  set_glass_solid(Some(false))
+  debug_assert(!glass_solid(), "explicit set_glass_solid(Some(false)) overrides frost == 1.0")
+  set_glass_solid(None)
   set_glass_frost(0.0)
+  debug_assert(!glass_solid(), "glass_solid returns false when frost is 0.0")
+
+  // Direct effective_glass curve verification at frost = 0.5 (f=0.5, mix=0.25)
+  let liq = paint::Glass::liquid(
+    tint=rgba(255, 255, 255, 40),
+    solid=rgba(200, 180, 160, 255),
+    blur=2.0,
+    refraction=9.0,
+  )
+  let liq_eff = effective_glass(liq, 0.5)
+  // RGB: 255 + (solid - 255) * 0.25 -> R=241, G=236, B=231
+  // Alpha: ta = 40/255, na = round((ta + (0.94 - ta) * 0.5) * 255) = round((40 + (239.7 - 40)*0.5)) = 140
+  let lr = (liq_eff.tint >> 24) & 0xFFL
+  let lg_c = (liq_eff.tint >> 16) & 0xFFL
+  let lb = (liq_eff.tint >> 8) & 0xFFL
+  let la = liq_eff.tint & 0xFFL
+  debug_assert(lr == 241L && lg_c == 236L && lb == 231L && la == 140L,
+    "effective_glass liquid tint mismatch: (\{lr}, \{lg_c}, \{lb}, \{la})")
+  // Blur: 2.0 + (14.0 - 2.0) * 0.25 = 5.0
+  debug_assert((liq_eff.blur - 5.0).abs() < 0.001, "effective_glass liquid blur expected 5.0, got \{liq_eff.blur}")
+  // Refraction: 9.0 * (1.0 - 0.55 * 0.5) = 6.525
+  debug_assert((liq_eff.refraction - 6.525).abs() < 0.001, "effective_glass liquid refraction expected 6.525, got \{liq_eff.refraction}")
+
+  // Frosted kind-5 glass at frost = 0.5: blur 8.0 -> 8.0 + (14.0 - 8.0) * 0.25 = 9.5, refraction unchanged (0.0)
+  let fr_gl = paint::Glass::frosted(blur=8.0, tint=rgba(255, 255, 255, 80), solid=rgba(220, 220, 220, 255))
+  let fr_eff = effective_glass(fr_gl, 0.5)
+  debug_assert((fr_eff.blur - 9.5).abs() < 0.001, "effective_glass frosted blur expected 9.5, got \{fr_eff.blur}")
+  debug_assert((fr_eff.refraction - 0.0).abs() < 0.001, "effective_glass frosted refraction stays 0.0")
+  let fa = fr_eff.tint & 0xFFL
+  // round((80/255 + (0.94 - 80/255) * 0.5) * 255) = round(80 + (239.7 - 80)*0.5) = 160
+  debug_assert(fa == 160L, "effective_glass frosted tint alpha expected 160, got \{fa}")
+
+  // Pure optical magnifying lens (tint alpha == 0 && zoom > 1.0001) is exempt
+  let pure_mag = paint::Glass::liquid(tint=rgba(255, 255, 255, 0), solid=rgba(240, 240, 240, 255), blur=0.0, zoom=1.4, refraction=12.0)
+  let mag_eff = effective_glass(pure_mag, 0.5)
+  debug_assert(mag_eff.tint == pure_mag.tint && mag_eff.blur == 0.0 && (mag_eff.refraction - 12.0).abs() < 0.001,
+    "pure optical magnifying lens must be exempt from frost")
+
+  // Clear pressed optical lens (liquid=true, tint alpha == 0, blur == 0, zoom == 1.0) is exempt at frost=0.0002 & 0.5
+  let clear_pressed = paint::Glass::liquid(tint=rgba(255, 255, 255, 0), solid=rgba(240, 240, 240, 255), blur=0.0, zoom=1.0, refraction=8.0)
+  let cp_tiny = effective_glass(clear_pressed, 0.0002)
+  let cp_half = effective_glass(clear_pressed, 0.5)
+  debug_assert(cp_tiny.tint == clear_pressed.tint && cp_tiny.blur == 0.0 && (cp_tiny.refraction - 8.0).abs() < 0.001,
+    "clear pressed lens must stay exempt at frost=0.0002")
+  debug_assert(cp_half.tint == clear_pressed.tint && cp_half.blur == 0.0 && (cp_half.refraction - 8.0).abs() < 0.001,
+    "clear pressed lens must stay exempt at frost=0.5")
+
+  // Progressive scroll-edge (!liquid && progressive) is exempt
+  let prog_edge = paint::Glass::frosted(blur=6.0, tint=rgba(255, 255, 255, 60), solid=rgba(240, 240, 240, 255), progressive=true)
+  let prog_eff = effective_glass(prog_edge, 0.5)
+  debug_assert(prog_eff.tint == prog_edge.tint && (prog_eff.blur - 6.0).abs() < 0.001,
+    "progressive scroll-edge blur must be exempt from frost")
 
   let t = Tester::tree(fn(root : view::View) {
-    // 1. Regular liquid glass capsule (blur=2.0) under 1.5x scale
+    // 1. Regular liquid glass capsule (blur=2.0, refraction=9.0) under 1.5x scale
     let _ = root.box(fn(cap : view::View) {
       let _ = cap.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(40.0)))
         .scale(view::Live::Is(1.5))
-        .glass(view::Live::Is(Some(paint::Glass::liquid(tint=rgba(255, 255, 255, 40), solid=rgba(240, 240, 240, 255), blur=2.0))))
+        .glass(view::Live::Is(Some(liq)))
     })
-    // 2. Clear liquid glass lens (blur=0.0, zoom=1.0 — Slider/Toggle/Segmented/Tab/Magnifier lens): must stay 0.0!
-    let _ = root.box(fn(clear_lens : view::View) {
-      let _ = clear_lens.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(32.0)))
-        .glass(view::Live::Is(Some(paint::Glass::liquid(tint=rgba(255, 255, 255, 10), solid=rgba(240, 240, 240, 255), blur=0.0, zoom=1.0))))
+    // 2. Tinted blur=0 liquid glass (e.g. Glass::clear with tint alpha > 0): affected by effective_glass
+    let _ = root.box(fn(tinted_clear : view::View) {
+      let _ = tinted_clear.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(32.0)))
+        .glass(view::Live::Is(Some(paint::Glass::liquid(tint=rgba(255, 255, 255, 26), solid=rgba(240, 240, 240, 255), blur=0.0, zoom=1.0, refraction=16.0))))
     })
-    // 3. Magnifying liquid glass lens (blur=0.0, zoom=1.4): must stay negative zoom slot!
+    // 3. Pure optical magnifying lens (tint alpha == 0, blur=0.0, zoom=1.4): exempt -> stays -0.4!
     let _ = root.box(fn(mag_lens : view::View) {
       let _ = mag_lens.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(40.0)))
-        .glass(view::Live::Is(Some(paint::Glass::liquid(tint=rgba(255, 255, 255, 10), solid=rgba(240, 240, 240, 255), blur=0.0, zoom=1.4))))
+        .glass(view::Live::Is(Some(pure_mag)))
     })
-    // 4. Frosted kind-5 glass (blur=8.0): must NOT be modified by liquid glass frost!
+    // 4. Frosted kind-5 glass (blur=8.0): modulated by effective_glass
     let _ = root.box(fn(fr : view::View) {
       let _ = fr.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(40.0)))
-        .glass(view::Live::Is(Some(paint::Glass::frosted(blur=8.0, tint=rgba(255, 255, 255, 80), solid=rgba(240, 240, 240, 255)))))
+        .glass(view::Live::Is(Some(fr_gl)))
     })
-    // 5. Plain text node cached in ViewBlock: changing glass_frost must NOT wipe ViewBlock cache!
+    // 5. Progressive kind-5 scroll-edge (blur=6.0, progressive=true): exempt!
+    let _ = root.box(fn(pe : view::View) {
+      let _ = pe.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(40.0)))
+        .glass(view::Live::Is(Some(prog_edge)))
+    })
+    // 6. Plain text node cached in ViewBlock: changing glass_frost (< 0.995) must NOT wipe ViewBlock cache!
     let _ = root.box(fn(txt : view::View) {
       let _ = txt.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(24.0)))
         .words(view::Live::Is("Cached label"), ink=rgba(20, 20, 20, 255), look=view::words_plain)
     })
   })
-  let find_blurs = fn(sc : Scene) -> (Double, Double, Double, Double, Int) {
+  let inspect = fn(sc : Scene) -> (Double, Double, Double, Double, Double, Double, Int, Int) {
     let mut cap_b = -999.0
+    let mut cap_ref = -999.0
     let mut clear_b = -999.0
     let mut mag_b = -999.0
     let mut fr_b = -999.0
+    let mut prog_b = -999.0
     let mut k6_count = 0
+    let mut k5_count = 0
     for i in 0..<sc.ninst {
       let b = i * inst_size
       let k = sc.inst[b + 5]
       let bl = sc.inst[b + 7]
+      let w = sc.inst[b + 2]
       if (k - 6.0).abs() < 0.01 {
         k6_count += 1
         if bl < 0.0 {
           mag_b = bl
-        } else if bl == 0.0 {
+        } else if (w - 60.0).abs() < 1.0 {
           clear_b = bl
         } else {
           cap_b = bl
+          cap_ref = sc.inst[b + 21]
         }
       } else if (k - 5.0).abs() < 0.01 {
-        fr_b = bl
+        k5_count += 1
+        if sc.inst[b + 22] < -0.5 {
+          prog_b = bl
+        } else {
+          fr_b = bl
+        }
       }
     }
-    (cap_b, clear_b, mag_b, fr_b, k6_count)
+    (cap_b, cap_ref, clear_b, mag_b, fr_b, prog_b, k6_count, k5_count)
   }
-  let (c0, cl0, m0, f0, k0) = find_blurs(t.scene())
-  debug_assert(k0 == 3, "3 liquid glass instances at baseline, got \{k0}")
-  debug_assert((c0 - 3.0).abs() < 0.01, "baseline scaled liquid blur 2.0 * 1.5 = 3.0, got \{c0}")
-  debug_assert(cl0 == 0.0, "baseline clear lens blur 0.0, got \{cl0}")
+  let (c0, r0, cl0, m0, f0, p0, k6_0, k5_0) = inspect(t.scene())
+  debug_assert(k6_0 == 3 && k5_0 == 2, "expected 3 liquid + 2 frosted at baseline, got \{k6_0}/\{k5_0}")
+  debug_assert((c0 - 3.0).abs() < 0.01 && (r0 - 9.0).abs() < 0.01, "baseline liquid blur=3.0 ref=9.0, got \{c0}/\{r0}")
+  debug_assert(cl0 == 0.0, "baseline tinted blur=0 liquid, got \{cl0}")
   debug_assert((m0 + 0.4).abs() < 0.01, "baseline mag lens zoom slot -0.4, got \{m0}")
   debug_assert((f0 - 8.0).abs() < 0.01, "baseline frosted blur 8.0, got \{f0}")
+  debug_assert((p0 - 6.0).abs() < 0.01, "baseline progressive blur 6.0, got \{p0}")
 
   // Prime ViewBlock cache on steady frame, then change frost -> non-glass ViewBlocks must stay cached (copied unchanged).
   t.frame()
@@ -5061,25 +5133,34 @@ test "set_glass_frost adds global extra blur to blurred liquid glass, skips clea
   t.frame()
   let base_work = view_paint_work_now()
   view_paint_work_reset()
-  set_glass_frost(6.0)
+  set_glass_frost(0.5)
   t.frame()
   let work = view_paint_work_now()
   debug_assert(
     base_work.copied > 0 && work.copied == base_work.copied && work.made == base_work.made,
     "glass_frost change must not wipe ViewBlock cache: base=(made=\{base_work.made} copied=\{base_work.copied}) after=(made=\{work.made} copied=\{work.copied})",
   )
-  let (c1, cl1, m1, f1, _) = find_blurs(t.scene())
-  debug_assert((c1 - 12.0).abs() < 0.01, "frosted liquid blur (2.0 + 6.0) * 1.5 = 12.0, got \{c1}")
-  debug_assert(cl1 == 0.0, "clear lens (blur=0, zoom=1) untouched by glass_frost, got \{cl1}")
-  debug_assert((m1 + 0.4).abs() < 0.01, "magnifying lens untouched by glass_frost, got \{m1}")
-  debug_assert((f1 - 8.0).abs() < 0.01, "frosted kind-5 glass untouched by glass_frost, got \{f1}")
+  let (c1, r1, cl1, m1, f1, p1, _, _) = inspect(t.scene())
+  debug_assert((c1 - 7.5).abs() < 0.01, "frosted liquid blur 5.0 * 1.5 = 7.5, got \{c1}")
+  debug_assert((r1 - 6.525).abs() < 0.01, "frosted liquid refraction 6.525, got \{r1}")
+  debug_assert((cl1 - 3.5).abs() < 0.01, "tinted blur=0 liquid gets blur 0 + 14*0.25 = 3.5, got \{cl1}")
+  debug_assert((m1 + 0.4).abs() < 0.01, "pure optical magnifying lens untouched by frost, got \{m1}")
+  debug_assert((f1 - 9.5).abs() < 0.01, "frosted kind-5 blur 8 + 6*0.25 = 9.5, got \{f1}")
+  debug_assert((p1 - 6.0).abs() < 0.01, "progressive scroll-edge blur untouched by frost, got \{p1}")
 
-  // set_glass_solid(Some(true)) takes precedence over glass_frost > 0 (0 liquid instances emitted).
-  set_glass_solid(Some(true))
+  // frost = 1.0 automatically switches to solid (0 glass instances emitted)
+  set_glass_frost(1.0)
   t.frame()
-  let (_, _, _, _, k_solid) = find_blurs(t.scene())
-  debug_assert(k_solid == 0, "glass_solid(Some(true)) overrides glass_frost with solid rects, got \{k_solid}")
+  let (_, _, _, _, _, _, k6_s, k5_s) = inspect(t.scene())
+  debug_assert(k6_s == 0 && k5_s == 0, "frost=1.0 switches to solid rects (0 glass), got \{k6_s}/\{k5_s}")
+
+  // Explicit set_glass_solid(Some(false)) overrides frost=1.0 back to glass (clamped at f=0.95 inside effective_glass)
+  set_glass_solid(Some(false))
+  t.frame()
+  let (_, _, _, _, _, _, k6_ov, k5_ov) = inspect(t.scene())
+  debug_assert(k6_ov == 3 && k5_ov == 2, "set_glass_solid(Some(false)) overrides frost=1.0, got \{k6_ov}/\{k5_ov}")
   set_glass_solid(None)
+  set_glass_frost(0.0)
 
   // Per-window isolation check (including actual window_frame rendering)
   set_window_tree(fn(_wid : Int, _what : String) -> (view::View) -> Unit {
@@ -5092,13 +5173,13 @@ test "set_glass_frost adds global extra blur to blurred liquid glass, skips clea
   })
   let w1 = window_open_here("frost-w1")
   let w2 = window_open_here("frost-w2")
-  in_window(w1, fn() { set_glass_frost(10.0) })
-  in_window(w2, fn() { set_glass_frost(2.0) })
+  in_window(w1, fn() { set_glass_frost(0.8) })
+  in_window(w2, fn() { set_glass_frost(0.2) })
   let mut f_w1 = -1.0
   let mut f_w2 = -1.0
   in_window(w1, fn() { f_w1 = glass_frost() })
   in_window(w2, fn() { f_w2 = glass_frost() })
-  debug_assert((f_w1 - 10.0).abs() < 0.01 && (f_w2 - 2.0).abs() < 0.01, "glass_frost isolated per window: \{f_w1}/\{f_w2}")
+  debug_assert((f_w1 - 0.8).abs() < 0.01 && (f_w2 - 0.2).abs() < 0.01, "glass_frost isolated per window: \{f_w1}/\{f_w2}")
   debug_assert(window_frame(w1, 200.0, 100.0, 1.0, 16.0), "window_frame renders w1 with its own frost")
   debug_assert(window_frame(w2, 200.0, 100.0, 1.0, 16.0), "window_frame renders w2 with its own frost")
   window_close_here(w1)

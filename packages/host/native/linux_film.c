@@ -49,7 +49,6 @@ static double size_w, size_h, size_scale;
 void mb_render_set_size(double w, double h, double scale) {
   int pw = (int)floor(w * scale + 0.5), ph = (int)floor(h * scale + 0.5);
   if (pw <= 0 || ph <= 0) return;
-  if (size_fb && w == size_w && h == size_h && scale == size_scale) return;
   if (!size_fb || pw != size_pw || ph != size_ph) {
     if (size_fb) {
       glDeleteFramebuffers(1, &size_fb);

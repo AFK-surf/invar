@@ -3728,6 +3728,7 @@ extern "C" int mb_render_init_offscreen(double w, double h, double scale) {
     return 0;
   }
   mb_text_set_scale(scale);
+  if (rw) ad_forget(rw);
   return 1;
 }
 

@@ -1589,7 +1589,7 @@ static void ensure_levels(int w, int h) {
   for (int j = 0; j < 4; j++)
     lv[j] = level_tex(j == 0 ? GL_RGBA8 : GL_RGB10_A2, (lv_w + (1 << j) - 1) >> j, (lv_h + (1 << j) - 1) >> j);
   lv[4] = level_tex(GL_RGB10_A2, lv_w, lv_h);
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
 }
 
 static void ensure_lens_levels(int w, int h) {
@@ -1602,7 +1602,7 @@ static void ensure_lens_levels(int w, int h) {
   lens_w = w > lens_w ? w : lens_w;
   lens_h = h > lens_h ? h : lens_h;
   for (int j = 0; j < 2; j++) lens_lv[j] = level_tex(GL_RGBA8, lens_w, lens_h);
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
 }
 
 static void post_pass(level *src, int sw, int sh, level *dst, int w, int h, int mode, float sg, float dx, float dy) {
@@ -2548,7 +2548,7 @@ static void shrink_levels(int w, int h) {
   for (int j = 0; j < 4; j++)
     lv[j] = level_tex(j == 0 ? GL_RGBA8 : GL_RGB10_A2, (lv_w + (1 << j) - 1) >> j, (lv_h + (1 << j) - 1) >> j);
   lv[4] = level_tex(GL_RGB10_A2, lv_w, lv_h);
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
   for (int i = 0; i < MB_GLASS_SLOTS; i++) {
     glass_slot *s = &slots[i];
     if (!s->bt) continue;
@@ -2930,7 +2930,7 @@ static glass_slot *slot_fill(const Grab *m, unsigned frame_clock) {
     }
 #endif
     glBlitFramebuffer(0, 0, gw, gh, 0, 0, gw, gh, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
   }
   slots_evict_budget(idx, frame_clock, 0);
   return s;
@@ -4096,6 +4096,9 @@ static int gl_offscreen(double w, double h, double scale) {
   if (ph <= 0) ph = 1;
   fb_w = pw;
   fb_h = ph;
+  canvas_ok = 0;
+  slots_invalidate();
+  gl_adaptive_reset();
   if (!off_fb || pw != off_pw || ph != off_ph) {
     if (off_fb) {
       glDeleteFramebuffers(1, &off_fb);
@@ -4108,7 +4111,6 @@ static int gl_offscreen(double w, double h, double scale) {
     glGenFramebuffers(1, &off_fb);
     glBindFramebuffer(GL_FRAMEBUFFER, off_fb);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, off_tex, 0);
-    canvas_ok = 0;
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
       LOG("mbui-render: no framebuffer (%dx%d)", pw, ph);
       glBindFramebuffer(GL_FRAMEBUFFER, 0);

@@ -4030,6 +4030,8 @@ int mb_render_init_offscreen(double w, double h, double scale) {
   NSUInteger ph = (NSUInteger)round(h * scale);
   if (pw == 0 || ph == 0) return 0;
   off_ok = 0;
+  mb_render_adaptive_reset();
+  slots_invalidate();
   if (off_target && off_target.width == pw && off_target.height == ph) {
     return 1;
   }

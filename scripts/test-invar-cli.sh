@@ -345,4 +345,241 @@ assert p['width'] == 390 and p['height'] == 844, f'scale=1 override failed: {p}'
 print('OK: invar shot fresh output + scale=1 override (%dx%d, build %d ms, run %d ms)' % (p['width'], p['height'], d['build_ms'], d['run_ms']))
 " "$SHOT_OK"
 
-echo "=== ALL 11 INVAR CLI E2E TESTS PASSED! ==="
+echo "=== 12. invar compare (full, multi-ROI @2x + zoom + with-diff, exact luma spread, error gates) ==="
+CMP_DIR="$TMP/cmp"
+mkdir -p "$CMP_DIR"
+python3 - "$CMP_DIR" << 'PYEOF'
+import json, os, struct, sys, zlib
+
+def write_png(path, w, h, rgba):
+    def chunk(ct, body):
+        crc = zlib.crc32(body, zlib.crc32(ct)) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + ct + body + struct.pack(">I", crc)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw.extend(rgba[y*w*4:(y+1)*w*4])
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+
+d = sys.argv[1]
+w, h = 40, 40
+# ref: 95% black (0,0,0) and 5% white (255,255,255) inside ROI [4..24, 4..24] (20x20 = 400 px: 380 black + 20 white)
+ref = bytearray([0, 0, 0, 255] * (w * h))
+cand = bytearray(ref)
+for y in range(4, 24):
+    for x in range(4, 24):
+        idx = (y - 4) * 20 + (x - 4)
+        o = (y * w + x) * 4
+        if idx >= 380:
+            ref[o:o+4] = bytes([255, 255, 255, 255])
+            cand[o:o+4] = bytes([128, 128, 128, 255])
+write_png(os.path.join(d, "ref.png"), w, h, ref)
+write_png(os.path.join(d, "cand.png"), w, h, cand)
+# Mismatched size PNG
+small = bytearray([10, 20, 30, 255] * (20 * 20))
+write_png(os.path.join(d, "small.png"), 20, 20, small)
+with open(os.path.join(d, "rois.json"), "w") as f:
+    json.dump([{"name": "top_left", "x": 0, "y": 0, "w": 6, "h": 6}], f)
+PYEOF
+
+# 12a. Full image compare (no --roi)
+CMP_FULL_OUT="$CMP_DIR/out_full"
+CMP_FULL_JSON="$("$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_FULL_OUT" --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['same_size'] is True
+assert len(d['rois']) == 1 and d['rois'][0]['name'] == 'full'
+assert d['rois'][0]['changed_pixels'] == 20
+assert os.path.isfile(d['rois'][0]['crop_file'])
+assert os.path.isfile(d['sheet_file'])
+assert os.path.isfile(d['json_file'])
+print('OK: invar compare full-image')
+" "$CMP_FULL_JSON"
+
+# 12b. Multi-ROI @2x logical coords + --roi-file + --zoom 2 + --with-diff + exact p99.5-p5 check
+CMP_ROI_OUT="$CMP_DIR/out_roi"
+CMP_ROI_JSON="$("$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_ROI_OUT" --scale 2 --zoom 2 --with-diff --roi-file "$CMP_DIR/rois.json" --roi "panel=2,2,10,10" --json)"
+assert_py "
+import json, os, struct, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and len(d['rois']) == 2
+r_tl, r_p = d['rois'][0], d['rois'][1]
+assert r_tl['name'] == 'top_left' and r_tl['rect_px'] == [0, 0, 12, 12]
+assert r_p['name'] == 'panel' and r_p['rect_px'] == [4, 4, 20, 20]
+assert r_p['changed_pixels'] == 20 and r_p['total_pixels'] == 400
+# ref ROI has 380 black (0) + 20 white (255) -> p5=0.0, p99_5=1.0, spread=1.0
+assert abs(r_p['ref_luma']['p5'] - 0.0) < 1e-5 and abs(r_p['ref_luma']['p99_5'] - 1.0) < 1e-5
+assert abs(r_p['ref_luma']['spread'] - 1.0) < 1e-5, f'ref spread={r_p[\"ref_luma\"]}'
+# cand ROI has 380 black (0) + 20 gray (128) -> p5=0.0, p99_5=128/255, spread=128/255
+expected_cand_sp = 128.0 / 255.0
+assert abs(r_p['cand_luma']['spread'] - expected_cand_sp) < 1e-4, f'cand spread={r_p[\"cand_luma\"]}'
+assert abs(r_p['luma_spread_delta'] - (expected_cand_sp - 1.0)) < 1e-4
+# Verify crop_panel.png dimensions: 3 panels of 20*2=40 px + 2*2=4 px red separators = 124 wide, 20 header + 40 = 60 tall
+with open(r_p['crop_file'], 'rb') as f:
+    hdr = f.read(24)
+cw, ch = struct.unpack('>II', hdr[16:24])
+assert cw == 124 and ch == 60, f'unexpected crop_panel size: {cw}x{ch}'
+assert os.path.isfile(d['sheet_file'])
+with open(d['json_file']) as f:
+    saved = json.load(f)
+assert saved['rois'][1]['changed_pixels'] == 20
+print('OK: invar compare multi-ROI @2x + zoom 2 + with-diff + exact luma spread (%dx%d)' % (cw, ch))
+" "$CMP_ROI_JSON"
+
+# 12c. Size mismatch exits non-zero by default
+if "$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/small.png" --out "$CMP_DIR/out_mismatch" --json >/dev/null 2>&1; then
+  echo "FAIL: invar compare should fail on size mismatch without --allow-size-diff" >&2
+  exit 1
+fi
+echo "OK: invar compare rejects size mismatch"
+
+# 12d. Out-of-bounds ROI exits non-zero
+if "$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_DIR/out_oob" --roi "bad=30,30,20,20" --json >/dev/null 2>&1; then
+  echo "FAIL: invar compare should fail on out-of-bounds ROI" >&2
+  exit 1
+fi
+echo "OK: invar compare rejects out-of-bounds ROI"
+
+# 12e. Malformed --roi syntax exits non-zero
+if "$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_DIR/out_syntax" --roi "bad_no_equals" --json >/dev/null 2>&1; then
+  echo "FAIL: invar compare should fail on malformed --roi syntax" >&2
+  exit 1
+fi
+echo "OK: invar compare rejects malformed --roi syntax"
+
+# 12f. Uncovered hotspot detection & --auto-hotspots 1 auto-cropping
+python3 - "$CMP_DIR" << 'PYEOF'
+import os, struct, sys, zlib
+def write_png(path, w, h, rgba):
+    def chunk(ct, body):
+        crc = zlib.crc32(body, zlib.crc32(ct)) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + ct + body + struct.pack(">I", crc)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw.extend(rgba[y*w*4:(y+1)*w*4])
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+d = sys.argv[1]
+w, h = 192, 128
+b1 = bytearray([20, 20, 20, 255] * (w * h))
+b2 = bytearray(b1)
+# Put a strong diff block outside user ROI [0,0,64,64] at [128..160, 64..96] (cell [128,64,64,64])
+for y in range(64, 96):
+    for x in range(128, 160):
+        o = (y * w + x) * 4
+        b2[o:o+4] = bytes([240, 40, 40, 255])
+write_png(os.path.join(d, "hs_ref.png"), w, h, b1)
+write_png(os.path.join(d, "hs_cand.png"), w, h, b2)
+PYEOF
+
+HS_JSON="$("$INVAR" compare "$CMP_DIR/hs_ref.png" "$CMP_DIR/hs_cand.png" --out "$CMP_DIR/out_hs" --roi "left=0,0,64,64" --auto-hotspots 1 --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True
+hs = d['hotspots']
+assert len(hs) >= 1, f'expected hotspot: {d}'
+assert hs[0]['rect_px'] == [128, 64, 64, 64], f'wrong hotspot rect: {hs[0]}'
+assert hs[0]['covered_by_roi'] is False, f'hotspot should be uncovered: {hs[0]}'
+names = [r['name'] for r in d['rois']]
+assert names == ['left', 'hotspot_1'], f'expected auto-cropped hotspot_1: {names}'
+assert os.path.isfile(d['rois'][1]['crop_file']), 'missing crop_hotspot_1.png'
+print('OK: invar compare hotspots + --auto-hotspots 1 (%s)' % os.path.basename(d['rois'][1]['crop_file']))
+" "$HS_JSON"
+
+# 12g. Adversarial hotspot test 1: 6 decreasing diff cells, ROIs cover top 5 -> 6th uncovered cell MUST be reported & cropped
+python3 - "$CMP_DIR" << 'PYEOF'
+import os, struct, sys, zlib
+def write_png(path, w, h, rgba):
+    def chunk(ct, body):
+        crc = zlib.crc32(body, zlib.crc32(ct)) & 0xFFFFFFFF
+        return struct.pack(">I", len(body)) + ct + body + struct.pack(">I", crc)
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw.extend(rgba[y*w*4:(y+1)*w*4])
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+d = sys.argv[1]
+w, h = 384, 128
+b1 = bytearray([20, 20, 20, 255] * (w * h))
+b2 = bytearray(b1)
+# 6 cells across top row: (0,0)..(320,0) with decreasing deltas 220, 190, 160, 130, 100, 70
+for ci, delta in enumerate([220, 190, 160, 130, 100, 70]):
+    x0 = ci * 64
+    for y in range(10, 54):
+        for x in range(x0 + 10, x0 + 54):
+            o = (y * w + x) * 4
+            b2[o] = 20 + delta
+write_png(os.path.join(d, "hs6_ref.png"), w, h, b1)
+write_png(os.path.join(d, "hs6_cand.png"), w, h, b2)
+
+# Half-cell adversarial image: diff in x=0..32, ROI covers x=32..64 (50% area, 0% diff pixels)
+b3 = bytearray([20, 20, 20, 255] * (128 * 64))
+b4 = bytearray(b3)
+for y in range(64):
+    for x in range(32):
+        o = (y * 128 + x) * 4
+        b4[o] = 240
+write_png(os.path.join(d, "half_ref.png"), 128, 64, b3)
+write_png(os.path.join(d, "half_cand.png"), 128, 64, b4)
+
+# Empty ROI file
+with open(os.path.join(d, "empty_rois.json"), "w") as f:
+    f.write("[]\n")
+PYEOF
+
+HS6_JSON="$("$INVAR" compare "$CMP_DIR/hs6_ref.png" "$CMP_DIR/hs6_cand.png" --out "$CMP_DIR/out_hs6" \
+  --roi "c0=0,0,64,64" --roi "c1=64,0,64,64" --roi "c2=128,0,64,64" --roi "c3=192,0,64,64" --roi "c4=256,0,64,64" \
+  --auto-hotspots 1 --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True
+uncov = [h for h in d['hotspots'] if not h['covered_by_roi']]
+assert len(uncov) == 1 and uncov[0]['rect_px'] == [320, 0, 64, 64], f'6th cell missed: {d[\"hotspots\"]}'
+hs_roi = [r for r in d['rois'] if r['name'] == 'hotspot_1']
+assert len(hs_roi) == 1 and hs_roi[0]['rect_px'] == [320, 0, 64, 64] and os.path.isfile(hs_roi[0]['crop_file'])
+print('OK: invar compare 6th uncovered hotspot detected & auto-cropped despite top-5 covered')
+" "$HS6_JSON"
+
+# 12h. Adversarial hotspot test 2: diff in x=0..32, ROI in x=32..64 (50% area but 0% diff pixels) -> uncovered!
+HALF_JSON="$("$INVAR" compare "$CMP_DIR/half_ref.png" "$CMP_DIR/half_cand.png" --out "$CMP_DIR/out_half" \
+  --roi "right_half=32,0,32,64" --auto-hotspots 1 --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True
+uncov = [h for h in d['hotspots'] if not h['covered_by_roi']]
+assert len(uncov) == 1 and uncov[0]['rect_px'] == [0, 0, 64, 64], f'half-cell misclassified as covered: {d[\"hotspots\"]}'
+hs_roi = [r for r in d['rois'] if r['name'] == 'hotspot_1']
+assert len(hs_roi) == 1 and os.path.isfile(hs_roi[0]['crop_file'])
+print('OK: invar compare diff-pixel hotspot coverage avoids half-cell blindspot')
+" "$HALF_JSON"
+
+# 12i. Case-insensitive global slug dedup + empty --roi-file rejection
+DEDUP_JSON="$("$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_DIR/out_dedup" \
+  --roi "a=0,0,10,10" --roi "a=10,0,10,10" --roi "a_2=20,0,10,10" --roi "A=30,0,10,10" --json)"
+assert_py "
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and len(d['rois']) == 4
+paths = [r['crop_file'] for r in d['rois']]
+assert all(os.path.isfile(p) for p in paths), f'missing files: {paths}'
+assert len(set(p.lower() for p in paths)) == 4, f'case-insensitive collision: {paths}'
+print('OK: invar compare case-insensitive slug dedup (%s)' % [os.path.basename(p) for p in paths])
+" "$DEDUP_JSON"
+
+if "$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_DIR/out_empty_rf" --roi-file "$CMP_DIR/empty_rois.json" --json >/dev/null 2>&1; then
+  echo "FAIL: invar compare should fail on empty --roi-file []" >&2
+  exit 1
+fi
+echo "OK: invar compare rejects empty --roi-file []"
+
+echo "=== ALL 12 INVAR CLI E2E TESTS PASSED! ==="
