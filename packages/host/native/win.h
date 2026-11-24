@@ -5,6 +5,9 @@
 #include <wchar.h>
 #ifndef MB_NO_MOONBIT_H
 #include "moonbit.h"
+#else
+typedef const uint16_t *moonbit_string_t;
+typedef uint8_t *moonbit_bytes_t;
 #endif
 
 #ifdef __cplusplus

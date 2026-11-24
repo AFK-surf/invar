@@ -1,0 +1,80 @@
+name: Windows Shaders Bake & WARP Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  win-shaders:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout invar
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Setup MSVC Developer Environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+
+      - name: Build bake_win_shaders.exe and win_render_test.exe
+        shell: cmd
+        run: |
+          mkdir build_win_shaders
+          cl /nologo /O2 packages\host\tools\bake_win_shaders.c /Fe:build_win_shaders\bake_win_shaders.exe
+          if errorlevel 1 exit /b %errorlevel%
+          cl /nologo /O2 /EHsc /DMB_NO_MOONBIT_H /Ipackages\host\native packages\host\tests\win_render_test.cpp packages\host\native\win_render.cpp /Fe:build_win_shaders\win_render_test.exe
+          if errorlevel 1 exit /b %errorlevel%
+
+      - name: Pass 1 — Fresh D3DCompile WARP smoke (INVAR_IGNORE_BAKED=1)
+        shell: cmd
+        run: |
+          mkdir build_win_shaders\gen_cso
+          set MBUI_NO_WARM=1
+          set INVAR_IGNORE_BAKED=1
+          set MBUI_SHADERS=%CD%\build_win_shaders\gen_cso
+          build_win_shaders\win_render_test.exe --pass1
+          if errorlevel 1 exit /b %errorlevel%
+
+      - name: Pass 1 — Bake win_shaders_baked.h from generated .cso files
+        shell: cmd
+        run: |
+          build_win_shaders\bake_win_shaders.exe build_win_shaders\gen_cso build_win_shaders\win_shaders_baked.h
+          if errorlevel 1 exit /b %errorlevel%
+
+      - name: Upload freshly baked win_shaders_baked.h artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: win-shaders-baked
+          path: build_win_shaders/win_shaders_baked.h
+          if-no-files-found: error
+
+      - name: Pass 1 — Assert baked key count and 0-diff vs committed win_shaders_baked.h
+        shell: bash
+        run: |
+          KEY_COUNT=$(grep -c 'baked_shader_' build_win_shaders/win_shaders_baked.h)
+          echo "Baked shader count (definitions+table): $KEY_COUNT"
+          TABLE_COUNT=$(grep -c 'ULL, sizeof baked_shader_' build_win_shaders/win_shaders_baked.h)
+          echo "Baked shader table entries: $TABLE_COUNT"
+          test "$TABLE_COUNT" -eq 21
+          diff -u --strip-trailing-cr packages/host/native/win_shaders_baked.h build_win_shaders/win_shaders_baked.h
+
+      - name: Pass 2 — Verify 100% baked_shaders[] hit with empty cache dir & WARP smoke
+        shell: cmd
+        run: |
+          mkdir build_win_shaders\empty_verify
+          set MBUI_NO_WARM=1
+          set INVAR_IGNORE_BAKED=
+          set MBUI_SHADERS=%CD%\build_win_shaders\empty_verify
+          build_win_shaders\win_render_test.exe --pass2
+
+      - name: Pass 2 — Assert empty_verify dir has 0 .cso files
+        shell: bash
+        run: |
+          CSO_COUNT=$(find build_win_shaders/empty_verify -name '*.cso' | wc -l)
+          echo "Pass 2 runtime .cso count: $CSO_COUNT"
+          test "$CSO_COUNT" -eq 0
