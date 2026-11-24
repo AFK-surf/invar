@@ -31,7 +31,9 @@ struct DropPathsTarget {
 }
 
 struct DropFilesTarget {
+  wid : Int
   id : view::NodeId
+  gen : Int
   on_files : (Array[hostapi::Picked]) -> Unit
   state : DropZoneState
 }
@@ -42,7 +44,47 @@ struct DropRegistry {
   files : Array[DropFilesTarget]
 }
 
-let drop_registry : DropRegistry = DropRegistry::{ words: [], paths: [], files: [] }
+fn DropRegistry::new() -> DropRegistry {
+  DropRegistry::{ words: [], paths: [], files: [] }
+}
+
+let drop_registry_ref : signals::Ref[DropRegistry] = ref_new(DropRegistry::new())
+let drop_registry_kept_registered : signals::Ref[Bool] = ref_new(false)
+let host_drop_channel : String = "mb" + "ui.drop"
+
+fn ensure_drop_registry_kept() -> Unit {
+  if !drop_registry_kept_registered.v {
+    drop_registry_kept_registered.v = true
+    window_kept_ref(drop_registry_ref, fn() { DropRegistry::new() })
+    on_message_said(host_drop_channel, fn(json : String, _b : Option[Bytes]) -> Bool {
+      handle_host_drop_message(json)
+      true
+    })
+  }
+}
+
+struct PendingDropPick {
+  wid : Int
+  tree_id : Int
+  node_id : view::NodeId
+  gen : Int
+  pick : hostapi::Pick
+}
+
+let pending_drop_picks : Map[Int, PendingDropPick] = Map::new()
+
+fn drops_reset() -> Unit {
+  ensure_drop_registry_kept()
+  drop_registry_ref.v = DropRegistry::new()
+  let ids = pending_drop_picks.keys()
+  for pid in ids {
+    match pending_drop_picks.get(pid) {
+      Some(p) => hostapi::forget_dropped(p.pick.id())
+      None => ()
+    }
+  }
+  pending_drop_picks.clear()
+}
 
 /// Whether the current host supports receiving external drops (desktop & web).
 pub fn takes_drops() -> Bool {
@@ -69,19 +111,21 @@ fn drop_point_hits(id : view::NodeId, x : Double, y : Double) -> Bool {
 
 /// Bind `v` as a text-drop receiver that inserts dropped text into `fld`.
 pub fn words_into(v : view::View, fld : Field) -> view::View {
+  ensure_drop_registry_kept()
   let id = v.id()
   let st = new_drop_zone_state()
-  drop_registry.words.push(DropWordsTarget::{ id, field: fld, state: st })
+  drop_registry_ref.v.words.push(DropWordsTarget::{ id, field: fld, state: st })
   let _ = v.owns(fn() {
+    let reg = drop_registry_ref.v
     let keep : Array[DropWordsTarget] = []
-    for item in drop_registry.words {
+    for item in reg.words {
       if item.id != id {
         keep.push(item)
       }
     }
-    drop_registry.words.clear()
+    reg.words.clear()
     for item in keep {
-      drop_registry.words.push(item)
+      reg.words.push(item)
     }
   })
   v
@@ -89,19 +133,21 @@ pub fn words_into(v : view::View, fld : Field) -> view::View {
 
 /// Bind `v` as a filesystem-path drop receiver invoking `on_paths`.
 pub fn paths_into(v : view::View, on_paths : (Array[DroppedPath]) -> Unit) -> view::View {
+  ensure_drop_registry_kept()
   let id = v.id()
   let st = new_drop_zone_state()
-  drop_registry.paths.push(DropPathsTarget::{ id, on_paths, state: st })
+  drop_registry_ref.v.paths.push(DropPathsTarget::{ id, on_paths, state: st })
   let _ = v.owns(fn() {
+    let reg = drop_registry_ref.v
     let keep : Array[DropPathsTarget] = []
-    for item in drop_registry.paths {
+    for item in reg.paths {
       if item.id != id {
         keep.push(item)
       }
     }
-    drop_registry.paths.clear()
+    reg.paths.clear()
     for item in keep {
-      drop_registry.paths.push(item)
+      reg.paths.push(item)
     }
   })
   v
@@ -109,19 +155,23 @@ pub fn paths_into(v : view::View, on_paths : (Array[DroppedPath]) -> Unit) -> vi
 
 /// Bind `v` as a picked-file drop receiver invoking `on_files`.
 pub fn files_into(v : view::View, on_files : (Array[hostapi::Picked]) -> Unit) -> view::View {
+  ensure_drop_registry_kept()
+  let wid = current_window_id()
   let id = v.id()
+  let gen = id.gen
   let st = new_drop_zone_state()
-  drop_registry.files.push(DropFilesTarget::{ id, on_files, state: st })
+  drop_registry_ref.v.files.push(DropFilesTarget::{ wid, id, gen, on_files, state: st })
   let _ = v.owns(fn() {
+    let reg = drop_registry_ref.v
     let keep : Array[DropFilesTarget] = []
-    for item in drop_registry.files {
-      if item.id != id {
+    for item in reg.files {
+      if !(item.id == id && item.gen == gen) {
         keep.push(item)
       }
     }
-    drop_registry.files.clear()
+    reg.files.clear()
     for item in keep {
-      drop_registry.files.push(item)
+      reg.files.push(item)
     }
   })
   v
@@ -129,23 +179,426 @@ pub fn files_into(v : view::View, on_files : (Array[hostapi::Picked]) -> Unit) -
 
 /// Inspect the reactive `DropZoneState` attached to `v`, if any.
 pub fn drop_zone_state(v : view::View) -> Option[DropZoneState] {
+  ensure_drop_registry_kept()
+  let reg = drop_registry_ref.v
   let id = v.id()
-  for t in drop_registry.files {
+  for t in reg.files {
     if t.id == id {
       return Some(t.state)
     }
   }
-  for t in drop_registry.paths {
+  for t in reg.paths {
     if t.id == id {
       return Some(t.state)
     }
   }
-  for t in drop_registry.words {
+  for t in reg.words {
     if t.id == id {
       return Some(t.state)
     }
   }
   None
+}
+
+fn drop_target_alive(id : view::NodeId) -> Bool {
+  match view_tree() {
+    Some(tr) => tr.lives(id)
+    None => true
+  }
+}
+
+fn find_drop_files_target_here(id : view::NodeId, gen : Int) -> Option[DropFilesTarget] {
+  let reg = drop_registry_ref.v
+  let mut i = reg.files.length() - 1
+  while i >= 0 {
+    let t = reg.files[i]
+    if t.id == id && t.gen == gen && drop_target_alive(t.id) {
+      return Some(t)
+    }
+    i -= 1
+  }
+  None
+}
+
+fn match_drop_files_target_here(x : Double, y : Double) -> Option[DropFilesTarget] {
+  let reg = drop_registry_ref.v
+  let mut i = reg.files.length() - 1
+  while i >= 0 {
+    let t = reg.files[i]
+    if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
+      return Some(t)
+    }
+    i -= 1
+  }
+  None
+}
+
+fn deliver_files_to_target(t : DropFilesTarget, files : Array[hostapi::Picked]) -> Unit {
+  t.state.active.set(true)
+  t.state.hovered.set(true)
+  (t.on_files)(files)
+  t.state.hovered.set(false)
+  t.state.active.set(false)
+}
+
+/// Route a dropped `hostapi::Pick` to the topmost matching `files_into` receiver in window `wid`
+/// keyed by `(wid, NodeId, gen)`.
+/// - On miss (no receiver or closed window): invokes `hostapi::forget_dropped(pick.id())` exactly once.
+/// - On immediate hit: consumes via `pick.files()` (which invokes `pk_end` internally; never double-forgets).
+/// - On async pending hit (`pick.files()` is `None`): stores `(wid, NodeId, gen)` until `drop_pick_ready(pick.id())`.
+pub fn drop_pick_at(
+  pick : hostapi::Pick,
+  x~ : Double = 0.0,
+  y~ : Double = 0.0,
+  wid~ : Int = current_window_id(),
+) -> Bool {
+  ensure_drop_registry_kept()
+  if wid > 0 && window_tree_of(wid).is_none() {
+    hostapi::forget_dropped(pick.id())
+    return false
+  }
+  let delivered = ref_new(false)
+  let run_in = fn() -> Unit {
+    match match_drop_files_target_here(x, y) {
+      None => {
+        hostapi::forget_dropped(pick.id())
+        delivered.v = false
+      }
+      Some(t) =>
+      match pick.files() {
+        Some(files) => {
+          deliver_files_to_target(t, files)
+          delivered.v = true
+        }
+        None => {
+          let tid = match view_tree() {
+            Some(tr) => tr.phys_id()
+            None => -1
+          }
+          pending_drop_picks[pick.id()] = PendingDropPick::{
+            wid,
+            tree_id: tid,
+            node_id: t.id,
+            gen: t.gen,
+            pick,
+          }
+          delivered.v = true
+        }
+      }
+    }
+  }
+  if wid == current_window_id() {
+    run_in()
+  } else {
+    in_window(wid, run_in)
+  }
+  delivered.v
+}
+
+/// Complete a pending asynchronous dropped `Pick` (`set_outside` kind 3) routed by `(wid, tree_id, NodeId, gen)`.
+/// - If the target receiver is still mounted in `wid` with matching `(tree_id, NodeId, gen)`: consumes via `pick.files()`
+///   (which executes `pk_end` once internally; never double-forgets) and delivers to `on_files`.
+/// - If the target was unmounted, its window closed/reopened, or its slot was reused with a new `gen`:
+///   invokes `hostapi::forget_dropped(pick.id())` exactly once and discards delivery.
+pub fn drop_pick_ready(pick_id : Int) -> Bool {
+  let pend = match pending_drop_picks.get(pick_id) {
+    Some(p) => p
+    None => return false
+  }
+  if pend.wid > 0 && window_tree_of(pend.wid).is_none() {
+    pending_drop_picks.remove(pick_id)
+    hostapi::forget_dropped(pend.pick.id())
+    return false
+  }
+  let result = ref_new(false)
+  let run_in = fn() -> Unit {
+    let same_tree = match view_tree() {
+      Some(tr) => tr.phys_id() == pend.tree_id
+      None => false
+    }
+    if !same_tree {
+      pending_drop_picks.remove(pick_id)
+      hostapi::forget_dropped(pend.pick.id())
+      result.v = false
+      return
+    }
+    match find_drop_files_target_here(pend.node_id, pend.gen) {
+      None => {
+        pending_drop_picks.remove(pick_id)
+        hostapi::forget_dropped(pend.pick.id())
+        result.v = false
+      }
+      Some(t) =>
+      match pend.pick.files() {
+        Some(files) => {
+          pending_drop_picks.remove(pick_id)
+          deliver_files_to_target(t, files)
+          result.v = true
+        }
+        None => result.v = false
+      }
+    }
+  }
+  if pend.wid == current_window_id() {
+    run_in()
+  } else {
+    in_window(pend.wid, run_in)
+  }
+  result.v
+}
+
+/// Wrap a raw host drop `pick_id` via `hostapi::dropped_pick` and route it through `drop_pick_at`.
+pub fn drop_host_pick(
+  pick_id : Int,
+  x~ : Double = 0.0,
+  y~ : Double = 0.0,
+  wid~ : Int = current_window_id(),
+) -> Bool {
+  drop_pick_at(hostapi::dropped_pick(pick_id), x=x, y=y, wid=wid)
+}
+
+fn drop_set_hover_here(at : Option[(Double, Double)]) -> Unit {
+  let reg = drop_registry_ref.v
+  for t in reg.files {
+    match at {
+      Some((x, y)) => {
+        t.state.active.set(true)
+        t.state.hovered.set(drop_target_alive(t.id) && drop_point_hits(t.id, x, y))
+      }
+      None => {
+        t.state.hovered.set(false)
+        t.state.active.set(false)
+      }
+    }
+  }
+  for t in reg.paths {
+    match at {
+      Some((x, y)) => {
+        t.state.active.set(true)
+        t.state.hovered.set(drop_target_alive(t.id) && drop_point_hits(t.id, x, y))
+      }
+      None => {
+        t.state.hovered.set(false)
+        t.state.active.set(false)
+      }
+    }
+  }
+  for t in reg.words {
+    match at {
+      Some((x, y)) => {
+        t.state.active.set(true)
+        t.state.hovered.set(drop_target_alive(t.id) && drop_point_hits(t.id, x, y))
+      }
+      None => {
+        t.state.hovered.set(false)
+        t.state.active.set(false)
+      }
+    }
+  }
+}
+
+fn drop_json_num(m : Map[String, hostapi::JsonValue], key : String, def : Double) -> Double {
+  match m.get(key) {
+    Some(hostapi::JsonValue::JNumber(v)) => v
+    _ => def
+  }
+}
+
+fn drop_json_str(m : Map[String, hostapi::JsonValue], key : String) -> String {
+  match m.get(key) {
+    Some(hostapi::JsonValue::JString(s)) => s
+    _ => ""
+  }
+}
+
+fn drop_path_basename(p : String) -> String {
+  let n = p.length()
+  let mut end = n
+  while end > 0 && (p.code_unit_at(end - 1) == 47 || p.code_unit_at(end - 1) == 92) {
+    end -= 1
+  }
+  let mut start = end
+  while start > 0 && p.code_unit_at(start - 1) != 47 && p.code_unit_at(start - 1) != 92 {
+    start -= 1
+  }
+  let sb = StringBuilder::new()
+  let mut i = start
+  while i < end {
+    sb.write_byte(p.code_unit_at(i) as Byte)
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn drop_parse_paths(m : Map[String, hostapi::JsonValue]) -> Array[DroppedPath] {
+  let out : Array[DroppedPath] = []
+  match m.get("paths") {
+    Some(hostapi::JsonValue::JArray(arr)) => {
+      for item in arr {
+        match item {
+          hostapi::JsonValue::JObject(pm) => {
+            let path = drop_json_str(pm, "path")
+            if path.length() > 0 {
+              let is_dir = match pm.get("dir") {
+                Some(hostapi::JsonValue::JBool(b)) => b
+                _ => false
+              }
+              out.push(DroppedPath::{ path, name: drop_path_basename(path), is_dir })
+            }
+          }
+          hostapi::JsonValue::JString(path) => {
+            if path.length() > 0 {
+              out.push(DroppedPath::{ path, name: drop_path_basename(path), is_dir: false })
+            }
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  out
+}
+
+fn handle_host_drop_message(json : String) -> Unit {
+  ensure_drop_registry_kept()
+  let obj = match hostapi::json_parse(json) {
+    Some(hostapi::JsonValue::JObject(m)) => m
+    _ => return
+  }
+  let kind = drop_json_str(obj, "type")
+  let x = drop_json_num(obj, "x", 0.0)
+  let y = drop_json_num(obj, "y", 0.0)
+  let wid = drop_json_num(obj, "wid", current_window_id().to_double()).to_int()
+  let run_in_wid = fn(f : () -> Unit) -> Unit {
+    if wid == current_window_id() {
+      f()
+    } else if wid == 0 || window_tree_of(wid).is_some() {
+      in_window(wid, f)
+    }
+  }
+  if kind == "over" {
+    run_in_wid(fn() { drop_set_hover_here(Some((x, y))) })
+    hostapi::request_frame()
+  } else if kind == "left" {
+    run_in_wid(fn() { drop_set_hover_here(None) })
+    hostapi::request_frame()
+  } else if kind == "words" {
+    run_in_wid(fn() { drop_set_hover_here(None) })
+    let txt = {
+      let s = drop_json_str(obj, "text")
+      if s.length() > 0 { s } else { drop_json_str(obj, "words") }
+    }
+    if txt.length() > 0 {
+      run_in_wid(fn() {
+        let reg = drop_registry_ref.v
+        let mut i = reg.words.length() - 1
+        while i >= 0 {
+          let t = reg.words[i]
+          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
+            t.field.insert(txt)
+            break
+          }
+          i -= 1
+        }
+      })
+      hostapi::request_frame()
+    }
+  } else if kind == "drop" {
+    run_in_wid(fn() { drop_set_hover_here(None) })
+    let pick_id = drop_json_num(obj, "pick", -1.0).to_int()
+    let paths = drop_parse_paths(obj)
+    if paths.length() > 0 {
+      let hit_paths = ref_new(false)
+      run_in_wid(fn() {
+        let reg = drop_registry_ref.v
+        let mut i = reg.paths.length() - 1
+        while i >= 0 {
+          let t = reg.paths[i]
+          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
+            (t.on_paths)(paths)
+            hit_paths.v = true
+            break
+          }
+          i -= 1
+        }
+      })
+      if hit_paths.v {
+        if pick_id >= 0 {
+          hostapi::forget_dropped(pick_id)
+        }
+        hostapi::request_frame()
+        return
+      }
+    }
+    if pick_id >= 0 {
+      let has_files_target = ref_new(false)
+      run_in_wid(fn() {
+        match match_drop_files_target_here(x, y) {
+          Some(_) => has_files_target.v = true
+          None => ()
+        }
+      })
+      if has_files_target.v {
+        let _ = drop_host_pick(pick_id, x=x, y=y, wid=wid)
+        hostapi::request_frame()
+        return
+      }
+    }
+    if paths.length() > 0 {
+      let sb = StringBuilder::new()
+      let mut pi = 0
+      while pi < paths.length() {
+        if pi > 0 {
+          sb.write_string("\n")
+        }
+        sb.write_string(paths[pi].path)
+        pi += 1
+      }
+      let joined = sb.to_string()
+      run_in_wid(fn() {
+        let reg = drop_registry_ref.v
+        let mut i = reg.words.length() - 1
+        while i >= 0 {
+          let t = reg.words[i]
+          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
+            t.field.insert(joined)
+            break
+          }
+          i -= 1
+        }
+      })
+      if pick_id >= 0 {
+        hostapi::forget_dropped(pick_id)
+      }
+      hostapi::request_frame()
+      return
+    }
+    if pick_id >= 0 {
+      hostapi::forget_dropped(pick_id)
+      hostapi::request_frame()
+      return
+    }
+    let txt = {
+      let s = drop_json_str(obj, "words")
+      if s.length() > 0 { s } else { drop_json_str(obj, "text") }
+    }
+    if txt.length() > 0 {
+      run_in_wid(fn() {
+        let reg = drop_registry_ref.v
+        let mut i = reg.words.length() - 1
+        while i >= 0 {
+          let t = reg.words[i]
+          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
+            t.field.insert(txt)
+            break
+          }
+          i -= 1
+        }
+      })
+      hostapi::request_frame()
+    }
+  }
 }
 
 /// Test driver helper: deliver `files` to the topmost matching `files_into` target at `(x, y)`.
@@ -155,22 +608,32 @@ pub fn Tester::hold_files(
   x~ : Double = 0.0,
   y~ : Double = 0.0,
 ) -> Bool {
-  let mut i = drop_registry.files.length() - 1
-  while i >= 0 {
-    let t = drop_registry.files[i]
-    if drop_point_hits(t.id, x, y) {
-      t.state.active.set(true)
-      t.state.hovered.set(true)
-      (t.on_files)(files)
-      t.state.hovered.set(false)
-      t.state.active.set(false)
+  ensure_drop_registry_kept()
+  match match_drop_files_target_here(x, y) {
+    Some(t) => {
+      deliver_files_to_target(t, files)
       self.fake.frame_requested = true
       self.frame()
-      return true
+      true
     }
-    i -= 1
+    None => false
   }
-  false
+}
+
+/// Test driver helper: route a `hostapi::Pick` drop to `(x, y)` in window `wid` through `drop_pick_at`.
+pub fn Tester::drop_pick(
+  self : Tester,
+  pick : hostapi::Pick,
+  x~ : Double = 0.0,
+  y~ : Double = 0.0,
+  wid~ : Int = current_window_id(),
+) -> Bool {
+  let ok = drop_pick_at(pick, x=x, y=y, wid=wid)
+  if ok && wid == current_window_id() {
+    self.fake.frame_requested = true
+    self.frame()
+  }
+  ok
 }
 
 /// Test driver helper: drop `words` onto the topmost matching `words_into` target at `(x, y)`.
@@ -180,9 +643,11 @@ pub fn Tester::drop_words(
   x~ : Double = 0.0,
   y~ : Double = 0.0,
 ) -> Bool {
-  let mut i = drop_registry.words.length() - 1
+  ensure_drop_registry_kept()
+  let reg = drop_registry_ref.v
+  let mut i = reg.words.length() - 1
   while i >= 0 {
-    let t = drop_registry.words[i]
+    let t = reg.words[i]
     if drop_point_hits(t.id, x, y) {
       t.state.active.set(true)
       t.state.hovered.set(true)
@@ -205,9 +670,11 @@ pub fn Tester::drop_paths(
   x~ : Double = 0.0,
   y~ : Double = 0.0,
 ) -> Bool {
-  let mut i = drop_registry.paths.length() - 1
+  ensure_drop_registry_kept()
+  let reg = drop_registry_ref.v
+  let mut i = reg.paths.length() - 1
   while i >= 0 {
-    let t = drop_registry.paths[i]
+    let t = reg.paths[i]
     if drop_point_hits(t.id, x, y) {
       t.state.active.set(true)
       t.state.hovered.set(true)

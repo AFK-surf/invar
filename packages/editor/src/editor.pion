@@ -629,22 +629,25 @@ pub fn EditorState::compose_cancel(self : EditorState) -> Unit {
   self.sync_signals()
 }
 
-/// Visible text including active IME `marked` composition spliced at `caret`.
+/// Visible text including active IME `marked` composition spliced at `caret` (and decorative `look` replacement when set).
 pub fn EditorState::display_text(self : EditorState) -> String {
-  let raw = self.raw_display_text()
-  if !self.config.secret {
-    return raw
+  if self.config.secret {
+    let raw = self.raw_display_text()
+    let sb = StringBuilder::new()
+    let mut i = 0
+    let n = raw.length()
+    while i < n {
+      let next = next_grapheme_boundary(raw, i)
+      // U+2022 bullet: E2 80 A2
+      sb.write_string("\xE2\x80\xA2")
+      i = next
+    }
+    return sb.to_string()
   }
-  let sb = StringBuilder::new()
-  let mut i = 0
-  let n = raw.length()
-  while i < n {
-    let next = next_grapheme_boundary(raw, i)
-    // U+2022 bullet: E2 80 A2
-    sb.write_string("\xE2\x80\xA2")
-    i = next
+  if self.look.is_some() {
+    return self.look_shown().0
   }
-  sb.to_string()
+  self.raw_display_text()
 }
 
 /// Caret byte offset within `display_text()`.
@@ -664,10 +667,49 @@ pub fn EditorState::set_look(
 ) -> Unit {
   self.look = f
   self.look_cache_valid = false
+  self.invalidate_layout()
 }
 
 pub fn EditorState::invalidate_look(self : EditorState) -> Unit {
   self.look_cache_valid = false
+  self.invalidate_layout()
+}
+
+fn is_utf8_char_boundary(s : String, off : Int) -> Bool {
+  let n = s.length()
+  if off <= 0 || off >= n {
+    return off == 0 || off == n
+  }
+  (s.code_unit_at(off) & 0xC0) != 0x80
+}
+
+fn utf8_boundaries_match(a : String, b : String) -> Bool {
+  let n = a.length()
+  if b.length() != n {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    let ba = (a.code_unit_at(i) & 0xC0) != 0x80
+    let bb = (b.code_unit_at(i) & 0xC0) != 0x80
+    if ba != bb {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn sanitize_look_spans(shown : String, spans : Array[(Int, Int, Int64)]) -> Array[(Int, Int, Int64)] {
+  let n = shown.length()
+  let out : Array[(Int, Int, Int64)] = []
+  for r in spans {
+    let (a, b, col) = r
+    if a >= 0 && a < b && b <= n && is_utf8_char_boundary(shown, a) && is_utf8_char_boundary(shown, b) {
+      out.push((a, b, col))
+    }
+  }
+  out
 }
 
 fn EditorState::look_of(self : EditorState, d : String) -> (String, Array[(Int, Int, Int64)]) {
@@ -677,8 +719,9 @@ fn EditorState::look_of(self : EditorState, d : String) -> (String, Array[(Int, 
       if self.look_cache_valid && self.look_cache_in == d {
         return (self.look_cache_out, self.look_cache_spans)
       }
-      let (o, spans) = f(d)
-      let shown = if o.length() == d.length() { o } else { d }
+      let (o, raw_spans) = f(d)
+      let shown = if utf8_boundaries_match(d, o) { o } else { d }
+      let spans = sanitize_look_spans(shown, raw_spans)
       self.look_cache_in = d
       self.look_cache_out = shown
       self.look_cache_spans = spans
@@ -695,7 +738,8 @@ pub fn EditorState::look_shown(self : EditorState) -> (String, Array[(Int, Int, 
   if ml == 0 {
     return (o, spans)
   }
-  let at = self.caret
+  let at = snap_to_grapheme(self.text, iclamp(self.caret, 0, self.text.length()))
+  let base = if is_utf8_char_boundary(o, at) { o } else { self.text }
   let moved : Array[(Int, Int, Int64)] = []
   for r in spans {
     let (a, b, k) = r
@@ -703,7 +747,7 @@ pub fn EditorState::look_shown(self : EditorState) -> (String, Array[(Int, Int, 
     let nb = if b > at { b + ml } else { b }
     moved.push((na, nb, k))
   }
-  (str_slice(o, 0, at) + self.marked + str_slice(o, at, o.length()), moved)
+  (str_slice(base, 0, at) + self.marked + str_slice(base, at, base.length()), moved)
 }
 
 // ── Text Editing Operations ──────────────────────────────────────────────────────────────────

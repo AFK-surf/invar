@@ -5,6 +5,7 @@ import "editor"
 import "hostapi"
 import "paint"
 import "signals"
+import "text"
 import "view"
 
 pub let caret_blink_ms : Double = 530.0
@@ -54,10 +55,15 @@ pub struct Field {
   pub mut on_edited : Option[(String) -> Unit]
   pub mut on_edit : Option[(FieldEdit) -> Unit]
   pub mut on_pasted : Option[(String) -> Unit]
+  pub mut on_files : Option[(Array[(String, Bytes)]) -> Unit]
   pub mut enter_sends : Bool
   pub mut command_sends : Bool
   pub mut paste_limit : Int
   pub mut secret : Bool
+  pub mut trim : Bool
+  pub mut words : Bool
+  pub mut leaves : Array[Int]
+  pub mut ime_action : Int
   pub mut last_font_size : Double
   pub mut last_line_h : Double
   pub mut last_max_w : Double
@@ -113,10 +119,15 @@ pub fn Field::new(text~ : String = "") -> Field {
     on_edited: None,
     on_edit: None,
     on_pasted: None,
+    on_files: None,
     enter_sends: true,
     command_sends: false,
     paste_limit: 0,
     secret: false,
+    trim: false,
+    words: false,
+    leaves: [],
+    ime_action: 0,
     last_font_size: 15.0,
     last_line_h: 21.0,
     last_max_w: 0.0,
@@ -422,10 +433,19 @@ pub fn Field::take(self : Field) -> String {
   out
 }
 
+/// Default `enter_sends` policy: Mouse pointing, single-line fields, or non-zero `ime_action`.
+pub fn enter_sends_by(max_lines : Int, ime_action : Int) -> Bool {
+  pointing() is Pointing::Mouse || max_lines <= 1 || ime_action != 0
+}
+
 /// The host input method's kind for this field (`hostapi::ime_action_*`), said before every `set_ime`: a secret's
 /// words go to the host's password input, never its plain text one.
 fn Field::ime_kind(self : Field) -> Int {
-  if self.secret { hostapi::ime_action_secret } else { hostapi::ime_action_none }
+  if self.secret {
+    hostapi::ime_action_secret
+  } else {
+    self.ime_action
+  }
 }
 
 /// Tell the host IME where the caret is and what the text and selection are (UTF-16 offsets).
@@ -623,7 +643,8 @@ pub fn Field::layout_for(
   self.last_font_size = sz
   self.last_line_h = lh
   self.last_max_w = max_w
-  let lines = self.editor.layout_lines(max_w, fn(s : String) { measure_text_width(s, sz) }, lh)
+  let style_bits = if self.words { (hostapi::face_text & 15) << 8 } else { 0 }
+  let lines = self.editor.layout_lines(max_w, fn(s : String) { measure_text_width(s, sz, style_bits=style_bits) }, lh)
   self.layout_sig.set(self.layout_sig.untracked() + 1)
   lines
 }
@@ -679,6 +700,9 @@ pub fn Field::loupe(
 
 /// Handle a keyboard event on this field. Returns true if consumed.
 pub fn Field::handle_key(self : Field, code : Int, mods : Int) -> Bool {
+  if mods == 0 && self.leaves.contains(code) {
+    return false
+  }
   self.sync_config()
   let platform = hostapi::keys_platform()
   let is_apple = platform == editor::platform_macos || platform == editor::platform_ios
@@ -695,6 +719,30 @@ pub fn Field::handle_key(self : Field, code : Int, mods : Int) -> Bool {
     return true
   }
   if primary && !alt && !shift && code == key_of_char('v') {
+    match self.on_files {
+      Some(_) =>
+      match hostapi::clip_read() {
+        Some(read) => {
+          let tid = match view_tree() {
+            Some(tr) => tr.phys_id()
+            None => -1
+          }
+          let pend = PendingClipRead::{
+            wid: current_window_id(),
+            tree_id: tid,
+            node_id: self.tree_node,
+            field: self,
+            read,
+          }
+          if !try_complete_clip_read(pend) {
+            pending_clip_reads[read.id()] = pend
+          }
+          return true
+        }
+        None => ()
+      }
+      None => ()
+    }
     self.paste_text(clipboard_get())
     return true
   }
@@ -721,13 +769,196 @@ pub fn Field::handle_key(self : Field, code : Int, mods : Int) -> Bool {
   true
 }
 
+struct PendingClipRead {
+  wid : Int
+  tree_id : Int
+  node_id : Option[view::NodeId]
+  field : Field
+  read : hostapi::ClipRead
+}
+
+let pending_clip_reads : Map[Int, PendingClipRead] = Map::new()
+
+fn try_complete_clip_read(pend : PendingClipRead) -> Bool {
+  match pend.read.got() {
+    None => false
+    Some(got) => {
+      let deliver = fn() -> Unit {
+        let alive = match pend.node_id {
+          Some(nid) => match find_tree_field_in(pend.tree_id, nid) {
+            Some(tf) => tf.field.phys_id == pend.field.phys_id
+            None => false
+          }
+          None => false
+        }
+        if alive {
+          if got.files.length() > 0 {
+            match pend.field.on_files {
+              Some(cb) => cb(got.files)
+              None => ()
+            }
+          } else if got.picture == hostapi::clip_png && got.png.length() > 0 {
+            match pend.field.on_files {
+              Some(cb) => cb([("image.png", got.png)])
+              None => ()
+            }
+          } else if got.text.length() > 0 {
+            pend.field.paste_text(got.text)
+          }
+        }
+      }
+      if pend.wid == current_window_id() {
+        deliver()
+      } else if pend.wid == 0 || window_tree_of(pend.wid).is_some() {
+        in_window(pend.wid, deliver)
+      }
+      true
+    }
+  }
+}
+
+/// Complete a pending asynchronous clipboard read (`set_outside` kind 9).
+/// Removes the pending entry before calling `ClipRead::got()` / user callbacks so re-entrant kind 9
+/// cannot double-end or double-deliver, and executes user callbacks in the initiating window `wid`.
+pub fn field_clip_read_ready(id : Int) -> Bool {
+  let pend = match pending_clip_reads.get(id) {
+    Some(p) => p
+    None => return false
+  }
+  pending_clip_reads.remove(id)
+  if !try_complete_clip_read(pend) {
+    pending_clip_reads[id] = pend
+    false
+  } else {
+    true
+  }
+}
+
+fn field_str_slice(s : String, start : Int, end : Int) -> String {
+  let n = s.length()
+  let lo = if start < 0 { 0 } else if start > n { n } else { start }
+  let hi = if end < lo { lo } else if end > n { n } else { end }
+  if lo == 0 && hi == n {
+    return s
+  }
+  let sb = StringBuilder::new()
+  let mut i = lo
+  while i < hi {
+    sb.write_byte(s.code_unit_at(i) as Byte)
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn field_line_height(font_size : Double, line : Double, trim : Bool) -> Double {
+  let base_line_h = if line > 0.0 { line } else { font_size * 1.4 }
+  if !trim {
+    return base_line_h
+  }
+  let out_metrics : Array[Double] = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+  hostapi::font_metrics(font_size, 400, 0, out_metrics)
+  let tight = if out_metrics[0] > 0.0 && out_metrics[1] >= 0.0 {
+    out_metrics[0] + out_metrics[1]
+  } else {
+    font_size
+  }
+  dmin(base_line_h, tight)
+}
+
+fn pick_placeholder(
+  primary : String,
+  shorter : Array[String],
+  avail_w : Double,
+  font_size : Double,
+) -> String {
+  if shorter.length() == 0 || avail_w <= 0.0 {
+    return primary
+  }
+  let pw = measure_text_width(primary, font_size)
+  if pw <= avail_w {
+    return primary
+  }
+  let mut best_fit : Option[(String, Double)] = None
+  let mut shortest = primary
+  let mut shortest_w = pw
+  for cand in shorter {
+    let cw = measure_text_width(cand, font_size)
+    if cw < shortest_w {
+      shortest = cand
+      shortest_w = cw
+    }
+    if cw <= avail_w {
+      match best_fit {
+        None => best_fit = Some((cand, cw))
+        Some((_, bw)) => if cw > bw { best_fit = Some((cand, cw)) }
+      }
+    }
+  }
+  match best_fit {
+    Some((s, _)) => s
+    None => shortest
+  }
+}
+
+fn field_build_runs(
+  shown : String,
+  spans : Array[(Int, Int, Int64)],
+  use_words_face : Bool,
+) -> Array[text::Run] {
+  let face = if use_words_face { Some(hostapi::face_text) } else { None }
+  let n = shown.length()
+  if n == 0 {
+    return []
+  }
+  if spans.length() == 0 {
+    return [text::Run::{ ..text::plain(shown), face }]
+  }
+  let valid : Array[(Int, Int, Int64)] = []
+  for r in spans {
+    let (a, b, col) = r
+    if a >= 0 && a < b && b <= n {
+      valid.push((a, b, col))
+    }
+  }
+  let mut si = 1
+  while si < valid.length() {
+    let cur = valid[si]
+    let mut j = si - 1
+    while j >= 0 && valid[j].0 > cur.0 {
+      valid[j + 1] = valid[j]
+      j -= 1
+    }
+    valid[j + 1] = cur
+    si += 1
+  }
+  let out : Array[text::Run] = []
+  let mut pos = 0
+  for r in valid {
+    let (a, b, col) = r
+    let start = if a > pos { a } else { pos }
+    if start > pos {
+      out.push(text::Run::{ ..text::plain(field_str_slice(shown, pos, start)), face })
+    }
+    if b > start {
+      out.push(text::Run::{ ..text::plain(field_str_slice(shown, start, b)), color: col, face })
+      pos = b
+    }
+  }
+  if pos < n {
+    out.push(text::Run::{ ..text::plain(field_str_slice(shown, pos, n)), face })
+  }
+  out
+}
+
 struct TreeField {
   tree_id : Int
   node_id : view::NodeId
   field : Field
   font_size : () -> Double
   line : Double
+  trim : Bool
   hint : () -> String
+  shorter : Array[String]
 }
 
 let tree_fields : Array[TreeField] = []
@@ -769,6 +1000,14 @@ fn remove_tree_field(tid : Int, id : view::NodeId) -> Unit {
 }
 
 fn fields_reset() -> Unit {
+  let ids = pending_clip_reads.keys()
+  for cid in ids {
+    match pending_clip_reads.get(cid) {
+      Some(p) => (hostapi::host().cl_end)(p.read.id())
+      None => ()
+    }
+  }
+  pending_clip_reads.clear()
   tree_fields.clear()
   focused_field_ref.v = None
 }
@@ -787,13 +1026,21 @@ pub fn field(
   caret_color~ : Int64 = c64(0x0A84, 0xFFFF),
   enter_sends? : Bool,
   command_sends~ : Bool = false,
+  shorter~ : Array[String] = [],
+  trim~ : Bool = false,
+  leaves~ : Array[Int] = [],
+  ime_action~ : Int = 0,
   paste_limit~ : Int = 0,
   secret~ : Bool = false,
+  words~ : Bool = false,
+  look? : (String) -> (String, Array[(Int, Int, Int64)]),
   submitted? : (String) -> Unit,
   pasted? : (String) -> Unit,
   edited? : (String) -> Unit,
   edit? : (FieldEdit) -> Unit,
+  files? : (Array[(String, Bytes)]) -> Unit,
   size_by? : () -> Double,
+  colors_by? : () -> (Int64, Int64, Int64),
   placeholder_by? : () -> String,
   label~ : String = "",
 ) -> view::View {
@@ -805,31 +1052,43 @@ pub fn field(
     Some(f) => f
     None => fn() { placeholder }
   }
+  let colors_fn = match colors_by {
+    Some(f) => f
+    None => fn() { (color, placeholder_color, caret_color) }
+  }
   let is_multi = max_lines != 1
-  fld.color = color
-  fld.ph_color = placeholder_color
-  fld.caret_color = caret_color
-  fld.sel_color = (caret_color & c64(0xFFFF, 0xFF00)) | 0x40L
+  let (init_ink, init_ph, init_caret) = signals::untracked(colors_fn)
+  fld.color = init_ink
+  fld.ph_color = init_ph
+  fld.caret_color = init_caret
+  fld.sel_color = (init_caret & c64(0xFFFF, 0xFF00)) | 0x40L
   fld.enter_sends = match enter_sends {
     Some(b) => b
-    None => max_lines <= 1
+    None => enter_sends_by(max_lines, ime_action)
   }
   fld.command_sends = command_sends
   fld.paste_limit = paste_limit
   fld.secret = secret
+  fld.trim = trim
+  fld.words = words
+  fld.leaves = leaves.copy()
+  fld.ime_action = ime_action
   fld.editor.config.multiline = is_multi
   fld.editor.config.wrap = is_multi
+  fld.editor.set_look(look)
   fld.sync_config()
   fld.on_submitted = submitted
   fld.on_pasted = pasted
   fld.on_edited = edited
   fld.on_edit = edit
+  fld.on_files = files
 
-  let init_sz = (sz_fn)()
-  let line_h = if line > 0.0 { line } else { init_sz * 1.4 }
+  let init_sz = signals::untracked(sz_fn)
+  let line_h = field_line_height(init_sz, line, trim)
   fld.last_font_size = init_sz
   fld.last_line_h = line_h
-  let look = view::WordsLook::of(init_sz, line=line_h, wrap=is_multi, max_lines=max_lines)
+  let wlook = view::WordsLook::of(init_sz, line=line_h, wrap=is_multi, max_lines=max_lines)
+  let use_runs = look.is_some() || words
 
   parent.box(fn(f : view::View) {
     let id = f.id()
@@ -838,25 +1097,84 @@ pub fn field(
       let _ = agent_secret(f)
     }
     fld.tree_node = Some(id)
-    tree_fields.push(TreeField::{ tree_id: tid, node_id: id, field: fld, font_size: sz_fn, line, hint: hint_fn })
+    tree_fields.push(TreeField::{
+      tree_id: tid,
+      node_id: id,
+      field: fld,
+      font_size: sz_fn,
+      line,
+      trim,
+      hint: hint_fn,
+      shorter: shorter.copy(),
+    })
+    match colors_by {
+      Some(cfn) =>
+      f.reacts_by(
+        cfn,
+        fn(a : (Int64, Int64, Int64), b : (Int64, Int64, Int64)) -> Bool {
+          a.0 == b.0 && a.1 == b.1 && a.2 == b.2
+        },
+        fn(k : (Int64, Int64, Int64)) -> Unit {
+          let (ink, ph, car) = k
+          fld.color = ink
+          fld.ph_color = ph
+          fld.caret_color = car
+          fld.sel_color = (car & c64(0xFFFF, 0xFF00)) | 0x40L
+          hostapi::request_frame()
+        },
+      )
+      None => ()
+    }
     let min_h = line_h * (if min_lines > 0 { min_lines } else { 1 }).to_double()
     let _ = f.min_height(view::Live::Is(Some(min_h)))
     let _ = f.focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
-    let _ = f.words(
-      view::Live::By(fn() {
-        let t = fld.text()
-        let m = fld.composed_said()
-        if t.length() > 0 || m.length() > 0 {
-          fld.editor.display_text()
-        } else {
-          (hint_fn)()
-        }
-      }),
-      ink=fld.color,
-      look=look,
-    )
+    let active_hint = fn() -> String {
+      let primary = (hint_fn)()
+      let laid_w = match f.laid_size_told() {
+        Some((lw, _)) if lw > 0.0 => lw
+        _ => fld.last_max_w
+      }
+      pick_placeholder(primary, shorter, laid_w, (sz_fn)())
+    }
+    if use_runs {
+      let _ = f.runs_look(view::Live::Is(view::RunsLook::{ ..view::runs_plain, words }))
+      let _ = f.words_runs(
+        view::Live::By(fn() -> Array[text::Run] {
+          let t = fld.text()
+          let m = fld.composed_said()
+          if t.length() > 0 || m.length() > 0 {
+            if fld.secret {
+              field_build_runs(fld.editor.display_text(), [], words)
+            } else {
+              fld.editor.invalidate_look()
+              let (shown, spans) = fld.editor.look_shown()
+              field_build_runs(shown, spans, words)
+            }
+          } else {
+            field_build_runs(active_hint(), [], words)
+          }
+        }),
+        ink=init_ink,
+        look=wlook,
+      )
+    } else {
+      let _ = f.words(
+        view::Live::By(fn() {
+          let t = fld.text()
+          let m = fld.composed_said()
+          if t.length() > 0 || m.length() > 0 {
+            fld.editor.display_text()
+          } else {
+            active_hint()
+          }
+        }),
+        ink=init_ink,
+        look=wlook,
+      )
+    }
     let _ = f.ink(view::Live::By(fn() {
-      if fld.text().length() > 0 || fld.composing() { fld.color } else { fld.ph_color }
+      let (ink, ph, _) = colors_fn()
+      if fld.text().length() > 0 || fld.composing() { ink } else { ph }
     }))
     // Pure-tree multi-line selection highlight overlay (one rect per spanned visual line).
     let _ = f.box(fn(sel_layer : view::View) {
@@ -908,7 +1226,10 @@ pub fn field(
               if idx < rects.length() { Some(rects[idx].h) } else { Some(0.0) }
             }),
           )
-          .ground(view::Live::Is(fld.sel_color))
+          .ground(view::Live::By(fn() {
+            let (_, _, car) = colors_fn()
+            (car & c64(0xFFFF, 0xFF00)) | 0x40L
+          }))
           .radius(view::Live::Is(3.0))
           .presses(view::Live::Is(false))
         },
@@ -924,7 +1245,6 @@ pub fn field(
       },
       fn(h_layer : view::View) {
         let _ = h_layer.over(view::Live::Is(true)).presses(view::Live::Is(false))
-        let accent = fld.caret_color
         let kr = 4.5
         let kd = kr * 2.0
         // Start handle: stem + small circle perched above start line.
@@ -951,7 +1271,7 @@ pub fn field(
               }
             }),
           )
-          .ground(view::Live::Is(accent))
+          .ground(view::Live::By(fn() { colors_fn().2 }))
           .radius(view::Live::Is(0.75))
           .presses(view::Live::Is(false))
         })
@@ -970,7 +1290,7 @@ pub fn field(
           )
           .width(view::Live::Is(Some(kd)))
           .height(view::Live::Is(Some(kd)))
-          .ground(view::Live::Is(accent))
+          .ground(view::Live::By(fn() { colors_fn().2 }))
           .radius(view::Live::Is(kr))
           .presses(view::Live::Is(false))
         })
@@ -998,7 +1318,7 @@ pub fn field(
               }
             }),
           )
-          .ground(view::Live::Is(accent))
+          .ground(view::Live::By(fn() { colors_fn().2 }))
           .radius(view::Live::Is(0.75))
           .presses(view::Live::Is(false))
         })
@@ -1017,7 +1337,7 @@ pub fn field(
           )
           .width(view::Live::Is(Some(kd)))
           .height(view::Live::Is(Some(kd)))
-          .ground(view::Live::Is(accent))
+          .ground(view::Live::By(fn() { colors_fn().2 }))
           .radius(view::Live::Is(kr))
           .presses(view::Live::Is(false))
         })
