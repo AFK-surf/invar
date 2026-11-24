@@ -1,0 +1,272 @@
+// Offscreen picture capture of a view subtree (`take_picture`): builds a standalone `view::Tree` laid out at the
+// requested width (and its own height), encodes it into a 60-Double `Scene` after the next presented frame, draws it
+// through `hostapi::drawn_pixels_of` in horizontal bands of at most `shot_band_most` rows, and streams the rows into a
+// compressed PNG (`pixels::PngRows`).
+// Ported from libs/mbui/src/ui/shot.mbt.
+
+import "hostapi"
+import "pixels"
+import "signals"
+import "view"
+
+/// Longest a picture waits for images inside it to finish decoding (ms).
+pub let shot_wait_most : Double = 10000.0
+
+let shot_band_most : Int = 2048
+let shot_tree_room : Double = 1000000.0
+
+struct PictureShot {
+  key : String
+  tree : view::Tree
+  held : view::View
+  w : Double
+  scale : Double
+  since : Double
+  done : (Option[Bytes]) -> Unit
+}
+
+let active_shots : Map[String, PictureShot] = Map::new()
+
+/// Capture `make` as an offscreen PNG of width `w` points (and its laid-out height) at `scale` pixels per point
+/// (defaulting to the current window's scale when `scale <= 0.0`), delivering `Some(png)` to `done` (or `None` when
+/// the host cannot read rendered pixels back or the picture has zero area). Calling again with the same `key` replaces
+/// the previous pending capture and disposes its tree.
+pub fn take_picture(
+  key : String,
+  w : Double,
+  make : (view::View) -> Unit,
+  done : (Option[Bytes]) -> Unit,
+  scale~ : Double = 0.0,
+) -> Unit {
+  match active_shots.get(key) {
+    Some(prev) => {
+      prev.tree.dispose()
+      active_shots.remove(key)
+    }
+    None => ()
+  }
+  let held : Ref[Option[view::View]] = ref_new(None)
+  let tree = signals::untracked(fn() -> view::Tree {
+    view::Tree::new(
+      fn(root : view::View) {
+        let _ = root.box(fn(b : view::View) {
+          let _ = b.width(view::Live::Is(Some(w)))
+          held.v = Some(b)
+          make(b)
+        })
+      },
+      measure=host_words_measure,
+      measure_runs=host_runs_measure,
+      measure_runs_least=host_runs_least_measure,
+      time=hostapi::now,
+    )
+  })
+  match held.v {
+    Some(h) => {
+      active_shots[key] = PictureShot::{
+        key,
+        tree,
+        held: h,
+        w,
+        scale,
+        since: hostapi::now(),
+        done,
+      }
+      hostapi::request_frame()
+    }
+    None => {
+      tree.dispose()
+      done(None)
+    }
+  }
+}
+
+/// Whether any `take_picture` request is still pending.
+pub fn shots_pending() -> Bool {
+  active_shots.length() > 0
+}
+
+fn shots_clear() -> Unit {
+  for k in active_shots.keys() {
+    match active_shots.get(k) {
+      Some(st) => st.tree.dispose()
+      None => ()
+    }
+  }
+  active_shots.clear()
+}
+
+fn shift_shot_inst(a : Array[Double], b : Int, dx : Double, dy : Double) -> Unit {
+  a[b] = a[b] + dx
+  a[b + 1] = a[b + 1] + dy
+  a[b + 16] = a[b + 16] + dx
+  a[b + 17] = a[b + 17] + dy
+  a[b + 18] = a[b + 18] + dx
+  a[b + 19] = a[b + 19] + dy
+  if a[b + 53] > 0.0 {
+    a[b + 52] = a[b + 52] + dy
+  }
+  if a[b + 55] > 0.0 {
+    a[b + 54] = a[b + 54] + dy
+  }
+  if a[b + 57] > 0.0 {
+    a[b + 56] = a[b + 56] + dx
+  }
+  if a[b + 59] > 0.0 {
+    a[b + 58] = a[b + 58] + dx
+  }
+  if a[b + 35] != 0.0 && (a[b + 42] > a[b + 40] || a[b + 43] > a[b + 41]) {
+    a[b + 40] = a[b + 40] + dx
+    a[b + 41] = a[b + 41] + dy
+    a[b + 42] = a[b + 42] + dx
+    a[b + 43] = a[b + 43] + dy
+  }
+  if a[b + 32] != 0.0 {
+    a[b + 33] = a[b + 33] + dx
+    a[b + 34] = a[b + 34] + dy
+  }
+}
+
+fn shot_scene_png(
+  sc : Scene,
+  nx : Double,
+  ny : Double,
+  nw : Double,
+  nh : Double,
+  scale : Double,
+  bg_r : Double,
+  bg_g : Double,
+  bg_b : Double,
+) -> Option[Bytes] {
+  let rows = (nh * scale).round().to_int()
+  let cols = (nw * scale).round().to_int()
+  if rows <= 0 || cols <= 0 {
+    return None
+  }
+  let png = pixels::PngRows::new(cols, rows)
+  let a = sc.inst
+  // Trailing shape-segment instances (kind == 12.0) are referenced by index and appended intact to every band.
+  let mut pieces = sc.ninst
+  while pieces > 0 && a[(pieces - 1) * inst_size + 5] == 12.0 {
+    pieces -= 1
+  }
+  let np = sc.ninst - pieces
+  let band_inst : Array[Double] = []
+  let need = sc.ninst * inst_size + inst_size
+  let mut z = 0
+  while z < need {
+    band_inst.push(0.0)
+    z += 1
+  }
+  let mut taken = 0
+  while taken < rows {
+    let rem = rows - taken
+    let band = if rem < shot_band_most { rem } else { shot_band_most }
+    let dx = -nx
+    let dy = -ny - taken.to_double() / scale
+    let top = -dy
+    let bottom = top + band.to_double() / scale
+    let mut k = 0
+    let mut i = 0
+    while i < pieces {
+      let b = i * inst_size
+      let grow = if a[b + 5] == 2.0 { a[b + 7] * 3.0 + 2.0 } else { 2.0 }
+      if a[b + 32] == 0.0 && (a[b + 1] - grow > bottom || a[b + 1] + a[b + 3] + grow < top) {
+        i += 1
+        continue
+      }
+      let o = k * inst_size
+      let mut f = 0
+      while f < inst_size {
+        band_inst[o + f] = a[b + f]
+        f += 1
+      }
+      shift_shot_inst(band_inst, o, dx, dy)
+      k += 1
+      i += 1
+    }
+    if np > 0 {
+      let src_base = pieces * inst_size
+      let dst_base = k * inst_size
+      let total = np * inst_size
+      let mut p = 0
+      while p < total {
+        band_inst[dst_base + p] = a[src_base + p]
+        p += 1
+      }
+    }
+    let px_len = cols * band * 4
+    let out : Array[Byte] = []
+    let mut bi = 0
+    while bi < px_len {
+      out.push(0 as Byte)
+      bi += 1
+    }
+    if !hostapi::drawn_pixels_of(band_inst, k + np, bg_r, bg_g, bg_b, scale, cols, band, out) {
+      return None
+    }
+    png.add(image_bytes_from_arr(out), band)
+    taken += band
+  }
+  Some(png.end())
+}
+
+fn shots_after_present(now : Double, bg_r : Double, bg_g : Double, bg_b : Double) -> Unit {
+  if active_shots.length() == 0 {
+    return
+  }
+  let keys : Array[String] = []
+  for k in active_shots.keys() {
+    keys.push(k)
+  }
+  let ended : Array[(String, Option[Bytes])] = []
+  let mut any_waiting = false
+  for key in keys {
+    let st = match active_shots.get(key) {
+      Some(s) => s
+      None => continue
+    }
+    let sc = if st.scale > 0.0 {
+      st.scale
+    } else if view_app.last_scale > 0.0 {
+      view_app.last_scale
+    } else {
+      1.0
+    }
+    let shot_scene = Scene::new()
+    let prev_blocks = view_blocks_state.enabled
+    view_blocks_state.enabled = false
+    let (nx, ny, nw, nh) = signals::untracked(fn() -> (Double, Double, Double, Double) {
+      let _ = st.tree.frame(st.w, shot_tree_room, now=now)
+      let rect = st.held.rect()
+      shot_scene.clear(dmax(rect.0 + rect.2, st.w), dmax(rect.1 + rect.3, 1.0), sc)
+      encode_held_tree(shot_scene, st.tree, view_app.frame_no, now, sc)
+      shot_scene.emit_segs()
+      rect
+    })
+    view_blocks_state.enabled = prev_blocks
+    let end = st.since + shot_wait_most
+    if images_pending() && now < end {
+      any_waiting = true
+      hostapi::wake_after(dmin(50.0, dmax(1.0, end - now)))
+      continue
+    }
+    let png = shot_scene_png(shot_scene, nx, ny, nw, nh, sc, bg_r, bg_g, bg_b)
+    ended.push((key, png))
+  }
+  if any_waiting {
+    hostapi::request_frame()
+  }
+  for entry in ended {
+    let (key, png) = entry
+    match active_shots.get(key) {
+      Some(st) => {
+        active_shots.remove(key)
+        st.tree.dispose()
+        (st.done)(png)
+        hostapi::request_frame()
+      }
+      None => ()
+    }
+  }
+}
