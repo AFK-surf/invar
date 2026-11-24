@@ -18,6 +18,8 @@ pub fn Damage::occlude(
   if self.unit_at.length() < count {
     self.unit_at = make_ints(count * 2, 0)
     self.hidden = make_bools(count * 2, false)
+    self.layered = make_bools(count * 2, false)
+    self.head_said = make_doubles(count * 6, 0.0)
     self.shown_at = make_ints(count * 2, -1)
   }
   self.occ_ok = false
@@ -30,24 +32,51 @@ pub fn Damage::occlude(
   let least = w * h * cover_least
   let mut units = 0
   let mut last = -1
-  let mut blur_depth = 0
+  let walk = LayerWalk::{ depth: 0, lens_end: 0, floor: 0, crossed: false }
   let mut k = 0
   while k < count && kind_at(inst, k) != 12 {
     self.unit_at[units] = k
     self.hidden[units] = false
     let o = k * inst_size
     let kind = kind_at(inst, k)
-    if kind == 14 {
-      blur_depth += 1
-    } else if kind == 15 {
-      if blur_depth > 0 {
-        blur_depth -= 1
+    let open = walk.depth > 0 || k < walk.lens_end
+    walk.crossed = false
+    walk.floor = walk.depth
+    if kind == 13 {
+      for j in 0..<3 {
+        self.head_said[units * 3 + j] = inst[o + 12 + j]
       }
-    } else if blur_depth == 0 && kind == 0 && inst[o + 11] == 1.0 && inst[o + 2] * inst[o + 3] >= least {
+      let _ = self.layers_walk(walk, group_at(inst, k), k, count - k, 0)
+    } else if kind == 8 {
+      // (a content lens with what it draws through it: its 12 says how many after it)
+      let end = k + 1 + dmax(inst[o + 12], 0.0).to_int()
+      let mut c = k + 1
+      while c < end && c < count {
+        let ck = kind_at(inst, c)
+        if ck == 13 {
+          c += self.layers_walk(walk, group_at(inst, c), c, count - c, 0)
+        } else {
+          walk.met(ck, c, if ck == 8 { dmax(inst[c * inst_size + 12], 0.0).to_int() } else { 0 })
+          c += 1
+        }
+      }
+    } else {
+      walk.met(kind, k, 0)
+    }
+    if !open && kind == 0 && inst[o + 11] == 1.0 && inst[o + 2] * inst[o + 3] >= least {
       last = units
     }
+    let at = units
     units += 1
-    k += if kind == 13 { dmax(inst[o + 14], 1.0).to_int() } else { 1 }
+    k += if kind == 13 {
+      dmax(inst[o + 14], 1.0).to_int()
+    } else if kind == 8 {
+      1 + dmax(inst[o + 12], 0.0).to_int()
+    } else {
+      1
+    }
+    // (in a layer open over it, or with one it opens for what is after it or closes: drawn whatever covers it)
+    self.layered[at] = open || walk.crossed || walk.depth != walk.floor || walk.lens_end > k
   }
   let pieces = if k < count { k } else { count }
   self.occ_units = units
@@ -62,32 +91,27 @@ pub fn Damage::occlude(
   let all = Rect::none()
   let r = Rect::none()
   let mut u = last
-  let mut rev_blur = 0
   while u >= 0 {
     let k = self.unit_at[u]
     let o = k * inst_size
     let kind = kind_at(inst, k)
-    if kind == 15 {
-      rev_blur += 1
-      u -= 1
-      continue
-    } else if kind == 14 {
-      if rev_blur > 0 {
-        rev_blur -= 1
-      }
+    if kind == 14 || kind == 15 {
       u -= 1
       continue
     }
+    let layered = self.layered[u]
     self.cover_unit = u
+    // (one in a layer is blurred past its own reach: never left out of it)
     if covers > 0 &&
-      (
-        kind == 13 ||
-        (inst[o] >= all.x0 &&
+    !layered &&
+    (
+      kind == 13 ||
+      (inst[o] >= all.x0 &&
         inst[o + 1] >= all.y0 &&
         inst[o] + inst[o + 2] <= all.x1 &&
         inst[o + 1] + inst[o + 3] <= all.y1)
-      ) &&
-      self.hideable(inst, k, kind) {
+    ) &&
+    self.hideable(inst, k, kind) {
       r.clear()
       self.reach_of(inst, k, r)
       r.x0 = dmax(r.x0, 0.0)
@@ -101,13 +125,15 @@ pub fn Damage::occlude(
         continue
       }
     }
-    if is_glass(kind) || (kind == 13 && self.reads_under(inst[o + 12].to_int(), 0)) {
+    if is_glass(kind) ||
+    (kind == 13 && self.reads_under(inst[o + 12].to_int(), 0)) ||
+    (kind == 8 && self.lens_reads_under(inst, k, pieces)) {
       if covers > 0 {
         covers = 0
         all.clear()
         self.cover_logged(-1, Rect::none())
       }
-    } else if kind == 0 && rev_blur == 0 {
+    } else if kind == 0 && !layered {
       let was = self.cover_log.length()
       covers = self.cover_add(inst, k, w, h, covers)
       if self.cover_log.length() != was {
@@ -148,8 +174,12 @@ pub fn Damage::occlude_moved(
       Some(v) => v
       None => return None
     }
+    // (another group, part of it or room than was asked: all of it asked again)
+    for j in 0..<3 {
+      guard self.head_said[u * 3 + j] == inst[k * inst_size + 12 + j] else { return None }
+    }
     let mut hide = false
-    if u <= self.occ_last && self.hideable(inst, k, 13) {
+    if u <= self.occ_last && !self.layered[u] && self.hideable(inst, k, 13) {
       let n = self.covers_at(u)
       if n > 0 {
         r.clear()
@@ -272,23 +302,23 @@ fn Damage::shown_put(self : Damage, inst : Array[Double]) -> (Array[Double], Int
 }
 
 fn Damage::hideable(self : Damage, a : Array[Double], k : Int, kind : Int) -> Bool {
-  if is_glass(kind) || kind == 9 || kind == 12 || kind == 14 || kind == 15 {
+  if is_glass(kind) || kind == 8 || kind == 9 || kind == 12 || kind == 14 || kind == 15 {
     return false
   }
   if kind == 13 {
-    return groups_contains(self.groups, a[k * inst_size + 12].to_int())
+    return self.groups.contains(a[k * inst_size + 12].to_int())
   }
   !(kind == 4 && a[k * inst_size + 20] >= stream_tex_base)
 }
 
 fn Damage::reads_under(self : Damage, id : Int, depth : Int) -> Bool {
-  match reads_get(self.group_reads, id) {
-    Some((glass, heads)) => {
-      if glass || depth > 8 {
+  match self.groups.get(id) {
+    Some(g) => {
+      if g.is_glass || depth > group_depth {
         return true
       }
-      for g in heads {
-        if self.reads_under(g, depth + 1) {
+      for h in g.heads {
+        if self.reads_under(h.id, depth + 1) {
           return true
         }
       }
@@ -296,6 +326,20 @@ fn Damage::reads_under(self : Damage, id : Int, depth : Int) -> Bool {
     }
     None => true
   }
+}
+
+/// Whether anything content lens `k` draws through it reads what is under it: glass, or a header of a group that does.
+fn Damage::lens_reads_under(self : Damage, a : Array[Double], k : Int, pieces : Int) -> Bool {
+  let mut c = k + 1
+  let end = c + dmax(a[k * inst_size + 12], 0.0).to_int()
+  while c < end && c < pieces {
+    let kind = kind_at(a, c)
+    if is_glass(kind) || (kind == 13 && self.reads_under(a[c * inst_size + 12].to_int(), 0)) {
+      return true
+    }
+    c += if kind == 13 { dmax(a[c * inst_size + 14], 1.0).to_int() } else { 1 }
+  }
+  false
 }
 
 fn Damage::covered(self : Damage, n : Int, r : Rect) -> Bool {
@@ -312,15 +356,15 @@ fn Damage::covered(self : Damage, n : Int, r : Rect) -> Bool {
 fn Damage::cover_add(self : Damage, a : Array[Double], k : Int, w : Double, h : Double, n : Int) -> Int {
   let o = k * inst_size
   let solid = a[o + 11] == 1.0 &&
-    a[o + 7] == 0.0 &&
-    a[o + 32] == 0.0 &&
-    a[o + 21] == 0.0 &&
-    a[o + 22] == 0.0 &&
-    a[o + 23] == 0.0 &&
-    a[o + 53] == 0.0 &&
-    a[o + 55] == 0.0 &&
-    a[o + 57] == 0.0 &&
-    a[o + 59] == 0.0
+  a[o + 7] == 0.0 &&
+  a[o + 32] == 0.0 &&
+  a[o + 21] == 0.0 &&
+  a[o + 22] == 0.0 &&
+  a[o + 23] == 0.0 &&
+  a[o + 53] == 0.0 &&
+  a[o + 55] == 0.0 &&
+  a[o + 57] == 0.0 &&
+  a[o + 59] == 0.0
   if !solid || a[o + 2] * a[o + 3] < w * h * cover_least {
     return n
   }

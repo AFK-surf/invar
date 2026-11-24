@@ -1,0 +1,394 @@
+// What is known of a host's groups: each group's own, the headers it holds followed as it is asked, so a group set again
+// is so for every group that holds a header of it, and what a header's clip cuts is asked where its group is moved to.
+
+/// Headers are followed in headers no deeper than this (as groups.h draws them).
+let group_depth : Int = 8
+
+/// A band (kind 11) a group draws: its place among its instances, its pieces and how far it reaches.
+struct GroupBand {
+  at : Int
+  first : Int
+  n : Int
+  reach : Rect
+}
+
+/// Glass of a capture a group draws: its place among its instances, as a box of it.
+struct GroupGlass {
+  at : Int
+  glass : GlassBox
+}
+
+/// What a group holds that says how it is drawn with what is after it, in order: a header, or a layer's kind (14, 15; 8
+/// of `more` after it).
+struct GroupItem {
+  at : Int
+  kind : Int
+  more : Int
+  head : Option[GroupAt]
+}
+
+/// A group's own, unmoved and uncut.
+struct GroupInfo {
+  n : Int
+  own : Rect
+  is_glass : Bool
+  glass : Array[GroupGlass]
+  layers : Array[Rect]
+  bands : Array[GroupBand]
+  items : Array[GroupItem]
+  heads : Array[GroupAt]
+}
+
+/// A header (its 12 to 15), what it draws moved by `dx`, `dy` and, where `cut`, cut to `clip`, which moves with nothing.
+struct GroupAt {
+  id : Int
+  first : Int
+  n : Int
+  dx : Double
+  dy : Double
+  seg_by : Double
+  cut : Bool
+  clip : Rect
+}
+
+/// How many instances header `k` of `a` stands for: one at least, as the renderers draw it out.
+fn span_of(a : Array[Double], k : Int) -> Int {
+  let n = a[k * inst_size + 14].to_int()
+  if n < 1 { 1 } else { n }
+}
+
+fn group_at(a : Array[Double], k : Int) -> GroupAt {
+  let o = k * inst_size
+  let clip = Rect::{ x0: a[o + 16], y0: a[o + 17], x1: a[o + 18], y1: a[o + 19] }
+  GroupAt::{
+    id: a[o + 12].to_int(),
+    first: a[o + 13].to_int(),
+    n: span_of(a, k),
+    dx: a[o],
+    dy: a[o + 1],
+    seg_by: a[o + 15],
+    cut: !(clip.x0 == 0.0 && clip.y0 == 0.0 && clip.x1 == 0.0 && clip.y1 == 0.0),
+    clip,
+  }
+}
+
+/// Header `h` of its group, as it draws in it, `room` at most.
+fn GroupAt::inner(self : GroupAt, h : GroupAt, room : Int) -> GroupAt {
+  GroupAt::{
+    id: h.id,
+    first: h.first,
+    n: if h.n > room { room } else { h.n },
+    dx: self.dx + h.dx,
+    dy: self.dy + h.dy,
+    seg_by: self.seg_by + h.seg_by,
+    cut: self.cut || h.cut,
+    clip: if self.cut && h.cut { h.clip.within(self.clip) } else if self.cut { self.clip } else { h.clip },
+  }
+}
+
+/// Rect `r` of its group where it draws it, added to `into`.
+fn GroupAt::add(self : GroupAt, r : Rect, into : Rect) -> Unit {
+  if r.empty() {
+    return
+  }
+  let m = Rect::{ x0: r.x0 + self.dx, y0: r.y0 + self.dy, x1: r.x1 + self.dx, y1: r.y1 + self.dy }
+  if self.cut {
+    let c = self.clip
+    m.cut_to(Rect::{ x0: c.x0 - reach_pad, y0: c.y0 - reach_pad, x1: c.x1 + reach_pad, y1: c.y1 + reach_pad })
+  }
+  into.add(m.x0, m.y0, m.x1, m.y1)
+}
+
+fn group_info(inst : Array[Double], n : Int) -> GroupInfo {
+  let own = Rect::none()
+  let mut glass_here = false
+  let glass : Array[GroupGlass] = []
+  let layers : Array[Rect] = []
+  let bands : Array[GroupBand] = []
+  let items : Array[GroupItem] = []
+  let heads : Array[GroupAt] = []
+  for k in 0..<n {
+    let kind = kind_at(inst, k)
+    let o = k * inst_size
+    if kind == 13 {
+      let h = group_at(inst, k)
+      heads.push(h)
+      items.push(GroupItem::{ at: k, kind, more: 0, head: Some(h) })
+      continue
+    }
+    reach(inst, k, own, cut=false)
+    if is_glass(kind) {
+      glass_here = true
+      let one : Array[GlassBox] = []
+      glass_put(one, inst, k, cut=false)
+      for b in one {
+        glass.push(GroupGlass::{ at: k, glass: b })
+      }
+    } else if is_layer(kind) {
+      let r = Rect::none()
+      reach(inst, k, r, cut=false)
+      layers.push(r)
+      items.push(GroupItem::{ at: k, kind, more: if kind == 8 { dmax(inst[o + 12], 0.0).to_int() } else { 0 }, head: None })
+    } else if kind == 11 && inst[o + 13] > 0.0 {
+      let r = Rect::none()
+      reach(inst, k, r, cut=false)
+      bands.push(GroupBand::{ at: k, first: inst[o + 12].to_int(), n: inst[o + 13].to_int(), reach: r })
+    }
+  }
+  GroupInfo::{ n, own, is_glass: glass_here, glass, layers, bands, items, heads }
+}
+
+/// What is known of group `id`; `old`: as the kept frame was drawn.
+fn Damage::info(self : Damage, id : Int, old : Bool) -> Option[GroupInfo] {
+  if old && self.stale.length() > 0 {
+    match self.stale.get(id) {
+      Some(was) => return was
+      None => ()
+    }
+  }
+  self.groups.get(id)
+}
+
+/// What is known of group `id` now kept as what the kept frame was drawn with.
+fn Damage::set_aside(self : Damage, id : Int) -> Unit {
+  if self.has && !self.stale.contains(id) {
+    self.stale.set(id, self.groups.get(id))
+  }
+}
+
+fn Damage::stale_clear(self : Damage) -> Unit {
+  if self.stale.length() > 0 {
+    self.stale = Map::new()
+  }
+}
+
+/// Each group header `at` draws, its own and those of the headers in it: what is known of it (none of one not known, or
+/// that comes round to itself), where it draws it.
+fn Damage::each_group(
+  self : Damage,
+  at : GroupAt,
+  old : Bool,
+  path : Array[Int],
+  f : (Option[GroupInfo], GroupAt) -> Unit,
+) -> Unit {
+  let over = path.length() >= group_depth || path.contains(at.id)
+  match self.info(at.id, old) {
+    Some(g) => {
+      if over {
+        f(None, at)
+        return
+      }
+      f(Some(g), at)
+      if g.heads.length() > 0 {
+        path.push(at.id)
+        let mut extra = 0
+        for it in g.items {
+          match it.head {
+            Some(h) => {
+              let room = at.n - it.at - extra
+              if room <= 0 {
+                break
+              }
+              let inner = at.inner(h, room)
+              self.each_group(inner, old, path, f)
+              extra += inner.n - 1
+            }
+            None => ()
+          }
+        }
+        let _ = path.pop()
+      }
+    }
+    None => f(None, at)
+  }
+}
+
+/// Which of a group's own instances header `at` draws, from and up to.
+fn GroupInfo::drawn(self : GroupInfo, at : GroupAt) -> (Int, Int) {
+  if self.heads.length() == 0 {
+    // (a part past what it holds: nothing of it)
+    return if at.first < 0 || at.first + at.n > self.n { (0, 0) } else { (at.first, at.first + at.n) }
+  }
+  // (from its start, each header in it as many as it stands for, of the room left)
+  let mut extra = 0
+  for it in self.items {
+    match it.head {
+      Some(h) => {
+        let room = at.n - it.at - extra
+        if room <= 0 {
+          break
+        }
+        extra += (if h.n > room { room } else { h.n }) - 1
+      }
+      None => ()
+    }
+  }
+  (0, at.n - extra)
+}
+
+/// Whether nothing header `u` of the kept frame `a` draws was set or let go since.
+fn Damage::group_same(self : Damage, a : Array[Double], u : Int) -> Bool {
+  if self.stale.length() == 0 {
+    return true
+  }
+  let same : Array[Bool] = [true]
+  self.each_group(group_at(a, u), true, [], fn(_g : Option[GroupInfo], at : GroupAt) {
+    if self.stale.contains(at.id) {
+      same[0] = false
+    }
+  })
+  same[0]
+}
+
+/// The glass of the groups of unit `k` of `a`, where it is a header, put in `out`.
+fn Damage::group_glass(self : Damage, a : Array[Double], k : Int, out : Array[GlassBox], old : Bool) -> Unit {
+  if kind_at(a, k) != 13 {
+    return
+  }
+  self.each_group(group_at(a, k), old, [], fn(g : Option[GroupInfo], at : GroupAt) {
+    match g {
+      Some(g) => {
+        let (from, to) = g.drawn(at)
+        for one in g.glass {
+          if one.at < from || one.at >= to {
+            continue
+          }
+          let b = one.glass
+          let into = glass_of(out, b.id)
+          into.box.add(b.box.x0 + at.dx, b.box.y0 + at.dy, b.box.x1 + at.dx, b.box.y1 + at.dy)
+          into.margin = dmax(into.margin, b.margin)
+        }
+      }
+      None => ()
+    }
+  })
+}
+
+/// The layers of the groups of unit `k` of `a`, where it is a header, each a rect of `out`.
+fn Damage::group_layers(self : Damage, a : Array[Double], k : Int, out : Array[Rect], old : Bool) -> Unit {
+  if kind_at(a, k) != 13 {
+    return
+  }
+  self.each_group(group_at(a, k), old, [], fn(g : Option[GroupInfo], at : GroupAt) {
+    match g {
+      Some(g) => {
+        for r in g.layers {
+          out.push(Rect::{ x0: r.x0 + at.dx, y0: r.y0 + at.dy, x1: r.x1 + at.dx, y1: r.y1 + at.dy })
+        }
+      }
+      None => ()
+    }
+  })
+}
+
+/// Whether any band the groups of header `k` draw is of pieces that differ (as Damage::changed's same_pieces), each that
+/// is added to `into`.
+fn Damage::bands_changed(
+  self : Damage,
+  prev : Array[Double],
+  seg_old : Int,
+  n_old : Int,
+  inst : Array[Double],
+  seg : Int,
+  count : Int,
+  k : Int,
+  into : Option[Rect],
+) -> Bool {
+  let any : Array[Bool] = [false]
+  self.each_group(group_at(inst, k), false, [], fn(g : Option[GroupInfo], at : GroupAt) {
+    match g {
+      Some(g) => {
+        let (from, to) = g.drawn(at)
+        for b in g.bands {
+          let first = b.first + at.seg_by.to_int()
+          // (only those drawn: another's pieces may be nowhere in the frame)
+          let drawn = b.at >= from && b.at < to
+          if drawn && (first < 0 || !same_pieces(prev, seg_old, n_old, inst, seg, count, first, b.n)) {
+            any[0] = true
+            match into {
+              Some(r) => at.add(b.reach, r)
+              None => ()
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  })
+  any[0]
+}
+
+/// Whether the pieces of shapes after `seg_a` of `a` and after `seg_b` of `b` are all the same.
+fn same_tail(a : Array[Double], seg_a : Int, count_a : Int, b : Array[Double], seg_b : Int, count_b : Int) -> Bool {
+  if count_a - seg_a != count_b - seg_b {
+    return false
+  }
+  for i in 0..<(count_a - seg_a) {
+    if !same_pair(a, seg_a + i, b, seg_b + i) {
+      return false
+    }
+  }
+  true
+}
+
+/// The layers open as a frame is gone through (Damage::occlude): how deep in blur layers, the instance a content lens's
+/// content ends before, and (of one unit, from `floor` deep) whether it closed one open before it.
+struct LayerWalk {
+  mut depth : Int
+  mut lens_end : Int
+  mut floor : Int
+  mut crossed : Bool
+}
+
+/// A layer's kind met at instance `at`.
+fn LayerWalk::met(self : LayerWalk, kind : Int, at : Int, more : Int) -> Unit {
+  if kind == 14 {
+    self.depth += 1
+  } else if kind == 15 {
+    if self.depth <= self.floor {
+      self.crossed = true
+    }
+    if self.depth > 0 {
+      self.depth -= 1
+    }
+  } else if kind == 8 {
+    self.lens_end = if at + 1 + more > self.lens_end { at + 1 + more } else { self.lens_end }
+  }
+}
+
+/// What header `h` draws from instance `at` on, `room` at most, gone through as groups.h draws it: how many it draws.
+fn Damage::layers_walk(self : Damage, w : LayerWalk, h : GroupAt, at : Int, room : Int, depth : Int) -> Int {
+  let mut n = if h.n < 1 { 1 } else { h.n }
+  if n > room {
+    n = room
+  }
+  if depth >= group_depth {
+    return n
+  }
+  match self.groups.get(h.id) {
+    Some(g) => {
+      if g.heads.length() == 0 && (h.first < 0 || h.first + n > g.n) {
+        return n
+      }
+      // (one holding headers is drawn from its start)
+      let from = if g.heads.length() == 0 { h.first } else { 0 }
+      // how many more than its own instances the headers in it have drawn
+      let mut extra = 0
+      for it in g.items {
+        if it.at < from {
+          continue
+        }
+        let d = it.at - from + extra
+        if d >= n {
+          break
+        }
+        match it.head {
+          Some(inner) => extra += self.layers_walk(w, inner, at + d, n - d, depth + 1) - 1
+          None => w.met(it.kind, at + d, it.more)
+        }
+      }
+    }
+    None => ()
+  }
+  n
+}

@@ -101,8 +101,15 @@ fi
 ls -lh "$LIB"
 echo "==> Linux EGL/GLES3 host archive check PASSED (${#OBJS[@]} objects)"
 
+echo "==> Kept groups (groups.h) unit test"
+$CC -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all \
+  -Ipackages/host/native packages/host/native/groups_test.c -o "$OUT_DIR/groups_test" -lm
+"$OUT_DIR/groups_test"
+
 PIONC="${PIONC:-$(command -v pionc2 || true)}"
 if [ -n "$PIONC" ]; then
+  echo "==> Running $PIONC test packages/damage/parity (groups.h against damage::Groups)"
+  "$PIONC" test packages/damage/parity
   echo "==> Running $PIONC check packages/host"
   "$PIONC" check packages/host
   echo "==> Running $PIONC test --package host packages/host (Mesa llvmpipe)"

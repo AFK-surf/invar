@@ -29,6 +29,8 @@
 
 #define MB_GROUP_INST 60
 #define MB_GROUP_HEAD 13.0
+// Headers are drawn out in headers no deeper than this (a group that comes round to itself ends there).
+#define MB_GROUP_DEPTH 8
 
 #ifdef __cplusplus
 #define MB_GROUPS_C extern "C"
@@ -48,6 +50,8 @@ typedef struct {
 
 static mb_group *mb_groups;
 static size_t mb_groups_cap;
+// (those here)
+static size_t mb_groups_live;
 // (those here and those let go, what a look goes past)
 static size_t mb_groups_taken;
 
@@ -55,7 +59,8 @@ static size_t mb_group_slot(int32_t id) { return ((uint32_t)id * 2654435761u) & 
 
 // Where group `id` is, or NULL.
 static mb_group *mb_group_find(int32_t id) {
-  if (!mb_groups_cap) return NULL;
+  // (0 and -1 say a place, never a group)
+  if (id <= 0 || !mb_groups_cap) return NULL;
   for (size_t i = mb_group_slot(id), k = 0; k < mb_groups_cap; i = (i + 1) & (mb_groups_cap - 1), k++) {
     if (mb_groups[i].id == id) return &mb_groups[i];
     if (mb_groups[i].id == 0) return NULL;
@@ -63,26 +68,34 @@ static mb_group *mb_group_find(int32_t id) {
   return NULL;
 }
 
-static void mb_group_put(mb_group g);
-
-// Room for more, those here put again (those let go left behind).
-static void mb_groups_grow(void) {
-  mb_group *old = mb_groups;
-  size_t cap = mb_groups_cap;
-  mb_groups_cap = cap ? cap * 2 : 256;
-  mb_groups = (mb_group *)calloc(mb_groups_cap, sizeof(mb_group));
-  mb_groups_taken = 0;
-  for (size_t i = 0; i < cap; i++)
-    if (old[i].id > 0) mb_group_put(old[i]);
-  free(old);
-}
-
+// Put where there is room for it (mb_groups_room).
 static void mb_group_put(mb_group g) {
-  if ((mb_groups_taken + 1) * 2 > mb_groups_cap) mb_groups_grow();
   size_t i = mb_group_slot(g.id);
   while (mb_groups[i].id > 0) i = (i + 1) & (mb_groups_cap - 1);
   if (mb_groups[i].id == 0) mb_groups_taken++;
+  mb_groups_live++;
   mb_groups[i] = g;
+}
+
+// Room for one more, less than half the places taken: those here put again, those let go left behind, in as many places
+// where those here take less than a quarter of them (a list scrolled, its rows' groups kept and let go for ever, stays
+// as large as what it keeps at once), else in twice as many. A quarter of the places at least free to take either way:
+// put again no more often than that.
+static void mb_groups_room(void) {
+  if (mb_groups_cap && (mb_groups_taken + 1) * 2 < mb_groups_cap) return;
+  mb_group *old = mb_groups;
+  size_t cap = mb_groups_cap;
+  size_t to = !cap ? 256 : (mb_groups_live + 1) * 4 >= cap ? cap * 2 : cap;
+  mb_group *made = (mb_group *)calloc(to, sizeof(mb_group));
+  // (no room for it: those here as they are)
+  if (!made) return;
+  mb_groups = made;
+  mb_groups_cap = to;
+  mb_groups_taken = 0;
+  mb_groups_live = 0;
+  for (size_t i = 0; i < cap; i++)
+    if (old[i].id > 0) mb_group_put(old[i]);
+  free(old);
 }
 
 MB_GROUPS_C int32_t mb_host_groups_here(void) { return 1; }
@@ -96,6 +109,7 @@ MB_GROUPS_C void mb_host_group_drop(int32_t id) {
   g->moves = NULL;
   g->n = 0;
   g->id = -1;
+  mb_groups_live--;
 }
 
 MB_GROUPS_C void mb_host_group_set(int32_t id, double *inst, double *moves, int32_t n) {
@@ -103,6 +117,13 @@ MB_GROUPS_C void mb_host_group_set(int32_t id, double *inst, double *moves, int3
   if (id <= 0 || n < 0) return;
   mb_group g = {id, n, (double *)malloc(sizeof(double) * MB_GROUP_INST * (size_t)(n > 0 ? n : 1)),
                 (int32_t *)malloc(sizeof(int32_t) * (size_t)(n > 0 ? n : 1)), 0};
+  mb_groups_room();
+  // (no room for it: not kept; one place is always left free, where a look ends)
+  if (!g.inst || !g.moves || mb_groups_taken + 1 >= mb_groups_cap) {
+    free(g.inst);
+    free(g.moves);
+    return;
+  }
   memcpy(g.inst, inst, sizeof(double) * MB_GROUP_INST * (size_t)n);
   for (int32_t i = 0; i < n; i++) {
     g.moves[i] = (int32_t)moves[i];
@@ -169,7 +190,7 @@ static void mb_group_inst_out(float *o, const double *e, int32_t m, double dx, d
 // it): each of its instances moved and cut as the header says. A group that holds headers (a list's, its rows kept:
 // mbui/src/ui/view_ride.mbt's ListRiding) is drawn whole, each of those in one place of it drawn out where it comes
 // in turn, moved with it and cut to its clip as well, as many as it says. How many it drew.
-static int32_t mb_group_out(float *d, int32_t room, const double *h) {
+static int32_t mb_group_out(float *d, int32_t room, const double *h, int depth) {
   int32_t first = (int32_t)h[13], n = (int32_t)h[14];
   double dx = h[0], dy = h[1], seg_by = h[15];
   // (its clip, 16-19, where it says one: each of its instances cut to it as well, mbui/src/ui/view_ride.mbt's
@@ -178,7 +199,7 @@ static int32_t mb_group_out(float *d, int32_t room, const double *h) {
   int cut = !(h0 == 0.0 && h1 == 0.0 && h2 == 0.0 && h3 == 0.0);
   if (n < 1) n = 1;
   if (n > room) n = room;
-  mb_group *g = mb_group_find((int32_t)h[12]);
+  mb_group *g = depth < MB_GROUP_DEPTH ? mb_group_find((int32_t)h[12]) : NULL;
   if (g && g->heads) {
     int32_t w = 0;
     for (int32_t i = 0; i < g->n && w < n; i++) {
@@ -204,7 +225,7 @@ static int32_t mb_group_out(float *d, int32_t room, const double *h) {
             if (hv[19] > h3) hv[19] = h3;
           }
         }
-        w += mb_group_out(d + (size_t)w * MB_GROUP_INST, n - w, hv);
+        w += mb_group_out(d + (size_t)w * MB_GROUP_INST, n - w, hv, depth + 1);
         continue;
       }
       mb_group_inst_out(d + (size_t)w * MB_GROUP_INST, e, g->moves[i], dx, dy, seg_by, cut, h0, h1, h2, h3);
@@ -237,7 +258,7 @@ static void mb_groups_floats(float *f, const double *buf, int32_t count) {
       k++;
       continue;
     }
-    k += mb_group_out(f + (size_t)k * MB_GROUP_INST, count - k, h);
+    k += mb_group_out(f + (size_t)k * MB_GROUP_INST, count - k, h, 0);
   }
 }
 

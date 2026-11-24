@@ -80,12 +80,13 @@ print('OK: workspace test (%d packages, %d passed, %d ms)' % (len(d['packages'])
 
 MULTI_TST_JSON="$("$INVAR" test --pkg damage --pkg halt --json)"
 assert_py "
-import json, sys
+import glob, json, sys
 d = json.loads(sys.argv[1])
 assert d['ok'] is True and d['total_failed'] == 0, f'multi-pkg test failed: {d}'
 assert [p['pkg'] for p in d['packages']] == ['damage', 'halt'], f'order mismatch: {d}'
-# damage has ~12 own tests and halt has ~2 own tests; --only-pkg must not re-run transitive deps
-assert d['packages'][0]['passed'] < 40 and d['packages'][1]['passed'] >= 1, f'unexpected counts: {d}'
+# --only-pkg must run only each package's own tests without re-running transitive deps
+own_damage = sum(1 for p in glob.glob('packages/damage/src/*.pion') for ln in open(p) if ln.startswith('test '))
+assert d['packages'][0]['passed'] == own_damage and d['packages'][1]['passed'] >= 1, f'unexpected counts: {d} (own_damage={own_damage})'
 print('OK: parallel multi-pkg --only-pkg (%d passed, %d ms)' % (d['total_passed'], d['elapsed_ms']))
 " "$MULTI_TST_JSON"
 
