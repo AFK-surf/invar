@@ -3286,7 +3286,7 @@ test "67 CJK kinsoku line-breaking keeps punctuation off forbidden edges and mat
   }
   match drawn_words {
     Some(d) => {
-      let _ = encode_words(sc, d, 1.0, 0.0, 0.0, 1000.0, 1000.0)
+      let _ = encode_words(sc, d, 1.0, 1.0, 0.0, 0.0, 1000.0, 1000.0)
     }
     None => debug_assert(false, "mixed words node must be drawn")
   }
@@ -3494,7 +3494,7 @@ test "UAX #14 line breaking preserves Cyrillic, Greek, accented Latin words and 
   let sc = Scene::new()
   for d in t2.drawn() {
     if d.words == mix2 {
-      let _ = encode_words(sc, d, 1.0, 0.0, 0.0, 1000.0, 1000.0)
+      let _ = encode_words(sc, d, 1.0, 1.0, 0.0, 0.0, 1000.0, 1000.0)
     }
   }
   let row_ys : Array[Int] = []
@@ -4249,5 +4249,431 @@ test "a terminal that failed to open releases its host handle at once" {
     if entry == "tm_close:\{id}" { closes += 1 }
   }
   debug_assert(closes == 1, "host handle closed exactly once, got \{closes}")
+  t.dispose()
+}
+
+// ---- View::scale draws everything a node holds at its drawn size ----
+
+let st_ground : Int64 = 0xF4F6FAFFL
+let st_edge : Int64 = 0x3355AAFFL
+let st_ring : Int64 = 0x22AA66FFL
+let st_rect : Int64 = 0xCC3344FFL
+let st_line : Int64 = 0x8844CCFFL
+let st_fill : Int64 = 0xFF8800FFL
+let st_stroke : Int64 = 0x0088FFFFL
+let st_mark : Int64 = 0xFFE066FFL
+
+/// A fake shaper whose glyphs are as big as the size they are shaped at (keyed by size, as a real host keys them):
+/// advance 0.6 x size (FakeHost's, so what was measured stays), glyph 0.5 x 0.75 x size.
+fn st_sized_glyphs(t : Tester) -> Unit {
+  let h = hostapi::host()
+  h.shape = fn(s : String, size : Double, _weight : Int, _style : Int, out : Array[Double]) -> Int {
+    let n = s.length()
+    let q = (size * 8.0 + 0.5).to_int()
+    let mut i = 0
+    while i < n && i * 4 + 3 < out.length() {
+      let ch = s.code_unit_at(i)
+      out[i * 4] = i.to_double()
+      out[i * 4 + 1] = 1.0
+      out[i * 4 + 2] = if ch == 10 { 0.0 } else { size * 0.6 }
+      out[i * 4 + 3] = if ch == 10 || ch == 32 || ch == 9 { -1.0 } else { (q * 65536 + ch).to_double() }
+      i += 1
+    }
+    n
+  }
+  h.glyph = fn(key : Int, out : Array[Double]) {
+    if out.length() >= 7 {
+      let mut i = 0
+      while i < 7 {
+        out[i] = 0.0
+        i += 1
+      }
+      if key >= 0 {
+        let sz = (key / 65536).to_double() / 8.0
+        out[2] = sz * 0.5
+        out[3] = sz * 0.75
+        out[4] = sz * 0.05
+        out[5] = -sz * 0.75 * 0.8
+      }
+    }
+  }
+  reset_glyph_atlas()
+  t.fake.frame_requested = true
+  t.frame()
+}
+
+fn st_rgb(inst : Array[Double], o : Int, c : Int64) -> Bool {
+  (inst[o] - ((c >> 24) & 0xFFL).to_double() / 255.0).abs() < 0.01 &&
+  (inst[o + 1] - ((c >> 16) & 0xFFL).to_double() / 255.0).abs() < 0.01 &&
+  (inst[o + 2] - ((c >> 8) & 0xFFL).to_double() / 255.0).abs() < 0.01
+}
+
+fn st_all(sc : Scene, from : Int, to : Int, pred : (Int) -> Bool) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut i = if from < 0 { 0 } else { from }
+  let end = if to < 0 || to > sc.ninst { sc.ninst } else { to }
+  while i < end {
+    if pred(i * inst_size) {
+      out.push(i)
+    }
+    i += 1
+  }
+  out
+}
+
+fn st_first(sc : Scene, from : Int, pred : (Int) -> Bool) -> Int {
+  let found = st_all(sc, from, -1, pred)
+  if found.length() > 0 { found[0] } else { -1 }
+}
+
+fn st_near(a : Double, b : Double) -> Bool {
+  (a - b).abs() < 0.02
+}
+
+fn st_kind(sc : Scene, b : Int, k : Double) -> Bool {
+  (sc.inst[b + 5] - k).abs() < 0.01
+}
+
+/// One card of every kind of thing a node draws in its own points, and a line of runs with a marked word below it.
+fn st_card(v : view::View, s : view::Live[Double]) -> Unit {
+  let tri = paint::shape_of([([100.0, 40.0, 124.0, 40.0, 112.0, 60.0], true)], fill=st_fill)
+  let ring = paint::shape_of([([140.0, 40.0, 164.0, 40.0, 164.0, 60.0, 140.0, 60.0], true)], stroke=st_stroke, width=2.0)
+  let marked = [text::plain("Find "), text::Run::{ ..text::plain("match"), bg: st_mark }, text::plain(" here")]
+  let _ = v.scale(s, about=view::Pivot::At(0.0, 0.0))
+  let _ = v.box(fn(c : view::View) {
+    let _ = c.width(view::Live::Is(Some(300.0)))
+    .height(view::Live::Is(Some(120.0)))
+    .ground(view::Live::Is(st_ground))
+    .edge(view::Live::Is((2.0, st_edge)))
+    .ring(view::Live::Is((3.0, 4.0, st_ring)))
+    .shadow(view::Live::Is((12.0, 6.0, 0x00000080L)))
+    .radius(view::Live::Is(10.0))
+    .rects(view::Live::Is([paint::rect(6.0, 70.0, 40.0, 10.0, color=st_rect, corners=(2.0, 2.0, 2.0, 2.0))]))
+    .lines(view::Live::Is([paint::line([(0.0, 100.0), (80.0, 100.0)], width=2.0, color=st_line)]))
+    .shapes(view::Live::Is([tri, ring]))
+    .words(view::Live::Is("Scale me"), ink=0x111111FFL, look=view::WordsLook::{ ..view::words_plain, size: 14.0 })
+  })
+  let _ = v.box(fn(r : view::View) {
+    let _ = r.width(view::Live::Is(Some(200.0)))
+    .height(view::Live::Is(Some(30.0)))
+    .words_runs(view::Live::Is(marked), ink=0x111111FFL, look=view::WordsLook::{ ..view::words_plain, size: 14.0 })
+  })
+}
+
+/// Where each card's pieces are in the scene: shadow, ground, ring and end of the first card (at 1.0), then the second's.
+fn st_marks(sc : Scene) -> Array[Int] {
+  let inst = sc.inst
+  let is_shadow = fn(b : Int) -> Bool { st_kind(sc, b, 2.0) }
+  let is_ground = fn(b : Int) -> Bool { st_kind(sc, b, 0.0) && inst[b + 11] > 0.5 && st_rgb(inst, b + 8, st_ground) }
+  let is_ring = fn(b : Int) -> Bool { st_kind(sc, b, 0.0) && inst[b + 11] < 0.01 && inst[b + 6] > 0.0 && st_rgb(inst, b + 12, st_ring) }
+  let sa = st_first(sc, 0, is_shadow)
+  let ga = st_first(sc, sa, is_ground)
+  let ra = st_first(sc, ga, is_ring)
+  let sb = st_first(sc, ra, is_shadow)
+  let gb = st_first(sc, sb, is_ground)
+  let rb = st_first(sc, gb, is_ring)
+  [sa, ga, ra, sb, sb, gb, rb, sc.ninst]
+}
+
+test "View::scale draws words, edge, rects, shapes, lines, shadow and ring at 1.5x (corners once, not twice)" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(a : view::View) { st_card(a, view::Live::Is(1.0)) })
+    let _ = root.box(fn(b : view::View) { st_card(b, view::Live::Is(1.5)) })
+  }, width=960.0, height=600.0)
+  st_sized_glyphs(t)
+  let sc = t.scene()
+  let inst = sc.inst
+  let m = st_marks(sc)
+  let sa = m[0]
+  let ga = m[1]
+  let ra = m[2]
+  let sb = m[4]
+  let gb = m[5]
+  let rb = m[6]
+  debug_assert(sa >= 0 && ga > sa && ra > ga && sb > ra && gb > sb && rb > gb, "both cards found (\{sa} \{ga} \{ra} \{sb} \{gb} \{rb})")
+  let oa = ga * inst_size
+  let ob = gb * inst_size
+  let ax = inst[oa]
+  let ay = inst[oa + 1]
+  let bx = inst[ob]
+  let by = inst[ob + 1]
+  // Box, corners and edge: the box 1.5x, its corners 1.5x (Tree::drawn_held's, never again: not 2.25x), the edge 1.5x.
+  debug_assert(st_near(inst[ob + 2], 450.0) && st_near(inst[ob + 3], 180.0), "scaled box 450x180, got \{inst[ob + 2]}x\{inst[ob + 3]}")
+  debug_assert(st_near(inst[ob + 4], 15.0) && st_near(inst[ob + 36], 15.0) && st_near(inst[ob + 39], 15.0), "corner 15 (1.5x), got \{inst[ob + 4]}")
+  debug_assert(st_near(inst[oa + 6], 2.0) && st_near(inst[ob + 6], 3.0), "edge 2 -> 3, got \{inst[ob + 6]}")
+  // Shadow: blur and drop 1.5x.
+  let osa = sa * inst_size
+  let osb = sb * inst_size
+  debug_assert(st_near(inst[osa + 7], 12.0) && st_near(inst[osb + 7], 18.0), "shadow blur 12 -> 18, got \{inst[osb + 7]}")
+  debug_assert(st_near(inst[osa + 1] - ay, 6.0) && st_near(inst[osb + 1] - by, 9.0), "shadow drop 6 -> 9, got \{inst[osb + 1] - by}")
+  // Focus ring: width and gap 1.5x, so it stands 10.5 off the box, not 7.
+  let ora = ra * inst_size
+  let orb = rb * inst_size
+  debug_assert(st_near(inst[ora + 6], 3.0) && st_near(inst[orb + 6], 4.5), "ring width 3 -> 4.5, got \{inst[orb + 6]}")
+  debug_assert(st_near(ax - inst[ora], 7.0) && st_near(bx - inst[orb], 10.5), "ring pad 7 -> 10.5, got \{bx - inst[orb]}")
+  debug_assert(st_near(inst[orb + 2], 450.0 + 21.0), "ring wraps the scaled box, got \{inst[orb + 2]}")
+  // Rects: where, how big and how round, all 1.5x.
+  let is_rect = fn(b : Int) -> Bool { st_kind(sc, b, 0.0) && st_rgb(inst, b + 8, st_rect) }
+  let rka = st_all(sc, ga, ra, is_rect)
+  let rkb = st_all(sc, gb, rb, is_rect)
+  debug_assert(rka.length() == 1 && rkb.length() == 1, "one rect each")
+  let ra0 = rka[0] * inst_size
+  let rb0 = rkb[0] * inst_size
+  debug_assert(st_near(inst[ra0] - ax, 6.0) && st_near(inst[ra0 + 1] - ay, 70.0), "rect at (6, 70)")
+  debug_assert(st_near(inst[rb0] - bx, 9.0) && st_near(inst[rb0 + 1] - by, 105.0), "rect at (9, 105), got (\{inst[rb0] - bx}, \{inst[rb0 + 1] - by})")
+  debug_assert(st_near(inst[rb0 + 2], 60.0) && st_near(inst[rb0 + 3], 15.0), "rect 60x15, got \{inst[rb0 + 2]}x\{inst[rb0 + 3]}")
+  debug_assert(st_near(inst[rb0 + 36], 3.0) && st_near(inst[rb0 + 38], 3.0), "rect corners 3, got \{inst[rb0 + 36]}")
+  // Lines: ends and width 1.5x.
+  let is_line = fn(b : Int) -> Bool { st_kind(sc, b, 0.0) && st_rgb(inst, b + 8, st_line) }
+  let lka = st_all(sc, ga, ra, is_line)
+  let lkb = st_all(sc, gb, rb, is_line)
+  debug_assert(lka.length() == 1 && lkb.length() == 1, "one line piece each")
+  let la0 = lka[0] * inst_size
+  let lb0 = lkb[0] * inst_size
+  debug_assert(st_near(inst[la0 + 2], 82.0) && st_near(inst[la0 + 3], 2.0), "line 82x2")
+  debug_assert(st_near(inst[lb0 + 2], 123.0) && st_near(inst[lb0 + 3], 3.0), "line 123x3, got \{inst[lb0 + 2]}x\{inst[lb0 + 3]}")
+  debug_assert(st_near(inst[lb0] - bx, -1.5) && st_near(inst[lb0 + 1] - by, 148.5), "line from (0, 150), got (\{inst[lb0] - bx}, \{inst[lb0 + 1] - by})")
+  // Shapes: the bands round the filled outline span 1.5x it; the stroke's half width is 1.5x.
+  let span = fn(ks : Array[Int], ox : Double, oy : Double) -> (Double, Double, Double, Double) {
+    let mut x0 = 1.0e9
+    let mut y0 = 1.0e9
+    let mut x1 = -1.0e9
+    let mut y1 = -1.0e9
+    for k in ks {
+      let o = k * inst_size
+      x0 = dmin(x0, inst[o] - ox)
+      y0 = dmin(y0, inst[o + 1] - oy)
+      x1 = dmax(x1, inst[o] + inst[o + 2] - ox)
+      y1 = dmax(y1, inst[o + 1] + inst[o + 3] - oy)
+    }
+    (x0, y0, x1, y1)
+  }
+  let is_fill = fn(b : Int) -> Bool { st_kind(sc, b, 11.0) && st_rgb(inst, b + 8, st_fill) }
+  let is_stroke = fn(b : Int) -> Bool { st_kind(sc, b, 11.0) && st_rgb(inst, b + 8, st_stroke) }
+  let (fax0, fay0, fax1, fay1) = span(st_all(sc, ga, ra, is_fill), ax, ay)
+  let (fbx0, fby0, fbx1, fby1) = span(st_all(sc, gb, rb, is_fill), bx, by)
+  debug_assert(st_near(fax0, 99.0) && st_near(fax1, 125.0) && st_near(fay0, 39.0) && st_near(fay1, 61.0), "triangle bands (99, 39)-(125, 61)")
+  debug_assert(st_near(fbx0, 149.0) && st_near(fbx1, 187.0), "scaled triangle bands x 149..187, got \{fbx0}..\{fbx1}")
+  debug_assert(st_near(fby0, 59.0) && st_near(fby1, 91.0), "scaled triangle bands y 59..91, got \{fby0}..\{fby1}")
+  let ska = st_all(sc, ga, ra, is_stroke)
+  let skb = st_all(sc, gb, rb, is_stroke)
+  debug_assert(ska.length() > 0 && skb.length() > 0, "stroke bands drawn")
+  debug_assert(st_near(inst[ska[0] * inst_size + 4], 1.0) && st_near(inst[skb[0] * inst_size + 4], 1.5), "stroke half width 1 -> 1.5")
+  let (sbx0, _, sbx1, _) = span(skb, bx, by)
+  debug_assert(st_near(sbx0, 210.0 - 2.5) && st_near(sbx1, 246.0 + 2.5), "scaled stroke bands 207.5..248.5, got \{sbx0}..\{sbx1}")
+  // Words: as many glyphs, each 1.5x as big and 1.5x as far along (no gaps opening between them).
+  let is_glyph = fn(b : Int) -> Bool { st_kind(sc, b, 1.0) }
+  let wa = st_all(sc, ga, ra, is_glyph)
+  let wb = st_all(sc, gb, rb, is_glyph)
+  debug_assert(wa.length() == 7 && wb.length() == 7, "7 glyphs each in 'Scale me', got \{wa.length()}/\{wb.length()}")
+  let mut k = 0
+  while k < wa.length() {
+    let p = wa[k] * inst_size
+    let q = wb[k] * inst_size
+    debug_assert(st_near(inst[q] - bx, (inst[p] - ax) * 1.5), "glyph \{k} x 1.5x: \{inst[q] - bx} vs \{inst[p] - ax}")
+    debug_assert(st_near(inst[q + 1] - by, (inst[p + 1] - ay) * 1.5), "glyph \{k} y 1.5x")
+    debug_assert(st_near(inst[q + 2], inst[p + 2] * 1.5) && st_near(inst[q + 3], inst[p + 3] * 1.5), "glyph \{k} quad 1.5x: \{inst[q + 2]} vs \{inst[p + 2]}")
+    debug_assert(st_near(inst[q + 14], inst[q + 2] * 2.0), "glyph \{k} drawn 1:1 from its atlas cell (rasterized at 1.5x)")
+    k += 1
+  }
+  t.dispose()
+}
+
+test "View::scale draws runs and their marked background at 1.5x, lined up with the glyphs" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(a : view::View) { st_card(a, view::Live::Is(1.0)) })
+    let _ = root.box(fn(b : view::View) { st_card(b, view::Live::Is(1.5)) })
+  }, width=960.0, height=600.0)
+  st_sized_glyphs(t)
+  let sc = t.scene()
+  let inst = sc.inst
+  let m = st_marks(sc)
+  let ra = m[2]
+  let ea = m[3]
+  let rb = m[6]
+  let eb = m[7]
+  let is_mark = fn(b : Int) -> Bool { st_kind(sc, b, 0.0) && st_rgb(inst, b + 8, st_mark) }
+  let is_glyph = fn(b : Int) -> Bool { st_kind(sc, b, 1.0) }
+  let ma = st_all(sc, ra + 1, ea, is_mark)
+  let mb = st_all(sc, rb + 1, eb, is_mark)
+  let ga = st_all(sc, ra + 1, ea, is_glyph)
+  let gb = st_all(sc, rb + 1, eb, is_glyph)
+  debug_assert(ma.length() == 1 && mb.length() == 1, "one merged mark behind 'match', got \{ma.length()}/\{mb.length()}")
+  debug_assert(ga.length() == 13 && gb.length() == 13, "13 glyphs in 'Find match here', got \{ga.length()}/\{gb.length()}")
+  debug_assert(ma[0] < ga[0] && mb[0] < gb[0], "merged mark emitted behind glyphs")
+  let ox_a = inst[ga[0] * inst_size]
+  let oy_a = inst[ga[0] * inst_size + 1]
+  let ox_b = inst[gb[0] * inst_size]
+  let oy_b = inst[gb[0] * inst_size + 1]
+  let mut k = 0
+  while k < ma.length() {
+    let p = ma[k] * inst_size
+    let q = mb[k] * inst_size
+    debug_assert(st_near(inst[q] - ox_b, (inst[p] - ox_a) * 1.5), "mark \{k} x 1.5x from the first glyph")
+    debug_assert(st_near(inst[q + 1] - oy_b, (inst[p + 1] - oy_a) * 1.5), "mark \{k} y 1.5x from the first glyph")
+    debug_assert(st_near(inst[q + 2], inst[p + 2] * 1.5) && st_near(inst[q + 3], inst[p + 3] * 1.5), "mark \{k} 1.5x: \{inst[q + 2]}x\{inst[q + 3]}")
+    debug_assert(st_near(inst[p + 4], 3.0) && st_near(inst[q + 4], 4.5), "mark corner 3 -> 4.5")
+    k += 1
+  }
+  k = 0
+  while k < ga.length() {
+    let p = ga[k] * inst_size
+    let q = gb[k] * inst_size
+    debug_assert(st_near(inst[q] - ox_b, (inst[p] - ox_a) * 1.5), "run glyph \{k} x 1.5x")
+    debug_assert(st_near(inst[q + 2], inst[p + 2] * 1.5) && st_near(inst[q + 3], inst[p + 3] * 1.5), "run glyph \{k} 1.5x")
+    k += 1
+  }
+  t.dispose()
+}
+
+test "a shrinking spring (0.95 -> 0.90 -> 0.85) draws the glyphs it has, smaller, rasterizing and evicting none" {
+  let s = signals::signal(1.0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.scale(view::Live::By(fn() { s.get() }), about=view::Pivot::At(0.0, 0.0))
+      .words(view::Live::Is("Press"), ink=0x111111FFL, look=view::WordsLook::{ ..view::words_plain, size: 20.0 })
+    })
+  })
+  st_sized_glyphs(t)
+  let widths = fn() -> Array[Double] {
+    let sc = t.scene()
+    let out : Array[Double] = []
+    for i in st_all(sc, 0, -1, fn(b : Int) -> Bool { st_kind(sc, b, 1.0) }) {
+      out.push(sc.inst[i * inst_size + 2])
+      out.push(sc.inst[i * inst_size + 14])
+    }
+    out
+  }
+  let base = widths()
+  debug_assert(base.length() == 10 && st_near(base[0], 10.0), "5 glyphs 10pt wide at 1.0, got \{base.length()}")
+  let epoch = glyph_state.epoch
+  let put = t.fake.glyphs_put.length()
+  let shaped = text_cache.shape_size
+  for ns in [0.95, 0.90, 0.85] {
+    s.set(ns)
+    t.frame()
+    let now = widths()
+    debug_assert(now.length() == 10, "5 glyphs at \{ns}")
+    let mut k = 0
+    while k < 5 {
+      debug_assert(st_near(now[k * 2], base[k * 2] * ns), "glyph \{k} \{ns}x as wide: \{now[k * 2]}")
+      debug_assert(now[k * 2 + 1] == base[k * 2 + 1], "glyph \{k} reads the same atlas cell")
+      k += 1
+    }
+    debug_assert(glyph_state.epoch == epoch, "atlas epoch unchanged at \{ns}")
+    debug_assert(t.fake.glyphs_put.length() == put, "no glyph rasterized at \{ns}")
+    debug_assert(text_cache.shape_size == shaped, "shaped at the same size at \{ns}")
+  }
+  t.dispose()
+}
+
+test "a node cached as a ViewBlock is drawn again at a new scale and back (1.0 -> 1.5 -> 1.0)" {
+  let s = signals::signal(1.0)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.scale(view::Live::By(fn() { s.get() }), about=view::Pivot::At(0.0, 0.0))
+      .width(view::Live::Is(Some(160.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .ground(view::Live::Is(st_ground))
+      .edge(view::Live::Is((2.0, st_edge)))
+      .radius(view::Live::Is(8.0))
+      .words(view::Live::Is("Cached"), ink=0x111111FFL, look=view::WordsLook::{ ..view::words_plain, size: 14.0 })
+    })
+  })
+  st_sized_glyphs(t)
+  let look = fn() -> Array[Double] {
+    let sc = t.scene()
+    let out : Array[Double] = []
+    let g = st_first(sc, 0, fn(b : Int) -> Bool { st_kind(sc, b, 0.0) && st_rgb(sc.inst, b + 8, st_ground) })
+    let gb = g * inst_size
+    out.push(sc.inst[gb + 2])
+    out.push(sc.inst[gb + 4])
+    out.push(sc.inst[gb + 6])
+    for i in st_all(sc, g, -1, fn(b : Int) -> Bool { st_kind(sc, b, 1.0) }) {
+      out.push(sc.inst[i * inst_size] - sc.inst[gb])
+      out.push(sc.inst[i * inst_size + 2])
+    }
+    out
+  }
+  // (a second frame unchanged copies the block)
+  t.fake.frame_requested = true
+  t.frame()
+  let at1 = look()
+  debug_assert(at1.length() == 3 + 12, "box + 6 glyphs, got \{at1.length()}")
+  debug_assert(view_blocks_state.work.copied > 0, "the node is drawn from its ViewBlock")
+  s.set(1.5)
+  t.frame()
+  let at15 = look()
+  debug_assert(at15.length() == at1.length(), "as many glyphs at 1.5")
+  let mut k = 0
+  while k < at1.length() {
+    debug_assert(st_near(at15[k], at1[k] * 1.5), "value \{k} 1.5x: \{at15[k]} vs \{at1[k]}")
+    k += 1
+  }
+  s.set(1.0)
+  t.frame()
+  let back = look()
+  debug_assert(back.length() == at1.length(), "as many glyphs back at 1.0")
+  k = 0
+  while k < at1.length() {
+    debug_assert(back[k] == at1[k], "value \{k} back at 1.0 as it was: \{back[k]} vs \{at1[k]}")
+    k += 1
+  }
+  t.dispose()
+}
+
+test "a Field under View::scale(1.5) scales selection, caret, IME and edit menu once (not 2.25x)" {
+  let fld_a = Field::new(text="hello")
+  let fld_b = Field::new(text="hello")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box_a : view::View) {
+      let _ = box_a.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(40.0)))
+      let _ = field(box_a, fld_a, max_lines=1)
+    })
+    let _ = root.box(fn(box_b : view::View) {
+      let _ = box_b
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .scale(view::Live::Is(1.5), about=view::Pivot::At(0.0, 0.0))
+      let _ = field(box_b, fld_b, max_lines=1)
+    })
+  }, width=800.0, height=400.0)
+  st_sized_glyphs(t)
+  fld_a.pick(0, 5)
+  fld_b.pick(0, 5)
+  fld_b.focus()
+  t.frame()
+  let sc = t.scene()
+  let inst = sc.inst
+  // Selection overlay rect uses translucent sel_color; caret uses opaque caret_color (same RGB hue).
+  let sels = st_all(sc, 0, -1, fn(b : Int) -> Bool {
+    st_kind(sc, b, 0.0) && st_rgb(inst, b + 8, fld_a.sel_color) && inst[b + 11] < 0.5
+  })
+  debug_assert(sels.length() == 2, "two selection rects (1.0x and 1.5x), got \{sels.length()}")
+  let sa = sels[0] * inst_size
+  let sb = sels[1] * inst_size
+  // Must be scaled once (1.5x), never twice (2.25x).
+  debug_assert(st_near(inst[sb + 2], inst[sa + 2] * 1.5), "selection width 1.5x (not 2.25x): \{inst[sb + 2]} vs \{inst[sa + 2]}")
+  debug_assert(st_near(inst[sb + 3], inst[sa + 3] * 1.5), "selection height 1.5x (not 2.25x): \{inst[sb + 3]} vs \{inst[sa + 3]}")
+  // Drawn selection width matches the 5 scaled glyphs of "hello".
+  let glyphs = st_all(sc, 0, -1, fn(b : Int) -> Bool { st_kind(sc, b, 1.0) })
+  debug_assert(glyphs.length() == 10, "10 glyphs across both 'hello' fields, got \{glyphs.length()}")
+  let b_g0 = glyphs[5] * inst_size
+  let b_g4 = glyphs[9] * inst_size
+  let adv_span_b = (inst[b_g4] - inst[b_g0]) / 4.0 * 5.0
+  debug_assert(st_near(inst[sb + 2], adv_span_b), "1.5x selection width \{inst[sb + 2]} matches 5 glyph advances \{adv_span_b}")
+  // Caret and IME rect on focused fld_b are scaled by 1.5x.
+  let carets = st_all(sc, 0, -1, fn(b : Int) -> Bool {
+    st_kind(sc, b, 0.0) && st_rgb(inst, b + 8, fld_b.caret_color) && inst[b + 11] > 0.9
+  })
+  debug_assert(carets.length() == 1, "one focused caret")
+  let cb = carets[0] * inst_size
+  debug_assert(st_near(inst[cb + 2], 2.25), "caret width 1.5 * 1.5 = 2.25, got \{inst[cb + 2]}")
+  debug_assert(st_near(inst[cb], fld_b.last_win_x + fld_b.caret_pos().x * 1.5), "caret x at 1.5x")
+  debug_assert(st_near(t.fake.ime_rect.0, inst[cb]) && st_near(t.fake.ime_rect.2, 2.25), "IME rect matches 1.5x caret")
+  // Edit menu rect is scaled once (1.5x) in window coordinates.
+  let em_a = fld_a.edit_menu_rect()
+  let em_b = fld_b.edit_menu_rect()
+  debug_assert(st_near(em_b.w, em_a.w * 1.5) && st_near(em_b.h, em_a.h * 1.5), "edit_menu_rect 1.5x: \{em_b.w}x\{em_b.h} vs \{em_a.w}x\{em_a.h}")
   t.dispose()
 }

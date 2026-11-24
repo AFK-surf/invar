@@ -31,6 +31,18 @@ fn view_spacing(scale : Double, look : view::WordsLook) -> Double {
   }
 }
 
+/// The text size glyphs are rasterized at for a node drawn `node_scale` times its laid-out size: 1.0 up to 1.05 (a
+/// press or entrance spring reuses the 1.0x glyphs already in the atlas, drawn scaled, so nothing is shaped, rasterized
+/// or evicted per frame), above that the next 0.25 step up to 4.0 (a page zoom of 1.25/1.5/2.0... draws its glyphs 1:1,
+/// crisp; 1.1 rasterizes at 1.25 and draws them down).
+fn text_raster_scale(node_scale : Double) -> Double {
+  if node_scale <= 1.05 {
+    1.0
+  } else {
+    dmin(4.0, (node_scale * 4.0).ceil() * 0.25)
+  }
+}
+
 /// Slice a UTF-8 String by UTF-16 code-unit range `[u16_start, u16_end)` (CoreText cluster ranges).
 fn utf16_slice(s : String, u16_start : Int, u16_end : Int) -> String {
   if u16_end <= u16_start || s.length() == 0 {
@@ -629,16 +641,18 @@ fn emit_glyph_quad(
   clip_y : Double,
   clip_x1 : Double,
   clip_y1 : Double,
+  quad_scale~ : Double = 1.0,
 ) -> Unit {
   let kind = if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 }
   // apple_text.m:697: e->oy = -(b.origin.y + b.size.height) (negative above baseline)
-  let gx = pen_x + slot.ox
-  let gy = baseline_y + slot.oy
+  // (drawn `quad_scale` times the size it was rasterized at; the atlas rectangle it reads stays the one it fills)
+  let gx = pen_x + slot.ox * quad_scale
+  let gy = baseline_y + slot.oy * quad_scale
   let idx = scene.push_inst(
     gx,
     gy,
-    slot.gw,
-    slot.gh,
+    slot.gw * quad_scale,
+    slot.gh * quad_scale,
     0.0,
     kind,
     0.0,
@@ -721,6 +735,7 @@ fn encode_words(
   scene : Scene,
   d : view::Drawn,
   scale : Double,
+  node_scale : Double,
   clip_x : Double,
   clip_y : Double,
   clip_x1 : Double,
@@ -729,20 +744,30 @@ fn encode_words(
   if d.words.length() == 0 || (d.ink & 0xFFL) == 0L {
     return false
   }
+  // Drawn `ns` times its laid-out size (View::scale, page zoom): shaped and rasterized at `sz_r` (`rs` times the size,
+  // text_raster_scale), every advance, offset and glyph drawn `qs` times that, so the words take `ns` times the room.
+  let ns = if node_scale > 0.0 { node_scale } else { 1.0 }
+  let rs = text_raster_scale(ns)
+  let qs = ns / rs
   let fm = font_scale_mul()
-  let sz = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * fm
+  let sz_r = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * fm * rs
+  let sz_eff = sz_r * qs
   let weight = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
-  let spacing = view_spacing(fm, d.words_look)
+  let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
   let style_bits = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
-  let (asc, desc) = measure_metrics(sz, weight, style_bits)
+  let (asc_r, desc_r) = measure_metrics(sz_r, weight, style_bits)
+  let asc = asc_r * qs
+  let desc = desc_r * qs
   let line_h = if d.words_look.line > 0.0 {
-    d.words_look.line * fm
+    d.words_look.line * fm * ns
   } else if d.words_look.line < 0.0 {
-    -d.words_look.line * sz
+    -d.words_look.line * sz_eff
   } else {
     asc + desc
   }
+  // (a box laid out as wide as its words, drawn scaled, is that wide again only to within rounding)
+  let wrap_w = if ns == 1.0 { d.w } else { d.w + 1.0e-4 }
   let lead = (line_h - (asc + desc)) * 0.5
   let optical_shift = if d.words_optical { (asc - desc) * 0.04 } else { 0.0 }
   let base_off = lead + asc + optical_shift
@@ -763,21 +788,21 @@ fn encode_words(
       line_idx += 1
       continue
     }
-    let mut sl = shape_line_cached(raw, sz, weight, style_bits)
+    let mut sl = shape_line_cached(raw, sz_r, weight, style_bits)
     let mut line_overflow = false
     if !wrap && d.w > 0.0 && sl.n > 0 {
       let mut raw_w = 0.0
       let mut rk = 0
       while rk < sl.n {
-        raw_w = raw_w + sl.advs[rk] + spacing
+        raw_w = raw_w + sl.advs[rk] * qs + spacing
         rk += 1
       }
-      if raw_w > d.w + 0.5 {
+      if raw_w > d.w + 0.5 * ns {
         line_overflow = true
         if !d.ellipsis_past {
-          let ell = ellipsize_text(raw, d.w, sz, weight=weight, style_bits=style_bits, tracking=spacing)
+          let ell = ellipsize_text(raw, d.w / qs, sz_r, weight=weight, style_bits=style_bits, tracking=spacing / qs)
           if ell.length() > 0 {
-            sl = shape_line_cached(ell, sz, weight, style_bits)
+            sl = shape_line_cached(ell, sz_r, weight, style_bits)
           }
         }
       }
@@ -813,11 +838,11 @@ fn encode_words(
       let mut break_line_w = 0.0
       let mut wrapped = false
       while end < n {
-        let adv = advs[end] + spacing
+        let adv = advs[end] * qs + spacing
         let loc = locs[end]
         let cp = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
         let is_space = cp == 32 || cp == 9
-        if wrap && end > start && line_w + adv > d.w {
+        if wrap && end > start && line_w + adv > wrap_w {
           if (!is_space || !space_break_allowed_locs(cps, locs, n, end)) && last_break_end > start {
             end = last_break_end
             line_w = break_line_w
@@ -840,7 +865,7 @@ fn encode_words(
         }
       }
       if end == start {
-        line_w = advs[start] + spacing
+        line_w = advs[start] * qs + spacing
         end = start + 1
       }
       let start_x = if d.words_center && d.w > line_w {
@@ -856,15 +881,15 @@ fn encode_words(
       let mut pen_x = start_x
       let mut k = start
       while k < end {
-        let adv = advs[k] + spacing
+        let adv = advs[k] * qs + spacing
         let gkey = gkeys[k]
         match resolve_glyph(gkey, scale) {
           Some(slot) =>
           scene.push_glyph_inst(
-            pen_x + pad + slot.ox,
-            baseline_y + slot.oy,
-            slot.gw,
-            slot.gh,
+            pen_x + pad + slot.ox * qs,
+            baseline_y + slot.oy * qs,
+            slot.gw * qs,
+            slot.gh * qs,
             if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
             ink_r,
             ink_g,
@@ -948,7 +973,10 @@ fn layout_runs(
   wrap : Bool,
   max_w : Double,
   max_lines : Int,
+  quad_scale~ : Double = 1.0,
 ) -> RunsLayout {
+  // (shaped at `base_sz`, every advance taken `quad_scale` times: encode_runs's node drawn scaled)
+  let wrap_w = if quad_scale == 1.0 { max_w } else { max_w + 1.0e-4 }
   let clusters : Array[RunsCluster] = []
   let para_ranges : Array[(Int, Int)] = []
   let para_texts : Array[String] = []
@@ -993,7 +1021,7 @@ fn layout_runs(
           let mut k = 0
           while k < n {
             let loc = sbuf[k * 4].to_int()
-            let adv = sbuf[k * 4 + 2] + spacing
+            let adv = sbuf[k * 4 + 2] * quad_scale + spacing
             let gkey = sbuf[k * 4 + 3].to_int()
             let cu = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
             clusters.push(RunsCluster::{ adv, gkey, cu, u16_off: para_u16_base + loc, rink, run_bg: run.bg })
@@ -1046,7 +1074,7 @@ fn layout_runs(
         let adv = cl.adv
         let cu = cl.cu
         let is_space = cu == 32 || cu == 9
-        if wrap && end > start && line_w + adv > max_w {
+        if wrap && end > start && line_w + adv > wrap_w {
           if (!is_space || !space_break_allowed_runs(clusters, p_end, end)) && last_break_end > start {
             end = last_break_end
             line_w = break_line_w
@@ -1097,6 +1125,7 @@ fn encode_runs(
   scene : Scene,
   d : view::Drawn,
   scale : Double,
+  node_scale : Double,
   clip_x : Double,
   clip_y : Double,
   clip_x1 : Double,
@@ -1106,44 +1135,109 @@ fn encode_runs(
     return
   }
   ensure_glyph_atlas(scale)
+  // (drawn `ns` times its laid-out size, as encode_words does it)
+  let ns = if node_scale > 0.0 { node_scale } else { 1.0 }
+  let rs = text_raster_scale(ns)
+  let qs = ns / rs
   let fm = font_scale_mul()
-  let base_sz = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * fm
+  let base_sz_r = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * fm * rs
+  let base_sz_eff = base_sz_r * qs
   let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
-  let spacing = view_spacing(fm, d.words_look)
+  let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
   let lig_bit = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
-  let (base_asc, base_desc) = measure_metrics(base_sz, base_w, lig_bit)
+  let (base_asc_r, base_desc_r) = measure_metrics(base_sz_r, base_w, lig_bit)
+  let base_asc = base_asc_r * qs
+  let base_desc = base_desc_r * qs
   let line_h = if d.words_look.line > 0.0 {
-    d.words_look.line * fm
+    d.words_look.line * fm * ns
   } else if d.words_look.line < 0.0 {
-    -d.words_look.line * base_sz
+    -d.words_look.line * base_sz_eff
   } else {
     base_asc + base_desc
   }
   let base_off = (line_h - (base_asc + base_desc)) * 0.5 + base_asc
   let wrap = d.words_look.wrap && d.w > 0.0
-  let layout = layout_runs(d.runs, base_sz, base_w, spacing, lig_bit, d.ink, wrap, d.w, d.words_look.max_lines)
+  let layout = layout_runs(
+    d.runs,
+    base_sz_r,
+    base_w,
+    spacing,
+    lig_bit,
+    d.ink,
+    wrap,
+    d.w,
+    d.words_look.max_lines,
+    quad_scale=qs,
+  )
 
+  let bg_pad = dmin(1.5 * ns, dmax(0.0, (line_h - base_sz_eff) * 0.35))
+  let bg_h = dmax(1.0 * ns, line_h - bg_pad * 2.0)
+  let bg_r = 3.0 * ns
   let mut line_idx = 0
   while line_idx < layout.lines.length() {
     let vl = layout.lines[line_idx]
     let line_y = d.y + line_idx.to_double() * line_h
     let baseline_y = line_y + base_off
+    // Emit merged highlight spans behind the line's glyphs (one rounded pill per contiguous same-bg span).
+    let mut bg_x = d.x
+    let mut span_col = 0L
+    let mut span_x = 0.0
+    let mut span_w = 0.0
+    let mut bk = vl.start
+    while bk < vl.end {
+      let cl = layout.clusters[bk]
+      let has_bg = (cl.run_bg & 0xFFL) != 0L
+      if has_bg && cl.run_bg == span_col {
+        span_w = span_w + cl.adv
+      } else {
+        if span_col != 0L && span_w > 0.0 {
+          let _ = scene.push_inst(
+            span_x, line_y + bg_pad, span_w, bg_h,
+            bg_r, 0.0, 0.0, 0.0, span_col, d.alpha, 0.0, 0.0, 0.0, 0.0,
+            clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+          )
+        }
+        if has_bg {
+          span_col = cl.run_bg
+          span_x = bg_x
+          span_w = cl.adv
+        } else {
+          span_col = 0L
+          span_w = 0.0
+        }
+      }
+      bg_x = bg_x + cl.adv
+      bk += 1
+    }
+    if span_col != 0L && span_w > 0.0 {
+      let _ = scene.push_inst(
+        span_x, line_y + bg_pad, span_w, bg_h,
+        bg_r, 0.0, 0.0, 0.0, span_col, d.alpha, 0.0, 0.0, 0.0, 0.0,
+        clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+      )
+    }
     let mut pen_x = d.x
     let mut k = vl.start
     while k < vl.end {
       let cl = layout.clusters[k]
-      if (cl.run_bg & 0xFFL) != 0L && cl.adv > 0.0 {
-        let bg_pad = dmin(1.5, dmax(0.0, (line_h - base_sz) * 0.35))
-        let _ = scene.push_inst(
-          pen_x, line_y + bg_pad, cl.adv, dmax(1.0, line_h - bg_pad * 2.0),
-          3.0, 0.0, 0.0, 0.0, cl.run_bg, d.alpha, 0.0, 0.0, 0.0, 0.0,
-          clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
-        )
-      }
       if (cl.rink & 0xFFL) != 0L {
         match resolve_glyph(cl.gkey, scale) {
-          Some(slot) => emit_glyph_quad(scene, pen_x + pad, baseline_y, slot, cl.rink, d.alpha, scale, clip_x, clip_y, clip_x1, clip_y1)
+          Some(slot) =>
+          emit_glyph_quad(
+            scene,
+            pen_x + pad,
+            baseline_y,
+            slot,
+            cl.rink,
+            d.alpha,
+            scale,
+            clip_x,
+            clip_y,
+            clip_x1,
+            clip_y1,
+            quad_scale=qs,
+          )
           None => ()
         }
       }
