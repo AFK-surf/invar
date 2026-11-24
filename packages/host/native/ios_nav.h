@@ -347,7 +347,7 @@ static UIColor *nav_rgba(id v) {
 }
 
 // The title of what is up over the whole window (a picture's name) over it: on a glass of its own, as the bar's items
-// are (iOS 26's UIGlassEffect, a capsule round the words), not bare words over the picture (the user, 2026-10-27); iOS
+// are (iOS 26's UIGlassEffect, a capsule round the words), not bare words over the picture; iOS
 // 18's bar its words. None: none.
 // Native menus share the same rows whether anchored to a bar item or a content button.
 static UIMenu *nav_menu(NSArray<NSDictionary *> *rows, void (^chosen)(NSString *)) {
@@ -555,7 +555,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
       if (!reuse) {
         // (the same action said otherwise, its icon, words, menu or dot, in the same colours: the item there changed in
         // place, not made anew, so the system swaps what it shows on the button there and fades none of the column's
-        // buttons, as Outlook's do: the user, 2026-10-31; a new item, even with its identifier, is faded in for the old)
+        // buttons, as Outlook's do; a new item, even with its identifier, is faded in for the old)
         UIBarButtonItem *was = b && [slot.barInk isEqual:ink] && [slot.barAccent isEqual:accent] ? b : nil;
         // (a picture the host loads: drawn in once it is here, on the item, while it is shown and still said so)
         __block __weak UIBarButtonItem *drawn = nil;
@@ -563,7 +563,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
         BOOL (^still)(void) = ^BOOL { return [slotWeak.barSpecs[ident] isEqual:d]; };
         NSString *spec = d[@"icon"];
         // (a workspace's mark a disc nearly the glass's own size, on the glass as it is: its picture once here, else its
-        // letter on its colour, an emoji alone with no colour round it: the user, 2026-10-28)
+        // letter on its colour, an emoji alone with no colour round it)
         if ([spec hasPrefix:@"badge:"]) {
           NSRange pic = [spec rangeOfString:@"\x1e"];
           NSString *mark = pic.location == NSNotFound ? [spec substringFromIndex:6] : [spec substringWithRange:NSMakeRange(6, pic.location - 6)];
@@ -581,7 +581,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
                             if (still()) drawn.image = nav_any(spec, 24);
                           })
                                         : nav_letter(d[@"title"], 24);
-        // (a chat's "…" the system's own glyph, as the "…" it folds into: the user, 2026-11-04)
+        // (a chat's "…" the system's own glyph, as the "…" it folds into)
         if ([ident hasSuffix:@"chat/more"]) icon = [UIImage systemImageNamed:@"ellipsis"] ?: icon;
         BOOL prominent = [d[@"prominent"] boolValue];
         // (said with where the item is in the app's view, for what opens from it: a popover at it)
@@ -617,7 +617,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
           }
           b.title = d[@"title"];
           // (folded into the system's "…", its rows there as they are, not a submenu of them: a submenu opened there
-          // heads its rows with its own "… 更多", the system's "…" opening a "…" (the user, 2026-11-13))
+          // heads its rows with its own "… 更多", the system's "…" opening a "…")
           if (@available(iOS 16.0, *))
             b.menuRepresentation = [UIMenu menuWithTitle:@"" image:nil identifier:nil
                                                  options:UIMenuOptionsDisplayInline children:menu.children];
@@ -640,7 +640,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
             b.style = UIBarButtonItemStylePlain;
             b.tintColor = ink;
           }
-          // (the app's own, 待处理's, on a glass of its own, apart from the card's: the user, 2026-10-27)
+          // (the app's own, 待处理's, on a glass of its own, apart from the card's)
           if ((bare && prominent) || [ident hasPrefix:@"act/"] || [ident hasPrefix:@"lead/"]) b.sharesBackground = NO;
 #ifdef __IPHONE_27_0
           // (short of room in the column, what goes first: never 待处理's bell, the user 2026-10-27, more wanted than the
@@ -696,7 +696,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
     nav_title(slot.navigationItem, bare ? title : @"", ink);
     // (put away only when something is up over the whole window, its title alone: hidden with its items gone, the system's
     // column keeps showing the views of those it had, a page's actions on the next tab, the outer screen's workspace
-    // button on the inner one; the user, 2026-10-27. Shown with none it takes no room: there, its items are the column's.
+    // button on the inner one. Shown with none it takes no room: there, its items are the column's.
     // Nor with no title either (a remote screen's 全屏): put away, the column showed the chat's actions under it; shown,
     // it is told they are gone, the user 2026-10-29)
     [nav setNavigationBarHidden:(bare && made.count + lead.count == 0 && title.length > 0) animated:bare];
@@ -1037,7 +1037,7 @@ int32_t mb_host_nav_bar(moonbit_string_t spec) {
 // How round the window's corners are (@hostapi.window_corner, window_corner_at): the app fills the screen, whose own
 // corners (40 and more) are rounder than anything by them could follow within the corner rule's ranges: said as none;
 // but where the system lays out the app's tabs in every pose (an iPhone Duo's: mb_host_nav_able), the screen's own,
-// the cards along its edges following them (the user, 2026-10-27): read off a view the window's size concentric with
+// the cards along its edges following them: read off a view the window's size concentric with
 // it (iOS 26's containerConcentricRadius), each corner its own (an iPhone Duo's outer screen: 8 along its hinge, 59
 // on the other side; a uniform configuration says the roundest of them for all four).
 static UIView *corner_probe;

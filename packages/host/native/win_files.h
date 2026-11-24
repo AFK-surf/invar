@@ -3,7 +3,7 @@
 // window from outside (ui/drop.mbt: the window an OLE drop target, Explorer's files as it holds them over it), each
 // read whole on a thread of its own and told as it is done, between frames (MB_OUTSIDE_PICK: WM_MB_PICKED, never left
 // for a frame to take as it begins). A file over 1 GB, or one
-// that cannot be read, is left out (as still.fail's composer refuses one so big). Folders let go come with their files,
+// that cannot be read, is left out (over the attachment size limit). Folders let go come with their files,
 // named by their way down from where they were dropped ("照片/2026/a.jpg"), each folder itself named with a "/" at its
 // end and no bytes (so an empty one is made too); the system's hidden files of a folder (Thumbs.db, desktop.ini) left
 // out, as the Mac leaves out .DS_Store. MBUI_PICK_FILES="<path>|<path>…" answers every ask with those files at once,

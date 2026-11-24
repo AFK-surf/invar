@@ -1,13 +1,13 @@
 // Updates on Windows (@hostapi.app_version, update_fetch, update_apply, update_state), as mac_app.m's "Updates": the app keeping
-// itself current, as still.fail's desktop app did (electron-updater's NsisUpdater). A newer build the core found
+// itself current, as a desktop host app does (electron-updater's NsisUpdater). A newer build the core found
 // (`app.update`, its signature checked there: the release's installer, its sha256 and size the signed ones) downloaded
 // into the app's own folder (%LOCALAPPDATA%\<its id>\updates), picking up where a cut connection left off (the bytes so
 // far kept in `<name>.part`, the rest asked for as a range, a few times over with a growing pause while each try gets
 // further), checked against its size and SHA-256, then run as the desktop app's updater ran its installer (`--updated
-// /S --force-run`: still.fail's windows/setup.c, which ends this app, puts the new one in its place and opens it) as
+// /S --force-run`: the Windows installer helper, which ends this app, puts the new one in its place and opens it) as
 // this one quits. How it goes the app reads (`update_state`: the phase, how far, what went wrong), told each time it
 // changes (MB_OUTSIDE_UPDATE, id 1: 0 while the host works at it, -1 failed). Only a program with a version of its own
-// (its resources' FILEVERSION 0.1.<n>: an app's, still.fail's scripts/win.sh) updates; a bare one (0) never asks.
+// (its resources' FILEVERSION 0.1.<n>: an app's, the Windows build script) updates; a bare one (0) never asks.
 // Where the core says a delta from this build (update_fetch's `delta`), that is tried first: downloaded as the installer
 // would be (`<name>.delta`), applied to the installed folder's files (update_delta.h) into the release's raw installer
 // (`<name less .exe>.raw.exe`: the same program, what it carries stored, not LZMS's), checked against the size and

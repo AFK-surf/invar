@@ -73,7 +73,7 @@ static id a11y_focused_element(void);
 static void notice_start(void);  // the system's notifications (below), before the app runs
 static int bench_mode;
 // The desktop window as the app asks for it (@hostapi.window_setup): its first size and its least, and whether its
-// title bar is the app's own top row (the system's buttons in it, 16 in and centred on its 44: as still.fail's
+// title bar is the app's own top row (the system's buttons in it, 16 in and centred on its 44: as the host app's
 // desktop app's hiddenInset window)
 static double setup_w, setup_h, setup_min_w, setup_min_h;
 static int setup_inset;
@@ -1268,7 +1268,7 @@ static void run_script_step(int step) {
 // the system's move, so the move shows the window as it will be: told at the move's end, the app changed its layout
 // once the window was back, a jump after it. Each window's own (MBWinSlot's fullScreenOn).
 
-// The window's buttons in the app's top row (an inset window): 16 from its left, centred on its 44, as still.fail's
+// The window's buttons in the app's top row (an inset window): 16 from its left, centred on its 44, as the host app's
 // desktop app has them (Electron's trafficLightPosition {16, 15}), as far apart as the system has them. Put there by
 // AppKit itself, each time it lays their title bar out (the window resized, its appearance set, in and out of full
 // screen): the window's frame (NSThemeFrame) asks itself how high the bar is (_titlebarHeight), how far in from the
@@ -1615,7 +1615,7 @@ void mb_host_set_cursor(int32_t kind) {
 }
 
 // ---- The app's life on the Mac, and what the system says of it ----
-// As still.fail's desktop app is on macOS (Electron's): closing the window puts it away and the app goes on (its core,
+// As a desktop app on macOS (Electron's): closing the window puts it away and the app goes on (its core,
 // its notifications, the Dock's badge); the Dock's icon clicked, the app opened again or a notification brings it back;
 // ⌘Q (the menu bar's 退出) quits. A program run bare
 // (not an app's bundle: a developer's run, a script's, a test's) ends as its window closes, as before, and so does a
@@ -1669,7 +1669,7 @@ int32_t mb_host_window_open(moonbit_string_t what_s) {
 
 // The notice by which a window of the app's own is told to come out (its pid the notice's object): only it can take
 // its window out of the Dock (window_front_heard); this run can only make that app the active one.
-static NSString *const window_front_notice = @"fail.still.mbui.window.front";
+static NSString *const window_front_notice = @"dev.invar.window.front";
 
 // ---- the windows of one run (win_use, above) ----
 
@@ -3566,12 +3566,12 @@ void mb_host_install_package(moonbit_string_t name, moonbit_bytes_t data) {
 }
 
 // ---- Updates (@hostapi.app_version, update_fetch, update_apply, update_state) ----
-// The app keeping itself current, as still.fail's desktop app does (Electron's autoUpdater; on macOS Squirrel's
+// The app keeping itself current, as a desktop app does (Electron's autoUpdater; on macOS Squirrel's
 // ShipIt): a newer build the core found (`app.update`: the release's zip) downloaded by itself into the app's caches
 // (update_fetch), picking up where a cut connection left off (the bytes so far kept in `<name>.part`, the rest asked
 // for as a range, a few times over with a growing pause while each try gets further: Android's Updates.java), checked
 // against its size and SHA-256, unzipped beside the app (on its volume), and taken only when it is this app, newer,
-// and signed as this one is (its signature valid and meeting this app's designated requirement: still.fail's team and
+// and signed as this one is (its signature valid and meeting this app's designated requirement: the app's team and
 // this app's id; a build signed ad hoc, a developer's, takes none): ready. Asked to (update_apply), it is put in this
 // app's place (the bundles swapped, this one's thrown away), and opened as this one quits (a shell waits for this
 // process to end first: two cores never share the data); the app quit with one ready, it is put in place as it goes
@@ -4121,7 +4121,7 @@ void mb_host_set_dark(int32_t dark) {
 }
 
 // ---- notifications (notify.mbt) ----
-// The system's (UNUserNotificationCenter) when the app is a bundle (an app's .app: still.fail mbui's): one request per
+// The system's (UNUserNotificationCenter) when the app is a bundle (an app's .app bundle): one request per
 // tag (a newer one with the same tag replaces it), what it opens in its userInfo, a tap bringing the app to the front
 // with that (the center's delegate, set before the app runs: a tap that launched it comes too); shown while the app is
 // in front as well (the app decides what to show). A bare executable has no bundle for the center (it throws): what
@@ -4403,7 +4403,7 @@ static void pick_answer(int32_t pid, NSArray<NSURL *> *urls) {
     NSMutableArray *names = [NSMutableArray new], *datas = [NSMutableArray new];
     for (NSURL *u in urls) {
       NSData *d = [NSData dataWithContentsOfURL:u options:NSDataReadingMappedIfSafe error:nil];
-      if (!d || d.length > (1ull << 30)) continue;  // unreadable, or over 1 GB (as still.fail's composer refuses)
+      if (!d || d.length > (1ull << 30)) continue;  // unreadable, or over 1 GB (over 1 GB limit)
       [names addObject:u.lastPathComponent ?: @"file"];
       [datas addObject:d];
     }

@@ -5,28 +5,42 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   macos-arm64:
     runs-on: macos-15
     env:
       PION_RELEASE_URL: ${{ vars.PION_RELEASE_URL_MACOS }}
+      PION_RELEASE_SHA256: ${{ vars.PION_RELEASE_SHA256_MACOS }}
     steps:
       - name: Checkout invar
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Download prebuilt pion toolchain (optional)
         if: env.PION_RELEASE_URL != ''
         run: |
+          if [ -z "$PION_RELEASE_SHA256" ]; then
+            echo "PION_RELEASE_SHA256_MACOS must be set when PION_RELEASE_URL_MACOS is configured" >&2
+            exit 1
+          fi
           mkdir -p .pion/release
-          curl -fsSL "$PION_RELEASE_URL" | tar -xz -C .pion/release
+          curl -fsSL "$PION_RELEASE_URL" -o .pion/release/pion.tar.gz
+          echo "${PION_RELEASE_SHA256}  .pion/release/pion.tar.gz" | shasum -a 256 -c -
+          tar -xzf .pion/release/pion.tar.gz -C .pion/release
+          rm -f .pion/release/pion.tar.gz
 
       - name: Checkout pion
         if: env.PION_RELEASE_URL == ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: AFK-surf/pion
+          ref: 14a5a63668bc46ca3aeeb08bf0f958bc00b476a3
           path: .pion
-          token: ${{ secrets.PION_REPO_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Resolve pion commit SHA
         if: env.PION_RELEASE_URL == ''
@@ -36,7 +50,7 @@ jobs:
       - name: Cache pion toolchain (pionc2, qbe, libpionrt.a)
         if: env.PION_RELEASE_URL == ''
         id: pion-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             .pion/out/pionc2
@@ -44,9 +58,63 @@ jobs:
             .pion/out/libpionrt.a
           key: pion-macos-arm64-${{ steps.pion-sha.outputs.sha }}
 
-      - name: Bootstrap pionc2
+      - name: Bootstrap pionc2 (Stage 0 -> Stage 2 fixed-point)
         if: env.PION_RELEASE_URL == '' && steps.pion-cache.outputs.cache-hit != 'true'
-        run: sh .pion/scripts/bootstrap.sh
+        run: |
+          set -eu
+          OUT_DIR="$PWD/.pion/out"
+          COMPILER_DIR="$PWD/.pion/compiler"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+
+          echo "=== [1/5] Build QBE + libpionrt.a ==="
+          sh .pion/scripts/build-qbe.sh "$PION_QBE"
+          cc -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+
+          echo "=== [2/5] Stage 0: Seed -> pionc0 (arm64_apple) ==="
+          gzip -dc .pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/pionc-seed.ssa"
+          "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$TMP_DIR/pionc-seed.ssa"
+          cc "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+
+          echo "=== [3/5] Stage 1: pionc0 -> pionc1 ==="
+          mkdir -p "$TMP_DIR/cas_s1"
+          PION_CACHE_DIR="$TMP_DIR/cas_s1" "$OUT_DIR/pionc0" build \
+            --emit-ssa "$OUT_DIR/stage1.ssa" \
+            --emit-asm "$OUT_DIR/stage1.s" \
+            -o "$OUT_DIR/pionc1" \
+            "$COMPILER_DIR/src/core" \
+            "$COMPILER_DIR/src/cli/main.pion"
+
+          echo "=== [4/5] Stage 2: pionc1 -> pionc2 ==="
+          mkdir -p "$TMP_DIR/cas_s2"
+          PION_CACHE_DIR="$TMP_DIR/cas_s2" "$OUT_DIR/pionc1" build \
+            --emit-ssa "$OUT_DIR/stage2.ssa" \
+            --emit-asm "$OUT_DIR/stage2.s" \
+            -o "$OUT_DIR/pionc2" \
+            "$COMPILER_DIR/src/core" \
+            "$COMPILER_DIR/src/cli/main.pion"
+
+          echo "=== [5/5] Fixed-point proof ==="
+          if cmp -s "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"; then
+            cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
+            echo "Fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
+          else
+            mkdir -p "$TMP_DIR/cas_s3"
+            PION_CACHE_DIR="$TMP_DIR/cas_s3" "$OUT_DIR/pionc2" build \
+              --emit-ssa "$OUT_DIR/stage3.ssa" \
+              --emit-asm "$OUT_DIR/stage3.s" \
+              -o "$OUT_DIR/pionc3" \
+              "$COMPILER_DIR/src/core" \
+              "$COMPILER_DIR/src/cli/main.pion"
+            cmp "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
+            cmp "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
+            echo "Fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
+          fi
 
       - name: Configure pion toolchain env
         run: |
@@ -100,9 +168,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PION_RELEASE_URL: ${{ vars.PION_RELEASE_URL_LINUX }}
+      PION_RELEASE_SHA256: ${{ vars.PION_RELEASE_SHA256_LINUX }}
     steps:
       - name: Checkout invar
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux GTK4 / EGL / GLES3 / Pango / libsoup dependencies
         run: |
@@ -117,21 +188,30 @@ jobs:
             zlib1g-dev \
             pkg-config \
             mesa-utils \
-            libgl1-mesa-dri
+            libgl1-mesa-dri \
+            ffmpeg
 
       - name: Download prebuilt pion toolchain (optional)
         if: env.PION_RELEASE_URL != ''
         run: |
+          if [ -z "$PION_RELEASE_SHA256" ]; then
+            echo "PION_RELEASE_SHA256_LINUX must be set when PION_RELEASE_URL_LINUX is configured" >&2
+            exit 1
+          fi
           mkdir -p .pion/release
-          curl -fsSL "$PION_RELEASE_URL" | tar -xz -C .pion/release
+          curl -fsSL "$PION_RELEASE_URL" -o .pion/release/pion.tar.gz
+          echo "${PION_RELEASE_SHA256}  .pion/release/pion.tar.gz" | sha256sum -c -
+          tar -xzf .pion/release/pion.tar.gz -C .pion/release
+          rm -f .pion/release/pion.tar.gz
 
       - name: Checkout pion
         if: env.PION_RELEASE_URL == ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: AFK-surf/pion
+          ref: 14a5a63668bc46ca3aeeb08bf0f958bc00b476a3
           path: .pion
-          token: ${{ secrets.PION_REPO_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Resolve pion commit SHA
         if: env.PION_RELEASE_URL == ''
@@ -141,7 +221,7 @@ jobs:
       - name: Cache pion toolchain (pionc2, qbe, libpionrt.a)
         if: env.PION_RELEASE_URL == ''
         id: pion-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             .pion/out/pionc2
@@ -149,9 +229,63 @@ jobs:
             .pion/out/libpionrt.a
           key: pion-linux-x86_64-${{ steps.pion-sha.outputs.sha }}
 
-      - name: Bootstrap pionc2
+      - name: Bootstrap pionc2 (Stage 0 -> Stage 2 fixed-point)
         if: env.PION_RELEASE_URL == '' && steps.pion-cache.outputs.cache-hit != 'true'
-        run: sh .pion/scripts/bootstrap.sh
+        run: |
+          set -eu
+          OUT_DIR="$PWD/.pion/out"
+          COMPILER_DIR="$PWD/.pion/compiler"
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          mkdir -p "$OUT_DIR"
+          export PION_QBE="$OUT_DIR/qbe"
+          export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+
+          echo "=== [1/5] Build QBE + libpionrt.a ==="
+          sh .pion/scripts/build-qbe.sh "$PION_QBE"
+          cc -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror \
+            -c .pion/runtime/pion_rt.c -o "$OUT_DIR/pion_rt.o"
+          ar rcs "$PION_RT_LIB" "$OUT_DIR/pion_rt.o"
+
+          echo "=== [2/5] Stage 0: Seed -> pionc0 (amd64_sysv) ==="
+          gzip -dc .pion/bootstrap/pionc-seed.ssa.gz > "$TMP_DIR/pionc-seed.ssa"
+          "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$TMP_DIR/pionc-seed.ssa"
+          cc "$TMP_DIR/pionc0.o" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+
+          echo "=== [3/5] Stage 1: pionc0 -> pionc1 ==="
+          mkdir -p "$TMP_DIR/cas_s1"
+          PION_CACHE_DIR="$TMP_DIR/cas_s1" "$OUT_DIR/pionc0" build \
+            --emit-ssa "$OUT_DIR/stage1.ssa" \
+            --emit-asm "$OUT_DIR/stage1.s" \
+            -o "$OUT_DIR/pionc1" \
+            "$COMPILER_DIR/src/core" \
+            "$COMPILER_DIR/src/cli/main.pion"
+
+          echo "=== [4/5] Stage 2: pionc1 -> pionc2 ==="
+          mkdir -p "$TMP_DIR/cas_s2"
+          PION_CACHE_DIR="$TMP_DIR/cas_s2" "$OUT_DIR/pionc1" build \
+            --emit-ssa "$OUT_DIR/stage2.ssa" \
+            --emit-asm "$OUT_DIR/stage2.s" \
+            -o "$OUT_DIR/pionc2" \
+            "$COMPILER_DIR/src/core" \
+            "$COMPILER_DIR/src/cli/main.pion"
+
+          echo "=== [5/5] Fixed-point proof ==="
+          if cmp -s "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"; then
+            cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
+            echo "Fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
+          else
+            mkdir -p "$TMP_DIR/cas_s3"
+            PION_CACHE_DIR="$TMP_DIR/cas_s3" "$OUT_DIR/pionc2" build \
+              --emit-ssa "$OUT_DIR/stage3.ssa" \
+              --emit-asm "$OUT_DIR/stage3.s" \
+              -o "$OUT_DIR/pionc3" \
+              "$COMPILER_DIR/src/core" \
+              "$COMPILER_DIR/src/cli/main.pion"
+            cmp "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
+            cmp "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
+            echo "Fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
+          fi
 
       - name: Configure pion toolchain env
         run: |
@@ -182,7 +316,7 @@ jobs:
       - name: Type-check workspace (manifest-discovered)
         run: python3 scripts/invar check --json
 
-      - name: Run unit tests (manifest-discovered)
+      - name: Run unit tests (manifest-discovered, including host & film)
         run: python3 scripts/invar test --json
 
       - name: Check WebGL2 shaders, a11y bridge, reactive audit & invar CLI

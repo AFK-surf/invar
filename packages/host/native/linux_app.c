@@ -1215,7 +1215,7 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
   // this machine's name (MBUI_MACHINE, @ui.env): what a station added from here is called (sfbase local_machine_name)
   if (!getenv("MBUI_MACHINE")) setenv("MBUI_MACHINE", g_get_host_name(), 0);
   setlocale(LC_ALL, "");
-  // its icon's name its id (MBUI_APP_ID, as its desktop entry runs it: still.fail's linux/install.sh), which the
+  // its icon's name its id (MBUI_APP_ID, as its desktop entry runs it: the Linux install script), which the
   // desktop knows its window by too (life_begin)
   gtk_init();
   if (*app_id()) gtk_window_set_default_icon_name(app_id());

@@ -4162,7 +4162,7 @@
   // DOM elements in a layer under the canvas, shown through its holes: a <video> whose bytes come through the app
   // (read in parts, then played from a Blob), a sandboxed <iframe> (scripts only) for a page of HTML, the frame of
   // H.siteFrame for a site where the page has one (a host of its own, whose service worker hands every request of the
-  // site's page here over a port: still.fail's cloud/src/preview.ts says the messages).
+  // site's page here over a port: the preview bridge defines the messages).
   const views = new Map();
   let nextZ = 0;  // the z-index the next view raised takes (view_tell 5); one opened goes over those before it
   let nextView = 0, viewLayer = null;

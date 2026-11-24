@@ -2511,7 +2511,7 @@ void mb_views_draw_under(CGContextRef ctx, double scale) {
 // the app's Documents (MBUI_DOWNLOADS_DIR instead, for tests); a name taken
 // gets " (2)", " (3)"… before its extension.
 
-// Marks drawn onto an image (marks.mbt), as still.fail's Android app's ImageMarks.kt draws them: decoded by ImageIO,
+// Marks drawn onto an image (marks.mbt), as the Android host draws image marks: decoded by ImageIO,
 // drawn in a bitmap context of its size (flipped: the marks' y down), round-capped strokes, a box's rounded corners,
 // an arrow's barbs, a hand-drawn line through its midpoints, words edged in their halo (Core Text), the numbered
 // marks' pins; PNG out. On a queue of its own; each job's state 0 drawing, 1 made, -1 failed.

@@ -192,7 +192,7 @@ final class Streams {
      * let go), the app's (its thread) or a route's (`direct`: android_host.c mb_stream_route_take, the engine's thread).
      */
     static void audio(int id, byte[] data) {
-        // (behind another app, its window off the screen: no sound, as no picture; the user, 2026-10-29)
+        // (behind another app, its window off the screen: no sound, as no picture)
         if (behind && data.length > 0) return;
         Sound o = sounds.get(id);
         if (o == null) {

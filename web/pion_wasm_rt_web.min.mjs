@@ -1,5 +1,6 @@
 // Pion WebAssembly (wasm32) Minimal Browser Runtime (Zero Node.js Dependencies)
-// Synced from AFK-surf/pion@b7290c9 runtime/pion_wasm_rt_web.mjs (P71-C 128-bit wymix Map hashing, P73 iterative RC drop, P75/P77) with zero-copy host bridge helpers preserved.
+// Synced from AFK-surf/pion@14a5a636 runtime/pion_wasm_rt.mjs (PION_WASM_RT_ABI v2, rawAlloc overflow guard, stride-4 Int/UInt/Char array sort, P71-C 128-bit wymix Map hashing, P73 iterative RC drop, P75/P77) with zero-copy host bridge helpers preserved.
+export const PION_WASM_RT_ABI = 2;
 const TAG_STRING = 1, TAG_BYTES = 2, TAG_ARRAY = 3, TAG_MAP = 7, TAG_CHANNEL = 8, TAG_MUTEX = 9, TAG_ATOMIC = 10, TAG_STRBUF = 11, TAG_SCOPE = 12, TAG_WORLD = 13;
 const FLAG_FROZEN = 1, FLAG_IMMORTAL = 2, HDR = 24, PAGE = 65536;
 const FREE_CLASSES = (() => {
@@ -109,6 +110,14 @@ export function createPionRuntime(opts = {}) {
     heapBase = (base + 15) & ~15; heapPtr = heapBase; heapEnd = memory.buffer.byteLength;
     const sc = e.__pion_slab_ctl;
     slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
+    const ra = e.__pion_wasm_rt_abi;
+    const modAbi = typeof ra === "number" ? ra : (ra && typeof ra.value === "number" ? ra.value : 0);
+    if ((slabCtl > 0 || ra !== undefined) && modAbi !== PION_WASM_RT_ABI) {
+      throw new Error(
+        `Pion Wasm runtime ABI mismatch: runtime expects v${PION_WASM_RT_ABI}, module exports v${modAbi}. ` +
+        `Sync web/pion_wasm_rt_web*.mjs with the pionc version that built this .wasm.`
+      );
+    }
     if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
       const sb = new BigUint64Array(2); globalThis.crypto.getRandomValues(sb); hashSeed = sb[0]; hashSeed2 = sb[1];
     } else {
@@ -142,8 +151,11 @@ export function createPionRuntime(opts = {}) {
     return need <= tq ? tq : p;
   }
   function rawAlloc(sz) {
+    if (!Number.isFinite(sz) || sz < 0 || sz > 0x7FFFFFE8) {
+      pionDie("allocation size exceeds wasm32 limit");
+    }
     sync();
-    const need = ((sz + 7) & ~7) + 8, c = clsIdx(need);
+    const need = Math.ceil(sz / 8) * 8 + 8, c = clsIdx(need);
     if (c >= 0) {
       if (slabCtl > 0 && c < 9) {
         const so = slabCtl + c * 4, h = gu32(so);
@@ -158,6 +170,7 @@ export function createPionRuntime(opts = {}) {
       if (bk && bk.length) { const b = bk.pop(); su32(b, asz); su32(b + 4, ALLOC_MAGIC); return b + 8; }
     }
     const hp = getHp();
+    if (hp + asz > 0xFFFF0000) pionDie("wasm32 out of memory");
     if (hp + asz > heapEnd) {
       const missing = hp + asz - heapEnd;
       const curPages = heapEnd >>> 16;
@@ -549,6 +562,7 @@ export function createPionRuntime(opts = {}) {
     if (cb > 0x7FFFFFEFn) pionDie("container length exceeds maximum");
     const c = Math.max(Number(cb), 0), f = flags | 0;
     const isObj = f > 2 ? (f >>> 8) : (f === 1 ? 1 : 0), st = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0), esz = st || 8;
+    if (cb * BigInt(esz) > 0x7FFFFFE8n) pionDie("container byte size exceeds wasm32 limit");
     const o = pion_alloc_uninit(32, TAG_ARRAY, 0n);
     const dp = c ? rawAlloc(c * esz) : 0, p = pNum(o); sync();
     s64(p, 0); s64(p + 8, c); s32(p + 16, isObj); s32(p + 20, st); s64(p + 24, pBig(dp)); return o;
@@ -637,7 +651,9 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_arr_sort_int = (a) => {
     const p = pNum(a); sync(); const l = Number(g64(p)); if (l <= 1) return;
-    if (g32(p + 20) === 1) { const dp = Number(g64(p + 24)); u8.subarray(dp, dp + l).sort(); return; }
+    const dp = Number(g64(p + 24)), st = g32(p + 20);
+    if (st === 1) { u8.subarray(dp, dp + l).sort(); return; }
+    if (st === 4) { new Int32Array(u8.buffer, dp, l).sort(); return; }
     arrSort(a, (x, y) => (x < y ? -1 : x > y ? 1 : 0));
   };
   const pion_arr_sort_str = (a) => arrSort(a, pion_str_cmp);
@@ -911,6 +927,7 @@ export function createPionRuntime(opts = {}) {
       pion_ptr_read_i64: (p, o) => (sync(), g64(pNum(p) + Number(o))),
       pion_ptr_write_i64: (p, o, v) => { sync(); s64(pNum(p) + Number(o), v); },
       pion_cstr_to_str: (c) => mkStr(readCStr(c)),
+      __pion_rt_abi_v2: () => {},
     },
   };
   if (exp) bindExports(exp);
