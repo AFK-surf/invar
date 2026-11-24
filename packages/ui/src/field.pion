@@ -70,6 +70,12 @@ pub struct Field {
   pub mut last_win_x : Double
   pub mut last_win_y : Double
   pub mut last_win_scale : Double
+  /// The tree node of it that had the tree's focus since it was last given the focus (none: not had yet, `focus_from`
+  /// what had the tree's focus as it was given it).
+  mut focus_held : Option[view::NodeId]
+  mut focus_from : Option[view::NodeId]
+  /// Let go of by a modal layer over it, to be given the focus back as that goes (shown or not as it was).
+  mut focus_back : Option[Bool]
 }
 
 let focused_field_ref : signals::Ref[Option[Field]] = ref_new(None)
@@ -134,6 +140,9 @@ pub fn Field::new(text~ : String = "") -> Field {
     last_win_x: 0.0,
     last_win_y: 0.0,
     last_win_scale: 1.0,
+    focus_held: None,
+    focus_from: None,
+    focus_back: None,
   }
 }
 
@@ -469,16 +478,18 @@ pub fn Field::focus(self : Field) -> Unit {
   }
   focused_field_ref.v = Some(self)
   self.editor.focus()
-  match (view_app.tree, self.tree_node) {
+  self.focus_held = None
+  self.focus_from = None
+  self.focus_back = None
+  match (view_app.tree, self.node_here()) {
     (Some(tree), Some(nid)) => {
-      let held = match tree.focused_now().0 {
-        Some(cur) => cur == nid
-        None => false
-      }
-      if !held {
-        let _ = tree.focus_to(Some(nid), visible=false)
+      if node_is(tree.focused_now().0, nid) || tree.focus_to(Some(nid), visible=false) {
+        self.focus_held = Some(nid)
+      } else {
+        self.focus_from = tree.focused_now().0
       }
     }
+    (Some(tree), None) => self.focus_from = tree.focused_now().0
     _ => ()
   }
   // Within the press itself: hosts only raise a keyboard inside a user gesture.
@@ -488,6 +499,7 @@ pub fn Field::focus(self : Field) -> Unit {
 
 pub fn Field::let_go(self : Field) -> Unit {
   let was_focused = self.focused_sig.untracked()
+  self.focus_back = None
   self.editor.blur()
   let mut cleared = false
   match focused_field_ref.v {
@@ -497,7 +509,7 @@ pub fn Field::let_go(self : Field) -> Unit {
     }
     _ => ()
   }
-  match (view_app.tree, self.tree_node) {
+  match (view_app.tree, self.node_here()) {
     (Some(tree), Some(nid)) => {
       let held = match tree.focused_now().0 {
         Some(cur) => cur == nid
@@ -513,6 +525,180 @@ pub fn Field::let_go(self : Field) -> Unit {
     hostapi::set_ime(false, 0.0, 0.0, 0.0, 0.0, "", 0, 0)
     hostapi::ime_action(hostapi::ime_action_none)
     hostapi::request_frame()
+  }
+}
+
+fn node_is(a : Option[view::NodeId], id : view::NodeId) -> Bool {
+  match a {
+    Some(x) => x == id
+    None => false
+  }
+}
+
+fn same_focus(a : Option[view::NodeId], b : Option[view::NodeId]) -> Bool {
+  match b {
+    Some(x) => node_is(a, x)
+    None => a is None
+  }
+}
+
+/// Its node in the window's tree now (none: not mounted, or mounted in another window's, whose nodes' ids may be equal).
+fn Field::node_here(self : Field) -> Option[view::NodeId] {
+  match (view_app.tree, self.tree_node) {
+    (Some(tree), Some(nid)) => match find_tree_field_in(tree.phys_id(), nid) {
+      Some(tf) if tf.field.phys_id == self.phys_id => Some(nid)
+      _ => None
+    }
+    _ => None
+  }
+}
+
+/// The focused Field mounted in `tree`, and its node there.
+fn focused_field_in(tree : view::Tree) -> Option[(Field, view::NodeId)] {
+  match focused_field_ref.v {
+    Some(cur) => match cur.tree_node {
+      Some(nid) => match find_tree_field_in(tree.phys_id(), nid) {
+        Some(tf) if tf.field.phys_id == cur.phys_id => Some((cur, nid))
+        _ => None
+      }
+      None => None
+    }
+    None => None
+  }
+}
+
+/// The focused Field let go of where `tree`'s focus has moved off its node; one not mounted in `tree` is left alone.
+/// One given the focus before its node could take it (asked for before it was mounted) is given the tree's focus once
+/// the node can; till then it is let go of only where the tree's focus moves, `layers` (moved by a layer opening or
+/// going, not by the user) apart, unless what opened keeps its node from the focus.
+fn field_let_go_if_left(tree : view::Tree, layers~ : Bool = false) -> Unit {
+  let (cur, nid) = match focused_field_in(tree) {
+    Some(pair) => pair
+    None => return
+  }
+  let (held, visible) = tree.focused_now()
+  if node_is(held, nid) {
+    cur.focus_held = Some(nid)
+    return
+  }
+  match held {
+    // (the same Field mounted twice, its other node focused)
+    Some(h) => match find_tree_field_in(tree.phys_id(), h) {
+      Some(tf) if tf.field.phys_id == cur.phys_id => {
+        cur.tree_node = Some(h)
+        cur.focus_held = Some(h)
+        return
+      }
+      _ => ()
+    }
+    None => ()
+  }
+  // (a modal layer over it has the focus and leaves what is typed to it: View::leaves_typing)
+  match held {
+    Some(h) if tree.typing_left_under() && tree.keys_own(nid) && !tree.allows(nid) && tree.allows(h) => return
+    _ => ()
+  }
+  if node_is(cur.focus_held, nid) {
+    cur.let_go()
+    return
+  }
+  if layers || same_focus(held, cur.focus_from) {
+    if tree.focus_to(Some(nid), visible=visible) {
+      cur.focus_held = Some(nid)
+      return
+    }
+    if !layers || held is None || tree.allows(nid) {
+      cur.focus_from = held
+      return
+    }
+  }
+  cur.let_go()
+}
+
+/// Bring the focused Field in line with `tree`'s focus, after it moved: the Field whose node has it takes the keys and
+/// the host's input method, and one whose node no longer has it is let go of.
+fn field_sync_with_tree(tree : view::Tree, layers~ : Bool = false) -> Unit {
+  let held = tree.focused_now().0
+  // (one that waits for its node to take the focus, the tree's not moved since it was given the keys, keeps them)
+  let waits = match focused_field_ref.v {
+    Some(cur) => cur.focus_held is None && same_focus(held, cur.focus_from)
+    None => false
+  }
+  if !waits {
+    // (the one the focus comes to first: from one Field to another the input method stays on)
+    match held {
+      Some(nid) => match find_tree_field_in(tree.phys_id(), nid) {
+        Some(tf) =>
+        if !tf.field.focused_sig.untracked() {
+          tf.field.tree_node = Some(nid)
+          tf.field.focus()
+        }
+        None => ()
+      }
+      None => ()
+    }
+  }
+  field_let_go_if_left(tree, layers=layers)
+}
+
+/// The focus let go of on node `id` of `tree` (Tree::on_focus_lost): the Field it is let go of too, and remembered
+/// where a modal layer over it alone did that, to be given it back as the layer goes (field_back_from_modal).
+fn field_focus_lost(tree : view::Tree, id : view::NodeId) -> Unit {
+  match focused_field_in(tree) {
+    // (let go of on another node, of a layer that left typing to the Field: the Field has it again as it can)
+    Some((f, nid)) if nid != id && tree.typing_left_under() => {
+      f.focus_held = None
+      f.focus_from = None
+      return
+    }
+    _ => ()
+  }
+  let under = match focused_field_in(tree) {
+    Some((f, nid)) if nid == id && tree.keys_own(id) && !tree.allows(id) => Some(f)
+    _ => None
+  }
+  field_let_go_if_left(tree, layers=true)
+  match under {
+    Some(f) if !f.focused_sig.untracked() => field_back_set(tree, f, false)
+    _ => ()
+  }
+}
+
+/// `f` alone of `tree`'s Fields is the one to be given the focus back as the modal layer over it goes.
+fn field_back_set(tree : view::Tree, f : Field, visible : Bool) -> Unit {
+  let tid = tree.phys_id()
+  for tf in tree_fields {
+    if tf.tree_id == tid {
+      tf.field.focus_back = None
+    }
+  }
+  f.focus_back = Some(visible)
+}
+
+/// What takes input in `tree` changed (Tree::on_modals): the Field a modal layer took the focus from given it back,
+/// once none is over it, where nothing else has taken it.
+fn field_back_from_modal(tree : view::Tree) -> Unit {
+  let tid = tree.phys_id()
+  let mut back : Option[(TreeField, Bool)] = None
+  for tf in tree_fields {
+    if tf.tree_id == tid {
+      match tf.field.focus_back {
+        Some(visible) => back = Some((tf, visible))
+        None => ()
+      }
+    }
+  }
+  match back {
+    Some((tf, visible)) => {
+      if !tree.can_focus(tf.node_id) {
+        return
+      }
+      tf.field.focus_back = None
+      if tree.focused_now().0 is None && focused_field_ref.v is None && tree.focus_to(Some(tf.node_id), visible=visible) {
+        field_sync_with_tree(tree)
+      }
+    }
+    None => ()
   }
 }
 
@@ -994,11 +1180,15 @@ fn remove_tree_field(tid : Int, id : view::NodeId) -> Unit {
   }
   if idx >= 0 {
     let tf = tree_fields[idx]
-    array_remove_at(tree_fields, idx)
+    // (let go of while still told mounted: the tree's focus on its node goes with it)
     if tf.field.focused_sig.untracked() {
       tf.field.let_go()
     }
-    tf.field.tree_node = None
+    tf.field.focus_back = None
+    if node_is(tf.field.tree_node, id) {
+      tf.field.tree_node = None
+    }
+    array_remove_at(tree_fields, idx)
   }
 }
 

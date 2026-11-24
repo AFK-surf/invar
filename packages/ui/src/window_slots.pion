@@ -155,6 +155,15 @@ fn first_focusable_in_layer(tree : view::Tree, layer : view::NodeId) -> Option[v
   }
 }
 
+fn array_holds(tree : view::Tree, layers : Array[view::NodeId], id : view::NodeId) -> Bool {
+  for l in layers {
+    if l == id || tree.holds_in_order(l, id) {
+      return true
+    }
+  }
+  false
+}
+
 fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
   tree.on_layers_focus(fn(gone : Array[view::NodeId], opened : Array[(view::NodeId, Option[view::NodeId])]) -> Unit {
     run_for_window(wid, gen, fn() -> Unit {
@@ -202,7 +211,17 @@ fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
           idx -= 1
         }
         if need_restore && popped.length() > 0 {
+          // (a Field that kept the keys while what is gone had the focus (View::leaves_typing), or was given them as it
+          // went, has the focus now)
+          match focused_field_in(tree) {
+            Some((_, nid)) if tree.focus_back_takes(nid) && !array_holds(tree, gone, nid) =>
+            restore = Some((Some(nid), cur_vis))
+            _ => ()
+          }
           for entry in popped {
+            if restore is Some(_) {
+              break
+            }
             let (layer, prev_f, prev_vis, saved_opener) = entry
             let opener = match tree.opener_of(layer) {
               Some(o) => Some(o)
@@ -248,6 +267,12 @@ fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
         match restore {
           Some((Some(tid), vis)) => {
             if !tree.focus_to(Some(tid), visible=vis) {
+              // (a modal layer still over the Field it goes back to: given it as that goes)
+              match find_tree_field_in(tree.phys_id(), tid) {
+                Some(tf) if tree.keys_own(tid) && !tree.allows(tid) && !tf.field.focused_sig.untracked() =>
+                field_back_set(tree, tf.field, vis)
+                _ => ()
+              }
               let mut moved = false
               let mut rem_idx = layer_prev_focus.v.length() - 1
               while rem_idx >= 0 {
@@ -273,6 +298,7 @@ fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
           }
           None => ()
         }
+        field_sync_with_tree(tree, layers=true)
         return
       }
       let (base_focus, base_vis) = match restore {
@@ -280,7 +306,7 @@ fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
         None => (cur_focus, cur_vis)
       }
       let mut running_prev = base_focus
-      let mut top_target : Option[view::NodeId] = None
+      let mut top_target : Option[(view::NodeId, view::NodeId)] = None
       for o in opened {
         let (layer, target_opt) = o
         let mut k = layer_prev_focus.v.length() - 1
@@ -313,17 +339,25 @@ fn install_tree_layers_focus(tree : view::Tree, wid : Int, gen : Int) -> Unit {
         match resolved {
           Some(t) => {
             running_prev = Some(t)
-            top_target = Some(t)
+            top_target = Some((layer, t))
           }
           None => ()
         }
       }
       match top_target {
-        Some(t) => {
-          let _ = tree.focus_to(Some(t), visible=base_vis)
+        Some((layer, t)) => {
+          // (a Field in what opened, focused as it opened, keeps the focus)
+          let kept = match focused_field_in(tree) {
+            Some((_, nid)) if tree.holds_in_order(layer, nid) => tree.focus_to(Some(nid), visible=base_vis)
+            _ => false
+          }
+          if !kept {
+            let _ = tree.focus_to(Some(t), visible=base_vis)
+          }
         }
         None => ()
       }
+      field_sync_with_tree(tree, layers=true)
     })
   })
 }
@@ -345,8 +379,27 @@ fn install_tree_hooks(tree : view::Tree, wid : Int, gen : Int) -> Unit {
     room_least(platform=platform(), width=w)
   })
   install_tree_layers_focus(tree, wid, gen)
+  tree.on_focus_lost(fn(id : view::NodeId) {
+    run_for_window(wid, gen, fn() -> Unit { field_focus_lost(tree, id) })
+  })
+  tree.on_focus_asked(fn(id : view::NodeId, visible : Bool) {
+    run_for_window(wid, gen, fn() -> Unit {
+      if tree.focus_to(Some(id), visible=visible) {
+        field_sync_with_tree(tree)
+      }
+    })
+  })
+  tree.drawn_by(focus_let_go=fn() {
+    run_for_window(wid, gen, fn() -> Unit {
+      blur_focused_field()
+      let _ = tree.focus_to(None)
+    })
+  })
   tree.on_modals(fn() {
-    run_for_window(wid, gen, fn() -> Unit { sync_back_enabled(tree) })
+    run_for_window(wid, gen, fn() -> Unit {
+      field_back_from_modal(tree)
+      sync_back_enabled(tree)
+    })
   })
   sync_back_enabled(tree)
 }
