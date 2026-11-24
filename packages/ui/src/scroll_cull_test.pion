@@ -1,0 +1,200 @@
+// Scrolling a long list: encode leaves out what the window cannot show (Tree::drawn_held's `cull`), and what a
+// column scrolls is drawn moved by whole pixels, so each text node keeps its sub-pixel place (PR #41's glyph phases)
+// and its ViewBlock is reused frame after frame at a fractional scale.
+
+import "signals"
+import "view"
+
+fn cull_list_page(root : view::View, scroll : view::Scroll, rows : Int) -> Unit {
+  let _ = root.scroll_box(fn(body : view::View) {
+    let mut i = 0
+    while i < rows {
+      let idx = i
+      let _ = body.box(fn(row : view::View) {
+        let _ = row
+        .row(view::Live::Is(true))
+        .width(view::Live::Is(Some(360.0)))
+        .height(view::Live::Is(Some(36.0)))
+        .bg(if idx % 2 == 0 { 0xF4F6FAFFL } else { 0xFFFFFFFFL })
+        .r(8.0)
+        .shadow(view::Live::Is(if idx % 4 == 0 { (6.0, 2.0, 0x00000022L) } else { (0.0, 0.0, 0L) }))
+        .pad_xy(8.0, 6.0)
+        let _ = row.box(fn(lbl : view::View) {
+          let _ = lbl.words(view::Live::Is("模组 Mod row #\{idx} · v1.\{idx}.0"))
+        })
+        let _ = row.box(fn(badge : view::View) {
+          let _ = badge.bg(0xE8EEF8FFL).r(6.0).words(view::Live::Is("客户端"))
+        })
+      })
+      i += 1
+    }
+  }, scroll=scroll)
+}
+
+fn words_y_phase(t : view::Tree, words : String, scale : Double) -> Double {
+  for e in t.drawn_held() {
+    let (d, _, _) = e
+    if d.words == words {
+      let p = d.y * scale
+      return p - p.floor()
+    }
+  }
+  -1.0
+}
+
+test "scroll_cull: 200 rows scrolled to the middle encode only what the window shows" {
+  set_view_blocks_enabled(true)
+  let count = fn(cull : Bool) -> Int {
+    set_view_cull_enabled(cull)
+    let scroll = view::Scroll::new()
+    let t = Tester::tree(fn(root : view::View) { cull_list_page(root, scroll, 200) }, width=400.0, height=320.0, scale=1.5)
+    scroll.put(3000.0)
+    t.fake.frame_requested = true
+    t.frame(ms=16.0)
+    let n = t.scene().ninst
+    t.dispose()
+    n
+  }
+  let all = count(false)
+  let seen = count(true)
+  set_view_cull_enabled(true)
+  // (320pt of 36pt rows: ~9 in sight, a margin's more each way; 200 encoded without the cull)
+  debug_assert(all > 0 && seen > 0, "both encode something (\{all}, \{seen})")
+  debug_assert(seen * 8 < all, "culled encode is under 1/8 of the whole list (\{seen} of \{all})")
+}
+
+test "scroll_cull: what is in sight is encoded the same with and without the cull" {
+  // A row in sight is encoded exactly as before: the same instances for every node the window shows, in the same
+  // order (the culled scene is the whole scene's instances of what is seen, nothing moved or changed).
+  set_view_blocks_enabled(false)
+  // (one tree, one glyph atlas: the whole scene first, then the same frame again with the cull, so a glyph's place in
+  // the atlas is the same in both)
+  let scroll = view::Scroll::new()
+  let t = Tester::tree(fn(root : view::View) { cull_list_page(root, scroll, 120) }, width=400.0, height=320.0, scale=1.5)
+  scroll.put(1234.5)
+  let copy_of = fn(sc : Scene) -> Scene {
+    let copy = Scene::new()
+    copy.clear(sc.width, sc.height, sc.scale)
+    copy.ensure_inst_len(sc.ninst * inst_size)
+    let mut i = 0
+    while i < sc.ninst * inst_size {
+      copy.inst[i] = sc.inst[i]
+      i += 1
+    }
+    copy.ninst = sc.ninst
+    copy
+  }
+  set_view_cull_enabled(false)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let whole = copy_of(t.scene())
+  set_view_cull_enabled(true)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let culled = copy_of(t.scene())
+  t.dispose()
+  set_view_cull_enabled(true)
+  set_view_blocks_enabled(true)
+  // every culled instance appears, in order, among the whole scene's (a subsequence, bit for bit)
+  let mut j = 0
+  let mut i = 0
+  while i < culled.ninst && j < whole.ninst {
+    let mut same = true
+    let mut k = 0
+    while k < inst_size {
+      if (culled.inst[i * inst_size + k] - whole.inst[j * inst_size + k]).abs() >= 1.0e-6 {
+        same = false
+        break
+      }
+      k += 1
+    }
+    if same {
+      i += 1
+    }
+    j += 1
+  }
+  if i < culled.ninst {
+    let mut row = ""
+    let mut k = 0
+    while k < inst_size {
+      row = row + " " + culled.inst[i * inst_size + k].to_string()
+      k += 1
+    }
+    debug_assert(false, "culled scene is an in-order subsequence of the whole scene (\{i} of \{culled.ninst} matched); first unmatched: \{row}")
+  }
+  debug_assert(culled.ninst < whole.ninst, "something was culled (\{culled.ninst} < \{whole.ninst})")
+}
+
+test "scroll_cull: a fractional scroll at 150% keeps each text node's pixel phase and reuses its ViewBlock" {
+  set_view_blocks_enabled(true)
+  set_view_cull_enabled(true)
+  let scroll = view::Scroll::new()
+  let t = Tester::tree(fn(root : view::View) { cull_list_page(root, scroll, 200) }, width=400.0, height=320.0, scale=1.5)
+  scroll.put(100.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => { debug_assert(false, "tree"); return }
+  }
+  let label = "模组 Mod row #5 · v1.5.0"
+  let phase0 = words_y_phase(tree, label, 1.5)
+  debug_assert(phase0 >= 0.0, "row 5 in sight")
+  view_paint_work_reset()
+  let mut f = 1
+  while f <= 30 {
+    // (wheel/fling positions: never on a pixel of the 150% grid)
+    scroll.put(100.0 + f.to_double() * 0.37)
+    t.fake.frame_requested = true
+    t.frame(ms=16.0)
+    let ph = words_y_phase(tree, label, 1.5)
+    debug_assert((ph - phase0).abs() < 1.0e-6, "frame \{f}: row 5's words keep their pixel phase (\{ph} vs \{phase0})")
+    f += 1
+  }
+  let w = view_paint_work_now()
+  debug_assert(w.copied > 0, "blocks copied while scrolling (\{w.copied})")
+  // (all but those come into sight: none made again for a sub-pixel move)
+  debug_assert(w.made * 20 <= w.copied, "scrolling by fractions rebuilds under 5% of blocks (made \{w.made}, copied \{w.copied})")
+  t.dispose()
+}
+
+test "scroll_cull: cached and uncached encode stay bit-exact through fractional scroll frames at 150%" {
+  let frames = fn(blocks : Bool) -> Array[Array[Double]] {
+    set_view_blocks_enabled(blocks)
+    let scroll = view::Scroll::new()
+    let t = Tester::tree(fn(root : view::View) { cull_list_page(root, scroll, 80) }, width=400.0, height=320.0, scale=1.5)
+    let out : Array[Array[Double]] = []
+    let mut f = 0
+    while f < 6 {
+      scroll.put(f.to_double() * 41.3)
+      t.fake.frame_requested = true
+      t.frame(ms=16.0)
+      let sc = t.scene()
+      let a : Array[Double] = []
+      let mut i = 0
+      while i < sc.ninst * inst_size {
+        a.push(sc.inst[i])
+        i += 1
+      }
+      out.push(a)
+      f += 1
+    }
+    t.dispose()
+    out
+  }
+  let direct = frames(false)
+  let cached = frames(true)
+  set_view_blocks_enabled(true)
+  let mut f = 0
+  while f < direct.length() {
+    debug_assert(direct[f].length() == cached[f].length(), "frame \{f}: same instance count")
+    let mut i = 0
+    while i < direct[f].length() {
+      debug_assert((direct[f][i] - cached[f][i]).abs() < 1.0e-6, "frame \{f}: inst value \{i} differs")
+      i += 1
+    }
+    f += 1
+  }
+}

@@ -3595,16 +3595,32 @@ fn Tree::presses_said(self : Tree, at : Int) -> Bool {
 /// drawn round it) and whether it is a press target (Tree::presses_said: not one that says it takes none): for a check of
 /// where things stand in what holds them (ui's corner rule). `scales`, where given: how big each is drawn pushed to it in
 /// the same order, as the walk composes it (Tree::drawn_scale's, worked out once for all).
-pub fn Tree::drawn_held(self : Tree, scales? : Array[Double]) -> Array[(Drawn, Int, Bool)] {
+pub fn Tree::drawn_held(
+  self : Tree,
+  scales? : Array[Double],
+  cull? : (Double, Double, Double, Double),
+) -> Array[(Drawn, Int, Bool)] {
   let out : Array[(Drawn, Int, Bool)] = []
   // (each in the order's place, where it is in what is drawn: -1 where it draws nothing)
-  let at_out : Array[Int] = Array::make(self.order.length(), -1)
+  let len = self.order.length()
+  let at_out : Array[Int] = Array::make(len, -1)
+  // (`cull`: the window's rectangle. What is seen of each node is cut to what clips it (its holders that clip, as
+  // view_host's encode cuts it), each place in the order the rectangle what it holds is cut to; a node whose rectangle,
+  // grown by what it may draw past itself (drawn_reach), meets none of that is left out, and so is all it holds where
+  // what it is cut to is nothing at all. What it holds is otherwise still gone through: each is looked at on its own,
+  // so one drawn past its holder's rectangle into sight is never lost with it.)
+  let culling = cull.is_some()
+  let clip_at : Array[Double] = if culling { Array::make(len * 4, 0.0) } else { [] }
+  let clip_set : Array[Bool] = if culling { Array::make(len, false) } else { [] }
+  let (vx0, vy0, vx1, vy1) = match cull {
+    Some(r) => r
+    None => (0.0, 0.0, 0.0, 0.0)
+  }
   self.each_drawn_in_order(fn(i, c, x, y, a, s, _, _) {
     let mut h = self.order_holder[i]
     while h >= 0 && at_out[h] < 0 {
       h = self.order_holder[h]
     }
-    at_out[i] = out.length()
     // (its corners as big as it is drawn, as its size is: where the window draws it, in the window's points; a leaf
     // grown in a block of a page's list on that block's way as tall as it is cut, as much of it as is seen:
     // Tree::grown_cut_of)
@@ -3615,6 +3631,36 @@ pub fn Tree::drawn_held(self : Tree, scales? : Array[Double]) -> Array[(Drawn, I
       radius: c.radius * s,
       corners: opt_map(c.corners, fn(k) { (k.0 * s, k.1 * s, k.2 * s, k.3 * s) }),
     }
+    if culling {
+      // (what it is cut to: its nearest holder's, gone up past those that draw nothing; the window's at the top)
+      let mut ch = self.order_holder[i]
+      while ch >= 0 && !clip_set[ch] {
+        ch = self.order_holder[ch]
+      }
+      let (cx0, cy0, cx1, cy1) = if ch >= 0 {
+        (clip_at[ch * 4], clip_at[ch * 4 + 1], clip_at[ch * 4 + 2], clip_at[ch * 4 + 3])
+      } else {
+        (vx0, vy0, vx1, vy1)
+      }
+      let (mx0, my0, mx1, my1) = drawn_reach(d)
+      let seen = mx1 > cx0 && mx0 < cx1 && my1 > cy0 && my0 < cy1
+      // (cut to itself too where it clips and is not turned: what it holds is cut to that, as encode cuts it)
+      let (nx0, ny0, nx1, ny1) = if d.clips && d.turn == 0.0 {
+        (dmax(cx0, d.x), dmax(cy0, d.y), dmin(cx1, d.x + d.w), dmin(cy1, d.y + d.h))
+      } else {
+        (cx0, cy0, cx1, cy1)
+      }
+      clip_at[i * 4] = nx0
+      clip_at[i * 4 + 1] = ny0
+      clip_at[i * 4 + 2] = nx1
+      clip_at[i * 4 + 3] = ny1
+      clip_set[i] = true
+      if !seen {
+        // (nothing of what it holds can be seen where what they are cut to is empty: all of it passed over)
+        return nx1 <= nx0 || ny1 <= ny0
+      }
+    }
+    at_out[i] = out.length()
     out.push((d, if h >= 0 { at_out[h] } else { -1 }, self.presses_said(c.id.at)))
     match scales {
       Some(sc) => sc.push(s)
@@ -3623,6 +3669,31 @@ pub fn Tree::drawn_held(self : Tree, scales? : Array[Double]) -> Array[(Drawn, I
     false
   })
   out
+}
+
+///|
+/// How far past its own rectangle a node may paint, as drawn_held's `cull` counts it: its shadow (blurred out
+/// three times its radius, moved by its offset), its ring, a glass's own shadow and lens, a blur; at least
+/// `drawn_reach_least` points every way (a ground drawn grown, an edge, what antialiasing spills), all of it in
+/// the window's points.
+pub let drawn_reach_least : Double = 48.0
+
+fn drawn_reach(d : Drawn) -> (Double, Double, Double, Double) {
+  let (sb, sy, sc) = d.shadow
+  let shadow = if sc != 0L && sb > 0.0 { sb * 3.0 + sy.abs() } else { 0.0 }
+  let ring = if d.ring.0 != 0.0 { d.ring.0.abs() + d.ring.1.abs() + 4.0 } else { 0.0 }
+  let glass = if d.glass.is_some() { 96.0 } else { 0.0 }
+  let blur = d.blur * 3.0
+  let m = drawn_reach_least + dmax(dmax(shadow, ring), dmax(glass, blur))
+  if d.turn != 0.0 {
+    // (turned about its middle: as far as its corners go round)
+    let r = (d.w * d.w + d.h * d.h).sqrt() * 0.5
+    let cx = d.x + d.w * 0.5
+    let cy = d.y + d.h * 0.5
+    (cx - r - m, cy - r - m, cx + r + m, cy + r + m)
+  } else {
+    (d.x - m, d.y - m, d.x + d.w + m, d.y + d.h + m)
+  }
 }
 
 ///|
