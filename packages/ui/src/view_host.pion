@@ -727,6 +727,9 @@ struct ViewAppState {
   mut text_interceptor : Option[(Int, String, Int, Int) -> Bool]
   mut last_wheel_phase : Int
   mut last_light_angle : Double
+  mut last_bg_r : Double
+  mut last_bg_g : Double
+  mut last_bg_b : Double
   mut last_atlas_gen : Int
   mut shown_cursor : Int
 }
@@ -765,6 +768,9 @@ let view_app : ViewAppState = ViewAppState::{
   text_interceptor: None,
   last_wheel_phase: 0,
   last_light_angle: -999.0,
+  last_bg_r: 0.0,
+  last_bg_g: 0.0,
+  last_bg_b: 0.0,
   last_atlas_gen: -1,
   shown_cursor: -1,
 }
@@ -930,6 +936,9 @@ fn view_forget_inner(clear_hooks : Bool) -> Bool {
   view_app.text_interceptor = None
   view_app.last_wheel_phase = 0
   view_app.last_light_angle = -999.0
+  view_app.last_bg_r = 0.0
+  view_app.last_bg_g = 0.0
+  view_app.last_bg_b = 0.0
   view_app.last_atlas_gen = -1
   view_app.shown_cursor = -1
   fields_reset()
@@ -1535,6 +1544,8 @@ struct ViewBlock {
   words_square_clip : Bool
   mono_glyph_plots : Array[Int]
   colour_glyph_plots : Array[Int]
+  image_obs : Array[(String, Option[(Int, Double, Double)])]
+  image_epoch : Int
   inst : Array[Double]
 }
 
@@ -1797,6 +1808,7 @@ fn view_block_matches(
   blk.image_cover == d.image_cover &&
   blk.image_contain == d.image_contain &&
   opt_pair_eq(blk.image_cover_at, d.image_cover_at) &&
+  ((blk.image_obs.length() == 0 && d.image is None) || blk.image_epoch == image_invalidate_epoch.v) &&
   rects_eq(blk.rects, d.rects)
 }
 
@@ -2297,6 +2309,10 @@ fn encode_drawn_node_direct(
       } else {
         256
       }
+      image_obs_node_at.v = d.id.at
+      image_obs_node_gen.v = d.id.gen
+      image_obs_call_slot.v = 0
+      image_resolve_transitional.v = false
       let primary = if src != "" { image_resolve(src, px, frame_no, now) } else { None }
       let resolved = match primary {
         Some(_) => primary
@@ -2305,12 +2321,20 @@ fn encode_drawn_node_direct(
             image_settled = false
           }
           if ph != "" && ph != src {
+            image_obs_call_slot.v = 1
             image_resolve(ph, px, frame_no, now)
           } else {
             None
           }
         }
       }
+      if image_resolve_transitional.v {
+        image_settled = false
+      }
+      image_resolve_transitional.v = false
+      image_obs_node_at.v = -1
+      image_obs_node_gen.v = -1
+      image_obs_call_slot.v = 0
       match resolved {
         Some((hid, iw, ih)) => {
           let mut ix = d.x
@@ -2687,6 +2711,11 @@ fn encode_drawn_node(
       if blk.atlas_gen == atlas_gen {
         touch_block_glyph_plots(blk.mono_glyph_plots, blk.colour_glyph_plots)
       }
+      if image_obs_recording.v {
+        for pair in blk.image_obs {
+          frame_image_obs[pair.0] = pair.1
+        }
+      }
       compose_view_block(scene, blk, d, gd, node_scale, clip, rc)
       view_blocks_state.work.copied = view_blocks_state.work.copied + 1
       view_blocks_state.work.handed = view_blocks_state.work.handed + blk.ninst
@@ -2700,10 +2729,13 @@ fn encode_drawn_node(
   let empty_deferred : Array[DeferredGlassShadow] = []
   let prev_block_glyph_missed = block_glyph_missed.v
   let prev_block_glyph_plots = block_glyph_plots.v
+  let prev_image_obs_sink = image_obs_block_sink.v
   let mono_plots : Array[Int] = []
   let col_plots : Array[Int] = []
+  let blk_image_obs : Array[(String, Option[(Int, Double, Double)])] = []
   block_glyph_missed.v = false
   block_glyph_plots.v = Some((mono_plots, col_plots))
+  image_obs_block_sink.v = Some(blk_image_obs)
   let (after_ground_n, words_start, words_end, words_square_clip, image_settled) = encode_drawn_node_direct(
     scratch,
     tree_id,
@@ -2723,6 +2755,7 @@ fn encode_drawn_node(
   let glyphs_settled = !block_glyph_missed.v
   block_glyph_missed.v = prev_block_glyph_missed
   block_glyph_plots.v = prev_block_glyph_plots
+  image_obs_block_sink.v = prev_image_obs_sink
   let blk_len = scratch.ninst * inst_size
   let blk_inst : Array[Double] = []
   let mut bi = 0
@@ -2783,6 +2816,8 @@ fn encode_drawn_node(
     words_square_clip,
     mono_glyph_plots: mono_plots,
     colour_glyph_plots: col_plots,
+    image_obs: blk_image_obs,
+    image_epoch: image_invalidate_epoch.v,
     inst: blk_inst,
   }
   // Do not cache a pending (not-yet-decoded) image block or a block that dropped glyphs due to a full atlas,
@@ -4068,7 +4103,9 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
     Some(_) => Some(view_app.scene.copy())
     None => None
   }
+  image_obs_begin_frame(in_frame_looks_hook.v.is_some())
   encode_held_tree(view_app.scene, tree, view_app.frame_no, now, scale)
+  image_obs_recording.v = false
   view_app.scene.emit_segs()
   let t2 = work_clock_now()
   let bg = tree_theme().bg
@@ -4082,6 +4119,9 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
       None => DamageReport::Full
     }
     hostapi::present(view_app.scene.inst, view_app.scene.ninst, bg_r, bg_g, bg_b)
+    view_app.last_bg_r = bg_r
+    view_app.last_bg_g = bg_g
+    view_app.last_bg_b = bg_b
     let t3 = work_clock_now()
     view_app.scene.perf.layout_ms = dmax(0.0, t1 - t0)
     view_app.scene.perf.paint_ms = dmax(0.0, t2 - t1)
@@ -4104,6 +4144,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
       }
       _ => ()
     }
+    image_obs_end_frame()
     frame_running.v = false
     drain_after_frame()
     return true
@@ -4126,6 +4167,9 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   view_app.scene.dirty_count = dirty.length()
   // hostapi::present(buf, count, bg_r, bg_g, bg_b) — clear color RGB, NOT (w, h, scale)!
   hostapi::present(view_app.scene.inst, view_app.scene.ninst, bg_r, bg_g, bg_b)
+  view_app.last_bg_r = bg_r
+  view_app.last_bg_g = bg_g
+  view_app.last_bg_b = bg_b
   let t3 = work_clock_now()
   view_app.scene.perf.layout_ms = dmax(0.0, t1 - t0)
   view_app.scene.perf.paint_ms = dmax(0.0, t2 - t1)
@@ -4148,6 +4192,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
     }
     _ => ()
   }
+  image_obs_end_frame()
   frame_running.v = false
   drain_after_frame()
   view_app.frame_no == 1 || dirty.length() > 0 || light_changed || atlas_changed

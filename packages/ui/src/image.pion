@@ -42,6 +42,53 @@ let image_cache : Map[String, Array[ImageEntry]] = Map::new()
 let image_bytes_total : signals::Ref[Double] = ref_new(0.0)
 let image_rev : signals::Ref[signals::Signal[Int]] = ref_new(signals::signal(0))
 let host_image_byte_bars : Map[String, Int] = Map::new()
+let image_obs_recording : signals::Ref[Bool] = ref_new(false)
+let image_obs_node_at : signals::Ref[Int] = ref_new(-1)
+let image_obs_node_gen : signals::Ref[Int] = ref_new(-1)
+let image_obs_call_slot : signals::Ref[Int] = ref_new(0)
+let frame_image_obs : Map[String, Option[(Int, Double, Double)]] = Map::new()
+let image_obs_block_sink : signals::Ref[Option[Array[(String, Option[(Int, Double, Double)])]]] = ref_new(None)
+let image_invalidate_epoch : signals::Ref[Int] = ref_new(0)
+let image_resolve_transitional : signals::Ref[Bool] = ref_new(false)
+
+fn image_list_has_transitional(list : Array[ImageEntry]) -> Bool {
+  for e in list {
+    if e.px == 0 {
+      return true
+    }
+  }
+  false
+}
+
+fn image_list_has_pending(list : Array[ImageEntry]) -> Bool {
+  for e in list {
+    if e.state == 0 {
+      return true
+    }
+  }
+  false
+}
+
+fn image_obs_begin_frame(record : Bool) -> Unit {
+  frame_image_obs.clear()
+  image_obs_recording.v = record
+  image_obs_node_at.v = -1
+  image_obs_node_gen.v = -1
+  image_obs_call_slot.v = 0
+}
+
+fn image_obs_end_frame() -> Unit {
+  frame_image_obs.clear()
+  image_obs_recording.v = false
+  image_obs_node_at.v = -1
+  image_obs_node_gen.v = -1
+  image_obs_call_slot.v = 0
+  image_resolve_transitional.v = false
+}
+
+fn image_obs_key(key : String, px : Int) -> String {
+  "\{image_obs_node_at.v}:\{image_obs_node_gen.v}:\{px}:\{image_obs_call_slot.v}:\{key}"
+}
 
 fn image_bytes_from_arr(arr : Array[Byte]) -> Bytes {
   let sb = StringBuilder::new()
@@ -90,6 +137,7 @@ fn image_cache_renew(key : String) -> Unit {
     }
     None => ()
   }
+  image_invalidate_epoch.v = image_invalidate_epoch.v + 1
   image_bump_rev()
 }
 
@@ -135,6 +183,7 @@ pub fn forget_image(key : String) -> Unit {
     }
     None => ()
   }
+  image_invalidate_epoch.v = image_invalidate_epoch.v + 1
   image_bump_rev()
 }
 
@@ -175,8 +224,47 @@ pub fn image_rasterize_vector(key : String, px : Int) -> Option[(Int, Int, Array
 /// Ensure a host decode entry exists for `key` at `px` and poll its readiness.
 /// Returns Option[(host_id, w, h)] when ready.
 pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Option[(Int, Double, Double)] {
-  let _ = image_rev.v.get()
   let req_px = if px <= 0 { 256 } else { px }
+  if bypass_glyph_atlas_writes.v {
+    match frame_image_obs.get(image_obs_key(key, req_px)) {
+      Some(Some((hid, w, h))) => {
+        let mut live = false
+        match image_cache.get(key) {
+          Some(list) => {
+            for e in list {
+              if e.id == hid && e.state == 1 {
+                live = true
+                break
+              }
+            }
+          }
+          None => ()
+        }
+        if live {
+          return Some((hid, w, h))
+        }
+      }
+      Some(None) => return None
+      None => ()
+    }
+    match image_cache.get(key) {
+      Some(list) => {
+        let mut best_ready : Option[ImageEntry] = None
+        for e in list {
+          if e.state == 1 {
+            best_ready = Some(e)
+          }
+        }
+        return match best_ready {
+          Some(e) => Some((e.id, e.w, e.h))
+          None => None
+        }
+      }
+      None => return None
+    }
+  }
+  image_resolve_transitional.v = false
+  let _ = image_rev.v.get()
   let list = match image_cache.get(key) {
     Some(l) => l
     None => {
@@ -198,6 +286,9 @@ pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Op
         e.h = info[1]
         e.ready_at = now
         image_bytes_total.v = image_bytes_total.v + e.w * e.h * 4.0
+        if image_list_has_transitional(list) {
+          image_invalidate_epoch.v = image_invalidate_epoch.v + 1
+        }
       } else if st < 0 {
         e.state = -1
       }
@@ -212,28 +303,28 @@ pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Op
   if !has_target {
     let id = match image_vector_drawers.get(key) {
       Some(draw) =>
-        match image_data.get(key) {
-          Some(bytes) =>
-            match draw(bytes, req_px) {
-              Some((vw, vh, rgba_arr)) if vw > 0 && vh > 0 && rgba_arr.length() >= vw * vh * 4 => {
-                let png_bytes = pixels::png(vw, vh, image_bytes_from_arr(rgba_arr))
-                let max_side = if vw > vh { vw } else { vh }
-                hostapi::image_load_bytes(png_bytes, max_side)
-              }
-              _ => 0
-            }
-          None => 0
+      match image_data.get(key) {
+        Some(bytes) =>
+        match draw(bytes, req_px) {
+          Some((vw, vh, rgba_arr)) if vw > 0 && vh > 0 && rgba_arr.length() >= vw * vh * 4 => {
+            let png_bytes = pixels::png(vw, vh, image_bytes_from_arr(rgba_arr))
+            let max_side = if vw > vh { vw } else { vh }
+            hostapi::image_load_bytes(png_bytes, max_side)
+          }
+          _ => 0
         }
+        None => 0
+      }
       None =>
-        match image_data.get(key) {
-          Some(bytes) => hostapi::image_load_bytes(bytes, req_px)
-          None =>
-            if str_has_prefix(key, "mem:") {
-              0
-            } else {
-              hostapi::image_load(key, req_px)
-            }
+      match image_data.get(key) {
+        Some(bytes) => hostapi::image_load_bytes(bytes, req_px)
+        None =>
+        if str_has_prefix(key, "mem:") {
+          0
+        } else {
+          hostapi::image_load(key, req_px)
         }
+      }
     }
     if id > 0 {
       let entry = ImageEntry::{ id, px: req_px, state: 0, w: 0.0, h: 0.0, used: frame_no, ready_at: 0.0 }
@@ -245,6 +336,9 @@ pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Op
         entry.h = info[1]
         entry.ready_at = now
         image_bytes_total.v = image_bytes_total.v + entry.w * entry.h * 4.0
+        if image_list_has_transitional(list) {
+          image_invalidate_epoch.v = image_invalidate_epoch.v + 1
+        }
         best_ready = Some(entry)
       } else if st < 0 {
         entry.state = -1
@@ -252,13 +346,24 @@ pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Op
       list.push(entry)
     }
   }
-  match best_ready {
+  let res = match best_ready {
     Some(e) => {
       e.used = frame_no
+      if e.px == 0 || (e.px < req_px && image_list_has_pending(list)) {
+        image_resolve_transitional.v = true
+      }
       Some((e.id, e.w, e.h))
     }
     None => None
   }
+  if image_obs_recording.v {
+    frame_image_obs[image_obs_key(key, req_px)] = res
+  }
+  match image_obs_block_sink.v {
+    Some(sink) => sink.push((image_obs_key(key, req_px), res))
+    None => ()
+  }
+  res
 }
 
 /// Whether a decode of `key` large enough for `px` is ready (subscribes to `image_rev`, never starts a decode).
@@ -277,6 +382,9 @@ pub fn image_ready_at(key : String, px : Double) -> Bool {
             e.h = info[1]
             e.ready_at = hostapi::now()
             image_bytes_total.v = image_bytes_total.v + e.w * e.h * 4.0
+            if image_list_has_transitional(list) {
+              image_invalidate_epoch.v = image_invalidate_epoch.v + 1
+            }
           } else if st < 0 {
             e.state = -1
           }
@@ -337,4 +445,6 @@ pub fn images_reset() -> Unit {
   image_data.clear()
   image_vector_drawers.clear()
   image_bytes_total.v = 0.0
+  image_invalidate_epoch.v = image_invalidate_epoch.v + 1
+  image_obs_end_frame()
 }
