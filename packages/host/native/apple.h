@@ -66,6 +66,10 @@ id<MTLTexture> mb_image_texture(int iid);
 // MB_STREAM_TEX + sid is it (src/hostapi/stream.mbt)
 #define MB_STREAM_TEX 4194304
 id<MTLTexture> mb_stream_texture(int sid);
+// the frame stream sid shows, whole, read back as top-down BGRA sRGB on a background queue for an app's own native code
+// (NULL: not read); 1 asked, 0 none shown
+typedef void (*mb_stream_grabbed_fn)(void *arg, const unsigned char *rows, int w, int h, int pitch, double ts);
+int mb_stream_grab(int sid, mb_stream_grabbed_fn done, void *arg);
 // offscreen physical-pixel tile layers (apple_render.m): an instance's image MB_LAYER_TEX + id is layer `id`
 #define MB_LAYER_TEX 12582912
 int32_t mb_host_layer_supported(void);
