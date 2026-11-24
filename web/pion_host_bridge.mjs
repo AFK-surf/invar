@@ -1927,6 +1927,9 @@ export function attachHostBridge(rt, perfHooks = {}) {
     getenv() {
       return 0n;
     },
+    fflush() {
+      return 0;
+    },
   };
 
   Object.assign(rt.imports.pion_rt, bridge);
