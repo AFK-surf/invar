@@ -2,6 +2,8 @@
 // input injection, incremental a11y verification, and unasked_faults checking.
 // Ported from libs/mbui/src/ui/tester.mbt, tester_time.mbt, tester_unasked.mbt.
 
+import "damage"
+import "halt"
 import "hostapi"
 import "view"
 
@@ -72,6 +74,26 @@ fn test_env_fps() -> Double {
   }
 }
 
+let tester_halt_intercept : signals::Ref[Option[(String) -> Unit]] = ref_new(None)
+
+fn tester_halt(msg : String) -> Unit {
+  match tester_halt_intercept.v {
+    Some(f) => f(msg)
+    None => {
+      let _ : Unit = halt::halt(msg)
+    }
+  }
+}
+
+fn tester_capture_halts(f : () -> Unit) -> Array[String] {
+  let caught : Array[String] = []
+  let prev = tester_halt_intercept.v
+  tester_halt_intercept.v = Some(fn(msg : String) { caught.push(msg) })
+  f()
+  tester_halt_intercept.v = prev
+  caught
+}
+
 /// Deterministic pure-tree UI test driver backed by FakeHost.
 pub struct Tester {
   pub fake : FakeHost
@@ -81,6 +103,13 @@ pub struct Tester {
   pub mut unasked_issues : Array[String]
   pub mut a11y_issues : Array[String]
   pub mut disposed : Bool
+  mut looks_on : Bool
+  ref_dmg : damage::Damage
+  ref_dmg_by_wid : Map[Int, damage::Damage]
+  ref_light_by_wid : Map[Int, Double]
+  ref_atlas_by_wid : Map[Int, Int]
+  mut saved_pointing : Option[Option[Pointing]]
+  mut touch_active : Bool
 }
 
 /// Create a pure-tree Tester, install FakeHost, build the tree, and render frame 0.
@@ -122,7 +151,15 @@ pub fn Tester::tree(
     unasked_issues: [],
     a11y_issues: [],
     disposed: false,
+    looks_on: true,
+    ref_dmg: damage::Damage::new(),
+    ref_dmg_by_wid: Map::new(),
+    ref_light_by_wid: Map::new(),
+    ref_atlas_by_wid: Map::new(),
+    saved_pointing: None,
+    touch_active: false,
   }
+  t.install_looks_hook()
   t.frame()
   t
 }
@@ -147,6 +184,10 @@ pub fn Tester::frame(self : Tester, ms~ : Double = 0.0) -> Unit {
   tree.wake().is_some()
   self.fake.frame_requested = false
   self.fake.non_clock_requested = false
+  if self.looks_on && in_frame_looks_hook.v.is_none() {
+    self.seed_all_ref_windows()
+    self.install_looks_hook()
+  }
   let changed = view_frame(self.fake.width, self.fake.height, self.fake.scale, self.fake.now_ms)
   if !was_asked && changed && self.fake.frame_count > 1 {
     self.unasked_issues.push("unasked frame at \{self.fake.now_ms}ms drew changed scene")
@@ -630,8 +671,517 @@ pub fn Tester::dispose(self : Tester) -> Unit {
     return
   }
   self.disposed = true
+  self.restore_touch_pointing()
+  self.looks_on = false
+  self.ref_dmg.forget()
+  self.ref_dmg_by_wid.clear()
+  self.ref_light_by_wid.clear()
+  self.ref_atlas_by_wid.clear()
+  set_in_frame_looks_hook(None)
   reset_press_rules()
   view_forget()
   active_fake_host.v = None
   let _ = hostapi::set_host(self.prev_host)
+}
+
+/// Draw at least one frame and continue up to 3 rounds while independent non-clock work remains pending.
+/// Halts with the exact non-converged flags if non-clock work is still pending after 3 frames.
+pub fn Tester::draw(self : Tester) -> Unit {
+  let mut round = 0
+  while round < 3 {
+    self.frame()
+    round += 1
+    let posted_pending = self.fake.posted.length() > 0 || self.fake.post_take_buf.length() > 0
+    let pending_msgs = messages_pending_count() > 0
+    let pending_after = after_frame_cbs.length() > 0
+    let pending = self.fake.non_clock_requested || posted_pending || pending_msgs || frame_woken.v || pending_after
+    if !pending {
+      return
+    }
+  }
+  let reasons : Array[String] = []
+  if self.fake.non_clock_requested {
+    reasons.push("non_clock_requested")
+  }
+  if self.fake.posted.length() > 0 || self.fake.post_take_buf.length() > 0 {
+    reasons.push("posted_pending(\{self.fake.posted.length() + self.fake.post_take_buf.length()})")
+  }
+  if messages_pending_count() > 0 {
+    reasons.push("messages_pending(\{messages_pending_count()})")
+  }
+  if frame_woken.v {
+    reasons.push("frame_woken")
+  }
+  if after_frame_cbs.length() > 0 {
+    reasons.push("after_frame_cbs(\{after_frame_cbs.length()})")
+  }
+  let mut detail = ""
+  let mut i = 0
+  while i < reasons.length() {
+    if i > 0 {
+      detail = detail + ", "
+    }
+    detail = detail + reasons[i]
+    i += 1
+  }
+  tester_halt("Tester::draw did not settle after 3 frames: \{detail}")
+}
+
+/// Concatenate `unasked_faults() ++ ui_craft_audit() ++ contrast_faults()` without deduplication.
+pub fn Tester::audit(self : Tester) -> Array[String] {
+  let out : Array[String] = []
+  for f in self.unasked_faults() {
+    out.push(f)
+  }
+  for f in self.ui_craft_audit() {
+    out.push(f)
+  }
+  for f in self.contrast_faults() {
+    out.push(f)
+  }
+  out
+}
+
+fn normalize_looks_damage(rep : DamageReport) -> DamageReport {
+  match rep {
+    DamageReport::Full => DamageReport::Full
+    DamageReport::None => DamageReport::None
+    DamageReport::Rects(rs) => {
+      if rs.length() == 0 {
+        return DamageReport::None
+      }
+      let out : Array[(Double, Double, Double, Double)] = []
+      for r in rs {
+        if r.2 < 0.0 || r.3 < 0.0 {
+          return DamageReport::Full
+        }
+        if r.2 > 0.0 && r.3 > 0.0 {
+          out.push(r)
+        }
+      }
+      if out.length() == 0 {
+        DamageReport::None
+      } else {
+        DamageReport::Rects(out)
+      }
+    }
+  }
+}
+
+fn sort_unique_doubles(arr : Array[Double]) -> Array[Double] {
+  let n = arr.length()
+  let mut i = 1
+  while i < n {
+    let key = arr[i]
+    let mut j = i - 1
+    while j >= 0 && arr[j] > key {
+      arr[j + 1] = arr[j]
+      j -= 1
+    }
+    arr[j + 1] = key
+    i += 1
+  }
+  let out : Array[Double] = []
+  for v in arr {
+    if out.length() == 0 || (v - out[out.length() - 1]).abs() > 1.0e-9 {
+      out.push(v)
+    }
+  }
+  out
+}
+
+/// Verify that the 2D union of `cover` rectangles covers 100% of `(tx, ty, tw, th)`.
+/// Returns `None` when fully covered, or `Some((ux, uy, uw, uh))` for the first uncovered cell.
+fn rects_union_covers_rect(
+  cover : Array[(Double, Double, Double, Double)],
+  tx : Double,
+  ty : Double,
+  tw : Double,
+  th : Double,
+) -> Option[(Double, Double, Double, Double)] {
+  if tw <= 1.0e-6 || th <= 1.0e-6 {
+    return None
+  }
+  let eps = 1.0e-6
+  let tx0 = tx
+  let ty0 = ty
+  let tx1 = tx + tw
+  let ty1 = ty + th
+  let raw_xs : Array[Double] = [tx0, tx1]
+  let raw_ys : Array[Double] = [ty0, ty1]
+  let clipped : Array[(Double, Double, Double, Double)] = []
+  for c in cover {
+    if c.2 <= 0.0 || c.3 <= 0.0 {
+      continue
+    }
+    let cx0 = c.0 - eps
+    let cy0 = c.1 - eps
+    let cx1 = c.0 + c.2 + eps
+    let cy1 = c.1 + c.3 + eps
+    if cx1 <= tx0 || cx0 >= tx1 || cy1 <= ty0 || cy0 >= ty1 {
+      continue
+    }
+    let ix0 = dclamp(cx0, tx0, tx1)
+    let iy0 = dclamp(cy0, ty0, ty1)
+    let ix1 = dclamp(cx1, tx0, tx1)
+    let iy1 = dclamp(cy1, ty0, ty1)
+    clipped.push((ix0, iy0, ix1, iy1))
+    raw_xs.push(ix0)
+    raw_xs.push(ix1)
+    raw_ys.push(iy0)
+    raw_ys.push(iy1)
+  }
+  if clipped.length() == 0 {
+    return Some((tx, ty, tw, th))
+  }
+  let xs = sort_unique_doubles(raw_xs)
+  let ys = sort_unique_doubles(raw_ys)
+  let mut ix = 0
+  while ix + 1 < xs.length() {
+    let x0 = xs[ix]
+    let x1 = xs[ix + 1]
+    if x1 - x0 > 1.0e-6 {
+      let mx = (x0 + x1) * 0.5
+      let mut iy = 0
+      while iy + 1 < ys.length() {
+        let y0 = ys[iy]
+        let y1 = ys[iy + 1]
+        if y1 - y0 > 1.0e-6 {
+          let my = (y0 + y1) * 0.5
+          let mut hit = false
+          for r in clipped {
+            if r.0 <= mx && mx <= r.2 && r.1 <= my && my <= r.3 {
+              hit = true
+              break
+            }
+          }
+          if !hit {
+            return Some((x0, y0, x1 - x0, y1 - y0))
+          }
+        }
+        iy += 1
+      }
+    }
+    ix += 1
+  }
+  None
+}
+
+fn Tester::ref_dmg_for(self : Tester, wid : Int) -> damage::Damage {
+  if wid == 0 {
+    return self.ref_dmg
+  }
+  match self.ref_dmg_by_wid.get(wid) {
+    Some(d) => d
+    None => {
+      let d = damage::Damage::new()
+      self.ref_dmg_by_wid[wid] = d
+      d
+    }
+  }
+}
+
+fn Tester::verify_looks_frame(
+  self : Tester,
+  prod : Scene,
+  ref_sc : Scene,
+  rep : DamageReport,
+  w : Double,
+  h : Double,
+  scale : Double,
+  bg_r : Double,
+  bg_g : Double,
+  bg_b : Double,
+) -> Unit {
+  if prod.ninst != ref_sc.ninst {
+    tester_halt("check_looks: instance count mismatch (prod=\{prod.ninst}, ref=\{ref_sc.ninst})")
+    return
+  }
+  let mut k = 0
+  while k < prod.ninst {
+    let b = k * inst_size
+    let mut j = 0
+    while j < inst_size {
+      let a = prod.inst[b + j]
+      let r = ref_sc.inst[b + j]
+      if !(a == r || (a - r).abs() <= 1.0e-9) {
+        tester_halt("check_looks: inst[\{k}] slot \{j} mismatch (prod=\{a}, ref=\{r})")
+        return
+      }
+      j += 1
+    }
+    k += 1
+  }
+  if prod.segs.length() != ref_sc.segs.length() {
+    tester_halt("check_looks: segs length mismatch (prod=\{prod.segs.length()}, ref=\{ref_sc.segs.length()})")
+    return
+  }
+  let mut si = 0
+  while si < prod.segs.length() {
+    let sa = prod.segs[si]
+    let sr = ref_sc.segs[si]
+    if !(sa == sr || (sa - sr).abs() <= 1.0e-9) {
+      tester_halt("check_looks: segs[\{si}] mismatch (prod=\{sa}, ref=\{sr})")
+      return
+    }
+    si += 1
+  }
+  let wid = current_window_id()
+  let cur_light = view_app.last_light_angle
+  let cur_atlas = view_app.last_atlas_gen
+  let light_changed = match self.ref_light_by_wid.get(wid) {
+    Some(prev_la) => (cur_light - prev_la).abs() > 1.0e-6
+    None => false
+  }
+  let atlas_changed = match self.ref_atlas_by_wid.get(wid) {
+    Some(prev_ag) => cur_atlas != prev_ag
+    None => false
+  }
+  self.ref_light_by_wid[wid] = cur_light
+  self.ref_atlas_by_wid[wid] = cur_atlas
+  let ref_dmg = self.ref_dmg_for(wid)
+  let exp_raw = ref_dmg.next(ref_sc.inst, ref_sc.ninst, w, h, scale, bg_r, bg_g, bg_b)
+  let expected = if light_changed || atlas_changed {
+    DamageReport::Full
+  } else {
+    normalize_looks_damage(DamageReport::Rects(exp_raw))
+  }
+  let actual = normalize_looks_damage(rep)
+  match actual {
+    DamageReport::Full => ()
+    DamageReport::None =>
+    match expected {
+      DamageReport::None => ()
+      DamageReport::Full =>
+      tester_halt("check_looks: actual damage is None, expected Full")
+      DamageReport::Rects(e_rects) =>
+      tester_halt("check_looks: actual damage is None, expected \{e_rects.length()} rect(s)")
+    }
+    DamageReport::Rects(a_rects) =>
+    match expected {
+      DamageReport::None => ()
+      DamageReport::Full =>
+      if w > 0.0 && h > 0.0 {
+        match rects_union_covers_rect(a_rects, 0.0, 0.0, w, h) {
+          Some((ux, uy, uw, uh)) =>
+          tester_halt(
+            "check_looks: actual damage rects do not cover Full viewport (uncovered=(\{ux}, \{uy}, \{uw}, \{uh}))",
+          )
+          None => ()
+        }
+      }
+      DamageReport::Rects(e_rects) => {
+        for e in e_rects {
+          match rects_union_covers_rect(a_rects, e.0, e.1, e.2, e.3) {
+            Some((ux, uy, uw, uh)) => {
+              tester_halt(
+                "check_looks: actual damage union missed expected (\{e.0}, \{e.1}, \{e.2}, \{e.3}) at (\{ux}, \{uy}, \{uw}, \{uh})",
+              )
+              return
+            }
+            None => ()
+          }
+        }
+      }
+    }
+  }
+}
+
+fn Tester::install_looks_hook(self : Tester) -> Unit {
+  set_in_frame_looks_hook(
+    Some(fn(
+      prod : Scene,
+      ref_sc : Scene,
+      rep : DamageReport,
+      w : Double,
+      h : Double,
+      scale : Double,
+      bg_r : Double,
+      bg_g : Double,
+      bg_b : Double,
+    ) {
+      self.verify_looks_frame(prod, ref_sc, rep, w, h, scale, bg_r, bg_g, bg_b)
+    }),
+  )
+}
+
+fn Tester::seed_one_ref_window(self : Tester, wid : Int) -> Unit {
+  let sc = view_scene_last()
+  if sc.width > 0.0 && sc.height > 0.0 {
+    let dmg = self.ref_dmg_for(wid)
+    let _ = dmg.next(
+      sc.inst,
+      sc.ninst,
+      sc.width,
+      sc.height,
+      sc.scale,
+      view_app.last_bg_r,
+      view_app.last_bg_g,
+      view_app.last_bg_b,
+    )
+    self.ref_light_by_wid[wid] = view_app.last_light_angle
+    self.ref_atlas_by_wid[wid] = view_app.last_atlas_gen
+  }
+}
+
+fn Tester::seed_all_ref_windows(self : Tester) -> Unit {
+  self.ref_dmg.forget()
+  self.ref_dmg_by_wid.clear()
+  self.ref_light_by_wid.clear()
+  self.ref_atlas_by_wid.clear()
+  let cur_wid = current_window_id()
+  let wids : Array[Int] = [0]
+  for pair in windows_open_here() {
+    let wid = pair.0
+    if wid != 0 && !wids.contains(wid) {
+      wids.push(wid)
+    }
+  }
+  for wid in wids {
+    if wid == cur_wid {
+      self.seed_one_ref_window(wid)
+    } else {
+      in_window(wid, fn() { self.seed_one_ref_window(wid) })
+    }
+  }
+}
+
+/// Enable or disable per-Tester in-frame reference-scene & damage coverage verification (default `true`).
+pub fn Tester::check_looks(self : Tester, on : Bool) -> Unit {
+  if !on {
+    self.looks_on = false
+    set_in_frame_looks_hook(None)
+    return
+  }
+  if !self.looks_on {
+    self.seed_all_ref_windows()
+    self.looks_on = true
+  }
+  self.install_looks_hook()
+}
+
+fn Tester::restore_touch_pointing(self : Tester) -> Unit {
+  match self.saved_pointing {
+    Some(prev) => {
+      self.saved_pointing = None
+      self.touch_active = false
+      set_pointing(prev)
+    }
+    None => {
+      self.touch_active = false
+    }
+  }
+}
+
+/// Inject a touch event (`kind`: 0=down, 1=move, 2=up, 3=cancel) at `(x, y)` using `self.fake.now_ms`
+/// and a stable touch id without advancing a frame. Preserves and restores prior `Option[Pointing]`.
+pub fn Tester::touch(self : Tester, kind : Int, x : Double, y : Double) -> Unit {
+  if !self.touch_active {
+    self.saved_pointing = Some(said_pointing.v)
+    self.touch_active = true
+    set_pointing(Some(Pointing::Finger))
+  }
+  view_host_pointer(10 + kind, x, y, 1, self.fake.now_ms)
+  self.fake.frame_requested = true
+  if kind == 2 || kind == 3 {
+    self.restore_touch_pointing()
+  }
+}
+
+/// Extract visible text for a drawn node (`field` display/placeholder, rich `runs`, or plain `words`).
+/// Returns empty string for skeleton (`bones`) nodes.
+fn drawn_words_found(tree : view::Tree, d : view::Drawn) -> String {
+  if tree.bones_of(d.id) != 0L {
+    return ""
+  }
+  match field_display_or_hint(d.id) {
+    Some(txt) => txt
+    None =>
+    if d.runs.length() > 0 {
+      let sb = StringBuilder::new()
+      for r in d.runs {
+        sb.write_string(r.text)
+      }
+      sb.to_string()
+    } else {
+      d.words
+    }
+  }
+}
+
+fn Tester::find_text_rects(
+  self : Tester,
+  s : String,
+) -> Option[((Double, Double, Double, Double), (Double, Double, Double, Double))] {
+  if s.length() == 0 {
+    return None
+  }
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return None
+  }
+  let sc = view_scene_last()
+  let vw = if sc.width > 0.0 { sc.width } else { self.fake.width }
+  let vh = if sc.height > 0.0 { sc.height } else { self.fake.height }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let mut i = 0
+  while i < n {
+    let d = held[i].0
+    if d.alpha > 0.0 && d.w > 0.0 && d.h > 0.0 && tree.bones_of(d.id) == 0L {
+      let (vx0, vy0, vx1, vy1) = clipped_visible_rect(held, i, vw, vh)
+      if vx1 > vx0 && vy1 > vy0 {
+        let txt = drawn_words_found(tree, d)
+        if txt.length() > 0 && (txt == s || str_contains(txt, s)) {
+          return Some(((d.x, d.y, d.w, d.h), (vx0, vy0, vx1, vy1)))
+        }
+      }
+    }
+    i += 1
+  }
+  None
+}
+
+/// Return the unclipped `(x, y, w, h)` of the first visible drawn node whose text contains `s`.
+/// Skips invisible (`alpha <= 0.0`), zero-size, skeleton (`bones`), and completely clipped nodes.
+pub fn Tester::rect_of(self : Tester, s : String) -> Option[(Double, Double, Double, Double)] {
+  match self.find_text_rects(s) {
+    Some((unclipped, _)) => Some(unclipped)
+    None => None
+  }
+}
+
+/// Tap the center of the visible clipped area of the first node matching `s`, or halt if no such text is on screen.
+pub fn Tester::tap_text(self : Tester, s : String) -> Unit {
+  match self.find_text_rects(s) {
+    Some((_, (vx0, vy0, vx1, vy1))) => self.tap((vx0 + vx1) * 0.5, (vy0 + vy1) * 0.5)
+    None => tester_halt("no text \"\{s}\" on screen")
+  }
+}
+
+fn pack_rgba_channel(v : Double) -> Int64 {
+  let c = dclamp(v, 0.0, 1.0)
+  let i = (c * 255.0 + 0.5).floor().to_int64()
+  if i < 0L { 0L } else if i > 255L { 255L } else { i }
+}
+
+/// Return all rectangle primitives (`slot 5 == 0.0`) from the last rendered scene as `(x, y, w, h, 0xRRGGBBAA)`.
+pub fn Tester::drawn_rects(self : Tester) -> Array[(Double, Double, Double, Double, Int64)] {
+  let _ = self
+  let sc = view_scene_last()
+  let out : Array[(Double, Double, Double, Double, Int64)] = []
+  let mut k = 0
+  while k < sc.ninst {
+    let b = k * inst_size
+    if sc.inst[b + 5] == 0.0 {
+      let r = pack_rgba_channel(sc.inst[b + 8])
+      let g = pack_rgba_channel(sc.inst[b + 9])
+      let bl = pack_rgba_channel(sc.inst[b + 10])
+      let a = pack_rgba_channel(sc.inst[b + 11])
+      let col = (r << 24) | (g << 16) | (bl << 8) | a
+      out.push((sc.inst[b], sc.inst[b + 1], sc.inst[b + 2], sc.inst[b + 3], col))
+    }
+    k += 1
+  }
+  out
 }

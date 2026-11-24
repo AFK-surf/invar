@@ -1,0 +1,1165 @@
+// Phase-1 high-frequency ui::Tester tests:
+// - check_looks: 5 poison counter-proofs, pure vector underlay, off->change->on->unchanged,
+//   resize (0,0,-1,-1) sentinel, drain_after_frame, multi-rect union coverage (exact & 1px gap),
+//   and zero side effects on view_paint_work / glyph atlas / host callbacks
+// - draw(): 1-frame, 2-3 frame convergence, clock animation non-looping, 3rd-round halt with flags
+// - audit(): exact unasked_faults ++ ui_craft_audit ++ contrast_faults without deduplication
+// - touch(): Option[Pointing] (None vs Some(Mouse)) restore on up/cancel/dispose, no auto-frame
+// - rect_of / tap_text: words, runs, field (value/secret/IME/placeholder), skip alpha<=0/zero-size/
+//   bones/clipped, unclipped coordinates, exact missing-text halt
+// - drawn_rects: slot 5 == 0.0 filter and 0xRRGGBBAA packing
+
+import "hostapi"
+import "paint"
+import "signals"
+import "text"
+import "view"
+
+fn p1_opt_rect_near(
+  got : Option[(Double, Double, Double, Double)],
+  ex : Double,
+  ey : Double,
+  ew : Double,
+  eh : Double,
+) -> Bool {
+  match got {
+    Some((x, y, w, h)) =>
+    (x - ex).abs() < 0.5 && (y - ey).abs() < 0.5 && (w - ew).abs() < 0.5 && (h - eh).abs() < 0.5
+    None => false
+  }
+}
+
+fn p1_opt_pointing_is_none(p : Option[Pointing]) -> Bool {
+  match p {
+    None => true
+    Some(_) => false
+  }
+}
+
+fn p1_opt_pointing_is_mouse(p : Option[Pointing]) -> Bool {
+  match p {
+    Some(Pointing::Mouse) => true
+    _ => false
+  }
+}
+
+test "phase1 check_looks: 5 poison counter-proofs fail then recover" {
+  // 1. set_view_block_poison(true) stale cache block
+  let col1 = signals::signal(rgba(220, 40, 40, 255))
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = b.ground(view::Live::By(fn() { col1.get() }))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  set_view_block_poison(true)
+  col1.set(rgba(40, 200, 40, 255))
+  let h1 = tester_capture_halts(fn() { t1.frame() })
+  debug_assert(h1.length() == 1 && str_contains(h1[0], "mismatch"), "poison 1 (stale view_block) must trigger check_looks halt")
+  set_view_block_poison(false)
+  let h1_ok = tester_capture_halts(fn() { t1.frame() })
+  debug_assert(h1_ok.length() == 0, "poison 1 must recover cleanly once unpoisoned")
+  t1.dispose()
+
+  // 2. 100x100 color change paired with DamageReport::None poison
+  let col2 = signals::signal(rgba(200, 30, 30, 255))
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = b.ground(view::Live::By(fn() { col2.get() }))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  set_damage_report_poison(Some(DamageReport::None))
+  col2.set(rgba(30, 30, 220, 255))
+  let h2 = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h2.length() == 1 && str_contains(h2[0], "actual damage is None"), "poison 2 (100x100 change + None) must halt")
+  set_damage_report_poison(None)
+  col2.set(rgba(30, 180, 180, 255))
+  let h2_ok = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h2_ok.length() == 0, "poison 2 must recover cleanly")
+  t2.dispose()
+
+  // 3. 100x100 color change paired with 1x1 tiny rect poison
+  let col3 = signals::signal(rgba(200, 30, 30, 255))
+  let t3 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = b.ground(view::Live::By(fn() { col3.get() }))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  set_damage_report_poison(Some(DamageReport::Rects([(0.0, 0.0, 1.0, 1.0)])))
+  col3.set(rgba(30, 220, 30, 255))
+  let h3 = tester_capture_halts(fn() { t3.frame() })
+  debug_assert(h3.length() == 1 && str_contains(h3[0], "missed expected"), "poison 3 (100x100 change + 1x1 rect) must halt")
+  set_damage_report_poison(None)
+  col3.set(rgba(220, 220, 30, 255))
+  let h3_ok = tester_capture_halts(fn() { t3.frame() })
+  debug_assert(h3_ok.length() == 0, "poison 3 must recover cleanly")
+  t3.dispose()
+
+  // 4. Moving element omitting old rect poison (only reports new rect)
+  let pos_x = signals::signal(10.0)
+  let t4 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.over_at(view::Live::By(fn() { (Some(pos_x.get()), Some(20.0), None, None) }))
+        let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(60.0)))
+        let _ = b.ground(view::Live::Is(rgba(80, 120, 220, 255)))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  // Move from x=10 to x=220, but poison damage to only report the new rect [216..284, 16..84]
+  set_damage_report_poison(Some(DamageReport::Rects([(216.0, 16.0, 68.0, 68.0)])))
+  pos_x.set(220.0)
+  let h4 = tester_capture_halts(fn() { t4.frame() })
+  debug_assert(h4.length() == 1 && str_contains(h4[0], "missed expected"), "poison 4 (move omitting old rect) must halt")
+  set_damage_report_poison(None)
+  pos_x.set(100.0)
+  let h4_ok = tester_capture_halts(fn() { t4.frame() })
+  debug_assert(h4_ok.length() == 0, "poison 4 must recover cleanly")
+  t4.dispose()
+
+  // 5. Deleting element omitting old rect poison
+  let show_el = signals::signal(true)
+  let t5 = Tester::tree(
+    fn(root : view::View) {
+      root.show(fn() { show_el.get() }, fn(b : view::View) {
+        let _ = b.over_at(view::Live::Is((Some(40.0), Some(40.0), None, None)))
+        let _ = b.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(80.0)))
+        let _ = b.ground(view::Live::Is(rgba(220, 80, 120, 255)))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  // Delete element at (40,40,80,80), but poison damage to report an unrelated far rect
+  set_damage_report_poison(Some(DamageReport::Rects([(300.0, 200.0, 20.0, 20.0)])))
+  show_el.set(false)
+  let h5 = tester_capture_halts(fn() { t5.frame() })
+  debug_assert(h5.length() == 1 && str_contains(h5[0], "missed expected"), "poison 5 (delete omitting old rect) must halt")
+  set_damage_report_poison(None)
+  show_el.set(true)
+  let h5_ok = tester_capture_halts(fn() { t5.frame() })
+  debug_assert(h5_ok.length() == 0, "poison 5 must recover cleanly")
+  t5.dispose()
+}
+
+test "phase1 check_looks: vector underlay, off->change->on->unchanged, resize sentinel, after_frame, multi-rect union, zero side effects" {
+  // 1. Pure vector underlay & underlay-only color change with DamageReport::None poison
+  let ul_col = signals::signal(rgba(255, 0, 0, 255))
+  let t = Tester::tree(fn(_root : view::View) { () }, width=400.0, height=300.0)
+  let tri : Array[(Array[Double], Bool)] = [([10.0, 10.0, 110.0, 10.0, 60.0, 110.0], true)]
+  set_underlay_painter(Some(fn(sc : Scene, _w : Double, _h : Double, _s : Double, _now : Double) {
+    sc.emit_vector(0.0, 0.0, tri, fill=true, color=ul_col.untracked())
+  }))
+  let h_ul0 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h_ul0.length() == 0, "pure vector underlay must pass check_looks")
+  set_damage_report_poison(Some(DamageReport::None))
+  ul_col.set(rgba(0, 0, 255, 255))
+  let h_ul1 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h_ul1.length() == 1 && str_contains(h_ul1[0], "actual damage is None"), "underlay-only color change + None poison must halt")
+  set_damage_report_poison(None)
+  ul_col.set(rgba(0, 200, 0, 255))
+  let h_ul2 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h_ul2.length() == 0, "underlay color change must pass without poison")
+  set_underlay_painter(None)
+  t.dispose()
+
+  // 2. off -> change -> on -> unchanged must NOT false-positive (ref_dmg seeded on false -> true)
+  let c_sig = signals::signal(rgba(10, 20, 30, 255))
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(100.0)))
+        let _ = b.ground(view::Live::By(fn() { c_sig.get() }))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t2.check_looks(false)
+  c_sig.set(rgba(200, 100, 50, 255))
+  t2.frame()
+  t2.check_looks(true)
+  let h_seed = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_seed.length() == 0, "off -> change -> on -> unchanged must not false-positive")
+
+  // 3. Resize (0, 0, -1, -1) sentinel normalization on both actual & expected sides
+  set_damage_report_poison(Some(DamageReport::Rects([(0.0, 0.0, -1.0, -1.0)])))
+  let h_res = tester_capture_halts(fn() { t2.resize(500.0, 350.0) })
+  debug_assert(h_res.length() == 0, "resize sentinel (0,0,-1,-1) must normalize to Full on both sides")
+  set_damage_report_poison(None)
+
+  // 4. drain_after_frame post-frame tree mutation must not false-positive
+  after_frame(fn() { c_sig.set(rgba(90, 40, 210, 255)) })
+  let h_af1 = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_af1.length() == 0, "frame running drain_after_frame mutation must pass")
+  let h_af2 = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_af2.length() == 0, "next frame rendering after_frame mutation must pass")
+
+  // 5. Multi-rect union tiling coverage: 2 rects that individually don't contain [0..102, 0..102]
+  //    but whose union covers 100% passes; leaving a 1px gap fails!
+  //    Box is at (0,0,100,100) with reach_pad=2 -> expected damage is (0, 0, 102, 102)
+  set_damage_report_poison(Some(DamageReport::Rects([(0.0, 0.0, 51.0, 102.0), (51.0, 0.0, 51.0, 102.0)])))
+  c_sig.set(rgba(11, 22, 33, 255))
+  let h_tile_ok = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_tile_ok.length() == 0, "two rects whose union covers 100% of expected must pass")
+
+  // 1px vertical gap at x=[50, 51]
+  set_damage_report_poison(Some(DamageReport::Rects([(0.0, 0.0, 50.0, 102.0), (51.0, 0.0, 51.0, 102.0)])))
+  c_sig.set(rgba(44, 55, 66, 255))
+  let h_tile_gap = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_tile_gap.length() == 1 && str_contains(h_tile_gap[0], "missed expected"), "1px gap in multi-rect union must fail")
+  set_damage_report_poison(None)
+
+  // 6. Zero side effects on view_paint_work_now() & glyph atlas uploads
+  let word_sig = signals::signal("CheckZeroSideEffects")
+  t2.dispose()
+  let t3 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(48.0)))
+        let _ = b.words(view::Live::By(fn() { word_sig.get() }))
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  t3.check_looks(true)
+  view_paint_work_reset()
+  let puts_before_on = t3.fake.glyphs_put.length()
+  t3.frame()
+  let work_on = view_paint_work_now()
+  let puts_on = t3.fake.glyphs_put.length() - puts_before_on
+
+  t3.check_looks(false)
+  view_paint_work_reset()
+  let puts_before_off = t3.fake.glyphs_put.length()
+  t3.frame()
+  let work_off = view_paint_work_now()
+  let puts_off = t3.fake.glyphs_put.length() - puts_before_off
+  debug_assert(
+    work_on.made == work_off.made && work_on.copied == work_off.copied && work_on.handed == work_off.handed,
+    "check_looks(true) must have zero view_paint_work side effects",
+  )
+  debug_assert(puts_on == puts_off, "check_looks(true) must have zero glyph upload side effects")
+  t3.dispose()
+}
+
+test "phase1 draw: single-frame, 2-3 frame convergence, clock animation non-looping, and 3rd-round halt" {
+  // 1. Single-frame settle
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  let fc0 = t.fake.frame_count
+  t.draw()
+  debug_assert(t.fake.frame_count == fc0 + 1, "idle draw() must run exactly 1 frame")
+
+  // 2. 2-frame convergence via after_frame
+  let step2 = ref_new(0)
+  after_frame(fn() {
+    step2.v = step2.v + 1
+    hostapi::request_frame()
+  })
+  let fc1 = t.fake.frame_count
+  t.draw()
+  debug_assert(step2.v == 1 && t.fake.frame_count == fc1 + 2, "1-step after_frame request must settle in 2 frames")
+
+  // 3. 3-frame convergence via chained after_frame
+  let step3 = ref_new(0)
+  after_frame(fn() {
+    step3.v = step3.v + 1
+    hostapi::request_frame()
+    after_frame(fn() {
+      step3.v = step3.v + 1
+      wake_frame()
+    })
+  })
+  let fc2 = t.fake.frame_count
+  t.draw()
+  debug_assert(step3.v == 2 && t.fake.frame_count == fc2 + 3, "2-step chained work must settle in 3 frames")
+
+  // 4. Persistent non-clock work halts after round 3 with exact flag names
+  let hook_id = on_before_frame(fn() {
+    hostapi::request_frame()
+  })
+  let fc3 = t.fake.frame_count
+  let halts = tester_capture_halts(fn() { t.draw() })
+  remove_before_frame(hook_id)
+  debug_assert(t.fake.frame_count == fc3 + 3, "unsettled draw() must stop after 3 frames")
+  debug_assert(
+    halts.length() == 1 && str_contains(halts[0], "non_clock_requested"),
+    "unsettled draw() must halt naming non_clock_requested",
+  )
+  t.dispose()
+
+  // 5. Pure clock animation does NOT loop or halt, AND does NOT mask real non-clock work
+  let shifted = signals::signal(false)
+  let start_ms = signals::signal(0.0)
+  let t_clk = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0)))
+        let _ = b.moved_by(
+          fn(_w : Double, _h : Double, now : Double) {
+            if !shifted.get() {
+              (0.0, 0.0)
+            } else {
+              let p = dclamp((now - start_ms.get()) / 300.0, 0.0, 1.0)
+              (100.0 * p, 0.0)
+            }
+          },
+          fn(_w : Double, _h : Double) {
+            if shifted.get() { start_ms.get() + 300.0 } else { 0.0 }
+          },
+        )
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  view::transition(fn() {
+    start_ms.set(t_clk.time())
+    shifted.set(true)
+  })
+  t_clk.fake.now_ms = 16.0
+  let fc_clk0 = t_clk.fake.frame_count
+  let h_clk = tester_capture_halts(fn() { t_clk.draw() })
+  debug_assert(h_clk.length() == 0, "pure clock animation must not halt draw()")
+  debug_assert(t_clk.fake.frame_count == fc_clk0 + 1, "pure clock animation must run only 1 frame in draw()")
+
+  // Clock animation active + real non-clock work (wake_frame) must NOT be masked by clock_read()
+  let woke = ref_new(0)
+  on_frame_take(fn() { woke.v = woke.v + 1 })
+  after_frame(fn() { wake_frame() })
+  let fc_clk1 = t_clk.fake.frame_count
+  t_clk.draw()
+  debug_assert(woke.v == 1 && t_clk.fake.frame_count == fc_clk1 + 2, "clock_read() must not mask real non-clock wake_frame")
+  t_clk.dispose()
+}
+
+test "phase1 audit: exact concatenation unasked_faults ++ ui_craft_audit ++ contrast_faults without dedup" {
+  // Build a scene with:
+  // - 2 duplicate unasked_issues pushed to verify order & no dedup
+  // - a ui_craft_audit fault (tiny interactive button -> room_faults)
+  // - 2 identical low-contrast text nodes (same wording -> duplicate contrast_faults string!)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.ground(view::Live::Is(rgba(255, 255, 255, 255)))
+      let _ = root.box(fn(ghost : view::View) {
+        let _ = ghost.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+        let _ = ghost.alpha(view::Live::Is(0.0))
+        let _ = ghost.on_press(fn() { () })
+        let _ = ghost.says(view::Live::Is(Some(view::said(view::Role::Button, label="GhostBtn"))))
+      })
+      let _ = root.box(fn(w1 : view::View) {
+        let _ = w1.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(24.0)))
+        let _ = w1.words(view::Live::Is("Faint"), ink=rgba(245, 245, 245, 255))
+      })
+      let _ = root.box(fn(w2 : view::View) {
+        let _ = w2.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(24.0)))
+        let _ = w2.words(view::Live::Is("Faint"), ink=rgba(245, 245, 245, 255))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t.unasked_issues.push("dup-unasked")
+  t.unasked_issues.push("dup-unasked")
+  let u = t.unasked_faults()
+  let c = t.ui_craft_audit()
+  let k = t.contrast_faults()
+  debug_assert(u.length() == 2, "must have 2 unasked faults")
+  debug_assert(c.length() >= 1, "must have at least 1 ui_craft_audit fault")
+  debug_assert(k.length() == 2 && k[0] == k[1], "must have 2 identical contrast faults")
+  let all = t.audit()
+  debug_assert(all.length() == u.length() + c.length() + k.length(), "audit() must concatenate without deduplication")
+  let mut idx = 0
+  for f in u {
+    debug_assert(all[idx] == f, "unasked fault order mismatch at \{idx}")
+    idx += 1
+  }
+  for f in c {
+    debug_assert(all[idx] == f, "ui_craft_audit fault order mismatch at \{idx}")
+    idx += 1
+  }
+  for f in k {
+    debug_assert(all[idx] == f, "contrast fault order mismatch at \{idx}")
+    idx += 1
+  }
+  t.dispose()
+}
+
+test "phase1 touch: restores None and Some(Mouse) on up/cancel/dispose without advancing frame" {
+  // 1. Prior pointing = None
+  set_pointing(None)
+  let pressed = ref_new(0)
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(60.0)))
+        let _ = b.on_press(fn() { pressed.v = pressed.v + 1 })
+      })
+    },
+    width=400.0,
+    height=300.0,
+    platform=0,
+  )
+  debug_assert(p1_opt_pointing_is_none(said_pointing.v), "initial said_pointing must be None")
+  let fc0 = t1.fake.frame_count
+  t1.fake.frame_requested = false
+  t1.fake.now_ms = 250.0
+  t1.touch(0, 50.0, 30.0)
+  debug_assert(t1.fake.frame_count == fc0, "touch(0) must NOT advance frame")
+  debug_assert(t1.fake.frame_requested, "touch(0) must set frame_requested = true")
+  debug_assert(pointing() == Pointing::Finger, "during touch gesture pointing() must be Finger")
+  t1.touch(1, 52.0, 30.0)
+  debug_assert(t1.fake.frame_count == fc0, "touch(1) must NOT advance frame")
+  debug_assert(pointing() == Pointing::Finger, "touch(1) keeps Finger")
+  t1.touch(2, 52.0, 30.0)
+  debug_assert(t1.fake.frame_count == fc0, "touch(2) must NOT advance frame")
+  debug_assert(pressed.v == 1, "touch down+up on button must fire on_press")
+  debug_assert(p1_opt_pointing_is_none(said_pointing.v), "touch(2) must restore None (not Some(Mouse))")
+
+  // Cancel also restores None
+  t1.touch(0, 50.0, 30.0)
+  debug_assert(pointing() == Pointing::Finger, "touch down sets Finger")
+  t1.touch(3, 50.0, 30.0)
+  debug_assert(p1_opt_pointing_is_none(said_pointing.v), "touch(3) cancel must restore None")
+
+  // Dispose mid-gesture restores None
+  t1.touch(0, 50.0, 30.0)
+  debug_assert(pointing() == Pointing::Finger, "mid-gesture pointing is Finger")
+  t1.dispose()
+  debug_assert(p1_opt_pointing_is_none(said_pointing.v), "dispose() mid-gesture must restore None")
+
+  // 2. Prior pointing = Some(Pointing::Mouse)
+  set_pointing(Some(Pointing::Mouse))
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(60.0)))
+      })
+    },
+    width=400.0,
+    height=300.0,
+    platform=1,
+  )
+  debug_assert(p1_opt_pointing_is_mouse(said_pointing.v), "initial said_pointing is Some(Mouse)")
+  t2.touch(0, 20.0, 20.0)
+  debug_assert(pointing() == Pointing::Finger, "touch sets Finger")
+  t2.touch(2, 20.0, 20.0)
+  debug_assert(p1_opt_pointing_is_mouse(said_pointing.v), "touch(2) must restore Some(Mouse)")
+  debug_assert(pointing() == Pointing::Mouse, "pointing() stays Mouse even on iOS platform=1")
+
+  // Dispose mid-gesture restores Some(Mouse)
+  t2.touch(0, 20.0, 20.0)
+  t2.dispose()
+  debug_assert(p1_opt_pointing_is_mouse(said_pointing.v), "dispose() mid-gesture must restore Some(Mouse)")
+  set_pointing(None)
+}
+
+test "phase1 rect_of and tap_text: words, runs, field, visibility filtering, unclipped coords, and halt" {
+  let plain_fld = Field::new()
+  let secret_fld = Field::new()
+  let taps = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      // 1. Plain words button
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+        let _ = b.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(40.0)))
+        let _ = b.words(view::Live::Is("Submit Order"))
+        let _ = b.on_press(fn() { taps.v = taps.v + 1 })
+      })
+      // 2. Rich runs node
+      let _ = root.box(fn(r : view::View) {
+        let _ = r.over_at(view::Live::Is((Some(10.0), Some(60.0), None, None)))
+        let _ = r.width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(30.0)))
+        let _ = r.words_runs(view::Live::Is([text::plain("Rich "), text::bold("Badge")]))
+      })
+      // 3. Plain field (placeholder -> value -> IME)
+      let _ = root.box(fn(fc : view::View) {
+        let _ = fc.over_at(view::Live::Is((Some(10.0), Some(100.0), None, None)))
+        let _ = fc.width(view::Live::Is(Some(180.0))).height(view::Live::Is(Some(32.0)))
+        let _ = field(fc, plain_fld, placeholder="Search docs")
+      })
+      // 4. Secret field
+      let _ = root.box(fn(sc : view::View) {
+        let _ = sc.over_at(view::Live::Is((Some(10.0), Some(140.0), None, None)))
+        let _ = sc.width(view::Live::Is(Some(180.0))).height(view::Live::Is(Some(32.0)))
+        let _ = field(sc, secret_fld, placeholder="Passcode", secret=true)
+      })
+      // 5. Hidden alpha=0 node
+      let _ = root.box(fn(h : view::View) {
+        let _ = h.over_at(view::Live::Is((Some(200.0), Some(10.0), None, None)))
+        let _ = h.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(30.0)))
+        let _ = h.alpha(view::Live::Is(0.0)).words(view::Live::Is("GhostAlpha"))
+      })
+      // 6. Zero-size node
+      let _ = root.box(fn(z : view::View) {
+        let _ = z.over_at(view::Live::Is((Some(200.0), Some(50.0), None, None)))
+        let _ = z.width(view::Live::Is(Some(0.0))).height(view::Live::Is(Some(30.0)))
+        let _ = z.words(view::Live::Is("ZeroWide"))
+      })
+      // 7. Bones (skeleton) node
+      let _ = root.box(fn(sk : view::View) {
+        let _ = sk.over_at(view::Live::Is((Some(200.0), Some(90.0), None, None)))
+        let _ = sk.bones(view::Live::Is(rgba(200, 200, 200, 255)))
+        let _ = sk.box(fn(ch : view::View) {
+          let _ = ch.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(30.0)))
+          let _ = ch.words(view::Live::Is("SkeletonLabel"))
+        })
+      })
+      // 8. Completely clipped child inside a clipping parent
+      let _ = root.box(fn(clip_box : view::View) {
+        let _ = clip_box.over_at(view::Live::Is((Some(200.0), Some(140.0), None, None)))
+        let _ = clip_box.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(40.0))).clips(view::Live::Is(true))
+        let _ = clip_box.box(fn(off : view::View) {
+          let _ = off.over_at(view::Live::Is((Some(150.0), Some(0.0), None, None)))
+          let _ = off.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0)))
+          let _ = off.words(view::Live::Is("ClippedOut"))
+        })
+      })
+      // 9. Partially clipped node -> must be found AND return UNCLIPPED (x, y, w, h)
+      let _ = root.box(fn(part : view::View) {
+        let _ = part.over_at(view::Live::Is((Some(350.0), Some(200.0), None, None)))
+        let _ = part.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+        let _ = part.words(view::Live::Is("HalfEdge"))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  // Plain words
+  debug_assert(p1_opt_rect_near(t.rect_of("Submit Order"), 10.0, 10.0, 120.0, 40.0), "rect_of plain words")
+  // Rich runs (substring spanning across runs!)
+  debug_assert(p1_opt_rect_near(t.rect_of("Rich Badge"), 10.0, 60.0, 160.0, 30.0), "rect_of rich runs")
+  // Field placeholder -> plain text -> IME composition
+  debug_assert(t.rect_of("Search docs").is_some(), "rect_of field placeholder")
+  plain_fld.set("query123")
+  t.frame()
+  debug_assert(t.rect_of("query123").is_some(), "rect_of field value")
+  debug_assert(t.rect_of("Search docs").is_none(), "placeholder hidden once value set")
+  plain_fld.set("")
+  plain_fld.focus()
+  plain_fld.compose("nihao")
+  t.frame()
+  debug_assert(t.rect_of("nihao").is_some(), "rect_of field IME composition")
+  // Secret field placeholder -> masked value (never plaintext)
+  debug_assert(t.rect_of("Passcode").is_some(), "rect_of secret field placeholder")
+  secret_fld.set("topsecret")
+  t.frame()
+  debug_assert(t.rect_of("topsecret").is_none(), "secret field must NOT match plaintext")
+  debug_assert(t.rect_of(secret_fld.editor.display_text()).is_some(), "secret field matches masked display text")
+  // Skips alpha<=0, zero-size, bones, completely clipped
+  debug_assert(t.rect_of("GhostAlpha").is_none(), "alpha<=0 must be skipped")
+  debug_assert(t.rect_of("ZeroWide").is_none(), "zero-size must be skipped")
+  debug_assert(t.rect_of("SkeletonLabel").is_none(), "bones node must be skipped")
+  debug_assert(t.rect_of("ClippedOut").is_none(), "completely clipped node must be skipped")
+  // Partially clipped returns UNCLIPPED (350, 200, 100, 40) even though viewport width is 400
+  debug_assert(p1_opt_rect_near(t.rect_of("HalfEdge"), 350.0, 200.0, 100.0, 40.0), "partially clipped must return unclipped rect")
+
+  // tap_text hits center once
+  t.tap_text("Submit Order")
+  debug_assert(taps.v == 1, "tap_text must click center of Submit Order once")
+  // tap_text on missing text halts with exact message
+  let h_miss = tester_capture_halts(fn() { t.tap_text("NotOnScreen") })
+  let got_miss = if h_miss.length() > 0 { h_miss[0] } else { "none" }
+  debug_assert(
+    h_miss.length() == 1 && h_miss[0] == "no text \"NotOnScreen\" on screen",
+    "tap_text missing must halt with exact message (got \{got_miss})",
+  )
+  t.dispose()
+}
+
+test "phase1 drawn_rects: filters slot 5 == 0.0 and packs 0xRRGGBBAA" {
+  let t = Tester::tree(
+    fn(root : view::View) {
+      // Opaque rect (kind=0.0)
+      let _ = root.box(fn(b1 : view::View) {
+        let _ = b1.over_at(view::Live::Is((Some(10.0), Some(20.0), None, None)))
+        let _ = b1.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(40.0)))
+        let _ = b1.ground(view::Live::Is(rgba(0x12, 0x34, 0x56, 0xFF)))
+      })
+      // Translucent rect (alpha=0.5 on 0xAABBCCFF -> alpha byte 0x80)
+      let _ = root.box(fn(b2 : view::View) {
+        let _ = b2.over_at(view::Live::Is((Some(100.0), Some(20.0), None, None)))
+        let _ = b2.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0)))
+        let _ = b2.alpha(view::Live::Is(0.5)).ground(view::Live::Is(rgba(0xAA, 0xBB, 0xCC, 0xFF)))
+      })
+      // Non-rect primitives: text glyphs (kind=1.0), shadow (kind=2.0), frosted glass (kind=5.0)
+      let _ = root.box(fn(txt : view::View) {
+        let _ = txt.over_at(view::Live::Is((Some(10.0), Some(80.0), None, None)))
+        let _ = txt.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(24.0)))
+        let _ = txt.words(view::Live::Is("NotARect"))
+      })
+      let _ = root.box(fn(gl : view::View) {
+        let _ = gl.over_at(view::Live::Is((Some(10.0), Some(120.0), None, None)))
+        let _ = gl.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(50.0)))
+        let _ = gl.glass(view::Live::Is(Some(paint::Glass::frosted(
+          blur=12.0,
+          tint=rgba(255, 255, 255, 180),
+          solid=rgba(240, 240, 240, 255),
+        ))))
+        let _ = gl.shadow(view::Live::Is((8.0, 2.0, rgba(0, 0, 0, 80))))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let rects = t.drawn_rects()
+  debug_assert(rects.length() == 2, "must contain only the 2 kind=0.0 rect instances (got \{rects.length()})")
+  let (x0, y0, w0, h0, c0) = rects[0]
+  debug_assert(
+    (x0 - 10.0).abs() < 0.1 && (y0 - 20.0).abs() < 0.1 && (w0 - 80.0).abs() < 0.1 && (h0 - 40.0).abs() < 0.1,
+    "first rect geometry must match",
+  )
+  debug_assert(c0 == rgba(0x12, 0x34, 0x56, 0xFF), "first rect color must pack to 0x123456FF")
+  let (x1, y1, w1, h1, c1) = rects[1]
+  debug_assert(
+    (x1 - 100.0).abs() < 0.1 && (y1 - 20.0).abs() < 0.1 && (w1 - 60.0).abs() < 0.1 && (h1 - 30.0).abs() < 0.1,
+    "second rect geometry must match",
+  )
+  debug_assert(c1 == rgba(0xAA, 0xBB, 0xCC, 0x80), "translucent rect must pack alpha=0.5 as 0x80")
+  t.dispose()
+}
+
+test "phase1 check_looks: pending image bypass polls image_info once and matches production" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=400.0, height=300.0)
+  let h = hostapi::host()
+  let prev_load = h.image_load
+  let prev_info = h.image_info
+  let polls = ref_new(0)
+  h.image_load = fn(_ : String, _ : Int) { 97 }
+  h.image_info = fn(_ : Int, out : Array[Double]) {
+    polls.v = polls.v + 1
+    out[0] = 64.0
+    out[1] = 64.0
+    if polls.v == 1 { 0 } else { 1 }
+  }
+  let root = match view_tree() {
+    Some(tr) => tr.root()
+    None => {
+      debug_assert(false, "tree must exist")
+      return
+    }
+  }
+  let _ = root.box(fn(b : view::View) {
+    let _ = b.width(view::Live::Is(Some(64.0))).height(view::Live::Is(Some(64.0)))
+    let _ = b.image(view::Live::Is(Some(("phase1-pending-image", "", 64))))
+  })
+  let hs = tester_capture_halts(fn() { t.frame() })
+  h.image_load = prev_load
+  h.image_info = prev_info
+  t.dispose()
+  debug_assert(polls.v == 1, "reference bypass must not re-poll image_info (got \{polls.v})")
+  debug_assert(hs.length() == 0, "pending image must not cause prod/ref mismatch")
+}
+
+test "phase1 check_looks: multi-window off->on reseeds primary and secondary windows independently" {
+  let main_col = signals::signal(rgba(10, 10, 10, 255))
+  let sec_col = signals::signal(rgba(200, 0, 0, 255))
+  let mk_box = fn(col : signals::Signal[Int64]) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(60.0)))
+        let _ = b.ground(view::Live::By(fn() { col.get() }))
+      })
+    }
+  }
+  let t = Tester::tree(mk_box(main_col), width=400.0, height=300.0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit { mk_box(sec_col) })
+  let w = window_open_here("secondary")
+  debug_assert(w > 0, "secondary window must open")
+  let h0 = tester_capture_halts(fn() { let _ = window_frame(w, 400.0, 600.0, 1.0, 10.0) })
+  debug_assert(h0.length() == 0, "initial secondary frame passes")
+
+  // Case 1: off -> on -> unchanged secondary
+  t.check_looks(false)
+  t.check_looks(true)
+  let h1 = tester_capture_halts(fn() { let _ = window_frame(w, 400.0, 600.0, 1.0, 20.0) })
+  debug_assert(h1.length() == 0, "off -> on -> unchanged secondary must not false-positive")
+
+  // Case 2: off -> change secondary -> on -> small change secondary + unchanged primary
+  t.check_looks(false)
+  sec_col.set(rgba(0, 0, 200, 255))
+  let _ = window_frame(w, 400.0, 600.0, 1.0, 30.0)
+  t.check_looks(true)
+  sec_col.set(rgba(0, 200, 0, 255))
+  let h2 = tester_capture_halts(fn() { let _ = window_frame(w, 400.0, 600.0, 1.0, 40.0) })
+  let h2m = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h2.length() == 0, "off -> change -> on -> small change secondary must pass")
+  debug_assert(h2m.length() == 0, "primary must remain clean after secondary reseed")
+
+  // Case 3: off -> change primary -> present secondary -> on -> unchanged primary
+  t.check_looks(false)
+  main_col.set(rgba(0, 120, 220, 255))
+  t.frame()
+  let _ = window_frame(w, 400.0, 600.0, 1.0, 50.0)
+  t.check_looks(true)
+  let h3 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h3.length() == 0, "primary off -> change -> secondary present -> on -> unchanged primary must pass")
+  t.dispose()
+}
+
+test "phase1 check_looks: set_view_app auto-restores hook on next frame" {
+  let col = signals::signal(rgba(10, 10, 10, 255))
+  let mk = fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(60.0)))
+      let _ = b.ground(view::Live::By(fn() { col.get() }))
+    })
+  }
+  let t = Tester::tree(mk, width=400.0, height=300.0)
+  set_view_app(mk)
+  let h0 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h0.length() == 0, "first frame after set_view_app must pass cleanly")
+  set_view_block_poison(true)
+  col.set(rgba(200, 200, 0, 255))
+  let h1 = tester_capture_halts(fn() { t.frame() })
+  set_view_block_poison(false)
+  debug_assert(h1.length() == 1 && str_contains(h1[0], "mismatch"), "hook must auto-restore after set_view_app")
+  t.dispose()
+}
+
+test "phase1 check_looks: glass light angle and atlas generation changes require Full damage" {
+  // 1. Glass light angle change + DamageReport::None poison
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.glass(view::Live::Is(Some(paint::Glass::frosted(
+        blur=8.0,
+        tint=rgba(255, 255, 255, 170),
+        solid=rgba(250, 250, 250, 255),
+      ))))
+    },
+    width=300.0,
+    height=200.0,
+  )
+  set_glass_light_angle(0.7)
+  let h_ok1 = tester_capture_halts(fn() { t1.frame() })
+  debug_assert(h_ok1.length() == 0, "normal glass light angle change must pass")
+  set_damage_report_poison(Some(DamageReport::None))
+  set_glass_light_angle(1.4)
+  let h_bad1 = tester_capture_halts(fn() { t1.frame() })
+  set_damage_report_poison(None)
+  debug_assert(h_bad1.length() == 1 && str_contains(h_bad1[0], "expected Full"), "light angle change + None poison must halt")
+  t1.dispose()
+
+  // 2. Atlas generation change + DamageReport::None poison
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(view::Live::Is("AtlasGlyph"))
+    },
+    width=300.0,
+    height=200.0,
+  )
+  let h = hostapi::host()
+  let prev_gen = h.atlas_generation
+  let g = ref_new(prev_gen())
+  h.atlas_generation = fn() { g.v }
+  g.v = g.v + 1
+  let h_ok2 = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_ok2.length() == 0, "normal atlas generation bump must pass")
+  set_damage_report_poison(Some(DamageReport::None))
+  g.v = g.v + 1
+  let h_bad2 = tester_capture_halts(fn() { t2.frame() })
+  set_damage_report_poison(None)
+  h.atlas_generation = prev_gen
+  debug_assert(h_bad2.length() == 1 && str_contains(h_bad2[0], "expected Full"), "atlas generation bump + None poison must halt")
+  t2.dispose()
+}
+
+test "phase1 rect_of and tap_text: secondary window viewport clipping and clipped target tap center" {
+  // 1. Secondary narrow window clips text outside its own 80x60 viewport
+  let t1 = Tester::tree(fn(_ : view::View) { () }, width=400.0, height=300.0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.over_at(view::Live::Is((Some(140.0), Some(10.0), None, None)))
+        let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(30.0)))
+        let _ = b.words(view::Live::Is("PanelOffscreen"))
+      })
+    }
+  })
+  let w = window_open_here("narrow_panel")
+  let _ = window_frame(w, 80.0, 60.0, 1.0, 0.0)
+  let found_off = ref_new(true)
+  in_window(w, fn() { found_off.v = t1.rect_of("PanelOffscreen").is_some() })
+  debug_assert(!found_off.v, "text at x=140 outside 80pt secondary window must be skipped by rect_of")
+  t1.dispose()
+
+  // 2. Clipped button A next to sibling B: rect_of returns unclipped bounds, tap_text clicks visible center
+  let hit_a = ref_new(0)
+  let hit_b = ref_new(0)
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(p : view::View) {
+        let _ = p.over_at(view::Live::Is((Some(0.0), Some(0.0), None, None)))
+        let _ = p.width(view::Live::Is(Some(20.0))).height(view::Live::Is(Some(40.0))).clips(view::Live::Is(true))
+        let _ = p.box(fn(a : view::View) {
+          let _ = a.over_at(view::Live::Is((Some(0.0), Some(0.0), None, None)))
+          let _ = a.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+          let _ = a.words(view::Live::Is("ClippedA"))
+          let _ = a.on_press(fn() { hit_a.v = hit_a.v + 1 })
+        })
+      })
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.over_at(view::Live::Is((Some(30.0), Some(0.0), None, None)))
+        let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(40.0)))
+        let _ = b.on_press(fn() { hit_b.v = hit_b.v + 1 })
+      })
+    },
+    width=120.0,
+    height=80.0,
+  )
+  debug_assert(p1_opt_rect_near(t2.rect_of("ClippedA"), 0.0, 0.0, 100.0, 40.0), "rect_of returns unclipped bounds")
+  t2.tap_text("ClippedA")
+  debug_assert(hit_a.v == 1 && hit_b.v == 0, "tap_text must click visible clipped center of A, not sibling B")
+  t2.dispose()
+}
+
+test "phase1 draw: drains nested after_frame callbacks without explicit wake" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=200.0, height=100.0)
+  let ran = ref_new(0)
+  let before = t.fake.frame_count
+  after_frame(fn() {
+    after_frame(fn() {
+      ran.v = ran.v + 1
+    })
+  })
+  t.draw()
+  debug_assert(ran.v == 1 && t.fake.frame_count == before + 2, "nested after_frame must drain in 2 frames")
+
+  // Unbounded self-requeueing after_frame must halt after 3 frames naming after_frame_cbs
+  let keep_requeue = ref_new(true)
+  let self_cb : signals::Ref[() -> Unit] = ref_new(fn() { () })
+  self_cb.v = fn() {
+    if keep_requeue.v {
+      after_frame(fn() { (self_cb.v)() })
+    }
+  }
+  after_frame(fn() { (self_cb.v)() })
+  let hs = tester_capture_halts(fn() { t.draw() })
+  keep_requeue.v = false
+  after_frame_cbs.clear()
+  debug_assert(hs.length() == 1 && str_contains(hs[0], "after_frame_cbs"), "persistent after_frame must halt naming after_frame_cbs")
+  t.dispose()
+}
+
+test "phase1 check_looks: segs 1e-9 tolerance and NaN rejection" {
+  let t = Tester::tree(fn(r : view::View) { let _ = r.ground(view::Live::Is(rgba(254, 0, 0, 255))) })
+  let a = t.scene().copy()
+  let b = a.copy()
+  a.segs.push(1.0)
+  b.segs.push(1.0 + 1.0e-10)
+  let h_tol = tester_capture_halts(fn() { t.verify_looks_frame(a, b, DamageReport::Full, 100.0, 100.0, 1.0, 0.0, 0.0, 0.0) })
+  debug_assert(h_tol.length() == 0, "segs within 1e-9 tolerance must pass")
+
+  let z = ref_new(0.0)
+  let nan = z.v / z.v
+  a.segs[0] = nan
+  b.segs[0] = nan
+  let h_nan = tester_capture_halts(fn() { t.verify_looks_frame(a, b, DamageReport::Full, 100.0, 100.0, 1.0, 0.0, 0.0, 0.0) })
+  debug_assert(h_nan.length() == 1 && str_contains(h_nan[0], "segs[0]"), "NaN in segs must fail closed")
+  t.dispose()
+}
+
+test "phase1 check_looks: two nodes sharing one async image key replay per-node readiness" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=400.0, height=300.0)
+  let h = hostapi::host()
+  let prev_load = h.image_load
+  let prev_info = h.image_info
+  let polls = ref_new(0)
+  h.image_load = fn(_ : String, _ : Int) { 97 }
+  h.image_info = fn(_ : Int, out : Array[Double]) {
+    polls.v = polls.v + 1
+    out[0] = 64.0
+    out[1] = 64.0
+    if polls.v == 1 { 0 } else { 1 }
+  }
+  let root = match view_tree() {
+    Some(tr) => tr.root()
+    None => {
+      debug_assert(false, "tree must exist")
+      return
+    }
+  }
+  for _ in 0..<2 {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(64.0))).height(view::Live::Is(Some(64.0)))
+      let _ = b.image(view::Live::Is(Some(("phase1-shared-async-img", "", 64))))
+    })
+  }
+  let hs = tester_capture_halts(fn() { t.frame() })
+  h.image_load = prev_load
+  h.image_info = prev_info
+  t.dispose()
+  debug_assert(polls.v == 2, "must poll image_info exactly twice in production (got \{polls.v})")
+  debug_assert(hs.length() == 0, "shared async image key pending->ready must replay per-node readiness without mismatch")
+}
+
+test "phase1 check_looks: unrendered light/atlas change survives off->on and mid-frame underlay atlas bump stays aligned" {
+  // 1. off -> change light angle without drawing -> on -> None poison must be caught
+  let t1 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.glass(
+        view::Live::Is(
+          Some(
+            paint::Glass::frosted(
+              blur=8.0,
+              tint=rgba(255, 255, 255, 170),
+              solid=rgba(250, 250, 250, 255),
+            ),
+          ),
+        ),
+      )
+    },
+    width=300.0,
+    height=200.0,
+  )
+  t1.check_looks(false)
+  set_glass_light_angle(0.8)
+  t1.check_looks(true)
+  let h_ok = tester_capture_halts(fn() { t1.frame() })
+  debug_assert(h_ok.length() == 0, "control frame with unrendered light change must pass")
+  t1.check_looks(false)
+  set_glass_light_angle(1.3)
+  t1.check_looks(true)
+  set_damage_report_poison(Some(DamageReport::None))
+  let h_bad = tester_capture_halts(fn() { t1.frame() })
+  set_damage_report_poison(None)
+  debug_assert(h_bad.length() == 1 && str_contains(h_bad[0], "expected Full"), "unrendered light change + None poison must halt after re-enabling")
+  t1.dispose()
+
+  // 2. Mid-frame underlay bumping atlas_generation must not false-positive on the current frame
+  let t2 = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(view::Live::Is("MidFrameAtlas"))
+    },
+    width=300.0,
+    height=200.0,
+  )
+  let h = hostapi::host()
+  let prev_gen = h.atlas_generation
+  let g = ref_new(prev_gen())
+  h.atlas_generation = fn() { g.v }
+  t2.frame()
+  let bumped = ref_new(false)
+  set_underlay_painter(
+    Some(fn(_sc : Scene, _w : Double, _h : Double, _s : Double, _now : Double) {
+      if !bumped.v {
+        bumped.v = true
+        g.v = g.v + 1
+      }
+    }),
+  )
+  let h_mid = tester_capture_halts(fn() { t2.frame() })
+  debug_assert(h_mid.length() == 0, "mid-frame underlay atlas_generation bump must match production frame start sampling")
+  set_underlay_painter(None)
+  // Next frame sees the bumped atlas generation at frame start -> None poison must halt
+  set_damage_report_poison(Some(DamageReport::None))
+  let h_next = tester_capture_halts(fn() { t2.frame() })
+  set_damage_report_poison(None)
+  h.atlas_generation = prev_gen
+  debug_assert(h_next.length() == 1 && str_contains(h_next[0], "expected Full"), "next frame must observe bumped atlas_generation and require Full")
+  t2.dispose()
+}
+
+test "phase1 check_looks: cached 32px thumbnail and newly added 96px node of same image key do not cross-talk" {
+  set_view_blocks_enabled(true)
+  let show_large = signals::signal(false)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(small : view::View) {
+        let _ = small.width(view::Live::Is(Some(16.0))).height(view::Live::Is(Some(16.0)))
+        let _ = small.image(view::Live::Is(Some(("phase1-multi-px-img", "", 32))))
+      })
+      root.show(fn() { show_large.get() }, fn(large : view::View) {
+        let _ = large.width(view::Live::Is(Some(48.0))).height(view::Live::Is(Some(48.0)))
+        let _ = large.image(view::Live::Is(Some(("phase1-multi-px-img", "", 96))))
+      })
+    },
+    width=400.0,
+    height=300.0,
+    scale=2.0,
+  )
+  // Frame 0 cached the 32px thumbnail ViewBlock; now add the 96px node of the same key
+  show_large.set(true)
+  let hs = tester_capture_halts(fn() { t.frame() })
+  debug_assert(hs.length() == 0, "32px cached ViewBlock + new 96px node must not cross-talk")
+  t.dispose()
+}
+
+test "phase1 check_looks: theme bg switch while off without drawing catches None poison after re-enabling" {
+  let dark_sig = signals::signal(false)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(60.0)))
+      })
+    },
+    width=300.0,
+    height=200.0,
+    theme=fn() { if dark_sig.get() { Theme::dark() } else { Theme::light() } },
+  )
+  t.check_looks(false)
+  dark_sig.set(true)
+  t.check_looks(true)
+  set_damage_report_poison(Some(DamageReport::None))
+  let hs = tester_capture_halts(fn() { t.frame() })
+  set_damage_report_poison(None)
+  debug_assert(
+    hs.length() == 1 && str_contains(hs[0], "actual damage is None"),
+    "unrendered theme bg change + None poison after re-enabling must halt",
+  )
+  t.dispose()
+}
+
+test "phase1 check_looks: image_ask_at 256 times with check_looks off leaves frame_image_obs empty" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=200.0, height=200.0)
+  t.check_looks(false)
+  for _ in 0..<256 {
+    image_ask_at("phase1-ask-leak-check", 64.0)
+  }
+  debug_assert(frame_image_obs.length() == 0, "frame_image_obs must stay empty when check_looks is off")
+  t.dispose()
+}
+
+test "phase1 check_looks: prewarmed 32px and 96px same image key stays consistent on cached 32px node" {
+  set_view_blocks_enabled(true)
+  let show_img = signals::signal(false)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      root.show(fn() { show_img.get() }, fn(small : view::View) {
+        let _ = small.width(view::Live::Is(Some(16.0))).height(view::Live::Is(Some(16.0)))
+        let _ = small.image(view::Live::Is(Some(("phase1-prewarmed-32-96", "", 32))))
+      })
+    },
+    width=400.0,
+    height=300.0,
+    scale=2.0,
+  )
+  image_ask_at("phase1-prewarmed-32-96", 32.0)
+  image_ask_at("phase1-prewarmed-32-96", 96.0)
+  show_img.set(true)
+  let h1 = tester_capture_halts(fn() { t.frame() })
+  let h2 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(h1.length() == 0, "first frame with prewarmed 32px+96px image must pass")
+  debug_assert(h2.length() == 0, "second frame hitting cached ViewBlock must select identical texture in reference bypass")
+  t.dispose()
+}
+
+test "phase1 check_looks: forget_image invalidates cached ViewBlock and emits zero image instances" {
+  set_view_blocks_enabled(true)
+  let key = "mem:phase1-forget-check"
+  add_image(key, "PNGDATA".to_bytes())
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+        let _ = b.image(view::Live::Is(Some((key, "", 80))))
+      })
+    },
+    width=300.0,
+    height=200.0,
+    scale=2.0,
+  )
+  let count_kind4 = fn() -> Int {
+    let sc = view_scene_last()
+    let mut n = 0
+    for k in 0..<sc.ninst {
+      if sc.inst[k * inst_size + 5] == 4.0 {
+        n += 1
+      }
+    }
+    n
+  }
+  debug_assert(count_kind4() == 1, "initial frame must draw 1 image instance")
+  forget_image(key)
+  let hs = tester_capture_halts(fn() { t.frame() })
+  debug_assert(count_kind4() == 0, "after forget_image production scene must emit 0 image instances")
+  debug_assert(hs.length() == 0, "check_looks must pass with 0 alerts after forget_image invalidation")
+  t.dispose()
+}
+
+test "phase1 check_looks: add_image async replacement transitions from old texture to ready new texture" {
+  set_view_blocks_enabled(true)
+  let key = "mem:phase1-replace-async"
+  add_image(key, "PNGDATA_V1".to_bytes())
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(40.0)))
+        let _ = b.image(view::Live::Is(Some((key, "", 80))))
+      })
+    },
+    width=300.0,
+    height=200.0,
+    scale=2.0,
+  )
+  let first_kind4_tex_id = fn() -> Int {
+    let sc = view_scene_last()
+    for k in 0..<sc.ninst {
+      if sc.inst[k * inst_size + 5] == 4.0 {
+        return sc.inst[k * inst_size + 20].to_int()
+      }
+    }
+    0
+  }
+  let id1 = first_kind4_tex_id()
+  debug_assert(id1 > 0, "initial frame must draw initial texture id")
+  let h = hostapi::host()
+  let orig_load = h.image_load_bytes
+  let orig_info = h.image_info
+  let id2_ref : signals::Ref[Int] = ref_new(0)
+  let ready2 : signals::Ref[Bool] = ref_new(false)
+  h.image_load_bytes = fn(data : Bytes, px : Int) -> Int {
+    let nid = orig_load(data, px)
+    id2_ref.v = nid
+    nid
+  }
+  h.image_info = fn(id : Int, out : Array[Double]) -> Int {
+    if id == id2_ref.v && !ready2.v {
+      0
+    } else {
+      orig_info(id, out)
+    }
+  }
+  add_image(key, "PNGDATA_V2".to_bytes())
+  let h1 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(id2_ref.v > 0 && id2_ref.v != id1, "async replacement must allocate a distinct new texture id")
+  debug_assert(first_kind4_tex_id() == id1, "transitional frame must display old texture while new decode is pending")
+  debug_assert(h1.length() == 0, "transitional frame must pass check_looks")
+  ready2.v = true
+  debug_assert(image_ready_at(key, 32.0), "image_ready_at must observe new texture becoming ready")
+  let h2 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(first_kind4_tex_id() == id2_ref.v, "frame after decode ready must switch to new texture instead of stale cached ViewBlock")
+  debug_assert(h2.length() == 0, "frame after decode ready must pass check_looks")
+  let h3 = tester_capture_halts(fn() { t.frame() })
+  debug_assert(first_kind4_tex_id() == id2_ref.v, "subsequent cached frame must keep displaying new texture")
+  debug_assert(h3.length() == 0, "subsequent cached frame must pass check_looks")
+  h.image_load_bytes = orig_load
+  h.image_info = orig_info
+  t.dispose()
+}
