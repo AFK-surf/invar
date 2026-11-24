@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include "post.h"
+#include "frame_late.h"
 #include "term.h"
 #include "app_calls.h"  // the app's own calls
 
@@ -276,24 +277,26 @@ static double drawn_for;
   // happens to fire and the link wakes after it: a step a frame or two late, by as much as the timer and the link's
   // wake fall, so a resident cycle's steps 75 to 108 ms apart, not 100); the ticks before it draw nothing
   if (!self.wantFrame && wake_for >= 0) {
-    if (l.targetTimestamp * 1000.0 < wake_for - 0.5) return;
+    if (l.targetTimestamp * 1000.0 < wake_for - 0.5) {
+      last_target = -1;
+      return;
+    }
     wake_for = -1;
     self.wantFrame = YES;
   }
   if (!self.wantFrame) {
+    last_target = -1;
     if (mb_render_adaptive_step(0)) return;
     l.paused = YES;
-    last_target = -1;
     return;
   }
   // the frame before on the screen since the display's last refresh (the link's timestamp): past the time it was drawn
   // for, it was late by as much (a frame that took longer than the display's frame to build)
-  frame_late = last_target >= 0 ? MAX(0, l.timestamp * 1000.0 - last_target) : 0;
+  frame_late = mb_frame_late_from_target(last_target, l.timestamp * 1000.0);
   [self drawFor:l.targetTimestamp * 1000.0];
-  last_target = l.targetTimestamp * 1000.0;
+  last_target = mb_frame_late_next(self.wantFrame, l.targetTimestamp * 1000.0);
   if (!self.wantFrame && !mb_render_adaptive_settling_of(0)) {
     l.paused = YES;
-    last_target = -1;
   }
 }
 
@@ -1960,13 +1963,25 @@ static void tell_state(void) {
 static uint64_t hidden_at;
 static void watch_shown(void) {
   NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+  [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue
+              usingBlock:^(NSNotification *n) {
+    (void)n;
+    last_target = -1;
+  }];
+  [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
+              usingBlock:^(NSNotification *n) {
+    (void)n;
+    last_target = -1;
+  }];
   [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue
               usingBlock:^(NSNotification *n) {
+    last_target = -1;
     if (!hidden_at) hidden_at = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     mb_perf_note("app: background");
   }];
   [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue
               usingBlock:^(NSNotification *n) {
+    last_target = -1;
     // (what was shared meanwhile: the inbox looked into again, shared_in)
     share_look = YES;
     [the_view requestFrame];
