@@ -1361,7 +1361,7 @@
           snellDmag = clamp(sn.x * shortening, -halfMinor, halfMinor);
           vec2 dropDisp = surfaceNormal * snellDmag;
           if (isRoleSlid && snellSLip > 0.6 && pressAmt > 0.001) {
-            menAA = 0.35 * smoothstep(0.6, 2.0, snellSLip) * pressAmt;
+            menAA = 0.35 * smoothstep(0.6, 2.0, snellSLip) * pressAmt * droplet;
           }
           if (isRoleTab) {
             float pinchWeight = smoothstep(4.5, 6.5, rawAmount);
@@ -1372,7 +1372,7 @@
             float capAbsX = clamp(1.0 - tipDist / max(v_rect.w * 0.6514, 1.0), 0.0, 1.0);
             float endCapX = smoothstep(0.32, 0.70, capAbsX);
             float iconBandY = 1.0 - smoothstep(0.66, 0.79, absC.y);
-            barIconGate = iconBandY * endCapX * pressAmt * pinchWeight;
+            barIconGate = iconBandY * endCapX * pressAmt * pinchWeight * droplet;
             float iconBevelX = smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward));
             float iconBevelY = smoothstep(0.45, 1.25, inward) * (1.0 - smoothstep(2.20, 9.00, inward));
             float signX = (centered.x >= 0.0) ? 1.0 : -1.0;
@@ -1393,13 +1393,15 @@
         if (abs(v_pad.z) > 0.001 && snellSLip > 0.15 && pressAmt > 0.001) {
           float dispR = mb_droplet_snell(inward, rawAmount, halfMinor, dropRole, 1.47).x * shortening;
           float dispB = mb_droplet_snell(inward, rawAmount, halfMinor, dropRole, 1.58).x * shortening;
-          float caW = smoothstep(0.15, 1.20, snellSLip) * clamp(abs(v_pad.z) / 0.04, 0.0, 1.0);
+          float caW = smoothstep(0.15, 1.20, snellSLip) * clamp(abs(v_pad.z) / 0.04, 0.0, 1.0) * droplet;
           float dR = clamp(mix(snellDmag, dispR, caW), -halfMinor, halfMinor);
           float dB = clamp(mix(snellDmag, dispB, caW), -halfMinor, halfMinor);
+          vec2 dRVec = mix(disp, surfaceNormal * dR, droplet);
+          vec2 dBVec = mix(disp, surfaceNormal * dB, droplet);
           refractColor = vec3(
-            backdrop(sampleBase + surfaceNormal * dR).r,
-            backdrop(sampleBase + surfaceNormal * snellDmag).g,
-            backdrop(sampleBase + surfaceNormal * dB).b
+            backdrop(sampleBase + dRVec).r,
+            backdrop(sampleBase + disp).g,
+            backdrop(sampleBase + dBVec).b
           );
         } else {
           refractColor = backdrop(sampleBase + disp);
@@ -1428,7 +1430,7 @@
         refractColor = mix(refractColor, aaCol, menAA);
       }
       if (is_drop && isRoleTab && barIconGate > 0.01 && dropHairline < 0.99) {
-        float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - dropHairline);
+        float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward)) * (1.0 - dropHairline);
         if (barBevelGate > 0.001) {
           float refX = centered.x >= 0.0 ? 0.26 : 0.74;
           vec2 refPt = v_rect.xy + vec2(refX, 0.18) * v_rect.zw;
@@ -1664,7 +1666,7 @@
           float regHw = min(0.50, 1.15 / max(u_scale, 1.0));
           regHairline = (1.0 - smoothstep(regHw * 0.35, regHw, inward)) * materialAlpha * regMix;
         } else {
-          float regHairWpx = max(1.10 * u_scale, 2.20);
+          float regHairWpx = max(0.85 * u_scale, 1.70);
           float regA = clamp(sd_px - 0.5, 0.0, regHairWpx);
           float regB = clamp(sd_px + 0.5, 0.0, regHairWpx);
           float regBandCov = mb_para_int(regB, regHairWpx) - mb_para_int(regA, regHairWpx);
@@ -1690,7 +1692,7 @@
           result = mix(result, rimTarget, clamp(regRim, 0.0, 1.0));
         }
         if (regHairline > 0.001) {
-          float regShade = (is_dark ? 0.0 : 0.22) * regShadeMask;
+          float regShade = (is_dark ? 0.0 : 0.13) * regShadeMask;
           result *= (1.0 - regShade * regHairline);
         }
       }
@@ -1699,20 +1701,20 @@
         float brightBg = smoothstep(0.35, 0.75, backdropLuma);
         float liftGain = isRoleTab ? 0.025 : (isRoleSeg ? 0.014 : 0.098);
         float lensLift = liftGain * pressAmt * (1.0 - backdropLuma);
-        result = clamp(refractColor + vec3(lensLift), 0.0, 1.0);
+        vec3 dropRes = clamp(refractColor + vec3(lensLift), 0.0, 1.0);
         float domeScale = clamp(v_rect.w / 38.4, 0.80, 1.35);
         float sizeGate = smoothstep(28.0, 36.0, v_rect.w);
         float roleVol = isRoleSeg ? 0.65 : (isRoleTab ? 0.55 : 1.0);
         float upperFace = smoothstep(-0.15, 0.85, -surfaceNormal.y);
         float qTop = (inward - 8.5 * domeScale) / (6.2 * domeScale);
         float topEnv = exp(-qTop * qTop) * upperFace * smoothstep(0.55, 1.80, inward);
-        result *= (1.0 - mix(0.20, 0.082, brightBg) * roleVol * sizeGate * pressAmt * topEnv);
+        dropRes *= (1.0 - mix(0.20, 0.082, brightBg) * roleVol * sizeGate * pressAmt * topEnv);
         float sideArc = pow(max(abs(surfaceNormal.x), 0.0), 1.6);
         float sideEnv = exp(-max(inward - 1.5, 0.0) / 4.2) * smoothstep(0.25, 1.20, inward);
-        result *= (1.0 - mix(0.16, 0.065, brightBg) * (isRoleSeg ? 0.55 : (isRoleTab ? 0.45 : 1.0)) * sizeGate * pressAmt * sideArc * sideEnv);
+        dropRes *= (1.0 - mix(0.16, 0.065, brightBg) * (isRoleSeg ? 0.55 : (isRoleTab ? 0.45 : 1.0)) * sizeGate * pressAmt * sideArc * sideEnv);
         float lowerFace = smoothstep(0.10, 0.85, surfaceNormal.y);
         float lowEnv = exp(-max(inward - 2.0, 0.0) / 5.5) * smoothstep(0.50, 1.60, inward);
-        result = clamp(result + vec3(mix(0.032, 0.025, brightBg) * lowerFace * lowEnv * (isRoleSeg ? 0.45 : (isRoleTab ? 0.35 : 1.0)) * sizeGate * pressAmt), 0.0, 1.0);
+        dropRes = clamp(dropRes + vec3(mix(0.032, 0.025, brightBg) * lowerFace * lowEnv * (isRoleSeg ? 0.45 : (isRoleTab ? 0.35 : 1.0)) * sizeGate * pressAmt), 0.0, 1.0);
         // Stage A: Razor-sharp inner 3D specular rim
         if (pressAmt > 0.001 && inward < 12.0) {
           float litTop = max(-surfaceNormal.y, 0.0);
@@ -1724,7 +1726,7 @@
           float rimInset = max(inward - rimPeak, 0.0);
           float rimEnv = rimRise * (0.90 * exp(-rimInset / 0.38) + 0.14 * exp(-rimInset / 1.50));
           float rimStr = mix(0.24, 0.14, brightBg) * dirLobe * rimEnv * pressAmt;
-          result = mix(result, vec3(1.0), clamp(rimStr, 0.0, 1.0));
+          dropRes = mix(dropRes, vec3(1.0), clamp(rimStr, 0.0, 1.0));
         }
         // Stage B: Slim Apple-exact closed-form analytic 3D bevel wall
         float across = pow(max(1.0 - surfaceNormal.y * surfaceNormal.y, 0.0), 1.35);
@@ -1745,7 +1747,7 @@
           float neutralMul = mix(0.26, mix(0.80, 0.72, across), brightEnv);
           vec3 neutralTint = envBg * neutralMul;
           vec3 satTint = pow(max(envBg, vec3(0.0001)), vec3(1.25)) * 0.72;
-          result = mix(result, mix(neutralTint, satTint, satEnv), wallBlend);
+          dropRes = mix(dropRes, mix(neutralTint, satTint, satEnv), wallBlend);
         }
         // Stage C: Segmented prismatic edge dispersion AFTER Stage B
         if (pressAmt > 0.001 && inward < 12.0 && abs(v_pad.z) > 0.005) {
@@ -1755,8 +1757,9 @@
           vec3 pDark = mix(vec3(-0.025, 0.015, 0.045), vec3(0.048, 0.012, -0.032), hw);
           vec3 pLight = mix(vec3(-0.085, 0.0, 0.0), vec3(-0.015, -0.075, -0.135), hw);
           vec3 pAdd = mix(pDark, pLight, brightBg);
-          result = clamp(result + pAdd * pBand, 0.0, 1.0);
+          dropRes = clamp(dropRes + pAdd * pBand, 0.0, 1.0);
         }
+        result = mix(result, dropRes, droplet);
       } else if (is_drop) {
         float pressAmt = clamp(v_c2.x, 0.0, 1.0);
         float backdropLuma = clamp(Y, 0.0, 1.0);

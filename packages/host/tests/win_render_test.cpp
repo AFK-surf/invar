@@ -383,6 +383,23 @@ static int run_v8_v9_2d_roi(void) {
     ok &= v9tab_ok;
   }
 
+  // V9-Tab-No-Ghost: Role 4 outer falloff (1 - smoothstep(2.60, 9.40, inward)) eliminates light-mode ghosting
+  {
+    int n = 0;
+    push_inst(inst, &n, 41.0, 28.0, 2.0, 44.0, 0.0, 0.0, 0.0, 0.0, 90.0/255.0, 90.0/255.0, 90.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 32.0, 18.0, 95.0, 63.5, 31.75, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 246.0/255.0, 244.0/255.0, 240.0/255.0, S3, W3, H3, rgba)) return 0;
+    int l_orig = px_luma_of(rgba, W3, 126, 149);
+    int min_refr_l = 255;
+    for (int rx = 130; rx <= 135; rx++) {
+      int lr = px_luma_of(rgba, W3, rx, 149);
+      if (lr < min_refr_l) min_refr_l = lr;
+    }
+    int ng_ok = (l_orig > 220) && (min_refr_l < 170);
+    printf("  [%s] V9-Tab-No-Ghost Role 4 outer falloff: origL@10pt=%d (>220) refrMinL@11.5..12.8pt=%d (<170)\n", ng_ok ? "PASS" : "FAIL", l_orig, min_refr_l);
+    ok &= ng_ok;
+  }
+
   // V9-E: Switch half-press p = 0.5 / 0.6 / 1.0 (no pinchWeight collapse at p=0.5)
   {
     const double ps[3] = { 0.5, 0.6, 1.0 };
@@ -458,8 +475,8 @@ static int run_v8_v9_2d_roi(void) {
     }
     // Exact pre-v8 (0c02853a) D3D11 WARP full rounded-corner ROI RGBA8 hash (strict max_abs_diff == 0, 42160 bytes)
     int v10_hash_ok = (h1 == 3135229502u && h2 == 158418064u);
-    int v10_ok = (max_d2 <= 14.0) && (side_min >= 190.0 && side_min <= 215.0) && (yd_top > yd_mid + 5.0) && v10_hash_ok;
-    printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([190,215]) dark_top=%.1f>mid=%.1f roi_hash=(%u,%u)\n",
+    int v10_ok = (max_d2 <= 14.0) && (side_min >= 212.0 && side_min <= 232.0) && (yd_top > yd_mid + 5.0) && v10_hash_ok;
+    printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([212,232]) dark_top=%.1f>mid=%.1f roi_hash=(%u,%u)\n",
            v10_ok ? "PASS" : "FAIL", max_d2, side_min, yd_top, yd_mid, h1, h2);
     ok &= v10_ok;
   }
@@ -582,6 +599,61 @@ static int run_v8_v9_2d_roi(void) {
                (top3_ok && top2_ok) ? "PASS" : "FAIL", dark ? "dark" : "light", off, gr0, l0, gr1, gr2, l2, g21, g22);
         v11_ok &= (top3_ok && top2_ok);
       }
+    }
+    // V11-Frost-Continuity: Switch ON continuous frost sweep (0.0 -> 0.0001 -> 0.00011 -> 0.01 -> 0.05 -> 0.10 -> 0.13 -> 0.30)
+    {
+      static uint8_t fb0[360 * 195 * 4], fb00011[360 * 195 * 4], fb10[360 * 195 * 4], fb127[360 * 195 * 4], fb128[360 * 195 * 4], fb13[360 * 195 * 4], fb30[360 * 195 * 4];
+      auto draw_frost = [&](double f, uint8_t *dst) -> int {
+        int active = f > 0.0001;
+        double a_frac = active ? 0.94 * f : 0.0;
+        double blur_slot = (a_frac <= 0.12) ? -32.0 : 14.0 * ((a_frac - 0.12) / 0.88) * 0.5;
+        double refr = active ? 9.0 * (1.0 - 0.55 * f) : 9.0;
+        double trgb = active ? 1.0 + (240.0 / 255.0 - 1.0) * (0.5 * f) : 1.0;
+        double ta = floor(a_frac * 255.0 + 0.5) / 255.0;
+        int nf = 0;
+        push_inst(inst, &nf, 18.5, 18.0, 63.0, 28.0, 14.0, 0.0, 0.0, 0.0, 48.0/255.0, 209.0/255.0, 88.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        push_inst(inst, &nf, 31.58, 12.8, 59.2, 38.4, 19.2, 6.0, 1.0, blur_slot, trgb, trgb, trgb, ta, 1.0, 9.0, 0.0, 1.0, -1.0, refr, 0.0, 0.0);
+        return render_rgba(inst, nf, 28.0/255.0, 28.0/255.0, 30.0/255.0, 3.0, 360, 195, dst);
+      };
+      auto roi_diff = [](const uint8_t *a, const uint8_t *b) -> int {
+        int md = 0;
+        for (int py = 38; py <= 154; py++) {
+          for (int px = 95; px <= 272; px++) {
+            size_t k = ((size_t)py * 360 + (size_t)px) * 4;
+            for (int c = 0; c < 3; c++) {
+              int d = abs((int)a[k + c] - (int)b[k + c]);
+              if (d > md) md = d;
+            }
+          }
+        }
+        return md;
+      };
+      auto mean_l = [&](const uint8_t *buf, int x0, int x1, int y0, int y1) -> double {
+        double s = 0.0;
+        int cnt = 0;
+        for (int py = y0; py <= y1; py++)
+          for (int px = x0; px <= x1; px++) { s += luma_f(buf, 360, px, py); cnt++; }
+        return s / (double)cnt;
+      };
+      if (!draw_frost(0.0, fb0)) return 0;
+      if (!draw_frost(0.0001, rgba)) return 0;
+      if (!draw_frost(0.00011, fb00011)) return 0;
+      if (!draw_frost(0.01, rgba)) return 0;
+      if (!draw_frost(0.05, rgba)) return 0;
+      if (!draw_frost(0.10, fb10)) return 0;
+      if (!draw_frost(0.127, fb127)) return 0;
+      if (!draw_frost(0.128, fb128)) return 0;
+      if (!draw_frost(0.13, fb13)) return 0;
+      if (!draw_frost(0.30, fb30)) return 0;
+      int d_eps = roi_diff(fb0, fb00011);
+      int d_blur = roi_diff(fb127, fb128);
+      int d_cross = roi_diff(fb10, fb13);
+      double ml10 = mean_l(fb10, 95, 272, 38, 154), ml13 = mean_l(fb13, 95, 272, 38, 154);
+      double ml0_roi = mean_l(fb0, 95, 272, 38, 154), ml30_roi = mean_l(fb30, 95, 272, 38, 154);
+      int frost_ok = (d_eps <= 2) && (d_blur <= 8) && (d_cross <= 90) && (fabs(ml13 - ml10) < 15.0) && (ml30_roi > ml0_roi + 15.0);
+      printf("  [%s] V11-Frost continuity: d_eps(0->0.00011)=%d (<=2) d_blur(0.127->0.128)=%d (<=8) d_cross(0.10->0.13)=%d (<=90, dMeanL=%.1f) fog30=%.1f>%.1f+15\n",
+             frost_ok ? "PASS" : "FAIL", d_eps, d_blur, d_cross, fabs(ml13 - ml10), ml30_roi, ml0_roi);
+      v11_ok &= frost_ok;
     }
     ok &= v11_ok;
   }
