@@ -3,6 +3,7 @@
 
 import "motion"
 import "paint"
+import "signals"
 import "ui"
 import "view"
 
@@ -81,11 +82,15 @@ pub fn liquid_capsule_decorate(
   interactive~ : Bool = false,
   solid? : () -> Int64,
   tint? : () -> Option[Int64],
+  glass? : (Option[(Double, Double)]) -> paint::Glass,
   extra_blur? : () -> Double,
   active? : () -> Bool,
   shadow? : () -> (Double, Double, Int64),
   solid_edge? : () -> (Double, Int64),
+  with_edge~ : Bool = true,
+  with_shadow~ : Bool = true,
   clips~ : Bool = true,
+  trigger~ : Bool = false,
 ) -> view::View {
   match min_height {
     Some(h) => {
@@ -105,13 +110,82 @@ pub fn liquid_capsule_decorate(
       None => true
     }
   }
-  let _ = v
-  .glass(
+  let resolve_base_glass = fn(spot : Option[(Double, Double)]) -> paint::Glass {
+    let base = match glass {
+      Some(gf) => gf(spot)
+      None => {
+        let sol = match solid {
+          Some(f) => f()
+          None => clear
+        }
+        let custom_tint = match tint {
+          Some(f) => f()
+          None => None
+        }
+        capsule_tone_glass(tone, spot, sol, custom_tint, sharing)
+      }
+    }
+    lg_glass_with_extra_blur(base, extra_blur)
+  }
+  let resolve_shadow = fn() -> (Double, Double, Int64) {
+    match shadow {
+      Some(f) => f()
+      None => glass_control_shadow()
+    }
+  }
+  let trig_opt : Option[PillTriggerScope] = if trigger {
+    let fx_sig : signals::Signal[(Option[(Double, Double)], Int)] = signals::signal_by((None, 0), pill_fx_eq)
+    let morph_glass : signals::Ref[Option[() -> Option[paint::Glass]]] = ui::ref_new(None)
+    let morph_shadow : signals::Ref[Option[() -> (Double, Double, Int64)]] = ui::ref_new(None)
+    let press_way = motion::NodeWay::new(0.0)
+    let children : Array[view::View] = []
+    let trig_h = match min_height {
+      Some(h) => h
+      None => 0.0
+    }
+    let trig_scope = PillTriggerScope::{
+      pill: v,
+      fx: fx_sig,
+      press_way,
+      morph_glass,
+      morph_shadow,
+      morph_owner: 0,
+      morph_cancel: None,
+      children,
+      height: trig_h,
+      pad: 0.0,
+      direction: PillDirection::Horizontal,
+      has_press_scale: false,
+      rest_glass: fn() { resolve_base_glass(None) },
+    }
+    let _ = v.lends(liquid_pill_trigger_lent, trig_scope)
+    Some(trig_scope)
+  } else {
+    None
+  }
+  let trig_fx_opt : Option[signals::Signal[(Option[(Double, Double)], Int)]] = match trig_opt {
+    Some(trig) => Some(trig.fx)
+    None => None
+  }
+  let _ = v.glass(
+    // invar-audit-allow: E008 (morph_glass Ref on trig_opt is invalidated via trig.fx.get())
     view::Live::By(fn() {
       if !is_active() {
         return None
       }
-      let spot = if interactive && v.pressed() && !v.glass_solid() {
+      match trig_opt {
+        Some(trig) => {
+          let (_, ly) = trig.fx.get()
+          if ly != 0 {
+            return match trig.morph_glass.v {
+              Some(mg) => mg()
+              None => if ly < 0 { None } else { Some(resolve_base_glass(None)) }
+            }
+          }
+        }
+        None => ()
+      }
+      let spot = if interactive && v.pressed() && !(v.glass_solid() || ui::glass_solid()) {
         let (_, _, w, h) = v.placed_window_now()
         if w > 0.0 && h > 0.0 {
           Some((w / 2.0, h / 2.0))
@@ -121,46 +195,59 @@ pub fn liquid_capsule_decorate(
       } else {
         None
       }
-      let sol = match solid {
-        Some(f) => f()
-        None => clear
-      }
-      let custom_tint = match tint {
-        Some(f) => f()
-        None => None
-      }
-      let base = capsule_tone_glass(tone, spot, sol, custom_tint, sharing)
-      let glass = lg_glass_with_extra_blur(base, extra_blur)
-      Some(glass)
+      Some(resolve_base_glass(spot))
     }),
   )
-  .edge(
-    view::Live::By(fn() {
-      if !is_active() {
-        (0.0, clear)
-      } else if v.glass_solid() || ui::glass_solid() {
-        match solid_edge {
-          Some(f) => f()
-          None => liquid_solid_edge()
+  if with_edge {
+    let _ = v.edge(
+      view::Live::By(fn() {
+        if !is_active() {
+          return (0.0, clear)
         }
-      } else {
-        (0.0, clear)
-      }
-    }),
-  )
-  .shadow(
-    view::Live::By(fn() {
-      if !is_active() {
-        shadow_none
-      } else {
-        match shadow {
-          Some(f) => f()
-          None => glass_control_shadow()
+        match trig_fx_opt {
+          Some(fx) => {
+            if fx.get().1 != 0 {
+              return (0.0, clear)
+            }
+          }
+          None => ()
         }
-      }
-    }),
-  )
-  .shadow_outside(view::Live::Is(true))
+        if v.glass_solid() || ui::glass_solid() {
+          match solid_edge {
+            Some(f) => f()
+            None => liquid_solid_edge()
+          }
+        } else {
+          (0.0, clear)
+        }
+      }),
+    )
+  }
+  if with_shadow {
+    let _ = v
+    .shadow(
+      // invar-audit-allow: E008 (morph_shadow Ref on trig_opt is invalidated via trig.fx.get())
+      view::Live::By(fn() {
+        if !is_active() {
+          return shadow_none
+        }
+        match trig_opt {
+          Some(trig) => {
+            let (_, ly) = trig.fx.get()
+            if ly != 0 {
+              return match trig.morph_shadow.v {
+                Some(ms) => ms()
+                None => if ly < 0 { shadow_none } else { resolve_shadow() }
+              }
+            }
+          }
+          None => ()
+        }
+        resolve_shadow()
+      }),
+    )
+    .shadow_outside(view::Live::Is(true))
+  }
   if clips {
     let _ = v.clips(view::Live::Is(true))
   }
@@ -178,11 +265,15 @@ pub fn liquid_capsule_node(
   interactive~ : Bool = false,
   solid? : () -> Int64,
   tint? : () -> Option[Int64],
+  glass? : (Option[(Double, Double)]) -> paint::Glass,
   extra_blur? : () -> Double,
   active? : () -> Bool,
   shadow? : () -> (Double, Double, Int64),
   solid_edge? : () -> (Double, Int64),
+  with_edge~ : Bool = true,
+  with_shadow~ : Bool = true,
   clips~ : Bool = true,
+  trigger~ : Bool = false,
   loc~ : String = "",
 ) -> view::View {
   parent.box(loc=loc, fn(v : view::View) -> Unit {
@@ -195,11 +286,15 @@ pub fn liquid_capsule_node(
       interactive=interactive,
       solid?=solid,
       tint?=tint,
+      glass?=glass,
       extra_blur?=extra_blur,
       active?=active,
       shadow?=shadow,
       solid_edge?=solid_edge,
+      with_edge=with_edge,
+      with_shadow=with_shadow,
       clips=clips,
+      trigger=trigger,
     )
     body(v)
   })
