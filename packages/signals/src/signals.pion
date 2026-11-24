@@ -56,6 +56,47 @@ struct ComputedState[T] {
   mut read_dependency : Option[Computed[Unit]]
   mut untracked_read : Option[() -> Option[T]]
   made_at : String
+  mut ctx_enter : Option[() -> (() -> Unit)]
+}
+
+let reactive_context_hooks : Array[() -> (() -> (() -> Unit))] = []
+
+/// Register a lightweight reactive context capture hook.
+/// `capture()` runs when a `Computed`, `Effect`, or `Watch` is created and returns an `enter`
+/// closure; each re-evaluation calls `let leave = enter()`, executes, and calls `leave()`.
+pub fn register_reactive_context(capture : () -> (() -> (() -> Unit))) -> Unit {
+  reactive_context_hooks.push(capture)
+}
+
+fn capture_reactive_context() -> Option[() -> (() -> Unit)] {
+  let n = reactive_context_hooks.length()
+  if n == 0 {
+    return None
+  }
+  if n == 1 {
+    return Some((reactive_context_hooks[0])())
+  }
+  let enters : Array[() -> (() -> Unit)] = []
+  let mut i = 0
+  while i < n {
+    enters.push((reactive_context_hooks[i])())
+    i += 1
+  }
+  Some(fn() -> (() -> Unit) {
+    let leaves : Array[() -> Unit] = []
+    let mut j = 0
+    while j < enters.length() {
+      leaves.push((enters[j])())
+      j += 1
+    }
+    fn() -> Unit {
+      let mut k = leaves.length() - 1
+      while k >= 0 {
+        (leaves[k])()
+        k -= 1
+      }
+    }
+  })
 }
 
 pub struct Computed[T] {
@@ -167,6 +208,14 @@ fn finish_computed_read(node_id : Int) -> Unit {
     slot.flags = flag_mutable | flag_dirty
     dispose_all_deps_in_reverse(node_id)
   }
+  if disposed_during_read {
+    let cb = slot.on_dispose
+    slot.on_dispose = None
+    match cb {
+      Some(f) => f()
+      None => ()
+    }
+  }
 }
 
 fn effect_like(dep : Int) -> Bool {
@@ -259,6 +308,7 @@ pub fn computed_by[T](getter : (Option[T]) -> T, same : (T, T) -> Bool) -> Compu
 }
 
 pub fn computed_by_at[T](getter : (Option[T]) -> T, same : (T, T) -> Bool, loc : String) -> Computed[T] {
+  let ctx_enter = capture_reactive_context()
   let state = ComputedState::{
     value: None,
     getter,
@@ -267,6 +317,7 @@ pub fn computed_by_at[T](getter : (Option[T]) -> T, same : (T, T) -> Bool, loc :
     read_dependency: None,
     untracked_read: None,
     made_at: loc,
+    ctx_enter,
   }
   let upd : (Int) -> Bool = fn(nid : Int) -> Bool {
     update_computed(nid, state)
@@ -367,8 +418,32 @@ pub fn effect_cleanup(f : () -> () -> Unit) -> () -> Unit {
   effect_of(fn() -> Option[() -> Unit] { Some(f()) }, "")
 }
 
+fn wrap_effect_cleanup(
+  cb : Option[() -> Unit],
+  ctx_enter : Option[() -> (() -> Unit)],
+) -> Option[() -> Unit] {
+  match (cb, ctx_enter) {
+    (Some(cleanup), Some(enter)) => Some(fn() -> Unit {
+      let leave = enter()
+      cleanup()
+      leave()
+    })
+    _ => cb
+  }
+}
+
 fn effect_of(f : () -> Option[() -> Unit], loc : String) -> () -> Unit {
-  let e = alloc_node(flag_watching | flag_recursed_check, kind_effect, Some(f), -1, None)
+  let ctx_enter = capture_reactive_context()
+  let wrapped_f = match ctx_enter {
+    Some(enter) => fn() -> Option[() -> Unit] {
+      let leave = enter()
+      let res = wrap_effect_cleanup(f(), ctx_enter)
+      leave()
+      res
+    }
+    None => f
+  }
+  let e = alloc_node(flag_watching | flag_recursed_check, kind_effect, Some(wrapped_f), -1, None)
   let gen = g.nodes[e].gen
   if g.computing > g.held_at {
     match g.effect_in_computed {
@@ -392,7 +467,7 @@ fn effect_of(f : () -> Option[() -> Unit], loc : String) -> () -> Unit {
     g.nodes[parent].flags = g.nodes[parent].flags | flag_has_child_effect
   }
   g.run_depth += 1
-  g.nodes[e].cleanup = f()
+  g.nodes[e].cleanup = wrap_effect_cleanup(f(), ctx_enter)
   g.run_depth -= 1
   g.active_sub = prev_sub
   g.owner = prev_owner
@@ -475,7 +550,15 @@ fn update_computed[T](c : Int, state : ComputedState[T]) -> Bool {
   g.cycle += 1
   let old_value = state.value
   g.computing += 1
-  let value = (state.getter)(old_value)
+  let value = match state.ctx_enter {
+    Some(enter) => {
+      let leave = enter()
+      let v = (state.getter)(old_value)
+      leave()
+      v
+    }
+    None => (state.getter)(old_value)
+  }
   g.computing -= 1
   state.value = Some(value)
   g.active_sub = prev_sub
@@ -654,7 +737,16 @@ pub fn Computed::get[T](self : Computed[T]) -> T {
   if g.active_sub < 0 {
     match state.untracked_read {
       Some(read) => {
-        match read() {
+        let r = match state.ctx_enter {
+          Some(enter) => {
+            let leave = enter()
+            let out = read()
+            leave()
+            out
+          }
+          None => read()
+        }
+        match r {
           Some(v) => return v
           None => ()
         }
@@ -694,7 +786,16 @@ pub fn Computed::get[T](self : Computed[T]) -> T {
     let prev_sub = g.active_sub
     g.active_sub = node_id
     g.computing += 1
-    state.value = Some((state.getter)(None))
+    let init_val = match state.ctx_enter {
+      Some(enter) => {
+        let leave = enter()
+        let v = (state.getter)(None)
+        leave()
+        v
+      }
+      None => (state.getter)(None)
+    }
+    state.value = Some(init_val)
     g.computing -= 1
     g.active_sub = prev_sub
     g.nodes[node_id].flags = g.nodes[node_id].flags & bit_not(flag_recursed_check)
@@ -841,6 +942,7 @@ fn effect_scope_oper(e : Int) -> Unit {
     o.gone = true
     o.changed = None
     o.marked = None
+    o.ctx_enter = None
   }
   g.nodes[e].flags = flag_none
   dispose_all_deps_in_reverse(e)
@@ -879,7 +981,10 @@ pub fn Computed::dispose[T](self : Computed[T]) -> Unit {
   let node_id = self.node_id
   if (g.nodes[node_id].flags & flag_recursed_check) != 0 || computed_extra_reading(node_id) {
     g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dispose_after_update
+    g.nodes[node_id].on_dispose = Some(fn() -> Unit { self.state.ctx_enter = None })
   } else {
+    self.state.ctx_enter = None
+    g.nodes[node_id].on_dispose = None
     unwatched_node(node_id)
   }
 }
@@ -1047,6 +1152,7 @@ fn watch_told(o : WatchSlot) -> Unit {
 }
 
 pub fn watch(changed : () -> Unit) -> Watch {
+  let ctx_enter = capture_reactive_context()
   let wid = g.watches.length()
   g.watches.push(WatchSlot::{
     changed: Some(changed),
@@ -1056,6 +1162,7 @@ pub fn watch(changed : () -> Unit) -> Watch {
     marked_by: "",
     set_by: [],
     resting: false,
+    ctx_enter,
   })
   let node_id = alloc_node(flag_none, kind_watch, None, wid, None)
   let node_gen = g.nodes[node_id].gen
@@ -1066,10 +1173,38 @@ pub fn watch(changed : () -> Unit) -> Watch {
   Watch::{ node_id, node_gen, watch_id: wid }
 }
 
+/// Run `f` inside the reactive context captured when this `Watch` was created (no-op if stopped).
+pub fn Watch::in_context[T](self : Watch, f : () -> T) -> T {
+  let own = g.watches[self.watch_id]
+  if own.gone {
+    return f()
+  }
+  match own.ctx_enter {
+    Some(enter) => {
+      let leave = enter()
+      let out = f()
+      leave()
+      out
+    }
+    None => f()
+  }
+}
+
 pub fn Watch::read[T](self : Watch, f : () -> T) -> T {
   let own = g.watches[self.watch_id]
-  if own.resting || own.gone {
+  if own.gone {
     return untracked(f)
+  }
+  if own.resting {
+    return match own.ctx_enter {
+      Some(enter) => {
+        let leave = enter()
+        let out = untracked(f)
+        leave()
+        out
+      }
+      None => untracked(f)
+    }
   }
   let e = self.node_id
   if g.watch_read_depth == 0 {
@@ -1083,7 +1218,15 @@ pub fn Watch::read[T](self : Watch, f : () -> T) -> T {
   let prev_sub = g.active_sub
   g.active_sub = e
   g.cycle += 1
-  let v = f()
+  let v = match own.ctx_enter {
+    Some(enter) => {
+      let leave = enter()
+      let out = f()
+      leave()
+      out
+    }
+    None => f()
+  }
   g.active_sub = prev_sub
   g.watch_read_depth -= 1
   if own.gone || !g.nodes[e].alive || g.nodes[e].gen != self.node_gen {

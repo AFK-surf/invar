@@ -3,6 +3,57 @@ import "flex"
 import "signals"
 import "text"
 
+let current_tree_room_ref : signals::Ref[Option[signals::Signal[(Double, Double)]]] = signals::ref_new(None)
+let view_ctx_hook_registered : signals::Ref[Bool] = signals::ref_new(false)
+
+fn ensure_view_ctx_hook() -> Unit {
+  if view_ctx_hook_registered.v {
+    return
+  }
+  view_ctx_hook_registered.v = true
+  signals::register_reactive_context(fn() -> (() -> (() -> Unit)) {
+    let captured_room = current_tree_room_ref.v
+    fn() -> (() -> Unit) {
+      let prev_room = current_tree_room_ref.v
+      current_tree_room_ref.v = captured_room
+      fn() -> Unit {
+        current_tree_room_ref.v = prev_room
+      }
+    }
+  })
+}
+
+fn init_view_ctx_hook() -> Bool {
+  ensure_view_ctx_hook()
+  true
+}
+
+let view_ctx_hook_init : Bool = init_view_ctx_hook()
+
+///|
+/// Active tree's stable size signal `(width, height)` during tree construction, layout, or reactive binding evaluation.
+pub fn current_tree_room() -> Option[signals::Signal[(Double, Double)]] {
+  current_tree_room_ref.v
+}
+
+///|
+/// Temporarily clear the active tree room scope while executing `f`, restoring the prior scope on exit.
+pub fn without_tree_room[T](f : () -> T) -> T {
+  let prev = current_tree_room_ref.v
+  current_tree_room_ref.v = None
+  let out = f()
+  current_tree_room_ref.v = prev
+  out
+}
+
+fn with_tree_room[T](room : signals::Signal[(Double, Double)], body : () -> T) -> T {
+  let prev = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(room)
+  let out = body()
+  current_tree_room_ref.v = prev
+  out
+}
+
 ///|
 /// A handle on a node made once: the tree, its index, its making there.
 pub struct View {
@@ -348,12 +399,16 @@ pub fn Tree::new(
   // View::rests) lets go of it, so the tree is not moving for a way nothing draws, and reads it anew as it wakes,
   // where the clock has it then: @signals.rest)
   t.clock.on_unwatched(fn() { })
+  ensure_view_ctx_hook()
   let root = t.made(-1, loc="")
+  let prev_room = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(t.room)
   if t.sources {
     root.owning(fn() { root.make_with_effect_diagnostics(make) })
   } else {
     root.owning(fn() { make(root) })
   }
+  current_tree_room_ref.v = prev_room
   t
 }
 
@@ -1268,6 +1323,13 @@ pub fn Tree::alive(self : Tree) -> Int {
   self.nodes.length() - self.free.length()
 }
 
+let tree_disposing_depth : signals::Ref[Int] = ref_new(0)
+
+/// Whether any `Tree::dispose()` is currently running node teardown callbacks.
+pub fn tree_disposing() -> Bool {
+  tree_disposing_depth.v > 0
+}
+
 ///|
 /// The whole tree let go: every node's scope stopped, what goes with it run, callbacks and measures dropped.
 pub fn Tree::dispose(self : Tree) -> Unit {
@@ -1275,7 +1337,9 @@ pub fn Tree::dispose(self : Tree) -> Unit {
   // (what follows the pointer held by nothing of the tree's nodes: let go with it, told nothing more)
   self.point_stopped()
   if self.nodes.length() > 0 && self.nodes[0].live {
+    tree_disposing_depth.v = tree_disposing_depth.v + 1
     self.root().let_go()
+    tree_disposing_depth.v = tree_disposing_depth.v - 1
   }
   if node_rests.length() > 0 {
     array_retain(node_rests, fn(e) { !(e.1.tree.phys_id == self.phys_id) })
@@ -2072,6 +2136,8 @@ fn Tree::queued[T](self : Tree, read : () -> T, then : (T) -> Unit, at~ : Int = 
     watch: None,
     run: bound_runs_not,
   }
+  let room_at_make = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(self.room)
   let w = signals::watch(fn() {
     if b.live && !b.queued {
       self.pointer_binding_changed(b)
@@ -2094,6 +2160,7 @@ fn Tree::queued[T](self : Tree, read : () -> T, then : (T) -> Unit, at~ : Int = 
       self.settle_after_change(b.told_at)
     }
   })
+  current_tree_room_ref.v = room_at_make
   w.on_marked(fn() {
     // (marked as an answer writes what it read: what it sets as it runs is the answer's)
     // (or, where only a transition moves its node, outside one, by no clock: its change at once, transition.mbt)
@@ -2132,6 +2199,8 @@ fn Tree::queued[T](self : Tree, read : () -> T, then : (T) -> Unit, at~ : Int = 
     let scopes = b.moved
     b.moved = []
     transition_again(scopes, fn() {
+      let prev_room = current_tree_room_ref.v
+      current_tree_room_ref.v = Some(self.room)
       let reading_was = self.binding_reading
       self.binding_reading = at
       let v = w.read(read)
@@ -2147,12 +2216,13 @@ fn Tree::queued[T](self : Tree, read : () -> T, then : (T) -> Unit, at~ : Int = 
       self.binding_running = self.binding_running + 1
       // (untracked: what it sets read by nothing that reads now)
       let was_sub = signals::set_active_sub(None)
-      then(v)
+      w.in_context(fn() { then(v) })
       signals::set_active_sub(was_sub)
       self.bound_by_clock = by_clock_was
       self.binding_answered = answered_was
       self.binding_running = self.binding_running - 1
       self.cause_at = was
+      current_tree_room_ref.v = prev_room
     })
     self.change_ended()
   }
@@ -2223,7 +2293,7 @@ fn Tree::structured[T : ViewEq](
   // (its work done once for every type it reads, by the count of the times what it read came out otherwise: each read
   // compared with the one before here alone, `then` given what was read last, the read that told it, as it is done at
   // once after it (Tree::structured_by). Compiled as one, not once a type: 385 of them were 15 MB of a program's C)
-  let last : Ref[Option[T]] = ref_new(None)
+  let last : signals::Ref[Option[T]] = ref_new(None)
   let changes = ref_new(0)
   self.structured_by(
     fn() {
@@ -2256,11 +2326,13 @@ fn Tree::structured_by(
   draws~ : Bool = true,
 ) -> () -> Unit {
   let live = ref_new(true)
-  let last : Ref[Option[Int]] = ref_new(None)
+  let last : signals::Ref[Option[Int]] = ref_new(None)
   // (the transitions told as what it reads was marked, kept for its next run whenever that comes: transition.mbt)
-  let moved : Ref[Array[Int]] = ref_new([])
+  let moved : signals::Ref[Array[Int]] = ref_new([])
   // (the watch reads anew as it is told; let go as it stops)
-  let watch : Ref[Option[signals::Watch]] = ref_new(None)
+  let watch : signals::Ref[Option[signals::Watch]] = ref_new(None)
+  let room_at_make = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(self.room)
   let w = signals::watch(fn() {
     guard live.v else { return }
     let w = match watch.v {
@@ -2278,17 +2350,19 @@ fn Tree::structured_by(
     self.at_cause(fn() {
       // (still bound once what was due by then is settled: one let go then reads nothing more, follows nothing again)
       guard live.v else { return false }
+      let prev_room = current_tree_room_ref.v
+      current_tree_room_ref.v = Some(self.room)
       let v = w.read(read)
       // (what this read was marked within is its own, whether it changes what is made or not: never left for a later run)
       let scopes = moved.v
       moved.v = []
-      if opt_ne(last.v, Some(v)) {
+      let out = if opt_ne(last.v, Some(v)) {
         last.v = Some(v)
         if live.v {
           self.structure_done(fn() {
             let was = answered.v
             answered.v = was || quiet
-            transition_again(scopes, fn() { then(v) })
+            transition_again(scopes, fn() { w.in_context(fn() { then(v) }) })
             answered.v = was
           })
         }
@@ -2296,8 +2370,11 @@ fn Tree::structured_by(
       } else {
         false
       }
+      current_tree_room_ref.v = prev_room
+      out
     })
   })
+  current_tree_room_ref.v = room_at_make
   watch.v = Some(w)
   // (settled as the answer that marked it ends, quietly: answering.mbt. Read anew and done now, its watch's own run
   // after finding it as it is, nothing to do)
@@ -2312,16 +2389,18 @@ fn Tree::structured_by(
     guard !self.gone else { return }
     self.at_cause(fn() {
       guard live.v else { return false }
+      let prev_room = current_tree_room_ref.v
+      current_tree_room_ref.v = Some(self.room)
       let v = w.read(read)
       // (settled as an answer: what it was marked within is done with)
       moved.v = []
-      if opt_ne(last.v, Some(v)) {
+      let out = if opt_ne(last.v, Some(v)) {
         last.v = Some(v)
         if live.v {
           self.structure_done(fn() {
             let was = answered.v
             answered.v = true
-            then(v)
+            w.in_context(fn() { then(v) })
             answered.v = was
           })
         }
@@ -2329,6 +2408,8 @@ fn Tree::structured_by(
       } else {
         false
       }
+      current_tree_room_ref.v = prev_room
+      out
     })
   }
   // (marked as it is told by an answer: settled as that ends)
@@ -2343,7 +2424,10 @@ fn Tree::structured_by(
       moved.v = concat_int_arrays(moved.v, told)
     }
   })
+  let prev_room_init = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(self.room)
   let v = w.read(read)
+  current_tree_room_ref.v = prev_room_init
   last.v = Some(v)
   let stop = fn() {
     live.v = false
@@ -2358,7 +2442,10 @@ fn Tree::structured_by(
   let held_was = answer_held.v
   cause_open.v += 1
   signals::start_batch()
-  self.structure_done(fn() { then(v) })
+  let prev_room_start = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(self.room)
+  self.structure_done(fn() { w.in_context(fn() { then(v) }) })
+  current_tree_room_ref.v = prev_room_start
   signals::end_batch()
   cause_open.v -= 1
   answer_held.v = held_was

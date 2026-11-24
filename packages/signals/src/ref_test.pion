@@ -1,0 +1,99 @@
+// Unit tests for canonical `signals::Ref[T]` and `signals::ref_new`.
+
+test "ref: in-place mutation, aliasing, and unique monotonic phys_id across types" {
+  let r_int : Ref[Int] = ref_new(10)
+  let r_str : Ref[String] = ref_new("hello")
+  let r_bool : Ref[Bool] = ref_new(false)
+  let r_opt : Ref[Option[Int]] = ref_new(None)
+  let r_arr : Ref[Array[Int]] = ref_new([1, 2])
+
+  debug_assert(r_int.phys_id > 0, "phys_id must be positive")
+  debug_assert(r_int.phys_id < r_str.phys_id, "phys_id must strictly increase (int < str)")
+  debug_assert(r_str.phys_id < r_bool.phys_id, "phys_id must strictly increase (str < bool)")
+  debug_assert(r_bool.phys_id < r_opt.phys_id, "phys_id must strictly increase (bool < opt)")
+  debug_assert(r_opt.phys_id < r_arr.phys_id, "phys_id must strictly increase (opt < arr)")
+
+  // Aliasing preserves in-place mutation
+  let alias = r_int
+  alias.v = 42
+  debug_assert(r_int.v == 42, "mutation through alias must be visible through original Ref")
+  debug_assert(alias.phys_id == r_int.phys_id, "alias shares identical phys_id")
+
+  r_str.v = "world"
+  r_bool.v = true
+  r_opt.v = Some(99)
+  r_arr.v.push(3)
+  debug_assert(r_str.v == "world", "string Ref mutated")
+  debug_assert(r_bool.v, "bool Ref mutated")
+  match r_opt.v {
+    Some(n) => debug_assert(n == 99, "option Ref mutated")
+    None => debug_assert(false, "option Ref should be Some(99)")
+  }
+  debug_assert(r_arr.v.length() == 3 && r_arr.v[2] == 3, "array Ref mutated")
+}
+
+test "ref: works inside signal_ref and signal_by without Eq impl" {
+  let cell_a : Ref[Int] = ref_new(1)
+  let cell_b : Ref[Int] = ref_new(2)
+  let sig = signal_by(cell_a, fn(a : Ref[Int], b : Ref[Int]) { a.phys_id == b.phys_id })
+  let fires : Ref[Int] = ref_new(0)
+  let stop = effect(fn() {
+    let _ = sig.get()
+    fires.v = fires.v + 1
+  })
+  debug_assert(fires.v == 1, "initial effect run")
+  // Setting the same Ref phys_id does not re-trigger
+  sig.set(cell_a)
+  debug_assert(fires.v == 1, "same phys_id must not re-trigger")
+  // Setting a different Ref phys_id triggers
+  sig.set(cell_b)
+  debug_assert(fires.v == 2, "distinct phys_id must trigger effect")
+  stop()
+}
+
+test "watch: stopped watch releases captured reactive context" {
+  register_reactive_context(fn() { fn() { fn() { () } } })
+  let w = watch(fn() { () })
+  let _ = w.read(fn() { 1 })
+  w.stop()
+  debug_assert(w.gone(), "watch is stopped")
+  debug_assert(g.watches[w.watch_id].ctx_enter.is_none(), "stopped watch slot must release captured context")
+}
+
+test "computed: deferred disposal releases captured reactive context" {
+  register_reactive_context(fn() { fn() { fn() { () } } })
+  let c = computed(fn(_ : Option[Int]) { 1 })
+  let _ = c.get()
+  c.reading(fn() { c.dispose() })
+  debug_assert(c.state.ctx_enter.is_none(), "context must be released after deferred disposal")
+}
+
+test "computed: temporarily unwatched computed retains reactive context for subsequent reads" {
+  let active_tag : Ref[Int] = ref_new(7)
+  register_reactive_context(fn() {
+    let captured = active_tag.v
+    fn() {
+      let prev = active_tag.v
+      active_tag.v = captured
+      fn() { active_tag.v = prev }
+    }
+  })
+  let tick = signal(0)
+  let c = computed_scoped(
+    fn(_ : Option[Int]) -> Int {
+      let _ = tick.get()
+      active_tag.v
+    },
+    None,
+  )
+  let seen : Ref[Int] = ref_new(-1)
+  let stop = effect(fn() { seen.v = c.get() })
+  debug_assert(seen.v == 7, "initial tracked read sees captured tag 7")
+  // Unwatch without disposing, then change ambient tag and re-read
+  stop()
+  active_tag.v = 99
+  tick.set(1)
+  debug_assert(c.state.ctx_enter.is_some(), "unwatched computed must retain captured context")
+  debug_assert(c.get() == 7, "re-reading unwatched computed still restores captured tag 7")
+  c.dispose()
+}
