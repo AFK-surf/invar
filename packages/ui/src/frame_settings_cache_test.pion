@@ -1,0 +1,421 @@
+// The system settings a frame reads (reduce transparency, reduce motion, increase contrast, MBUI_GLASS) are asked of
+// the host at most once a frame, or once an encode_tree_scene, however many nodes read them; a change between frames,
+// and an override at any moment, is seen at once.
+
+import "hostapi"
+import "paint"
+import "signals"
+import "view"
+
+struct HostAsks {
+  mut transparency : Int
+  mut motion : Int
+  mut contrast : Int
+  mut env : Int
+  env_keys : Map[String, Int]
+}
+
+fn HostAsks::zero(self : HostAsks) -> Unit {
+  self.transparency = 0
+  self.motion = 0
+  self.contrast = 0
+  self.env = 0
+  self.env_keys.clear()
+}
+
+fn HostAsks::env_of(self : HostAsks, name : String) -> Int {
+  match self.env_keys.get(name) {
+    Some(n) => n
+    None => 0
+  }
+}
+
+fn HostAsks::said(self : HostAsks) -> String {
+  "transparency \{self.transparency}, motion \{self.motion}, contrast \{self.contrast}, MBUI_GLASS \{self.env_of("MBUI_GLASS")}, INVAR_APP_VISIBLE \{self.env_of("INVAR_APP_VISIBLE")}, env \{self.env}"
+}
+
+fn HostAsks::most(self : HostAsks, n : Int, label : String) -> Unit {
+  debug_assert(
+    self.transparency <= n && self.motion <= n && self.contrast <= n && self.env_of("MBUI_GLASS") <= n && self.env_of("INVAR_APP_VISIBLE") <= n && self.env == self.env_of("MBUI_GLASS") + self.env_of("INVAR_APP_VISIBLE"),
+    "\{label}: at most \{n} each, asked \{self.said()}",
+  )
+}
+
+/// Count what is asked of the host in place (a Tester's fake, until it is disposed).
+fn count_host_asks() -> HostAsks {
+  let asks = HostAsks::{ transparency: 0, motion: 0, contrast: 0, env: 0, env_keys: Map::new() }
+  let h = hostapi::host()
+  let transparency = h.reduce_transparency
+  let motion = h.reduce_motion
+  let contrast = h.increase_contrast
+  let env = h.env
+  h.reduce_transparency = fn() {
+    asks.transparency = asks.transparency + 1
+    transparency()
+  }
+  h.reduce_motion = fn() {
+    asks.motion = asks.motion + 1
+    motion()
+  }
+  h.increase_contrast = fn() {
+    asks.contrast = asks.contrast + 1
+    contrast()
+  }
+  h.env = fn(name : String) {
+    asks.env = asks.env + 1
+    asks.env_keys[name] = asks.env_of(name) + 1
+    env(name)
+  }
+  asks
+}
+
+/// 210 nodes and more in sight (by default 70 rows of a box, its words and a glass or plain box), each row reading the settings
+/// as `tick` changes.
+fn settings_page(root : view::View, tick : signals::Signal[Int], rows~ : Int = 70) -> Unit {
+  let mut i = 0
+  while i < rows {
+    let idx = i
+    let _ = root.box(fn(row : view::View) {
+      let _ = row.over(view::Live::Is(true))
+      .offset(view::Live::By(fn() { (tick.get().to_double(), idx.to_double() * 8.0) }))
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(8.0)))
+      .alpha(view::Live::By(fn() {
+        let moved = tick.get()
+        if glass_solid() || reduced_motion() || more_contrast_now() || moved < 0 { 0.9 } else { 1.0 }
+      }))
+      let _ = row.box(fn(w : view::View) { let _ = w.words(view::Live::Is("row \{idx}")) })
+      let _ = row.box(fn(g : view::View) {
+        let _ = g.width(view::Live::Is(Some(20.0))).height(view::Live::Is(Some(6.0)))
+        let _ = if idx % 2 == 0 {
+          g.glass(view::Live::Is(Some(paint::Glass::liquid(blur=3.0, rim=0.5, solid=0x223344FFL, layer=1))))
+        } else {
+          g.bg(0xF4F6FAFFL)
+        }
+      })
+    })
+    i += 1
+  }
+}
+
+fn settings_tester(tick : signals::Signal[Int]) -> Tester {
+  set_glass_solid(None)
+  set_glass_frost(0.0)
+  let t = Tester::tree(fn(root : view::View) { settings_page(root, tick) }, width=400.0, height=600.0, scale=1.0)
+  let n = match view_tree() {
+    Some(tree) => tree.drawn_held().length()
+    None => 0
+  }
+  debug_assert(n >= 200, "200 nodes held, got \{n}")
+  t
+}
+
+fn settings_frame(t : Tester) -> Unit {
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+}
+
+/// Whether the frame drawn last drew its glass solid.
+fn drawn_solid(t : Tester) -> Bool {
+  t.drawn_glass().length() == 0
+}
+
+test "frame_settings: a frame of 200 nodes asks the host each setting at most once, 10 frames at most 10 times" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  let asks = count_host_asks()
+  tick.set(1)
+  settings_frame(t)
+  asks.most(1, "one frame")
+  debug_assert(asks.transparency == 1 && asks.motion == 1 && asks.contrast == 1, "each still asked in a frame")
+  asks.zero()
+  let mut k = 2
+  while k < 12 {
+    tick.set(k)
+    settings_frame(t)
+    k += 1
+  }
+  asks.most(10, "ten frames")
+  // A second encode in the same frame (the reference a frame is compared with) asks no more.
+  let looked : signals::Ref[Int] = ref_new(0)
+  set_in_frame_looks_hook(Some(fn(_sc, _ref, _dmg, _w, _h, _s, _r, _g, _b) { looked.v = looked.v + 1 }))
+  asks.zero()
+  tick.set(15)
+  settings_frame(t)
+  asks.most(1, "a frame encoded twice")
+  debug_assert(looked.v == 1, "encoded twice")
+  set_in_frame_looks_hook(None)
+  // Solid glass asks no more.
+  t.fake.reduce_transparency_flag = true
+  asks.zero()
+  tick.set(20)
+  settings_frame(t)
+  asks.most(1, "a solid frame")
+  debug_assert(drawn_solid(t), "drawn solid")
+  t.dispose()
+}
+
+test "frame_settings: what a frame asks of the host does not grow with its nodes" {
+  let told : Array[String] = []
+  for rows in [4, 70] {
+    set_glass_solid(None)
+    let tick = signals::signal(0)
+    let t = Tester::tree(
+      fn(root : view::View) { settings_page(root, tick, rows=rows) },
+      width=400.0,
+      height=600.0,
+      scale=1.0,
+    )
+    let asks = count_host_asks()
+    tick.set(1)
+    settings_frame(t)
+    told.push(asks.said())
+    t.dispose()
+  }
+  debug_assert(told[0] == told[1], "4 rows: \{told[0]}; 70 rows: \{told[1]}")
+}
+
+test "frame_settings: a binding first run in a frame follows the overrides after it" {
+  set_glass_solid(None)
+  set_glass_frost(0.0)
+  let shown = signals::signal(false)
+  let runs : signals::Ref[Int] = ref_new(0)
+  let last : signals::Ref[Bool] = ref_new(false)
+  let t = Tester::tree(fn(root : view::View) {
+    root.show(fn() { shown.get() }, fn(v : view::View) {
+      let _ = v.box(fn(b : view::View) {
+        let _ = b.width(view::Live::By(fn() {
+          runs.v = runs.v + 1
+          last.v = glass_solid()
+          Some(if last.v { 20.0 } else { 10.0 })
+        }))
+      })
+    })
+  })
+  shown.set(true)
+  settings_frame(t)
+  let first = runs.v
+  debug_assert(first > 0 && !last.v, "first run in the frame")
+  set_glass_frost(1.0)
+  settings_frame(t)
+  debug_assert(runs.v > first && last.v, "follows the frost")
+  let second = runs.v
+  set_glass_solid(Some(false))
+  settings_frame(t)
+  debug_assert(runs.v > second && !last.v, "follows the override")
+  set_glass_solid(None)
+  set_glass_frost(0.0)
+  t.dispose()
+}
+
+test "frame_settings: a change between frames is drawn by the next frame" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  debug_assert(!drawn_solid(t) && !glass_solid_now(), "glass at first")
+  t.fake.reduce_transparency_flag = true
+  settings_frame(t)
+  debug_assert(drawn_solid(t) && glass_solid_now(), "reduce transparency on")
+  t.fake.reduce_transparency_flag = false
+  settings_frame(t)
+  debug_assert(!drawn_solid(t) && !glass_solid_now(), "reduce transparency off")
+  set_glass_solid(Some(true))
+  settings_frame(t)
+  debug_assert(drawn_solid(t), "set_glass_solid(Some(true))")
+  t.fake.reduce_transparency_flag = true
+  set_glass_solid(Some(false))
+  settings_frame(t)
+  debug_assert(!drawn_solid(t), "set_glass_solid(Some(false)) over the system's")
+  set_glass_solid(None)
+  settings_frame(t)
+  debug_assert(drawn_solid(t), "set_glass_solid(None) follows the system again")
+  t.fake.reduce_transparency_flag = false
+  set_glass_frost(1.0)
+  settings_frame(t)
+  debug_assert(drawn_solid(t), "set_glass_frost(1.0)")
+  set_glass_frost(0.0)
+  settings_frame(t)
+  debug_assert(!drawn_solid(t), "set_glass_frost(0.0)")
+  t.fake.reduce_motion_flag = true
+  t.fake.increase_contrast_flag = true
+  settings_frame(t)
+  debug_assert(reduced_motion_now() && more_contrast_now(), "motion and contrast on")
+  t.fake.reduce_motion_flag = false
+  t.fake.increase_contrast_flag = false
+  settings_frame(t)
+  debug_assert(!reduced_motion_now() && !more_contrast_now(), "motion and contrast off")
+  t.dispose()
+}
+
+test "frame_settings: MBUI_GLASS changed between frames, or with the host, is drawn by the next frame" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  debug_assert(!drawn_solid(t), "glass at first")
+  t.fake.env_vars["MBUI_GLASS"] = "solid"
+  settings_frame(t)
+  debug_assert(drawn_solid(t), "MBUI_GLASS=solid")
+  t.fake.env_vars["MBUI_GLASS"] = ""
+  settings_frame(t)
+  debug_assert(!drawn_solid(t), "MBUI_GLASS unset")
+  // (no read outside a frame between these: the frame itself asks the host in place)
+  let h = hostapi::host()
+  let env = h.env
+  h.env = fn(name : String) { if name == "MBUI_GLASS" { "solid" } else { env(name) } }
+  settings_frame(t)
+  debug_assert(drawn_solid(t), "another host's MBUI_GLASS")
+  h.env = env
+  settings_frame(t)
+  debug_assert(!drawn_solid(t), "the first host's again")
+  t.dispose()
+}
+
+test "frame_settings: an override said in a frame is drawn by that frame, and read at once" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  let said : signals::Ref[Option[Bool]] = ref_new(None)
+  let frost : signals::Ref[Double] = ref_new(0.0)
+  let still : signals::Ref[Option[Bool]] = ref_new(None)
+  let read : signals::Ref[(Bool, Bool)] = ref_new((false, false))
+  let hook = on_before_frame(fn() {
+    // (read before it is said: what is sampled then must not cover what is said after)
+    let _ = (glass_solid(), reduced_motion())
+    set_glass_solid(said.v)
+    set_glass_frost(frost.v)
+    set_reduced_motion(still.v)
+    read.v = (glass_solid(), reduced_motion())
+  })
+  said.v = Some(true)
+  still.v = Some(true)
+  settings_frame(t)
+  debug_assert(drawn_solid(t) && read.v.0 && read.v.1, "said solid and still in the frame")
+  said.v = Some(false)
+  still.v = Some(false)
+  settings_frame(t)
+  debug_assert(!drawn_solid(t) && !read.v.0 && !read.v.1, "said glass and moving in the frame")
+  said.v = None
+  frost.v = 1.0
+  settings_frame(t)
+  debug_assert(drawn_solid(t) && read.v.0, "frosted whole in the frame")
+  frost.v = 0.0
+  still.v = None
+  settings_frame(t)
+  debug_assert(!drawn_solid(t) && !read.v.0, "frost gone in the frame")
+  remove_before_frame(hook)
+  t.dispose()
+}
+
+test "frame_settings: outside a frame each read asks the host" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  t.fake.reduce_transparency_flag = true
+  debug_assert(glass_solid(), "transparency on, no frame")
+  t.fake.reduce_transparency_flag = false
+  debug_assert(!glass_solid(), "transparency off, no frame")
+  t.fake.env_vars["MBUI_GLASS"] = "solid"
+  debug_assert(glass_solid(), "MBUI_GLASS=solid, no frame")
+  settings_frame(t)
+  debug_assert(drawn_solid(t), "MBUI_GLASS=solid drawn")
+  t.fake.env_vars["MBUI_GLASS"] = ""
+  debug_assert(!glass_solid(), "MBUI_GLASS unset, no frame")
+  settings_frame(t)
+  debug_assert(!drawn_solid(t), "MBUI_GLASS unset drawn")
+  t.fake.reduce_motion_flag = true
+  debug_assert(reduced_motion(), "motion reduced, no frame")
+  t.fake.reduce_motion_flag = false
+  debug_assert(!reduced_motion(), "motion back, no frame")
+  t.fake.env_vars["MBUI_GLASS"] = "solid"
+  debug_assert(glass_solid(), "solid by the environment")
+  t.dispose()
+  // Another program's run takes nothing from the one before it.
+  let t2 = settings_tester(tick)
+  debug_assert(!drawn_solid(t2) && !glass_solid(), "a new app starts from its own host")
+  t2.dispose()
+}
+
+fn seen_is(seen : Map[String, Bool], what : String, on : Bool) -> Bool {
+  match seen.get(what) {
+    Some(v) => v == on
+    None => false
+  }
+}
+
+test "frame_settings: windows' overrides stay their own within their frames" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  let seen : Map[String, Bool] = Map::new()
+  set_window_tree(fn(_wid : Int, what : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.box(fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+        .alpha(view::Live::By(fn() {
+          let at = tick.get()
+          seen[what] = glass_solid()
+          if at < 0 { 0.5 } else { 1.0 }
+        }))
+      })
+    }
+  })
+  let w1 = window_open_here("solid")
+  let w2 = window_open_here("glass")
+  let w3 = window_open_here("system")
+  in_window(w1, fn() { set_glass_solid(Some(true)) })
+  in_window(w2, fn() { set_glass_solid(Some(false)) })
+  let asks = count_host_asks()
+  let mut k = 0
+  while k < 2 {
+    let on = k == 0
+    t.fake.reduce_transparency_flag = on
+    tick.set(k + 1)
+    asks.zero()
+    let now = 100.0 + k.to_double() * 16.0
+    let _ = window_frame(w1, 400.0, 300.0, 1.0, now)
+    let _ = window_frame(w2, 400.0, 300.0, 1.0, now)
+    let _ = window_frame(w3, 400.0, 300.0, 1.0, now)
+    settings_frame(t)
+    debug_assert(asks.transparency <= 4, "at most once a window's frame, \{asks.transparency} in 4")
+    debug_assert(seen_is(seen, "solid", true), "w1 solid by its own")
+    debug_assert(seen_is(seen, "glass", false), "w2 glass by its own")
+    debug_assert(seen_is(seen, "system", on), "w3 follows the system")
+    debug_assert(drawn_solid(t) == on, "the first window follows the system")
+    k += 1
+  }
+  window_close_here(w1)
+  window_close_here(w2)
+  window_close_here(w3)
+  t.dispose()
+}
+
+test "frame_settings: encode_tree_scene of 200 nodes asks the host each setting at most once, and anew each time" {
+  let tick = signals::signal(0)
+  let t = settings_tester(tick)
+  let off = view::Tree::new(fn(root : view::View) { settings_page(root, tick) })
+  let _ = encode_tree_scene(off, 400.0, 600.0, 1.0, 0.0)
+  let asks = count_host_asks()
+  tick.set(1)
+  let glass = encode_tree_scene(off, 400.0, 600.0, 1.0, 16.0)
+  asks.most(1, "offscreen, glass")
+  t.fake.reduce_transparency_flag = true
+  asks.zero()
+  tick.set(2)
+  let solid = encode_tree_scene(off, 400.0, 600.0, 1.0, 32.0)
+  asks.most(1, "offscreen, solid")
+  debug_assert(liquid_count(glass) == 35, "35 glass drawn, got \{liquid_count(glass)}")
+  debug_assert(liquid_count(solid) == 0, "none drawn once solid")
+  // It leaves nothing sampled behind it.
+  t.fake.reduce_transparency_flag = false
+  debug_assert(!glass_solid(), "read live after it")
+  settings_frame(t)
+  debug_assert(!drawn_solid(t), "the window draws by its own")
+  t.dispose()
+}
+
+fn liquid_count(sc : Scene) -> Int {
+  let mut n = 0
+  let mut i = 0
+  while i < sc.ninst {
+    if sc.inst[i * inst_size + 5] == 6.0 {
+      n += 1
+    }
+    i += 1
+  }
+  n
+}
