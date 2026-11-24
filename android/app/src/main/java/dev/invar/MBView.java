@@ -204,7 +204,7 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
         else queueEvent(r);
     }
 
-    /** {@code r} run on the app's thread (MoonBit's), after what is there now: the GL thread's with ONE. */
+    /** {@code r} run on the app's thread, after what is there now: the GL thread's with ONE. */
     static void onApp(Runnable r) {
         if (logic != null) {
             logic.post(r);

@@ -2774,6 +2774,16 @@ void mb_host_set_window_close(int32_t (*f)(void)) { (void)f; }
 void mb_host_window_center(void) {}
 void mb_host_window_hide(void) {}
 
+// Up to `ms` for the decoders to hand over what mb_images_upload takes (a frame off the screen holds the GL thread, so
+// their uploads are kept in Images till then). How many are still decoding is not known here: the whole of it.
+void mb_images_wait_decoded(double ms) {
+  if (!(ms > 0.0)) ms = 1.0;
+  struct timespec ts;
+  ts.tv_sec = (time_t)(ms / 1000.0);
+  ts.tv_nsec = (long)((ms - (double)ts.tv_sec * 1000.0) * 1000000.0);
+  nanosleep(&ts, NULL);
+}
+
 void mb_images_upload(void) {
   JNIEnv *env = env_();
   if (env && images_cls && m_img_pump) (*env)->CallStaticVoidMethod(env, images_cls, m_img_pump);
