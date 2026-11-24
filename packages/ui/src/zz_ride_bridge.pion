@@ -1,0 +1,400 @@
+// Real bridge connecting `by_node.pion` and `view_ride.pion` directly to Invar's
+// `Scene`, `view_app.dmg` (`damage::Damage`), `glyph_state`, and `hostapi::group_*`.
+
+import "damage"
+import "hostapi"
+import "signals"
+import "view"
+
+let clip_n : Int = 24
+
+let clip_stack : Array[Double] = [
+  0.0, 0.0, 1.0e9, 1.0e9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+]
+
+let clip_window : Array[Bool] = [true]
+let clip_apart : Array[Bool] = [false]
+
+fn clip_top() -> Int {
+  clip_stack.length() - clip_n
+}
+
+fn clip_reset() -> Unit {
+  while clip_stack.length() > clip_n {
+    let _ = clip_stack.pop()
+  }
+  clip_stack[0] = 0.0
+  clip_stack[1] = 0.0
+  clip_stack[2] = 1.0e9
+  clip_stack[3] = 1.0e9
+  let mut j = 4
+  while j < clip_n {
+    clip_stack[j] = 0.0
+    j += 1
+  }
+  while clip_window.length() > 1 {
+    let _ = clip_window.pop()
+  }
+  clip_window[0] = true
+  while clip_apart.length() > 1 {
+    let _ = clip_apart.pop()
+  }
+  clip_apart[0] = false
+}
+
+fn clip_current() -> ((Double, Double, Double, Double), (Double, Double, Double, Double)) {
+  let k = clip_top()
+  (
+    (clip_stack[k], clip_stack[k + 1], clip_stack[k + 2], clip_stack[k + 3]),
+    (clip_stack[k + 4], clip_stack[k + 5], clip_stack[k + 6], clip_stack[k + 7]),
+  )
+}
+
+fn clip_push_rect_rc(
+  clip : (Double, Double, Double, Double),
+  rc : (Double, Double, Double, Double),
+) -> Unit {
+  clip_stack.push(clip.0)
+  clip_stack.push(clip.1)
+  clip_stack.push(clip.2)
+  clip_stack.push(clip.3)
+  clip_stack.push(rc.0)
+  clip_stack.push(rc.1)
+  clip_stack.push(rc.2)
+  clip_stack.push(rc.3)
+  let mut k = 8
+  while k < clip_n {
+    clip_stack.push(0.0)
+    k += 1
+  }
+  clip_window.push(false)
+  clip_apart.push(false)
+}
+
+fn clip_say_window(on : Bool) -> Unit {
+  if clip_window.length() > 0 {
+    clip_window[clip_window.length() - 1] = on
+  }
+}
+
+fn clip_say_apart(on : Bool) -> Unit {
+  if clip_apart.length() > 0 {
+    clip_apart[clip_apart.length() - 1] = on
+  }
+}
+
+fn clip_is_window(k : Int) -> Bool {
+  let idx = k / clip_n
+  if idx >= 0 && idx < clip_window.length() { clip_window[idx] } else { true }
+}
+
+fn clip_is_apart(k : Int) -> Bool {
+  let idx = k / clip_n
+  if idx >= 0 && idx < clip_apart.length() { clip_apart[idx] } else { false }
+}
+
+fn clip_has_outer(k : Int) -> Bool {
+  clip_stack[k + 16] > 0.0 ||
+  clip_stack[k + 17] > 0.0 ||
+  clip_stack[k + 18] > 0.0 ||
+  clip_stack[k + 19] > 0.0
+}
+
+fn push_unclipped() -> Unit {
+  clip_push_rect_rc((-1.0e9, -1.0e9, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
+  clip_say_window(true)
+}
+
+fn pop_clip() -> Unit {
+  if clip_stack.length() > clip_n {
+    let mut k = 0
+    while k < clip_n {
+      let _ = clip_stack.pop()
+      k += 1
+    }
+    if clip_window.length() > 1 {
+      let _ = clip_window.pop()
+    }
+    if clip_apart.length() > 1 {
+      let _ = clip_apart.pop()
+    }
+  }
+}
+
+fn[T] ride_arr_last(arr : Array[T]) -> Option[T] {
+  let n = arr.length()
+  if n == 0 { None } else { Some(arr[n - 1]) }
+}
+
+fn[T] ride_arr_append(dst : Array[T], src : Array[T]) -> Unit {
+  for x in src {
+    dst.push(x)
+  }
+}
+
+fn[T, U] ride_arr_map(arr : Array[T], f : (T) -> U) -> Array[U] {
+  let out : Array[U] = []
+  for x in arr {
+    out.push(f(x))
+  }
+  out
+}
+
+fn blit_doubles_ui(src : Array[Double], src_off : Int, dst : Array[Double], dst_off : Int, len : Int) -> Unit {
+  let mut i = 0
+  while i < len {
+    dst[dst_off + i] = src[src_off + i]
+    i += 1
+  }
+}
+
+fn inst_copy(src : Array[Double], start : Int, len : Int) -> Array[Double] {
+  let out = Array::make(len, 0.0)
+  blit_doubles_ui(src, start, out, 0, len)
+  out
+}
+
+/// Touch all mono/colour glyph plots kept by a `RideKept` row/list so LRU eviction
+/// keeps them alive while the row/list is drawn via `ride_again` / `list_again`.
+fn touch_ride_kept_glyphs(kept : Array[Array[(Int, Double, Double)]]) -> Unit {
+  if bypass_glyph_atlas_writes.v {
+    return
+  }
+  for plots in kept {
+    for entry in plots {
+      let p = entry.0
+      if p >= 0 {
+        glyph_state.mono.drawn(p)
+      } else {
+        glyph_state.colour.drawn(-p - 1)
+      }
+    }
+  }
+}
+
+struct GlassPaint {
+  mut run : Int
+  mut frost_run : Int
+  mut liquid_run : Int
+  mut liquid_blur : Double
+  mut liquid_first : Int
+  mut liquid_y0 : Double
+  mut liquid_y1 : Double
+  mut run_start : Int
+  mut run_len : Int
+  mut solid : Bool
+  mut frost : Double
+  mut contrast : Bool
+  mut forced : Int
+  mut in_group : Int
+  mut ink_x : Double
+  mut ink_y : Double
+  mut ink_r : Double
+}
+
+let glass_paint : GlassPaint = GlassPaint::{
+  run: 0,
+  frost_run: 0,
+  liquid_run: 0,
+  liquid_blur: 0.0,
+  liquid_first: -1,
+  liquid_y0: 0.0,
+  liquid_y1: 0.0,
+  run_start: -1,
+  run_len: 0,
+  solid: false,
+  frost: 0.0,
+  contrast: false,
+  forced: -1,
+  in_group: 0,
+  ink_x: 0.0,
+  ink_y: 0.0,
+  ink_r: 0.0,
+}
+
+struct SegPack {
+  mut packed : Option[Array[Double]]
+  mut seen : Bool
+}
+
+fn SegPack::new() -> SegPack {
+  SegPack::{ packed: None, seen: false }
+}
+
+struct InstOwners {
+  owner : Array[Int]
+  cell : Array[(Double, Double)]
+  tree : Array[Option[view::NodeId]]
+  mark : Array[Int]
+}
+
+let inst_owners : InstOwners = InstOwners::{
+  owner: [],
+  cell: [],
+  tree: [],
+  mark: [],
+}
+
+fn inst_owners_kept() -> Bool {
+  false
+}
+
+fn inst_owned(q : Int) -> Unit {
+  while inst_owners.owner.length() <= q {
+    inst_owners.owner.push(-1)
+    inst_owners.cell.push((0.0, 1.0))
+    inst_owners.tree.push(None)
+    inst_owners.mark.push(0)
+  }
+}
+
+struct DrawStateBridge {
+  mut mode : Int
+  scrims : Array[Int]
+}
+
+let dr : DrawStateBridge = DrawStateBridge::{
+  mode: 0,
+  scrims: [],
+}
+
+// Bound directly to `view_app.dmg` (initialized after `view_host.pion`).
+let presented : damage::Damage = view_app.dmg
+let glyphs_kept : signals::Ref[Option[Array[(Int, Double, Double)]]] = signals::ref_new(None)
+let words_zoom : signals::Ref[Double] = signals::ref_new(1.0)
+let shooting : signals::Ref[Bool] = signals::ref_new(false)
+let cycle_tagged : signals::Ref[Bool] = signals::ref_new(false)
+let old_whole : signals::Ref[Bool] = signals::ref_new(false)
+let old_box_of : ByNode[Int] = ByNode::new()
+let paint_phase : signals::Ref[Int] = signals::ref_new(0)
+let paint_said : signals::Ref[String] = signals::ref_new("")
+let ride_paint_watch : signals::Watch = signals::watch(fn() { () })
+let ride_last_tree_id : signals::Ref[Int] = signals::ref_new(-1)
+let ride_last_theme_dark : signals::Ref[Bool] = signals::ref_new(false)
+let ride_last_theme_bg : signals::Ref[Int64] = signals::ref_new(0L)
+let ride_last_theme_fg : signals::Ref[Int64] = signals::ref_new(0L)
+let ride_last_contrast : signals::Ref[Bool] = signals::ref_new(false)
+let ride_last_frost : signals::Ref[Double] = signals::ref_new(0.0)
+
+fn paint_watch_of() -> signals::Watch {
+  ride_paint_watch
+}
+
+fn h_frame_owed() -> Unit {
+  ()
+}
+
+/// Thin frame context wrapping the real `Scene` for `view_ride.pion`.
+struct Ctx {
+  scene : Scene
+  mut inst : Array[Double]
+  mut ninst : Int
+  mut segs : Array[Double]
+  mut scale : Double
+  mut build_no : Int
+  mut cycling : Bool
+  mut wants_frame : Bool
+  mut wake_at : Double
+  mut clock : Double
+}
+
+fn Ctx::from_scene(sc : Scene, now : Double) -> Ctx {
+  Ctx::{
+    scene: sc,
+    inst: sc.inst,
+    ninst: sc.ninst,
+    segs: sc.segs,
+    scale: sc.scale,
+    build_no: view_app.frame_no,
+    cycling: false,
+    wants_frame: false,
+    wake_at: -1.0,
+    clock: now,
+  }
+}
+
+fn Ctx::sync_to_scene(self : Ctx) -> Unit {
+  self.scene.ninst = self.ninst
+}
+
+fn Ctx::sync_from_scene(self : Ctx) -> Unit {
+  self.ninst = self.scene.ninst
+}
+
+fn Ctx::grow(self : Ctx) -> Unit {
+  let cur = self.inst.length()
+  let next_cap = if cur == 0 { 256 * inst_size } else { cur * 2 }
+  while self.inst.length() < next_cap {
+    self.inst.push(0.0)
+  }
+}
+
+fn Ctx::moves_now(self : Ctx) -> Bool {
+  let _ = self
+  false
+}
+
+fn Ctx::now_before(self : Ctx, _end : Double) -> Double {
+  self.clock
+}
+
+fn Ctx::segs_cut(self : Ctx, n : Int) -> Unit {
+  while self.segs.length() > n {
+    let _ = self.segs.pop()
+  }
+}
+
+fn Ctx::segs_from(self : Ctx, start : Int) -> Array[Double] {
+  let out : Array[Double] = []
+  let mut i = start
+  while i < self.segs.length() {
+    out.push(self.segs[i])
+    i += 1
+  }
+  out
+}
+
+fn Ctx::segs_put(self : Ctx, segs : Array[Double], _pack : SegPack) -> Double {
+  let base = self.segs.length()
+  for v in segs {
+    self.segs.push(v)
+  }
+  (base / 4).to_double()
+}
+
+fn Ctx::segs_whole(self : Ctx) -> Unit {
+  let _ = self
+}
+
+fn Ctx::segs_whole_at(self : Ctx) -> Int {
+  self.segs.length() / 4
+}
+
+fn Ctx::view_picture(self : Ctx, _c : view::Content, _x : Double, _y : Double, _s : Double, _a : Double) -> Unit {
+  let _ = self
+}
+
+fn Ctx::view_unseen(self : Ctx, _c : view::Content, _s : Double) -> Unit {
+  let _ = self
+}
+
+pub fn view_ride_drawn_now() -> Int {
+  ride_drawn.v
+}
+
+pub fn view_ride_drawn_reset() -> Unit {
+  ride_drawn.v = 0
+}
+
+pub fn view_ride_heads_now() -> Int {
+  ride_heads.v
+}
+
+pub fn view_ride_groups_count() -> Int {
+  ride_groups.length()
+}
+
+pub fn view_ride_glyphs_gone_now() -> Int {
+  ride_glyphs_gone.v
+}

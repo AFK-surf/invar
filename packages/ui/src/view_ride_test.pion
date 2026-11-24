@@ -1,0 +1,158 @@
+import "damage"
+import "hostapi"
+import "signals"
+import "view"
+
+fn has_kind13_header(inst : Array[Double], ninst : Int) -> Bool {
+  let mut k = 0
+  while k < ninst {
+    if inst[k * inst_size + 5] == 13.0 {
+      return true
+    }
+    k += 1
+  }
+  false
+}
+
+fn assert_expanded_matches_ref(
+  fake : FakeHost,
+  tree : view::Tree,
+  w : Double,
+  h : Double,
+  scale : Double,
+  now : Double,
+  label : String,
+) -> Unit {
+  let expanded = fake.groups.draw_out(fake.last_inst, fake.last_ninst)
+  let ref_sc = Scene::new()
+  ref_sc.clear(w, h, scale)
+  let prev_cull = view_cull_enabled.v
+  view_cull_enabled.v = false
+  encode_held_tree(ref_sc, tree, view_app.frame_no, now, scale, bypass_blocks=true)
+  view_cull_enabled.v = prev_cull
+  ref_sc.emit_segs()
+  debug_assert(
+    fake.last_ninst == ref_sc.ninst,
+    "\{label}: ninst mismatch \{fake.last_ninst} vs \{ref_sc.ninst}",
+  )
+  let total = ref_sc.ninst * inst_size
+  let mut i = 0
+  while i < total {
+    let a = expanded[i]
+    let b = ref_sc.inst[i]
+    if a != b && (a - b).abs() > 1.0e-12 {
+      let inst_i = i / inst_size
+      let field_i = i % inst_size
+      debug_assert(false, "\{label}: inst[\{inst_i}].\{field_i} mismatch: \{a} vs \{b}")
+    }
+    i += 1
+  }
+}
+
+test "view_ride: text scrolling list hits group_set, Kind-13 header, Damage::moved and matches ref bit-for-bit" {
+  let fake = FakeHost::new(width=400.0, height=300.0, scale=2.0)
+  fake.groups_enabled = true
+  let prev_host = fake.install()
+
+  let sc = view::Scroll::list()
+  let row3_text = signals::signal("Row 3 initial")
+  let row_count = signals::signal(20)
+
+  view_forget()
+  view_blocks_reset()
+  view_ride_drawn_reset()
+  view_damage_moved_hits_reset()
+
+  let tree = view::Tree::new(fn(root : view::View) {
+    let _ = root
+    .width(view::Live::Is(Some(400.0)))
+    .height(view::Live::Is(Some(300.0)))
+    .scrolls(sc, fn(held : view::View) {
+      let _ = held.each(
+        fn() {
+          let n = row_count.get()
+          let ids : Array[Int] = []
+          let mut i = 0
+          while i < n {
+            ids.push(i)
+            i += 1
+          }
+          ids
+        },
+        fn(idx : Int) { idx.to_string() },
+        fn(row : view::View, idx_sig : signals::Signal[Int]) {
+          let idx = idx_sig.untracked()
+          let _ = row
+          .row(view::Live::Is(true))
+          .width(view::Live::Is(Some(380.0)))
+          .height(view::Live::Is(Some(36.0)))
+          .ground(view::Live::Is(if idx % 2 == 0 { 0x1F2430FFL } else { 0x262C3AFFL }))
+          let _ = row.box(fn(icon : view::View) {
+            let _ = icon
+            .width(view::Live::Is(Some(16.0)))
+            .height(view::Live::Is(Some(16.0)))
+            .radius(view::Live::Is(4.0))
+            .ground(view::Live::Is(0x3B82F6FFL))
+          })
+          let _ = row.box(fn(lbl : view::View) {
+            let _ = lbl
+            .width(view::Live::Is(Some(300.0)))
+            .height(view::Live::Is(Some(24.0)))
+            .ink(view::Live::Is(0xF8FAFCFFL))
+            .words(
+              if idx == 3 {
+                view::Live::By(fn() { row3_text.get() })
+              } else {
+                view::Live::Is("List row item #\{idx}")
+              },
+            )
+          })
+        },
+      )
+    })
+  })
+  view_app.tree = Some(tree)
+
+  // Frame 1: initial draw populates groups & caches text rows
+  let _ = view_frame(400.0, 300.0, 2.0, 0.0)
+  debug_assert(
+    fake.group_set_calls > 0,
+    "expected hostapi::group_set > 0, got \{fake.group_set_calls} (groups_on=\{groups_on()}, groups_host=\{groups_host.v}, ninst=\{fake.last_ninst}, ride_kept=\{ride_kept.count}, ride_groups=\{ride_groups.length()}, list_heads=\{list_heads.length()}, ride_heads=\{ride_heads.v})",
+  )
+  assert_expanded_matches_ref(fake, tree, 400.0, 300.0, 2.0, 0.0, "frame1-init")
+
+  // Frame 2: scroll by 40pt — must hit list_again / ride_again, emit Kind-13 header, and hit Damage::moved
+  sc.put(40.0)
+  let _ = view_frame(400.0, 300.0, 2.0, 16.0)
+  debug_assert(view_ride_drawn_now() > 0, "expected ride_again/list_again hits on scrolled text list")
+  debug_assert(has_kind13_header(fake.last_inst, fake.last_ninst), "expected Kind-13 header in presented scene")
+  debug_assert(view_damage_moved_hits_now() > 0, "expected Damage::moved fast path hit on scroll")
+  assert_expanded_matches_ref(fake, tree, 400.0, 300.0, 2.0, 16.0, "frame2-scroll-40")
+
+  // Frame 3: mutate row 3's text — must invalidate row 3 and stay bit-identical to ref
+  row3_text.set("Row 3 updated!")
+  let _ = view_frame(400.0, 300.0, 2.0, 32.0)
+  assert_expanded_matches_ref(fake, tree, 400.0, 300.0, 2.0, 32.0, "frame3-text-update")
+
+  // Frame 4: simulate glyph atlas epoch bump — must increment ride_glyphs_gone and stay bit-identical
+  let gone_before = view_ride_glyphs_gone_now()
+  glyph_state.epoch = glyph_state.epoch + 1
+  let _ = view_frame(400.0, 300.0, 2.0, 48.0)
+  debug_assert(view_ride_glyphs_gone_now() > gone_before, "expected ride_glyphs_gone to increment on atlas epoch bump")
+  assert_expanded_matches_ref(fake, tree, 400.0, 300.0, 2.0, 48.0, "frame4-atlas-bump")
+
+  // Frame 5: scale / clip / theme invalidation
+  let _ = view_frame(400.0, 300.0, 1.5, 64.0)
+  assert_expanded_matches_ref(fake, tree, 400.0, 300.0, 1.5, 64.0, "frame5-scale-change")
+
+  // Frame 6: remove rows — must call ride_let_go and drop groups
+  let drops_before = fake.group_drop_calls
+  row_count.set(10)
+  let _ = view_frame(400.0, 300.0, 1.5, 80.0)
+  debug_assert(fake.group_drop_calls > drops_before, "expected hostapi::group_drop on removed rows")
+  assert_expanded_matches_ref(fake, tree, 400.0, 300.0, 1.5, 80.0, "frame6-remove-rows")
+
+  view_forget()
+  tree.dispose()
+  hostapi::set_host(prev_host)
+}
