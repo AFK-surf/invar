@@ -1,0 +1,171 @@
+import "dmath"
+import "signals"
+
+// View::memo: node-owned memoized derivation that evaluates once per change across multiple readers, stops downstream
+// updates when equal, disposes on unmount, and preserves Tree::clock_read_now tracking for callers like View::alpha.
+
+test "View::memo evaluates once per change for multiple readers and cuts off equal values" {
+  let src = signals::signal(1)
+  let memo_runs = ref_new(0)
+  let bind_a = ref_new(0)
+  let bind_b = ref_new(0)
+  let t = Tree::new(fn(root : View) {
+    let _ = root.box(fn(box : View) {
+      let _ = box.width(Is(Some(100.0))).height(Is(Some(40.0)))
+      // Bucket by src / 2 so changing 2 -> 3 produces an equal value (1).
+      let m = box.memo(fn() -> Int {
+        memo_runs.v = memo_runs.v + 1
+        src.get() / 2
+      })
+      let _ = box.offset(By(fn() {
+        bind_a.v = bind_a.v + 1
+        (m().to_double(), 0.0)
+      }))
+      .drawn_off(By(fn() {
+        bind_b.v = bind_b.v + 1
+        (0.0, m().to_double())
+      }))
+    })
+  })
+  let _ = t.frame(200.0, 200.0, now=0.0)
+  debug_assert(memo_runs.v == 1, "initial frame evaluates memo once across 2 bindings: \{memo_runs.v}")
+  debug_assert(bind_a.v == 1 && bind_b.v == 1, "each binding ran once")
+  // Changing 1 -> 2 changes src / 2 from 0 -> 1: memo runs once, both bindings update.
+  src.set(2)
+  let _ = t.frame(200.0, 200.0, now=16.0)
+  debug_assert(memo_runs.v == 2, "changed value evaluates memo once: \{memo_runs.v}")
+  debug_assert(bind_a.v == 2 && bind_b.v == 2, "both bindings updated")
+  // Changing 2 -> 3 keeps src / 2 == 1: memo recomputes once, but the equality cutoff stops both bindings.
+  src.set(3)
+  let _ = t.frame(200.0, 200.0, now=32.0)
+  debug_assert(memo_runs.v == 3, "memo recomputes on dependency change: \{memo_runs.v}")
+  debug_assert(bind_a.v == 2 && bind_b.v == 2, "equality cutoff stops both bindings")
+  t.dispose()
+}
+
+test "View::memo same and View::memo_by cut off what they say is the same" {
+  let src = signals::signal(10)
+  let runs = ref_new(0)
+  let pair_runs = ref_new(0)
+  let t = Tree::new(fn(root : View) {
+    let _ = root.box(fn(box : View) {
+      let near = box.memo(fn() -> Int { src.get() }, same=fn(a : Int, b : Int) -> Bool { (a - b).abs() < 5 })
+      let pair = box.memo_by(
+        fn() -> (Int, Int) { (src.get() / 10, 0) },
+        fn(a : (Int, Int), b : (Int, Int)) -> Bool { a.0 == b.0 && a.1 == b.1 },
+      )
+      let _ = box.width(By(fn() {
+        runs.v = runs.v + 1
+        Some(near().to_double())
+      }))
+      .height(By(fn() {
+        pair_runs.v = pair_runs.v + 1
+        Some(pair().0.to_double())
+      }))
+    })
+  })
+  let _ = t.frame(200.0, 200.0, now=0.0)
+  src.set(12)
+  let _ = t.frame(200.0, 200.0, now=16.0)
+  debug_assert(runs.v == 1 && pair_runs.v == 1, "10 -> 12 is the same to both: \{runs.v}, \{pair_runs.v}")
+  src.set(22)
+  let _ = t.frame(200.0, 200.0, now=32.0)
+  debug_assert(runs.v == 2 && pair_runs.v == 2, "12 -> 22 is told by both: \{runs.v}, \{pair_runs.v}")
+  t.dispose()
+}
+
+test "View::memo disposes when its owning node unmounts" {
+  let show = signals::signal(true)
+  let src = signals::signal(10)
+  let runs = ref_new(0)
+  let t = Tree::new(fn(root : View) {
+    root.show(
+      fn() { show.get() },
+      fn(box : View) {
+        let m = box.memo(fn() -> Int {
+          runs.v = runs.v + 1
+          src.get() * 2
+        })
+        let _ = box.width(By(fn() { Some(m().to_double()) })).height(Is(Some(20.0)))
+      },
+      at_once=true,
+    )
+  })
+  let _ = t.frame(200.0, 200.0, now=0.0)
+  debug_assert(runs.v == 1, "memo ran once: \{runs.v}")
+  debug_assert(src.watched(), "memo follows what it reads")
+  // Unmount node: memo must dispose and stop reacting to src.
+  show.set(false)
+  let _ = t.frame(200.0, 200.0, now=16.0)
+  src.set(20)
+  let _ = t.frame(200.0, 200.0, now=32.0)
+  debug_assert(runs.v == 1, "disposed memo must not re-run after unmount: \{runs.v}")
+  debug_assert(!src.watched(), "disposed memo follows nothing")
+  t.dispose()
+}
+
+test "View::memo is disposed with its node while a reader elsewhere still holds it" {
+  let show = signals::signal(true)
+  let src = signals::signal(1)
+  let runs = ref_new(0)
+  let read : signals::Ref[() -> Int] = ref_new(fn() -> Int { 0 })
+  let t = Tree::new(fn(root : View) {
+    root.show(
+      fn() { show.get() },
+      fn(box : View) {
+        read.v = box.memo(fn() -> Int {
+          runs.v = runs.v + 1
+          src.get()
+        })
+      },
+      at_once=true,
+    )
+  })
+  let _ = t.frame(200.0, 200.0, now=0.0)
+  // Read outside any binding: nothing but the node holds the memo, so only its drop lets go of `src`.
+  debug_assert((read.v)() == 1 && runs.v == 1 && src.watched(), "read once, following src")
+  show.set(false)
+  let _ = t.frame(200.0, 200.0, now=16.0)
+  debug_assert(!src.watched(), "let go of with its node")
+  t.dispose()
+}
+
+test "View::memo forwards clock_read_now so View::alpha keeps alpha_animating" {
+  let a_view : signals::Ref[Int] = ref_new(-1)
+  let b_view : signals::Ref[Int] = ref_new(-1)
+  let ended = signals::signal(false)
+  let t = Tree::new(fn(root : View) {
+    let _ = root.box(fn(holder : View) {
+      let _ = holder.width(Is(Some(100.0))).height(Is(Some(100.0)))
+      let _ = holder.at_moment(200.0, fn() { ended.set(true) })
+      let anim_alpha = holder.memo(fn() -> Double {
+        let _ = ended.get()
+        let now = holder.drawn_while(fn(at) { at < 200.0 })
+        if now == dmath::inf() {
+          1.0
+        } else {
+          now / 200.0
+        }
+      })
+      let _ = holder.box(fn(a : View) {
+        a_view.v = a.at
+        let _ = a.width(Is(Some(40.0))).height(Is(Some(40.0))).alpha(By(anim_alpha))
+      })
+      let _ = holder.box(fn(b : View) {
+        b_view.v = b.at
+        let _ = b.width(Is(Some(40.0))).height(Is(Some(40.0))).alpha(By(anim_alpha))
+      })
+    })
+  })
+  t.at(50.0)
+  let _ = t.frame(200.0, 200.0, now=50.0)
+  debug_assert(t.nodes[a_view.v].alpha_animating, "first alpha reader must see alpha_animating=true")
+  debug_assert(t.nodes[b_view.v].alpha_animating, "second alpha reader hitting memo cache must also see alpha_animating=true")
+  // Past end of drawn_while (200ms): at_moment fires, clock is no longer read, so alpha_animating must clear.
+  let _ = t.frame(200.0, 200.0, now=250.0)
+  t.at(250.0)
+  let _ = t.frame(200.0, 200.0, now=250.0)
+  debug_assert(!t.nodes[a_view.v].alpha_animating, "first alpha reader clears alpha_animating at rest")
+  debug_assert(!t.nodes[b_view.v].alpha_animating, "second alpha reader clears alpha_animating at rest")
+  t.dispose()
+}
