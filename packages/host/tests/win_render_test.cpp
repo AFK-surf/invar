@@ -475,8 +475,8 @@ static int run_v8_v9_2d_roi(void) {
     }
     // Exact pre-v8 (0c02853a) D3D11 WARP full rounded-corner ROI RGBA8 hash (strict max_abs_diff == 0, 42160 bytes)
     int v10_hash_ok = (h1 == 3135229502u && h2 == 158418064u);
-    int v10_ok = (max_d2 <= 14.0) && (side_min >= 190.0 && side_min <= 215.0) && (yd_top > yd_mid + 5.0) && v10_hash_ok;
-    printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([190,215]) dark_top=%.1f>mid=%.1f roi_hash=(%u,%u)\n",
+    int v10_ok = (max_d2 <= 14.0) && (side_min >= 212.0 && side_min <= 232.0) && (yd_top > yd_mid + 5.0) && v10_hash_ok;
+    printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([212,232]) dark_top=%.1f>mid=%.1f roi_hash=(%u,%u)\n",
            v10_ok ? "PASS" : "FAIL", max_d2, side_min, yd_top, yd_mid, h1, h2);
     ok &= v10_ok;
   }

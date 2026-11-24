@@ -1664,7 +1664,7 @@
           float regHw = min(0.50, 1.15 / max(u_scale, 1.0));
           regHairline = (1.0 - smoothstep(regHw * 0.35, regHw, inward)) * materialAlpha * regMix;
         } else {
-          float regHairWpx = max(1.10 * u_scale, 2.20);
+          float regHairWpx = max(0.85 * u_scale, 1.70);
           float regA = clamp(sd_px - 0.5, 0.0, regHairWpx);
           float regB = clamp(sd_px + 0.5, 0.0, regHairWpx);
           float regBandCov = mb_para_int(regB, regHairWpx) - mb_para_int(regA, regHairWpx);
@@ -1690,7 +1690,7 @@
           result = mix(result, rimTarget, clamp(regRim, 0.0, 1.0));
         }
         if (regHairline > 0.001) {
-          float regShade = (is_dark ? 0.0 : 0.22) * regShadeMask;
+          float regShade = (is_dark ? 0.0 : 0.13) * regShadeMask;
           result *= (1.0 - regShade * regHairline);
         }
       }

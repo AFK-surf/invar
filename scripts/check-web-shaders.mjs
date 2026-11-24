@@ -913,10 +913,10 @@ function buildHtmlPage(programs) {
           }
         }
         const v10DarkHashOk = (h1 === 811113702 && h2 === 3136138768);
-        const v10Ok = maxD2 <= 14.0 && sideMin >= 190.0 && sideMin <= 215.0 && ydTop > ydMid + 5.0 && v10DarkHashOk;
+        const v10Ok = maxD2 <= 14.0 && sideMin >= 212.0 && sideMin <= 232.0 && ydTop > ydMid + 5.0 && v10DarkHashOk;
         pushVec('V10 regular glass Light AA & Dark ROI RGBA8 exact (@2x, R=24)', v10Ok,
           [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), h1, h2],
-          'lightD2<=14, sideMin [190,215], darkTop>darkMid+5, darkROI=(811113702,3136138768) max_abs_diff==0');
+          'lightD2<=14, sideMin [212,232], darkTop>darkMid+5, darkROI=(811113702,3136138768) max_abs_diff==0');
       }
 
       // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
