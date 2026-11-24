@@ -656,6 +656,104 @@ static int run_v8_v9_2d_roi(void) {
       v11_ok &= frost_ok;
     }
     ok &= v11_ok;
+
+    // V12-Apple-Panel-Glass: Light 0xFDFCFDBFL bright-bg chroma + 1.5pt cushion rim & 0xFDFCFDFFL uniformity
+    {
+      static uint8_t pbuf[320 * 240 * 4];
+      int np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 6.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, 191.0/255.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 26.0, 0.03, 0.0);
+      if (!render_rgba(inst, np, 211.0/255.0, 232.0/255.0, 253.0/255.0, 2.0, 320, 240, pbuf)) return 0;
+      size_t kc = (88 * 320 + 160) * 4;
+      int center_chroma = (int)pbuf[kc + 2] - (int)pbuf[kc];
+      double top_l = luma_f(pbuf, 320, 160, 43);
+      double center_l = luma_f(pbuf, 320, 160, 88);
+      int bf_ok = (center_chroma >= 22) && ((top_l - center_l) >= 4.0);
+
+      np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 6.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, 1.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 26.0, 0.03, 0.0);
+      if (!render_rgba(inst, np, 211.0/255.0, 232.0/255.0, 253.0/255.0, 2.0, 320, 240, pbuf)) return 0;
+      double top_ff = luma_f(pbuf, 320, 160, 43);
+      double center_ff = luma_f(pbuf, 320, 160, 88);
+      int ff_ok = (fabs(top_ff - center_ff) <= 3.0);
+
+      // 3. Light monotonicity over gray 0.60 vs 0.72: 0xBF L(0.72) >= L(0.60) + 2.0, and 0xCD (frost=0.3) L(0.72) >= L(0.60)
+      np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 6.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, 191.0/255.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 26.0, 0.03, 0.0);
+      if (!render_rgba(inst, np, 0.60, 0.60, 0.60, 2.0, 320, 240, pbuf)) return 0;
+      double l_g60 = luma_f(pbuf, 320, 160, 88);
+      if (!render_rgba(inst, np, 0.72, 0.72, 0.72, 2.0, 320, 240, pbuf)) return 0;
+      double l_g72 = luma_f(pbuf, 320, 160, 88);
+
+      np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 6.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, 205.0/255.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 26.0, 0.03, 0.0);
+      if (!render_rgba(inst, np, 0.60, 0.60, 0.60, 2.0, 320, 240, pbuf)) return 0;
+      double l_cd60 = luma_f(pbuf, 320, 160, 88);
+      if (!render_rgba(inst, np, 0.72, 0.72, 0.72, 2.0, 320, 240, pbuf)) return 0;
+      double l_cd72 = luma_f(pbuf, 320, 160, 88);
+      int mono_ok = (l_g72 >= l_g60 + 2.0) && (l_cd72 >= l_cd60);
+
+      // 4. Dark 0xA8 chroma=0.03 vs chroma=0.0 over saturated blue (60, 120, 210): B-R diff >= 8
+      np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 6.0,
+                32.0/255.0, 32.0/255.0, 32.0/255.0, 168.0/255.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 26.0, 0.03, 0.0);
+      if (!render_rgba(inst, np, 60.0/255.0, 120.0/255.0, 210.0/255.0, 2.0, 320, 240, pbuf)) return 0;
+      int a8_c3 = (int)pbuf[kc + 2] - (int)pbuf[kc];
+      np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 6.0,
+                32.0/255.0, 32.0/255.0, 32.0/255.0, 168.0/255.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 26.0, 0.0, 0.0);
+      if (!render_rgba(inst, np, 60.0/255.0, 120.0/255.0, 210.0/255.0, 2.0, 320, 240, pbuf)) return 0;
+      int a8_c0 = (int)pbuf[kc + 2] - (int)pbuf[kc];
+      int dark_a8_ok = ((a8_c3 - a8_c0) >= 8);
+
+      // 5. Dark 0xCC (Sheet/Drawer, chroma=0.0) over saturated blue (60, 120, 210): zero drift (B-R ~ 45)
+      np = 0;
+      push_inst(inst, &np, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 12.0,
+                32.0/255.0, 32.0/255.0, 32.0/255.0, 204.0/255.0,
+                0.6, 20.0, 0.0, 1.0, -1.0, 24.0, 0.0, 0.0);
+      if (!render_rgba(inst, np, 60.0/255.0, 120.0/255.0, 210.0/255.0, 2.0, 320, 240, pbuf)) return 0;
+      int cc_chroma = (int)pbuf[kc + 2] - (int)pbuf[kc];
+      int dark_cc_ok = (cc_chroma >= 41 && cc_chroma <= 49);
+
+      // 6. Regular controls (chroma=0.06) under contrast=true (0x85) and frost=0.5 (0xAB): max_abs_diff == 0 vs chroma=0.0
+      static uint8_t pbuf2[320 * 240 * 4];
+      auto ctrl_max_diff = [&](double tr, double tg, double tb, double ta, double bgr, double bgg, double bgb) -> int {
+        int n6 = 0, n0 = 0;
+        push_inst(inst, &n6, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 2.0, tr, tg, tb, ta, 0.6, 14.0, 0.0, 1.0, -1.0, 20.0, 0.06, 0.0);
+        if (!render_rgba(inst, n6, bgr, bgg, bgb, 2.0, 320, 240, pbuf)) return 999;
+        push_inst(inst, &n0, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 2.0, tr, tg, tb, ta, 0.6, 14.0, 0.0, 1.0, -1.0, 20.0, 0.0, 0.0);
+        if (!render_rgba(inst, n0, bgr, bgg, bgb, 2.0, 320, 240, pbuf2)) return 999;
+        int md = 0;
+        for (int py = 40; py <= 200; py++) {
+          for (int px = 40; px <= 280; px++) {
+            size_t k = ((size_t)py * 320 + (size_t)px) * 4;
+            for (int c = 0; c < 4; c++) {
+              int d = abs((int)pbuf[k + c] - (int)pbuf2[k + c]);
+              if (d > md) md = d;
+            }
+          }
+        }
+        return md;
+      };
+      int d_l85 = ctrl_max_diff(253.0/255.0, 252.0/255.0, 253.0/255.0, 133.0/255.0, 211.0/255.0, 232.0/255.0, 253.0/255.0);
+      int d_lab = ctrl_max_diff(253.0/255.0, 252.0/255.0, 253.0/255.0, 171.0/255.0, 211.0/255.0, 232.0/255.0, 253.0/255.0);
+      int d_dab = ctrl_max_diff(32.0/255.0, 32.0/255.0, 32.0/255.0, 171.0/255.0, 60.0/255.0, 120.0/255.0, 210.0/255.0);
+      int ctrl_zero_ok = (d_l85 == 0 && d_lab == 0 && d_dab == 0);
+
+      int v12_ok = bf_ok && ff_ok && mono_ok && dark_a8_ok && dark_cc_ok && ctrl_zero_ok;
+      printf("  [%s] V12-Apple-Panel-Glass: 0xBF B-R=%d(>=22) dRim=%.1f(>=4) mono=%.1f->%.1f 0xCD=%.1f->%.1f; 0xFF |dL|=%.2f(<=3); darkA8=%d/%d(d=%d>=8); darkCC=%d([41..49]); ctrlDiff=(%d,%d,%d)\n",
+             v12_ok ? "PASS" : "FAIL", center_chroma, top_l - center_l, l_g60, l_g72, l_cd60, l_cd72, fabs(top_ff - center_ff), a8_c3, a8_c0, a8_c3 - a8_c0, cc_chroma, d_l85, d_lab, d_dab);
+      ok &= v12_ok;
+    }
   }
 
   return ok;
