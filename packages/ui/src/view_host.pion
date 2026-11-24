@@ -949,6 +949,7 @@ fn view_forget_inner(clear_hooks : Bool) -> Bool {
   reset_glyph_atlas()
   view_blocks_reset()
   view_pictures_reset()
+  host_samples_begin()
   last_damage_report.v = DamageReport::None
   damage_report_poison.v = None
   in_frame_looks_hook.v = None
@@ -1399,7 +1400,7 @@ fn encode_glass(
     apply_node_corners(scene, idx, d)
     return
   }
-  let gl = effective_glass(gl, glass_frost(), contrast=more_contrast_now())
+  let gl = effective_glass(gl, frost_now(), contrast=contrast_now())
   let kind = if gl.liquid { 6.0 } else { 5.0 }
   let gblur = if gl.blur > 0.0 { gl.blur * node_scale } else { gl.blur }
   let blur_slot = if !gl.liquid {
@@ -1667,7 +1668,7 @@ fn view_blocks_reset() -> Unit {
 
 fn view_blocks_sync_frame() -> Unit {
   let gen = glyph_state.epoch
-  let solid = glass_solid()
+  let solid = solid_now()
   if view_blocks_state.atlas_gen != gen || view_blocks_state.solid != solid {
     view_blocks_state.blocks.clear()
     view_blocks_state.atlas_gen = gen
@@ -3112,6 +3113,28 @@ fn solid_now() -> Bool {
   }
 }
 
+/// more_contrast_now() as one encode reads it (outside a frame each read of it asks the host). -1: not in an encode.
+let encode_contrast : signals::Ref[Int] = ref_new(-1)
+
+fn contrast_now() -> Bool {
+  if encode_contrast.v >= 0 {
+    encode_contrast.v == 1
+  } else {
+    more_contrast_now()
+  }
+}
+
+/// glass_frost() as one encode reads it. Below 0: not in an encode.
+let encode_frost : signals::Ref[Double] = ref_new(-1.0)
+
+fn frost_now() -> Double {
+  if encode_frost.v >= 0.0 {
+    encode_frost.v
+  } else {
+    glass_frost()
+  }
+}
+
 fn encode_held_tree(
   scene : Scene,
   tree : view::Tree,
@@ -3121,6 +3144,14 @@ fn encode_held_tree(
   bypass_blocks~ : Bool = false,
 ) -> Unit {
   let prev_bypass_glyph = bypass_glyph_atlas_writes.v
+  // (whether glass is drawn solid, with more contrast and how frosted, worked out once for the whole frame: solid_now,
+  // contrast_now, frost_now)
+  let solid_was = encode_solid.v
+  let contrast_was = encode_contrast.v
+  let frost_was = encode_frost.v
+  encode_solid.v = if glass_solid() { 1 } else { 0 }
+  encode_contrast.v = if more_contrast_now() { 1 } else { 0 }
+  encode_frost.v = glass_frost()
   if bypass_blocks {
     bypass_glyph_atlas_writes.v = true
   } else {
@@ -3138,9 +3169,7 @@ fn encode_held_tree(
   let scales : Array[Double] = []
   // (only what can be seen in the window: a long list's rows scrolled out of its column, or out of the window, not
   // encoded frame by frame; Tree::drawn_held's `cull`, `view_cull_enabled` off for the reference walks)
-  // (the theme and whether glass is drawn solid, worked out once for the whole frame: solid_now, tree_theme_hold)
-  let solid_was = encode_solid.v
-  encode_solid.v = if glass_solid() { 1 } else { 0 }
+  // (the theme worked out once for the whole frame: tree_theme_hold)
   tree_theme_hold(true)
   let held = if view_cull_enabled.v && scene.width > 0.0 && scene.height > 0.0 {
     tree.drawn_held(scales=scales, cull=(0.0, 0.0, scene.width, scene.height))
@@ -3354,7 +3383,7 @@ fn encode_held_tree(
       shadow_out,
       bypass_blocks=bypass_blocks,
     )
-    if !solid_now() {
+    if d.glass.is_some() && !solid_now() {
       match d.glass {
         Some(gl) if gl.liquid && gl.layer > 0 && gl.strength > 0.001 => {
           if k0 < scene.ninst && scene.inst[k0 * inst_size + 5] == 6.0 && scene.inst[k0 * inst_size + 15] > 0.001 {
@@ -3547,7 +3576,7 @@ fn encode_held_tree(
           let lns = if idx < scales.length() { scales[idx] } else { 1.0 }
           let lgd = tree.ground_drawn_of(ld.id)
           match ld.glass {
-            Some(gl) if gl.liquid && gl.adaptive && gl.strength > 0.001 && !glass_solid() => {
+            Some(gl) if gl.liquid && gl.adaptive && gl.strength > 0.001 && !solid_now() => {
               sub_ink_stack.push((ld.id, scene.ink_x, scene.ink_y, scene.ink_r))
               let gx = ld.x + lgd.dx * lns
               let gy = ld.y + lgd.dy * lns
@@ -3627,7 +3656,7 @@ fn encode_held_tree(
             lshadow_out,
             bypass_blocks=bypass_blocks,
           )
-          if !glass_solid() {
+          if ld.glass.is_some() && !solid_now() {
             match ld.glass {
               Some(gl) if gl.liquid && gl.layer > 0 && gl.strength > 0.001 => {
                 if lk0 < scene.ninst && scene.inst[lk0 * inst_size + 5] == 6.0 && scene.inst[lk0 * inst_size + 15] > 0.001 {
@@ -3984,6 +4013,8 @@ fn encode_held_tree(
     scene.merge_liquid_layers(n0, glass_slots)
   }
   encode_solid.v = solid_was
+  encode_contrast.v = contrast_was
+  encode_frost.v = frost_was
   tree_theme_hold(false)
   bypass_glyph_atlas_writes.v = prev_bypass_glyph
 }
@@ -3991,6 +4022,12 @@ fn encode_held_tree(
 /// Encode `tree.drawn_held()` into a standalone 60-Double `Scene` using the currently active `hostapi`
 /// (uploads glyphs to the active host's atlas, packs shape segments, and syncs glass light angle).
 pub fn encode_tree_scene(tree : view::Tree, w : Double, h : Double, scale : Double, now : Double) -> Scene {
+  // (in a frame it reads what the frame sampled; of its own, what it samples once)
+  let sampled_was = sampled_offscreen.v
+  if !frame_running.v && !sampled_was {
+    host_samples_begin()
+    sampled_offscreen.v = true
+  }
   if scale > 0.0 {
     tree.set_pixel_grid(scale)
   }
@@ -3999,6 +4036,7 @@ pub fn encode_tree_scene(tree : view::Tree, w : Double, h : Double, scale : Doub
   let sc = Scene::new()
   sc.clear(w, h, scale)
   encode_held_tree(sc, tree, 1, now, scale)
+  sampled_offscreen.v = sampled_was
   sc.emit_segs()
   sc.perf.instances = sc.ninst
   sc
@@ -4048,6 +4086,7 @@ let in_tree_frame : signals::Ref[Bool] = ref_new(false)
 pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool {
   let t0 = work_clock_now()
   frame_running.v = true
+  host_samples_begin()
   view_app.last_w = w
   view_app.last_h = h
   view_app.last_scale = scale
