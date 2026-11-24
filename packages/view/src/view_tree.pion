@@ -1447,6 +1447,11 @@ fn Tree::brought(self : Tree, upto : Double, via~ : Int = 0) -> Unit {
 let told_passes_most : Int = 4
 
 ///|
+/// How many post-layout re-entry passes (`outs_told`, `sizes_told`, `laid_waits`, `shown_now`, `holds_now`) one
+/// outermost `Tree::laid_out` call may run before breaking a feedback cycle and leaving the rest for the next frame.
+let laid_passes_most : Int = 64
+
+///|
 /// A hover may move the box that says it, leaving no stable state for the
 /// pointer. Check for repeated states after ordinary chains have time to settle.
 let pointer_passes_check : Int = 32
@@ -1459,6 +1464,32 @@ let pointer_passes_most : Int = 256
 /// What was marked laid out and drawn at `upto`, the logic not moved: no moment's work done, nothing due run (for where
 /// things are as an event finds them in the middle of its change: Tree::laid_now).
 fn Tree::laid_out(self : Tree, upto : Double) -> Unit {
+  if self.laid_depth == 0 {
+    self.laid_passes = 0
+  }
+  self.laid_depth = self.laid_depth + 1
+  self.laid_out_pass(upto)
+  self.laid_depth = self.laid_depth - 1
+  // (what its bound left undone asks for the next frame: told here, the passes behind it that clear `due` all over)
+  if self.laid_depth == 0 && self.laid_passes >= laid_passes_most && self.laid_left() {
+    self.marked()
+  }
+}
+
+///|
+/// Whether a layout stopped by `laid_passes_most` left any of what it tells once all of it is laid out untold.
+fn Tree::laid_left(self : Tree) -> Bool {
+  self.outs_changed ||
+  (self.sizes_due && self.sized.length() > 0) ||
+  self.laid_waits.length() > 0 ||
+  self.shows_due.length() > 0 ||
+  self.focus_holds.length() > 0 ||
+  self.pointer_again
+}
+
+///|
+/// One pass of `Tree::laid_out`, within the depth and the passes it counts.
+fn Tree::laid_out_pass(self : Tree, upto : Double) -> Unit {
   let w = self.last_w
   let h = self.last_h
   if !self.due {
@@ -1611,44 +1642,58 @@ fn Tree::laid_out(self : Tree, upto : Double) -> Unit {
   }
   // (what its rows left out told once all of it is laid out, and what that tells (a ⋯ saying how many) laid out in this
   // same pass: one result, the frame drawing all of it)
-  if self.outs_changed {
+  if self.laid_passes < laid_passes_most && self.outs_changed {
     self.outs_told()
-    if self.due {
+    if self.due && self.laid_passes < laid_passes_most {
+      self.laid_passes = self.laid_passes + 1
       self.again_said(1)
       self.laid_out(upto)
     }
   }
   // (the sizes followed told once all of it is laid out, and what that tells laid out in this same pass)
-  if self.sizes_due && self.sized.length() > 0 && self.sizes_told() && self.due {
+  if self.laid_passes < laid_passes_most &&
+  self.sizes_due &&
+  self.sized.length() > 0 &&
+  self.sizes_told() &&
+  self.due &&
+  self.laid_passes < laid_passes_most {
+    self.laid_passes = self.laid_passes + 1
     self.again_said(2)
     self.laid_out(upto)
   }
   // (what waited on all of it laid out, told once now, whether any size it follows came out otherwise or not; what that
   // tells laid out in this same pass)
-  if self.laid_waits.length() > 0 {
+  if self.laid_passes < laid_passes_most && self.laid_waits.length() > 0 {
     let waits = self.laid_waits.copy()
     self.laid_waits.clear()
     array_release_unused(self.laid_waits, run_gone)
     for f in waits {
       signals::untracked(f)
     }
-    if self.due {
+    if self.due && self.laid_passes < laid_passes_most {
+      self.laid_passes = self.laid_passes + 1
       self.again_said(3)
       self.laid_out(upto)
     }
   }
   // (what is to be brought into sight, where all of it is laid out, before it is drawn; what that moves laid out in
   // this same pass)
-  if self.shows_due.length() > 0 {
+  if self.laid_passes < laid_passes_most && self.shows_due.length() > 0 {
     self.shown_now()
-    if self.due {
+    if self.due && self.laid_passes < laid_passes_most {
+      self.laid_passes = self.laid_passes + 1
       self.again_said(4)
       self.laid_out(upto)
     }
   }
   // (what the focus has kept in sight by the column it was brought into sight by, where that column's room came out
   // another: placed so it is, in this same pass)
-  if self.focus_holds.length() > 0 && self.holds_now() && self.due {
+  if self.laid_passes < laid_passes_most &&
+  self.focus_holds.length() > 0 &&
+  self.holds_now() &&
+  self.due &&
+  self.laid_passes < laid_passes_most {
+    self.laid_passes = self.laid_passes + 1
     self.again_said(5)
     self.laid_out(upto)
   }
@@ -1668,7 +1713,14 @@ fn Tree::laid_out(self : Tree, upto : Double) -> Unit {
   if !self.withins_passing {
     let _ = self.pointer_still_holds()
   }
-  let pointer_ready = !self.withins_passing
+  let pointer_ready = !self.withins_passing && self.laid_passes < laid_passes_most
+  // (what is under the pointer left untold by the bound: the next layout's, Tree::laid_left)
+  if !self.withins_passing &&
+  !pointer_ready &&
+  (placing || pointer_needed ||
+    (self.bar_cols.length() > 0 && (ordered || self.changed.length() > 0 || self.bars_due))) {
+    self.pointer_again = true
+  }
   if (placing || pointer_needed) && pointer_ready {
     self.pointer_pass = self.pointer_pass + 1
     self.withins_passing = true
@@ -5395,23 +5447,30 @@ fn Tree::bar_near_at(self : Tree) -> Option[Int] {
   // (of the columns whose bars come out so, the last drawn the pointer is in, found there within what holds it and
   // taking input: the innermost of those holding one another, the upper of those over one another; nothing else drawn
   // counts, its bar's own room over it none of it)
-  let top : signals::Ref[Int] = ref_new(-1)
-  self.each_drawn_scaled(fn(c, cx, cy, _, s) {
-    let n = self.nodes[c.id.at]
-    if n.bar_near > 0.0 &&
-    n.bar_near_cell.is_some() &&
-    !self.pressless_at(c.id.at) &&
-    px >= cx &&
-    py >= cy &&
-    px < cx + c.w * s &&
-    py < cy + c.h * s {
-      let (bx0, by0, bx1, by1) = self.input_bounds(c.id)
-      if px >= bx0 && py >= by0 && px < bx1 && py < by1 {
-        top.v = c.id.at
+  let mut top = -1
+  let mut top_ord = -1
+  for e in self.bar_cols {
+    let (at, gen) = e
+    guard at >= 0 && at < self.nodes.length() else { continue }
+    let n = self.nodes[at]
+    guard n.live && n.gen == gen && n.bar_near > 0.0 && n.bar_near_cell.is_some() && !self.pressless_at(at) else { continue }
+    let id = NodeId::{ at, gen }
+    match self.drawn_one(id) {
+      Some((c, cx, cy, _, s, _, _, ord)) if ord > top_ord &&
+      px >= cx &&
+      py >= cy &&
+      px < cx + c.w * s &&
+      py < cy + c.h * s => {
+        let (bx0, by0, bx1, by1) = self.input_bounds(id)
+        if px >= bx0 && py >= by0 && px < bx1 && py < by1 {
+          top = at
+          top_ord = ord
+        }
       }
+      _ => ()
     }
-  })
-  let i = top.v
+  }
+  let i = top
   if i >= 0 {
     let n = self.nodes[i]
     let (x, y, sc) = self.placed(i)
