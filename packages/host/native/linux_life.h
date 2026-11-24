@@ -2,7 +2,7 @@
 // its keys (its window, schedule, app_state above).
 //
 // A program that is an app has an identity: MBUI_APP_ID (and MBUI_APP_NAME, MBUI_SCHEMES), from its environment (its
-// desktop entry runs it so: still.fail's linux/install.sh). Such an app:
+// desktop entry runs it so: the Linux install script). Such an app:
 // - runs once for its person: started again, the one that runs is brought to the front and handed the link this one
 //   was started with, and this one ends, as the program starts, before any of it runs (its core on the same files:
 //   life_begin, among the program's constructors). GApplication's own way, on the session bus: a GtkApplication of the
@@ -14,7 +14,7 @@
 //   clicked, or the app started again, brings it back; the icon's menu (the app's words: menu_setup's `"role": "tray"`
 //   menu) brings it back or quits. Where the desktop shows none (GNOME's own), its window closed ends it, as apps
 //   there do: nothing would show that it runs;
-// - is opened with a link of its schemes (MBUI_SCHEMES, "stillfail,stillfail-beta"): as it starts, or the one running is.
+// - is opened with a link of its schemes (MBUI_SCHEMES, "myapp,myapp-beta"): as it starts, or the one running is.
 // A program without one (a demo, a test app's scripted run) ends as its window closes, as before. So does a window of
 // the app's own (@hostapi.window_open: the program run again with MBUI_WINDOW): it runs beside the app's one run, not
 // handed to it, with no icon among the desktop's and none of its notifications.
@@ -48,7 +48,7 @@ static const char *app_name(void) {
   return v && *v ? v : window_title ? window_title : app_id();
 }
 
-// a link of the app's schemes (MBUI_SCHEMES: "stillfail,stillfail-beta"), else 0
+// a link of the app's schemes (MBUI_SCHEMES: "myapp,myapp-beta"), else 0
 static int app_link(const char *s) {
   const char *schemes = getenv("MBUI_SCHEMES");
   const char *colon = s ? strchr(s, ':') : NULL;

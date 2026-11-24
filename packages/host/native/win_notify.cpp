@@ -107,7 +107,7 @@ std::wstring xml_escaped(const std::wstring &s) {
   return o;
 }
 
-// the program's own icon's largest picture (its group 1's entries: PNGs, still.fail's scripts/win.sh), as a file
+// the program's own icon's largest picture (its group 1's entries: PNGs, the Windows packaging script), as a file
 // beside the app's data the system can read: its path, "" none
 std::wstring own_icon_file(const std::wstring &id) {
   HMODULE m = GetModuleHandleW(NULL);

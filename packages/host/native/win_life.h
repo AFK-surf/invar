@@ -1,9 +1,9 @@
 // The app's life on Windows, and what the system says of it (mac_app.m's "The app's life on the Mac", the Windows
-// way, as still.fail's desktop app had it there: apps/desktop/src/main.ts). Included by win_app.c after its keys (its
+// way, as a desktop host app does). Included by win_app.c after its keys (its
 // hwnd, want_frame, mb_now_ms above).
 //
 // A program that is an app has an identity: MBUI_APP_ID (and MBUI_APP_NAME, MBUI_SCHEMES), from its environment or,
-// as an app's are, its own (its resource RCDATA "MBUI_ENV": still.fail's scripts/win.sh writes it, as a Mac app's
+// as an app's are, its own (its resource RCDATA "MBUI_ENV": the Windows packaging script writes it, as a Mac app's
 // Info.plist has LSEnvironment). Such an app:
 // - runs once for its person: started again, the one that runs is brought to the front and handed the link this one
 //   was started with (WM_COPYDATA), and this one ends, as the program starts, before any of it runs (its core on the
@@ -12,8 +12,8 @@
 // - goes on with its window closed, put away to its icon in the notification area (its core, its notifications on):
 //   the icon clicked, or the app started again, brings it back; the icon's menu (the app's words: menu_setup's
 //   `"role": "tray"` menu) brings it back or quits;
-// - is opened with a link of its schemes (MBUI_SCHEMES, "stillfail,stillfail-beta"): as it starts, or the one running is;
-//   built in still.fail's desktop app's place (MBUI_OWN), its schemes are claimed for it (links_claimed).
+// - is opened with a link of its schemes (MBUI_SCHEMES, "myapp,myapp-beta"): as it starts, or the one running is;
+//   built as the primary desktop app (MBUI_OWN), its schemes are claimed for it (links_claimed).
 // A program without one (a demo, a test app's scripted run) ends as its window closes, as before. So does a window of
 // the app's own (@hostapi.window_open: the program run again with MBUI_WINDOW): it runs beside the app's one run, not
 // handed to it, with no icon in the notification area and no schemes claimed, its window's class its own.
@@ -174,7 +174,7 @@ static void say_shown(ULONGLONG at) {
   say_system(b, (size_t)n);
 }
 
-// a link of the app's schemes (MBUI_SCHEMES: "stillfail,stillfail-beta"), else 0
+// a link of the app's schemes (MBUI_SCHEMES: "myapp,myapp-beta"), else 0
 static int app_link(const WCHAR *s) {
   const WCHAR *schemes = app_env(L"MBUI_SCHEMES");
   if (!schemes || !s) return 0;
@@ -217,7 +217,7 @@ static const WCHAR *started_with(void) {
   return link;
 }
 
-// The app's links its own (MBUI_OWN: built in still.fail's desktop app's place, its schemes that app's): each of its
+// The app's links its own (MBUI_OWN: built as the primary desktop app, its schemes that app's): each of its
 // schemes opens this program, as that app's setAsDefaultProtocolClient had them (HKCU\Software\Classes\<scheme>,
 // shell\open\command "<this program>" "%1"), said again as it starts (it may have moved, or another taken them)
 static void links_claimed(void) {

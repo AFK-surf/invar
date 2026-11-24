@@ -94,7 +94,7 @@ REQUIRED_SYMS=(
 
 MISSING=0
 for sym in "${REQUIRED_SYMS[@]}"; do
-  if echo "$NM_OUT" | grep -q " T ${sym}$"; then
+  if grep -q " T ${sym}$" <<< "$NM_OUT"; then
     echo "  OK   $sym"
   else
     echo "  MISS $sym" >&2

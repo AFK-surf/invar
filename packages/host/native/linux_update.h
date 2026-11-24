@@ -1,7 +1,7 @@
 // Updates (@hostapi.app_version, update_fetch, update_apply, update_state) on Linux: the app keeping itself current, as the Mac's
 // does (mac_app.m's Updates), where it is installed as an app: an identity (MBUI_APP_ID) and its version in a VERSION
-// file beside its program (0.1.<n>, which still.fail's linux/install.sh puts there with it). A newer build the core
-// found (`app.update`: the release's .tar.gz of the app's folder, still.fail's scripts/beta.sh linux) downloaded into
+// file beside its program (0.1.<n>, which the Linux install script puts there with it). A newer build the core
+// found (`app.update`: the release's .tar.gz of the app's folder, the Linux release archive) downloaded into
 // the app's cache ($XDG_CACHE_HOME/<id>/updates), picking up where a cut connection left off (the bytes so far kept in
 // `<name>.part`, the rest asked for as a range, a few times over with a growing pause while each try gets further),
 // checked against its size and SHA-256 (update_fetch: ready); asked to (update_apply), unpacked there, and taken only
@@ -374,7 +374,7 @@ static const char *own_arch(void) {
   return "";
 }
 
-// whether a release by its name is for this machine (stillfail-mbui-<n>-<x64|arm64>-linux.tar.gz)
+// whether a release by its name is for this machine (invar-app-<n>-<x64|arm64>-linux.tar.gz)
 static int update_for_here(const char *name) {
   char *arch = g_strdup_printf("-%s-linux.", own_arch());
   int here = *own_arch() && strstr(name, arch) != NULL;
@@ -399,7 +399,7 @@ static char *update_put(const char *tgz) {
     why = g_strdup("incomplete");
     goto end;
   }
-  // its one folder (still.fail-mbui/)
+  // its one folder (invar-app/)
   GDir *d = g_dir_open(stage, 0, NULL);
   const char *first = d ? g_dir_read_name(d) : NULL;
   if (first) folder = g_build_filename(stage, first, NULL);

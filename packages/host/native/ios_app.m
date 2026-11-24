@@ -244,7 +244,7 @@ static void link_rate(CADisplayLink *l) {
 
 // A new size (the screen turned, unfolded or folded): a frame drawn now at it and shown with the change, in its Core
 // Animation transaction, not at the display link's next tick, when the system had shown the frame before stretched to
-// the new size the while between (its words drawn wide: the user, 2026-10-27), as mac_app.m's drawWithWindow does for
+// the new size the while between (its words drawn wide), as mac_app.m's drawWithWindow does for
 // a window's resize. Not in a scripted run (its frames are its steps'), nor before the first frame, nor within one.
 static BOOL in_frame;
 static double drawn_for;
@@ -341,7 +341,7 @@ static double drawn_for;
 static double event_time = -1;
 // A touch's time on the frames' clock. A UITouch's timestamp is not always on it: an iPhone Duo's touches came some 665
 // ms behind CACurrentMediaTime for a while, all alike and however often the app began, then on it again (past
-// long_press_ms as they went down: every tap a long press, the user, 2026-11-03). So as the first finger goes down, what
+// long_press_ms as they went down: every tap a long press). So as the first finger goes down, what
 // it is behind by, past what a touch takes to come, is taken off it and off all that follows until the next: how far
 // apart they are kept as it is.
 static const double touch_late_most_ms = 100.0;
@@ -821,8 +821,7 @@ static MBController *the_controller;
   return self.dark ? UIStatusBarStyleLightContent : UIStatusBarStyleDarkContent;
 }
 // on its side while a film asks (@hostapi.set_sideways), the status bar and the home indicator out of its way then (as
-// Android's system bars: a swipe brings them for a while); else as turned on a foldable, closed or open (the user,
-// 2026-11-10: an iPhone Duo's cover turns as its inner panel does, which iOS turns whatever the app asks), upright on
+// Android's system bars: a swipe brings them for a while); else as turned on a foldable, closed or open (a foldable's cover turns with its inner panel as iOS dictates), upright on
 // an iPhone, as turned on an iPad (mb_upright), an iPhone as turned too while the app lets it (@hostapi.set_turnable)
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return [self held]; }
 - (UIInterfaceOrientationMask)held {
@@ -1104,7 +1103,7 @@ double mb_host_mem_bytes(void);
 static NSString *thread_queue(thread_identifier_info_data_t *id) { return id->dispatch_qaddr ? @"gcd" : @"?"; }
 
 // The shell's threads' share of a CPU at the last ask, in percent: the threads its app names in its Info.plist
-// (MBUIShellThread: still.fail's "stillfail-shell", tokio's, the network's), none where it names none.
+// (MBUIShellThread: the host app's shell thread, tokio's, the network's), none where it names none.
 static double shell_share;
 static NSString *shell_thread(void) {
   static NSString *name;
@@ -1827,7 +1826,7 @@ void mb_host_clipboard_secret_off(void) {}
 
 
 // The app's log: the system's (os_log, `log stream`) and stderr as it is (unbuffered: `simctl launch --stderr`, which a
-// scripted run reads line by line as the app goes: scripts/ios.sh run, still.fail's e2e).
+// scripted run reads line by line as the app goes: iOS scripted e2e runner).
 static void say(NSString *s) {
   const char *c = s.UTF8String ?: "";
   os_log(OS_LOG_DEFAULT, "%{public}s", c);
@@ -2711,7 +2710,7 @@ void mb_host_set_dark(int32_t dark) {
   [c setNeedsStatusBarAppearanceUpdate];
 }
 
-// Notifications (notify.mbt), as still.fail's Android app shows them: the system's (UNUserNotificationCenter), one
+// Notifications (notify.mbt), as the Android host shows them: the system's (UNUserNotificationCenter), one
 // request per tag (a newer one with the same tag replaces it), what it opens in its userInfo, a tap bringing the app to
 // the front with that (the center's delegate, set as the app starts: a tap that launched it comes too); shown while the
 // app is in front as well (the app decides what to show). Each is also kept (one per tag) and said on the log (NOTICE
@@ -3048,7 +3047,7 @@ static void pick_answer(int32_t pid, NSArray<NSURL *> *urls) {
       BOOL scoped = [u startAccessingSecurityScopedResource];
       NSData *d = [NSData dataWithContentsOfURL:u options:NSDataReadingMappedIfSafe error:nil];
       if (scoped) [u stopAccessingSecurityScopedResource];
-      if (!d || d.length > (1ull << 30)) continue;  // unreadable, or over 1 GB (as still.fail's composer refuses)
+      if (!d || d.length > (1ull << 30)) continue;  // unreadable, or over 1 GB (over 1 GB limit)
       [names addObject:u.lastPathComponent ?: @"file"];
       [datas addObject:d];
     }

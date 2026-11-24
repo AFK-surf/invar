@@ -1,4 +1,4 @@
-// How long input takes to show on screen, measured on this Mac (still.fail's scripts/latency.sh; a drive's `latency
+// How long input takes to show on screen, measured on this Mac (the macOS latency harness; a drive's `latency
 // MODE TEXT`, @hostapi.drive 12): from when an event arrives to when the frame showing it reached the display, as its
 // drawable's presented handler tells (presentedTime). For people to read, never a check's condition: the window
 // server settles in a state that lasts a run and changes from run to run, so a run is one process and runs are

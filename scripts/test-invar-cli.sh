@@ -167,6 +167,8 @@ assert d['ok'] is True, f'web-app build failed: {d}'
 assert d['raw_bytes'] > 0 and d['gzip_bytes'] > 0
 assert d['imports_missing'] == [], f'missing imports: {d}'
 assert os.path.isfile(os.path.join(d['out_dir'], 'index.html'))
+for lf in ('LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'LICENSES/Apache-2.0.txt', 'LICENSES/OFL-1.1.txt', 'LICENSES/Unicode-3.0.txt'):
+    assert os.path.isfile(os.path.join(d['out_dir'], lf)), f'missing license file in web dist: {lf}'
 print('OK: web-app build (%d B raw, %d B gzip, %d imports, 0 missing)' % (d['raw_bytes'], d['gzip_bytes'], d['imports_total']))
 " "$WEB_BLD"
 

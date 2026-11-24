@@ -119,3 +119,11 @@ PIONC=/path/to/pionc2 bash scripts/bench.sh --cpu-only --filter flex
 - [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) — `packages/lg` 一页纸组件速查目录与复制即用样例
 - [`examples/jsx_app/`](examples/jsx_app/) — 推荐标杆：纯 Pion-JSX + Leading-Dot `.Enum` + `ui::Worker` + `packages/lg` 应用
 - [`examples/worker_app/`](examples/worker_app/) — 标准双线程 Builder API Invar App 完整范例
+
+---
+
+## License
+
+Invar is licensed under the [MIT License](LICENSE).
+
+Attribution notices for Apache-2.0 and other third-party components included or adapted in this repository are documented in [`NOTICE`](NOTICE), [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md), and the [`LICENSES/`](LICENSES/) directory.

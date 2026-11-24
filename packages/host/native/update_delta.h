@@ -1,6 +1,6 @@
 // A delta applied, as the desktop hosts' updaters apply one (mac_app.m's Updates, linux_update.h, win_update.h): the
 // installed app's files turned into the release's raw package, whose SHA-256 the feed says, so that a few MB are
-// downloaded instead of the whole package. Its format is still.fail's scripts/delta.ts's (little-endian):
+// downloaded instead of the whole package. Its format is the delta packer's (little-endian):
 //
 //   "SFDELTA1"; u32 n_files, each { u16 len; UTF-8 path }   the old blob: these files (relative to the app's root, '/'
 //                                                            between names) one after the other

@@ -1,4 +1,4 @@
-// What a scripted run's runner has finished (src/ui/drive.mbt `done X`): the runner (still.fail's run.sh, beside the
+// What a scripted run's runner has finished (src/ui/drive.mbt `done X`): the runner (the test runner script, beside the
 // run) writes each thing it was asked to do and has done as a file of the directory the run names (MBUI_DONE_DIR, else
 // $MBUI_SHOT_DIR/done), named as the thing, its words what came of it ("ok", or what went wrong), written as .NAME and
 // then renamed NAME, so that it is whole as it comes. The host is told of the directory's change by its system (macOS

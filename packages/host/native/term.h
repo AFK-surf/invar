@@ -1,6 +1,6 @@
 // A terminal's screen, kept by the host (src/hostapi/terminal.mbt says what is asked and what comes back). Included by
 // each host's C after post.h (its post_string). What a host answers where nothing keeps one: opening one answers 0, so
-// the app shows no terminal. An app whose build links a terminal's library (still.fail's libghostty-vt) defines these
+// the app shows no terminal. An app whose build links a terminal's library (e.g. libghostty-vt) defines these
 // calls itself, in its own C, and its ones take the place of these (weak on clang/gcc; /alternatename defaults on MSVC).
 #ifndef MB_TERM_H
 #define MB_TERM_H

@@ -2490,31 +2490,79 @@ def cmd_audit(args):
                                     f"Remove `import \"{imp}\"` from {rel}; keep view/render bindings in packages/headless.",
                                 )
 
-    # W005: Stale brand leak check (error severity to prevent leaks)
-    brand_files = [
-        "web/index.html",
-        "README.md",
-        "AGENTS.md",
-        "packages/lg/CATALOG.md",
-        "packages/lg/DESIGN.md",
-    ]
-    stale_pat = re.compile(r"ui\.monoid|still\.fail", re.IGNORECASE)
-    for rel in brand_files:
+    # W005: Stale brand & internal host leak check across tracked repository files
+    w005_skip_dirs = {".git", ".pion", "target", ".pion_cache", "out", "LICENSES", "node_modules", "__pycache__", "build"}
+    w005_skip_files = {
+        "THIRD_PARTY_NOTICES.md",
+        "NOTICE",
+    }
+    w005_binary_exts = {
+        ".png", ".webp", ".jpg", ".jpeg", ".gif", ".ico", ".mp4", ".mov",
+        ".woff", ".woff2", ".ttf", ".otf", ".wasm", ".jar", ".zip", ".gz",
+        ".a", ".o", ".so", ".dylib", ".dll", ".exe", ".pdf",
+    }
+    stale_pat = re.compile(
+        "|".join([
+            "still" + r"\.?" + "fail",
+            "fail" + r"\." + "still" + r"\.",
+            "ui" + r"\." + "mon" + "oid",
+            r"\b" + "mon" + "oid" + r"\b",
+            r"\." + "agents/" + "skills/",
+            "Office" + "-Host",
+            "tokyo-" + "mac-studio",
+            "mac-" + "studio-0",
+            "pvg-" + "office",
+            "youdid" + r"\." + "wtf",
+            "cue" + r"\." + "surf",
+        ]),
+        re.IGNORECASE,
+    )
+    w005_rel_files = []
+    rc_ls, ls_out, _, _ = run_cmd(["git", "ls-files", "-z"], cwd=INVAR_ROOT)
+    if rc_ls == 0 and ls_out:
+        for rel in ls_out.split("\0"):
+            rel = rel.replace(os.sep, "/")
+            if not rel or rel.startswith("LICENSES/"):
+                continue
+            w005_rel_files.append(rel)
+    else:
+        for r_d, ds, fs in os.walk(INVAR_ROOT):
+            ds[:] = sorted(d for d in ds if d not in w005_skip_dirs)
+            for fn in sorted(fs):
+                fp = os.path.join(r_d, fn)
+                rel = os.path.relpath(fp, INVAR_ROOT).replace(os.sep, "/")
+                w005_rel_files.append(rel)
+    for rel in sorted(w005_rel_files):
+        if rel in w005_skip_files or rel.startswith("LICENSES/"):
+            continue
+        _, ext = os.path.splitext(rel)
+        if ext.lower() in w005_binary_exts:
+            continue
         fp = os.path.join(INVAR_ROOT, rel)
         if not os.path.isfile(fp):
             continue
-        with open(fp, "r", encoding="utf-8", errors="replace") as f:
-            for ln, text in enumerate(f, 1):
-                m = stale_pat.search(text)
-                if m:
-                    add_diag(
-                        "INVAR_W005_STALE_BRAND",
-                        "error",
-                        rel,
-                        ln,
-                        f"Stale brand reference `{m.group(0)}` in public file",
-                        f"Replace `{m.group(0)}` with `Invar`.",
-                    )
+        try:
+            with open(fp, "rb") as fb:
+                head = fb.read(2048)
+            if b"\x00" in head:
+                continue
+            with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                for ln, text in enumerate(f, 1):
+                    # Narrow exemption: hygiene rule pattern definition line only
+                    if rel == "scripts/check-android-host.sh" and text.lstrip().startswith("BAD_PATTERN="):
+                        continue
+                    m = stale_pat.search(text)
+                    if m:
+                        add_diag(
+                            "INVAR_W005_STALE_BRAND",
+                            "error",
+                            rel,
+                            ln,
+                            f"Stale brand or internal host reference `{m.group(0)}` in public file",
+                            f"Remove or replace `{m.group(0)}` with a neutral public name.",
+                        )
+        except OSError:
+            continue
 
     # W006: External app gates
     if is_external_app:
@@ -3145,6 +3193,20 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt, track_dist=True):
     if os.path.isfile(vt_src):
         shutil.copy2(vt_src, os.path.join(out_dir, "ghostty-vt.wasm"))
         managed.add("ghostty-vt.wasm")
+    # Bundle root license and third-party notice files alongside inter.woff2 and JS runtimes (OFL-1.1 / Apache-2.0 / MIT)
+    for lf in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
+        lsrc = os.path.join(INVAR_ROOT, lf)
+        if os.path.isfile(lsrc):
+            shutil.copy2(lsrc, os.path.join(out_dir, lf))
+            managed.add(lf)
+    lic_dir_src = os.path.join(INVAR_ROOT, "LICENSES")
+    if os.path.isdir(lic_dir_src):
+        lic_dir_dst = os.path.join(out_dir, "LICENSES")
+        os.makedirs(lic_dir_dst, exist_ok=True)
+        for fn in sorted(os.listdir(lic_dir_src)):
+            fsrc = os.path.join(lic_dir_src, fn)
+            if os.path.isfile(fsrc):
+                shutil.copy2(fsrc, os.path.join(lic_dir_dst, fn))
 
     # Write clean index.html tailored to wasm_name & title
     tpl_path = os.path.join(INVAR_ROOT, "web", "index.html")
