@@ -355,8 +355,22 @@ static int run_v8_v9_2d_roi(void) {
       }
     }
     int v9d_ok = (cyan_top >= 10) && (cyan >= 10) && (amber >= 20) && (max_txt_diff == 0);
-    printf("  [%s] V9-D light segmented prism: top(B-R)=%d bot(B-R)=%d cap(R-B)=%d textDiff=%d\n",
-           v9d_ok ? "PASS" : "FAIL", cyan_top, cyan, amber, max_txt_diff);
+    // Role 3 Segmented text-scale (12pt stroke -> 35..37px@3x) & outer track pinch (8.0pt white ring vs 11.5pt gray track)
+    n = 0;
+    push_inst(inst, &n, 15.0, 32.5, 130.0, 34.0, 17.0, 0.0, 0.0, 0.0, 195.0/255.0, 195.0/255.0, 198.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 78.0, 43.5, 4.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 25.0, 27.0, 110.0, 45.0, 22.5, 6.0, 1.0, -48.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.04, 0.0);
+    if (!render_rgba(inst, n, 1.0, 1.0, 1.0, S3, W3, H3, rgba)) return 0;
+    int dark_span = 0;
+    for (int sy = 110; sy <= 190; sy++) {
+      if (px_luma_of(rgba, W3, 240, sy) < 120) dark_span++;
+    }
+    int l_ring = px_luma_of(rgba, W3, 240, 105);
+    int l_track = px_luma_of(rgba, W3, 240, 116);
+    int seg_scale_ok = (dark_span >= 35 && dark_span <= 37) && (l_ring >= 225 && l_track <= 210 && l_ring - l_track >= 20);
+    v9d_ok &= seg_scale_ok;
+    printf("  [%s] V9-D light segmented prism & scale: top(B-R)=%d bot(B-R)=%d cap(R-B)=%d textDiff=%d strokeSpan=%d(35..37) ring8=%d track11.5=%d\n",
+           v9d_ok ? "PASS" : "FAIL", cyan_top, cyan, amber, max_txt_diff, dark_span, l_ring, l_track);
     ok &= v9d_ok;
   }
 

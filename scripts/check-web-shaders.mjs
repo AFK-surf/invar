@@ -858,11 +858,27 @@ function buildHtmlPage(programs) {
         }
         const ngOk = ngOrigL > 220 && ngRefrMinL < 170;
 
+        const segScaleBg = (x, y) => {
+          if (x >= 78 && x <= 82 && y >= 43.5 && y <= 55.5) return [0, 0, 0];
+          const dx = Math.max(0, Math.abs(x - 80) - 48);
+          const dy = Math.abs(y - 49.5);
+          return (dx * dx + dy * dy <= 17 * 17) ? [195, 195, 198] : [255, 255, 255];
+        };
+        const segScale = run2D(160, 100, 3, segScaleBg,
+          { x: 25, y: 27, w: 110, h: 45, r: 22.5, blurSlot: -48, rim: 1, bezel: 9, refract: 9, chroma: 0.04 });
+        let segStrokeSpan = 0;
+        for (let sy = 110; sy <= 190; sy++) {
+          if (segScale.lumaAt(240, sy) < 120) segStrokeSpan++;
+        }
+        const segRingL = segScale.lumaAt(240, 105);
+        const segTrackL = segScale.lumaAt(240, 116);
+        const segScaleOk = segStrokeSpan >= 35 && segStrokeSpan <= 37 && segRingL >= 225 && segTrackL <= 210 && (segRingL - segTrackL) >= 20;
+
         const v9Ok = gr0 < 15 && gr1 > 60 && gr2 < 15 && coreH >= 20 && coreH <= 22.5 && moat >= 6.5 &&
-          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && capDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && ngOk && halfOk;
+          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && capDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && ngOk && halfOk && segScaleOk;
         pushVec('V9 switch ON/OFF/half, light segmented & role4 tab 2D ROI', v9Ok,
-          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, capDelta, gate0SameX, gate0InCap, ngOrigL, ngRefrMinL, Number(h50.toFixed(2))],
-          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, capDelta>=40, gate0=0, ngOrig>220, ngRefr<170');
+          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, capDelta, gate0SameX, gate0InCap, ngOrigL, ngRefrMinL, Number(h50.toFixed(2)), segStrokeSpan, segRingL, segTrackL],
+          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, capDelta>=40, gate0=0, ngOrig>220, ngRefr<170, segSpan[35..37], ring>=225/track<=210');
       }
 
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)
