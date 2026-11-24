@@ -545,3 +545,68 @@ test "d3: multi_window isolation builds secondary window trees and cleans up on 
   debug_assert(closed_ids.length() == 2, "window_closed callbacks fired")
   t.dispose()
 }
+
+test "take_picture captures offscreen tree bands into a valid PNG and window_front_here delegates to host" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.words(view::Live::Is("Host"), look=view::words_plain)
+  })
+  // Wire a deterministic software rasterizer onto drawn_pixels_of so we verify instance shifting,
+  // banding, pixel scale, and PNG encoding end-to-end.
+  let calls : Ref[Int] = ref_new(0)
+  let saw_w : Ref[Int] = ref_new(0)
+  let saw_h : Ref[Int] = ref_new(0)
+  let saw_inst : Ref[Int] = ref_new(0)
+  let h = hostapi::host()
+  h.drawn_pixels_of = fn(_inst : Array[Double], count : Int, _r : Double, _g : Double, _b : Double, _sc : Double, w : Int, hh : Int, out : Array[Byte]) -> Bool {
+    calls.v = calls.v + 1
+    saw_w.v = w
+    saw_h.v = saw_h.v + hh
+    saw_inst.v = count
+    let mut i = 0
+    while i + 3 < out.length() {
+      out[i] = 0x33 as Byte
+      out[i + 1] = 0x66 as Byte
+      out[i + 2] = 0x99 as Byte
+      out[i + 3] = 0xFF as Byte
+      i += 4
+    }
+    true
+  }
+  let fronted : Ref[Int] = ref_new(0)
+  h.window_front_id = fn(wid : Int) -> Bool {
+    fronted.v = wid
+    wid == 7
+  }
+  debug_assert(window_front_here(7) && fronted.v == 7, "window_front_here delegates to hostapi::window_front_id")
+  debug_assert(!window_front_here(3) && fronted.v == 3, "window_front_here propagates false")
+  debug_assert(
+    wheel_mod_shift == 1 && wheel_mod_ctrl == 2 && wheel_mod_alt == 4 && wheel_mod_cmd == 8 && wheel_mod_pinch == 16,
+    "wheel modifier constants match host bitmask",
+  )
+
+  let got_png : Ref[Option[Bytes]] = ref_new(None)
+  take_picture(
+    "card",
+    80.0,
+    fn(b : view::View) {
+      let _ = b.height(view::Live::Is(Some(40.0))).ground(view::Live::Is(rgba(0x22, 0x44, 0x66, 0xFF)))
+    },
+    fn(png : Option[Bytes]) { got_png.v = png },
+    scale=2.0,
+  )
+  debug_assert(shots_pending(), "take_picture queues a pending shot")
+  t.frame(ms=16.0)
+  debug_assert(!shots_pending(), "shot completes and disposes after present")
+  debug_assert(calls.v == 1 && saw_w.v == 160 && saw_h.v == 80 && saw_inst.v >= 1, "rendered at 2x scale (160x80)")
+  match got_png.v {
+    Some(png) => {
+      debug_assert(png.length() > 32, "PNG payload is non-empty")
+      debug_assert(
+        png[0] == (0x89 as Byte) && png[1] == (0x50 as Byte) && png[2] == (0x4E as Byte) && png[3] == (0x47 as Byte),
+        "PNG magic header valid",
+      )
+    }
+    None => debug_assert(false, "take_picture must deliver Some(png)")
+  }
+  t.dispose()
+}
