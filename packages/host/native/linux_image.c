@@ -32,6 +32,7 @@ typedef struct {
 static image *imgs;
 static int nimgs, img_cap;
 static GMutex lock;
+static GCond img_cond;
 static GThreadPool *pool;
 static int log_times;
 
@@ -144,6 +145,7 @@ static void work(gpointer item, gpointer user) {
       if (!px) im->state = -1, im->untold = !im->told;
       px = NULL;
     }
+    g_cond_broadcast(&img_cond);
     g_mutex_unlock(&lock);
     free(px);  // freed meanwhile
     mb_app_wake();
@@ -177,6 +179,7 @@ static void work(gpointer item, gpointer user) {
     }
     px = NULL;
   }
+  g_cond_broadcast(&img_cond);
   g_mutex_unlock(&lock);
   free(px);  // freed meanwhile
   mb_app_wake();
@@ -268,6 +271,27 @@ static GLuint make_tex(const uint8_t *px, int w, int h) {
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
   return t;
+}
+
+void mb_images_wait_decoded(double ms) {
+  if (!pool) return;
+  gint64 deadline = g_get_monotonic_time() + (gint64)((ms > 0.0 ? ms : 1.0) * 1000.0);
+  g_mutex_lock(&lock);
+  for (;;) {
+    int pending = 0, ready_px = 0;
+    for (int id = 1; id < nimgs; id++) {
+      if (imgs[id].state == 0) {
+        pending = 1;
+        if (imgs[id].px) {
+          ready_px = 1;
+          break;
+        }
+      }
+    }
+    if (!pending || ready_px) break;
+    if (!g_cond_wait_until(&img_cond, &lock, deadline)) break;
+  }
+  g_mutex_unlock(&lock);
 }
 
 void mb_images_upload(void) {

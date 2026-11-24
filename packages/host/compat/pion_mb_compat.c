@@ -10,6 +10,7 @@
 #elif defined(__linux__)
 #include <time.h>
 extern void mb_images_upload(void);
+extern void mb_images_wait_decoded(double ms);
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
@@ -404,15 +405,15 @@ void pion_host_pump_main_loop(double ms) {
   double sec = ms > 0.0 ? ms / 1000.0 : 0.001;
   CFRunLoopRunInMode(kCFRunLoopDefaultMode, sec, true);
 #elif defined(__linux__)
-  if (ms > 0.0) {
+  if (pion_offscreen_active) {
+    mb_images_wait_decoded(ms > 0.0 ? ms : 1.0);
+    mb_images_upload();
+  } else if (ms > 0.0) {
     struct timespec ts;
     ts.tv_sec = (time_t)(ms / 1000.0);
     ts.tv_nsec = (long)((ms - (double)ts.tv_sec * 1000.0) * 1000000.0);
     if (ts.tv_nsec < 0) ts.tv_nsec = 0;
     nanosleep(&ts, NULL);
-  }
-  if (pion_offscreen_active) {
-    mb_images_upload();
   }
 #elif defined(_WIN32)
   // Deliver what is waiting on this thread's queue (decodes and other posted callbacks), then wait up to `ms` for more.

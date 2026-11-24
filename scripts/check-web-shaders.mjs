@@ -565,6 +565,19 @@ function buildHtmlPage(programs) {
         });
       }
 
+      // Background blit program so run2D renders the actual 2D backdrop (e.g. green track) before blending glass
+      const bgVs = gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(bgVs, '#version 300 es\\nout vec2 v_uv;\\nvoid main(){\\n  vec2 p = vec2((gl_VertexID == 1 || gl_VertexID == 4 || gl_VertexID == 5) ? 1.0 : -1.0,\\n                (gl_VertexID == 2 || gl_VertexID == 3 || gl_VertexID == 5) ? -1.0 : 1.0);\\n  v_uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\\n  gl_Position = vec4(p, 0.0, 1.0);\\n}');
+      gl.compileShader(bgVs);
+      const bgFs = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(bgFs, '#version 300 es\\nprecision highp float;\\nuniform sampler2D u_tex;\\nin vec2 v_uv;\\nout vec4 o;\\nvoid main(){ o = texture(u_tex, v_uv); }');
+      gl.compileShader(bgFs);
+      const bgProg = gl.createProgram();
+      gl.attachShader(bgProg, bgVs);
+      gl.attachShader(bgProg, bgFs);
+      gl.linkProgram(bgProg);
+      const bgTexLoc = gl.getUniformLocation(bgProg, 'u_tex');
+
       // Real 2D multi-pixel ROI gates V8 & V9 (using full 2D backdrop textures at 3x & 2x!)
       const run2D = (wPt, hPt, sc, fillBgFn, glass) => {
         const W2 = Math.round(wPt * sc), H2 = Math.round(hPt * sc);
@@ -588,15 +601,22 @@ function buildHtmlPage(programs) {
           }
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W2, H2, 0, gl.RGBA, gl.UNSIGNED_BYTE, bgTexBuf);
         }
+
+        // Blit 2D backdrop texture onto framebuffer before blending glass (matches Metal/GLES3/D3D11)
+        gl.useProgram(bgProg);
+        gl.disable(gl.BLEND);
+        gl.uniform1i(bgTexLoc, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+        gl.useProgram(prog);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
         gl.uniform2f(u('u_vp'), wPt, hPt);
         gl.uniform1f(u('u_scale'), sc);
         gl.uniform1f(u('u_top'), H2);
         gl.uniform4f(u('u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
         gl.uniform4f(u('u_uvc'), 0.5 / W2, 0.5 / H2, 1.0 - 0.5 / W2, 1.0 - 0.5 / H2);
 
-        const bg0 = fillBgFn ? fillBgFn(0, 0) : [28, 28, 30];
-        gl.clearColor(bg0[0] / 255, bg0[1] / 255, bg0[2] / 255, 1);
-        gl.clear(gl.COLOR_BUFFER_BIT);
         gl.vertexAttrib4f(0, glass.x, glass.y, glass.w, glass.h);
         gl.vertexAttrib4f(1, glass.r, 6.0, 1.0, glass.blurSlot);
         const col = glass.col || [1.0, 1.0, 1.0, 0.0];
@@ -786,13 +806,50 @@ function buildHtmlPage(programs) {
         const seg = run2D(160, 100, 3, () => [255, 255, 255],
           { x: 25, y: 27, w: 110, h: 45, r: 22.5, blurSlot: -48, rim: 1, bezel: 9, refract: 9, chroma: 0.04 });
         const cyan = seg.at(240, 213)[2] - seg.at(240, 213)[0];
+        const cyanTop = seg.at(240, 84)[2] - seg.at(240, 84)[0];
         const amber = seg.at(78, 148)[0] - seg.at(78, 148)[2];
 
+        const segTxtBg = (x, y) => (x >= 72 && x <= 88 && y >= 45 && y <= 54) ? [0, 0, 0] : [255, 255, 255];
+        const segTxtC1 = run2D(160, 100, 3, segTxtBg,
+          { x: 25, y: 27, w: 110, h: 45, r: 22.5, blurSlot: -48, rim: 1, bezel: 9, refract: 9, chroma: 0.04 });
+        const segTxtC0 = run2D(160, 100, 3, null,
+          { x: 25, y: 27, w: 110, h: 45, r: 22.5, blurSlot: -48, rim: 1, bezel: 9, refract: 9, chroma: 0.0 });
+        let maxTxtDiff = 0;
+        for (let ty = 135; ty <= 162; ty++) {
+          for (let tx = 216; tx <= 264; tx++) {
+            const c1 = segTxtC1.at(tx, ty), c0 = segTxtC0.at(tx, ty);
+            const d = Math.max(Math.abs(c1[0] - c0[0]), Math.abs(c1[1] - c0[1]), Math.abs(c1[2] - c0[2]));
+            if (d > maxTxtDiff) maxTxtDiff = d;
+          }
+        }
+
+        const tabBgEmpty = (x, y) => {
+          const dx = Math.max(0, Math.abs(x - 80) - 48);
+          const dy = Math.abs(y - 50);
+          return (dx * dx + dy * dy <= 22 * 22) ? [42, 42, 48] : [16, 16, 20];
+        };
+        const tabBgIcon = (x, y) => {
+          if (x >= 114 && x <= 122 && y >= 42 && y <= 58) return [255, 149, 0];
+          return tabBgEmpty(x, y);
+        };
+        const tabE = run2D(160, 100, 3, tabBgEmpty,
+          { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
+        const tabI = run2D(160, 100, 3, tabBgIcon,
+          { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
+        let maxIconDelta = 0;
+        for (let iy = 132; iy <= 168; iy++) {
+          for (let ix = 330; ix <= 351; ix++) {
+            const ce = tabE.at(ix, iy), ci = tabI.at(ix, iy);
+            const d = Math.abs(ci[0] - ce[0]) + Math.abs(ci[1] - ce[1]) + Math.abs(ci[2] - ce[2]);
+            if (d > maxIconDelta) maxIconDelta = d;
+          }
+        }
+
         const v9Ok = gr0 < 15 && gr1 > 60 && gr2 < 15 && coreH >= 20 && coreH <= 22.5 && moat >= 6.5 &&
-          grTip < 15 && p2Ok && offOk && cyan >= 10 && amber >= 20 && halfOk;
-        pushVec('V9 switch ON/OFF/half & light segmented 2D ROI', v9Ok,
-          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, amber, Number(h50.toFixed(2))],
-          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan>=10, amber>=20, h50<27');
+          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && maxIconDelta >= 40 && halfOk;
+        pushVec('V9 switch ON/OFF/half, light segmented & role4 tab 2D ROI', v9Ok,
+          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, maxIconDelta, Number(h50.toFixed(2))],
+          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, tabDelta>=40');
       }
 
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)
@@ -832,10 +889,23 @@ function buildHtmlPage(programs) {
           rim: 0.6, bezel: 14, refract: 18, chroma: 0.06,
         });
         const ydMid = lumaF(regD, 160, 120), ydTop = lumaF(regD, 160, 41);
-        const v10Ok = maxD2 <= 14.0 && sideMin >= 190.0 && sideMin <= 215.0 && ydTop > ydMid + 5.0;
-        pushVec('V10 regular glass Light AA & Dark rim (@2x, R=24)', v10Ok,
-          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1))],
-          'lightD2<=14, sideMin [190,215], darkTop>darkMid+5');
+        const v10DarkRef = [
+          [160,40,79,79,81],[160,41,62,62,64],[160,42,54,54,56],[160,43,51,51,53],[160,44,48,48,50],
+          [160,45,48,48,50],[160,46,47,47,49],[160,47,48,48,50],[160,48,47,47,49],[160,49,47,47,49],
+          [272,120,46,46,48],[273,120,47,47,49],[274,120,46,46,48],[275,120,47,47,49],
+          [276,120,46,46,48],[277,120,47,47,49],[278,120,47,47,49],[279,120,47,47,49],
+          [278,84,47,47,49],[277,76,48,48,50],[274,68,48,48,50],[270,61,48,48,51],[265,55,49,49,51],
+          [259,50,51,51,53],[252,46,53,53,55],[244,43,59,59,61],[238,42,59,59,61],[234,41,68,68,70],
+        ];
+        let v10DarkMaxDiff = 0;
+        for (const [px, py, er, eg, eb] of v10DarkRef) {
+          const [gr, gg, gb] = regD.at(px, py);
+          v10DarkMaxDiff = Math.max(v10DarkMaxDiff, Math.abs(gr - er), Math.abs(gg - eg), Math.abs(gb - eb));
+        }
+        const v10Ok = maxD2 <= 14.0 && sideMin >= 190.0 && sideMin <= 215.0 && ydTop > ydMid + 5.0 && v10DarkMaxDiff <= 1;
+        pushVec('V10 regular glass Light AA & Dark 28pt baseline (@2x, R=24)', v10Ok,
+          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), v10DarkMaxDiff],
+          'lightD2<=14, sideMin [190,215], darkTop>darkMid+5, dark28MaxDiff<=1');
       }
 
       // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
@@ -874,6 +944,9 @@ function buildHtmlPage(programs) {
           const sw3 = run2D(120, 65, 3, swBg, {
             x: 31.58, y: 12.8, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
           });
+          // Verify run2D blitted the real green track outside the left cap (not flat bg0)
+          const [outR, outG] = sw3.at(88, 96);
+          const bgBlitOk = (outG - outR) > 100;
           const d2L3 = arcD2(sw3, 89, 109, 66, 125);
           const d2R3 = arcD2(sw3, 259, 281, 66, 125);
           const lim3 = dark ? 10.0 : 12.0;
@@ -886,11 +959,38 @@ function buildHtmlPage(programs) {
           const l1 = lumaF(sw3, rDeepX - 1, 96), l2 = lumaF(sw3, rDeepX - 2, 96), l3 = lumaF(sw3, rDeepX - 3, 96), l4 = lumaF(sw3, rDeepX - 4, 96);
           const wallOk = dark
             ? (rDeepL <= 14.0 && (rgD - rrD) <= 12 && l1 >= rDeepL && l2 >= l1 && l3 >= l2)
-            : (rDeepL >= 170.0 && rDeepL <= 205.0 && l1 >= rDeepL && l2 >= l1 && l4 >= 230.0);
+            : (rDeepL >= 170.0 && rDeepL <= 205.0 && l1 >= rDeepL && l2 >= l1 && l3 >= l2 && l4 >= l3 && l4 >= 230.0);
           let emeraldOk = false;
           for (let lx = 93; lx <= 99; lx++) {
             const [lr, lg] = sw3.at(lx, 96);
             if (lg - lr >= 90 && lg >= 125 && lg <= 165) emeraldOk = true;
+          }
+          let hornOk = true;
+          let prevHorn = 0.0;
+          for (const dx of [6, 8, 10, 12, 14, 16, 18, 20]) {
+            const pc = Math.round((31.58 + dx) * 3.0);
+            const rem = Math.max(0.0, 19.2 - dx);
+            const dyc = Math.sqrt(19.2 * 19.2 - rem * rem);
+            const y0 = Math.round((32.0 - dyc + 1.0) * 3.0);
+            let best = 0, cur = 0;
+            for (let py = y0; py < 96; py++) {
+              const [hr, hg] = sw3.at(pc, py);
+              if (hg - hr < 26) { cur++; if (cur > best) best = cur; } else cur = 0;
+            }
+            const moat = best / 3.0;
+            if (dx === 6 || dx === 8) { if (moat !== 0.0) hornOk = false; }
+            else if (dx === 10) { if (moat < 1.5 || moat > 4.5) hornOk = false; }
+            else { if (moat < prevHorn - 0.35 || moat > prevHorn + 3.5) hornOk = false; }
+            prevHorn = moat;
+          }
+          let centerOk = true;
+          if (dark) {
+            const swG = run2D(120, 65, 3, () => [48, 209, 88], {
+              x: 31.58, y: 12.8, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
+            });
+            const [cr, cg, cb] = swG.at(184, 96);
+            centerOk = Math.abs(cr - 57) <= 2 && Math.abs(cg - 218) <= 2 && Math.abs(cb - 97) <= 2;
+            v11Summary.centerGreen = [cr, cg, cb];
           }
           const sw2 = run2D(120, 65, 2, swBg, {
             x: 31.58, y: 12.8, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
@@ -903,9 +1003,9 @@ function buildHtmlPage(programs) {
             d2_3x: [Number(d2L3.toFixed(2)), Number(d2R3.toFixed(2))],
             d2_2x: [Number(d2L2.toFixed(2)), Number(d2R2.toFixed(2))],
             rDeepL: Number(rDeepL.toFixed(1)),
-            wallOk, emeraldOk,
+            bgBlitOk, wallOk, emeraldOk, hornOk, centerOk,
           };
-          if (!(d2L3 <= lim3 && d2R3 <= lim3 && d2L2 <= lim2 && d2R2 <= lim2 && wallOk && emeraldOk)) v11Ok = false;
+          if (!(bgBlitOk && d2L3 <= lim3 && d2R3 <= lim3 && d2L2 <= lim2 && d2R2 <= lim2 && wallOk && emeraldOk && hornOk && centerOk)) v11Ok = false;
 
           for (const off of [5.00, 5.20]) {
             const th = 38.4 - 2.0 * off;
@@ -949,6 +1049,9 @@ function buildHtmlPage(programs) {
       }
 
       gl.deleteTexture(bdTex);
+      gl.deleteProgram(bgProg);
+      gl.deleteShader(bgVs);
+      gl.deleteShader(bgFs);
       gl.deleteProgram(prog);
       gl.deleteShader(vs);
       gl.deleteShader(fs);

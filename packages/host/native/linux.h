@@ -61,6 +61,7 @@ void mb_atlas_put(int colour, int x, int y, int w, int h, const uint8_t *px);
 unsigned mb_image_tex(int id);
 // the decoded ones' textures made (GL context current), and each decode done told once to f(1, id, state)
 void mb_images_upload(void);
+void mb_images_wait_decoded(double ms);
 void mb_images_tell(mb_outside_fn f);
 // a new context: the textures of the old one gone, made again from the pictures kept
 void mb_images_lost(void);

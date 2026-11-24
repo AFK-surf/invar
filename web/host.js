@@ -1398,7 +1398,7 @@
           float dB = clamp(mix(snellDmag, dispB, caW), -halfMinor, halfMinor);
           refractColor = vec3(
             backdrop(sampleBase + surfaceNormal * dR).r,
-            backdrop(sampleBase + disp).g,
+            backdrop(sampleBase + surfaceNormal * snellDmag).g,
             backdrop(sampleBase + surfaceNormal * dB).b
           );
         } else {
@@ -1698,7 +1698,8 @@
         float backdropLuma = clamp(Y, 0.0, 1.0);
         float brightBg = smoothstep(0.35, 0.75, backdropLuma);
         float liftGain = isRoleTab ? 0.025 : (isRoleSeg ? 0.014 : 0.098);
-        result = clamp(result + vec3(liftGain * pressAmt * (1.0 - backdropLuma)), 0.0, 1.0);
+        float lensLift = liftGain * pressAmt * (1.0 - backdropLuma);
+        result = clamp(refractColor + vec3(lensLift), 0.0, 1.0);
         float domeScale = clamp(v_rect.w / 38.4, 0.80, 1.35);
         float sizeGate = smoothstep(28.0, 36.0, v_rect.w);
         float roleVol = isRoleSeg ? 0.65 : (isRoleTab ? 0.55 : 1.0);
