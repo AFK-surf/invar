@@ -1,0 +1,348 @@
+// Pure state model for interactive 2D data grids: stable row_key/col_key focus,
+// sorting, single/multi/range selection, column resizing, and pagination/load-more.
+
+import "dmath"
+
+/// Column sort direction mapped to ARIA `aria-sort`.
+#derive(Eq)
+pub enum SortDir {
+  None
+  Ascending
+  Descending
+}
+
+/// Convert `SortDir` to ARIA `aria-sort` value (`"none"` / `"ascending"` / `"descending"`).
+pub fn sort_dir_aria(dir : SortDir) -> Option[String] {
+  match dir {
+    SortDir::None => Some("none")
+    SortDir::Ascending => Some("ascending")
+    SortDir::Descending => Some("descending")
+  }
+}
+
+/// Cycle sort direction: None -> Ascending -> Descending -> None.
+pub fn sort_dir_next(dir : SortDir) -> SortDir {
+  match dir {
+    SortDir::None => SortDir::Ascending
+    SortDir::Ascending => SortDir::Descending
+    SortDir::Descending => SortDir::None
+  }
+}
+
+/// Selection mode for a data grid.
+#derive(Eq)
+pub enum TableSelectionMode {
+  None
+  Single
+  Multiple
+}
+
+/// Pure 2D table grid controller state keyed by stable `row_key` and `col_key`.
+pub struct TableGridState {
+  pub selection_mode : TableSelectionMode
+  pub mut focus_row : Option[String]
+  pub mut focus_col : Option[String]
+  pub selected_rows : Array[String]
+  pub mut anchor_row : Option[String]
+  pub mut sort_col : Option[String]
+  pub mut sort_dir : SortDir
+  pub col_widths : Map[String, Double]
+  pub mut page : Int
+  pub mut has_more : Bool
+}
+
+/// Create a new `TableGridState`.
+pub fn TableGridState::new(
+  selection_mode~ : TableSelectionMode = TableSelectionMode::Multiple,
+  page~ : Int = 1,
+  has_more~ : Bool = false,
+) -> TableGridState {
+  TableGridState::{
+    selection_mode,
+    focus_row: None,
+    focus_col: None,
+    selected_rows: [],
+    anchor_row: None,
+    sort_col: None,
+    sort_dir: SortDir::None,
+    col_widths: Map::new(),
+    page: if page < 1 { 1 } else { page },
+    has_more,
+  }
+}
+
+fn str_index_of(arr : Array[String], key : String) -> Int {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == key {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+fn str_remove_key(arr : Array[String], key : String) -> Unit {
+  let kept : Array[String] = []
+  for x in arr {
+    if x != key {
+      kept.push(x)
+    }
+  }
+  arr.clear()
+  for x in kept {
+    arr.push(x)
+  }
+}
+
+/// Whether `row_key` is currently selected.
+pub fn TableGridState::is_selected(self : TableGridState, row_key : String) -> Bool {
+  str_index_of(self.selected_rows, row_key) >= 0
+}
+
+/// Whether `(row_key, col_key)` is the currently focused 2D cell.
+pub fn TableGridState::is_focused_cell(self : TableGridState, row_key : String, col_key : String) -> Bool {
+  match (self.focus_row, self.focus_col) {
+    (Some(r), Some(c)) => r == row_key && c == col_key
+    _ => false
+  }
+}
+
+/// Current ARIA `aria-sort` value for `col_key`.
+pub fn TableGridState::sort_of(self : TableGridState, col_key : String) -> SortDir {
+  match self.sort_col {
+    Some(c) if c == col_key => self.sort_dir
+    _ => SortDir::None
+  }
+}
+
+/// Toggle sort on `col_key`. If switching columns, starts at `Ascending`.
+pub fn TableGridState::toggle_sort(self : TableGridState, col_key : String) -> SortDir {
+  let next = match self.sort_col {
+    Some(c) if c == col_key => sort_dir_next(self.sort_dir)
+    _ => SortDir::Ascending
+  }
+  if next == SortDir::None {
+    self.sort_col = None
+    self.sort_dir = SortDir::None
+  } else {
+    self.sort_col = Some(col_key)
+    self.sort_dir = next
+  }
+  next
+}
+
+/// Explicitly set focus to `(row_key, col_key)`.
+pub fn TableGridState::set_focus(self : TableGridState, row_key : String, col_key : String) -> Unit {
+  self.focus_row = Some(row_key)
+  self.focus_col = Some(col_key)
+}
+
+/// Move 2D focus by `(dr, dc)` within ordered `row_keys` and `col_keys`.
+/// Returns `Some((row_key, col_key))` if focus is valid.
+pub fn TableGridState::move_focus(
+  self : TableGridState,
+  row_keys : Array[String],
+  col_keys : Array[String],
+  dr : Int,
+  dc : Int,
+) -> Option[(String, String)] {
+  let nr = row_keys.length()
+  let nc = col_keys.length()
+  if nr == 0 || nc == 0 {
+    self.focus_row = None
+    self.focus_col = None
+    return None
+  }
+  let cur_r = match self.focus_row {
+    Some(rk) => {
+      let idx = str_index_of(row_keys, rk)
+      if idx >= 0 { idx } else { 0 }
+    }
+    None => 0
+  }
+  let cur_c = match self.focus_col {
+    Some(ck) => {
+      let idx = str_index_of(col_keys, ck)
+      if idx >= 0 { idx } else { 0 }
+    }
+    None => 0
+  }
+  let mut nr_idx = cur_r + dr
+  if nr_idx < 0 { nr_idx = 0 }
+  if nr_idx >= nr { nr_idx = nr - 1 }
+  let mut nc_idx = cur_c + dc
+  if nc_idx < 0 { nc_idx = 0 }
+  if nc_idx >= nc { nc_idx = nc - 1 }
+  let rk = row_keys[nr_idx]
+  let ck = col_keys[nc_idx]
+  self.focus_row = Some(rk)
+  self.focus_col = Some(ck)
+  Some((rk, ck))
+}
+
+/// Jump focus to first or last column in current row, or first/last cell in grid (`ctrl=true`).
+pub fn TableGridState::jump_focus(
+  self : TableGridState,
+  row_keys : Array[String],
+  col_keys : Array[String],
+  to_end : Bool,
+  ctrl : Bool,
+) -> Option[(String, String)] {
+  let nr = row_keys.length()
+  let nc = col_keys.length()
+  if nr == 0 || nc == 0 {
+    return None
+  }
+  let r_idx = if ctrl {
+    if to_end { nr - 1 } else { 0 }
+  } else {
+    match self.focus_row {
+      Some(rk) => {
+        let i = str_index_of(row_keys, rk)
+        if i >= 0 { i } else { 0 }
+      }
+      None => 0
+    }
+  }
+  let c_idx = if to_end { nc - 1 } else { 0 }
+  let rk = row_keys[r_idx]
+  let ck = col_keys[c_idx]
+  self.focus_row = Some(rk)
+  self.focus_col = Some(ck)
+  Some((rk, ck))
+}
+
+/// Select or toggle `row_key`. When `shift_range=true` in `Multiple` mode, selects the contiguous
+/// range from `anchor_row` to `row_key` in the current `row_keys` order.
+pub fn TableGridState::select_row(
+  self : TableGridState,
+  row_keys : Array[String],
+  row_key : String,
+  shift_range~ : Bool = false,
+) -> Bool {
+  if self.selection_mode == TableSelectionMode::None {
+    return false
+  }
+  let target_idx = str_index_of(row_keys, row_key)
+  if target_idx < 0 {
+    return false
+  }
+  match self.selection_mode {
+    TableSelectionMode::None => false
+    TableSelectionMode::Single => {
+      self.selected_rows.clear()
+      self.selected_rows.push(row_key)
+      self.anchor_row = Some(row_key)
+      true
+    }
+    TableSelectionMode::Multiple => {
+      if shift_range {
+        let anchor_idx = match self.anchor_row {
+          Some(ak) => {
+            let ai = str_index_of(row_keys, ak)
+            if ai >= 0 { ai } else { target_idx }
+          }
+          None => target_idx
+        }
+        let lo = if anchor_idx <= target_idx { anchor_idx } else { target_idx }
+        let hi = if anchor_idx >= target_idx { anchor_idx } else { target_idx }
+        let mut i = lo
+        while i <= hi {
+          let k = row_keys[i]
+          if !self.is_selected(k) {
+            self.selected_rows.push(k)
+          }
+          i += 1
+        }
+        if self.anchor_row is None {
+          self.anchor_row = Some(row_key)
+        }
+        true
+      } else {
+        if self.is_selected(row_key) {
+          str_remove_key(self.selected_rows, row_key)
+        } else {
+          self.selected_rows.push(row_key)
+        }
+        self.anchor_row = Some(row_key)
+        true
+      }
+    }
+  }
+}
+
+/// Select all `row_keys` in `Multiple` mode.
+pub fn TableGridState::select_all(self : TableGridState, row_keys : Array[String]) -> Bool {
+  if self.selection_mode != TableSelectionMode::Multiple {
+    return false
+  }
+  self.selected_rows.clear()
+  for k in row_keys {
+    self.selected_rows.push(k)
+  }
+  true
+}
+
+/// Clear all selected rows.
+pub fn TableGridState::clear_selection(self : TableGridState) -> Unit {
+  self.selected_rows.clear()
+  self.anchor_row = None
+}
+
+/// Reconcile focus and selection after sorting or filtering `row_keys` / `col_keys`.
+/// Preserves existing `selected_rows` and `(focus_row, focus_col)` by stable key when still present!
+pub fn TableGridState::reconcile(
+  self : TableGridState,
+  row_keys : Array[String],
+  col_keys : Array[String],
+  prune_missing_selection~ : Bool = false,
+) -> Unit {
+  if prune_missing_selection {
+    let kept : Array[String] = []
+    for k in self.selected_rows {
+      if str_index_of(row_keys, k) >= 0 {
+        kept.push(k)
+      }
+    }
+    self.selected_rows.clear()
+    for k in kept {
+      self.selected_rows.push(k)
+    }
+  }
+  match self.focus_row {
+    Some(rk) =>
+      if str_index_of(row_keys, rk) < 0 {
+        self.focus_row = if row_keys.length() > 0 { Some(row_keys[0]) } else { None }
+      }
+    None => ()
+  }
+  match self.focus_col {
+    Some(ck) =>
+      if str_index_of(col_keys, ck) < 0 {
+        self.focus_col = if col_keys.length() > 0 { Some(col_keys[0]) } else { None }
+      }
+    None => ()
+  }
+}
+
+/// Resize column `col_key` to `width` clamped to `[min_w, max_w]`.
+pub fn TableGridState::resize_column(
+  self : TableGridState,
+  col_key : String,
+  width : Double,
+  min_w~ : Double = 40.0,
+  max_w~ : Double = 1200.0,
+) -> Double {
+  let clamped = dmath::clamp(width, min_w, max_w)
+  self.col_widths[col_key] = clamped
+  clamped
+}
+
+/// Read stored column width or `default_w`.
+pub fn TableGridState::column_width(self : TableGridState, col_key : String, default_w~ : Double = 120.0) -> Double {
+  match self.col_widths.get(col_key) {
+    Some(w) => w
+    None => default_w
+  }
+}

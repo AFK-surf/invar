@@ -417,7 +417,7 @@ static const char *FS =
     "void shade(vec2 p, float fade_r) {\n"
     "  int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5));\n"
     "  // where a native view shows: its picture (NativeViews.Picture), the part of it c2 says, cut to its corners\n"
-    "  if (kind == 9) { vec2 hh = v_rect.zw * 0.5; float rr = min(mb_corner_of(p - v_rect.xy - hh, v_rr), min(hh.x, hh.y)); vec2 q = abs(p - v_rect.xy - hh) - hh + rr; float a = clamp(0.5 - (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr) * u_scale, 0.0, 1.0); if (a <= 0.0) discard; vec2 uv = v_c2.xy + clamp((p - v_rect.xy) / v_rect.zw, 0.0, 1.0) * v_c2.zw; if (uv.y < 0.0 || uv.y > 1.0) discard; o = texture(u_img, uv) * a; return; }\n"
+    "  if (kind == 9) { vec2 hh = v_rect.zw * 0.5; float rr = min(abs(mb_corner_of(p - v_rect.xy - hh, v_rr)), min(hh.x, hh.y)); vec2 q = abs(p - v_rect.xy - hh) - hh + rr; float a = clamp(0.5 - (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr) * u_scale, 0.0, 1.0); if (a <= 0.0) discard; vec2 uv = v_c2.xy + clamp((p - v_rect.xy) / v_rect.zw, 0.0, 1.0) * v_c2.zw; if (uv.y < 0.0 || uv.y > 1.0) discard; o = texture(u_img, uv) * a; return; }\n"
     "  vec4 col = v_color;\n"
     "  if (kind == 11) {\n"
     "    // a band of a shape (src/ui/shape.mbt): c2.y of its pieces from c2.x; p.x half its stroke's width (0: a fill,\n"
@@ -433,6 +433,9 @@ static const char *FS =
     "      for (int i = first; i < first + n; i++) { int t = (i / 6) * 15 + mb_seg_slot(i); w += mb_path_rows(texelFetch(u_segs, ivec2(t % 2040, t / 2040), 0), v_rect, p, u_scale); }\n"
     "      a = mb_path_cover(w, v_c2.z);\n"
     "    }\n"
+    "    float ly = p.y - v_rect.y;\n"
+    "    if (v_rr.y > 0.0) a *= clamp((ly - v_rr.x) / v_rr.y, 0.0, 1.0);\n"
+    "    if (v_rr.w > 0.0) a *= clamp((v_rr.z - ly) / v_rr.w, 0.0, 1.0);\n"
     "    if (v_pad.w > 0.0) col.rgb = mb_adaptive_ink_at(col.rgb, v_pad.yz, v_pad.w * 0.5, v_rect);\n"
     "    o = vec4(col.rgb, 1.0) * col.a * a;\n"
     "    return;\n"
@@ -489,7 +492,7 @@ static const char *FS =
     "    // Copyright 2025, Tim Lehmann for whynotmake.it. Adapted from flutter_liquid_glass\n"
     "    // liquid_glass_final_render_core.glsl, Apache-2.0.\n"
     "    float k = v_pad.w;\n"
-    "    vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);\n"
+    "    vec4 s_rr = max(max(abs(v_rr.x), abs(v_rr.y)), max(abs(v_rr.z), abs(v_rr.w))) > 0.0 ? v_rr : vec4(v_p.x);\n"
     "    float d;\n"
     "    float halfMinor = 1e9;\n"
     "#if ONE_KIND == 13\n"
@@ -1105,7 +1108,7 @@ static const char *FS =
     "    return;\n"
     "  }\n"
     "  if (kind == 8) {\n"
-    "    vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);\n"
+    "    vec4 s_rr = max(max(abs(v_rr.x), abs(v_rr.y)), max(abs(v_rr.z), abs(v_rr.w))) > 0.0 ? v_rr : vec4(v_p.x);\n"
     "    float d = sd_rr(p, v_rect, s_rr);\n"
     "    float materialAlpha = clamp(0.5 - d * u_scale, 0.0, 1.0);\n"
     "    if (materialAlpha < 0.005) discard;\n"
@@ -1160,7 +1163,7 @@ static const char *FS =
     "      float pd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);\n"
     "      pic *= v_pad.w * clamp(0.5 - pd * u_scale, 0.0, 1.0);\n"
     "      pic += vec4(col.rgb * v_pad.y, v_pad.y) * (1.0 - pic.a);\n"
-    "      if (v_pad.x < 0.5 && max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) <= 0.0 &&\n"
+    "      if (v_pad.x < 0.5 && max(max(abs(v_rr.x), abs(v_rr.y)), max(abs(v_rr.z), abs(v_rr.w))) <= 0.0 &&\n"
     "          max(max(v_rc.x, v_rc.y), max(v_rc.z, v_rc.w)) > 0.0 &&\n"
     "          all(greaterThanEqual(v_clip.xy, v_rect.xy)) && all(lessThanEqual(v_clip.zw, v_rect.xy + v_rect.zw))) edge = 1.0;\n"
     "    }\n"
@@ -1170,10 +1173,14 @@ static const char *FS =
     "  if (kind == 2) {\n"
     "    // as Core Animation's: the shape blurred, sigma its radius (corner.sl mb_shadow)\n"
     "    float a = mb_shadow(p - c, hs, rad, max(v_p.w, 0.25));\n"
-    "    // glass's: only outside its box (c2.y above it)\n"
+    "    // glass's (and View::shadows'): only outside its box\n"
     "    if (v_c2.x > 0.5) {\n"
-    "      vec2 q = p - c + vec2(0.0, v_c2.y);\n"
-    "      float db = mb_sd_box(q, hs, mb_corner_of(q, v_rr), band);\n"
+    "      // (the box itself: (c2.z, c2.y) back from the shadow's, its spread c2.w smaller each side)\n"
+    "      vec2 q = p - c + vec2(v_c2.z, v_c2.y);\n"
+    "      vec2 hb = max(hs - vec2(v_c2.w, v_c2.w), vec2(0.0, 0.0));\n"
+    "      float rb = mb_corner_of(q, v_rr);\n"
+    "      rb = rb < 0.0 ? -max(-rb - v_c2.w, 0.0) : max(rb - v_c2.w, 0.0);\n"
+    "      float db = mb_sd_box(q, hb, rb, band);\n"
     "      a *= clamp(0.5 + db * u_scale, 0.0, 1.0);\n"
     "    }\n"
     "    o = vec4(col.rgb, 1.0) * col.a * a;\n"
@@ -1524,7 +1531,7 @@ static int is_simple_rect(const float *f, int32_t i) {
   const float *b = f + (size_t)i * MB_INST;
   return (int)(b[5] + 0.5f) == 0 && b[2] >= 0.0f && b[3] >= 0.0f && b[6] <= 0.0f &&
          b[20] == 0.0f && b[21] == 0.0f && b[22] == 0.0f && b[23] == 0.0f &&
-         b[32] == 0.0f && b[4] <= 0.0f && b[36] <= 0.0f && b[37] <= 0.0f && b[38] <= 0.0f && b[39] <= 0.0f &&
+         b[32] == 0.0f && b[4] == 0.0f && b[36] == 0.0f && b[37] == 0.0f && b[38] == 0.0f && b[39] == 0.0f &&
          b[24] <= 0.0f && b[25] <= 0.0f && b[26] <= 0.0f && b[27] <= 0.0f &&
          b[44] <= 0.0f && b[45] <= 0.0f && b[46] <= 0.0f && b[47] <= 0.0f &&
          b[53] <= 0.0f && b[55] <= 0.0f && b[57] <= 0.0f && b[59] <= 0.0f;
@@ -1925,23 +1932,27 @@ static void draw_parts(GLuint fb, int kept) {
   if (n != 0) pictures_missing = missing;
 }
 
-// Offscreen blur layers (kind == 14 PUSH_BLUR_LAYER / kind == 15 POP_BLUR_LAYER): lazily allocated
-// GL_RGBA8 layer targets and an RGBA8 blur pyramid (full 8-bit alpha for smooth premultiplied edges).
-#define MB_BLUR_LAYERS 4
-static level bl_lv[MB_BLUR_LAYERS];
+// Offscreen blur / group-alpha layers (kind == 14/16 push, 15/17 pop): lazily allocated
+// GL_RGBA8 layer targets (dynamically grown from 8 up to 64) and an RGBA8 blur pyramid.
+#define MB_BLUR_LAYERS_INIT 8
+#define MB_BLUR_LAYERS_MAX 64
+static level *bl_lv = NULL;
+static int bl_cap = 0;
 static int bl_w, bl_h;
 static level bl_py[5];
 static int bl_py_w, bl_py_h;
 
 static void blur_layers_lost(void) {
-  memset(bl_lv, 0, sizeof bl_lv);
+  free(bl_lv);
+  bl_lv = NULL;
+  bl_cap = 0;
   bl_w = bl_h = 0;
   memset(bl_py, 0, sizeof bl_py);
   bl_py_w = bl_py_h = 0;
 }
 
 static void blur_layers_free(void) {
-  for (int j = 0; j < MB_BLUR_LAYERS; j++)
+  for (int j = 0; j < bl_cap; j++)
     if (bl_lv[j].t) {
       glDeleteTextures(1, &bl_lv[j].t);
       glDeleteFramebuffers(1, &bl_lv[j].fb);
@@ -1954,24 +1965,41 @@ static void blur_layers_free(void) {
   blur_layers_lost();
 }
 
+static int g_gl_test_fail_blur_depth = -1;
+void invar_gl_test_fail_blur_depth(int depth) {
+  g_gl_test_fail_blur_depth = depth;
+}
+
 static int ensure_blur_layer(int depth, int tw, int th) {
-  if (depth < 0 || depth >= MB_BLUR_LAYERS || tw <= 0 || th <= 0) return 0;
+  if (depth < 0 || depth >= MB_BLUR_LAYERS_MAX || tw <= 0 || th <= 0) return 0;
   if (bl_w != tw || bl_h != th) {
-    for (int j = 0; j < MB_BLUR_LAYERS; j++)
+    for (int j = 0; j < bl_cap; j++)
       if (bl_lv[j].t) {
         glDeleteTextures(1, &bl_lv[j].t);
         glDeleteFramebuffers(1, &bl_lv[j].fb);
       }
-    memset(bl_lv, 0, sizeof bl_lv);
+    if (bl_lv && bl_cap > 0) memset(bl_lv, 0, (size_t)bl_cap * sizeof(level));
     bl_w = tw;
     bl_h = th;
   }
+  if (depth >= bl_cap) {
+    int nc = bl_cap > 0 ? bl_cap : MB_BLUR_LAYERS_INIT;
+    while (nc <= depth) nc *= 2;
+    if (nc > MB_BLUR_LAYERS_MAX) nc = MB_BLUR_LAYERS_MAX;
+    level *nl = (level *)realloc(bl_lv, (size_t)nc * sizeof(level));
+    if (!nl) return 0;
+    memset(nl + bl_cap, 0, (size_t)(nc - bl_cap) * sizeof(level));
+    bl_lv = nl;
+    bl_cap = nc;
+  }
   if (!bl_lv[depth].t) {
     bl_lv[depth] = level_tex(GL_RGBA8, tw, th);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    if ((g_gl_test_fail_blur_depth >= 0 && depth == g_gl_test_fail_blur_depth) ||
+        glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
       glDeleteTextures(1, &bl_lv[depth].t);
       glDeleteFramebuffers(1, &bl_lv[depth].fb);
       bl_lv[depth] = (level){0};
+      glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
     }
   }
   return bl_lv[depth].t != 0 && bl_lv[depth].fb != 0;
@@ -2066,7 +2094,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
       bx0 = b[0] - m23; by0 = b[1] - m23; bx1 = b[0] + b[2] + m23; by1 = b[1] + b[3] + m23;
       if (merged_liquid && m->n < 8) {
         for (int k = 0; k < 4; k++) m->shape[m->n * 4 + k] = b[k];
-        if (fmaxf(fmaxf(b[36], b[37]), fmaxf(b[38], b[39])) > 0.0f) {
+        if (fmaxf(fmaxf(fabsf(b[36]), fabsf(b[37])), fmaxf(fabsf(b[38]), fabsf(b[39]))) > 0.0f) {
           for (int k = 0; k < 4; k++) m->rad[m->n * 4 + k] = b[36 + k];
         } else {
           for (int k = 0; k < 4; k++) m->rad[m->n * 4 + k] = b[4];
@@ -2957,11 +2985,11 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     if (i > 0 && tid != f[(size_t)(i - 1) * MB_INST + 20]) run = i;
     int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
     int take = 0;
-    if (k == 14) {
+    if (k == 14 || k == 16) {
       if (in_blur == 0) blur_hit = reaches(f, i, run, dep);
       in_blur++;
       take = blur_hit;
-    } else if (k == 15) {
+    } else if (k == 15 || k == 17) {
       take = blur_hit;
       if (in_blur > 0) {
         in_blur--;
@@ -3820,8 +3848,10 @@ static void draw_into(GLuint fb, int part) {
     int prev_cut_on;
     int prev_cut[4];
   } BlurLayer;
-  BlurLayer bstack[MB_BLUR_LAYERS];
-  int bdepth = 0, bover = 0;
+  BlurLayer bstack_inline[MB_BLUR_LAYERS_INIT];
+  int bcap = MB_BLUR_LAYERS_INIT;
+  BlurLayer *bstack = bstack_inline;
+  int bdepth = 0, bover = 0, bskip = 0;
   int32_t start = 0;
   int bound = 0, shows = 0, levels_sized = 0;
   unsigned frame_clock = slots_clock;
@@ -3836,15 +3866,15 @@ static void draw_into(GLuint fb, int part) {
     int max_w = 0, max_h = 0, scan_bound = 0, any_glass = 0, scan_bd = 0;
     for (int32_t s0 = 0; s0 < count;) {
       int sk = (int)(fbuf[s0 * MB_INST + 5] + 0.5f);
-      if (sk == 14) { scan_bd++; s0++; continue; }
-      if (sk == 15) { if (scan_bd > 0) scan_bd--; s0++; continue; }
+      if (sk == 14 || sk == 16) { scan_bd++; s0++; continue; }
+      if (sk == 15 || sk == 17) { if (scan_bd > 0) scan_bd--; s0++; continue; }
       int stid = (int)fbuf[s0 * MB_INST + 20];
       int32_t e0 = s0 + 1;
       if (scan_bd == 0 && stid < 0) {
         any_glass = 1;
         while (e0 < count && (int)fbuf[e0 * MB_INST + 20] == stid) {
           int ek = (int)(fbuf[e0 * MB_INST + 5] + 0.5f);
-          if (ek == 14 || ek == 15) break;
+          if (ek == 14 || ek == 15 || ek == 16 || ek == 17) break;
           e0++;
         }
         if (stid != scan_bound) {
@@ -3876,14 +3906,14 @@ static void draw_into(GLuint fb, int part) {
         int pre_bound = 0, pre_bd = 0;
         for (int32_t s0 = 0; s0 < count;) {
           int skind = (int)(fbuf[s0 * MB_INST + 5] + 0.5f);
-          if (skind == 14) { pre_bd++; s0++; continue; }
-          if (skind == 15) { if (pre_bd > 0) pre_bd--; s0++; continue; }
+          if (skind == 14 || skind == 16) { pre_bd++; s0++; continue; }
+          if (skind == 15 || skind == 17) { if (pre_bd > 0) pre_bd--; s0++; continue; }
           int stid = (int)fbuf[s0 * MB_INST + 20];
           int32_t e0 = s0 + 1;
           if (pre_bd == 0 && stid < 0) {
             while (e0 < count && (int)fbuf[e0 * MB_INST + 20] == stid) {
               int ek = (int)(fbuf[e0 * MB_INST + 5] + 0.5f);
-              if (ek == 14 || ek == 15) break;
+              if (ek == 14 || ek == 15 || ek == 16 || ek == 17) break;
               e0++;
             }
             if (stid != pre_bound) {
@@ -3933,16 +3963,23 @@ static void draw_into(GLuint fb, int part) {
   while (start < count) {
     int tid = (int)fbuf[start * MB_INST + 20];
     int kind = (int)(fbuf[start * MB_INST + 5] + 0.5f);
-    if (kind == 14) {
-      if (bdepth >= MB_BLUR_LAYERS) {
-        bover++;
+    if (bskip > 0) {
+      if (kind == 14 || kind == 16) bskip++;
+      else if (kind == 15 || kind == 17) bskip--;
+      start++;
+      continue;
+    }
+    if (kind == 14 || kind == 16) {
+      if (bdepth >= MB_BLUR_LAYERS_MAX) {
+        bskip = 1;
         start++;
         continue;
       }
+      int is_group = (kind == 16);
       const float *a = fbuf + (size_t)start * MB_INST;
       float sc = (float)cur_scale;
-      float sigma = fabsf(a[7]);
-      float margin = sigma > 0.0f ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
+      float sigma = is_group ? 0.0f : fabsf(a[7]);
+      float margin = (!is_group && sigma > 0.0f) ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
       int top = vy0 + vhp;
       int px0 = (int)floorf((a[0] - margin) * sc), px1 = (int)ceilf((a[0] + a[2] + margin) * sc);
       int pb0 = top - (int)ceilf((a[1] + a[3] + margin) * sc), pb1 = top - (int)floorf((a[1] - margin) * sc);
@@ -3951,8 +3988,36 @@ static void draw_into(GLuint fb, int part) {
       if (pb0 < vy0) pb0 = vy0;
       if (pb1 > top) pb1 = top;
       int bw = px1 - px0, bh = pb1 - pb0;
+      if (bw <= 0 || bh <= 0) {
+        bskip = 1;
+        start++;
+        continue;
+      }
+      if (bdepth >= bcap) {
+        int nc = bcap * 2;
+        if (nc > MB_BLUR_LAYERS_MAX) nc = MB_BLUR_LAYERS_MAX;
+        BlurLayer *nb = NULL;
+        if (bstack == bstack_inline) {
+          nb = (BlurLayer *)malloc((size_t)nc * sizeof(BlurLayer));
+          if (nb) memcpy(nb, bstack_inline, (size_t)bdepth * sizeof(BlurLayer));
+        } else {
+          nb = (BlurLayer *)realloc(bstack, (size_t)nc * sizeof(BlurLayer));
+        }
+        if (!nb) {
+          bskip = 1;
+          start++;
+          continue;
+        }
+        bstack = nb;
+        bcap = nc;
+      }
       BlurLayer L = {px0, pb0, bw, bh, top, 0, sigma, target_fb, cut_on, {cut[0], cut[1], cut[2], cut[3]}};
-      if (sigma > 0.0f && bw > 0 && bh > 0 && ensure_blur_layer(bdepth, fb_w, fb_h)) {
+      if (!is_group && sigma <= 0.0f) {
+        bstack[bdepth++] = L;
+        start++;
+        continue;
+      }
+      if (ensure_blur_layer(bdepth, fb_w, fb_h)) {
         L.active = 1;
         target_fb = bl_lv[bdepth].fb;
         cut_on = 1;
@@ -3964,12 +4029,63 @@ static void draw_into(GLuint fb, int part) {
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
       } else {
-        cut_on = 1;
-        cut[0] = 0; cut[1] = 0; cut[2] = 0; cut[3] = 0;
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(0, 0, 0, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, target_fb);
+        main_state();
+        bskip = 1;
+        start++;
+        continue;
       }
       bstack[bdepth++] = L;
+      start++;
+      continue;
+    }
+    if (kind == 17) {
+      if (bover > 0) {
+        bover--;
+        start++;
+        continue;
+      }
+      if (bdepth <= 0) {
+        start++;
+        continue;
+      }
+      BlurLayer L = bstack[--bdepth];
+      target_fb = L.prev_fb;
+      cut_on = L.prev_cut_on;
+      memcpy(cut, L.prev_cut, sizeof cut);
+      main_state();
+      if (L.active && bl_lv[bdepth].w > 0 && bl_lv[bdepth].h > 0) {
+        float sc = (float)cur_scale;
+        float comp[MB_INST];
+        memcpy(comp, fbuf + (size_t)start * MB_INST, MB_INST * sizeof(float));
+        comp[0] = (float)L.px0 / sc;
+        comp[1] = (float)(L.top - (L.pb0 + L.h)) / sc;
+        comp[2] = (float)L.w / sc;
+        comp[3] = (float)L.h / sc;
+        comp[4] = 0.0f;
+        comp[5] = 4.0f;
+        comp[6] = 0.0f;
+        comp[7] = 0.0f;
+        comp[8] = 1.0f;
+        comp[9] = 1.0f;
+        comp[10] = 1.0f;
+        comp[12] = (float)L.px0 / (float)bl_lv[bdepth].w;
+        comp[13] = (float)(L.pb0 + L.h) / (float)bl_lv[bdepth].h;
+        comp[14] = (float)L.w / (float)bl_lv[bdepth].w;
+        comp[15] = -(float)L.h / (float)bl_lv[bdepth].h;
+        comp[20] = 0.0f; comp[21] = 0.0f; comp[22] = 0.0f; comp[23] = 0.0f;
+        comp[32] = 0.0f; comp[33] = 0.0f; comp[34] = 0.0f; comp[35] = 0.0f;
+        comp[36] = 0.0f; comp[37] = 0.0f; comp[38] = 0.0f; comp[39] = 0.0f;
+        use_prog(4);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, bl_lv[bdepth].t);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)((size_t)(count + 1) * MB_INST * sizeof(float)),
+                        MB_INST * sizeof(float), comp);
+        draw_run(count + 1, 1);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, atlas);
+      }
       start++;
       continue;
     }
@@ -4125,7 +4241,7 @@ static void draw_into(GLuint fb, int part) {
       while (cs < cend_all) {
         int ctid = (int)fbuf[cs * MB_INST + 20];
         int ck = (int)(fbuf[cs * MB_INST + 5] + 0.5f);
-        if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ctid < 0) {
+        if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ck == 16 || ck == 17 || ctid < 0) {
           cs++;
           continue;
         }
@@ -4133,7 +4249,7 @@ static void draw_into(GLuint fb, int part) {
         int32_t ce = cs + 1;
         while (ce < cend_all && (int)fbuf[ce * MB_INST + 20] == ctid) {
           int kk = (int)(fbuf[ce * MB_INST + 5] + 0.5f);
-          if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15) break;
+          if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15 || kk == 16 || kk == 17) break;
           if (cown ? kk != ck : has_own_prog(kk)) break;
           ce++;
         }
@@ -4179,7 +4295,7 @@ static void draw_into(GLuint fb, int part) {
     int32_t end = start + 1;
     while (end < count && (int)fbuf[end * MB_INST + 20] == tid) {
       int k = (int)(fbuf[end * MB_INST + 5] + 0.5f);
-      if (k == 8 || k == 14 || k == 15) break;
+      if (k == 8 || k == 14 || k == 15 || k == 16 || k == 17) break;
       if (own ? k != kind : tid >= 0 && has_own_prog(k)) break;
       if (tid == 0 && kind == 0 && prog_rect && fast_rect_enabled() && is_simple_rect(fbuf, end) != fast_rect) break;
       end++;
@@ -4261,6 +4377,7 @@ static void draw_into(GLuint fb, int part) {
     }
     start = end;
   }
+  if (bstack != bstack_inline) free(bstack);
   if (levels_sized && slots_total_bytes() > MB_GLASS_CACHE_MAX_BYTES) slots_evict_budget(-1, frame_clock, 1);
   if (cut_on) glDisable(GL_SCISSOR_TEST);
   cut_on = 0;

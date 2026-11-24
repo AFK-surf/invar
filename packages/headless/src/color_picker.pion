@@ -1,0 +1,406 @@
+// Headless ColorPicker primitives:
+// - `color_area`: arbitrary 2-channel 2D drag & 4-way Arrow keys (Shift = 10x)
+// - `color_slider`: single-channel 1D slider
+// - `color_swatch_picker`: 2D grid roving swatch picker
+
+import "dmath"
+import "headless_core"
+import "signals"
+import "view"
+
+/// Handle for a 2D `ColorArea` editing `(x_channel, y_channel)`.
+pub struct ColorArea {
+  node : view::View
+  x_channel : headless_core::ColorChannel
+  y_channel : headless_core::ColorChannel
+  model_ : () -> headless_core::ColorModel
+  on_change : (headless_core::ColorModel) -> Unit
+  off : () -> Bool
+}
+
+pub fn ColorArea::node(self : ColorArea) -> view::View {
+  self.node
+}
+
+pub fn ColorArea::x_norm(self : ColorArea) -> Double {
+  (self.model_)().channel_norm(self.x_channel)
+}
+
+pub fn ColorArea::y_norm(self : ColorArea) -> Double {
+  (self.model_)().channel_norm(self.y_channel)
+}
+
+pub fn ColorArea::disabled(self : ColorArea) -> Bool {
+  (self.off)()
+}
+
+/// Set both channels from normalized `(tx, ty)` in `[0, 1]` (`ty=0` at bottom, `ty=1` at top).
+pub fn ColorArea::set_norm(self : ColorArea, tx : Double, ty : Double) -> Unit {
+  if signals::untracked(self.off) {
+    return
+  }
+  let cur = signals::untracked(self.model_)
+  let next = cur.with_channel_norm(self.x_channel, tx).with_channel_norm(self.y_channel, ty)
+  if next != cur {
+    (self.on_change)(next)
+  }
+}
+
+/// Mount a headless 2D `ColorArea` supporting arbitrary channel pairs (S/V, R/G, B/G, etc.),
+/// pointer 2D drag, and 4-way Arrow keys (with Shift = 10x step).
+pub fn color_area(
+  parent : view::View,
+  label : () -> String,
+  x_channel : headless_core::ColorChannel,
+  y_channel : headless_core::ColorChannel,
+  model : () -> headless_core::ColorModel,
+  on_change : (headless_core::ColorModel) -> Unit,
+  look : (view::View, ColorArea) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let ca = ColorArea::{ node: v, x_channel, y_channel, model_: model, on_change, off: disabled }
+    let able = fn() -> Bool { !disabled() }
+    let update_from_point = fn(wx : Double, wy : Double) {
+      let (rx, ry, rw, rh) = v.rect()
+      if rw <= 0.0 || rh <= 0.0 {
+        return
+      }
+      let tx = dmath::clamp((wx - rx) / rw, 0.0, 1.0)
+      // Y-axis: top of area = 1.0, bottom = 0.0
+      let ty = dmath::clamp(1.0 - (wy - ry) / rh, 0.0, 1.0)
+      ca.set_norm(tx, ty)
+    }
+    look(v, ca)
+    let _ = v
+    .presses(view::Live::By(able))
+    .focusable(view::Live::By(able), keys=0)
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      let m = model()
+      let xv = (m.channel_norm(x_channel) * 100.0).round().to_int()
+      let yv = (m.channel_norm(y_channel) * 100.0).round().to_int()
+      Some(view::said(
+        view::Role::Slider,
+        label=label(),
+        value="\{xv}%, \{yv}%",
+        range=(0.0, xv.to_double(), 100.0),
+      ))
+    }))
+    .gesture(
+      0.0,
+      press=fn(d : view::Drag) {
+        if able() {
+          let _ = v.ask_focus(visible=false)
+          update_from_point(d.wx, d.wy)
+        }
+      },
+      drag=fn(d : view::Drag) {
+        if able() && d.kind == view::DragIs::Moved {
+          update_from_point(d.wx, d.wy)
+        }
+      },
+    )
+    .on_key(fn(k : view::Key) -> Bool {
+      if !able() || !v.focused() || (k.mods != 0 && k.mods != shift_mod) {
+        return false
+      }
+      let large = k.mods == shift_mod
+      let cur = signals::untracked(model)
+      let next = if k.code == grid_key_right {
+        cur.step_channel(x_channel, 1, large=large)
+      } else if k.code == grid_key_left {
+        cur.step_channel(x_channel, -1, large=large)
+      } else if k.code == group_key_up {
+        cur.step_channel(y_channel, 1, large=large)
+      } else if k.code == group_key_down {
+        cur.step_channel(y_channel, -1, large=large)
+      } else {
+        return false
+      }
+      if next != cur {
+        on_change(next)
+      }
+      true
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Handle for a 1D `ColorSlider` editing a single `ColorChannel`.
+pub struct ColorSlider {
+  node : view::View
+  channel : headless_core::ColorChannel
+  model_ : () -> headless_core::ColorModel
+  on_change : (headless_core::ColorModel) -> Unit
+  vertical : Bool
+  off : () -> Bool
+}
+
+pub fn ColorSlider::node(self : ColorSlider) -> view::View {
+  self.node
+}
+
+pub fn ColorSlider::norm(self : ColorSlider) -> Double {
+  (self.model_)().channel_norm(self.channel)
+}
+
+pub fn ColorSlider::value(self : ColorSlider) -> Double {
+  (self.model_)().channel(self.channel)
+}
+
+pub fn ColorSlider::disabled(self : ColorSlider) -> Bool {
+  (self.off)()
+}
+
+/// Mount a single-channel headless `ColorSlider` (`Role::Slider`).
+pub fn color_slider(
+  parent : view::View,
+  label : () -> String,
+  channel : headless_core::ColorChannel,
+  model : () -> headless_core::ColorModel,
+  on_change : (headless_core::ColorModel) -> Unit,
+  look : (view::View, ColorSlider) -> Unit,
+  vertical~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let cs = ColorSlider::{ node: v, channel, model_: model, on_change, vertical, off: disabled }
+    let able = fn() -> Bool { !disabled() }
+    let update_from_point = fn(wx : Double, wy : Double) {
+      let (rx, ry, rw, rh) = v.rect()
+      let t = if vertical {
+        if rh <= 0.0 { return }
+        dmath::clamp(1.0 - (wy - ry) / rh, 0.0, 1.0)
+      } else {
+        if rw <= 0.0 { return }
+        dmath::clamp((wx - rx) / rw, 0.0, 1.0)
+      }
+      let cur = signals::untracked(model)
+      let next = cur.with_channel_norm(channel, t)
+      if next != cur {
+        on_change(next)
+      }
+    }
+    look(v, cs)
+    let _ = v
+    .presses(view::Live::By(able))
+    .focusable(view::Live::By(able), keys=0)
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      let (lo, hi, _) = headless_core::color_channel_range(channel)
+      let cur = model().channel(channel)
+      Some(view::said(
+        view::Role::Slider,
+        label=label(),
+        value="\{cur.round().to_int()}",
+        range=(lo, cur, hi),
+        actions=if disabled() { [] } else { [view::Action::Increment, view::Action::Decrement] },
+      ))
+    }))
+    .on_step(fn(by : Int) {
+      if able() {
+        let cur = signals::untracked(model)
+        let next = cur.step_channel(channel, by)
+        if next != cur {
+          on_change(next)
+        }
+      }
+    })
+    .gesture(
+      0.0,
+      press=fn(d : view::Drag) {
+        if able() {
+          let _ = v.ask_focus(visible=false)
+          update_from_point(d.wx, d.wy)
+        }
+      },
+      drag=fn(d : view::Drag) {
+        if able() && d.kind == view::DragIs::Moved {
+          update_from_point(d.wx, d.wy)
+        }
+      },
+    )
+    .on_key(fn(k : view::Key) -> Bool {
+      if !able() || !v.focused() || (k.mods != 0 && k.mods != shift_mod) {
+        return false
+      }
+      let large = k.mods == shift_mod
+      let cur = signals::untracked(model)
+      let (lo, hi, _) = headless_core::color_channel_range(channel)
+      let next = if k.code == grid_key_right || k.code == group_key_up {
+        cur.step_channel(channel, 1, large=large)
+      } else if k.code == grid_key_left || k.code == group_key_down {
+        cur.step_channel(channel, -1, large=large)
+      } else if k.code == group_key_home {
+        cur.with_channel(channel, lo)
+      } else if k.code == group_key_end {
+        cur.with_channel(channel, hi)
+      } else {
+        return false
+      }
+      if next != cur {
+        on_change(next)
+      }
+      true
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// 2D grid roving color swatch picker controller.
+pub struct ColorSwatchPicker {
+  node : view::View
+  columns : Int
+  off : () -> Bool
+  selected_ : () -> Option[String]
+  on_select : (String) -> Unit
+  swatches : Array[(String, view::View, () -> Bool)]
+  focus_idx : signals::Signal[Int]
+}
+
+pub fn ColorSwatchPicker::node(self : ColorSwatchPicker) -> view::View {
+  self.node
+}
+
+/// Mount a headless 2D grid `ColorSwatchPicker` (`Role::Listbox` with 2D arrow roving).
+pub fn color_swatch_picker(
+  parent : view::View,
+  label : () -> String,
+  selected : () -> Option[String],
+  on_select : (String) -> Unit,
+  look : (view::View, ColorSwatchPicker) -> Unit,
+  columns~ : Int = 6,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let cols = if columns < 1 { 1 } else { columns }
+  let setup = fn(v : view::View) {
+    let sp = ColorSwatchPicker::{
+      node: v,
+      columns: cols,
+      off: disabled,
+      selected_: selected,
+      on_select,
+      swatches: [],
+      focus_idx: signals::signal(0),
+    }
+    look(v, sp)
+    let _ = v
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Listbox, label=label()))
+    }))
+    .on_key(fn(k : view::Key) -> Bool {
+      if disabled() || k.mods != 0 || !focus_in(v, false) {
+        return false
+      }
+      let n = sp.swatches.length()
+      if n == 0 {
+        return false
+      }
+      let mut cur = -1
+      let mut i = 0
+      while i < n {
+        if sp.swatches[i].1.focused() {
+          cur = i
+          break
+        }
+        i += 1
+      }
+      if cur < 0 {
+        return false
+      }
+      let next = if k.code == grid_key_right {
+        if cur + 1 < n { cur + 1 } else { cur }
+      } else if k.code == grid_key_left {
+        if cur > 0 { cur - 1 } else { cur }
+      } else if k.code == group_key_down {
+        if cur + cols < n { cur + cols } else { cur }
+      } else if k.code == group_key_up {
+        if cur - cols >= 0 { cur - cols } else { cur }
+      } else if k.code == group_key_home {
+        0
+      } else if k.code == group_key_end {
+        n - 1
+      } else {
+        return false
+      }
+      if next != cur && !(sp.swatches[next].2)() && sp.swatches[next].1.alive() {
+        sp.focus_idx.set(next)
+        let _ = sp.swatches[next].1.ask_focus(visible=true)
+      }
+      true
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount one swatch (`Role::Option`) in `ColorSwatchPicker`.
+pub fn ColorSwatchPicker::swatch(
+  self : ColorSwatchPicker,
+  parent : view::View,
+  hex : String,
+  label : () -> String,
+  look : (view::View, () -> Bool) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let is_sel = fn() -> Bool {
+      match (self.selected_)() {
+        Some(s) => s == hex
+        None => false
+      }
+    }
+    let idx = self.swatches.length()
+    self.swatches.push((hex, v, off))
+    let _ = v.owns(fn() {
+      view::array_retain(self.swatches, fn(e : (String, view::View, () -> Bool)) -> Bool { e.1.id() != v.id() })
+    })
+    look(v, is_sel)
+    let _ = v
+    .presses(view::Live::By(able))
+    .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space, tab=false)
+    .tab_stop(view::Live::By(fn() -> Bool { self.focus_idx.get() == idx }))
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Option, label=label(), selected=is_sel()))
+    }))
+    .on_press(fn() {
+      if able() {
+        self.focus_idx.set(idx)
+        (self.on_select)(hex)
+      }
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

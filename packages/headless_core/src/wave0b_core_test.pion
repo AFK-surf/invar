@@ -1,0 +1,125 @@
+// Wave 0B headless_core unit tests: TableGridState, pagination_items, ColorModel, and ISO Calendar/SegmentedDateTime.
+
+import "color"
+import "dmath"
+
+fn w0bc_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+test "w0b-core-01 TableGridState 2D focus, sort, shift-range selection, resize, and sort-safe key preservation" {
+  let st = TableGridState::new(selection_mode=TableSelectionMode::Multiple)
+  let rows = ["r1", "r2", "r3", "r4"]
+  let cols = ["name", "age", "role"]
+
+  // 2D focus movement
+  match st.move_focus(rows, cols, 0, 0) {
+    Some((r, c)) => w0bc_assert(r == "r1" && c == "name", "initial focus r1/name")
+    None => panic("expected focus")
+  }
+  match st.move_focus(rows, cols, 1, 2) {
+    Some((r, c)) => w0bc_assert(r == "r2" && c == "role", "move down 1 right 2")
+    None => panic("expected focus")
+  }
+  w0bc_assert(st.is_focused_cell("r2", "role"), "focused cell is r2/role")
+
+  // Multi-select + shift-range
+  w0bc_assert(st.select_row(rows, "r2"), "select r2")
+  w0bc_assert(st.select_row(rows, "r4", shift_range=true), "shift-select r2..r4")
+  w0bc_assert(st.is_selected("r2") && st.is_selected("r3") && st.is_selected("r4") && !st.is_selected("r1"), "r2..r4 selected")
+
+  // Sort toggle + reorder rows -> selection & focus MUST stay on stable keys!
+  w0bc_assert(st.toggle_sort("age") == SortDir::Ascending, "first sort is Ascending")
+  match sort_dir_aria(st.sort_of("age")) {
+    Some(s) => w0bc_assert(s == "ascending", "aria-sort ascending")
+    None => panic("expected ascending")
+  }
+  let sorted_rows = ["r4", "r1", "r3", "r2"]
+  st.reconcile(sorted_rows, cols)
+  w0bc_assert(st.is_focused_cell("r2", "role"), "focus stays on stable key r2/role after sort")
+  w0bc_assert(st.is_selected("r2") && st.is_selected("r3") && st.is_selected("r4") && !st.is_selected("r1"), "selected row keys preserved after sort")
+
+  // Column resize clamping
+  w0bc_assert(st.resize_column("name", 20.0, min_w=50.0, max_w=400.0) == 50.0, "min width clamped")
+  w0bc_assert(st.resize_column("name", 240.0, min_w=50.0, max_w=400.0) == 240.0, "valid width stored")
+  w0bc_assert(st.column_width("name") == 240.0, "stored column width returned")
+}
+
+test "w0b-core-02 pagination_items ellipsis collapsing across start, middle, and end" {
+  let short = pagination_items(5, 3)
+  w0bc_assert(short.length() == 5 && short[0] == PageToken::Page(1) && short[4] == PageToken::Page(5), "no ellipsis for small total")
+
+  let start = pagination_items(20, 2, siblings=1, boundaries=1)
+  w0bc_assert(start.length() == 7, "start page 2 has 7 tokens")
+  w0bc_assert(start[5] == PageToken::Ellipsis && start[6] == PageToken::Page(20), "right ellipsis only at start")
+
+  let mid = pagination_items(20, 10, siblings=1, boundaries=1)
+  w0bc_assert(mid.length() == 7, "middle page 10 has 7 tokens")
+  w0bc_assert(mid[0] == PageToken::Page(1) && mid[1] == PageToken::Ellipsis, "left ellipsis in middle")
+  w0bc_assert(mid[2] == PageToken::Page(9) && mid[3] == PageToken::Page(10) && mid[4] == PageToken::Page(11), "siblings around 10")
+  w0bc_assert(mid[5] == PageToken::Ellipsis && mid[6] == PageToken::Page(20), "right ellipsis in middle")
+
+  let end = pagination_items(20, 19, siblings=1, boundaries=1)
+  w0bc_assert(end[0] == PageToken::Page(1) && end[1] == PageToken::Ellipsis && end[6] == PageToken::Page(20), "left ellipsis only at end")
+}
+
+test "w0b-core-03 ColorModel HSVA/HSLA/RGBA/OKLCH/Hex roundtrips and hue preservation" {
+  let c = ColorModel::from_hsva(210.0, 0.8, 0.9, alpha=0.75)
+  let srgb = c.to_srgba()
+  let back = ColorModel::from_srgba(srgb)
+  w0bc_assert(dmath::abs(back.h - 210.0) < 0.01 && dmath::abs(back.s - 0.8) < 0.01 && dmath::abs(back.v - 0.9) < 0.01, "HSVA->sRGBA->HSVA roundtrip")
+
+  let (hh, hs, hl, ha) = c.to_hsla()
+  let from_hsl = ColorModel::from_hsla(hh, hs, hl, alpha=ha)
+  w0bc_assert(dmath::abs(from_hsl.s - c.s) < 0.01 && dmath::abs(from_hsl.v - c.v) < 0.01, "HSLA roundtrip")
+
+  // Hue preserved when saturation drops to 0
+  let gray = c.with_channel(ColorChannel::Saturation, 0.0)
+  w0bc_assert(dmath::abs(gray.h - 210.0) < 0.001, "hue preserved at zero saturation")
+
+  // RGB channel editing & hex parse/format
+  let hex_c = match color_parse_hex("#3366CC") {
+    Some(m) => m
+    None => panic("failed to parse hex")
+  }
+  w0bc_assert(hex_c.to_hex() == "#3366CC", "hex roundtrip")
+  let ok = hex_c.to_oklch()
+  w0bc_assert(ok.l > 0.4 && ok.l < 0.6 && ok.c > 0.1, "packages/color OKLCH conversion works")
+  let _ : color::Srgba = hex_c.to_srgba()
+}
+
+test "w0b-core-04 ISO calendar leap years, month grid, range normalization, and segmented datetime" {
+  w0bc_assert(iso_is_leap_year(2024) && !iso_is_leap_year(2023) && !iso_is_leap_year(1900) && iso_is_leap_year(2000), "leap year rules")
+  w0bc_assert(iso_days_in_month(2024, 2) == 29 && iso_days_in_month(2025, 2) == 28, "Feb days")
+
+  // 2024-02-29 + 1 year -> 2025-02-28
+  let leap = IsoDate::new(2024, 2, 29)
+  w0bc_assert(iso_add_years(leap, 1) == IsoDate::new(2025, 2, 28), "leap day clamped +1y")
+  w0bc_assert(iso_day_of_week(IsoDate::new(2026, 11, 24)) == 2, "2026-11-24 is Tuesday (2)")
+
+  // Month grid has 42 cells starting on Monday (1)
+  let grid = calendar_month_grid(2026, 11, first_day_of_week=1)
+  w0bc_assert(grid.length() == 42, "42 cells in 6-week grid")
+  w0bc_assert(iso_day_of_week(grid[0].date) == 1, "grid starts on Monday when first_day_of_week=1")
+
+  // Range normalization
+  let (rs, re) = calendar_normalize_range(IsoDate::new(2026, 11, 20), IsoDate::new(2026, 11, 10))
+  w0bc_assert(rs == IsoDate::new(2026, 11, 10) && re == IsoDate::new(2026, 11, 20), "range normalized")
+
+  // Year page
+  let yrs = calendar_year_page(2026, page_size=12)
+  w0bc_assert(yrs.length() == 12 && yrs[0] == 2016 && yrs[11] == 2027, "year page 2016..2027")
+
+  // SegmentedDateTime: empty placeholder -> step -> 12h cycle -> clear
+  let empty = SegmentedDateTime::empty()
+  w0bc_assert(empty.segment_text(DateSegmentKind::Year) == "yyyy", "empty year placeholder")
+  w0bc_assert(empty.segment_text(DateSegmentKind::Hour) == "--", "empty hour placeholder")
+  let s1 = empty.step_segment(DateSegmentKind::Hour, 1, hour_cycle_12=true)
+  w0bc_assert(s1.segment_text(DateSegmentKind::Hour, hour_cycle_12=true) == "12", "12h initial step")
+  let s2 = s1.step_segment(DateSegmentKind::DayPeriod, 1, hour_cycle_12=true)
+  w0bc_assert(s2.segment_text(DateSegmentKind::DayPeriod, hour_cycle_12=true) == "AM", "12h AM/PM toggle")
+  let s3 = s2.clear_segment(DateSegmentKind::Hour)
+  w0bc_assert(s3.hour is None, "clear segment resets to None")
+}

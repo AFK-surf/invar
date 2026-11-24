@@ -1,0 +1,194 @@
+// Headless TagGroup: single/multi selection, horizontal roving focus,
+// and Backspace/Delete removal that deterministically lands focus on the adjacent surviving tag.
+
+import "headless_core"
+import "view"
+
+struct TagEntry[K] {
+  key : K
+  node : view::View
+  off : () -> Bool
+}
+
+/// Headless tag group controller.
+pub struct TagGroup[K] {
+  node : view::View
+  multiple : Bool
+  off : () -> Bool
+  is_selected : (K) -> Bool
+  on_select : Option[(K) -> Unit]
+  on_remove : Option[(K) -> Unit]
+  roving : RovingFocus
+  entries : Array[TagEntry[K]]
+}
+
+pub fn TagGroup::node[K](self : TagGroup[K]) -> view::View {
+  self.node
+}
+
+pub fn TagGroup::disabled[K](self : TagGroup[K]) -> Bool {
+  (self.off)()
+}
+
+pub fn TagGroup::multiple[K](self : TagGroup[K]) -> Bool {
+  self.multiple
+}
+
+fn TagGroup::adjacent_of[K](self : TagGroup[K], target_id : view::NodeId) -> Option[view::View] {
+  let n = self.entries.length()
+  let mut pos = -1
+  let mut i = 0
+  while i < n {
+    if self.entries[i].node.id() == target_id {
+      pos = i
+      break
+    }
+    i += 1
+  }
+  if pos < 0 {
+    return None
+  }
+  let ok = fn(e : TagEntry[K]) -> Bool {
+    e.node.id() != target_id && e.node.alive() && !e.node.leaving() && e.node.takes_input() && !(e.off)()
+  }
+  // Prefer next surviving tag; fall back to previous surviving tag
+  let mut fwd = pos + 1
+  while fwd < n {
+    if ok(self.entries[fwd]) {
+      return Some(self.entries[fwd].node)
+    }
+    fwd += 1
+  }
+  let mut bwd = pos - 1
+  while bwd >= 0 {
+    if ok(self.entries[bwd]) {
+      return Some(self.entries[bwd].node)
+    }
+    bwd -= 1
+  }
+  None
+}
+
+/// Remove tag `key` associated with `tag_node` and transfer keyboard focus to its adjacent surviving tag.
+pub fn TagGroup::remove_tag[K](self : TagGroup[K], key : K, tag_node : view::View) -> Bool {
+  if (self.off)() {
+    return false
+  }
+  match self.on_remove {
+    Some(f) => {
+      let neighbor = self.adjacent_of(tag_node.id())
+      f(key)
+      match neighbor {
+        Some(nv) => if nv.alive() { let _ = nv.ask_focus(visible=true) }
+        None => ()
+      }
+      true
+    }
+    None => false
+  }
+}
+
+/// Mount a headless `TagGroup` (`Role::Listbox` with `multiselectable`) in `parent`.
+pub fn tag_group[K](
+  parent : view::View,
+  label : () -> String,
+  look : (view::View, TagGroup[K]) -> Unit,
+  is_selected? : (K) -> Bool,
+  on_select? : (K) -> Unit,
+  on_remove? : (K) -> Unit,
+  multiple~ : Bool = false,
+  wraps~ : Bool = false,
+  rtl~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let is_sel_fn : (K) -> Bool = match is_selected {
+    Some(f) => f
+    None => fn(_k : K) -> Bool { false }
+  }
+  let setup = fn(v : view::View) {
+    let tg = TagGroup::{
+      node: v,
+      multiple,
+      off: disabled,
+      is_selected: is_sel_fn,
+      on_select,
+      on_remove,
+      roving: RovingFocus::new(axis=GroupAxis::Horizontal, roving=true, wraps=wraps, rtl=rtl),
+      entries: [],
+    }
+    look(v, tg)
+    let _ = v
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Listbox, label=label(), multiselectable=multiple))
+    }))
+    .on_key(fn(k : view::Key) -> Bool {
+      if disabled() || k.mods != 0 || !focus_in(v, false) {
+        return false
+      }
+      tg.roving.step(k.code) is Some(_)
+    })
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount one tag (`Role::Option`) in `TagGroup`: Space/Enter selects, Backspace/Delete removes and focuses neighbor.
+pub fn TagGroup::tag[K](
+  self : TagGroup[K],
+  parent : view::View,
+  key : K,
+  label : () -> String,
+  look : (view::View, () -> Bool, () -> Bool) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    let off = fn() -> Bool { (self.off)() || disabled() }
+    let able = fn() -> Bool { !off() }
+    let sel = fn() -> Bool { (self.is_selected)(key) }
+    self.entries.push(TagEntry::{ key, node: v, off })
+    let _ = v.owns(fn() {
+      view::array_retain(self.entries, fn(e : TagEntry[K]) -> Bool { e.node.id() != v.id() })
+    })
+    look(v, sel, off)
+    let _ = v
+    .presses(view::Live::By(able))
+    .focusable(view::Live::By(able), keys=view::focus_enter | view::focus_space, tab=false)
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      Some(view::said(view::Role::Option, label=label(), selected=sel()))
+    }))
+    .on_press(fn() {
+      if able() {
+        match self.on_select {
+          Some(f) => f(key)
+          None => ()
+        }
+      }
+    })
+    .on_key(fn(k : view::Key) -> Bool {
+      if !able() || k.mods != 0 || !v.focused() {
+        return false
+      }
+      if k.code == headless_core::key_backspace || k.code == headless_core::key_delete {
+        return self.remove_tag(key, v)
+      }
+      false
+    })
+    self.roving.add(v, off=off, first=sel)
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}

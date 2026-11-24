@@ -24,6 +24,101 @@ pub fn number_parse(raw : String) -> Option[Double] {
   headless_core::number_parse(raw)
 }
 
+fn strip_ascii_char(s : String, target : Int) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c != target {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn format_grouped_int(digits : String) -> String {
+  let n = digits.length()
+  if n <= 3 {
+    return digits
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < n {
+    if i > 0 && (n - i) % 3 == 0 {
+      sb.write_char(',')
+    }
+    sb.write_char(digits.code_unit_at(i).unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+/// Format a number with thousands grouping commas and fixed `precision` decimal places.
+pub fn number_format_grouped(x : Double, precision : Int) -> String {
+  let plain = number_format(x, precision)
+  let neg = plain.length() > 0 && plain.code_unit_at(0) == 45
+  let body = if neg { view::str_slice_from(plain, 1) } else { plain }
+  let mut dot = -1
+  let mut i = 0
+  while i < body.length() {
+    if body.code_unit_at(i) == 46 {
+      dot = i
+      break
+    }
+    i += 1
+  }
+  let int_part = if dot >= 0 { view::str_slice_to(body, dot) } else { body }
+  let frac_part = if dot >= 0 { view::str_slice_from(body, dot) } else { "" }
+  let grouped = format_grouped_int(int_part)
+  if neg { "-\{grouped}\{frac_part}" } else { "\{grouped}\{frac_part}" }
+}
+
+/// Parse a grouped decimal string (stripping `,` separators and whitespace).
+pub fn number_parse_grouped(raw : String) -> Option[Double] {
+  number_parse(strip_ascii_char(str_trim(raw), 44))
+}
+
+/// Format a fractional value `x` as a percentage (`0.25` -> `"25%"`).
+pub fn number_format_percent(x : Double, precision : Int) -> String {
+  "\{number_format_grouped(x * 100.0, precision)}%"
+}
+
+/// Parse a percentage string (`"25%"` -> `Some(0.25)`, `"25"` -> `Some(0.25)`).
+pub fn number_parse_percent(raw : String) -> Option[Double] {
+  let trimmed = str_trim(raw)
+  let cleaned = strip_ascii_char(strip_ascii_char(trimmed, 37), 44)
+  match number_parse(cleaned) {
+    Some(v) => Some(v / 100.0)
+    None => None
+  }
+}
+
+/// Format a currency value with `symbol` prefix and thousands grouping (`1234.5` -> `"$1,234.50"`).
+pub fn number_format_currency(x : Double, symbol : String, precision : Int) -> String {
+  let neg = x < 0.0
+  let mag = if neg { -x } else { x }
+  let formatted = number_format_grouped(mag, precision)
+  if neg { "-\{symbol}\{formatted}" } else { "\{symbol}\{formatted}" }
+}
+
+/// Parse a currency string (stripping optional leading/trailing `symbol` and `,` separators).
+pub fn number_parse_currency(raw : String, symbol : String) -> Option[Double] {
+  let mut s = str_trim(raw)
+  let neg = s.length() > 0 && s.code_unit_at(0) == 45
+  if neg {
+    s = str_trim(view::str_slice_from(s, 1))
+  }
+  if symbol.length() > 0 && str_has_prefix(s, symbol) {
+    s = str_trim(view::str_slice_from(s, symbol.length()))
+  }
+  let cleaned = strip_ascii_char(s, 44)
+  match number_parse(cleaned) {
+    Some(v) => Some(if neg { -v } else { v })
+    None => None
+  }
+}
+
 /// Headless numeric stepper input controller.
 pub struct NumberInput {
   label_ : () -> String
@@ -34,6 +129,8 @@ pub struct NumberInput {
   step : Double
   large_step : Double
   precision : Int
+  format_fn : (Double) -> String
+  parse_fn : (String) -> Option[Double]
   off : () -> Bool
   ro : () -> Bool
   repeat_delay_ms : Double
@@ -45,7 +142,7 @@ pub fn NumberInput::value(self : NumberInput) -> Double {
 }
 
 pub fn NumberInput::formatted(self : NumberInput) -> String {
-  number_format(self.value(), self.precision)
+  (self.format_fn)(self.value())
 }
 
 pub fn NumberInput::disabled(self : NumberInput) -> Bool {
@@ -101,7 +198,7 @@ pub fn NumberInput::commit_text(self : NumberInput, raw : String) -> Bool {
   if signals::untracked(self.off) || signals::untracked(self.ro) {
     return false
   }
-  match number_parse(raw) {
+  match (self.parse_fn)(raw) {
     Some(v) => {
       let next = number_round(num_clamp(v, self.min, self.max), self.precision)
       let cur = number_round(num_clamp(signals::untracked(self.now), self.min, self.max), self.precision)
@@ -126,6 +223,8 @@ pub fn number_input(
   step~ : Double = 1.0,
   large_step~ : Double = 10.0,
   precision~ : Int = 0,
+  format? : (Double) -> String,
+  parse? : (String) -> Option[Double],
   disabled~ : () -> Bool = fn() { false },
   read_only~ : () -> Bool = fn() { false },
   repeat_delay_ms~ : Double = 400.0,
@@ -137,6 +236,14 @@ pub fn number_input(
   let hi = if min <= max { max } else { min }
   let st = if step > 0.0 { step } else { 1.0 }
   let lst = if large_step > 0.0 { large_step } else { st * 10.0 }
+  let fmt_fn : (Double) -> String = match format {
+    Some(f) => f
+    None => fn(v : Double) -> String { number_format(v, precision) }
+  }
+  let parse_fn : (String) -> Option[Double] = match parse {
+    Some(p) => p
+    None => number_parse
+  }
   let ni = NumberInput::{
     label_: label,
     now: value,
@@ -146,6 +253,8 @@ pub fn number_input(
     step: st,
     large_step: lst,
     precision,
+    format_fn: fmt_fn,
+    parse_fn,
     off: disabled,
     ro: read_only,
     repeat_delay_ms,
@@ -314,4 +423,54 @@ pub fn NumberInput::decrement_button(
     disabled=off,
   )
   v
+}
+
+/// Attach a horizontal scrub-to-step handle (e.g. a label) reusing `headless_core::ScrubStepper`.
+pub fn NumberInput::scrub_handle(
+  self : NumberInput,
+  parent : view::View,
+  look : (view::View, headless_core::ScrubStepper) -> Unit,
+  step_px~ : Double = 10.0,
+  deadzone_px~ : Double = 4.0,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let stepper = headless_core::ScrubStepper::new(step_px=step_px, deadzone_px=deadzone_px)
+  let setup = fn(v : view::View) {
+    let able = fn() -> Bool { !(self.off)() && !(self.ro)() }
+    look(v, stepper)
+    let _ = v
+      .presses(view::Live::By(able))
+      .gesture(
+        0.0,
+        press=fn(d : view::Drag) {
+          if able() {
+            stepper.on_down(d.wx)
+          }
+        },
+        drag=fn(d : view::Drag) {
+          if !able() {
+            stepper.reset()
+            return
+          }
+          match d.kind {
+            view::DragIs::Moved => {
+              let steps = stepper.on_move(d.wx)
+              if steps != 0 {
+                self.step_by(steps.to_double() * self.step)
+              }
+            }
+            view::DragIs::Up | view::DragIs::Off => stepper.on_up()
+            _ => ()
+          }
+        },
+      )
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
 }

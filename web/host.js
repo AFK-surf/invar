@@ -531,10 +531,10 @@
       a_fadex.w > 0.0 ? (a_fadex.z - cq.x) / a_fadex.w : 2.0, a_fade.w > 0.0 ? (a_fade.z - cq.y) / a_fade.w : 2.0);
   }`;
   const CORNERS = `
-  // corner.sl begin (scripts/chk corner-sl: not edited here)
+  // corner.sl begin (scripts/sync_corner_sl.py: not edited here)
   #define float2 vec2
   #define float4 vec4
-  // smooth.mbt's corners for the renderers; scripts/chk corner-sl makes corner_sl.h and web/host.js from it.
+  // smooth.mbt's corners for the renderers; scripts/sync_corner_sl.py makes corner_sl.h and web/host.js from it.
   //
   // How smooth a corner of radius r is where room is half its box's shorter side: 0 a circle's or a capsule's end, 1
   // superellipse(1.5) over r a quarter longer; between, as far as the room goes.
@@ -642,6 +642,12 @@
   // few points high sharing a frame's corner is cut by the frame's very curve, not by one flattened to its half height.
   // Each corner against its own corner point; the rect's edges straight.
   float mb_clip_corner(float2 p, float2 k, float2 inward, float2 hs, float r, float s, float band) {
+    if (s < -0.5) {
+      float2 hv = max(hs, float2(r, r));
+      float2 cp = max(hv - (p - k) * inward, float2(0.0, 0.0));
+      float2 q = abs(cp) - hv + r;
+      return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+    }
     float R = r * (1.0 + 0.25 * s);
     float2 hv = max(hs, float2(R, R));
     return mb_sd_corner(max(hv - (p - k) * inward, float2(0.0, 0.0)), hv, r, s, band);
@@ -656,8 +662,13 @@
     if (r.w > 0.0) d = max(d, mb_clip_corner(p, c.xw, float2(1.0, -1.0), hs, r.w, s.w, band));
     return d;
   }
-  // A box's own corners: r at most its shorter half, as smooth as its size has room for (band: mb_sd_corner's).
+  // A box's own corners: r >= 0 continuous superellipse/capsule; r < 0 exact CSS circular arc of radius |r|.
   float mb_sd_box(float2 p, float2 hs, float r, float band) {
+    if (r < 0.0) {
+      float rr = min(-r, min(hs.x, hs.y));
+      float2 q = abs(p) - hs + rr;
+      return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr;
+    }
     float room = min(hs.x, hs.y);
     float rr = min(r, room);
     return mb_sd_corner(p, hs, rr, mb_smoothness(rr, room), band);
@@ -680,7 +691,7 @@
     return 0.5 * (mb_erf((x + curved) * k) - mb_erf((x - curved) * k));
   }
   float mb_shadow(float2 p, float2 hs, float r, float sigma) {
-    float rr = min(r, min(hs.x, hs.y));
+    float rr = min(abs(r), min(hs.x, hs.y));
     float lo = clamp(-3.0 * sigma, p.y - hs.y, p.y + hs.y);
     float hi = clamp(3.0 * sigma, p.y - hs.y, p.y + hs.y);
     float st = (hi - lo) / 4.0;
@@ -786,11 +797,12 @@
   // Skip the distance and search entirely along the straight parts of the edges and in the middle of the picture.
   bool mb_contained_corner(float2 p, float4 c, float4 r, float pad) {
     // A capsule's easing can reach two radii along its long edge.
-    float4 R = r * 2.5 + float4(pad, pad, pad, pad);
-    return (r.x > 0.0 && p.x < c.x + R.x && p.y < c.y + R.x) ||
-           (r.y > 0.0 && p.x > c.z - R.y && p.y < c.y + R.y) ||
-           (r.z > 0.0 && p.x > c.z - R.z && p.y > c.w - R.z) ||
-           (r.w > 0.0 && p.x < c.x + R.w && p.y > c.w - R.w);
+    float4 ar = abs(r);
+    float4 R = ar * 2.5 + float4(pad, pad, pad, pad);
+    return (ar.x > 0.0 && p.x < c.x + R.x && p.y < c.y + R.x) ||
+           (ar.y > 0.0 && p.x > c.z - R.y && p.y < c.y + R.y) ||
+           (ar.z > 0.0 && p.x > c.z - R.z && p.y > c.w - R.z) ||
+           (ar.w > 0.0 && p.x < c.x + R.w && p.y > c.w - R.w);
   }
   float2 mb_contained_point(float2 p, float4 box, float4 rr, float4 clip, float4 rc, float4 rs,
                             float4 outer, float4 orc, float4 ors, float pixel) {
@@ -1163,7 +1175,7 @@
   void shade(vec2 p, float fade_r) {
     int kind = ONE_KIND == 13 ? 6 : (ONE_KIND >= 0 ? ONE_KIND : int(v_p.y + 0.5));
     #if ONE_KIND < 0
-    if (kind == 9) { vec2 hh = v_rect.zw * 0.5; float rr = min(mb_corner_of(p - v_rect.xy - hh, v_rr), min(hh.x, hh.y)); vec2 q = abs(p - v_rect.xy - hh) - hh + rr; if (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr > 0.0) discard; o = vec4(0.0); return; }
+    if (kind == 9) { vec2 hh = v_rect.zw * 0.5; float rr = min(abs(mb_corner_of(p - v_rect.xy - hh, v_rr)), min(hh.x, hh.y)); vec2 q = abs(p - v_rect.xy - hh) - hh + rr; if (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr > 0.0) discard; o = vec4(0.0); return; }
     #endif
     vec4 col = v_color;
     #if ONE_KIND < 0 || ONE_KIND == 11
@@ -1181,6 +1193,9 @@
         for (int i = first; i < first + n; i++) { int t = (i / 6) * 15 + mb_seg_slot(i); w += mb_path_rows(texelFetch(u_segs, ivec2(t % 2040, t / 2040), 0), v_rect, p, u_scale); }
         a = mb_path_cover(w, v_c2.z);
       }
+      float ly = p.y - v_rect.y;
+      if (v_rr.y > 0.0) a *= clamp((ly - v_rr.x) / v_rr.y, 0.0, 1.0);
+      if (v_rr.w > 0.0) a *= clamp((v_rr.z - ly) / v_rr.w, 0.0, 1.0);
       if (v_pad.w > 0.0) col.rgb = mb_adaptive_ink_at(col.rgb, v_pad.yz, v_pad.w * 0.5, v_rect);
       o = vec4(col.rgb, 1.0) * col.a * a;
       return;
@@ -1237,7 +1252,7 @@
       // Copyright 2025, Tim Lehmann for whynotmake.it. Adapted from flutter_liquid_glass
       // liquid_glass_final_render_core.glsl, Apache-2.0.
       float k = v_pad.w;
-      vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);
+      vec4 s_rr = max(max(abs(v_rr.x), abs(v_rr.y)), max(abs(v_rr.z), abs(v_rr.w))) > 0.0 ? v_rr : vec4(v_p.x);
       float d;
       float halfMinor = 1e9;
       #if ONE_KIND == 13
@@ -1855,7 +1870,7 @@
     #endif
     #if ONE_KIND < 0 || ONE_KIND == 8
     if (kind == 8) {
-      vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);
+      vec4 s_rr = max(max(abs(v_rr.x), abs(v_rr.y)), max(abs(v_rr.z), abs(v_rr.w))) > 0.0 ? v_rr : vec4(v_p.x);
       float d = sd_rr(p, v_rect, s_rr);
       float materialAlpha = clamp(0.5 - d * u_scale, 0.0, 1.0);
       if (materialAlpha < 0.005) discard;
@@ -1915,7 +1930,7 @@
         float pd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
         pic *= v_pad.w * clamp(0.5 - pd * u_scale, 0.0, 1.0);
         pic += vec4(col.rgb * v_pad.y, v_pad.y) * (1.0 - pic.a);
-        if (v_pad.x < 0.5 && max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) <= 0.0 &&
+        if (v_pad.x < 0.5 && max(max(abs(v_rr.x), abs(v_rr.y)), max(abs(v_rr.z), abs(v_rr.w))) <= 0.0 &&
             max(max(v_rc.x, v_rc.y), max(v_rc.z, v_rc.w)) > 0.0 &&
             all(greaterThanEqual(v_clip.xy, v_rect.xy)) && all(lessThanEqual(v_clip.zw, v_rect.xy + v_rect.zw))) edge = 1.0;
       }
@@ -1927,10 +1942,14 @@
     if (kind == 2) {
       // as Core Animation's: the shape blurred, sigma its radius (corner.sl mb_shadow)
       float a = mb_shadow(p - c, hs, rad, max(v_p.w, 0.25));
-      // glass's: only outside its box (c2.y above it)
+      // glass's (and View::shadows'): only outside its box
       if (v_c2.x > 0.5) {
-        vec2 q = p - c + vec2(0.0, v_c2.y);
-        float db = mb_sd_box(q, hs, mb_corner_of(q, v_rr), band);
+        // (the box itself: (c2.z, c2.y) back from the shadow's, its spread c2.w smaller each side)
+        vec2 q = p - c + vec2(v_c2.z, v_c2.y);
+        vec2 hb = max(hs - vec2(v_c2.w, v_c2.w), vec2(0.0, 0.0));
+        float rb = mb_corner_of(q, v_rr);
+        rb = rb < 0.0 ? -max(-rb - v_c2.w, 0.0) : max(rb - v_c2.w, 0.0);
+        float db = mb_sd_box(q, hb, rb, band);
         a *= clamp(0.5 + db * u_scale, 0.0, 1.0);
       }
       o = vec4(col.rgb, 1.0) * col.a * a;
@@ -2470,8 +2489,9 @@
   // and kept in an LRU slot (GLASS_SLOTS) so frames with unchanged content under the glass reuse the blur with zero passes.
   let lv = null, lvW = 0, lvH = 0, bdTex = null;
   let lensLv = null, lensW = 0, lensH = 0, lensOx = 0, lensOy = 0, lensVpW = 0, lensVpH = 0, lensPh = 0;
-  const BLUR_LAYERS = 4;
-  let blTex = [null, null, null, null], blFb = [null, null, null, null], blW = 0, blH = 0;
+  const BLUR_LAYERS_INIT = 8;
+  const BLUR_LAYERS_MAX = 64;
+  let blTex = new Array(BLUR_LAYERS_INIT).fill(null), blFb = new Array(BLUR_LAYERS_INIT).fill(null), blW = 0, blH = 0;
   let blPy = null, blPyW = 0, blPyH = 0;
   let blCompVao = null, blCompBuf = null;
   const blComp = new Float32Array(INST);
@@ -2486,17 +2506,21 @@
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
   function ensureBlurLayer(depth, tw, th) {
+    if (depth < 0 || depth >= BLUR_LAYERS_MAX || tw <= 0 || th <= 0) return false;
     if (blW !== tw || blH !== th) {
       if (gl) {
-        for (let j = 0; j < BLUR_LAYERS; j++) {
+        for (let j = 0; j < blTex.length; j++) {
           if (blTex[j]) { gl.deleteTexture(blTex[j]); blTex[j] = null; }
           if (blFb[j]) { gl.deleteFramebuffer(blFb[j]); blFb[j] = null; }
         }
-      } else {
-        blTex = [null, null, null, null];
-        blFb = [null, null, null, null];
       }
+      blTex = new Array(BLUR_LAYERS_INIT).fill(null);
+      blFb = new Array(BLUR_LAYERS_INIT).fill(null);
       blW = tw; blH = th;
+    }
+    while (blTex.length <= depth) {
+      blTex.push(null);
+      blFb.push(null);
     }
     if (!blTex[depth]) {
       const t = gl.createTexture();
@@ -2512,6 +2536,7 @@
       blTex[depth] = t;
       blFb[depth] = fb;
     }
+    return true;
   }
   let glassSlots = makeGlassSlots(), glassSlotsClock = 0;
   let underNow = new Float32Array(INST * 256), underNowN = 0, underWhole = 0, underPicked = 0;
@@ -2741,7 +2766,7 @@
   function glassLost() {
     lv = null; lvW = 0; lvH = 0; bdTex = null;
     lensLv = null; lensW = 0; lensH = 0;
-    blTex = [null, null, null, null]; blFb = [null, null, null, null]; blW = 0; blH = 0;
+    blTex = new Array(BLUR_LAYERS_INIT).fill(null); blFb = new Array(BLUR_LAYERS_INIT).fill(null); blW = 0; blH = 0;
     blPy = null; blPyW = 0; blPyH = 0;
     for (let i = 0; i < GLASS_SLOTS; i++) {
       const s = glassSlots[i];
@@ -2755,7 +2780,7 @@
     if (lensLv && gl) for (const l of lensLv) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
     if (blPy && gl) for (const l of blPy) { gl.deleteTexture(l.t); gl.deleteFramebuffer(l.fb); }
     if (gl) {
-      for (let j = 0; j < BLUR_LAYERS; j++) {
+      for (let j = 0; j < blTex.length; j++) {
         if (blTex[j]) gl.deleteTexture(blTex[j]);
         if (blFb[j]) gl.deleteFramebuffer(blFb[j]);
       }
@@ -2903,7 +2928,7 @@
         bx0 = f32[b] - m; by0 = f32[b + 1] - m; bx1 = f32[b] + f32[b + 2] + m; by1 = f32[b + 1] + f32[b + 3] + m;
         if (mergedLiquid && mN < 8) {
           for (let k = 0; k < 4; k++) mShape[mN * 4 + k] = f32[b + k];
-          if (Math.max(f32[b + 36], f32[b + 37], f32[b + 38], f32[b + 39]) > 0) {
+          if (Math.max(Math.abs(f32[b + 36]), Math.abs(f32[b + 37]), Math.abs(f32[b + 38]), Math.abs(f32[b + 39])) > 0) {
             for (let k = 0; k < 4; k++) mRad[mN * 4 + k] = f32[b + 36 + k];
           } else {
             for (let k = 0; k < 4; k++) mRad[mN * 4 + k] = f32[b + 4];
@@ -3259,12 +3284,12 @@
       const tid = f32[i * INST + 20];
       if (i > 0 && tid !== f32[(i - 1) * INST + 20]) run = i;
       const k = Math.round(f32[i * INST + 5]);
-      if (k === 14) {
+      if (k === 14 || k === 16) {
         if (inBlur === 0) blurHit = reaches(i, run, dep);
         inBlur++;
       }
       const hit = blurHit || reaches(i, run, dep);
-      if (k === 15 && inBlur > 0) {
+      if ((k === 15 || k === 17) && inBlur > 0) {
         if (--inBlur === 0) blurHit = false;
       }
       if (!hit) continue;
@@ -3521,7 +3546,12 @@
     const room = Math.min(hw, hh);
     if (room <= inset) return false;
     for (let i = 0; i < 4; i++) {
-      const rr = Math.min(f32[a + 36 + i], room);
+      const raw = f32[a + 36 + i];
+      if (raw < 0) {
+        bandR[i] = Math.min(-raw, room) * scale;
+        continue;
+      }
+      const rr = Math.min(raw, room);
       if (rr <= 0) { bandR[i] = 0; continue; }
       if (room - rr < 0.25 * rr) return false;
       bandR[i] = Math.min(rr * 1.25, room) * scale;
@@ -3570,7 +3600,12 @@
     mbWhole(a, 0, scale, toX0, toY0, toX1, toY1);
     const hw = f32[a + 2] * 0.5, hh = f32[a + 3] * 0.5, room = Math.min(hw, hh);
     for (let i = 0; i < 4; i++) {
-      const rr = Math.min(f32[a + 36 + i], room);
+      const raw = f32[a + 36 + i];
+      if (raw < 0) {
+        bandR[i] = Math.min(-raw, room) * scale;
+        continue;
+      }
+      const rr = Math.min(raw, room);
       if (rr <= 0) { bandR[i] = 0; continue; }
       if (room - rr < 0.25 * rr) return -1;
       bandR[i] = Math.min(rr * 1.25, room) * scale;
@@ -3746,7 +3781,7 @@
       f32[b + 20] === 0 && f32[b + 21] === 0 && f32[b + 22] === 0 && f32[b + 23] === 0 &&
       f32[b + 24] <= 0 && f32[b + 25] <= 0 && f32[b + 26] <= 0 && f32[b + 27] <= 0 &&
       f32[b + 32] === 0 &&
-      f32[b + 36] <= 0 && f32[b + 37] <= 0 && f32[b + 38] <= 0 && f32[b + 39] <= 0 &&
+      f32[b + 4] === 0 && f32[b + 36] === 0 && f32[b + 37] === 0 && f32[b + 38] === 0 && f32[b + 39] === 0 &&
       f32[b + 44] <= 0 && f32[b + 45] <= 0 && f32[b + 46] <= 0 && f32[b + 47] <= 0 &&
       f32[b + 53] <= 0 && f32[b + 55] <= 0 && f32[b + 57] <= 0 && f32[b + 59] <= 0;
   }
@@ -4049,34 +4084,50 @@
     // (and per run of holes, kind 9: written transparent with no blending, where a native view shows)
     let start = 0, bound = 0, shows = false, levelsSized = false;
     const bstack = [];
-    let bover = 0;
+    let bover = 0, bskip = 0;
     const frameGlassClock = glassSlotsClock;
     while (start < n) {
       const tid = f32[start * INST + 20] | 0;
       const kind = Math.round(f32[start * INST + 5]);
       if (kind === 12) { start++; continue; }
-      if (kind === 14) {
-        if (bstack.length >= BLUR_LAYERS) {
+      if (bskip > 0) {
+        if (kind === 14 || kind === 16) bskip++;
+        else if (kind === 15 || kind === 17) bskip--;
+        start++;
+        continue;
+      }
+      if (kind === 14 || kind === 16) {
+        if (bstack.length >= BLUR_LAYERS_MAX) {
           bover++;
           start++;
           continue;
         }
+        const isGroup = kind === 16;
         const bi = start * INST;
-        const sigma = Math.max(f32[bi + 7], 0);
-        const margin = sigma > 0 ? Math.ceil(3 * sigma) + 2 : 0;
+        const sigma = isGroup ? 0 : Math.max(f32[bi + 7], 0);
+        const margin = (!isGroup && sigma > 0) ? Math.ceil(3 * sigma) + 2 : 0;
         const px0 = Math.max(0, Math.floor((f32[bi] - margin) * sc));
         const py0 = Math.max(0, Math.floor((f32[bi + 1] - margin) * sc));
         const px1 = Math.min(tw, Math.ceil((f32[bi] + f32[bi + 2] + margin) * sc));
         const py1 = Math.min(th, Math.ceil((f32[bi + 1] + f32[bi + 3] + margin) * sc));
         const bw = px1 - px0, bh = py1 - py0;
         const pb0 = th - (py0 + bh);
-        if (bw <= 0 || bh <= 0 || sigma <= 0) {
+        if (bw <= 0 || bh <= 0) {
+          bskip = 1;
+          start++;
+          continue;
+        }
+        if (!isGroup && sigma <= 0) {
           bstack.push({ px0, py0, pb0, w: bw, h: bh, sigma, active: false });
           start++;
           continue;
         }
         const depth = bstack.length;
-        ensureBlurLayer(depth, tw, th);
+        if (!ensureBlurLayer(depth, tw, th)) {
+          bover++;
+          start++;
+          continue;
+        }
         bstack.push({ px0, py0, pb0, w: bw, h: bh, sigma, active: true });
         target = blFb[depth];
         cutOn = true;
@@ -4087,6 +4138,68 @@
         gl.clear(gl.COLOR_BUFFER_BIT);
         mainState();
         bound = 0;
+        start++;
+        continue;
+      }
+      if (kind === 17) {
+        if (bover > 0) {
+          bover--;
+          start++;
+          continue;
+        }
+        if (bstack.length === 0) {
+          start++;
+          continue;
+        }
+        const L = bstack.pop();
+        if (!L.active) {
+          start++;
+          continue;
+        }
+        const depth = bstack.length;
+        let parent = bstack.length - 1;
+        while (parent >= 0 && !bstack[parent].active) parent--;
+        if (parent >= 0) {
+          const P = bstack[parent];
+          target = blFb[parent];
+          cutOn = true;
+          cut[0] = P.px0; cut[1] = P.pb0; cut[2] = P.w; cut[3] = P.h;
+        } else {
+          target = origTarget;
+          cutOn = origCutOn;
+          cut[0] = origCut0; cut[1] = origCut1; cut[2] = origCut2; cut[3] = origCut3;
+        }
+        mainState();
+        bound = 0;
+        blComp.set(f32.subarray(start * INST, (start + 1) * INST));
+        blComp[0] = L.px0 / sc;
+        blComp[1] = L.py0 / sc;
+        blComp[2] = L.w / sc;
+        blComp[3] = L.h / sc;
+        blComp[4] = 0;
+        blComp[5] = 4;
+        blComp[6] = 0;
+        blComp[7] = 0;
+        blComp[8] = 1;
+        blComp[9] = 1;
+        blComp[10] = 1;
+        blComp[12] = L.px0 / tw;
+        blComp[13] = (L.pb0 + L.h) / th;
+        blComp[14] = L.w / tw;
+        blComp[15] = -L.h / th;
+        blComp[20] = blComp[21] = blComp[22] = blComp[23] = 0;
+        blComp.fill(0, 32, 40);
+        useProg(hasOwnProg(4) ? 4 : -1);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, blTex[depth]);
+        gl.bindVertexArray(blCompVao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, blCompBuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, blComp);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
         start++;
         continue;
       }
@@ -4227,7 +4340,7 @@
         while (cs < cendAll) {
           const ctid = f32[cs * INST + 20] | 0;
           const ck = Math.round(f32[cs * INST + 5]);
-          if (ck === 5 || ck === 6 || ck === 8 || ck === 9 || ck === 12 || ck === 14 || ck === 15 || ctid < 0) {
+          if (ck === 5 || ck === 6 || ck === 8 || ck === 9 || ck === 12 || ck === 14 || ck === 15 || ck === 16 || ck === 17 || ctid < 0) {
             cs++;
             continue;
           }
@@ -4235,7 +4348,7 @@
           let ce = cs + 1;
           while (ce < cendAll && (f32[ce * INST + 20] | 0) === ctid) {
             const kk = Math.round(f32[ce * INST + 5]);
-            if (kk === 5 || kk === 6 || kk === 8 || kk === 9 || kk === 12 || kk === 14 || kk === 15) break;
+            if (kk === 5 || kk === 6 || kk === 8 || kk === 9 || kk === 12 || kk === 14 || kk === 15 || kk === 16 || kk === 17) break;
             if (cown ? kk !== ck : hasOwnProg(kk)) break;
             ce++;
           }
@@ -4288,7 +4401,7 @@
       let end = start + 1;
       while (end < n && (f32[end * INST + 20] | 0) === tid) {
         const k = Math.round(f32[end * INST + 5]);
-        if (k === 8 || k === 14 || k === 15) break;
+        if (k === 8 || k === 14 || k === 15 || k === 16 || k === 17) break;
         if ((k === 9) !== h) break;
         if (tid < 0 ? k !== kind : (own ? k !== kind : (!h && hasOwnProg(k)))) break;
         if (tid === 0 && kind === 0 && progRect && isSimpleRect(end) !== simple) break;
@@ -5357,12 +5470,15 @@
     return faces.has(1) ? 1 : 0;
   };
   // style: 1 slanted, 2 the code face; 64 a CJK face's marks narrow among Latin letters (style.mbt
-  // style_proportional): the face loaded again with pwid (a canvas has no font-feature-settings), once asked for
+  // style_proportional): the face loaded again with pwid (a canvas has no font-feature-settings), once asked for;
+  // 128 opts out of cv11/ss01 alternates on faces 1 and 2 via companion `mbface${f}_plain`.
   const font = (size, weight, style) => {
     const own = style & 2 ? MONO : style & 4 ? SERIF : FAMILY;
     const f = faceOf(style);
-    const narrow = f && style & 64 && narrowFace(f) ? `"mbface${f}n", ` : '';
-    return `${style & 1 ? 'italic ' : ''}${weight} ${size}px ${f ? `${narrow}"mbface${f}", ${own}` : own}`;
+    const plain = (f === 1 || f === 2) && (style & 128) ? '_plain' : '';
+    const fam = `mbface${f}${plain}`;
+    const narrow = f && (style & 64) && narrowFace(f) ? `"${fam}n", ` : '';
+    return `${style & 1 ? 'italic ' : ''}${weight} ${size}px ${f ? `${narrow}"${fam}", ${own}` : own}`;
   };
   // each face's files as given (a URL or bytes, its weight), and which faces are loaded with pwid (true) or being
   const faceFiles = new Map();
@@ -5373,20 +5489,34 @@
     narrowFaces.set(face, false);
     const cjk = cjkFiles.get(face);
     const files = [...(faceFiles.get(face) || []), ...(cjk || [])];
-    Promise.all(files.map(([src, weight, desc]) => {
+    const hasPlain = face === 1 || face === 2;
+    const loads = [];
+    for (const [src, weight, desc] of files) {
       const d = desc ? { ...desc } : faceDescriptors(face, weight);
       d.featureSettings = d.featureSettings ? `${d.featureSettings}, "pwid" 1` : '"pwid" 1';
       const ff = new FontFace(`mbface${face}n`, src, d);
       // (a CJK companion's (setCjkFace) kept with it, gone as it goes; one of its files the system has not: the rest
       // narrow as they are)
-      return ff.load().then(() => {
+      loads.push(ff.load().then(() => {
         if (desc) {
           if (cjkFiles.get(face) !== cjk) return;
           cjkLoaded.get(face).push(ff);
         }
         document.fonts.add(ff);
-      }, () => {});
-    })).then(() => {
+      }, () => {}));
+      if (hasPlain) {
+        const dp = desc ? { ...desc, featureSettings: '"pwid" 1' } : { ...faceDescriptorsPlain(weight), featureSettings: '"pwid" 1' };
+        const ffp = new FontFace(`mbface${face}_plainn`, src, dp);
+        loads.push(ffp.load().then(() => {
+          if (desc) {
+            if (cjkFiles.get(face) !== cjk) return;
+            cjkLoaded.get(face).push(ffp);
+          }
+          document.fonts.add(ffp);
+        }, () => {}));
+      }
+    }
+    Promise.all(loads).then(() => {
       if (narrowFaces.get(face) !== false) return;
       narrowFaces.set(face, true);
       textChanged();
@@ -5431,17 +5561,28 @@
   }
   // a face's descriptors: its weight (0: variable, all of them); the words' faces (1, 2) with Inter's single-storey a and
   // open digits, as the Mac's host sets them (apple_text.m face_font: cv11, ss01; a face without them is as it is)
-  const faceDescriptors = (face, weight) => ({
+  const faceDescriptorsPlain = (weight) => ({
     weight: weight ? String(weight) : '1 1000',
+  });
+  const faceDescriptors = (face, weight) => ({
+    ...faceDescriptorsPlain(weight),
     ...(face === 1 || face === 2 ? { featureSettings: '"cv11" 1, "ss01" 1' } : {}),
   });
+  const loadFacePair = (face, src, weight) => {
+    const ff = new FontFace(`mbface${face}`, src, faceDescriptors(face, weight));
+    const list = [ff.load().then(() => { document.fonts.add(ff); })];
+    if (face === 1 || face === 2) {
+      const ffp = new FontFace(`mbface${face}_plain`, src, faceDescriptorsPlain(weight));
+      list.push(ffp.load().then(() => { document.fonts.add(ffp); }, () => {}));
+    }
+    return Promise.all(list);
+  };
   // a face's file (a URL), for a weight (0: variable, all of them): drawn in once the page has loaded it
   H.faceAdd = (face, url, weight) => {
     if (!(face > 0 && face < 16) || typeof FontFace !== 'function') return false;
-    const ff = new FontFace(`mbface${face}`, `url(${JSON.stringify(url)})`, faceDescriptors(face, weight));
-    faceFile(face, `url(${JSON.stringify(url)})`, weight);
-    ff.load().then(() => {
-      document.fonts.add(ff);
+    const src = `url(${JSON.stringify(url)})`;
+    faceFile(face, src, weight);
+    loadFacePair(face, src, weight).then(() => {
       faces.add(face);
       textChanged();
       H.requestFrame();
@@ -5451,10 +5592,8 @@
   // the same, the file's bytes given
   H.faceAddBytes = (face, data, weight) => {
     if (!(face > 0 && face < 16) || typeof FontFace !== 'function') return false;
-    const ff = new FontFace(`mbface${face}`, data, faceDescriptors(face, weight));
     faceFile(face, data, weight);
-    ff.load().then(() => {
-      document.fonts.add(ff);
+    loadFacePair(face, data, weight).then(() => {
       faces.add(face);
       textChanged();
       H.requestFrame();
@@ -5465,10 +5604,8 @@
   H.faceAddAsync = (face, srcOrData, weight) => {
     if (!(face > 0 && face < 16) || typeof FontFace !== 'function') return Promise.resolve(false);
     const src = typeof srcOrData === 'string' ? `url(${JSON.stringify(srcOrData)})` : srcOrData;
-    const ff = new FontFace(`mbface${face}`, src, faceDescriptors(face, weight));
     faceFile(face, src, weight);
-    return ff.load().then(() => {
-      document.fonts.add(ff);
+    return loadFacePair(face, src, weight).then(() => {
       faces.add(face);
       textChanged();
       H.requestFrame();
@@ -5534,9 +5671,12 @@
         return true;
       }, () => false);
     };
+    const hasPlain = face === 1 || face === 2;
     Promise.all([
       ...files.map((f) => load(`mbface${face}`, f, {})),
+      ...(hasPlain ? files.map((f) => load(`mbface${face}_plain`, f, {})) : []),
       ...(narrow ? files.map((f) => load(`mbface${face}n`, f, { featureSettings: '"pwid" 1' })) : []),
+      ...(narrow && hasPlain ? files.map((f) => load(`mbface${face}_plainn`, f, { featureSettings: '"pwid" 1' })) : []),
     ]).then((took) => {
       if (cjkFiles.get(face) !== files || !took.some((t) => t)) return;
       faces.add(face);
@@ -5552,7 +5692,7 @@
     if (!faces.delete(face)) return;
     for (const ff of [...document.fonts]) {
       const fam = ff.family.replace(/"/g, '');
-      if (fam === `mbface${face}` || fam === `mbface${face}n`) document.fonts.delete(ff);
+      if (fam === `mbface${face}` || fam === `mbface${face}n` || fam === `mbface${face}_plain` || fam === `mbface${face}_plainn`) document.fonts.delete(ff);
     }
     textChanged();
   };
@@ -7211,7 +7351,7 @@
       gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null,
       extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
       progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
-      lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
+      lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: new Array(BLUR_LAYERS_INIT).fill(null), blFb: new Array(BLUR_LAYERS_INIT).fill(null), blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       adProg: null, ADU: {}, adTex: [null, null], adFb: [null, null], adCur: 0, adSlots: makeAdSlots(),
       adLastTime: 0, adFrameSerial: 0, adSettling: false, adRaf: 0, lastN: 0, lastR: 0, lastG: 0, lastB: 0, lastF32: null,
       cv: null, cvOk: false, target: null,
@@ -7332,7 +7472,7 @@
       ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta, pw: cpw,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
-      lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
+      lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: new Array(BLUR_LAYERS_INIT).fill(null), blFb: new Array(BLUR_LAYERS_INIT).fill(null), blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       adProg: null, ADU: {}, adTex: [null, null], adFb: [null, null], adCur: 0, adSlots: makeAdSlots(),
       adLastTime: 0, adFrameSerial: 0, adSettling: false, adRaf: 0, lastN: 0, lastR: 0, lastG: 0, lastB: 0, lastF32: null,
       cv: null, cvOk: false, target: null, dirty: [],

@@ -95,7 +95,13 @@ static int mb_inside(const float *a, float up, float in, float scale, MBRound *o
   float room = fminf(hw, hh);
   if (room <= in) return 0;
   for (int i = 0; i < 4; i++) {
-    float rr = fminf(a[36 + i], room);
+    float raw = a[36 + i];
+    if (raw < 0.0f) {
+      float rr = fminf(-raw, room);
+      o->r[i] = rr * scale;
+      continue;
+    }
+    float rr = fminf(raw, room);
     if (rr <= 0) {
       o->r[i] = 0;
       continue;
@@ -152,7 +158,13 @@ static int mb_pieces(const float *a, float scale, MBStrip to, MBStrip out[MB_STR
   // each corner's reach, R (mb_inside), in pixels: wholly smooth or square
   float hw = a[2] * 0.5f, hh = a[3] * 0.5f, room = fminf(hw, hh), R[4];
   for (int i = 0; i < 4; i++) {
-    float rr = fminf(a[36 + i], room);
+    float raw = a[36 + i];
+    if (raw < 0.0f) {
+      float rr = fminf(-raw, room);
+      R[i] = rr * scale;
+      continue;
+    }
+    float rr = fminf(raw, room);
     if (rr <= 0) {
       R[i] = 0;
       continue;

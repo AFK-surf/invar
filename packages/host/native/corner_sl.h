@@ -1,7 +1,7 @@
-// src/host/corner.sl as a C string (scripts/chk corner-sl makes it: edit corner.sl, then run it). The shaders
+// packages/host/native/corner.sl as a C string (scripts/sync_corner_sl.py makes it: edit corner.sl, then run it). The shaders
 // write float2; GLSL's take it with `#define float2 vec2` and `#define float4 vec4` before it.
 #define MB_CORNER_SL \
-  "// smooth.mbt's corners for the renderers; scripts/chk corner-sl makes corner_sl.h and web/host.js from it.\n" \
+  "// smooth.mbt's corners for the renderers; scripts/sync_corner_sl.py makes corner_sl.h and web/host.js from it.\n" \
   "//\n" \
   "// How smooth a corner of radius r is where room is half its box's shorter side: 0 a circle's or a capsule's end, 1\n" \
   "// superellipse(1.5) over r a quarter longer; between, as far as the room goes.\n" \
@@ -109,6 +109,12 @@
   "// few points high sharing a frame's corner is cut by the frame's very curve, not by one flattened to its half height.\n" \
   "// Each corner against its own corner point; the rect's edges straight.\n" \
   "float mb_clip_corner(float2 p, float2 k, float2 inward, float2 hs, float r, float s, float band) {\n" \
+  "  if (s < -0.5) {\n" \
+  "    float2 hv = max(hs, float2(r, r));\n" \
+  "    float2 cp = max(hv - (p - k) * inward, float2(0.0, 0.0));\n" \
+  "    float2 q = abs(cp) - hv + r;\n" \
+  "    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;\n" \
+  "  }\n" \
   "  float R = r * (1.0 + 0.25 * s);\n" \
   "  float2 hv = max(hs, float2(R, R));\n" \
   "  return mb_sd_corner(max(hv - (p - k) * inward, float2(0.0, 0.0)), hv, r, s, band);\n" \
@@ -123,8 +129,13 @@
   "  if (r.w > 0.0) d = max(d, mb_clip_corner(p, c.xw, float2(1.0, -1.0), hs, r.w, s.w, band));\n" \
   "  return d;\n" \
   "}\n" \
-  "// A box's own corners: r at most its shorter half, as smooth as its size has room for (band: mb_sd_corner's).\n" \
+  "// A box's own corners: r >= 0 continuous superellipse/capsule; r < 0 exact CSS circular arc of radius |r|.\n" \
   "float mb_sd_box(float2 p, float2 hs, float r, float band) {\n" \
+  "  if (r < 0.0) {\n" \
+  "    float rr = min(-r, min(hs.x, hs.y));\n" \
+  "    float2 q = abs(p) - hs + rr;\n" \
+  "    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr;\n" \
+  "  }\n" \
   "  float room = min(hs.x, hs.y);\n" \
   "  float rr = min(r, room);\n" \
   "  return mb_sd_corner(p, hs, rr, mb_smoothness(rr, room), band);\n" \
@@ -166,11 +177,12 @@
   "// Skip the distance and search entirely along the straight parts of the edges and in the middle of the picture.\n" \
   "bool mb_contained_corner(float2 p, float4 c, float4 r, float pad) {\n" \
   "  // A capsule's easing can reach two radii along its long edge.\n" \
-  "  float4 R = r * 2.5 + float4(pad, pad, pad, pad);\n" \
-  "  return (r.x > 0.0 && p.x < c.x + R.x && p.y < c.y + R.x) ||\n" \
-  "         (r.y > 0.0 && p.x > c.z - R.y && p.y < c.y + R.y) ||\n" \
-  "         (r.z > 0.0 && p.x > c.z - R.z && p.y > c.w - R.z) ||\n" \
-  "         (r.w > 0.0 && p.x < c.x + R.w && p.y > c.w - R.w);\n" \
+  "  float4 ar = abs(r);\n" \
+  "  float4 R = ar * 2.5 + float4(pad, pad, pad, pad);\n" \
+  "  return (ar.x > 0.0 && p.x < c.x + R.x && p.y < c.y + R.x) ||\n" \
+  "         (ar.y > 0.0 && p.x > c.z - R.y && p.y < c.y + R.y) ||\n" \
+  "         (ar.z > 0.0 && p.x > c.z - R.z && p.y > c.w - R.z) ||\n" \
+  "         (ar.w > 0.0 && p.x < c.x + R.w && p.y > c.w - R.w);\n" \
   "}\n" \
   "float2 mb_contained_point(float2 p, float4 box, float4 rr, float4 clip, float4 rc, float4 rs,\n" \
   "                          float4 outer, float4 orc, float4 ors, float pixel) {\n" \
@@ -226,7 +238,7 @@
   "  return 0.5 * (mb_erf((x + curved) * k) - mb_erf((x - curved) * k));\n" \
   "}\n" \
   "float mb_shadow(float2 p, float2 hs, float r, float sigma) {\n" \
-  "  float rr = min(r, min(hs.x, hs.y));\n" \
+  "  float rr = min(abs(r), min(hs.x, hs.y));\n" \
   "  float lo = clamp(-3.0 * sigma, p.y - hs.y, p.y + hs.y);\n" \
   "  float hi = clamp(3.0 * sigma, p.y - hs.y, p.y + hs.y);\n" \
   "  float st = (hi - lo) / 4.0;\n" \

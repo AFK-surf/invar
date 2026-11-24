@@ -15,6 +15,8 @@
 typedef struct {
   int nid, parent, widget;
   char *role, *flags, *label, *value, *help, *actions;
+  char *current, *sort;
+  int controls, active_descendant;
   double x, y, w, h;
   int range;
   double low, at, high;
@@ -42,6 +44,7 @@ static gboolean a11y_has(const char *letters, char c) { return letters && strchr
 static void a11y_node_free(gpointer p) {
   A11yNode *n = p;
   g_free(n->role), g_free(n->flags), g_free(n->label), g_free(n->value), g_free(n->help), g_free(n->actions);
+  g_free(n->current), g_free(n->sort);
   g_array_free(n->kids, TRUE);
   if (n->obj) g_object_unref(n->obj);
   g_free(n);
@@ -115,6 +118,10 @@ static GtkAccessibleRole a11y_role(const char *r) {
       {"Row", GTK_ACCESSIBLE_ROLE_ROW},
       {"ColumnHeader", GTK_ACCESSIBLE_ROLE_COLUMN_HEADER},
       {"Cell", GTK_ACCESSIBLE_ROLE_CELL},
+      {"Meter", GTK_ACCESSIBLE_ROLE_METER},
+      {"Grid", GTK_ACCESSIBLE_ROLE_GRID},
+      {"GridCell", GTK_ACCESSIBLE_ROLE_GRID_CELL},
+      {"SpinButton", GTK_ACCESSIBLE_ROLE_SPIN_BUTTON},
   };
   for (gsize i = 0; i < G_N_ELEMENTS(roles); i++)
     if (strcmp(roles[i].name, r) == 0) return roles[i].role;
@@ -228,8 +235,15 @@ static void mb_a11y_obj_init(MBA11yObj *o) { (void)o; }
 // value or state it no longer has is reset, as the same accessible is told again)
 static void a11y_obj_said(A11yNode *n) {
   GtkAccessible *a = GTK_ACCESSIBLE(n->obj);
-  gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_LABEL, n->label, GTK_ACCESSIBLE_PROPERTY_DESCRIPTION,
-                                 n->help, -1);
+  // (aria-current: GTK 4 has no state of its own for it, nor object attributes an accessible that is no widget can
+  // set, so it is said after the description, "current <value>", as the Mac says it in its role description)
+  gchar *desc = (n->current && *n->current)
+                    ? (*n->help ? g_strdup_printf("%s, current %s", n->help, n->current)
+                                : g_strdup_printf("current %s", n->current))
+                    : g_strdup(n->help);
+  gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_LABEL, n->label, GTK_ACCESSIBLE_PROPERTY_DESCRIPTION, desc,
+                                 -1);
+  g_free(desc);
   if (n->range) {
     gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_VALUE_MIN, n->low, GTK_ACCESSIBLE_PROPERTY_VALUE_MAX,
                                    n->high, GTK_ACCESSIBLE_PROPERTY_VALUE_NOW, n->at, -1);
@@ -257,6 +271,40 @@ static void a11y_obj_said(A11yNode *n) {
   else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_EXPANDED);
   if (a11y_has(n->flags, 's')) gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_SELECTED, TRUE, -1);
   else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_SELECTED);
+  // AT-SPI / GTK4 extended ARIA states, properties, and virtual-focus relations
+  if (a11y_has(n->flags, 'b')) gtk_accessible_update_state(a, GTK_ACCESSIBLE_STATE_BUSY, TRUE, -1);
+  else gtk_accessible_reset_state(a, GTK_ACCESSIBLE_STATE_BUSY);
+  if (a11y_has(n->flags, 'u')) gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_MULTI_SELECTABLE, TRUE, -1);
+  else gtk_accessible_reset_property(a, GTK_ACCESSIBLE_PROPERTY_MULTI_SELECTABLE);
+  if (n->sort && *n->sort) {
+    GtkAccessibleSort sv = GTK_ACCESSIBLE_SORT_NONE;
+    if (strcmp(n->sort, "ascending") == 0) sv = GTK_ACCESSIBLE_SORT_ASCENDING;
+    else if (strcmp(n->sort, "descending") == 0) sv = GTK_ACCESSIBLE_SORT_DESCENDING;
+    else if (strcmp(n->sort, "none") != 0) sv = GTK_ACCESSIBLE_SORT_OTHER;
+    gtk_accessible_update_property(a, GTK_ACCESSIBLE_PROPERTY_SORT, sv, -1);
+  } else {
+    gtk_accessible_reset_property(a, GTK_ACCESSIBLE_PROPERTY_SORT);
+  }
+  if (n->controls > 0 && n->controls != n->nid) {
+    GObject *ctrl_obj = a11y_obj(n->controls);
+    if (ctrl_obj) {
+      gtk_accessible_update_relation(a, GTK_ACCESSIBLE_RELATION_CONTROLS, GTK_ACCESSIBLE(ctrl_obj), NULL, -1);
+    } else {
+      gtk_accessible_reset_relation(a, GTK_ACCESSIBLE_RELATION_CONTROLS);
+    }
+  } else {
+    gtk_accessible_reset_relation(a, GTK_ACCESSIBLE_RELATION_CONTROLS);
+  }
+  if (n->active_descendant > 0 && n->active_descendant != n->nid) {
+    GObject *ad_obj = a11y_obj(n->active_descendant);
+    if (ad_obj) {
+      gtk_accessible_update_relation(a, GTK_ACCESSIBLE_RELATION_ACTIVE_DESCENDANT, GTK_ACCESSIBLE(ad_obj), -1);
+    } else {
+      gtk_accessible_reset_relation(a, GTK_ACCESSIBLE_RELATION_ACTIVE_DESCENDANT);
+    }
+  } else {
+    gtk_accessible_reset_relation(a, GTK_ACCESSIBLE_RELATION_ACTIVE_DESCENDANT);
+  }
 }
 
 static GObject *a11y_obj(int nid) {
@@ -389,11 +437,15 @@ void mb_host_a11y_tree(moonbit_string_t s) {
   if (!a11y_nodes) a11y_nodes = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, a11y_node_free);
   if (full) g_hash_table_remove_all(a11y_nodes);
   GHashTable *held = g_hash_table_new(g_direct_hash, g_direct_equal);
+  // (nodes whose accessible is no more, made again for a new role or gone with the node: what points at them by a
+  // relation, controls or active descendant, is told again, so no relation keeps the one let go)
+  GHashTable *remade = g_hash_table_new(g_direct_hash, g_direct_equal);
   GArray *let_go = g_array_new(FALSE, FALSE, sizeof(int));
   GPtrArray *told = g_ptr_array_new();
   for (int i = 1; lines[i]; i++) {
     gchar **f = g_strsplit(lines[i], "\x1f", -1);
-    if (g_strv_length(f) < 17 || strcmp(f[0], "N") != 0) {
+    guint nf = g_strv_length(f);
+    if (nf < 17 || strcmp(f[0], "N") != 0) {
       g_strfreev(f);
       continue;
     }
@@ -415,6 +467,10 @@ void mb_host_a11y_tree(moonbit_string_t s) {
       }
       g_strfreev(ks);
     }
+    n->current = nf > 17 ? a11y_unescape(f[17]) : g_strdup("");
+    n->sort = nf > 18 ? a11y_unescape(f[18]) : g_strdup("");
+    n->controls = (nf > 19 && f[19][0]) ? atoi(f[19]) : 0;
+    n->active_descendant = (nf > 20 && f[20][0]) ? atoi(f[20]) : 0;
     g_strfreev(f);
     A11yNode *o = a11y_node(n->nid);
     if (o) {
@@ -426,6 +482,7 @@ void mb_host_a11y_tree(moonbit_string_t s) {
       }
       // (its accessible kept where its role is: what holds it on to it holds the same one)
       if (o->obj && strcmp(o->role, n->role) == 0) n->obj = g_steal_pointer(&o->obj);
+      else if (o->obj) g_hash_table_add(remade, GINT_TO_POINTER(n->nid));
     }
     g_hash_table_replace(a11y_nodes, GINT_TO_POINTER(n->nid), n);
     g_ptr_array_add(told, n);
@@ -446,12 +503,26 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     A11yNode *n = a11y_node(k);
     if (!n) continue;
     g_array_append_vals(let_go, n->kids->data, n->kids->len);
+    if (n->obj) g_hash_table_add(remade, GINT_TO_POINTER(k));
     g_hash_table_remove(a11y_nodes, GINT_TO_POINTER(k));
   }
   for (guint i = 0; i < told->len; i++) {
     A11yNode *n = g_ptr_array_index(told, i);
     if (n->obj) a11y_obj_said(n);
   }
+  if (g_hash_table_size(remade)) {
+    GHashTableIter it;
+    gpointer key, val;
+    g_hash_table_iter_init(&it, a11y_nodes);
+    while (g_hash_table_iter_next(&it, &key, &val)) {
+      A11yNode *n = val;
+      if (!n->obj) continue;
+      if ((n->controls > 0 && g_hash_table_contains(remade, GINT_TO_POINTER(n->controls))) ||
+          (n->active_descendant > 0 && g_hash_table_contains(remade, GINT_TO_POINTER(n->active_descendant))))
+        a11y_obj_said(n);
+    }
+  }
+  g_hash_table_destroy(remade);
   // (the focus as a platform state, read as AT-SPI asks: GTK 4.14 has nothing public to tell it moved of one that is
   // no widget)
   a11y_focus = focus;

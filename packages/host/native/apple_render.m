@@ -686,7 +686,7 @@ MB_CORNER_SL
 "    // Copyright 2025, Tim Lehmann for whynotmake.it. Adapted from flutter_liquid_glass\n"
 "    // liquid_glass_final_render_core.glsl, Apache-2.0.\n"
 "    float k = I.pad.w;\n"
-"    float4 s_rr = max(max(I.rr.x, I.rr.y), max(I.rr.z, I.rr.w)) > 0.0 ? I.rr : float4(I.p.x);\n"
+"    float4 s_rr = max(max(abs(I.rr.x), abs(I.rr.y)), max(abs(I.rr.z), abs(I.rr.w))) > 0.0 ? I.rr : float4(I.p.x);\n"
 "    float d;\n"
 "    float halfMinor = 1e9;\n"
 "    bool single_liquid = (one_kind == 13) || (k <= 0.0);\n"
@@ -1279,7 +1279,7 @@ MB_CORNER_SL
 "  }\n"
 "  if (kind == 8) {\n"
 "    // Foreground optical lens (View::content_lens): offscreen blurred child subtree refracted through spherical bevel & SDF-clipped\n"
-"    float4 s_rr = max(max(I.rr.x, I.rr.y), max(I.rr.z, I.rr.w)) > 0.0 ? I.rr : float4(I.p.x);\n"
+"    float4 s_rr = max(max(abs(I.rr.x), abs(I.rr.y)), max(abs(I.rr.z), abs(I.rr.w))) > 0.0 ? I.rr : float4(I.p.x);\n"
 "    float d = sd_rr(p, I.rect, s_rr);\n"
 "    float materialAlpha = clamp(0.5 - d * u.scale, 0.0, 1.0);\n"
 "    if (materialAlpha < 0.005) discard_fragment();\n"
@@ -1344,6 +1344,9 @@ MB_CORNER_SL
 "      for (int i = first; i < first + n; i++) w += mb_path_rows(sg[(base + i / 6) * 15 + mb_seg_slot(i)], I.rect, p, u.scale);\n"
 "      a = mb_path_cover(w, I.c2.z);\n"
 "    }\n"
+"    float ly = p.y - I.rect.y;\n"
+"    if (I.rr.y > 0.0) a *= clamp((ly - I.rr.x) / I.rr.y, 0.0, 1.0);\n"
+"    if (I.rr.w > 0.0) a *= clamp((I.rr.z - ly) / I.rr.w, 0.0, 1.0);\n"
 "    if (I.pad.w > 0.0) col.rgb = mb_adaptive_ink_at(bd, ad_tex, g, col.rgb, I.pad.yz, I.pad.w * 0.5, I.rect);\n"
 "    return (float4(col.rgb, 1.0) * col.a * a) * cover;\n"
 "  }\n"
@@ -1355,7 +1358,7 @@ MB_CORNER_SL
 "  float rad = mb_corner_of(p - c, I.rr);\n"
 "  float d = mb_sd_box(p - c, hs, rad, band);\n"
 "  if (kind == 0 || kind == 5) d = notch_cut(d, p, I.rect, I.pad);\n"
-"  if (kind == 9) { float rr = min(rad, min(hs.x, hs.y)); float2 q = abs(p - c) - hs + rr; if (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr > 0.0) discard_fragment(); return (float4(0.0)) * cover; }\n"
+"  if (kind == 9) { float rr = min(abs(rad), min(hs.x, hs.y)); float2 q = abs(p - c) - hs + rr; if (length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rr > 0.0) discard_fragment(); return (float4(0.0)) * cover; }\n"
 "  if (kind == 4) {\n"
 "    constexpr sampler si(filter::linear, address::clamp_to_edge);\n"
 "    float2 uv = I.c2.xy + clamp((p - I.rect.xy) / I.rect.zw, 0.0, 1.0) * I.c2.zw;\n"
@@ -1371,7 +1374,7 @@ MB_CORNER_SL
 "      float pd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);\n"
 "      pic *= I.pad.w * clamp(0.5 - pd * u.scale, 0.0, 1.0);\n"
 "      pic += float4(col.rgb * I.pad.y, I.pad.y) * (1.0 - pic.a);\n"
-"      if (I.rot.w < 0.5 && max(max(I.rr.x, I.rr.y), max(I.rr.z, I.rr.w)) <= 0.0 &&\n"
+"      if (I.rot.w < 0.5 && max(max(abs(I.rr.x), abs(I.rr.y)), max(abs(I.rr.z), abs(I.rr.w))) <= 0.0 &&\n"
 "          max(max(I.rc.x, I.rc.y), max(I.rc.z, I.rc.w)) > 0.0 &&\n"
 "          all(I.clip.xy >= I.rect.xy) && all(I.clip.zw <= I.rect.xy + I.rect.zw)) edge = 1.0;\n"
 "    }\n"
@@ -1380,10 +1383,14 @@ MB_CORNER_SL
 "  if (kind == 2) {\n"
 "    // as Core Animation's: the shape blurred, sigma its radius (corner.sl mb_shadow)\n"
 "    float a = mb_shadow(p - c, hs, rad, max(I.p.w, 0.25));\n"
-"    // glass's: only outside its box (c2.y above it)\n"
+"    // glass's (and View::shadows'): only outside its box\n"
 "    if (I.c2.x > 0.5) {\n"
-"      float2 q = p - c + float2(0.0, I.c2.y);\n"
-"      float db = mb_sd_box(q, hs, mb_corner_of(q, I.rr), band);\n"
+"      // (the box itself: (c2.z, c2.y) back from the shadow's, its spread c2.w smaller each side)\n"
+"      float2 q = p - c + float2(I.c2.z, I.c2.y);\n"
+"      float2 hb = max(hs - float2(I.c2.w, I.c2.w), float2(0.0, 0.0));\n"
+"      float rb = mb_corner_of(q, I.rr);\n"
+"      rb = rb < 0.0 ? -max(-rb - I.c2.w, 0.0) : max(rb - I.c2.w, 0.0);\n"
+"      float db = mb_sd_box(q, hb, rb, band);\n"
 "      a *= clamp(0.5 + db * u.scale, 0.0, 1.0);\n"
 "    }\n"
 "    return (float4(col.rgb, 1.0) * col.a * a) * cover;\n"
@@ -1853,19 +1860,34 @@ static void ensure_levels(int w, int h) {
   // so growing the shared scratch pyramid must not invalidate cached glass slots.
 }
 
-// Offscreen blur layers (kind == 14 PUSH_BLUR_LAYER / kind == 15 POP_BLUR_LAYER): lazily allocated on first use.
-#define MB_BLUR_LAYERS 4
+// Offscreen blur / group-alpha layers (kind == 14/16 push, 15/17 pop): lazily allocated and dynamically grown up to 64.
+#define MB_BLUR_LAYERS_INIT 8
+#define MB_BLUR_LAYERS_MAX 64
 typedef struct { int px0, py0, w, h, active; float sigma; } BlurFrame;
-static id<MTLTexture> bl_tex[MB_BLUR_LAYERS];
+static NSMutableArray *bl_tex;
 static int bl_w, bl_h;
 
-static void ensure_blur_layer(int depth, int tw, int th) {
+static id<MTLTexture> blur_layer_at(int depth) {
+  if (!bl_tex || depth < 0 || depth >= (int)bl_tex.count) return nil;
+  id obj = bl_tex[depth];
+  return obj == [NSNull null] ? nil : (id<MTLTexture>)obj;
+}
+
+static id<MTLTexture> ensure_blur_layer(int depth, int tw, int th) {
+  if (depth < 0 || depth >= MB_BLUR_LAYERS_MAX || tw <= 0 || th <= 0) return nil;
   if (bl_w != tw || bl_h != th) {
-    for (int j = 0; j < MB_BLUR_LAYERS; j++) bl_tex[j] = nil;
+    [bl_tex removeAllObjects];
     bl_w = tw;
     bl_h = th;
   }
-  if (!bl_tex[depth]) bl_tex[depth] = level_tex(MTLPixelFormatBGRA8Unorm, tw, th);
+  if (!bl_tex) bl_tex = [NSMutableArray arrayWithCapacity:MB_BLUR_LAYERS_INIT];
+  while ((int)bl_tex.count <= depth) [bl_tex addObject:[NSNull null]];
+  if (bl_tex[depth] == [NSNull null]) {
+    id<MTLTexture> t = level_tex(MTLPixelFormatBGRA8Unorm, tw, th);
+    if (!t) return nil;
+    bl_tex[depth] = t;
+  }
+  return (id<MTLTexture>)bl_tex[depth];
 }
 
 static void clear_tex(id<MTLCommandBuffer> cb, id<MTLTexture> tex) {
@@ -2033,7 +2055,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
       bx0 = b[0] - m23; by0 = b[1] - m23; bx1 = b[0] + b[2] + m23; by1 = b[1] + b[3] + m23;
       if (merged_liquid && n < 8) {
         for (int k = 0; k < 4; k++) m->g.shape[n][k] = b[k];
-        if (fmaxf(fmaxf(b[36], b[37]), fmaxf(b[38], b[39])) > 0.0f) {
+        if (fmaxf(fmaxf(fabsf(b[36]), fabsf(b[37])), fmaxf(fabsf(b[38]), fabsf(b[39]))) > 0.0f) {
           for (int k = 0; k < 4; k++) m->g.rad[n][k] = b[36 + k];
         } else {
           for (int k = 0; k < 4; k++) m->g.rad[n][k] = b[4];
@@ -2508,7 +2530,9 @@ static void glass_free(void) {
   for (int j = 0; j < 4; j++) lv[j] = nil;
   ltmp = nil;
   gtex = nil;
-  for (int j = 0; j < MB_BLUR_LAYERS; j++) bl_tex[j] = nil;
+  [bl_tex removeAllObjects];
+  bl_tex = nil;
+  bl_w = bl_h = 0;
   bl_w = bl_h = 0;
   for (int i = 0; i < MB_GLASS_SLOTS; i++) {
     slot_bt[i] = nil;
@@ -2670,12 +2694,12 @@ static int under_take(const float *f, int32_t start, int32_t count, int32_t piec
     float tid = f[(size_t)i * MB_INST + 20];
     if (i > 0 && tid != f[(size_t)(i - 1) * MB_INST + 20]) run = i;
     int k = (int)(f[(size_t)i * MB_INST + 5] + 0.5f);
-    if (k == 14) {
+    if (k == 14 || k == 16) {
       if (in_blur == 0) blur_hit = reaches(f, i, run, dep);
       in_blur++;
     }
     int hit = blur_hit || reaches(f, i, run, dep);
-    if (k == 15 && in_blur > 0) {
+    if ((k == 15 || k == 17) && in_blur > 0) {
       if (--in_blur == 0) blur_hit = 0;
     }
     if (!hit) continue;
@@ -2910,8 +2934,8 @@ static int is_simple_rect(const float *f, int32_t i) {
   return (int)(b[5] + 0.5f) == 0 && b[6] <= 0.0f &&
          b[20] == 0.0f && b[21] == 0.0f && b[22] == 0.0f && b[23] == 0.0f &&
          b[24] <= 0.0f && b[25] <= 0.0f && b[26] <= 0.0f && b[27] <= 0.0f &&
-         b[32] == 0.0f &&
-         b[36] <= 0.0f && b[37] <= 0.0f && b[38] <= 0.0f && b[39] <= 0.0f &&
+         b[32] == 0.0f && b[4] == 0.0f &&
+         b[36] == 0.0f && b[37] == 0.0f && b[38] == 0.0f && b[39] == 0.0f &&
          b[44] <= 0.0f && b[45] <= 0.0f && b[46] <= 0.0f && b[47] <= 0.0f &&
          b[53] <= 0.0f && b[55] <= 0.0f && b[57] <= 0.0f && b[59] <= 0.0f;
 }
@@ -2960,7 +2984,11 @@ static void size_levels_once(const float *f, int32_t from, int32_t count, int tw
     int skind = (int)(f[s0 * MB_INST + 5] + 0.5f);
     int32_t e0 = s0 + 1;
     if (stid < 0) {
-      while (e0 < count && (int)f[e0 * MB_INST + 20] == stid) e0++;
+      while (e0 < count && (int)f[e0 * MB_INST + 20] == stid) {
+        int ek = (int)(f[e0 * MB_INST + 5] + 0.5f);
+        if (ek == 14 || ek == 15 || ek == 16 || ek == 17) break;
+        e0++;
+      }
       if (stid != scan_bound) {
         scan_bound = stid;
         Grab gm;
@@ -3008,8 +3036,10 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
   id<MTLTexture> cur_target = target;
   int tw = (int)target.width, th = (int)target.height;
   float sc_f = (float)at_scale;
-  BlurFrame bstack[MB_BLUR_LAYERS];
-  int bdepth = 0, bover = 0;
+  BlurFrame bstack_inline[MB_BLUR_LAYERS_INIT];
+  int bcap = MB_BLUR_LAYERS_INIT;
+  BlurFrame *bstack = bstack_inline;
+  int bdepth = 0, bover = 0, bskip = 0;
   // Pre-scan top-level glass captures before opening the main render pass: size blur levels once,
   // cache slot hits (kind 5 & 6), and batch adaptive updates for hit kind-6 groups before begin_pass.
   int levels_sized = 0;
@@ -3024,8 +3054,8 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
     int any_glass = 0, pre_bd = 0;
     for (int32_t s0 = 0; s0 < count; s0++) {
       int sk = (int)(f[s0 * MB_INST + 5] + 0.5f);
-      if (sk == 14) { pre_bd++; continue; }
-      if (sk == 15) { if (pre_bd > 0) pre_bd--; continue; }
+      if (sk == 14 || sk == 16) { pre_bd++; continue; }
+      if (sk == 15 || sk == 17) { if (pre_bd > 0) pre_bd--; continue; }
       if (pre_bd == 0 && (int)f[s0 * MB_INST + 20] < 0) { any_glass = 1; break; }
     }
     if (any_glass) {
@@ -3037,14 +3067,14 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       int pre_bound = 0, scan_bd = 0;
       for (int32_t s0 = 0; s0 < count;) {
         int skind = (int)(f[s0 * MB_INST + 5] + 0.5f);
-        if (skind == 14) { scan_bd++; s0++; continue; }
-        if (skind == 15) { if (scan_bd > 0) scan_bd--; s0++; continue; }
+        if (skind == 14 || skind == 16) { scan_bd++; s0++; continue; }
+        if (skind == 15 || skind == 17) { if (scan_bd > 0) scan_bd--; s0++; continue; }
         int stid = (int)f[s0 * MB_INST + 20];
         int32_t e0 = s0 + 1;
         if (scan_bd == 0 && stid < 0) {
           while (e0 < count && (int)f[e0 * MB_INST + 20] == stid) {
             int ek = (int)(f[e0 * MB_INST + 5] + 0.5f);
-            if (ek == 14 || ek == 15) break;
+            if (ek == 14 || ek == 15 || ek == 16 || ek == 17) break;
             e0++;
           }
           if (stid != pre_bound) {
@@ -3105,19 +3135,26 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
   while (start < count) {
     int tid = (int)f[start * MB_INST + 20];
     int kind = (int)(f[start * MB_INST + 5] + 0.5f), hole = kind == 9;
-    if (kind == 14) {
+    if (bskip > 0) {
+      if (kind == 14 || kind == 16) bskip++;
+      else if (kind == 15 || kind == 17) bskip--;
+      start++;
+      continue;
+    }
+    if (kind == 14 || kind == 16) {
       if (!levels_sized) {
         levels_sized = 1;
         size_levels_once(f, start, count, tw, th);
       }
-      if (bdepth >= MB_BLUR_LAYERS) {
-        bover++;
+      if (bdepth >= MB_BLUR_LAYERS_MAX) {
+        bskip = 1;
         start++;
         continue;
       }
+      int is_group = (kind == 16);
       const float *bl = f + (size_t)start * MB_INST;
-      float sigma = fmaxf(bl[7], 0.0f);
-      float margin = sigma > 0.0f ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
+      float sigma = is_group ? 0.0f : fmaxf(bl[7], 0.0f);
+      float margin = (!is_group && sigma > 0.0f) ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
       int px0 = (int)floorf((bl[0] - margin) * sc_f), py0 = (int)floorf((bl[1] - margin) * sc_f);
       int px1 = (int)ceilf((bl[0] + bl[2] + margin) * sc_f), py1 = (int)ceilf((bl[1] + bl[3] + margin) * sc_f);
       if (px0 < 0) px0 = 0;
@@ -3125,20 +3162,109 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       if (px1 > tw) px1 = tw;
       if (py1 > th) py1 = th;
       int bw = px1 - px0, bh = py1 - py0;
-      if (bw <= 0 || bh <= 0 || sigma <= 0.0f) {
+      if (bw <= 0 || bh <= 0) {
+        bskip = 1;
+        start++;
+        continue;
+      }
+      if (bdepth >= bcap) {
+        int nc = bcap * 2;
+        if (nc > MB_BLUR_LAYERS_MAX) nc = MB_BLUR_LAYERS_MAX;
+        BlurFrame *nb = NULL;
+        if (bstack == bstack_inline) {
+          nb = (BlurFrame *)malloc((size_t)nc * sizeof(BlurFrame));
+          if (nb) memcpy(nb, bstack_inline, (size_t)bdepth * sizeof(BlurFrame));
+        } else {
+          nb = (BlurFrame *)realloc(bstack, (size_t)nc * sizeof(BlurFrame));
+        }
+        if (!nb) {
+          bskip = 1;
+          start++;
+          continue;
+        }
+        bstack = nb;
+        bcap = nc;
+      }
+      if (!is_group && sigma <= 0.0f) {
         bstack[bdepth++] = (BlurFrame){px0, py0, bw, bh, 0, sigma};
         start++;
         continue;
       }
+      id<MTLTexture> lt = ensure_blur_layer(bdepth, tw, th);
+      if (!lt) {
+        bskip = 1;
+        start++;
+        continue;
+      }
       [enc endEncoding];
-      ensure_blur_layer(bdepth, tw, th);
       bstack[bdepth] = (BlurFrame){px0, py0, bw, bh, 1, sigma};
-      cur_target = bl_tex[bdepth];
+      cur_target = lt;
       bdepth++;
       sc_on = 1;
       sc = (MTLScissorRect){(NSUInteger)px0, (NSUInteger)py0, (NSUInteger)bw, (NSUInteger)bh};
       enc = begin_pass(cb, cur_target, p, buf, 1, 0, 0, 0, 0);
       bound = 0;
+      start++;
+      continue;
+    }
+    if (kind == 17) {
+      if (bover > 0) {
+        bover--;
+        start++;
+        continue;
+      }
+      if (bdepth <= 0) {
+        start++;
+        continue;
+      }
+      BlurFrame L = bstack[--bdepth];
+      if (!L.active) {
+        start++;
+        continue;
+      }
+      [enc endEncoding];
+      int parent = bdepth - 1;
+      while (parent >= 0 && !bstack[parent].active) parent--;
+      cur_target = parent >= 0 ? blur_layer_at(parent) : target;
+      if (parent >= 0) {
+        BlurFrame P = bstack[parent];
+        sc_on = 1;
+        sc = (MTLScissorRect){(NSUInteger)P.px0, (NSUInteger)P.py0, (NSUInteger)P.w, (NSUInteger)P.h};
+      } else {
+        sc_on = orig_part != NULL;
+        if (orig_part) sc = *orig_part;
+      }
+      enc = begin_pass(cb, cur_target, p, buf, 0, r, g, b, alpha);
+      bound = 0;
+      id<MTLTexture> src_tex = blur_layer_at(bdepth);
+      float comp[MB_INST];
+      memcpy(comp, f + (size_t)start * MB_INST, sizeof comp);
+      comp[0] = (float)L.px0 / sc_f;
+      comp[1] = (float)L.py0 / sc_f;
+      comp[2] = (float)L.w / sc_f;
+      comp[3] = (float)L.h / sc_f;
+      comp[4] = 0.0f;
+      comp[5] = 4.0f;
+      comp[6] = 0.0f;
+      comp[7] = 0.0f;
+      comp[8] = 1.0f;
+      comp[9] = 1.0f;
+      comp[10] = 1.0f;
+      float W = (float)src_tex.width, H = (float)src_tex.height;
+      comp[12] = (float)L.px0 / W;
+      comp[13] = (float)L.py0 / H;
+      comp[14] = (float)L.w / W;
+      comp[15] = (float)L.h / H;
+      comp[20] = comp[21] = comp[22] = comp[23] = 0.0f;
+      memset(comp + 32, 0, 8 * sizeof(float));
+      [enc setRenderPipelineState:kind_pipe(p, 4)];
+      [enc setFragmentTexture:src_tex atIndex:1];
+      [enc setVertexBytes:comp length:sizeof comp atIndex:0];
+      [enc setFragmentBytes:comp length:sizeof comp atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:1 baseInstance:0];
+      [enc setVertexBuffer:buf offset:0 atIndex:0];
+      [enc setFragmentBuffer:buf offset:0 atIndex:0];
+      [enc setFragmentTexture:atlas atIndex:1];
       start++;
       continue;
     }
@@ -3173,7 +3299,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       }
       clear_tex(cb, lv[0]);
       id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-      [bl copyFromTexture:bl_tex[bdepth] sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(L.px0, L.py0, 0)
+      [bl copyFromTexture:blur_layer_at(bdepth) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(L.px0, L.py0, 0)
                sourceSize:MTLSizeMake(L.w, L.h, 1) toTexture:lv[0] destinationSlice:0 destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
       [bl endEncoding];
@@ -3185,7 +3311,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       }
       int parent = bdepth - 1;
       while (parent >= 0 && !bstack[parent].active) parent--;
-      cur_target = parent >= 0 ? bl_tex[parent] : target;
+      cur_target = parent >= 0 ? blur_layer_at(parent) : target;
       if (parent >= 0) {
         BlurFrame P = bstack[parent];
         sc_on = 1;
@@ -3267,7 +3393,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       while (cs < cend_all) {
         int ctid = (int)f[cs * MB_INST + 20];
         int ck = (int)(f[cs * MB_INST + 5] + 0.5f);
-        if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ctid < 0) {
+        if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ck == 16 || ck == 17 || ctid < 0) {
           cs++;
           continue;
         }
@@ -3275,7 +3401,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
         int32_t ce = cs + 1;
         while (ce < cend_all && (int)f[ce * MB_INST + 20] == ctid) {
           int kk = (int)(f[ce * MB_INST + 5] + 0.5f);
-          if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15) break;
+          if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15 || kk == 16 || kk == 17) break;
           if (cown ? kk != ck : has_own_pipe(kk)) break;
           ce++;
         }
@@ -3332,7 +3458,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
     int32_t end = start + 1;
     while (end < count && (int)f[end * MB_INST + 20] == tid) {
       int k = (int)(f[end * MB_INST + 5] + 0.5f);
-      if (k == 8 || k == 14 || k == 15) break;
+      if (k == 8 || k == 14 || k == 15 || k == 16 || k == 17) break;
       if ((k == 9) != hole || (own ? k != kind : tid >= 0 && has_own_pipe(k))) break;
       if (tid == 0 && kind == 0 && rect_pipe && is_simple_rect(f, end) != simple) break;
       end++;
@@ -3432,6 +3558,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
     else draw_banded(enc, kp, f, start, end, count, tw, th);
     start = end;
   }
+  if (bstack != bstack_inline) free(bstack);
   [enc endEncoding];
   sc_on = 0;
 }

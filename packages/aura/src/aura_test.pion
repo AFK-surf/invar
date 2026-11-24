@@ -1,0 +1,307 @@
+// Wave 0A unit tests: View::shadows, CornerShape::Circular, View::group_alpha, View::focus_within,
+// CSS spread outer ring + gap fill ring, responsive breakpoint decoupling, SurfaceContext, and 13 atomics.
+
+import "halt"
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+fn w0_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    halt::saying("aura_test", msg)
+  }
+}
+
+fn w0_unwrap_tree(opt : Option[view::Tree]) -> view::Tree {
+  match opt {
+    Some(tr) => tr
+    None => halt::saying("aura_test", "missing tree")
+  }
+}
+
+fn w0_count_kind(sc : ui::Scene, want_kind : Int) -> Int {
+  let mut n = 0
+  let mut i = 0
+  while i < sc.ninst {
+    let k = (sc.inst[i * 60 + 5] + 0.5).to_int()
+    if k == want_kind {
+      n += 1
+    }
+    i += 1
+  }
+  n
+}
+
+test "w0_view_shadows_order_cache_invalidation_and_clear" {
+  let step = signals::signal(0)
+  let tree_ref : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    tree_ref.v = Some(root.tree)
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(80.0)))
+        .radius(view::Live::Is(12.0))
+        .corner_circular(view::Live::Is(true))
+        .ground(view::Live::Is(0xFFFFFFFFL))
+        .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+          let st = step.get()
+          if st == 0 {
+            [view::Shadow::drop(2.0, 2.0, 0xFF000040L), view::Shadow::drop(6.0, 4.0, 0x0000FF80L)]
+          } else if st == 1 {
+            [view::Shadow::drop(2.0, 2.0, 0xFF000040L), view::Shadow::drop(6.0, 9.0, 0x00FF0080L)]
+          } else {
+            []
+          }
+        }))
+    })
+  }, width=300.0, height=200.0)
+  let tr = w0_unwrap_tree(tree_ref.v)
+  let sc1 = ui::encode_tree_scene(tr, 300.0, 200.0, 2.0, 0.0)
+  let sh_idx : Array[Int] = []
+  let mut i = 0
+  while i < sc1.ninst {
+    if (sc1.inst[i * 60 + 5] + 0.5).to_int() == 2 {
+      sh_idx.push(i)
+    }
+    i += 1
+  }
+  w0_assert(sh_idx.length() == 2, "expected 2 shadow layers, got \{sh_idx.length()}")
+  let b0 = sh_idx[0] * 60
+  let b1 = sh_idx[1] * 60
+  w0_assert(sc1.inst[b0 + 7] == 2.0, "layer 0 sigma should be 2.0")
+  w0_assert(sc1.inst[b0 + 8] > 0.9 && sc1.inst[b0 + 10] < 0.1, "layer 0 should be red")
+  w0_assert(sc1.inst[b0 + 12] == 1.0, "layer 0 should be outside=true")
+  w0_assert(sc1.inst[b1 + 7] == 6.0, "layer 1 sigma should be 6.0")
+  w0_assert(sc1.inst[b1 + 10] > 0.9 && sc1.inst[b1 + 8] < 0.1, "layer 1 should be blue")
+
+  // Update only layer 1 color & dy -> ViewBlock cache MUST invalidate.
+  step.set(1)
+  let sc2 = ui::encode_tree_scene(tr, 300.0, 200.0, 2.0, 16.0)
+  let sh2 : Array[Int] = []
+  let mut j = 0
+  while j < sc2.ninst {
+    if (sc2.inst[j * 60 + 5] + 0.5).to_int() == 2 {
+      sh2.push(j)
+    }
+    j += 1
+  }
+  w0_assert(sh2.length() == 2, "expected 2 shadows after layer 1 update")
+  let nb1 = sh2[1] * 60
+  w0_assert(sc2.inst[nb1 + 9] > 0.9 && sc2.inst[nb1 + 10] < 0.1, "layer 1 should now be green after ViewBlock invalidation")
+  w0_assert(sc2.inst[nb1 + 13] == 9.0, "layer 1 dy should be 9.0")
+
+  // Clear shadows array -> zero shadows emitted.
+  step.set(2)
+  let sc3 = ui::encode_tree_scene(tr, 300.0, 200.0, 2.0, 32.0)
+  w0_assert(w0_count_kind(sc3, 2) == 0, "expected 0 shadows after clearing array")
+  t.dispose()
+}
+
+test "w0_corner_circular_body_and_clip_sentinel_survives_viewblock_replay" {
+  let xoff = signals::signal(0.0)
+  let tree_ref : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    tree_ref.v = Some(root.tree)
+    let _ = root.box(fn(card : view::View) -> Unit {
+      let _ = card
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(120.0)))
+        .radius(view::Live::Is(24.0))
+        .corner_circular(view::Live::Is(true))
+        .clips(view::Live::Is(true))
+        .ground(view::Live::Is(0xFFFFFFFFL))
+      let _ = card.box(fn(child : view::View) -> Unit {
+        let _ = child
+          .width(view::Live::Is(Some(180.0)))
+          .height(view::Live::Is(Some(100.0)))
+          .offset(view::Live::By(fn() -> (Double, Double) { (xoff.get(), 0.0) }))
+          .corners(view::Live::Is(Some((16.0, 8.0, 0.0, 24.0))))
+          .corner_circular(view::Live::Is(true))
+          .ground(view::Live::Is(0x0485F7FFL))
+      })
+    })
+  }, width=300.0, height=200.0)
+  let tr = w0_unwrap_tree(tree_ref.v)
+  let sc1 = ui::encode_tree_scene(tr, 300.0, 200.0, 2.0, 0.0)
+  let rects : Array[Int] = []
+  let mut i = 0
+  while i < sc1.ninst {
+    if (sc1.inst[i * 60 + 5] + 0.5).to_int() == 0 {
+      rects.push(i)
+    }
+    i += 1
+  }
+  w0_assert(rects.length() >= 2, "expected card + child rects")
+  let cb = rects[0] * 60
+  w0_assert(sc1.inst[cb + 36] == -24.0 && sc1.inst[cb + 37] == -24.0, "card circular rr should be -24")
+  let kb = rects[1] * 60
+  w0_assert(sc1.inst[kb + 36] == -16.0 && sc1.inst[kb + 37] == -8.0 && sc1.inst[kb + 38] == 0.0 && sc1.inst[kb + 39] == -24.0, "child asymmetric circular rr")
+  w0_assert(sc1.inst[kb + 24] == 24.0, "child inherited clip rc must stay positive 24")
+  w0_assert(sc1.inst[kb + 28] == -1.0 && sc1.inst[kb + 29] == -1.0 && sc1.inst[kb + 30] == -1.0 && sc1.inst[kb + 31] == -1.0, "child inherited clip rs must be -1.0 sentinel")
+
+  // Frame 2: translate child so it hits ViewBlock cached replay -> rs == -1.0 MUST NOT be zeroed!
+  xoff.set(4.0)
+  let sc2 = ui::encode_tree_scene(tr, 300.0, 200.0, 2.0, 16.0)
+  let rects2 : Array[Int] = []
+  let mut j = 0
+  while j < sc2.ninst {
+    if (sc2.inst[j * 60 + 5] + 0.5).to_int() == 0 {
+      rects2.push(j)
+    }
+    j += 1
+  }
+  let kb2 = rects2[1] * 60
+  w0_assert(sc2.inst[kb2 + 28] == -1.0 && sc2.inst[kb2 + 31] == -1.0, "ViewBlock replay must preserve rs = -1.0 sentinel")
+  t.dispose()
+}
+
+test "w0_group_alpha_push_pop_bounds_and_glass_exclusion" {
+  let ga = signals::signal(0.5)
+  let tree_ref : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    tree_ref.v = Some(root.tree)
+    let _ = root.box(fn(grp : view::View) -> Unit {
+      let _ = grp
+        .width(view::Live::Is(Some(140.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .group_alpha(view::Live::By(fn() -> Double { ga.get() }))
+        .ground(view::Live::Is(0x0485F7FFL))
+        .shadows(view::Live::Is([view::Shadow::drop(6.0, -6.0, 0x00000040L)]))
+      let _ = grp.words(view::Live::Is("Disabled"), look=view::words_plain).ink(view::Live::Is(0xFFFFFFFFL))
+    })
+    // Subtree with frosted glass MUST NOT emit kind 16/17.
+    let _ = root.box(fn(gwrap : view::View) -> Unit {
+      let _ = gwrap
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .group_alpha(view::Live::Is(0.5))
+      let _ = gwrap.box(fn(gl : view::View) -> Unit {
+        let _ = gl
+          .width(view::Live::Is(Some(80.0)))
+          .height(view::Live::Is(Some(30.0)))
+          .glass(view::Live::Is(Some(paint::Glass::frosted(blur=12.0, tint=0x00000080L, solid=0x00000080L))))
+      })
+    })
+  }, width=400.0, height=300.0)
+  let tr = w0_unwrap_tree(tree_ref.v)
+  let sc_half = ui::encode_tree_scene(tr, 400.0, 300.0, 2.0, 0.0)
+  w0_assert(w0_count_kind(sc_half, 16) == 1, "exactly 1 PUSH_GROUP_ALPHA (glass subtree excluded)")
+  w0_assert(w0_count_kind(sc_half, 17) == 1, "exactly 1 POP_GROUP_ALPHA")
+
+  // At alpha = 1.0: zero offscreen group layers.
+  ga.set(1.0)
+  let sc_full = ui::encode_tree_scene(tr, 400.0, 300.0, 2.0, 16.0)
+  w0_assert(w0_count_kind(sc_full, 16) == 0, "group_alpha=1.0 must have zero overhead")
+  w0_assert(w0_count_kind(sc_full, 17) == 0, "group_alpha=1.0 must emit zero POP_GROUP_ALPHA")
+
+  // At alpha = 0.0: zero offscreen group layers and skipped subtree.
+  ga.set(0.0)
+  let sc_zero = ui::encode_tree_scene(tr, 400.0, 300.0, 2.0, 32.0)
+  w0_assert(w0_count_kind(sc_zero, 16) == 0, "group_alpha=0.0 must emit zero PUSH_GROUP_ALPHA")
+  t.dispose()
+}
+
+test "w0_focus_within_and_two_layer_gap_ring_and_css_spread" {
+  let parent_fw = view::ref_new(false)
+  let child_id = view::ref_new(view::NodeId::{ at: -1, gen: 0 })
+  let tree_ref : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    tree_ref.v = Some(root.tree)
+    let _ = root.box(fn(wrapper : view::View) -> Unit {
+      let _ = wrapper
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .corners(view::Live::Is(Some((18.0, 0.0, 0.0, 18.0))))
+        .corner_circular(view::Live::Is(true))
+        .ground(view::Live::By(fn() -> Int64 {
+          parent_fw.v = wrapper.focus_within()
+          0xFFFFFFFFL
+        }))
+        .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+          if wrapper.focus_within() { (2.0, 2.0, 0x0485F7FFL) } else { (0.0, 0.0, 0L) }
+        }))
+        .ring_gap_color(view::Live::Is(0xF5F5F5FFL))
+      let _ = wrapper.box(fn(inner : view::View) -> Unit {
+        child_id.v = inner.id()
+        let _ = inner
+          .width(view::Live::Is(Some(100.0)))
+          .height(view::Live::Is(Some(28.0)))
+          .focusable(view::Live::Is(true))
+      })
+    })
+  }, width=300.0, height=120.0)
+  let tr = w0_unwrap_tree(tree_ref.v)
+  w0_assert(!parent_fw.v, "focus_within initially false")
+  let ok = tr.focus_to(Some(child_id.v), visible=true)
+  w0_assert(ok, "focus_to child should succeed")
+  let sc = ui::encode_tree_scene(tr, 300.0, 120.0, 2.0, 16.0)
+  w0_assert(parent_fw.v, "focus_within should become true when child is focused")
+  let k0 : Array[Int] = []
+  let mut i = 0
+  while i < sc.ninst {
+    if (sc.inst[i * 60 + 5] + 0.5).to_int() == 0 {
+      k0.push(i)
+    }
+    i += 1
+  }
+  w0_assert(k0.length() == 3, "expected ground + gap ring + outer ring (3 kind=0), got \{k0.length()}")
+  let ob = k0[2] * 60
+  w0_assert(sc.inst[ob + 36] == -22.0 && sc.inst[ob + 37] == 0.0 && sc.inst[ob + 38] == 0.0 && sc.inst[ob + 39] == -22.0, "CSS spread per-corner circular ring radii")
+
+  let _ = tr.focus_to(None, visible=false)
+  let _ = tr.frame(300.0, 120.0, now=32.0)
+  w0_assert(!parent_fw.v, "focus_within should return to false when focus leaves")
+  t.dispose()
+}
+
+test "w0_breakpoints_decoupled_from_pointer_and_surface_ctx_and_atomics" {
+  let is_md_seen = view::ref_new(false)
+  let is_coarse_seen = view::ref_new(false)
+  let nested_level = view::ref_new(AuraSurfaceLevel::Primary)
+  let tree_ref : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    tree_ref.v = Some(root.tree)
+    let cfg = signals::signal(AuraConfig::light())
+    let _ = aura_provide_config(root, cfg)
+    let _ = root.pad(view::Live::Is(16.0)).gap(view::Live::Is(12.0))
+    let _ = root.box(fn(probe : view::View) -> Unit {
+      let _ = probe.ground(view::Live::By(fn() -> Int64 {
+        is_md_seen.v = aura_is_md(probe)
+        is_coarse_seen.v = aura_is_coarse_pointer(probe)
+        0x00000000L
+      }))
+    })
+    let _ = surface_node(root, variant=AuraSurfaceVariant::Secondary, pad=12.0, gap=8.0, content=fn(s : view::View) -> Unit {
+      let _ = surface_node(s, variant=AuraSurfaceVariant::Transparent, content=fn(tr_v : view::View) -> Unit {
+        nested_level.v = aura_surface_level_of(tr_v)
+      })
+      let _ = label_node(s, view::Live::Is("Email"), required=true)
+      let _ = w0_field_shell(s, content=fn(f : view::View) -> Unit {
+        let _ = description_node(f, view::Live::Is("Enter email"))
+      })
+      let _ = field_error_node(s, view::Live::Is("Required"), visible=view::Live::Is(true))
+      let _ = separator_node(s)
+      let _ = button_node(s, view::Live::Is("Submit"), variant=AuraButtonVariant::Primary)
+      let _ = close_button_node(s, size=AuraButtonSize::Md)
+      let _ = spinner_node(s, size=AuraSpinnerSize::Sm)
+      let _ = aura_icon_node(s, AuraIconKind::CircleCheck, size=16.0)
+    })
+  }, width=748.0, height=400.0)
+  let tr = w0_unwrap_tree(tree_ref.v)
+  w0_assert(!is_md_seen.v, "748pt should be below md (768pt)")
+  w0_assert(nested_level.v is AuraSurfaceLevel::Secondary, "Transparent surface must not override ambient Secondary")
+  assert_aura_ui(t, label="w0_atomics_748")
+
+  let _ = tr.frame(788.0, 400.0, now=16.0)
+  w0_assert(is_md_seen.v, "788pt should be >= md (768pt)")
+  w0_assert(!is_coarse_seen.v, "default pointer is not coarse")
+
+  ui::set_pointing(Some(ui::Pointing::Finger))
+  let _ = tr.frame(788.0, 400.0, now=32.0)
+  w0_assert(is_md_seen.v, "md breakpoint must stay true under Finger at 788pt")
+  w0_assert(is_coarse_seen.v, "coarse pointer must reflect Finger")
+  ui::set_pointing(None)
+  t.dispose()
+}

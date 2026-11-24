@@ -32,6 +32,7 @@ extern "C" {
 int mb_render_init_offscreen(double w, double h, double scale);
 void invar_win_shader_stats(int *baked_hits, int *disk_hits, int *runtime_compiles);
 void invar_win_shader_stats_reset(void);
+void invar_win_test_fail_blur_depth(int depth);
 
 size_t invar_test_array_length(const void *p) {
   (void)p;
@@ -884,6 +885,88 @@ static int run_warp_smoke(void) {
               32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
               0.6, 14.0, 0.0, 1.0, -4.0, 20.0, 0.06, 12.0);
     if (!render_and_sample(inst, n, 0.1, 0.1, 0.12, 20, 20, &r, &g, &b)) return 0;
+  }
+
+  // Group alpha (kind 16/17): overlapping opaque rects at alpha=0.5 -> exact 0.5 (128, 0, 0), NOT 0.75 (191, 0, 0)
+  {
+    int n = 0;
+    push_inst(inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 16.0, 0.0, 0.0,
+              0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 0.0, 0.0, 0.0,
+              1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 0.0, 0.0, 0.0,
+              1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 17.0, 0.0, 0.0,
+              1.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 0.0, 0.0, 100, 100, &r, &g, &b)) return 0;
+    ok &= check_rgb("GroupAlpha kind 16/17 overlapping opaque rects at 0.5", r, g, b, 128, 0, 0, 2);
+  }
+
+  // Group alpha (kind 16/17): empty capture rect suppresses all child & nested draws (0 leaked pixels), sibling draws cleanly
+  {
+    int n = 0;
+    push_inst(inst, &n, -100.0, 0.0, 50.0, 50.0, 0.0, 16.0, 0.0, 0.0,
+              0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
+              1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 0.0, 0.0, 160.0, 120.0, 0.0, 16.0, 0.0, 0.0,
+              0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
+              0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 0.0, 0.0, 160.0, 120.0, 0.0, 17.0, 0.0, 0.0,
+              1.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, -100.0, 0.0, 50.0, 50.0, 0.0, 17.0, 0.0, 0.0,
+              1.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 100.0, 60.0, 40.0, 40.0, 0.0, 0.0, 0.0, 0.0,
+              0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 0.0, 0.0, 50, 50, &r, &g, &b)) return 0;
+    ok &= check_rgb("GroupAlpha empty capture rect zero leaked pixels", r, g, b, 0, 0, 0, 0);
+    if (!render_and_sample(inst, n, 0.0, 0.0, 0.0, 240, 160, &r, &g, &b)) return 0;
+    ok &= check_rgb("GroupAlpha sibling after empty capture draws cleanly", r, g, b, 0, 0, 255, 2);
+  }
+
+  // Group alpha (kind 16/17): depth 9 nested layers (dynamic bl_lv > 8) -> exact 0.5 (128, 0, 0)
+  {
+    static double deep_inst[24 * INST_SIZE];
+    int n = 0;
+    for (int d = 0; d < 9; d++) {
+      push_inst(deep_inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 16.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    push_inst(deep_inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 0.0, 0.0, 0.0,
+              1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(deep_inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 0.0, 0.0, 0.0,
+              1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(deep_inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 17.0, 0.0, 0.0,
+              1.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (int d = 1; d < 9; d++) {
+      push_inst(deep_inst, &n, 10.0, 10.0, 80.0, 80.0, 0.0, 17.0, 0.0, 0.0,
+                1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    if (!render_and_sample(deep_inst, n, 0.0, 0.0, 0.0, 100, 100, &r, &g, &b)) return 0;
+    ok &= check_rgb("GroupAlpha depth 9 overlapping opaque rects at 0.5", r, g, b, 128, 0, 0, 2);
+  }
+
+  // Group alpha (kind 16/17): controlled offscreen layer allocation failure skips subtree (0 leaked child pixels)
+  // and renders subsequent sibling cleanly on parent target
+  {
+    int n = 0;
+    push_inst(inst, &n, 10.0, 10.0, 60.0, 60.0, 0.0, 16.0, 0.0, 0.0,
+              0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 10.0, 60.0, 60.0, 0.0, 0.0, 0.0, 0.0,
+              1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 10.0, 60.0, 60.0, 0.0, 17.0, 0.0, 0.0,
+              1.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 90.0, 40.0, 40.0, 40.0, 0.0, 0.0, 0.0, 0.0,
+              0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    invar_win_test_fail_blur_depth(0);
+    int s1 = render_and_sample(inst, n, 0.0, 0.0, 1.0, 80, 80, &r, &g, &b);
+    int r1 = r, g1 = g, b1 = b;
+    int s2 = render_and_sample(inst, n, 0.0, 0.0, 1.0, 220, 120, &r, &g, &b);
+    invar_win_test_fail_blur_depth(-1);
+    if (!s1 || !s2) return 0;
+    ok &= check_rgb("GroupAlpha alloc failure skips subtree (parent stays blue)", r1, g1, b1, 0, 0, 255, 2);
+    ok &= check_rgb("GroupAlpha alloc failure sibling draws green cleanly", r, g, b, 0, 255, 0, 2);
   }
 
   if (!run_v8_v9_2d_roi()) ok = 0;

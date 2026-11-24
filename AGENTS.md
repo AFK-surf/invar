@@ -67,7 +67,7 @@ pub fn main(world : World) -> Int {
 - 100% of Liquid Glass UI must be built from `packages/lg` components. Before building any glass surface, control, toolbar, panel, menu, or overlay, look up the right component in [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) and read [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md).
 - Downstream repos must enforce two automated gates:
   1. Static grep gate: `grep -rn "Glass::liquid" src/` must return **0 hits** outside `invar/packages/lg`.
-  2. Runtime/layout test gate: every UI test suite must run `lg::assert_no_nested_glass(t, label="...")` (exported from `packages/lg/src/audit.pion`).
+  2. Runtime/layout test gate: every UI test suite must run `lg::assert_no_nested_glass(t, label="...")` (for Liquid Glass apps) or `aura::assert_aura_ui(t, label="...")` (for `packages/aura` apps, which enforces `ui_craft_audit()` minus `corner:`, `unasked_faults()`, and zero `Glass::liquid`).
 
 ### 1.3 Upstream missing primitives to `AFK-surf/invar` first
 - If `packages/lg` lacks a desktop size, variant, or reusable glass primitive, **add it to `AFK-surf/invar` (`packages/lg`) first** with full unit tests and offscreen verification. Never degrade or hand-roll a one-off glass surface in downstream business code.
@@ -111,7 +111,7 @@ pub fn build_page(root : view::View, field : ui::Field, on_send : () -> Unit) ->
   2. **Unbounded flex ancestor**: wrapping a scroller in `parent.box(...)` without `.fill()` or `.min_height(Is(Some(0.0)))` lets the ancestor expand to full content height, leaving `reach == 0` (silent non-scrolling).
   3. **Calling `.scrolls(...)` on a container that already has sibling children**: mutating `parent` into a scroller after adding headers/footers breaks layout and clipping; always wrap the scrollable region in its own child box (`ui::scroll_box` / `View::scroll_box`).
   4. **Using `clips(true)` alone or raw `View::scrolls` without `bar` / `slop`**: clipping does not scroll, and raw `View::scrolls` without `bar=ui::tree_scroll_bar(), slop=ui::touch_slop()` drops scrollbars and touch-slop ergonomics; prefer `<lg::PageShell>` or `ui::scroll_box`.
-- **Mandatory test gate**: every UI test suite must run `lg::assert_apple_ui(t, label="...")` (which checks zero nested glass, content-layer glass limits, `t.scroll_faults().length() == 0`, and `t.assert_ui_craft()`).
+- **Mandatory test gate**: every UI test suite must run `lg::assert_apple_ui(t, label="...")` (for `packages/lg` apps: zero nested glass, content-layer glass limits, `t.scroll_faults().length() == 0`, and `t.assert_ui_craft()`) or `aura::assert_aura_ui(t, label="...")` (for `packages/aura` apps: standard solid-surface layout, zero `Glass::liquid`, `t.ui_craft_audit()` minus `corner:`, and `t.unasked_faults()`). First-frame quiet allowlist for Aura exempts `Spinner`, `Skeleton`, indeterminate `ProgressBar`/`ProgressCircle`, and `Toast` entrance (all static when `reduced_motion == true`).
 
 ### 1.5 Keep all 4 GPU renderers in lockstep
 - Any shader, optical transfer model (including 15-tap trimmed-mean temporal adaptive liquid glass and 9-tap small-sigma progressive blur), or instance-layout change in the GPU renderer **MUST** be updated simultaneously across all 4 backends:

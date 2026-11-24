@@ -1,0 +1,281 @@
+// Headless InputOTP behavior over `headless_core::OtpState`.
+// Strictly zero `ui` dependency: receives committed text / selection / edit callbacks
+// from an outer look library (e.g. `packages/aura` bridging its single `ui::Field`),
+// and exposes reactive slot snapshots and accessibility semantics.
+
+import "headless_core"
+import "signals"
+import "view"
+
+/// Headless OTP controller holding reactive `headless_core::OtpState` and accessibility bindings.
+pub struct InputOtp {
+  allow_ : (Int) -> Bool
+  disabled_ : () -> Bool
+  invalid_ : () -> Bool
+  label_ : () -> String
+  description_ : () -> String
+  state_ : signals::Signal[headless_core::OtpState]
+  on_change_ : (String) -> Unit
+  on_complete_ : (String) -> Unit
+  node_ : signals::Signal[Option[view::View]]
+  mut focus_target_ : Option[() -> Bool]
+}
+
+/// Create a headless `InputOtp` controller for `max_length` slots.
+/// When mounting with `owns_focus=false` (e.g. an outer `ui::Field` owns keyboard focus & IME),
+/// pass `focus_target` (or call `set_focus_target` inside `root`'s look closure) so `focus()` and
+/// slot clicks focus that field, and mirror its focus state into `set_focused(...)`.
+pub fn InputOtp::new(
+  max_length : Int,
+  value~ : String = "",
+  allow~ : (Int) -> Bool = headless_core::otp_is_digit,
+  label~ : () -> String = fn() { "One-time code" },
+  description~ : () -> String = fn() { "" },
+  disabled~ : () -> Bool = fn() { false },
+  invalid~ : () -> Bool = fn() { false },
+  on_change~ : (String) -> Unit = fn(_) { () },
+  on_complete~ : (String) -> Unit = fn(_) { () },
+  focus_target? : () -> Bool,
+) -> InputOtp {
+  let init = headless_core::otp_init(max_length, initial=value, allow=allow)
+  InputOtp::{
+    allow_: allow,
+    disabled_: disabled,
+    invalid_: invalid,
+    label_: label,
+    description_: description,
+    state_: signals::signal_by(init, fn(a, b) { a == b }),
+    on_change_: on_change,
+    on_complete_: on_complete,
+    node_: signals::signal_by(None, same_node),
+    focus_target_: focus_target,
+  }
+}
+
+/// Bind or replace the external focus target callback (used when `owns_focus=false`).
+pub fn InputOtp::set_focus_target(self : InputOtp, target : () -> Bool) -> Unit {
+  self.focus_target_ = Some(target)
+}
+
+fn InputOtp::apply(self : InputOtp, step : headless_core::OtpStep) -> Unit {
+  self.state_.set(step.state)
+  if step.changed {
+    (self.on_change_)(step.state.value)
+  }
+  if step.completed {
+    (self.on_complete_)(step.state.value)
+  }
+}
+
+/// Current normalized OTP value (tracked).
+pub fn InputOtp::value(self : InputOtp) -> String {
+  self.state_.get().value
+}
+
+/// Configured slot count.
+pub fn InputOtp::max_length(self : InputOtp) -> Int {
+  self.state_.get().max_length
+}
+
+/// Currently active slot index (tracked).
+pub fn InputOtp::active_index(self : InputOtp) -> Int {
+  self.state_.get().active_index
+}
+
+/// Whether the OTP control is currently focused (tracked).
+pub fn InputOtp::focused(self : InputOtp) -> Bool {
+  self.state_.get().is_focused
+}
+
+/// Whether the OTP control is disabled (tracked).
+pub fn InputOtp::disabled(self : InputOtp) -> Bool {
+  (self.disabled_)()
+}
+
+/// Whether the OTP control is marked invalid (tracked).
+pub fn InputOtp::invalid(self : InputOtp) -> Bool {
+  (self.invalid_)()
+}
+
+/// Whether all `max_length` slots are filled (tracked).
+pub fn InputOtp::is_complete(self : InputOtp) -> Bool {
+  self.state_.get().is_complete
+}
+
+/// Reactive snapshot of all slots (tracked).
+pub fn InputOtp::slots(self : InputOtp) -> Array[headless_core::OtpSlot] {
+  headless_core::otp_slots(self.state_.get())
+}
+
+/// Reactive snapshot of slot `index` (returns an empty inactive slot if out of range).
+pub fn InputOtp::slot(self : InputOtp, index : Int) -> headless_core::OtpSlot {
+  let all = self.slots()
+  if index >= 0 && index < all.length() {
+    all[index]
+  } else {
+    headless_core::OtpSlot::{ index, char: "", is_active: false, has_fake_caret: false }
+  }
+}
+
+/// Commit normalized text (e.g. from IME commit or controlled text change).
+pub fn InputOtp::commit_text(
+  self : InputOtp,
+  text : String,
+  selection_start~ : Int = -1,
+  selection_end~ : Int = -1,
+) -> Unit {
+  if signals::untracked(self.disabled_) {
+    return
+  }
+  let cur = self.state_.untracked()
+  let step = headless_core::otp_commit_text(
+    cur,
+    text,
+    selection_start=selection_start,
+    selection_end=selection_end,
+    allow=self.allow_,
+  )
+  self.apply(step)
+}
+
+/// Replace the code-point range `[start, end)` with `text` (mid-segment edit / IME replacement).
+pub fn InputOtp::replace_range(self : InputOtp, start : Int, end : Int, text : String) -> Unit {
+  if signals::untracked(self.disabled_) {
+    return
+  }
+  let cur = self.state_.untracked()
+  let step = headless_core::otp_replace_range(cur, start, end, text, allow=self.allow_)
+  self.apply(step)
+}
+
+/// Handle a full-string paste (filters invalid characters and truncates to `max_length`).
+pub fn InputOtp::paste(self : InputOtp, text : String) -> Unit {
+  if signals::untracked(self.disabled_) {
+    return
+  }
+  let cur = self.state_.untracked()
+  let step = headless_core::otp_paste(cur, text, allow=self.allow_)
+  self.apply(step)
+}
+
+/// Handle backspace key press.
+pub fn InputOtp::backspace(self : InputOtp) -> Unit {
+  if signals::untracked(self.disabled_) {
+    return
+  }
+  let cur = self.state_.untracked()
+  let step = headless_core::otp_backspace(cur)
+  self.apply(step)
+}
+
+/// Update active slot selection range `[start, end)`.
+pub fn InputOtp::set_selection(self : InputOtp, start : Int, end : Int) -> Unit {
+  let cur = self.state_.untracked()
+  self.state_.set(headless_core::otp_select(cur, start, end))
+}
+
+/// Update focus state.
+pub fn InputOtp::set_focused(self : InputOtp, focused : Bool) -> Unit {
+  let cur = self.state_.untracked()
+  self.state_.set(headless_core::otp_set_focused(cur, focused))
+}
+
+/// Clear the OTP value.
+pub fn InputOtp::clear(self : InputOtp) -> Unit {
+  self.commit_text("", selection_start=0, selection_end=0)
+}
+
+/// Focus the OTP control: delegates to `focus_target` if bound (e.g. an outer `ui::Field` under
+/// `owns_focus=false`), otherwise requests focus on the mounted root node when alive and not disabled.
+pub fn InputOtp::focus(self : InputOtp) -> Bool {
+  if signals::untracked(self.disabled_) {
+    return false
+  }
+  match self.focus_target_ {
+    Some(f) => f()
+    None =>
+    match self.node_.untracked() {
+      Some(n) => if n.alive() { n.ask_focus(visible=true) } else { false }
+      None => false
+    }
+  }
+}
+
+/// Mount the OTP root container.
+/// - `owns_focus=true` (default, for headless tests or external text sources): makes the root focusable
+///   with `Role::TextField` and syncs its focus into `self.set_focused(...)`.
+/// - `owns_focus=false` (recommended for look libraries such as `packages/aura` that mount a single
+///   `ui::Field` inside the root): keeps the root non-focusable without `Role::TextField` so no nested
+///   text fields exist; bind `set_focus_target(...)` (or `focus_target`) and mirror the field's focus
+///   into `set_focused(...)` so slot clicks focus the field and active-slot / fake-caret state stays live.
+pub fn InputOtp::root(
+  self : InputOtp,
+  parent : view::View,
+  look : (view::View, InputOtp) -> Unit,
+  owns_focus~ : Bool = true,
+  in_node~ : Bool = false,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  let setup = fn(v : view::View) {
+    self.node_.set(Some(v))
+    let _ = v.owns(fn() {
+      if same_node(self.node_.untracked(), Some(v)) {
+        self.node_.set(None)
+      }
+    })
+    look(v, self)
+    if owns_focus {
+      let able = fn() -> Bool { !(self.disabled_)() }
+      let _ = v
+      .presses(view::Live::By(able))
+      .focusable(view::Live::By(able), keys=0)
+      .says(view::Live::By(fn() -> Option[view::Said] {
+        Some(view::said(
+          view::Role::TextField,
+          label=(self.label_)(),
+          description=(self.description_)(),
+          value=self.value(),
+        ))
+      }))
+      .on_press(fn() {
+        if able() {
+          let _ = v.ask_focus()
+        }
+      })
+      v.reacts(
+        fn() -> Bool { v.focused() },
+        fn(now : Bool) { self.set_focused(now) },
+      )
+    }
+  }
+  if in_node {
+    setup(parent)
+    parent
+  } else {
+    parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
+  }
+}
+
+/// Mount an individual OTP slot node; pressing it moves the active slot to `index` and focuses the OTP root.
+pub fn InputOtp::slot_node(
+  self : InputOtp,
+  parent : view::View,
+  index : Int,
+  look : (view::View, () -> headless_core::OtpSlot) -> Unit,
+  made_for? : String,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(fn(v : view::View) {
+    look(v, fn() -> headless_core::OtpSlot { self.slot(index) })
+    let able = fn() -> Bool { !(self.disabled_)() }
+    let _ = v
+    .presses(view::Live::By(able))
+    .on_press(fn() {
+      if able() {
+        self.set_selection(index, index + 1)
+        let _ = self.focus()
+      }
+    })
+  }, made_for=resolve_made_for(made_for, loc), loc=loc)
+}

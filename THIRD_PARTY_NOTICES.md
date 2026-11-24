@@ -428,3 +428,26 @@ PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
     `packages/host/tools/fetch-webview2.sh`.
   - Subject to the Microsoft Software License Terms for Microsoft.Web.WebView2
     1.0.4258.31 (<https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.4258.31/License>).
+
+---
+
+## 20. HeroUI v3, `@gravity-ui/icons`, and Inter (`packages/aura`)
+
+- **HeroUI v3 (`v3.2.8` @ `c3373a1557c469dc823d78e56d53f0abaad89135`)**:
+  - **Files**: `packages/aura/src/*.pion`, `packages/aura_shots/src/*.pion`.
+  - **Source**: <https://github.com/heroui-inc/heroui>
+  - **License**: Apache-2.0 (full text in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt))
+  - **Copyright**: `Copyright 2025 NextUI Inc.`
+  - **Modifications**: Design tokens, semantic surface hierarchy, elevation
+    shadows, focus ring rules, and component architecture ported to Pion.
+- **`@gravity-ui/icons` (`2.23.1`)**:
+  - **Files**: `packages/aura/src/icons.pion`.
+  - **Source**: <https://github.com/gravity-ui/icons>
+  - **License**: MIT (full text in [`LICENSES/MIT-gravity-ui.txt`](LICENSES/MIT-gravity-ui.txt))
+  - **Copyright**: `Copyright (c) 2022 YANDEX LLC`
+  - **Modifications**: 15 built-in monochrome icon vector paths ported to Pion.
+- **Inter Typeface**:
+  - **Files**: `web/inter.woff2` (loaded via `ui::face_add` in `packages/aura_shots`).
+  - **Source**: <https://github.com/rsms/inter>
+  - **License**: SIL Open Font License 1.1 (full text in [`LICENSES/OFL-1.1.txt`](LICENSES/OFL-1.1.txt))
+  - **Copyright**: `Copyright 2016 The Inter Project Authors`

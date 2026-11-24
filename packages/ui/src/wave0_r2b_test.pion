@@ -1,0 +1,630 @@
+// Wave 0 R2-B: View::shadows as view::Shadow (dx, spread, cache), one node alpha over a ground and its edge, group
+// alpha with blur on one node and past the renderers' layers, and a turned piece's reach inside a captured layer.
+
+import "signals"
+import "view"
+
+fn r2b_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    halt::saying("wave0_r2b_test", msg)
+  }
+}
+
+fn r2b_near(a : Double, b : Double) -> Bool {
+  let d = a - b
+  d < 1.0e-6 && d > -1.0e-6
+}
+
+fn r2b_kinds(sc : Scene, kind : Int) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < sc.ninst {
+    if (sc.inst[i * inst_size + 5] + 0.5).to_int() == kind {
+      out.push(i)
+    }
+    i += 1
+  }
+  out
+}
+
+fn r2b_tree(tr : signals::Ref[Option[view::Tree]]) -> view::Tree {
+  match tr.v {
+    Some(t) => t
+    None => halt::saying("wave0_r2b_test", "missing tree")
+  }
+}
+
+/// What the four renderers' kind 0 writes (its alpha, premultiplied) where its edge lies whole over its ground (inner 0,
+/// cover 1): `view_host` composites translucent edges src-over ground in CPU (`over_rgba`) before multiplying once by
+/// `d.alpha`, so the shader's `mix(bc, fill, inner)` outputs `bc.a` directly without double-fading.
+fn r2b_edge_alpha(sc : Scene, i : Int) -> Double {
+  let b = i * inst_size
+  sc.inst[b + 15]
+}
+
+test "r2b: View::shadows carries dx, dy, sigma and spread to kind 2, and a change of any one is drawn anew" {
+  let layer = signals::signal(view::Shadow::of(dx=3.0, dy=4.0, sigma=2.0, spread=5.0, 0x000000FFL))
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .radius(view::Live::Is(10.0))
+        .ground(view::Live::Is(0xFFFFFFFFL))
+        .shadows(view::Live::By(fn() -> Array[view::Shadow] { [layer.get()] }))
+    })
+  }, width=300.0, height=200.0)
+  let tree = r2b_tree(tr)
+  let sc = encode_tree_scene(tree, 300.0, 200.0, 2.0, 0.0)
+  let sh = r2b_kinds(sc, 2)
+  r2b_assert(sh.length() == 1, "one shadow layer, got \{sh.length()}")
+  let g = r2b_kinds(sc, 0)
+  r2b_assert(g.length() >= 1, "its ground")
+  let gb = g[0] * inst_size
+  let (x, y, w, h) = (sc.inst[gb], sc.inst[gb + 1], sc.inst[gb + 2], sc.inst[gb + 3])
+  let b = sh[0] * inst_size
+  r2b_assert(r2b_near(sc.inst[b], x - 5.0 + 3.0), "x spread by 5 and moved by dx 3: \{sc.inst[b]} vs \{x}")
+  r2b_assert(r2b_near(sc.inst[b + 1], y - 5.0 + 4.0), "y spread by 5 and moved by dy 4")
+  r2b_assert(r2b_near(sc.inst[b + 2], w + 10.0) && r2b_near(sc.inst[b + 3], h + 10.0), "w, h grown by twice the spread")
+  r2b_assert(r2b_near(sc.inst[b + 4], 15.0), "a square corner grows by the spread: 10 + 5, got \{sc.inst[b + 4]}")
+  r2b_assert(r2b_near(sc.inst[b + 7], 2.0), "sigma")
+  r2b_assert(sc.inst[b + 12] == 1.0, "outside only")
+  r2b_assert(r2b_near(sc.inst[b + 13], 4.0) && r2b_near(sc.inst[b + 14], 3.0), "the box's offset back: dy in p13, dx in p14")
+  r2b_assert(r2b_near(sc.inst[b + 15], 5.0), "its spread in p15")
+  // (spread alone changed: the cached block is not reused)
+  layer.set(view::Shadow::of(dx=3.0, dy=4.0, sigma=2.0, spread=-2.0, 0x000000FFL))
+  let sc2 = encode_tree_scene(tree, 300.0, 200.0, 2.0, 16.0)
+  let sh2 = r2b_kinds(sc2, 2)
+  r2b_assert(sh2.length() == 1, "still one layer")
+  let b2 = sh2[0] * inst_size
+  r2b_assert(r2b_near(sc2.inst[b2 + 2], w - 4.0), "a negative spread shrinks it: \{sc2.inst[b2 + 2]}")
+  r2b_assert(r2b_near(sc2.inst[b2 + 15], -2.0), "the new spread drawn")
+  // (dx alone changed)
+  layer.set(view::Shadow::of(dx=-7.0, dy=4.0, sigma=2.0, spread=-2.0, 0x000000FFL))
+  let sc3 = encode_tree_scene(tree, 300.0, 200.0, 2.0, 32.0)
+  let b3 = r2b_kinds(sc3, 2)[0] * inst_size
+  r2b_assert(r2b_near(sc3.inst[b3], x + 2.0 - 7.0) && r2b_near(sc3.inst[b3 + 14], -7.0), "the new dx drawn")
+  // (Shadow::drop is a straight drop: no dx, no spread)
+  layer.set(view::Shadow::drop(6.0, 2.0, 0x00000040L))
+  let sc4 = encode_tree_scene(tree, 300.0, 200.0, 2.0, 48.0)
+  let b4 = r2b_kinds(sc4, 2)[0] * inst_size
+  r2b_assert(r2b_near(sc4.inst[b4], x) && r2b_near(sc4.inst[b4 + 1], y + 2.0) && r2b_near(sc4.inst[b4 + 2], w), "drop")
+  r2b_assert(r2b_near(sc4.inst[b4 + 7], 6.0) && sc4.inst[b4 + 14] == 0.0 && sc4.inst[b4 + 15] == 0.0, "drop's parts")
+  t.dispose()
+}
+
+test "r2b: a circular corner's shadow spread grows as CSS's (css_spread_corner), signed circular" {
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .radius(view::Live::Is(4.0))
+        .corner_circular(view::Live::Is(true))
+        .ground(view::Live::Is(0xFFFFFFFFL))
+        .shadows(view::Live::Is([view::Shadow::of(sigma=1.0, spread=8.0, 0x00000080L)]))
+    })
+  }, width=300.0, height=200.0)
+  let sc = encode_tree_scene(r2b_tree(tr), 300.0, 200.0, 2.0, 0.0)
+  let b = r2b_kinds(sc, 2)[0] * inst_size
+  let want = css_spread_corner(4.0, 8.0)
+  r2b_assert(want < 12.0 && want > 4.0, "CSS spread of a small corner is less than r + s")
+  r2b_assert(r2b_near(sc.inst[b + 4], -want), "circular sentinel radius -\{want}, got \{sc.inst[b + 4]}")
+  t.dispose()
+}
+
+test "r2b: View.alpha(0.5) with an opaque edge over the same opaque ground is 0.5 at its middle and its edge" {
+  let a = signals::signal(0.5)
+  let edge = signals::signal(0xFF0000FFL)
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(0xFF0000FFL))
+        .edge(view::Live::By(fn() -> (Double, Int64) { (2.0, edge.get()) }))
+        .alpha(view::Live::By(fn() -> Double { a.get() }))
+    })
+  }, width=200.0, height=100.0)
+  let tree = r2b_tree(tr)
+  let sc = encode_tree_scene(tree, 200.0, 100.0, 2.0, 0.0)
+  let k = r2b_kinds(sc, 0)
+  r2b_assert(k.length() == 1, "ground and edge in one kind 0, got \{k.length()}")
+  let b = k[0] * inst_size
+  r2b_assert(sc.inst[b + 7] == 0.0, "p7 stays 0.0 (edge composited src-over ground in CPU)")
+  r2b_assert(r2b_near(sc.inst[b + 11], 0.5), "its ground carries its alpha (what reads cover takes it so)")
+  r2b_assert(r2b_near(sc.inst[b + 15], 0.5), "its edge carries its alpha")
+  r2b_assert(r2b_near(sc.inst[b + 11], 0.5), "middle: 0.5")
+  r2b_assert(r2b_near(r2b_edge_alpha(sc, k[0]), 0.5), "edge: 0.5, not 0.75: got \{r2b_edge_alpha(sc, k[0])}")
+  // (a translucent edge over the opaque ground: at alpha 1 the ground shows through it; at 0.5 the same, halved)
+  edge.set(0x00FF0080L)
+  a.set(1.0)
+  let sc1 = encode_tree_scene(tree, 200.0, 100.0, 2.0, 16.0)
+  let k1 = r2b_kinds(sc1, 0)[0]
+  r2b_assert(sc1.inst[k1 * inst_size + 7] == 0.0, "alpha 1: p7 0, as every other kind 0")
+  let full = r2b_edge_alpha(sc1, k1)
+  r2b_assert(r2b_near(full, 1.0), "half-alpha edge over an opaque ground covers whole: \{full}")
+  a.set(0.5)
+  let sc2 = encode_tree_scene(tree, 200.0, 100.0, 2.0, 32.0)
+  let half = r2b_edge_alpha(sc2, r2b_kinds(sc2, 0)[0])
+  r2b_assert(r2b_near(half, 0.5), "and at alpha 0.5 exactly half of that: \{half}")
+  t.dispose()
+}
+
+fn r2b_nest(v : view::View, k : Int, depth : Int, blur_at : Int) -> Unit {
+  let _ = v.box(fn(g : view::View) -> Unit {
+    let _ = g
+      .width(view::Live::Is(Some(100.0 - k.to_double() * 4.0)))
+      .height(view::Live::Is(Some(100.0 - k.to_double() * 4.0)))
+      .group_alpha(view::Live::Is(0.5))
+    if k == blur_at {
+      let _ = g.blur(view::Live::Is(3.0))
+    }
+    if k + 1 < depth {
+      r2b_nest(g, k + 1, depth, blur_at)
+    } else {
+      let _ = g.ground(view::Live::Is(0x000000FFL))
+    }
+  })
+}
+
+fn r2b_nested_groups(depth : Int, blur_at : Int) -> (Scene, Tester) {
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    r2b_nest(root, 0, depth, blur_at)
+  }, width=200.0, height=200.0)
+  (encode_tree_scene(r2b_tree(tr), 200.0, 200.0, 2.0, 0.0), t)
+}
+
+/// Its alpha as drawn: every group layer's alpha it lies in (kind 17) times its own.
+fn r2b_through_groups(sc : Scene) -> Double {
+  let mut m = 1.0
+  for i in r2b_kinds(sc, 17) {
+    m = m * sc.inst[i * inst_size + 11]
+  }
+  let g = r2b_kinds(sc, 0)
+  r2b_assert(g.length() == 1, "one ground")
+  m * sc.inst[g[0] * inst_size + 11]
+}
+
+test "r2b: five and nine nested group alphas each get their layer, past 64 falls back, never opaque" {
+  let (sc5, t5) = r2b_nested_groups(5, -1)
+  r2b_assert(r2b_kinds(sc5, 16).length() == 5 && r2b_kinds(sc5, 17).length() == 5, "five layers pushed and popped")
+  r2b_assert(r2b_near(r2b_through_groups(sc5), 1.0 / 32.0), "1/32 through five, got \{r2b_through_groups(sc5)}")
+  t5.dispose()
+  let (sc9, t9) = r2b_nested_groups(9, -1)
+  let pushes9 = r2b_kinds(sc9, 16).length()
+  r2b_assert(pushes9 == 9, "depth 9 gets all 9 layers without fallback: \{pushes9}")
+  r2b_assert(r2b_kinds(sc9, 17).length() == 9, "all 9 popped")
+  r2b_assert(r2b_near(r2b_through_groups(sc9), 1.0 / 512.0), "1/512 through nine, got \{r2b_through_groups(sc9)}")
+  t9.dispose()
+  let (sc65, t65) = r2b_nested_groups(65, -1)
+  let pushes65 = r2b_kinds(sc65, 16).length()
+  r2b_assert(pushes65 == scene_layers_most, "past 64 falls back at scene_layers_most (\{scene_layers_most}): \{pushes65}")
+  r2b_assert(r2b_kinds(sc65, 17).length() == pushes65, "each popped")
+  t65.dispose()
+}
+
+test "r2b: one node with group alpha and blur opens both, the blur inside, and closes both in turn" {
+  let (sc, t) = r2b_nested_groups(2, 0)
+  let order : Array[Int] = []
+  let mut i = 0
+  while i < sc.ninst {
+    let k = (sc.inst[i * inst_size + 5] + 0.5).to_int()
+    if k >= 14 && k <= 17 {
+      order.push(k)
+    }
+    i += 1
+  }
+  r2b_assert(order.length() == 6, "two groups and one blur: \{order.length()}")
+  r2b_assert(order[0] == 16 && order[1] == 14 && order[2] == 16, "group, its blur, then the inner group")
+  r2b_assert(order[3] == 17 && order[4] == 15 && order[5] == 17, "inner group, the blur, then the outer group")
+  r2b_assert(r2b_near(r2b_through_groups(sc), 0.25), "both alphas kept")
+  t.dispose()
+  // (as deep as the layers go: the blur still fits, the group past them falls back)
+  let (sc8, t8) = r2b_nested_groups(9, 7)
+  r2b_assert(r2b_kinds(sc8, 14).length() + r2b_kinds(sc8, 16).length() <= scene_layers_most, "never past the layers")
+  r2b_assert(r2b_near(r2b_through_groups(sc8), 1.0 / 512.0), "alpha kept whole: \{r2b_through_groups(sc8)}")
+  t8.dispose()
+}
+
+test "r2b: a turned long piece inside a blur is captured as far as it reaches once turned" {
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(holder : view::View) -> Unit {
+      let _ = holder
+        .width(view::Live::Is(Some(240.0)))
+        .height(view::Live::Is(Some(20.0)))
+        .offset(view::Live::Is((0.0, 120.0)))
+        .blur(view::Live::Is(1.0))
+      let _ = holder.box(fn(bar : view::View) -> Unit {
+        let _ = bar
+          .width(view::Live::Is(Some(200.0)))
+          .height(view::Live::Is(Some(10.0)))
+          .ground(view::Live::Is(0x0000FFFFL))
+          .turn(view::Live::Is(1.5707963267948966))
+      })
+    })
+  }, width=300.0, height=400.0)
+  let sc = encode_tree_scene(r2b_tree(tr), 300.0, 400.0, 2.0, 0.0)
+  let push = r2b_kinds(sc, 14)
+  r2b_assert(push.length() == 1, "one blur layer")
+  let bar = r2b_kinds(sc, 0)
+  r2b_assert(bar.length() == 1, "the bar")
+  let bb = bar[0] * inst_size
+  let cy = sc.inst[bb + 1] + sc.inst[bb + 3] * 0.5
+  let pb = push[0] * inst_size
+  let top = sc.inst[pb + 1]
+  let foot = sc.inst[pb + 1] + sc.inst[pb + 3]
+  // (turned a quarter, the bar 200 long stands 100 above and below its middle)
+  r2b_assert(top <= cy - 100.0 + 1.0e-6, "captured up to its turned top: \{top} vs \{cy - 100.0}")
+  r2b_assert(foot >= cy + 100.0 - 1.0e-6, "and down to its turned foot: \{foot} vs \{cy + 100.0}")
+  t.dispose()
+}
+
+/// Deterministic software pixel evaluator matching all 4 GPU renderers' premultiplied src-over
+/// contract for kind 0 (solid rect with clip), kind 14/16 (offscreen layer + empty capture rect
+/// `bskip` suppression), and kind 15/17 (layer composite with pop alpha).
+/// Returns premultiplied `(r, g, b, a)` at point `(px, py)` inside a `(w, h)` viewport.
+fn r2b_eval_pixel(sc : Scene, px : Double, py : Double, w : Double, h : Double) -> (Double, Double, Double, Double) {
+  let stack : Array[(Double, Double, Double, Double, Double, Double, Double, Double, Bool)] = []
+  let mut cr = 0.0
+  let mut cg = 0.0
+  let mut cb = 0.0
+  let mut ca = 0.0
+  let mut bskip = 0
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    let kind = (sc.inst[b + 5] + 0.5).to_int()
+    if bskip > 0 {
+      if kind == 14 || kind == 16 {
+        bskip += 1
+      } else if kind == 15 || kind == 17 {
+        bskip -= 1
+      }
+      i += 1
+      continue
+    }
+    if kind == 14 || kind == 16 {
+      let is_group = kind == 16
+      let sigma = if is_group { 0.0 } else { sc.inst[b + 7].abs() }
+      let margin = if !is_group && sigma > 0.0 { (3.0 * sigma).ceil() + 2.0 } else { 0.0 }
+      let x0 = dmax(0.0, (sc.inst[b] - margin).floor())
+      let y0 = dmax(0.0, (sc.inst[b + 1] - margin).floor())
+      let x1 = dmin(w, (sc.inst[b] + sc.inst[b + 2] + margin).ceil())
+      let y1 = dmin(h, (sc.inst[b + 1] + sc.inst[b + 3] + margin).ceil())
+      if x1 <= x0 || y1 <= y0 {
+        bskip = 1
+        i += 1
+        continue
+      }
+      if !is_group && sigma <= 0.0 {
+        stack.push((cr, cg, cb, ca, x0, y0, x1, y1, false))
+        i += 1
+        continue
+      }
+      stack.push((cr, cg, cb, ca, x0, y0, x1, y1, true))
+      cr = 0.0
+      cg = 0.0
+      cb = 0.0
+      ca = 0.0
+      i += 1
+      continue
+    }
+    if kind == 15 || kind == 17 {
+      match stack.pop() {
+        Some((pr, pg, pb, pa, lx0, ly0, lx1, ly1, active)) => {
+          if active {
+            let pop_a = sc.inst[b + 11]
+            let cx0 = sc.inst[b + 16]
+            let cy0 = sc.inst[b + 17]
+            let cx1 = sc.inst[b + 18]
+            let cy1 = sc.inst[b + 19]
+            let inside = px >= lx0 && px < lx1 && py >= ly0 && py < ly1 &&
+              px >= cx0 && px < cx1 && py >= cy0 && py < cy1
+            if inside {
+              let sr = cr * pop_a
+              let sg = cg * pop_a
+              let sb = cb * pop_a
+              let sa = ca * pop_a
+              cr = sr + pr * (1.0 - sa)
+              cg = sg + pg * (1.0 - sa)
+              cb = sb + pb * (1.0 - sa)
+              ca = sa + pa * (1.0 - sa)
+            } else {
+              cr = pr
+              cg = pg
+              cb = pb
+              ca = pa
+            }
+          }
+        }
+        None => ()
+      }
+      i += 1
+      continue
+    }
+    if kind == 0 {
+      let x0 = sc.inst[b]
+      let y0 = sc.inst[b + 1]
+      let x1 = x0 + sc.inst[b + 2]
+      let y1 = y0 + sc.inst[b + 3]
+      let cx0 = sc.inst[b + 16]
+      let cy0 = sc.inst[b + 17]
+      let cx1 = sc.inst[b + 18]
+      let cy1 = sc.inst[b + 19]
+      let mut in_layer = true
+      if stack.length() > 0 {
+        let top = stack[stack.length() - 1]
+        if top.8 {
+          in_layer = px >= top.4 && px < top.6 && py >= top.5 && py < top.7
+        }
+      }
+      if in_layer && px >= x0 && px < x1 && py >= y0 && py < y1 &&
+        px >= cx0 && px < cx1 && py >= cy0 && py < cy1 {
+        let sa = sc.inst[b + 11]
+        let sr = sc.inst[b + 8] * sa
+        let sg = sc.inst[b + 9] * sa
+        let sb = sc.inst[b + 10] * sa
+        cr = sr + cr * (1.0 - sa)
+        cg = sg + cg * (1.0 - sa)
+        cb = sb + cb * (1.0 - sa)
+        ca = sa + ca * (1.0 - sa)
+      }
+    }
+    i += 1
+  }
+  (cr, cg, cb, ca)
+}
+
+test "r3-1: over_scrim node preserves group_alpha 0.0 / 0.5 / 1.0 over scrim" {
+  let ga = signals::signal(0.0)
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    // Lifted over_scrim node (solid red) placed before scrim
+    let _ = root.box(fn(lifted : view::View) -> Unit {
+      let _ = lifted
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(100.0)))
+        .ground(view::Live::Is(0xFF0000FFL))
+        .over_scrim(view::Live::Is(true))
+        .group_alpha(view::Live::By(fn() -> Double { ga.get() }))
+    })
+    // Full-screen opaque blue scrim
+    let _ = root.box(fn(scrim : view::View) -> Unit {
+      let _ = scrim
+        .over(view::Live::Is(true))
+        .ground(view::Live::Is(0x0000FFFFL))
+        .scrim_under()
+    })
+  }, width=200.0, height=200.0)
+  let tree = r2b_tree(tr)
+
+  // group_alpha = 0.0 -> culled completely; pixel is pure scrim blue (0, 0, 1, 1)
+  let sc0 = encode_tree_scene(tree, 200.0, 200.0, 2.0, 0.0)
+  r2b_assert(r2b_kinds(sc0, 16).length() == 0, "group_alpha=0.0 pushes no layer")
+  let (r0, g0, b0, a0) = r2b_eval_pixel(sc0, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(r0, 0.0) && r2b_near(g0, 0.0) && r2b_near(b0, 1.0) && r2b_near(a0, 1.0),
+    "over_scrim ga=0.0 must be pure scrim blue, got (\{r0},\{g0},\{b0},\{a0})")
+
+  // group_alpha = 0.5 -> red at 0.5 over blue scrim => (0.5, 0, 0.5, 1.0)
+  ga.set(0.5)
+  let sc5 = encode_tree_scene(tree, 200.0, 200.0, 2.0, 16.0)
+  r2b_assert(r2b_kinds(sc5, 16).length() == 1 && r2b_kinds(sc5, 17).length() == 1, "group_alpha=0.5 pushes/pops one layer")
+  let (r5, g5, b5, a5) = r2b_eval_pixel(sc5, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(r5, 0.5) && r2b_near(g5, 0.0) && r2b_near(b5, 0.5) && r2b_near(a5, 1.0),
+    "over_scrim ga=0.5 over blue must be (0.5,0,0.5,1), got (\{r5},\{g5},\{b5},\{a5})")
+
+  // group_alpha = 1.0 -> opaque red over blue scrim => (1.0, 0, 0, 1.0)
+  ga.set(1.0)
+  let sc1 = encode_tree_scene(tree, 200.0, 200.0, 2.0, 32.0)
+  r2b_assert(r2b_kinds(sc1, 16).length() == 0, "group_alpha=1.0 needs no layer")
+  let (r1, g1, b1, a1) = r2b_eval_pixel(sc1, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(r1, 1.0) && r2b_near(g1, 0.0) && r2b_near(b1, 0.0) && r2b_near(a1, 1.0),
+    "over_scrim ga=1.0 must be opaque red, got (\{r1},\{g1},\{b1},\{a1})")
+  t.dispose()
+}
+
+test "r3-1: child inside over_scrim subtree preserves group_alpha with overlapping opaque children (0.5, not 0.75)" {
+  let ga = signals::signal(0.0)
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    let _ = root.box(fn(lifted : view::View) -> Unit {
+      let _ = lifted
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(120.0)))
+        .over_scrim(view::Live::Is(true))
+      let _ = lifted.box(fn(grp : view::View) -> Unit {
+        let _ = grp
+          .width(view::Live::Is(Some(100.0)))
+          .height(view::Live::Is(Some(100.0)))
+          .group_alpha(view::Live::By(fn() -> Double { ga.get() }))
+        // Two overlapping opaque red children covering (0..100, 0..100)
+        let _ = grp.box(fn(c1 : view::View) -> Unit {
+          let _ = c1
+            .over(view::Live::Is(true))
+            .ground(view::Live::Is(0xFF0000FFL))
+        })
+        let _ = grp.box(fn(c2 : view::View) -> Unit {
+          let _ = c2
+            .over(view::Live::Is(true))
+            .ground(view::Live::Is(0xFF0000FFL))
+        })
+      })
+    })
+    let _ = root.box(fn(scrim : view::View) -> Unit {
+      let _ = scrim
+        .over(view::Live::Is(true))
+        .ground(view::Live::Is(0x00000001L))
+        .scrim_under()
+    })
+  }, width=200.0, height=200.0)
+  let tree = r2b_tree(tr)
+
+  // ga = 0.0 -> culled completely (only scrim present, red channel 0.0)
+  let sc0 = encode_tree_scene(tree, 200.0, 200.0, 2.0, 0.0)
+  let (r0, _, _, _) = r2b_eval_pixel(sc0, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(r0, 0.0), "over_scrim child ga=0.0 must emit 0 red, got \{r0}")
+
+  // ga = 0.5 -> two overlapping opaque red children inside group_alpha(0.5) => exact 0.5, NOT 0.75
+  ga.set(0.5)
+  let sc5 = encode_tree_scene(tree, 200.0, 200.0, 2.0, 16.0)
+  r2b_assert(r2b_kinds(sc5, 16).length() == 1 && r2b_kinds(sc5, 17).length() == 1, "child ga=0.5 opens one layer")
+  let (r5, _, _, _) = r2b_eval_pixel(sc5, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(r5, 0.5), "overlapping children in over_scrim child ga=0.5 must be exact 0.5 (not 0.75), got \{r5}")
+
+  // ga = 1.0 -> opaque red => 1.0
+  ga.set(1.0)
+  let sc1 = encode_tree_scene(tree, 200.0, 200.0, 2.0, 32.0)
+  let (r1, _, _, _) = r2b_eval_pixel(sc1, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(r1, 1.0), "over_scrim child ga=1.0 must be 1.0, got \{r1}")
+  t.dispose()
+}
+
+fn r3_nest_overlap(v : view::View, k : Int, depth : Int, with_blur : Bool) -> Unit {
+  let is_last = k + 1 == depth
+  let _ = v.box(fn(g : view::View) -> Unit {
+    let _ = g
+      .width(view::Live::Is(Some(100.0)))
+      .height(view::Live::Is(Some(100.0)))
+      .group_alpha(view::Live::Is(if is_last { 0.5 } else { 0.999 }))
+    if is_last && with_blur {
+      let _ = g.blur(view::Live::Is(2.0))
+    }
+    if !is_last {
+      r3_nest_overlap(g, k + 1, depth, with_blur)
+    } else {
+      let _ = g.box(fn(c1 : view::View) -> Unit {
+        let _ = c1.over(view::Live::Is(true)).ground(view::Live::Is(0xFF0000FFL))
+      })
+      let _ = g.box(fn(c2 : view::View) -> Unit {
+        let _ = c2.over(view::Live::Is(true)).ground(view::Live::Is(0xFF0000FFL))
+      })
+    }
+  })
+}
+
+test "r3-1: overlapping opaque children at depth 8, depth 9, and group_alpha+blur output exact 0.5 (never 0.75)" {
+  // Depth 8
+  let tr8 : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t8 = Tester::tree(fn(root : view::View) -> Unit {
+    tr8.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    r3_nest_overlap(root, 0, 8, false)
+  }, width=200.0, height=200.0)
+  let sc8 = encode_tree_scene(r2b_tree(tr8), 200.0, 200.0, 2.0, 0.0)
+  r2b_assert(r2b_kinds(sc8, 16).length() == 8 && r2b_kinds(sc8, 17).length() == 8, "depth 8: 8 layers")
+  for gi in r2b_kinds(sc8, 0) {
+    r2b_assert(r2b_near(sc8.inst[gi * inst_size + 11], 1.0), "depth 8 children stay opaque inside layer")
+  }
+  let (r8, _, _, a8) = r2b_eval_pixel(sc8, 50.0, 50.0, 200.0, 200.0)
+  let exp8 = 0.5 * 0.999 * 0.999 * 0.999 * 0.999 * 0.999 * 0.999 * 0.999
+  r2b_assert((r8 - exp8).abs() < 1.0e-4 && (a8 - exp8).abs() < 1.0e-4, "depth 8 overlap exact 0.5*0.999^7: got \{r8}")
+  t8.dispose()
+
+  // Depth 9 (previously exceeded old cap=8 and degraded to 0.75!)
+  let tr9 : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t9 = Tester::tree(fn(root : view::View) -> Unit {
+    tr9.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    r3_nest_overlap(root, 0, 9, false)
+  }, width=200.0, height=200.0)
+  let sc9 = encode_tree_scene(r2b_tree(tr9), 200.0, 200.0, 2.0, 0.0)
+  r2b_assert(r2b_kinds(sc9, 16).length() == 9 && r2b_kinds(sc9, 17).length() == 9, "depth 9: all 9 layers, zero fallback")
+  for gi in r2b_kinds(sc9, 0) {
+    r2b_assert(r2b_near(sc9.inst[gi * inst_size + 11], 1.0), "depth 9 children stay opaque inside layer")
+  }
+  let (r9, _, _, a9) = r2b_eval_pixel(sc9, 50.0, 50.0, 200.0, 200.0)
+  let exp9 = exp8 * 0.999
+  r2b_assert((r9 - exp9).abs() < 1.0e-4 && (a9 - exp9).abs() < 1.0e-4, "depth 9 overlap exact 0.5*0.999^8 (not 0.75): got \{r9}")
+  t9.dispose()
+
+  // group_alpha(0.5) + blur(2.0) on one node
+  let trb : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let tb = Tester::tree(fn(root : view::View) -> Unit {
+    trb.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    r3_nest_overlap(root, 0, 1, true)
+  }, width=200.0, height=200.0)
+  let scb = encode_tree_scene(r2b_tree(trb), 200.0, 200.0, 2.0, 0.0)
+  r2b_assert(r2b_kinds(scb, 16).length() == 1 && r2b_kinds(scb, 14).length() == 1, "group_alpha + blur opens both")
+  for gi in r2b_kinds(scb, 0) {
+    r2b_assert(r2b_near(scb.inst[gi * inst_size + 11], 1.0), "group_alpha+blur children stay opaque inside layer")
+  }
+  let (rb, _, _, ab) = r2b_eval_pixel(scb, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(rb, 0.5) && r2b_near(ab, 0.5), "group_alpha+blur overlap exact 0.5 (not 0.75): got \{rb}")
+  tb.dispose()
+}
+
+test "r3-1: empty capture rect suppresses child draws with zero leaked pixels" {
+  let sc = Scene::new()
+  // Push group_alpha with empty capture rect (outside viewport x=-100, w=50 -> clamped bw=0)
+  let _ = sc.push_group_alpha(-100.0, 0.0, 50.0, 50.0)
+  // Child rect inside visible viewport (0..100, 0..100) MUST be suppressed by bskip
+  let _ = sc.push_inst(0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0xFF0000FFL, 1.0, 0.0, 0.0, 0.0, 0.0)
+  // Nested group_alpha inside suppressed empty group must also stay suppressed
+  let _ = sc.push_group_alpha(0.0, 0.0, 100.0, 100.0)
+  let _ = sc.push_inst(0.0, 0.0, 100.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0x00FF00FFL, 1.0, 0.0, 0.0, 0.0, 0.0)
+  let _ = sc.pop_group_alpha(0.0, 0.0, 100.0, 100.0, alpha=0.5)
+  let _ = sc.pop_group_alpha(-100.0, 0.0, 50.0, 50.0, alpha=0.5)
+  // Subsequent sibling after pop must draw normally
+  let _ = sc.push_inst(120.0, 0.0, 40.0, 40.0, 0.0, 0.0, 0.0, 0.0, 0x0000FFFFL, 1.0, 0.0, 0.0, 0.0, 0.0)
+
+  let (rl, gl, bl, al) = r2b_eval_pixel(sc, 50.0, 50.0, 200.0, 200.0)
+  r2b_assert(r2b_near(rl, 0.0) && r2b_near(gl, 0.0) && r2b_near(bl, 0.0) && r2b_near(al, 0.0),
+    "empty capture rect must leak 0 pixels, got (\{rl},\{gl},\{bl},\{al})")
+  let (rs, gs, bs, as_) = r2b_eval_pixel(sc, 130.0, 20.0, 200.0, 200.0)
+  r2b_assert(r2b_near(rs, 0.0) && r2b_near(gs, 0.0) && r2b_near(bs, 1.0) && r2b_near(as_, 1.0),
+    "sibling after empty capture pop draws normally, got (\{rs},\{gs},\{bs},\{as_})")
+}
+
+test "r3-1: Theme.font_alternates controls hostapi::style_no_alternates bit" {
+  let prev = tree_theme()
+  let light = Theme::light()
+  let dark = Theme::dark()
+  r2b_assert(light.font_alternates && dark.font_alternates, "default themes keep font_alternates=true")
+  set_tree_theme(fn() { light })
+  r2b_assert((view_words_style_bits(0.0) & hostapi::style_no_alternates) == 0, "font_alternates=true clears bit 128")
+  set_tree_theme(fn() { Theme::{ ..light, font_alternates: false } })
+  r2b_assert((view_words_style_bits(0.0) & hostapi::style_no_alternates) == hostapi::style_no_alternates, "font_alternates=false sets bit 128")
+  set_tree_theme(fn() { prev })
+}
+
+test "r3-1: drawn_reach includes View::shadows so large offscreen shadows are not culled" {
+  let tr : signals::Ref[Option[view::Tree]] = view::ref_new(None)
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    tr.v = Some(root.tree)
+    let _ = root.lines_up(view::Live::Is(Some(view::Along::Start)))
+    // Positioned at x=-80..x=-60 (past drawn_reach_least=48 from viewport x=0), with a large shadow reaching +78
+    let _ = root.box(fn(b : view::View) -> Unit {
+      let _ = b
+        .width(view::Live::Is(Some(20.0)))
+        .height(view::Live::Is(Some(20.0)))
+        .offset(view::Live::Is((-80.0, 20.0)))
+        .ground(view::Live::Is(0xFFFFFFFFL))
+        .shadows(view::Live::Is([view::Shadow::of(dx=20.0, dy=0.0, sigma=20.0, spread=10.0, 0x000000FFL)]))
+    })
+  }, width=200.0, height=200.0)
+  let tree = r2b_tree(tr)
+  let sc = encode_tree_scene(tree, 200.0, 200.0, 2.0, 0.0)
+  r2b_assert(r2b_kinds(sc, 2).length() == 1, "large shadow node at x=-80 must not be culled, got \{r2b_kinds(sc, 2).length()}")
+  t.dispose()
+}

@@ -1,0 +1,467 @@
+// Deterministic ISO Gregorian calendar math, range normalization, year-picker paging,
+// and segmented date/time editor state (`DateField` / `TimeField`).
+// Non-Gregorian calendar systems are intentionally deferred to a future extension.
+
+/// ISO Gregorian calendar date (`year`, `month` 1..12, `day` 1..31).
+#derive(Eq)
+pub struct IsoDate {
+  pub year : Int
+  pub month : Int
+  pub day : Int
+}
+
+/// Construct a clamped valid `IsoDate`.
+pub fn IsoDate::new(year : Int, month : Int, day : Int) -> IsoDate {
+  let m = if month < 1 { 1 } else if month > 12 { 12 } else { month }
+  let max_d = iso_days_in_month(year, m)
+  let d = if day < 1 { 1 } else if day > max_d { max_d } else { day }
+  IsoDate::{ year, month: m, day: d }
+}
+
+/// Whether `year` is a Gregorian leap year.
+pub fn iso_is_leap_year(year : Int) -> Bool {
+  (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Number of days in `(year, month)` (`month` 1..12).
+pub fn iso_days_in_month(year : Int, month : Int) -> Int {
+  match month {
+    1 => 31
+    2 => if iso_is_leap_year(year) { 29 } else { 28 }
+    3 => 31
+    4 => 30
+    5 => 31
+    6 => 30
+    7 => 31
+    8 => 31
+    9 => 30
+    10 => 31
+    11 => 30
+    _ => 31
+  }
+}
+
+/// Convert `IsoDate` to days since civil epoch 1970-01-01 (Howard Hinnant algorithm).
+pub fn iso_to_epoch_days(d : IsoDate) -> Int {
+  let y = if d.month <= 2 { d.year - 1 } else { d.year }
+  let era = if y >= 0 { y / 400 } else { (y - 399) / 400 }
+  let yoe = y - era * 400
+  let m_adj = if d.month > 2 { d.month - 3 } else { d.month + 9 }
+  let doy = (153 * m_adj + 2) / 5 + d.day - 1
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  era * 146097 + doe - 719468
+}
+
+/// Convert days since 1970-01-01 back to `IsoDate`.
+pub fn iso_from_epoch_days(z_in : Int) -> IsoDate {
+  let z = z_in + 719468
+  let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  let d = doy - (153 * mp + 2) / 5 + 1
+  let m = if mp < 10 { mp + 3 } else { mp - 9 }
+  let yr = if m <= 2 { y + 1 } else { y }
+  IsoDate::{ year: yr, month: m, day: d }
+}
+
+/// Day of week for `d`: `0 = Sunday, 1 = Monday, ..., 6 = Saturday`.
+pub fn iso_day_of_week(d : IsoDate) -> Int {
+  let days = iso_to_epoch_days(d)
+  // 1970-01-01 was Thursday (4)
+  let r = (days + 4) % 7
+  if r < 0 { r + 7 } else { r }
+}
+
+/// Compare two dates: `< 0` if `a < b`, `0` if equal, `> 0` if `a > b`.
+pub fn iso_compare(a : IsoDate, b : IsoDate) -> Int {
+  if a.year != b.year {
+    a.year - b.year
+  } else if a.month != b.month {
+    a.month - b.month
+  } else {
+    a.day - b.day
+  }
+}
+
+/// Add `delta` days to `d`.
+pub fn iso_add_days(d : IsoDate, delta : Int) -> IsoDate {
+  iso_from_epoch_days(iso_to_epoch_days(d) + delta)
+}
+
+/// Add `delta` months to `d`, clamping day to the target month's length.
+pub fn iso_add_months(d : IsoDate, delta : Int) -> IsoDate {
+  let total = d.year * 12 + (d.month - 1) + delta
+  let yr = if total >= 0 { total / 12 } else { (total - 11) / 12 }
+  let m0 = total - yr * 12
+  let m = m0 + 1
+  let max_d = iso_days_in_month(yr, m)
+  let day = if d.day > max_d { max_d } else { d.day }
+  IsoDate::{ year: yr, month: m, day }
+}
+
+/// Add `delta` years to `d`, clamping Feb 29 -> Feb 28 on non-leap years.
+pub fn iso_add_years(d : IsoDate, delta : Int) -> IsoDate {
+  iso_add_months(d, delta * 12)
+}
+
+/// Format `d` as `"YYYY-MM-DD"`.
+pub fn iso_format(d : IsoDate) -> String {
+  let pad2 = fn(v : Int) -> String { if v < 10 { "0\{v}" } else { "\{v}" } }
+  let pad4 = fn(v : Int) -> String {
+    if v < 10 { "000\{v}" } else if v < 100 { "00\{v}" } else if v < 1000 { "0\{v}" } else { "\{v}" }
+  }
+  "\{pad4(d.year)}-\{pad2(d.month)}-\{pad2(d.day)}"
+}
+
+/// One cell in a 6x7 (42-cell) calendar month grid.
+#derive(Eq)
+pub struct CalendarCell {
+  pub date : IsoDate
+  pub outside_month : Bool
+}
+
+/// Build a 42-cell (6 weeks x 7 days) month grid for `(year, month)` starting on `first_day_of_week` (`0=Sun..6=Sat`).
+pub fn calendar_month_grid(year : Int, month : Int, first_day_of_week~ : Int = 0) -> Array[CalendarCell] {
+  let first = IsoDate::new(year, month, 1)
+  let dow = iso_day_of_week(first)
+  let fdow = ((first_day_of_week % 7) + 7) % 7
+  let lead = (dow - fdow + 7) % 7
+  let start = iso_add_days(first, -lead)
+  let out : Array[CalendarCell] = []
+  let mut i = 0
+  while i < 42 {
+    let dt = iso_add_days(start, i)
+    out.push(CalendarCell::{ date: dt, outside_month: dt.month != month || dt.year != year })
+    i += 1
+  }
+  out
+}
+
+/// Normalize a date range `(a, b)` so `start <= end`.
+pub fn calendar_normalize_range(a : IsoDate, b : IsoDate) -> (IsoDate, IsoDate) {
+  if iso_compare(a, b) <= 0 { (a, b) } else { (b, a) }
+}
+
+/// Whether `d` is disabled given optional `min`, `max`, and custom `is_unavailable` predicate.
+pub fn calendar_is_unavailable(
+  d : IsoDate,
+  min : Option[IsoDate],
+  max : Option[IsoDate],
+  is_unavailable : (IsoDate) -> Bool,
+) -> Bool {
+  match min {
+    Some(lo) => if iso_compare(d, lo) < 0 { return true }
+    None => ()
+  }
+  match max {
+    Some(hi) => if iso_compare(d, hi) > 0 { return true }
+    None => ()
+  }
+  is_unavailable(d)
+}
+
+/// Compute a page of years for `CalendarYearPicker` (e.g. 12 years per page aligned to `page_size`).
+pub fn calendar_year_page(anchor_year : Int, page_size~ : Int = 12) -> Array[Int] {
+  let sz = if page_size < 1 { 12 } else { page_size }
+  let start = (anchor_year / sz) * sz
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < sz {
+    out.push(start + i)
+    i += 1
+  }
+  out
+}
+
+/// Granularity for segmented `DateField` / `TimeField`.
+#derive(Eq)
+pub enum DateGranularity {
+  Day
+  Hour
+  Minute
+  Second
+}
+
+/// One editable segment of a `DateField` or `TimeField`.
+#derive(Eq)
+pub enum DateSegmentKind {
+  Year
+  Month
+  Day
+  Hour
+  Minute
+  Second
+  DayPeriod
+}
+
+/// Segmented date/time value supporting empty/placeholder segments (`None`) and 12h/24h mode.
+pub struct SegmentedDateTime {
+  pub year : Option[Int]
+  pub month : Option[Int]
+  pub day : Option[Int]
+  /// Stored in 24-hour `[0..23]` internally.
+  pub hour : Option[Int]
+  pub minute : Option[Int]
+  pub second : Option[Int]
+}
+
+/// Value equality for `SegmentedDateTime`.
+pub fn SegmentedDateTime::eq(self : SegmentedDateTime, other : SegmentedDateTime) -> Bool {
+  opt_int_eq(self.year, other.year) &&
+  opt_int_eq(self.month, other.month) &&
+  opt_int_eq(self.day, other.day) &&
+  opt_int_eq(self.hour, other.hour) &&
+  opt_int_eq(self.minute, other.minute) &&
+  opt_int_eq(self.second, other.second)
+}
+
+/// Create an empty (all-placeholder) `SegmentedDateTime`.
+pub fn SegmentedDateTime::empty() -> SegmentedDateTime {
+  SegmentedDateTime::{ year: None, month: None, day: None, hour: None, minute: None, second: None }
+}
+
+/// Create a `SegmentedDateTime` from an `IsoDate` and optional time components.
+pub fn SegmentedDateTime::from_date(
+  d : IsoDate,
+  hour~ : Option[Int] = None,
+  minute~ : Option[Int] = None,
+  second~ : Option[Int] = None,
+) -> SegmentedDateTime {
+  SegmentedDateTime::{
+    year: Some(d.year),
+    month: Some(d.month),
+    day: Some(d.day),
+    hour,
+    minute,
+    second,
+  }
+}
+
+/// Return the ordered segment kinds for `DateField` with `granularity` and `hour_cycle_12`.
+pub fn date_field_segments(granularity : DateGranularity, hour_cycle_12~ : Bool = false) -> Array[DateSegmentKind] {
+  let out : Array[DateSegmentKind] = [DateSegmentKind::Year, DateSegmentKind::Month, DateSegmentKind::Day]
+  match granularity {
+    DateGranularity::Day => ()
+    DateGranularity::Hour => {
+      out.push(DateSegmentKind::Hour)
+      if hour_cycle_12 { out.push(DateSegmentKind::DayPeriod) }
+    }
+    DateGranularity::Minute => {
+      out.push(DateSegmentKind::Hour)
+      out.push(DateSegmentKind::Minute)
+      if hour_cycle_12 { out.push(DateSegmentKind::DayPeriod) }
+    }
+    DateGranularity::Second => {
+      out.push(DateSegmentKind::Hour)
+      out.push(DateSegmentKind::Minute)
+      out.push(DateSegmentKind::Second)
+      if hour_cycle_12 { out.push(DateSegmentKind::DayPeriod) }
+    }
+  }
+  out
+}
+
+/// Return the ordered segment kinds for `TimeField` with `granularity` and `hour_cycle_12`.
+pub fn time_field_segments(granularity : DateGranularity, hour_cycle_12~ : Bool = false) -> Array[DateSegmentKind] {
+  let out : Array[DateSegmentKind] = [DateSegmentKind::Hour]
+  match granularity {
+    DateGranularity::Day | DateGranularity::Hour => ()
+    DateGranularity::Minute => out.push(DateSegmentKind::Minute)
+    DateGranularity::Second => {
+      out.push(DateSegmentKind::Minute)
+      out.push(DateSegmentKind::Second)
+    }
+  }
+  if hour_cycle_12 {
+    out.push(DateSegmentKind::DayPeriod)
+  }
+  out
+}
+
+fn wrap_range(v : Int, lo : Int, hi : Int) -> Int {
+  let span = hi - lo + 1
+  if span <= 0 { return lo }
+  let r = (v - lo) % span
+  lo + (if r < 0 { r + span } else { r })
+}
+
+/// Display text for a segment (returns placeholder like `"yyyy"`, `"mm"`, `"dd"`, `"--"` when empty).
+pub fn SegmentedDateTime::segment_text(self : SegmentedDateTime, kind : DateSegmentKind, hour_cycle_12~ : Bool = false) -> String {
+  let pad2 = fn(v : Int) -> String { if v < 10 { "0\{v}" } else { "\{v}" } }
+  match kind {
+    DateSegmentKind::Year =>
+      match self.year {
+        Some(y) => if y < 10 { "000\{y}" } else if y < 100 { "00\{y}" } else if y < 1000 { "0\{y}" } else { "\{y}" }
+        None => "yyyy"
+      }
+    DateSegmentKind::Month =>
+      match self.month {
+        Some(m) => pad2(m)
+        None => "mm"
+      }
+    DateSegmentKind::Day =>
+      match self.day {
+        Some(d) => pad2(d)
+        None => "dd"
+      }
+    DateSegmentKind::Hour =>
+      match self.hour {
+        Some(h) =>
+          if hour_cycle_12 {
+            let h12 = h % 12
+            pad2(if h12 == 0 { 12 } else { h12 })
+          } else {
+            pad2(h)
+          }
+        None => "--"
+      }
+    DateSegmentKind::Minute =>
+      match self.minute {
+        Some(m) => pad2(m)
+        None => "--"
+      }
+    DateSegmentKind::Second =>
+      match self.second {
+        Some(s) => pad2(s)
+        None => "--"
+      }
+    DateSegmentKind::DayPeriod =>
+      match self.hour {
+        Some(h) => if h < 12 { "AM" } else { "PM" }
+        None => "AM"
+      }
+  }
+}
+
+/// Numeric `(min, current, max)` for ARIA `SpinButton` range.
+pub fn SegmentedDateTime::segment_range(self : SegmentedDateTime, kind : DateSegmentKind, hour_cycle_12~ : Bool = false) -> (Double, Double, Double) {
+  match kind {
+    DateSegmentKind::Year => (1.0, (match self.year { Some(v) => v; None => 2026 }).to_double(), 9999.0)
+    DateSegmentKind::Month => (1.0, (match self.month { Some(v) => v; None => 1 }).to_double(), 12.0)
+    DateSegmentKind::Day => {
+      let y = match self.year { Some(v) => v; None => 2026 }
+      let m = match self.month { Some(v) => v; None => 1 }
+      let max_d = iso_days_in_month(y, m)
+      (1.0, (match self.day { Some(v) => v; None => 1 }).to_double(), max_d.to_double())
+    }
+    DateSegmentKind::Hour =>
+      if hour_cycle_12 {
+        let h12 = match self.hour {
+          Some(h) => { let x = h % 12; if x == 0 { 12 } else { x } }
+          None => 12
+        }
+        (1.0, h12.to_double(), 12.0)
+      } else {
+        (0.0, (match self.hour { Some(v) => v; None => 0 }).to_double(), 23.0)
+      }
+    DateSegmentKind::Minute => (0.0, (match self.minute { Some(v) => v; None => 0 }).to_double(), 59.0)
+    DateSegmentKind::Second => (0.0, (match self.second { Some(v) => v; None => 0 }).to_double(), 59.0)
+    DateSegmentKind::DayPeriod => {
+      let p = match self.hour { Some(h) => if h < 12 { 0 } else { 1 }; None => 0 }
+      (0.0, p.to_double(), 1.0)
+    }
+  }
+}
+
+/// Step one segment by `delta` (`+1` / `-1`).
+pub fn SegmentedDateTime::step_segment(
+  self : SegmentedDateTime,
+  kind : DateSegmentKind,
+  delta : Int,
+  hour_cycle_12~ : Bool = false,
+  default_year~ : Int = 2026,
+) -> SegmentedDateTime {
+  match kind {
+    DateSegmentKind::Year => {
+      let next_y = match self.year {
+        Some(y) => wrap_range(y + delta, 1, 9999)
+        None => default_year
+      }
+      let next_d = match (self.month, self.day) {
+        (Some(m), Some(d)) => {
+          let max_d = iso_days_in_month(next_y, m)
+          Some(if d > max_d { max_d } else { d })
+        }
+        _ => self.day
+      }
+      SegmentedDateTime::{ year: Some(next_y), month: self.month, day: next_d, hour: self.hour, minute: self.minute, second: self.second }
+    }
+    DateSegmentKind::Month => {
+      let next_m = match self.month {
+        Some(m) => wrap_range(m + delta, 1, 12)
+        None => if delta >= 0 { 1 } else { 12 }
+      }
+      let y = match self.year { Some(v) => v; None => default_year }
+      let next_d = match self.day {
+        Some(d) => {
+          let max_d = iso_days_in_month(y, next_m)
+          Some(if d > max_d { max_d } else { d })
+        }
+        None => None
+      }
+      SegmentedDateTime::{ year: self.year, month: Some(next_m), day: next_d, hour: self.hour, minute: self.minute, second: self.second }
+    }
+    DateSegmentKind::Day => {
+      let y = match self.year { Some(v) => v; None => default_year }
+      let m = match self.month { Some(v) => v; None => 1 }
+      let max_d = iso_days_in_month(y, m)
+      let next_d = match self.day {
+        Some(d) => wrap_range(d + delta, 1, max_d)
+        None => if delta >= 0 { 1 } else { max_d }
+      }
+      SegmentedDateTime::{ year: self.year, month: self.month, day: Some(next_d), hour: self.hour, minute: self.minute, second: self.second }
+    }
+    DateSegmentKind::Hour => {
+      let next_h = match self.hour {
+        Some(h) =>
+          if hour_cycle_12 {
+            let pm = h >= 12
+            let h12 = h % 12
+            let next12 = wrap_range(h12 + delta, 0, 11)
+            if pm { next12 + 12 } else { next12 }
+          } else {
+            wrap_range(h + delta, 0, 23)
+          }
+        None => if delta >= 0 { if hour_cycle_12 { 12 } else { 0 } } else { 23 }
+      }
+      SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: Some(next_h), minute: self.minute, second: self.second }
+    }
+    DateSegmentKind::Minute => {
+      let next_min = match self.minute {
+        Some(m) => wrap_range(m + delta, 0, 59)
+        None => if delta >= 0 { 0 } else { 59 }
+      }
+      SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: self.hour, minute: Some(next_min), second: self.second }
+    }
+    DateSegmentKind::Second => {
+      let next_s = match self.second {
+        Some(s) => wrap_range(s + delta, 0, 59)
+        None => if delta >= 0 { 0 } else { 59 }
+      }
+      SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: self.hour, minute: self.minute, second: Some(next_s) }
+    }
+    DateSegmentKind::DayPeriod => {
+      let next_h = match self.hour {
+        Some(h) => if h < 12 { h + 12 } else { h - 12 }
+        None => if delta >= 0 { 12 } else { 0 }
+      }
+      SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: Some(next_h), minute: self.minute, second: self.second }
+    }
+  }
+}
+
+/// Clear one segment back to its empty placeholder (`None`).
+pub fn SegmentedDateTime::clear_segment(self : SegmentedDateTime, kind : DateSegmentKind) -> SegmentedDateTime {
+  match kind {
+    DateSegmentKind::Year => SegmentedDateTime::{ year: None, month: self.month, day: self.day, hour: self.hour, minute: self.minute, second: self.second }
+    DateSegmentKind::Month => SegmentedDateTime::{ year: self.year, month: None, day: self.day, hour: self.hour, minute: self.minute, second: self.second }
+    DateSegmentKind::Day => SegmentedDateTime::{ year: self.year, month: self.month, day: None, hour: self.hour, minute: self.minute, second: self.second }
+    DateSegmentKind::Hour | DateSegmentKind::DayPeriod =>
+      SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: None, minute: self.minute, second: self.second }
+    DateSegmentKind::Minute => SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: self.hour, minute: None, second: self.second }
+    DateSegmentKind::Second => SegmentedDateTime::{ year: self.year, month: self.month, day: self.day, hour: self.hour, minute: self.minute, second: None }
+  }
+}

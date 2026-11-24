@@ -61,6 +61,8 @@ namespace {
 struct Node {
   int id = 0, parent = 0, widget = 0;
   std::wstring role, flags, label, value, description, actions;
+  std::wstring current, sort;
+  int controls = 0, active_descendant = 0;
   double x = 0, y = 0, w = 0, h = 0;
   bool range = false;
   double low = 0, at = 0, high = 0;
@@ -72,6 +74,7 @@ struct Node {
 HWND win;
 std::unordered_map<int, Node> nodes;
 int focused;            // the node with the keyboard's focus (0: none)
+int focus_told;         // the node the readers were last told has it (focus_target_of(focused))
 bool asked;             // a reader asked for the window (a frame asked for then, for the app to tell its widgets)
 
 class Item;
@@ -82,6 +85,16 @@ std::unordered_map<int, Item *> items;  // this side's providers, by node (one h
 const Node *node_of(int id) {
   auto it = nodes.find(id);
   return it == nodes.end() ? nullptr : &it->second;
+}
+
+// The node readers are told has the focus: the focused node's live active descendant (aria-activedescendant: the
+// item browsed to while the keyboard's focus stays on the input or list), else the focused node itself. Never a
+// selection: IsSelected stays the node's own 's'.
+int focus_target_of(int f) {
+  const Node *n = f ? node_of(f) : nullptr;
+  if (n && n->active_descendant > 0 && n->active_descendant != f && node_of(n->active_descendant))
+    return n->active_descendant;
+  return f;
 }
 
 // what node `id` holds as providers: those of no use of their own (flags v: what a column scrolls is held in) left out,
@@ -187,6 +200,8 @@ long control_type(const std::wstring &r) {
       {L"Heading", UIA_TextControlTypeId},        {L"ScrollArea", UIA_PaneControlTypeId},
       {L"Table", UIA_TableControlTypeId},         {L"Row", UIA_DataItemControlTypeId},
       {L"ColumnHeader", UIA_HeaderItemControlTypeId}, {L"Cell", UIA_DataItemControlTypeId},
+      {L"Meter", UIA_ProgressBarControlTypeId},   {L"Grid", UIA_DataGridControlTypeId},
+      {L"GridCell", UIA_DataItemControlTypeId},   {L"SpinButton", UIA_SpinnerControlTypeId},
   };
   auto it = types.find(r);
   return it == types.end() ? UIA_GroupControlTypeId : it->second;
@@ -299,8 +314,16 @@ class Item : public IRawElementProviderSimple,
         break;
       case UIA_FrameworkIdPropertyId: put_bstr(v, L"mbui"); break;
       case UIA_IsEnabledPropertyId: put_bool(v, !n->has(L'd')); break;
-      case UIA_HasKeyboardFocusPropertyId: put_bool(v, n->id == focused); break;
-      case UIA_IsKeyboardFocusablePropertyId: put_bool(v, n->can(L'f') || n->id == focused); break;
+      case UIA_HasKeyboardFocusPropertyId: {
+        // Expose a single public keyboard focus matching GetFocus() & AutomationFocusChanged:
+        // when the input owns a live active descendant, that descendant alone reports HasKeyboardFocus=true.
+        int ft = focus_target_of(focused);
+        put_bool(v, ft > 0 && n->id == ft);
+        break;
+      }
+      case UIA_IsKeyboardFocusablePropertyId:
+        put_bool(v, n->can(L'f') || n->id == focused || n->id == focus_target_of(focused));
+        break;
       case UIA_IsControlElementPropertyId:
       case UIA_IsContentElementPropertyId: put_bool(v, true); break;
       case UIA_IsOffscreenPropertyId: put_bool(v, n->w <= 0 || n->h <= 0); break;
@@ -314,6 +337,32 @@ class Item : public IRawElementProviderSimple,
         break;
       case UIA_HeadingLevelPropertyId:
         if (n->role == L"Heading") put_i4(v, HeadingLevel2);
+        break;
+      // UIA AriaProperties exposes ARIA states that lack dedicated UIA properties (busy, multiselectable, current, sort)
+      case UIA_AriaPropertiesPropertyId: {
+        std::wstring props;
+        if (n->has(L'b')) props += L"busy=true;";
+        if (n->has(L'u')) props += L"multiselectable=true;";
+        if (!n->current.empty()) props += L"current=" + n->current + L";";
+        if (!n->sort.empty()) props += L"sort=" + n->sort + L";";
+        if (!props.empty()) put_bstr(v, props);
+        break;
+      }
+      // UIA ControllerFor maps ARIA aria-controls to the controlled target provider
+      case UIA_ControllerForPropertyId:
+        if (n->controls > 0 && n->controls != n->id) {
+          IRawElementProviderFragment *ctrl = fragment_of(n->controls);
+          if (ctrl) {
+            SAFEARRAY *sa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+            if (sa) {
+              LONG idx = 0;
+              SafeArrayPutElement(sa, &idx, ctrl);
+              v->vt = VT_ARRAY | VT_UNKNOWN;
+              v->parray = sa;
+            }
+            ctrl->Release();
+          }
+        }
         break;
     }
     return S_OK;
@@ -561,7 +610,8 @@ class Root : public IRawElementProviderSimple, public IRawElementProviderFragmen
     return S_OK;
   }
   HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment **out) override {
-    *out = focused ? fragment_of(focused) : NULL;
+    int f = focus_target_of(focused);
+    *out = f ? fragment_of(f) : NULL;
     return S_OK;
   }
 };
@@ -709,7 +759,7 @@ void a11y_flush(void *unused) {
     r->Release();
   }
   if (do_focus) {
-    int f_id = focused;
+    int f_id = focus_target_of(focused);
     IRawElementProviderFragment *f = f_id ? fragment_of(f_id) : NULL;
     if (f) {
       IRawElementProviderSimple *simple = NULL;
@@ -793,6 +843,10 @@ void mb_host_a11y_tree(moonbit_string_t s) {
       d.kids.push_back((int)number(f[16].substr(k, c - k)));
       k = c + 1;
     }
+    if (f.size() > 17) d.current = a11y_unescape(f[17]);
+    if (f.size() > 18) d.sort = a11y_unescape(f[18]);
+    if (f.size() > 19 && !f[19].empty()) d.controls = (int)number(f[19]);
+    if (f.size() > 20 && !f[20].empty()) d.active_descendant = (int)number(f[20]);
     told.push_back(d);
   }
   if (!head) return;
@@ -850,6 +904,7 @@ void mb_host_a11y_tree(moonbit_string_t s) {
   }
   if (!MB_A11Y_CLIENTS_LISTENING() || !root) {
     focused = focus;
+    focus_told = focus_target_of(focus);
     pending_props.clear();
     pending_shape = false;
     pending_focus = false;
@@ -896,10 +951,17 @@ void mb_host_a11y_tree(moonbit_string_t s) {
       p.was_d = o.at, p.now_d = d.at;
       queue_prop(std::move(p));
     }
+    // (an active descendant browsed to is not chosen: IsSelected stays the node's own 's' alone; the item browsed
+    // to is told as the focus below, focus_target_of)
   }
   if (shape) pending_shape = true;
-  if (focus != focused) {
+  // Virtual focus (ARIA aria-activedescendant), as UIA readers expect it (Chromium's way): while the focused node
+  // has a live active descendant, that descendant is the focus they are told of (GetFocus, a focus-changed event on
+  // it as it switches), the focused node keeping the keyboard's focus; none live, the focused node itself.
+  int target = focus_target_of(focus);
+  if (focus != focused || target != focus_told) {
     focused = focus;
+    focus_told = target;
     pending_focus = true;
   }
   if ((!pending_props.empty() || pending_shape || pending_focus) && !flush_posted && !flushing) {

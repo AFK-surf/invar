@@ -1,0 +1,307 @@
+// Pure deterministic OTP (One-Time Password) reducer for Layer-0 `headless_core`.
+// Handles max_length, character predicate filtering, committed-text normalization,
+// active slot index, full-string paste truncation, mid-segment replacement,
+// backspace retreat, and completion signaling.
+
+/// Default OTP predicate: ASCII digits `0`..`9`.
+pub fn otp_is_digit(code : Int) -> Bool {
+  code >= 48 && code <= 57
+}
+
+/// Alphanumeric OTP predicate: ASCII `0`..`9`, `A`..`Z`, `a`..`z`.
+pub fn otp_is_alnum(code : Int) -> Bool {
+  (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+}
+
+/// View of a single OTP slot.
+#derive(Eq)
+pub struct OtpSlot {
+  pub index : Int
+  pub char : String
+  pub is_active : Bool
+  pub has_fake_caret : Bool
+}
+
+/// Pure deterministic state of an OTP input.
+#derive(Eq)
+pub struct OtpState {
+  pub value : String
+  pub max_length : Int
+  pub sel_start : Int
+  pub sel_end : Int
+  pub active_index : Int
+  pub is_focused : Bool
+  pub is_complete : Bool
+}
+
+/// Result of a pure OTP reducer transition.
+#derive(Eq)
+pub struct OtpStep {
+  pub state : OtpState
+  pub changed : Bool
+  pub completed : Bool
+}
+
+fn codes_to_string(codes : Array[Int], start : Int, end : Int) -> String {
+  let sb = StringBuilder::new()
+  let lo = if start < 0 { 0 } else { start }
+  let hi = if end > codes.length() { codes.length() } else { end }
+  let mut i = lo
+  while i < hi {
+    sb.write_char(codes[i].unsafe_to_char())
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn filter_codes(raw : String, max_length : Int, allow : (Int) -> Bool) -> Array[Int] {
+  let out : Array[Int] = []
+  if max_length <= 0 {
+    return out
+  }
+  let codes = str_to_codes(raw)
+  for cp in codes {
+    if out.length() >= max_length {
+      break
+    }
+    if allow(cp) {
+      out.push(cp)
+    }
+  }
+  out
+}
+
+/// Filter `raw` by `allow` and truncate to `max_length` Unicode scalar characters.
+pub fn otp_filter(raw : String, max_length : Int, allow~ : (Int) -> Bool = otp_is_digit) -> String {
+  let filtered = filter_codes(raw, max_length, allow)
+  codes_to_string(filtered, 0, filtered.length())
+}
+
+/// Compute the active slot index in `[0, max_length - 1]` (or `-1` if `max_length <= 0`).
+pub fn otp_active_index(
+  value_len : Int,
+  max_length : Int,
+  selection_start : Int,
+  selection_end : Int,
+) -> Int {
+  if max_length <= 0 {
+    return -1
+  }
+  let last = max_length - 1
+  let sel_s = if selection_start < 0 { 0 } else if selection_start > value_len { value_len } else { selection_start }
+  let sel_e = if selection_end < sel_s { sel_s } else if selection_end > value_len { value_len } else { selection_end }
+  if sel_s < sel_e {
+    if sel_s > last { last } else { sel_s }
+  } else if sel_s < value_len {
+    if sel_s > last { last } else { sel_s }
+  } else if value_len < max_length {
+    value_len
+  } else {
+    last
+  }
+}
+
+fn clamp_sel(start : Int, end : Int, len : Int) -> (Int, Int) {
+  let s = if start < 0 { 0 } else if start > len { len } else { start }
+  let e = if end < s { s } else if end > len { len } else { end }
+  (s, e)
+}
+
+/// Construct an initial `OtpState` of `max_length` slots, normalizing `initial` via `allow`.
+pub fn otp_init(
+  max_length : Int,
+  initial~ : String = "",
+  allow~ : (Int) -> Bool = otp_is_digit,
+) -> OtpState {
+  let cap = if max_length < 0 { 0 } else { max_length }
+  let codes = filter_codes(initial, cap, allow)
+  let value = codes_to_string(codes, 0, codes.length())
+  let len = codes.length()
+  let active = otp_active_index(len, cap, len, len)
+  OtpState::{
+    value,
+    max_length: cap,
+    sel_start: len,
+    sel_end: len,
+    active_index: active,
+    is_focused: false,
+    is_complete: cap > 0 && len == cap,
+  }
+}
+
+/// Normalize and commit a full text snapshot (e.g. after IME composition commit or controlled edit).
+pub fn otp_commit_text(
+  state : OtpState,
+  text : String,
+  selection_start~ : Int = -1,
+  selection_end~ : Int = -1,
+  allow~ : (Int) -> Bool = otp_is_digit,
+) -> OtpStep {
+  let codes = filter_codes(text, state.max_length, allow)
+  let next_val = codes_to_string(codes, 0, codes.length())
+  let len = codes.length()
+  let raw_s = if selection_start < 0 { len } else { selection_start }
+  let raw_e = if selection_end < 0 { raw_s } else { selection_end }
+  let (sel_start, sel_end) = clamp_sel(raw_s, raw_e, len)
+  let active = otp_active_index(len, state.max_length, sel_start, sel_end)
+  let is_complete = state.max_length > 0 && len == state.max_length
+  let changed = next_val != state.value
+  let next_state = OtpState::{
+    value: next_val,
+    max_length: state.max_length,
+    sel_start,
+    sel_end,
+    active_index: active,
+    is_focused: state.is_focused,
+    is_complete,
+  }
+  OtpStep::{ state: next_state, changed, completed: changed && is_complete }
+}
+
+/// Handle a full-string paste: filter valid characters and truncate to `max_length`.
+/// If `pasted` is non-empty but contains zero allowed characters, leaves existing value unchanged.
+pub fn otp_paste(
+  state : OtpState,
+  pasted : String,
+  allow~ : (Int) -> Bool = otp_is_digit,
+) -> OtpStep {
+  if pasted != "" && filter_codes(pasted, state.max_length, allow).length() == 0 {
+    return OtpStep::{ state, changed: false, completed: false }
+  }
+  otp_commit_text(state, pasted, allow=allow)
+}
+
+/// Replace the code-point range `[start, end)` with filtered `replacement`, truncating to `max_length`.
+/// If `replacement` is non-empty but contains zero allowed characters, the edit is rejected and state is unchanged.
+/// When the OTP is already full and `[start, end)` is a collapsed caret, replaces the slot(s) starting at the caret.
+pub fn otp_replace_range(
+  state : OtpState,
+  start : Int,
+  end : Int,
+  replacement : String,
+  allow~ : (Int) -> Bool = otp_is_digit,
+) -> OtpStep {
+  let cur = str_to_codes(state.value)
+  let cur_len = cur.length()
+  let (lo0, hi0) = clamp_sel(start, end, cur_len)
+  let repl = filter_codes(replacement, state.max_length, allow)
+  if replacement != "" && repl.length() == 0 {
+    return OtpStep::{ state, changed: false, completed: false }
+  }
+  let (lo, hi) = if lo0 == hi0 && cur_len == state.max_length && state.max_length > 0 && repl.length() > 0 {
+    let ov_lo = if lo0 >= state.max_length { state.max_length - 1 } else { lo0 }
+    let ov_hi = if ov_lo + repl.length() > cur_len { cur_len } else { ov_lo + repl.length() }
+    (ov_lo, ov_hi)
+  } else {
+    (lo0, hi0)
+  }
+  let combined : Array[Int] = []
+  let mut i = 0
+  while i < lo && combined.length() < state.max_length {
+    combined.push(cur[i])
+    i += 1
+  }
+  let mut j = 0
+  while j < repl.length() && combined.length() < state.max_length {
+    combined.push(repl[j])
+    j += 1
+  }
+  let next_caret = combined.length()
+  let mut k = hi
+  while k < cur_len && combined.length() < state.max_length {
+    combined.push(cur[k])
+    k += 1
+  }
+  let next_val = codes_to_string(combined, 0, combined.length())
+  let len = combined.length()
+  let active = otp_active_index(len, state.max_length, next_caret, next_caret)
+  let is_complete = state.max_length > 0 && len == state.max_length
+  let changed = next_val != state.value
+  let next_state = OtpState::{
+    value: next_val,
+    max_length: state.max_length,
+    sel_start: next_caret,
+    sel_end: next_caret,
+    active_index: active,
+    is_focused: state.is_focused,
+    is_complete,
+  }
+  OtpStep::{ state: next_state, changed, completed: changed && is_complete }
+}
+
+/// Handle backspace using `sel_start`/`sel_end`:
+/// - Non-empty selection `[sel_start, sel_end)` deletes the selected range and places caret at `sel_start`.
+/// - Collapsed caret at `sel_start > 0` deletes `sel_start - 1` and retreats caret to `sel_start - 1`.
+/// - Collapsed caret at `0` (or empty value) is a no-op.
+pub fn otp_backspace(state : OtpState) -> OtpStep {
+  let cur = str_to_codes(state.value)
+  let cur_len = cur.length()
+  if cur_len == 0 {
+    return OtpStep::{ state, changed: false, completed: false }
+  }
+  let (s, e) = clamp_sel(state.sel_start, state.sel_end, cur_len)
+  let (del_lo, del_hi) = if s < e {
+    (s, e)
+  } else if s > 0 {
+    (s - 1, s)
+  } else {
+    return OtpStep::{ state, changed: false, completed: false }
+  }
+  let next : Array[Int] = []
+  let mut i = 0
+  while i < cur_len {
+    if i < del_lo || i >= del_hi {
+      next.push(cur[i])
+    }
+    i += 1
+  }
+  let next_val = codes_to_string(next, 0, next.length())
+  let len = next.length()
+  let active = otp_active_index(len, state.max_length, del_lo, del_lo)
+  let next_state = OtpState::{
+    value: next_val,
+    max_length: state.max_length,
+    sel_start: del_lo,
+    sel_end: del_lo,
+    active_index: active,
+    is_focused: state.is_focused,
+    is_complete: state.max_length > 0 && len == state.max_length,
+  }
+  OtpStep::{ state: next_state, changed: true, completed: false }
+}
+
+/// Update active slot index and selection range without modifying value.
+pub fn otp_select(state : OtpState, selection_start : Int, selection_end : Int) -> OtpState {
+  let len = str_to_codes(state.value).length()
+  let (sel_start, sel_end) = clamp_sel(selection_start, selection_end, len)
+  let active = otp_active_index(len, state.max_length, sel_start, sel_end)
+  OtpState::{ ..state, sel_start, sel_end, active_index: active }
+}
+
+/// Update focus state.
+pub fn otp_set_focused(state : OtpState, focused : Bool) -> OtpState {
+  OtpState::{ ..state, is_focused: focused }
+}
+
+/// Derive all `max_length` slot view snapshots from `state`.
+pub fn otp_slots(state : OtpState) -> Array[OtpSlot] {
+  let codes = str_to_codes(state.value)
+  let out : Array[OtpSlot] = []
+  let mut i = 0
+  while i < state.max_length {
+    let ch = if i < codes.length() {
+      codes_to_string(codes, i, i + 1)
+    } else {
+      ""
+    }
+    let is_active = state.is_focused && i == state.active_index
+    out.push(OtpSlot::{
+      index: i,
+      char: ch,
+      is_active,
+      has_fake_caret: is_active && ch == "",
+    })
+    i += 1
+  }
+  out
+}

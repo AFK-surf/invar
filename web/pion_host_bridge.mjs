@@ -88,6 +88,10 @@ export function a11yRoleSpec(role) {
     case "Row": return { tag: "div", role: "row" };
     case "ColumnHeader": return { tag: "div", role: "columnheader" };
     case "Cell": return { tag: "div", role: "cell" };
+    case "Meter": return { tag: "div", role: "meter" };
+    case "Grid": return { tag: "div", role: "grid" };
+    case "GridCell": return { tag: "div", role: "gridcell" };
+    case "SpinButton": return { tag: "div", role: "spinbutton" };
     default: return { tag: "span", role: null };
   }
 }
@@ -246,6 +250,7 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (el && el.parentNode) el.parentNode.removeChild(el);
       el = document.createElement(spec.tag);
       if (spec.tag === "button") el.type = "button";
+      el.id = "mb-a11y-" + node.id;
       el.dataset.a11yId = node.id;
       const nid = node.id;
       // An activatable mirror element handles its own activation and stops the
@@ -369,6 +374,39 @@ export function attachHostBridge(rt, perfHooks = {}) {
       if (disabled) el.setAttribute("aria-disabled", "true");
       else el.removeAttribute("aria-disabled");
       if (spec.tag === "button") el.disabled = disabled;
+
+      if (flags.includes("b")) el.setAttribute("aria-busy", "true");
+      else el.removeAttribute("aria-busy");
+
+      if (flags.includes("u")) el.setAttribute("aria-multiselectable", "true");
+      else el.removeAttribute("aria-multiselectable");
+      semanticChanged = true;
+    }
+
+    if (!last || last.current !== node.current) {
+      if (node.current) el.setAttribute("aria-current", node.current);
+      else el.removeAttribute("aria-current");
+      semanticChanged = true;
+    }
+
+    if (!last || last.sort !== node.sort) {
+      if (node.sort) el.setAttribute("aria-sort", node.sort);
+      else el.removeAttribute("aria-sort");
+      semanticChanged = true;
+    }
+
+    if (!last || last.controls !== node.controls) {
+      if (node.controls && node.controls !== "0") el.setAttribute("aria-controls", "mb-a11y-" + node.controls);
+      else el.removeAttribute("aria-controls");
+      semanticChanged = true;
+    }
+
+    if (!last || last.activeDescendant !== node.activeDescendant) {
+      if (node.activeDescendant && node.activeDescendant !== "0") {
+        el.setAttribute("aria-activedescendant", "mb-a11y-" + node.activeDescendant);
+      } else {
+        el.removeAttribute("aria-activedescendant");
+      }
       semanticChanged = true;
     }
 
@@ -431,6 +469,10 @@ export function attachHostBridge(rt, perfHooks = {}) {
       rangeAt: node.rangeAt,
       rangeHigh: node.rangeHigh,
       flags,
+      current: node.current,
+      sort: node.sort,
+      controls: node.controls,
+      activeDescendant: node.activeDescendant,
       actions: node.actions,
       disabled,
       x: last ? last.x : node.x,
@@ -488,6 +530,10 @@ export function attachHostBridge(rt, perfHooks = {}) {
           actions: parts[14] || "",
           widget: Number(parts[15]) || 0,
           kids,
+          current: parts.length > 17 ? unescapeSemField(parts[17] || "") : "",
+          sort: parts.length > 18 ? unescapeSemField(parts[18] || "") : "",
+          controls: parts.length > 19 ? (parts[19] || "") : "",
+          activeDescendant: parts.length > 20 ? (parts[20] || "") : "",
         });
       }
     }

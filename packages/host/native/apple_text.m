@@ -108,8 +108,8 @@ static NSArray *proportional_widths(void) {
 }
 
 // Face `face` at this size and weight: its file for the nearest weight, a variable one at the weight itself; its digits
-// all one width where `tabular`, its marks narrow where `proportional`.
-static CTFontRef face_font(int face, double size, int weight, bool tabular, bool proportional) {
+// all one width where `tabular`, its marks narrow where `proportional`, its stylistic alternates (`cv11`/`ss01`) where `alternates`.
+static CTFontRef face_font(int face, double size, int weight, bool tabular, bool proportional, bool alternates) {
   NSArray<NSNumber *> *ws = face_weights[face];
   NSUInteger best = 0;
   int bestd = INT_MAX;
@@ -128,10 +128,10 @@ static CTFontRef face_font(int face, double size, int weight, bool tabular, bool
     at = CTFontDescriptorCreateCopyWithVariation(d, (__bridge CFNumberRef)@(0x77676874), (CGFloat)weight);
   }
   // the app's words and what people wrote with the web's alternates (global.css.ts: font-feature-settings "cv11",
-  // "ss01": Inter's single-storey a, its open digits; a face without them is as it is)
+  // "ss01": Inter's single-storey a, its open digits; a face without them is as it is; opted out via style_no_alternates)
   CTFontDescriptorRef feat = NULL;
   NSMutableArray *fs = [NSMutableArray new];
-  if (face == 1 || face == 2) {
+  if ((face == 1 || face == 2) && alternates) {
     [fs addObject:@{(__bridge id)kCTFontOpenTypeFeatureTag : @"cv11", (__bridge id)kCTFontOpenTypeFeatureValue : @1}];
     [fs addObject:@{(__bridge id)kCTFontOpenTypeFeatureTag : @"ss01", (__bridge id)kCTFontOpenTypeFeatureValue : @1}];
   }
@@ -275,7 +275,7 @@ static CTFontRef font_for(double size, int weight, int style) {
   id f = fonts[k];
   if (!f) {
     int face = face_id(style);
-    CTFontRef base = face ? face_font(face, size, weight, (style & 32) != 0, (style & 64) != 0) : NULL;
+    CTFontRef base = face ? face_font(face, size, weight, (style & 32) != 0, (style & 64) != 0, !(style & 128)) : NULL;
     if (!base) {
       base = (style & 4) && !(style & 2) ? serif_font(size, weight) : mb_platform_font(size, weight, (style & 2) != 0);
       if (style & (32 | 64)) {
