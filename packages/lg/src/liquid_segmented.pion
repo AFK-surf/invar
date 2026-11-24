@@ -5,6 +5,53 @@ import "signals"
 import "ui"
 import "view"
 
+/// Compute unified per-item `(x0, width, center)` geometry in strip-local coordinates.
+/// Shared by item layout, sliding thumb/lens interpolation, tap origin capture, and drag inverse mapping.
+fn seg_item_geoms(
+  n : Int,
+  room_w : Double,
+  gap : Double,
+  widths : Option[() -> Array[Double]],
+) -> Array[(Double, Double, Double)] {
+  let count = if n > 0 { n } else { 1 }
+  let out : Array[(Double, Double, Double)] = []
+  let total_gap = gap * (count - 1).to_double()
+  let equal_w = dmax(0.0, (room_w - total_gap) / count.to_double())
+  let ws_opt = match widths {
+    Some(ws_fn) => Some(ws_fn())
+    None => None
+  }
+  let missing_w = match ws_opt {
+    Some(ws) =>
+    if ws.length() < count {
+      let mut used = 0.0
+      let mut j = 0
+      while j < ws.length() {
+        used = used + dmax(0.0, ws[j])
+        j += 1
+      }
+      let missing = count - ws.length()
+      let rem = room_w - used - total_gap
+      if rem > 0.0 { rem / missing.to_double() } else { equal_w }
+    } else {
+      0.0
+    }
+    None => equal_w
+  }
+  let mut x = 0.0
+  let mut i = 0
+  while i < count {
+    let w = match ws_opt {
+      Some(ws) => if i < ws.length() { dmax(0.0, ws[i]) } else { missing_w }
+      None => equal_w
+    }
+    out.push((x, w, x + w * 0.5))
+    x = x + w + gap
+    i += 1
+  }
+  out
+}
+
 pub fn liquid_segmented_node(
   parent : view::View,
   labels : () -> Array[String],
@@ -13,14 +60,29 @@ pub fn liquid_segmented_node(
   width? : Double,
   height~ : Double = 32.0,
   drag? : DampedDrag,
+  glass_track? : Bool,
+  pad~ : Double = ctrl_seg_pad,
+  gap~ : Double = 0.0,
+  widths? : () -> Array[Double],
+  height_by? : () -> Double,
+  text_size? : () -> Double,
+  kind~ : headless::GroupKind = headless::GroupKind::Tab,
+  said~ : String = "Segmented Control",
+  shown~ : () -> Bool = fn() { true },
+  in_node~ : Bool = false,
   render_item? : (view::View, Int, () -> Bool) -> Unit,
   flat? : Bool,
   loc~ : String = "",
 ) -> view::View {
-  let is_flat = is_flat_in(parent, flat)
-  let outer_r = height / 2.0
-  let inner_h = height - 2.0 * ctrl_seg_pad
-  let inner_r = inner_h / 2.0
+  let is_flat = match glass_track {
+    Some(b) => !b
+    None => is_flat_in(parent, flat)
+  }
+  let total_h = match height_by {
+    Some(f) => f
+    None => fn() { height }
+  }
+  let inner_h = fn() -> Double { dmax(0.0, total_h() - 2.0 * pad) }
   let init_count = signals::untracked(labels).length()
   let last_init = if init_count > 1 { (init_count - 1).to_double() } else { 0.0 }
   let first = signals::untracked(selected).to_double()
@@ -35,19 +97,21 @@ pub fn liquid_segmented_node(
   headless::radio_group(
     loc=loc,
     parent,
-    fn() { "Segmented Control" },
+    fn() { said },
     selected,
     on_select,
-    kind=headless::GroupKind::Tab,
+    kind=kind,
     axis=headless::GroupAxis::Horizontal,
+    shown=shown,
+    in_node=in_node,
     fn(g : view::View, rg : headless::RadioGroup[Int]) -> Unit {
       dd.attach(g)
       let _ = g
-      .height(view::Live::Is(Some(height)))
+      .height(view::Live::By(fn() { Some(total_h()) }))
       .shrink(view::Live::Is(1.0))
       .min_width(view::Live::Is(Some(0.0)))
-      .padding(view::Live::Is((ctrl_seg_pad, 0.0, ctrl_seg_pad, 0.0)))
-      .radius(view::Live::Is(outer_r))
+      .padding(view::Live::Is((pad, 0.0, pad, 0.0)))
+      .radius(view::Live::By(fn() { total_h() / 2.0 }))
       if is_flat {
         // Flat: Native iOS 27 tertiarySystemFill recessed track (zero resting glass).
         let _ = g
@@ -64,33 +128,47 @@ pub fn liquid_segmented_node(
           let _ = g.width(view::Live::Is(Some(w))).max_width(view::Live::Is(Some(w)), within=true)
         }
         None =>
-        match render_item {
+        match widths {
           Some(_) => ()
-          None => {
-            let auto_w = fn() -> Option[Double] {
-              let _ = g.words_redone()
-              let ls = labels()
-              let n = ls.length()
-              if n <= 0 {
-                return None
-              }
-              let mut max_lbl = 0.0
-              let mut i = 0
-              while i < n {
-                let w = ui::measure_text_width(ls[i], ctrl_type_seg, weight=weight_medium).ceil()
-                if w > max_lbl {
-                  max_lbl = w
+          None =>
+          match render_item {
+            Some(_) => ()
+            None => {
+              let auto_w = fn() -> Option[Double] {
+                let _ = g.words_redone()
+                let ls = labels()
+                let n = ls.length()
+                if n <= 0 {
+                  return None
                 }
-                i += 1
+                let sz = match text_size {
+                  Some(f) => f()
+                  None => ctrl_type_seg
+                }
+                let mut max_lbl = 0.0
+                let mut i = 0
+                while i < n {
+                  let w = ui::measure_text_width(ls[i], sz, weight=weight_medium).ceil()
+                  if w > max_lbl {
+                    max_lbl = w
+                  }
+                  i += 1
+                }
+                let slot_w = dmax(36.0, max_lbl + 2.0 * ctrl_seg_px + 2.0)
+                Some(2.0 * pad + slot_w * n.to_double() + gap * (if n > 1 { (n - 1).to_double() } else { 0.0 }))
               }
-              let slot_w = dmax(36.0, max_lbl + 2.0 * ctrl_seg_px + 2.0)
-              Some(2.0 * ctrl_seg_pad + slot_w * n.to_double())
+              let _ = g.width(view::Live::By(auto_w)).max_width(view::Live::By(auto_w), within=true)
             }
-            let _ = g.width(view::Live::By(auto_w)).max_width(view::Live::By(auto_w), within=true)
           }
         }
       }
+      g.reacts(fn() { labels().length() }, fn(n : Int) -> Unit {
+        let last = if n > 1 { (n - 1).to_double() } else { 0.0 }
+        dd.set_hi(last)
+      })
       g.reacts(at_start=false, selected, fn(i : Int) -> Unit {
+        let n = signals::untracked(labels).length()
+        dd.set_hi(if n > 1 { (n - 1).to_double() } else { 0.0 })
         if i != current.v {
           current.v = i
           dd.slide_to(i.to_double())
@@ -108,18 +186,65 @@ pub fn liquid_segmented_node(
           let n = count_fn()
           if n > 1 { (n - 1).to_double() } else { 0.0 }
         }
-        let seg_w = fn() -> Double { room.width() / count_fn().to_double() }
+        let geoms = fn() -> Array[(Double, Double, Double)] {
+          seg_item_geoms(count_fn(), room.width(), gap, widths)
+        }
+        let geom_of = fn(k : Int) -> (Double, Double, Double) {
+          let gs = geoms()
+          if k >= 0 && k < gs.length() {
+            gs[k]
+          } else {
+            (0.0, 0.0, 0.0)
+          }
+        }
+        let rect_at = fn(p : Double) -> (Double, Double) {
+          let gs = geoms()
+          let n = gs.length()
+          if n <= 1 {
+            return (gs[0].0, gs[0].1)
+          }
+          let cp = clamp(p, 0.0, (n - 1).to_double())
+          let i = cp.floor().to_int()
+          let a = if i < 0 { 0 } else if i > n - 2 { n - 2 } else { i }
+          let f = clamp(cp - a.to_double(), 0.0, 1.0)
+          let (x0, w0, _) = gs[a]
+          let (x1, w1, _) = gs[a + 1]
+          (x0 + (x1 - x0) * f, dmax(0.0, w0 + (w1 - w0) * f))
+        }
+        let index_at = fn(lx : Double) -> Double {
+          let gs = geoms()
+          let n = gs.length()
+          if n <= 1 {
+            return 0.0
+          }
+          let mut from = gs[0].2
+          if lx <= from {
+            return 0.0
+          }
+          let mut k = 1
+          while k < n {
+            let to = gs[k].2
+            if lx < to && to > from {
+              return (k - 1).to_double() + clamp((lx - from) / (to - from), 0.0, 1.0)
+            }
+            from = to
+            k += 1
+          }
+          (n - 1).to_double()
+        }
         let thumb_shape = fn(n : view::View) -> view::GroundShape {
-          let sw = seg_w()
+          let (rx, rw) = rect_at(dd.value(n))
+          let th_tot = total_h()
+          let ih = inner_h()
           let (sx, sy) = if no_lens() { (1.0, 1.0) } else { dd.jelly(n, 10.0) }
-          let tw = dmax(0.0, sw + dmin(sw * (sx - 1.0), ctrl_seg_max_grow_x))
-          let th = inner_h * sy
+          let tw = dmax(0.0, rw + dmin(rw * (sx - 1.0), ctrl_seg_max_grow_x))
+          let th = ih * sy
           let r = th / 2.0
           view::GroundShape::{
-            dx: dd.value(n) * sw + (sw - tw) / 2.0,
-            dy: (height - th) / 2.0,
-            dw: tw - sw,
-            dh: th - inner_h,
+            dx: rx + (rw - tw) / 2.0,
+            dy: (th_tot - th) / 2.0,
+            dw: tw,
+            dh: th - ih,
             corners: Some((r, r, r, r)),
           }
         }
@@ -127,17 +252,19 @@ pub fn liquid_segmented_node(
           let _ = thumb
           .over(view::Live::Is(true))
           .points(view::Live::Is(false))
-          .width(view::Live::By(fn() { Some(seg_w()) }))
-          .height(view::Live::Is(Some(inner_h)))
-          .radius(view::Live::Is(inner_r))
+          .offset(view::Live::Is((0.0, 0.0)))
+          .width(view::Live::Is(Some(0.0)))
+          .height(view::Live::By(fn() { Some(inner_h()) }))
+          .radius(view::Live::By(fn() { inner_h() / 2.0 }))
           .ground_drawn(view::Live::By(fn() { thumb_shape(thumb) }))
           let _ = thumb.box(fn(pill : view::View) -> Unit {
             let _ = pill
             .over(view::Live::Is(true))
             .points(view::Live::Is(false))
-            .width(view::Live::By(fn() { Some(seg_w()) }))
-            .height(view::Live::Is(Some(inner_h)))
-            .radius(view::Live::Is(inner_r))
+            .offset(view::Live::Is((0.0, 0.0)))
+            .width(view::Live::Is(Some(0.0)))
+            .height(view::Live::By(fn() { Some(inner_h()) }))
+            .radius(view::Live::By(fn() { inner_h() / 2.0 }))
             .ground(view::Live::By(ctrl_seg_thumb_idle))
             .shadow(view::Live::Is(ctrl_seg_thumb_idle_shadow))
             .shadow_outside(view::Live::Is(true))
@@ -149,15 +276,12 @@ pub fn liquid_segmented_node(
           })
         })
         let pos_at = fn(wx : Double) -> Double {
-          let sw = seg_w()
-          if sw <= 0.0 {
-            0.0
-          } else {
-            clamp((wx - strip_origin_x.v) / sw - 0.5, 0.0, last_fn())
-          }
+          clamp(index_at(wx - strip_origin_x.v), 0.0, last_fn())
         }
         let stopped = fn() -> Unit {
-          let to = clamp(dd.target().round(), 0.0, last_fn())
+          let last = last_fn()
+          dd.set_hi(last)
+          let to = clamp(dd.target().round(), 0.0, last)
           let i = to.to_int()
           current.v = i
           dd.update_value(to)
@@ -171,6 +295,7 @@ pub fn liquid_segmented_node(
           holding.set(false)
         }
         let on_drag = fn(d : view::Drag) -> Unit {
+          dd.set_hi(last_fn())
           match d.kind {
             Down => {
               if !lifted.v && !no_lens() {
@@ -178,9 +303,21 @@ pub fn liquid_segmented_node(
                 holding.set(true)
                 dd.press()
               }
-              dd.update_value(pos_at(d.wx))
+              let p = pos_at(d.wx)
+              if no_lens() {
+                dd.slide_to(p)
+              } else {
+                dd.update_value(p)
+              }
             }
-            Moved => dd.update_value(pos_at(d.wx))
+            Moved => {
+              let p = pos_at(d.wx)
+              if no_lens() {
+                dd.slide_to(p)
+              } else {
+                dd.update_value(p)
+              }
+            }
             Up => {
               if lifted.v {
                 stopped()
@@ -202,7 +339,11 @@ pub fn liquid_segmented_node(
           }
         }
         let _ = inner.box(fn(row : view::View) -> Unit {
-          let _ = row.row(view::Live::Is(true)).height(view::Live::Is(Some(height)))
+          let _ = row
+          .row(view::Live::Is(true))
+          .gap(view::Live::Is(gap))
+          .height(view::Live::By(fn() { Some(total_h()) }))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
           row.each(
             fn() -> Array[(Int, String)] {
               let ls = labels()
@@ -225,22 +366,35 @@ pub fn liquid_segmented_node(
                 fn() { item_sig.get().1 },
                 in_node=true,
                 fn(seg : view::View, it : headless::RadioItem) -> Unit {
-                  let seg_hit_h = dmax(height, 36.0)
-                  let seg_hit_out = (seg_hit_h - height) / 2.0
+                  let seg_hit_h = fn() -> Double { dmax(total_h(), 36.0) }
+                  let seg_hit_out = fn() -> Double { (seg_hit_h() - total_h()) / 2.0 }
+                  match widths {
+                    Some(_) => {
+                      let _ = seg.width(view::Live::By(fn() { Some(geom_of(idx).1) }))
+                    }
+                    None => {
+                      let _ = seg
+                      .grow(view::Live::Is(1.0))
+                      .basis(view::Live::Is(Some(0.0)))
+                      .padding(view::Live::By(fn() {
+                        let sw = geom_of(idx).1
+                        let px = if sw > 0.0 && sw < 86.0 { 4.0 } else { ctrl_seg_px }
+                        (px, 0.0, px, 0.0)
+                      }))
+                    }
+                  }
                   let _ = seg
-                  .grow(view::Live::Is(1.0))
-                  .basis(view::Live::Is(Some(0.0)))
-                  .height(view::Live::Is(Some(seg_hit_h)))
-                  .padding(view::Live::By(fn() {
-                    let sw = seg_w()
-                    let px = if sw > 0.0 && sw < 86.0 { 4.0 } else { ctrl_seg_px }
-                    (px, 0.0, px, 0.0)
+                  .height(view::Live::By(fn() { Some(seg_hit_h()) }))
+                  .margin(view::Live::By(fn() {
+                    let out = seg_hit_out()
+                    if out > 0.0 {
+                      (0.0, -out, 0.0, -out)
+                    } else {
+                      (0.0, 0.0, 0.0, 0.0)
+                    }
                   }))
                   .lines_up(view::Live::Is(Some(view::Along::Middle)))
                   .lies_along(view::Live::Is(view::Lies::Middle))
-                  if seg_hit_out > 0.0 {
-                    let _ = seg.margin(view::Live::Is((0.0, -seg_hit_out, 0.0, -seg_hit_out)))
-                  }
                   match render_item {
                     Some(draw_item) => draw_item(seg, idx, fn() { it.chosen() })
                     None => {
@@ -248,7 +402,11 @@ pub fn liquid_segmented_node(
                         let _ = w
                         .words(view::Live::By(fn() { item_sig.get().1 }))
                         .words_look(view::Live::By(fn() {
-                          words_at(ctrl_type_seg, weight=if it.chosen() { 600 } else { weight_medium })
+                          let sz = match text_size {
+                            Some(f) => f()
+                            None => ctrl_type_seg
+                          }
+                          words_at(sz, weight=if it.chosen() { 600 } else { weight_medium })
                         }))
                         .ink(view::Live::By(fn() {
                           let lit = clamp(1.0 - (dd.value(w) - idx_f).abs(), 0.0, 1.0)
@@ -261,7 +419,9 @@ pub fn liquid_segmented_node(
                     let _ = hit.over(view::Live::Is(true)).gesture(
                       ui::touch_slop(),
                       press=fn(d : view::Drag) -> Unit {
-                        strip_origin_x.v = d.wx - d.x - idx_f * seg_w()
+                        dd.set_hi(last_fn())
+                        let (ix0, _, _) = geom_of(idx)
+                        strip_origin_x.v = d.wx - (ix0 + d.x)
                         pressed_idx.v = idx
                         if !no_lens() {
                           lifted.v = true
@@ -273,6 +433,7 @@ pub fn liquid_segmented_node(
                         }
                       },
                       tap=fn(_d : view::Drag) -> Unit {
+                        dd.set_hi(last_fn())
                         let i = pressed_idx.v
                         current.v = i
                         dd.slide_to(i.to_double())
@@ -292,8 +453,11 @@ pub fn liquid_segmented_node(
                     let _ = ring
                     .over(view::Live::Is(true))
                     .points(view::Live::Is(false))
-                    .margin(view::Live::Is((0.0, seg_hit_out, 0.0, seg_hit_out)))
-                    .radius(view::Live::Is(inner_r))
+                    .margin(view::Live::By(fn() {
+                      let out = seg_hit_out()
+                      (0.0, out, 0.0, out)
+                    }))
+                    .radius(view::Live::By(fn() { inner_h() / 2.0 }))
                     .edge(view::Live::By(fn() { (ctrl_focus_w, colors().accent) }))
                   })
                 },
@@ -303,21 +467,23 @@ pub fn liquid_segmented_node(
           )
         })
         let lens_shape = fn(n : view::View) -> view::GroundShape {
-          let sw = seg_w()
+          let (rx, rw) = rect_at(dd.value(n))
+          let th_tot = total_h()
+          let ih = inner_h()
           let p = clamp(lens(n), 0.0, 1.0)
           let v = if no_lens() { 0.0 } else { dd.velocity(n) / 10.0 }
           let stretch_x = 1.0 / (1.0 - clamp(v * 0.75, -0.2, 0.2))
           let stretch_y = 1.0 - clamp(v * 0.25, -0.2, 0.2)
-          let base_lw = sw + lerp(0.0, 20.0, p)
-          let base_lh = lerp(inner_h, height + 13.0, p)
-          let tw = dmax(0.0, sw + dmin(base_lw * stretch_x - sw, ctrl_seg_max_grow_x))
+          let base_lw = rw + lerp(0.0, 20.0, p)
+          let base_lh = lerp(ih, th_tot + 13.0, p)
+          let tw = dmax(0.0, rw + dmin(base_lw * stretch_x - rw, ctrl_seg_max_grow_x))
           let th = base_lh * stretch_y
           let r = th / 2.0
           view::GroundShape::{
-            dx: dd.value(n) * sw + (sw - tw) / 2.0,
-            dy: (height - th) / 2.0,
-            dw: tw - sw,
-            dh: th - inner_h,
+            dx: rx + (rw - tw) / 2.0,
+            dy: (th_tot - th) / 2.0,
+            dw: tw,
+            dh: th - ih,
             corners: Some((r, r, r, r)),
           }
         }
@@ -336,9 +502,10 @@ pub fn liquid_segmented_node(
             let _ = gl
             .over(view::Live::Is(true))
             .points(view::Live::Is(false))
-            .width(view::Live::By(fn() { Some(seg_w()) }))
-            .height(view::Live::Is(Some(inner_h)))
-            .radius(view::Live::Is(inner_r))
+            .offset(view::Live::Is((0.0, 0.0)))
+            .width(view::Live::Is(Some(0.0)))
+            .height(view::Live::By(fn() { Some(inner_h()) }))
+            .radius(view::Live::By(fn() { inner_h() / 2.0 }))
             .shadow(view::Live::By(fn() { lg_seg_lens_shadow(full()) }))
             .shadow_outside(view::Live::Is(true))
             .glass(view::Live::By(fn() {

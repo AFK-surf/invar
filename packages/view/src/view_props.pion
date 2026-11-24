@@ -2095,14 +2095,25 @@ pub fn Tree::content_lens_of(self : Tree, id : NodeId) -> paint::ContentLens {
 /// How node `id` draws its own ground other than as it is laid out (View::ground_drawn; as laid out for one let go).
 pub fn Tree::ground_drawn_of(self : Tree, id : NodeId) -> GroundShape {
   if self.alive_id(id) {
+    let n = self.nodes[id.at]
     // (by how tall the one it follows shows, given it where it is drawn: View::shown_by)
-    let g = match self.shown_bys.get(id.at) {
-      Some((of, f)) if self.alive_id(of) => f(self.nodes[of.at].flex.height)
-      _ => self.nodes[id.at].look.ground_drawn
+    let g = match n.overlay_ground_drawn_fn {
+      Some(gf) => {
+        let (px, py, pw, ph) = View::{ tree: self, at: id.at, gen: id.gen }.placed_window_now()
+        gf(px, py, pw, ph)
+      }
+      None =>
+      match n.overlay_ground_drawn {
+        Some(ov) => ov
+        None =>
+        match self.shown_bys.get(id.at) {
+          Some((of, f)) if self.alive_id(of) => f(self.nodes[of.at].flex.height)
+          _ => n.look.ground_drawn
+        }
+      }
     }
     // (drawn shorter as what it holds changes in a block of a page's list said `flips`, View::flip_in; and narrower,
     // its corners on their way, where the block is as wide as it was)
-    let n = self.nodes[id.at]
     let less = n.flip_in.1
     let less_w = n.flip_across.1
     let g = if less != 0.0 || less_w != 0.0 { GroundShape::{ ..g, dh: g.dh - less, dw: g.dw - less_w } } else { g }
@@ -2113,6 +2124,256 @@ pub fn Tree::ground_drawn_of(self : Tree, id : NodeId) -> GroundShape {
   } else {
     ground_as_laid
   }
+}
+
+fn morph_overlay_ground_eq(a : GroundShape, b : GroundShape) -> Bool {
+  if a.dx != b.dx || a.dy != b.dy || a.dw != b.dw || a.dh != b.dh {
+    return false
+  }
+  match (a.corners, b.corners) {
+    (None, None) => true
+    (Some(ca), Some(cb)) => ca.0 == cb.0 && ca.1 == cb.1 && ca.2 == cb.2 && ca.3 == cb.3
+    _ => false
+  }
+}
+
+fn morph_overlay_bind[T](
+  tree : Tree,
+  at : Int,
+  gen : Int,
+  live : Live[T],
+  same : (T, T) -> Bool,
+  apply : (Node, T) -> Unit,
+  stops : Array[() -> Unit],
+) -> Unit {
+  match live {
+    Is(v) => {
+      let n = tree.nodes[at]
+      if n.live && n.gen == gen {
+        apply(n, v)
+        tree.place_marked_at(at)
+      }
+    }
+    By(f) => {
+      let last : signals::Ref[Option[T]] = ref_new(None)
+      let wrapped = fn() {
+        let was = tree.looks_reading
+        tree.looks_reading = true
+        let v = f()
+        tree.looks_reading = was
+        v
+      }
+      let stop = tree.queued(
+        at=at,
+        wrapped,
+        fn(v) {
+          let n = tree.nodes[at]
+          if !n.live || n.gen != gen {
+            return
+          }
+          match last.v {
+            Some(prev) if same(prev, v) => return
+            _ => ()
+          }
+          last.v = Some(v)
+          apply(n, v)
+          tree.place_marked_at(at)
+        },
+      )
+      stops.push(stop)
+    }
+  }
+}
+
+fn Node::recompute_morph_overlays(self : Node) -> Unit {
+  let mut a = 1.0
+  let mut dx = 0.0
+  let mut dy = 0.0
+  let mut s = 1.0
+  let mut gd : Option[GroundShape] = None
+  let mut gdf : Option[(Double, Double, Double, Double) -> GroundShape] = None
+  let mut i = 0
+  while i < self.overlay_slots.length() {
+    let sl = self.overlay_slots[i]
+    a = a * sl.alpha
+    dx = dx + sl.dx
+    dy = dy + sl.dy
+    s = s * sl.scale
+    match sl.ground_drawn {
+      Some(g) => gd = Some(g)
+      None => ()
+    }
+    match sl.ground_drawn_fn {
+      Some(gf) => gdf = Some(gf)
+      None => ()
+    }
+    i += 1
+  }
+  self.overlay_alpha = a
+  self.overlay_dx = dx
+  self.overlay_dy = dy
+  self.overlay_scale = s
+  self.overlay_ground_drawn = gd
+  self.overlay_ground_drawn_fn = gdf
+}
+
+///|
+/// Attaches composable temporary animation overlay channels (`alpha`, `offset`, `scale`, `ground_drawn`)
+/// on top of a node without overwriting or stopping the caller's own `Prop` bindings.
+/// Multiple overlays on the same node compose cleanly (`alpha`/`scale` multiply, `offset` sums,
+/// `ground_drawn`/`ground_drawn_fn` use the latest active provider). Returns an idempotent cleanup
+/// closure that removes only this overlay slot and recomputes the remaining active overlays.
+pub fn View::morph_overlay(
+  self : View,
+  alpha? : Live[Double],
+  offset? : Live[(Double, Double)],
+  scale? : Live[Double],
+  ground_drawn? : Live[GroundShape],
+  ground_drawn_fn? : (Double, Double, Double, Double) -> GroundShape,
+) -> () -> Unit {
+  let node = match self.live() {
+    Some(n) => n
+    None => return fn() -> Unit { () }
+  }
+  let tree = self.tree
+  let at = self.at
+  let gen = self.gen
+  let slot_id = node.overlay_next
+  node.overlay_next = slot_id + 1
+  let slot = MorphOverlaySlot::{
+    id: slot_id,
+    alpha: 1.0,
+    dx: 0.0,
+    dy: 0.0,
+    scale: 1.0,
+    ground_drawn: None,
+    ground_drawn_fn: None,
+  }
+  node.overlay_slots.push(slot)
+  let stops : Array[() -> Unit] = []
+  let prev_owner = signals::set_owner(None)
+  match alpha {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      fn(a : Double, b : Double) -> Bool { a == b },
+      fn(n : Node, v : Double) -> Unit {
+        slot.alpha = v
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match offset {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      fn(a : (Double, Double), b : (Double, Double)) -> Bool { a.0 == b.0 && a.1 == b.1 },
+      fn(n : Node, v : (Double, Double)) -> Unit {
+        slot.dx = v.0
+        slot.dy = v.1
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match scale {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      fn(a : Double, b : Double) -> Bool { a == b },
+      fn(n : Node, v : Double) -> Unit {
+        slot.scale = v
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match ground_drawn {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      morph_overlay_ground_eq,
+      fn(n : Node, v : GroundShape) -> Unit {
+        slot.ground_drawn = Some(v)
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match ground_drawn_fn {
+    Some(gf) => {
+      let n = tree.nodes[at]
+      if n.live && n.gen == gen {
+        slot.ground_drawn_fn = Some(gf)
+        n.recompute_morph_overlays()
+        tree.place_marked_at(at)
+      }
+    }
+    None => ()
+  }
+  let _ = signals::set_owner(prev_owner)
+  let cleaned = ref_new(false)
+  let unown_ref : signals::Ref[Option[() -> Unit]] = ref_new(None)
+  let cleanup = fn() -> Unit {
+    if cleaned.v {
+      return
+    }
+    cleaned.v = true
+    match unown_ref.v {
+      Some(u) => {
+        unown_ref.v = None
+        u()
+      }
+      None => ()
+    }
+    let mut i = 0
+    while i < stops.length() {
+      (stops[i])()
+      i += 1
+    }
+    let n = tree.nodes[at]
+    if n.live && n.gen == gen {
+      let len = n.overlay_slots.length()
+      let mut idx = -1
+      let mut j = 0
+      while j < len {
+        if n.overlay_slots[j].id == slot_id {
+          idx = j
+          break
+        }
+        j += 1
+      }
+      if idx >= 0 {
+        let mut k = idx
+        while k + 1 < len {
+          n.overlay_slots[k] = n.overlay_slots[k + 1]
+          k += 1
+        }
+        let _ = n.overlay_slots.pop()
+      }
+      n.recompute_morph_overlays()
+      tree.place_marked_at(at)
+    }
+  }
+  unown_ref.v = Some(self.owns_while(cleanup))
+  cleanup
 }
 
 ///|
