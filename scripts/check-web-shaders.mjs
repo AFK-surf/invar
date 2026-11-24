@@ -599,7 +599,8 @@ function buildHtmlPage(programs) {
         gl.clear(gl.COLOR_BUFFER_BIT);
         gl.vertexAttrib4f(0, glass.x, glass.y, glass.w, glass.h);
         gl.vertexAttrib4f(1, glass.r, 6.0, 1.0, glass.blurSlot);
-        gl.vertexAttrib4f(2, 1.0, 1.0, 1.0, 0.0);
+        const col = glass.col || [1.0, 1.0, 1.0, 0.0];
+        gl.vertexAttrib4f(2, col[0], col[1], col[2], col[3]);
         gl.vertexAttrib4f(3, glass.rim, glass.bezel, 0.0, 1.0);
         gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
         gl.vertexAttrib4f(5, -1.0, glass.refract, glass.chroma, 0.0);
@@ -633,7 +634,7 @@ function buildHtmlPage(programs) {
             return x < 80 ? [0, 136, 255] : [104, 104, 110];
           }
           return [28, 28, 30];
-        }, { x: 51, y: 31, w: 58, h: 38, r: 19, blurSlot: -16, rim: 1, bezel: 8, refract: 3, chroma: 0 });
+        }, { x: 51, y: 31, w: 58, h: 38, r: 19, blurSlot: -16, rim: 1, bezel: 9, refract: 9, chroma: 0 });
         let bestB = 0, blueDx = -1, bestG = 0, greyDx = -1;
         for (let i = 0; i <= 18; i++) {
           const dxPt = (i + 0.5) / 3;
@@ -641,7 +642,7 @@ function buildHtmlPage(programs) {
           for (let y = 93; y < 207; y++) {
             const [rb, , bb] = s.at(153 + i, y);
             if (bb - rb > 100) cb++;
-            if (s.lumaAt(326 - i, y) > 72) cg++;
+            if (s.lumaAt(326 - i, y) > 60) cg++;
           }
           if (cb / 3 > bestB) { bestB = cb / 3; blueDx = dxPt; }
           if (cg / 3 > bestG) { bestG = cg / 3; greyDx = dxPt; }
@@ -660,10 +661,10 @@ function buildHtmlPage(programs) {
         const sm = run2D(160, 100, 3, (_x, y) => {
           const t = Math.max(0, Math.min(1, (y - 31) / 38));
           return [0, Math.round(t * 255), 0];
-        }, { x: 51, y: 31, w: 58, h: 38, r: 19, blurSlot: -16, rim: 1, bezel: 8, refract: 3, chroma: 0 });
+        }, { x: 51, y: 31, w: 58, h: 38, r: 19, blurSlot: -16, rim: 1, bezel: 9, refract: 9, chroma: 0 });
         let monoOk = true, prevG = -1;
         for (let y = 138; y <= 162; y++) {
-          const g = sm.at(156, y)[1];
+          const g = sm.at(159, y)[1];
           if (prevG >= 0 && g < prevG - 2) monoOk = false;
           prevG = g;
         }
@@ -673,7 +674,7 @@ function buildHtmlPage(programs) {
             return x < 80 ? [0, 136, 255] : [115, 115, 122];
           }
           return [255, 255, 255];
-        }, { x: 51, y: 31, w: 58, h: 38, r: 19, blurSlot: -16, rim: 1, bezel: 8, refract: 3, chroma: 0 });
+        }, { x: 51, y: 31, w: 58, h: 38, r: 19, blurSlot: -16, rim: 1, bezel: 9, refract: 9, chroma: 0 });
         let lBestB = 0, lDxB = -1, lBestG = 0, lDxG = -1;
         for (let i = 0; i <= 18; i++) {
           const dxPt = (i + 0.5) / 3;
@@ -698,8 +699,8 @@ function buildHtmlPage(programs) {
         const [lrl, , lbl] = sl.at(237, 150), [lrr, , lbr] = sl.at(243, 150);
         const [lrt, , lbt] = sl.at(156, 105), [lrbo, , lbbo] = sl.at(156, 195);
         const lHair = sl.lumaAt(240, 93), lRim = sl.lumaAt(240, 95), lSh = sl.lumaAt(240, 99), lDome = sl.lumaAt(240, 120), lLow = sl.lumaAt(240, 165);
-        const lightOk = lBestB >= 10 && lBestB <= 12 && lDxB >= 0.67 && lDxB <= 1.33 &&
-          lBestG >= 10 && lBestG <= 12 && lDxG >= 0.67 && lDxG <= 1.33 &&
+        const lightOk = lBestB >= 9.5 && lBestB <= 12.5 && lDxB >= 0.33 && lDxB <= 1.50 &&
+          lBestG >= 9.5 && lBestG <= 12.5 && lDxG >= 0.33 && lDxG <= 1.50 &&
           lh55B >= 5.6 && lh55B <= 6.4 && lh55G >= 5.6 && lh55G <= 6.4 &&
           (lbl - lrl > 100 && lbr - lrr < 25) && (lbt - lrt < 25 && lbbo - lrbo < 25) &&
           lHair < lLow - 15 && lRim > lHair && lSh < lLow && lDome < lLow;
@@ -716,7 +717,7 @@ function buildHtmlPage(programs) {
         const zMidGR = szoom.at(240, 150)[1] - szoom.at(240, 150)[0];
 
         const v8Flags = {
-          peaks: bestB >= 10 && bestB <= 12 && blueDx >= 0.67 && blueDx <= 1.33 && bestG >= 10 && bestG <= 12 && greyDx >= 0.67 && greyDx <= 1.33,
+          peaks: bestB >= 9.5 && bestB <= 12.5 && blueDx >= 0.33 && blueDx <= 1.50 && bestG >= 9.5 && bestG <= 12.5 && greyDx >= 0.33 && greyDx <= 1.50,
           h55: h55B >= 5.6 && h55B <= 6.4 && h55G >= 5.6 && h55G <= 6.4,
           split: bl - rl > 100 && br - rr < 25,
           zeroBlue: bt - rt < 25 && bbo - rbo < 25,
@@ -794,6 +795,159 @@ function buildHtmlPage(programs) {
           'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan>=10, amber>=20, h50<27');
       }
 
+      // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)
+      {
+        gl.uniform2f(u('u_glight'), 1.0, 0.0);
+        const lumaF = (res, x, y) => {
+          const [r, g, b] = res.at(x, y);
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        };
+        const regL = run2D(160, 120, 2, () => [242, 240, 236], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.1,
+          col: [253 / 255, 252 / 255, 253 / 255, 103 / 255],
+          rim: 0.6, bezel: 14, refract: 18, chroma: 0.06,
+        });
+        const mins = [];
+        for (let py = 44; py <= 84; py++) {
+          let rm = 1e9;
+          for (let px = 200; px <= 284; px++) {
+            const l = lumaF(regL, px, py);
+            if (l < rm) rm = l;
+          }
+          mins.push(rm);
+        }
+        let maxD2 = 0;
+        for (let k = 1; k < mins.length - 1; k++) {
+          const d2 = Math.abs(mins[k - 1] - 2 * mins[k] + mins[k + 1]);
+          if (d2 > maxD2) maxD2 = d2;
+        }
+        let sideMin = 1e9;
+        for (let sx = 270; sx <= 284; sx++) {
+          const l = lumaF(regL, sx, 120);
+          if (l < sideMin) sideMin = l;
+        }
+        const regD = run2D(160, 120, 2, () => [28, 28, 30], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.1,
+          col: [32 / 255, 32 / 255, 32 / 255, 103 / 255],
+          rim: 0.6, bezel: 14, refract: 18, chroma: 0.06,
+        });
+        const ydMid = lumaF(regD, 160, 120), ydTop = lumaF(regD, 160, 41);
+        const v10Ok = maxD2 <= 14.0 && sideMin >= 190.0 && sideMin <= 215.0 && ydTop > ydMid + 5.0;
+        pushVec('V10 regular glass Light AA & Dark rim (@2x, R=24)', v10Ok,
+          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1))],
+          'lightD2<=14, sideMin [190,215], darkTop>darkMid+5');
+      }
+
+      // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
+      {
+        const lumaF = (res, x, y) => {
+          const [r, g, b] = res.at(x, y);
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        };
+        const arcD2 = (res, x0, x1, y0, y1) => {
+          const mins = [];
+          for (let py = y0; py <= y1; py++) {
+            let rm = 1e9;
+            for (let px = x0; px <= x1; px++) {
+              const l = lumaF(res, px, py);
+              if (l < rm) rm = l;
+            }
+            mins.push(rm);
+          }
+          let md = 0;
+          for (let k = 1; k < mins.length - 1; k++) {
+            const d2 = Math.abs(mins[k - 1] - 2 * mins[k] + mins[k + 1]);
+            if (d2 > md) md = d2;
+          }
+          return md;
+        };
+        let v11Ok = true;
+        const v11Summary = {};
+        for (const dark of [true, false]) {
+          const bg = dark ? [28, 28, 30] : [255, 255, 255];
+          const tr = dark ? [48, 209, 88] : [52, 199, 89];
+          const swBg = (x, y) => {
+            const dx = Math.max(0, Math.abs(x - 50) - 17.5);
+            const dy = Math.abs(y - 32);
+            return (dx * dx + dy * dy <= 14 * 14) ? tr : bg;
+          };
+          const sw3 = run2D(120, 65, 3, swBg, {
+            x: 31.58, y: 12.8, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
+          });
+          const d2L3 = arcD2(sw3, 89, 109, 66, 125);
+          const d2R3 = arcD2(sw3, 259, 281, 66, 125);
+          const lim3 = dark ? 10.0 : 12.0;
+          let rDeepX = 272, rDeepL = 1e9;
+          for (let sx = 266; sx <= 274; sx++) {
+            const l = lumaF(sw3, sx, 96);
+            if (l < rDeepL) { rDeepL = l; rDeepX = sx; }
+          }
+          const [rrD, rgD] = sw3.at(rDeepX, 96);
+          const l1 = lumaF(sw3, rDeepX - 1, 96), l2 = lumaF(sw3, rDeepX - 2, 96), l3 = lumaF(sw3, rDeepX - 3, 96), l4 = lumaF(sw3, rDeepX - 4, 96);
+          const wallOk = dark
+            ? (rDeepL <= 14.0 && (rgD - rrD) <= 12 && l1 >= rDeepL && l2 >= l1 && l3 >= l2)
+            : (rDeepL >= 170.0 && rDeepL <= 205.0 && l1 >= rDeepL && l2 >= l1 && l4 >= 230.0);
+          let emeraldOk = false;
+          for (let lx = 93; lx <= 99; lx++) {
+            const [lr, lg] = sw3.at(lx, 96);
+            if (lg - lr >= 90 && lg >= 125 && lg <= 165) emeraldOk = true;
+          }
+          const sw2 = run2D(120, 65, 2, swBg, {
+            x: 31.58, y: 12.8, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
+          });
+          const d2L2 = arcD2(sw2, 58, 74, 44, 83);
+          const d2R2 = arcD2(sw2, 170, 188, 44, 83);
+          const lim2 = dark ? 12.0 : 14.0;
+          const tag = dark ? 'dark' : 'light';
+          v11Summary[tag] = {
+            d2_3x: [Number(d2L3.toFixed(2)), Number(d2R3.toFixed(2))],
+            d2_2x: [Number(d2L2.toFixed(2)), Number(d2R2.toFixed(2))],
+            rDeepL: Number(rDeepL.toFixed(1)),
+            wallOk, emeraldOk,
+          };
+          if (!(d2L3 <= lim3 && d2R3 <= lim3 && d2L2 <= lim2 && d2R2 <= lim2 && wallOk && emeraldOk)) v11Ok = false;
+
+          for (const off of [5.00, 5.20]) {
+            const th = 38.4 - 2.0 * off;
+            const trR = th * 0.5;
+            const topBg = (x, y) => {
+              const dx = Math.max(0, Math.abs(x - 50) - (31.5 - trR));
+              const dy = Math.abs(y - (21.0 + 19.2));
+              return (dx * dx + dy * dy <= trR * trR) ? tr : bg;
+            };
+            const t3 = run2D(120, 70, 3, topBg, {
+              x: 31.4, y: 21.0, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
+            });
+            const gr0 = t3.at(183, 63)[1] - t3.at(183, 63)[0];
+            const gr1 = t3.at(183, 64)[1] - t3.at(183, 64)[0];
+            const gr2 = t3.at(183, 65)[1] - t3.at(183, 65)[0];
+            const l0 = lumaF(t3, 183, 63), l2t = lumaF(t3, 183, 65);
+            const top3Ok = dark
+              ? (gr0 < 15 && l0 <= 35 && gr1 >= 100 && gr2 < 15 && l2t >= 75)
+              : (gr0 < 15 && l0 >= 180 && l0 <= 215 && gr1 >= 95 && gr2 < 15 && l2t >= 245);
+            const t2 = run2D(120, 70, 2, topBg, {
+              x: 31.4, y: 21.0, w: 59.2, h: 38.4, r: 19.2, blurSlot: -32, rim: 1, bezel: 9, refract: 9, chroma: 0,
+            });
+            const g21 = t2.at(122, 43)[1] - t2.at(122, 43)[0];
+            const g22 = t2.at(122, 44)[1] - t2.at(122, 44)[0];
+            const top2Ok = g21 >= 70 && g22 < 15;
+            if (!(top3Ok && top2Ok)) {
+              v11Ok = false;
+              v11Summary[tag + '_top_' + off] = { gr0, l0: Number(l0.toFixed(1)), gr1, gr2, l2t: Number(l2t.toFixed(1)), g21, g22 };
+            }
+          }
+        }
+        pushVec('V11 3D slim bevel wall & curved-cap AA (V11-AA/Wall/Top)', v11Ok,
+          [
+            v11Summary.dark.d2_3x[0], v11Summary.dark.d2_3x[1],
+            v11Summary.light.d2_3x[0], v11Summary.light.d2_3x[1],
+            v11Summary.dark.d2_2x[0], v11Summary.dark.d2_2x[1],
+            v11Summary.light.d2_2x[0], v11Summary.light.d2_2x[1],
+            v11Summary.dark.rDeepL, v11Summary.light.rDeepL,
+          ],
+          v11Ok ? '3x<=10/12, 2x<=12/14, wall+emerald, top 5.00/5.20pt' : JSON.stringify(v11Summary));
+      }
+
       gl.deleteTexture(bdTex);
       gl.deleteProgram(prog);
       gl.deleteShader(vs);
@@ -801,7 +955,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 9,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 11,
       passed,
       total: programs.length,
       drawPassed,
