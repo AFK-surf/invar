@@ -1428,7 +1428,7 @@
         refractColor = mix(refractColor, aaCol, menAA);
       }
       if (is_drop && isRoleTab && barIconGate > 0.01 && dropHairline < 0.99) {
-        float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - dropHairline);
+        float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward)) * (1.0 - dropHairline);
         if (barBevelGate > 0.001) {
           float refX = centered.x >= 0.0 ? 0.26 : 0.74;
           vec2 refPt = v_rect.xy + vec2(refX, 0.18) * v_rect.zw;

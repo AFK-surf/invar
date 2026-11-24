@@ -848,11 +848,21 @@ function buildHtmlPage(programs) {
         const g1c = tabIcon.at(311, 87), g0c = tabEmpty.at(311, 87);
         const gate0InCap = Math.abs(g1c[0] - g0c[0]) + Math.abs(g1c[1] - g0c[1]) + Math.abs(g1c[2] - g0c[2]);
 
+        const tabNg = run2D(160, 100, 3, (x, y) => (x >= 41.0 && x <= 43.0 && y >= 28.0 && y <= 72.0) ? [90, 90, 90] : [246, 244, 240],
+          { x: 32, y: 18, w: 95, h: 63.5, r: 31.75, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
+        const ngOrigL = tabNg.lumaAt(126, 149);
+        let ngRefrMinL = 255;
+        for (let rx = 130; rx <= 135; rx++) {
+          const lr = tabNg.lumaAt(rx, 149);
+          if (lr < ngRefrMinL) ngRefrMinL = lr;
+        }
+        const ngOk = ngOrigL > 220 && ngRefrMinL < 170;
+
         const v9Ok = gr0 < 15 && gr1 > 60 && gr2 < 15 && coreH >= 20 && coreH <= 22.5 && moat >= 6.5 &&
-          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && capDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && halfOk;
+          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && capDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && ngOk && halfOk;
         pushVec('V9 switch ON/OFF/half, light segmented & role4 tab 2D ROI', v9Ok,
-          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, capDelta, gate0SameX, gate0InCap, Number(h50.toFixed(2))],
-          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, capDelta>=40, gate0=0');
+          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, capDelta, gate0SameX, gate0InCap, ngOrigL, ngRefrMinL, Number(h50.toFixed(2))],
+          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, capDelta>=40, gate0=0, ngOrig>220, ngRefr<170');
       }
 
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)

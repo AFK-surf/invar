@@ -859,7 +859,7 @@ MB_CORNER_SL
 "      refractColor = mix(refractColor, aaCol, menAA);\n"
 "    }\n"
 "    if (is_drop && isRoleTab && barIconGate > 0.01 && dropHairline < 0.99) {\n"
-"      float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - dropHairline);\n"
+"      float barBevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward)) * (1.0 - dropHairline);\n"
 "      if (barBevelGate > 0.001) {\n"
 "        float refX = centered.x >= 0.0 ? 0.26 : 0.74;\n"
 "        float2 refPt = I.rect.xy + float2(refX, 0.18) * I.rect.zw;\n"

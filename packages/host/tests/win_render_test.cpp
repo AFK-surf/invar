@@ -383,6 +383,23 @@ static int run_v8_v9_2d_roi(void) {
     ok &= v9tab_ok;
   }
 
+  // V9-Tab-No-Ghost: Role 4 outer falloff (1 - smoothstep(2.60, 9.40, inward)) eliminates light-mode ghosting
+  {
+    int n = 0;
+    push_inst(inst, &n, 41.0, 28.0, 2.0, 44.0, 0.0, 0.0, 0.0, 0.0, 90.0/255.0, 90.0/255.0, 90.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 32.0, 18.0, 95.0, 63.5, 31.75, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 246.0/255.0, 244.0/255.0, 240.0/255.0, S3, W3, H3, rgba)) return 0;
+    int l_orig = px_luma_of(rgba, W3, 126, 149);
+    int min_refr_l = 255;
+    for (int rx = 130; rx <= 135; rx++) {
+      int lr = px_luma_of(rgba, W3, rx, 149);
+      if (lr < min_refr_l) min_refr_l = lr;
+    }
+    int ng_ok = (l_orig > 220) && (min_refr_l < 170);
+    printf("  [%s] V9-Tab-No-Ghost Role 4 outer falloff: origL@10pt=%d (>220) refrMinL@11.5..12.8pt=%d (<170)\n", ng_ok ? "PASS" : "FAIL", l_orig, min_refr_l);
+    ok &= ng_ok;
+  }
+
   // V9-E: Switch half-press p = 0.5 / 0.6 / 1.0 (no pinchWeight collapse at p=0.5)
   {
     const double ps[3] = { 0.5, 0.6, 1.0 };
