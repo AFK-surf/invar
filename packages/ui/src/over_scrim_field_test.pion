@@ -1,0 +1,1535 @@
+// Comprehensive unit tests for isolated deferred-subtree `over_scrim` lifting,
+// token-keyed per-window `over_scrim_floor` stacks, and full production `ui::field` alignment.
+
+import "dmath"
+import "editor"
+import "hostapi"
+import "paint"
+import "signals"
+import "view"
+
+fn opt_str_eq(a : Option[String], b : String) -> Bool {
+  match a {
+    Some(x) => x == b
+    None => false
+  }
+}
+
+fn opt_int_eq(a : Option[Int], b : Int) -> Bool {
+  match a {
+    Some(x) => x == b
+    None => false
+  }
+}
+
+fn field_drawn_ink(fld : Field) -> Int64 {
+  match (view_tree(), fld.tree_node) {
+    (Some(tr), Some(nid)) => match tr.drawn_of(nid) {
+      Some(d) => d.ink
+      None => 0L
+    }
+    _ => 0L
+  }
+}
+
+fn field_drawn_h(fld : Field) -> Double {
+  match (view_tree(), fld.tree_node) {
+    (Some(tr), Some(nid)) => match tr.drawn_of(nid) {
+      Some(d) => d.h
+      None => 0.0
+    }
+    _ => 0.0
+  }
+}
+
+fn field_hint_now(fld : Field) -> Option[String] {
+  match fld.tree_node {
+    Some(nid) => field_display_or_hint(nid)
+    None => None
+  }
+}
+
+fn find_rect_index_by_rgb(sc : Scene, color : Int64) -> Int {
+  let tr = ((color >> 24) & 0xFFL).to_double() / 255.0
+  let tg = ((color >> 16) & 0xFFL).to_double() / 255.0
+  let tb = ((color >> 8) & 0xFFL).to_double() / 255.0
+  let mut k = 0
+  while k < sc.ninst {
+    let b = k * inst_size
+    if (sc.inst[b + 5] - 0.0).abs() < 0.01 &&
+    (sc.inst[b + 8] - tr).abs() < 0.01 &&
+    (sc.inst[b + 9] - tg).abs() < 0.01 &&
+    (sc.inst[b + 10] - tb).abs() < 0.01 {
+      return k
+    }
+    k += 1
+  }
+  -1
+}
+
+fn find_all_rects_by_rgb(sc : Scene, color : Int64) -> Array[Int] {
+  let tr = ((color >> 24) & 0xFFL).to_double() / 255.0
+  let tg = ((color >> 16) & 0xFFL).to_double() / 255.0
+  let tb = ((color >> 8) & 0xFFL).to_double() / 255.0
+  let out : Array[Int] = []
+  let mut k = 0
+  while k < sc.ninst {
+    let b = k * inst_size
+    if (sc.inst[b + 5] - 0.0).abs() < 0.01 &&
+    (sc.inst[b + 8] - tr).abs() < 0.01 &&
+    (sc.inst[b + 9] - tg).abs() < 0.01 &&
+    (sc.inst[b + 10] - tb).abs() < 0.01 {
+      out.push(k)
+    }
+    k += 1
+  }
+  out
+}
+
+// ── Part A: Isolated Deferred-Subtree `over_scrim` Lifting & Floor Stack ────────────────────
+
+test "over_scrim 01: 3-layer overlapping Z-order (base < scrim < lifted < panel)" {
+  let c_base = c64(0x2244, 0xCCFF)
+  let c_lifted = c64(0xEE33, 0x33FF)
+  let c_scrim = c64(0x1010, 0x1080)
+  let c_panel = c64(0x22AA, 0x44FF)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(base : view::View) {
+        let _ = base
+        .over_at(view::Live::Is((Some(20.0), Some(100.0), None, None)))
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(80.0)))
+        .ground(view::Live::Is(c_base))
+      })
+      let _ = root.box(fn(lifted : view::View) {
+        let _ = lifted
+        .over_at(view::Live::Is((Some(30.0), Some(110.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim
+        .over(view::Live::Is(true))
+        .scrim_under()
+        .ground(view::Live::Is(c_scrim))
+        // Drawer/dialog panel as child of the scrim layer (mirrors kit/overlays.pion)
+        let _ = scrim.box(fn(panel : view::View) {
+          let _ = panel
+          .over_at(view::Live::Is((Some(40.0), Some(320.0), None, None)))
+          .width(view::Live::Is(Some(320.0)))
+          .height(view::Live::Is(Some(200.0)))
+          .ground(view::Live::Is(c_panel))
+        })
+      })
+    },
+    width=400.0,
+    height=600.0,
+  )
+  let sc = t.scene()
+  let idx_base = find_rect_index_by_rgb(sc, c_base)
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  let idx_lifted = find_rect_index_by_rgb(sc, c_lifted)
+  let idx_panel = find_rect_index_by_rgb(sc, c_panel)
+  debug_assert(idx_base >= 0 && idx_scrim >= 0 && idx_lifted >= 0 && idx_panel >= 0, "all 4 rects emitted")
+  debug_assert(idx_base < idx_scrim, "base sits below scrim")
+  debug_assert(idx_scrim < idx_lifted, "lifted over_scrim sits above scrim")
+  debug_assert(idx_lifted < idx_panel, "lifted over_scrim sits below drawer panel child of scrim")
+  t.dispose()
+}
+
+test "over_scrim 02: normal parent-child after skipped deferred subtree keeps exact eff_clip" {
+  let c_lifted = c64(0xFF44, 0x00FF)
+  let c_after_child = c64(0x00BB, 0xCCFF)
+  let c_scrim = c64(0x0000, 0x0066)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(lifted : view::View) {
+        let _ = lifted
+        .over_at(view::Live::Is((Some(10.0), Some(20.0), None, None)))
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+        let _ = lifted.box(fn(sub : view::View) {
+          let _ = sub.width(view::Live::Is(Some(30.0))).height(view::Live::Is(Some(20.0)))
+        })
+      })
+      // Normal clipped parent-child appearing AFTER the deferred subtree and BEFORE the scrim
+      let _ = root.box(fn(normal_parent : view::View) {
+        let _ = normal_parent
+        .over_at(view::Live::Is((Some(50.0), Some(120.0), None, None)))
+        .width(view::Live::Is(Some(140.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .clips(view::Live::Is(true))
+        let _ = normal_parent.box(fn(normal_child : view::View) {
+          let _ = normal_child
+          .width(view::Live::Is(Some(200.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .ground(view::Live::Is(c_after_child))
+        })
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_child = find_rect_index_by_rgb(sc, c_after_child)
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  let idx_lifted = find_rect_index_by_rgb(sc, c_lifted)
+  debug_assert(idx_child >= 0 && idx_child < idx_scrim && idx_scrim < idx_lifted, "ordering preserved")
+  let cb = idx_child * inst_size
+  debug_assert((sc.inst[cb + 16] - 50.0).abs() < 0.5, "normal child clip_x == 50")
+  debug_assert((sc.inst[cb + 17] - 120.0).abs() < 0.5, "normal child clip_y == 120")
+  debug_assert((sc.inst[cb + 18] - 190.0).abs() < 0.5, "normal child clip_x1 == 190")
+  debug_assert((sc.inst[cb + 19] - 180.0).abs() < 0.5, "normal child clip_y1 == 180")
+  t.dispose()
+}
+
+test "over_scrim 03: zero effective-width scrim (w=40, gd.dw=-40) before visible scrim is skipped" {
+  let c_lifted = c64(0xDD22, 0x88FF)
+  let c_vis_scrim = c64(0x1234, 0x5680)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(lifted : view::View) {
+        let _ = lifted
+        .over_at(view::Live::Is((Some(20.0), Some(60.0), None, None)))
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+      })
+      // Zero effective-width scrim: w=40, gd.dw=-40 -> gw == 0.0 -> node_emits_ground == false
+      let _ = root.box(fn(zero_scrim : view::View) {
+        let _ = zero_scrim
+        .over_at(view::Live::Is((Some(0.0), Some(0.0), None, None)))
+        .width(view::Live::Is(Some(40.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(c64(0xFF00, 0x00FF)))
+        .ground_drawn(view::Live::Is(view::GroundShape::{ ..view::ground_as_laid, dw: -40.0 }))
+        .scrim_under()
+      })
+      // Real visible scrim after the zero-width one
+      let _ = root.box(fn(vis_scrim : view::View) {
+        let _ = vis_scrim
+        .over(view::Live::Is(true))
+        .scrim_under()
+        .ground(view::Live::Is(c_vis_scrim))
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_scrim = find_rect_index_by_rgb(sc, c_vis_scrim)
+  let idx_lifted = find_rect_index_by_rgb(sc, c_lifted)
+  debug_assert(idx_scrim >= 0 && idx_lifted > idx_scrim, "lifted node placed after visible scrim, skipping zero-width scrim")
+  t.dispose()
+}
+
+test "over_scrim 04: lifted root with own blur, and lifted child under unlifted blur/lens ancestors" {
+  let c_own_blur = c64(0x33AA, 0x55FF)
+  let c_anc_blur = c64(0x8833, 0xCCFF)
+  let c_anc_lens = c64(0xCC88, 0x33FF)
+  let c_scrim = c64(0x0000, 0x0055)
+  let tok_ref = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      tok_ref.v = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((200.0, 200.0)) })
+      // 1) Lifted root carrying its own blur
+      let _ = root.box(fn(own_b : view::View) {
+        let _ = own_b
+        .over_at(view::Live::Is((Some(20.0), Some(180.0), None, None)))
+        .width(view::Live::Is(Some(60.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .blur(view::Live::Is(6.0))
+        .ground(view::Live::Is(c_own_blur))
+        .over_scrim(view::Live::Is(true))
+      })
+      // 2) Unlifted blur parent containing lifted child
+      let _ = root.box(fn(bp : view::View) {
+        let _ = bp
+        .over_at(view::Live::Is((Some(100.0), Some(180.0), None, None)))
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .blur(view::Live::Is(4.0))
+        let _ = bp.box(fn(bc : view::View) {
+          let _ = bc
+          .width(view::Live::Is(Some(60.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .ground(view::Live::Is(c_anc_blur))
+          .over_scrim(view::Live::Is(true))
+        })
+      })
+      // 3) Unlifted content_lens parent containing lifted child
+      let _ = root.box(fn(lp : view::View) {
+        let _ = lp
+        .over_at(view::Live::Is((Some(200.0), Some(180.0), None, None)))
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .content_lens(view::Live::Is(paint::ContentLens::{ blur: 5.0, refraction: 0.2, bezel: 4.0, alpha: 1.0 }))
+        let _ = lp.box(fn(lc : view::View) {
+          let _ = lc
+          .width(view::Live::Is(Some(60.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .ground(view::Live::Is(c_anc_lens))
+          .over_scrim(view::Live::Is(true))
+        })
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  debug_assert(idx_scrim >= 0, "scrim emitted")
+  // All 3 lifted rects sit after scrim and shifted up by dy = 200 - 12 - 220 = -32
+  let i1 = find_rect_index_by_rgb(sc, c_own_blur)
+  let i2 = find_rect_index_by_rgb(sc, c_anc_blur)
+  let i3 = find_rect_index_by_rgb(sc, c_anc_lens)
+  debug_assert(i1 > idx_scrim && i2 > idx_scrim && i3 > idx_scrim, "all 3 lifted rects after scrim")
+  debug_assert((sc.inst[i1 * inst_size + 1] - 148.0).abs() < 0.5, "own-blur lifted y == 180 - 32 == 148")
+  debug_assert((sc.inst[i2 * inst_size + 1] - 148.0).abs() < 0.5, "anc-blur lifted y == 148")
+  debug_assert((sc.inst[i3 * inst_size + 1] - 148.0).abs() < 0.5, "anc-lens lifted y == 148")
+  // Verify kind 14/15 blur layers and kind 8 lens header were emitted after scrim
+  let mut post_blur_push = 0
+  let mut post_blur_pop = 0
+  let mut post_lens = 0
+  let mut k = idx_scrim + 1
+  while k < sc.ninst {
+    let kind = (sc.inst[k * inst_size + 5] + 0.5).to_int()
+    if kind == 14 { post_blur_push += 1 }
+    if kind == 15 { post_blur_pop += 1 }
+    if kind == 8 {
+      post_lens += 1
+      debug_assert(sc.inst[k * inst_size + 12] > 0.0, "replayed lens header has child_n > 0")
+      debug_assert((sc.inst[k * inst_size + 1] - 148.0).abs() < 0.5, "replayed lens y shifted by dy")
+    }
+    k += 1
+  }
+  debug_assert(post_blur_push == 2 && post_blur_pop == 2, "2 balanced blur pairs after scrim")
+  debug_assert(post_lens == 1, "1 replayed lens header after scrim")
+  remove_over_scrim_floor(tok_ref.v)
+  t.dispose()
+}
+
+test "over_scrim 05: text child lifted from adaptive glass ancestor keeps kind==7 and exact ink_y+dy" {
+  let c_scrim = c64(0x0000, 0x0066)
+  let tok_ref = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      // Adaptive glass ancestor at y=200, h=60 -> center ink_y = 230.0
+      // Lifted text child at y=210, h=30 -> foot = 240.0
+      // Floor at top=212, tall=188 (win_h=400) -> dy = 212 - 12 - 240 = -40.0
+      // Expected lifted ink_y = 230.0 - 40.0 = 190.0!
+      tok_ref.v = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((212.0, 188.0)) })
+      let _ = root.box(fn(glass_anc : view::View) {
+        let gl = paint::Glass::{ ..paint::Glass::liquid(), adaptive: true }
+        let _ = glass_anc
+        .over_at(view::Live::Is((Some(40.0), Some(200.0), None, None)))
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .glass(view::Live::Is(Some(gl)))
+        let _ = glass_anc.box(fn(txt : view::View) {
+          let _ = txt
+          .over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+          .width(view::Live::Is(Some(120.0)))
+          .height(view::Live::Is(Some(30.0)))
+          .words(view::Live::Is("Hello"))
+          .ink(view::Live::Is(c64(0xFFFF, 0xFFFF)))
+          .over_scrim(view::Live::Is(true))
+        })
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  debug_assert(idx_scrim >= 0, "scrim emitted")
+  let mut found_kind7 = false
+  let mut k = idx_scrim + 1
+  while k < sc.ninst {
+    let b = k * inst_size
+    if (sc.inst[b + 5] - 7.0).abs() < 0.01 {
+      found_kind7 = true
+      debug_assert((sc.inst[b + 21] - 140.0).abs() < 0.5, "slot 21 ink_x == 40 + 100 == 140")
+      debug_assert((sc.inst[b + 22] - 190.0).abs() < 0.5, "slot 22 ink_y == 230 - 40 == 190 (got \{sc.inst[b + 22]})")
+      debug_assert((sc.inst[b + 23] - 30.0).abs() < 0.5, "slot 23 ink_r == 30")
+    }
+    k += 1
+  }
+  debug_assert(found_kind7, "lifted text child from adaptive glass ancestor emitted kind==7 glyphs")
+  remove_over_scrim_floor(tok_ref.v)
+  t.dispose()
+}
+
+test "over_scrim 06: lifted child from fade ancestor shifts fade fy0/fy1 by +dy" {
+  let c_child = c64(0x3366, 0x99FF)
+  let c_scrim = c64(0x0000, 0x0066)
+  let tok_ref = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      // Fade ancestor at y=180, h=80 (fy0=180, fy1=260), fades=(0, 12, 0, 16)
+      // Lifted child at y=200, h=40 (foot=240). Floor=(212, 188) -> dy = -40.0
+      // Expected lifted fade: fy0=140, ftop=12, fy1=220, ffoot=16
+      tok_ref.v = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((212.0, 188.0)) })
+      let _ = root.box(fn(fp : view::View) {
+        let _ = fp
+        .over_at(view::Live::Is((Some(20.0), Some(180.0), None, None)))
+        .width(view::Live::Is(Some(160.0)))
+        .height(view::Live::Is(Some(80.0)))
+        .fades(view::Live::Is((0.0, 12.0, 0.0, 16.0)))
+        let _ = fp.box(fn(fc : view::View) {
+          let _ = fc
+          .over_at(view::Live::Is((Some(0.0), Some(20.0), None, None)))
+          .width(view::Live::Is(Some(100.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .ground(view::Live::Is(c_child))
+          .over_scrim(view::Live::Is(true))
+        })
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx = find_rect_index_by_rgb(sc, c_child)
+  debug_assert(idx >= 0, "lifted fade child emitted")
+  let b = idx * inst_size
+  debug_assert((sc.inst[b + 52] - 140.0).abs() < 0.5, "lifted fade top fy0 == 180 - 40 == 140")
+  debug_assert((sc.inst[b + 53] - 12.0).abs() < 0.5, "lifted fade top soft == 12")
+  debug_assert((sc.inst[b + 54] - 220.0).abs() < 0.5, "lifted fade foot fy1 == 260 - 40 == 220")
+  debug_assert((sc.inst[b + 55] - 16.0).abs() < 0.5, "lifted fade foot soft == 16")
+  remove_over_scrim_floor(tok_ref.v)
+  t.dispose()
+}
+
+test "over_scrim 07: parent clip [100,140) + dy=-40 + lifted child [70,80) visible with internal rounded corners" {
+  let c_inner = c64(0x44AA, 0xEEFF)
+  let c_scrim = c64(0x0000, 0x0066)
+  let tok_ref = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      // Outer parent clips [100, 140). Lifted root at y=100, h=40 (foot=140) with clips=true & radius=10.
+      // Inner child at y=110, h=10 -> after dy=-40: lifted root is [60, 100), inner child is [70, 80).
+      // Floor at top=112, tall=288 (win_h=400) -> dy = 112 - 12 - 140 = -40.0.
+      tok_ref.v = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((112.0, 288.0)) })
+      let _ = root.box(fn(outer : view::View) {
+        let _ = outer
+        .over_at(view::Live::Is((Some(20.0), Some(100.0), None, None)))
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .clips(view::Live::Is(true))
+        let _ = outer.box(fn(lifted_root : view::View) {
+          let _ = lifted_root
+          .width(view::Live::Is(Some(200.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .radius(view::Live::Is(10.0))
+          .clips(view::Live::Is(true))
+          .over_scrim(view::Live::Is(true))
+          let _ = lifted_root.box(fn(inner : view::View) {
+            let _ = inner
+            .over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+            .width(view::Live::Is(Some(80.0)))
+            .height(view::Live::Is(Some(10.0)))
+            .ground(view::Live::Is(c_inner))
+          })
+        })
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx = find_rect_index_by_rgb(sc, c_inner)
+  debug_assert(idx >= 0, "inner child emitted")
+  let b = idx * inst_size
+  // Inner child moved to [70, 80)
+  debug_assert((sc.inst[b + 1] - 70.0).abs() < 0.5, "inner child y == 70")
+  debug_assert((sc.inst[b + 3] - 10.0).abs() < 0.5, "inner child h == 10")
+  // Clip comes from lifted root [60, 100), NOT old outer clip [100, 140)!
+  debug_assert((sc.inst[b + 17] - 60.0).abs() < 0.5, "inner clip_y == 60 (lifted root top)")
+  debug_assert((sc.inst[b + 19] - 100.0).abs() < 0.5, "inner clip_y1 == 100 (lifted root bottom)")
+  // Internal rounded clip corners preserved from lifted_root (radius 10.0)
+  debug_assert((sc.inst[b + 24] - 10.0).abs() < 0.5, "internal clip corner tl == 10")
+  debug_assert((sc.inst[b + 25] - 10.0).abs() < 0.5, "internal clip corner tr == 10")
+  remove_over_scrim_floor(tok_ref.v)
+  t.dispose()
+}
+
+test "over_scrim 08: floor=None stays above scrim, leaving&&dy==0 stays below, -head clamp beats 12pt" {
+  let c_lifted = c64(0xAA44, 0x22FF)
+  let c_scrim = c64(0x0000, 0x0066)
+  let show_scrim = signals::signal(true)
+  let floor_mode = signals::signal(0) // 0=None, 1=head-clamp
+  let tok_ref = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      tok_ref.v = push_over_scrim_floor(fn(_w : Double, _h : Double) {
+        if floor_mode.get() == 0 { None } else { Some((100.0, 300.0)) }
+      })
+      // Lifted box at y=20, h=140 -> head=20, foot=160
+      let _ = root.box(fn(lifted : view::View) {
+        let _ = lifted
+        .over_at(view::Live::Is((Some(20.0), Some(20.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(140.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+      })
+      root.show(
+        fn() { show_scrim.get() },
+        leave=200.0,
+        fn(scrim : view::View) {
+          let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+        },
+      )
+    },
+    width=400.0,
+    height=400.0,
+  )
+  // 1) floor=None (dy=0): still drawn ABOVE scrim at original y=20
+  let sc0 = t.scene()
+  let s0 = find_rect_index_by_rgb(sc0, c_scrim)
+  let l0 = find_rect_index_by_rgb(sc0, c_lifted)
+  debug_assert(s0 >= 0 && l0 > s0, "floor=None still lifts above scrim")
+  debug_assert((sc0.inst[l0 * inst_size + 1] - 20.0).abs() < 0.5, "floor=None keeps y=20")
+
+  // 2) -head clamping takes precedence over 12pt clearance:
+  // top=100 -> 100 - 12 - 160 = -72, but -head = -20 -> dy = -20 -> y = 0.0 (never negative!)
+  floor_mode.set(1)
+  t.frame(ms=16.0)
+  let sc1 = t.scene()
+  let l1 = find_rect_index_by_rgb(sc1, c_lifted)
+  debug_assert(l1 >= 0 && (sc1.inst[l1 * inst_size + 1] - 0.0).abs() < 0.5, "-head clamp pins top to 0.0")
+
+  // 3) leaving && dy == 0 -> stays on original path (below scrim)
+  floor_mode.set(0)
+  view::transition(fn() { show_scrim.set(false) })
+  t.frame(ms=50.0) // mid-leave (leave=200ms)
+  let sc2 = t.scene()
+  let s2 = find_rect_index_by_rgb(sc2, c_scrim)
+  let l2 = find_rect_index_by_rgb(sc2, c_lifted)
+  debug_assert(s2 >= 0 && l2 >= 0 && l2 < s2, "leaving scrim with dy==0 keeps lifted node on original path below scrim")
+  remove_over_scrim_floor(tok_ref.v)
+  t.dispose()
+}
+
+test "over_scrim 09: two sheets A/B close in both orders, scrim keeps input, and A/B window isolation" {
+  let c_lifted = c64(0xCC55, 0x11FF)
+  let c_scrim = c64(0x0000, 0x0066)
+  let lifted_clicks = ref_new(0)
+  let scrim_clicks = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(lifted : view::View) {
+        let _ = lifted
+        .over_at(view::Live::Is((Some(20.0), Some(200.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+        .presses(view::Live::Is(true))
+        .on_press(fn() { lifted_clicks.v = lifted_clicks.v + 1 })
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim
+        .over(view::Live::Is(true))
+        .scrim_under()
+        .ground(view::Live::Is(c_scrim))
+        .presses(view::Live::Is(true))
+        .on_press(fn() { scrim_clicks.v = scrim_clicks.v + 1 })
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  // Order 1: push A (top=220 -> dy=-32), push B (top=180 -> dy=-72), close B first -> A remains top (dy=-32)
+  let tok_a1 = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((220.0, 180.0)) })
+  let tok_b1 = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((180.0, 220.0)) })
+  t.frame(ms=16.0)
+  let idx_b1 = find_rect_index_by_rgb(t.scene(), c_lifted)
+  debug_assert((t.scene().inst[idx_b1 * inst_size + 1] - 128.0).abs() < 0.5, "B on top lifts y to 200-72=128")
+  remove_over_scrim_floor(tok_b1)
+  t.frame(ms=16.0)
+  let idx_a1 = find_rect_index_by_rgb(t.scene(), c_lifted)
+  debug_assert((t.scene().inst[idx_a1 * inst_size + 1] - 168.0).abs() < 0.5, "closing B leaves A at y=200-32=168")
+  remove_over_scrim_floor(tok_a1)
+
+  // Order 2: push A, push B, close A first -> B stays on top (dy=-72)
+  let tok_a2 = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((220.0, 180.0)) })
+  let tok_b2 = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((180.0, 220.0)) })
+  remove_over_scrim_floor(tok_a2)
+  t.frame(ms=16.0)
+  let idx_b2 = find_rect_index_by_rgb(t.scene(), c_lifted)
+  debug_assert((t.scene().inst[idx_b2 * inst_size + 1] - 128.0).abs() < 0.5, "closing A keeps B on top at y=128")
+
+  // Scrim retains pointer input even at the lifted node's position
+  view_pointer(1, 50.0, 220.0, 30.0)
+  view_pointer(2, 50.0, 220.0, 32.0)
+  debug_assert(scrim_clicks.v == 1 && lifted_clicks.v == 0, "scrim retains input over lifted node")
+
+  // Window A / Window B isolation: floor pushed in window A must NOT affect window B
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      let _ = root.box(fn(lifted_b : view::View) {
+        let _ = lifted_b
+        .over_at(view::Live::Is((Some(20.0), Some(200.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+      })
+      let _ = root.box(fn(scrim_b : view::View) {
+        let _ = scrim_b.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    }
+  })
+  let wid_b = window_open_here("win-b")
+  debug_assert(wid_b > 0, "window B opened")
+  let _ = window_frame(wid_b, 400.0, 400.0, 2.0, 40.0)
+  in_window(wid_b, fn() {
+    let sc_b = view_scene_last()
+    let lb = find_rect_index_by_rgb(sc_b, c_lifted)
+    debug_assert(lb >= 0 && (sc_b.inst[lb * inst_size + 1] - 200.0).abs() < 0.5, "window B unaffected by window A floor stack")
+  })
+  remove_over_scrim_floor(tok_b2)
+  t.dispose()
+}
+
+// ── Part B: Full Production `ui::field` Alignment ───────────────────────────────────────────
+
+test "field_prod 01: colors_by reactively updates all 4 coloring points" {
+  let c_ink = signals::signal(c64(0x1122, 0x33FF))
+  let c_ph = signals::signal(c64(0x4455, 0x66FF))
+  let c_car = signals::signal(c64(0xAA00, 0x00FF))
+  let fld = Field::new(text="")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(box_v : view::View) {
+        let _ = box_v.width(view::Live::Is(Some(240.0)))
+        let _ = field(
+          box_v,
+          fld,
+          placeholder="Hint",
+          colors_by=fn() { (c_ink.get(), c_ph.get(), c_car.get()) },
+          label="ColorsField",
+        )
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  // 1) Placeholder ink updates reactively
+  debug_assert(field_drawn_ink(fld) == c64(0x4455, 0x66FF), "initial placeholder ink")
+  c_ph.set(c64(0x7788, 0x99FF))
+  t.frame(ms=16.0)
+  debug_assert(field_drawn_ink(fld) == c64(0x7788, 0x99FF), "reactive placeholder ink updated")
+
+  // 2) Text ink, 3) Selection highlight fill, 4) Caret & selection handles update reactively
+  fld.set("Hello")
+  fld.focus()
+  fld.pick(0, 5)
+  fld.set_handles_shown(true)
+  t.frame(ms=16.0)
+  debug_assert(field_drawn_ink(fld) == c64(0x1122, 0x33FF), "initial text ink")
+  c_ink.set(c64(0x22EE, 0x44FF))
+  c_car.set(c64(0x00AA, 0xEEFF))
+  t.frame(ms=16.0)
+  debug_assert(field_drawn_ink(fld) == c64(0x22EE, 0x44FF), "reactive text ink updated")
+  debug_assert(fld.caret_color == c64(0x00AA, 0xEEFF), "caret_color updated")
+  debug_assert(fld.sel_color == c64(0x00AA, 0xEE40), "sel_color updated")
+  let sc = t.scene()
+  let car_rects = find_all_rects_by_rgb(sc, c64(0x00AA, 0xEEFF))
+  // Caret + 4 handle parts + selection highlight all share rgb 0x00AAEE
+  debug_assert(car_rects.length() >= 5, "caret + selection + handles recolored reactively (got \{car_rects.length()})")
+  t.dispose()
+}
+
+test "field_prod 02: trim trims line-box height while preserving raw submitted value" {
+  let fld_norm = Field::new(text="  keep spaces  ")
+  let fld_trim = Field::new(text="  keep spaces  ")
+  let got_sub = ref_new("")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = field(root, fld_norm, font_size=15.0, max_lines=1, trim=false, label="Norm")
+      let _ = field(
+        root,
+        fld_trim,
+        font_size=15.0,
+        max_lines=1,
+        trim=true,
+        submitted=fn(s : String) { got_sub.v = s },
+        label="Trim",
+      )
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let h_norm = field_drawn_h(fld_norm)
+  let h_trim = field_drawn_h(fld_trim)
+  debug_assert(h_trim < h_norm, "trim=true produces tighter line-box height (\{h_trim} < \{h_norm})")
+  fld_trim.focus()
+  let _ = view_key(key_enter, 0, 16.0)
+  debug_assert(got_sub.v == "  keep spaces  ", "trim preserves raw submitted whitespace verbatim")
+  t.dispose()
+}
+
+test "field_prod 03: words=true uses runs path with face_text" {
+  let fld = Field::new(text="Typography")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = field(root, fld, words=true, max_lines=2, label="WordsField")
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let want_face_bits = (hostapi::face_text & 15) << 8
+  debug_assert((t.fake.last_shape_style & (15 << 8)) == want_face_bits, "words=true shapes runs with face_text")
+  t.dispose()
+}
+
+test "field_prod 04: leaves passes unmodified key through while preserving focus and selection" {
+  let fld = Field::new(text="hello")
+  let parent_got = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(wrap : view::View) {
+        let _ = wrap.on_key(fn(ev : view::Key) -> Bool {
+          if ev.code == key_enter || ev.code == key_code_down {
+            parent_got.v = parent_got.v + 1
+            true
+          } else {
+            false
+          }
+        })
+        let _ = field(wrap, fld, leaves=[key_enter, key_code_down], max_lines=3, label="LeavesField")
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  fld.focus()
+  fld.pick(1, 4)
+  let consumed_down = view_key(key_code_down, 0, 16.0)
+  let consumed_enter = view_key(key_enter, 0, 32.0)
+  debug_assert(consumed_down && consumed_enter && parent_got.v == 2, "leaves keys passed through to parent on_key")
+  debug_assert(fld.focused(), "focus preserved after leaves passthrough")
+  debug_assert(fld.text() == "hello", "text untouched by leaves passthrough")
+  let (lo, hi) = fld.selection()
+  debug_assert(lo == 1 && hi == 4, "selection (1, 4) preserved after leaves passthrough")
+  t.dispose()
+}
+
+test "field_prod 05: ime_action unified ime_kind, secret priority, and enter_sends_by default" {
+  set_pointing(Some(Pointing::Finger))
+  debug_assert(!enter_sends_by(5, 0), "Finger + multiline + ime_action==0 -> enter_sends false")
+  debug_assert(enter_sends_by(1, 0), "Finger + single-line -> enter_sends true")
+  debug_assert(enter_sends_by(5, hostapi::ime_action_search), "Finger + ime_action!=0 -> enter_sends true")
+  set_pointing(Some(Pointing::Mouse))
+  debug_assert(enter_sends_by(5, 0), "Mouse -> enter_sends true")
+
+  let fld_search = Field::new(text="q")
+  let fld_secret = Field::new(text="pw")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = field(root, fld_search, ime_action=hostapi::ime_action_search, max_lines=3, label="Search")
+      let _ = field(root, fld_secret, ime_action=hostapi::ime_action_search, secret=true, max_lines=1, label="Secret")
+    },
+    width=400.0,
+    height=300.0,
+  )
+  fld_search.focus()
+  debug_assert(t.fake.ime_kind == hostapi::ime_action_search, "ime_action sent to host IME")
+  fld_secret.focus()
+  debug_assert(t.fake.ime_kind == hostapi::ime_action_secret, "secret=true overrides ime_action")
+  set_pointing(None)
+  t.dispose()
+}
+
+test "field_prod 06: look runs rendering and UTF-8 boundary safety fallback (éa -> aé)" {
+  let highlight = c64(0xDD22, 0x66FF)
+  // 1) Unsafe look returning "aé" for "éa" (same byte length 3, mismatched UTF-8 char boundaries!)
+  let ed = editor::EditorState::new(text="\xC3\xA9a")
+  ed.set_look(Some(fn(_s : String) { ("a\xC3\xA9", [(0, 2, highlight)]) }))
+  ed.set_selection(2, 2)
+  ed.compose_update("X", sel_start=0, sel_end=1)
+  let (shown_safe, spans_safe) = ed.look_shown()
+  // Must fall back to original "éa" so splicing "X" at byte 2 produces valid UTF-8 "éXa"
+  debug_assert(shown_safe == "\xC3\xA9Xa", "unsafe look falls back cleanly on UTF-8 boundary mismatch (got \{shown_safe})")
+  debug_assert(spans_safe.length() == 1 && spans_safe[0].0 == 0 && spans_safe[0].1 == 2, "valid span on fallback kept")
+
+  // 2) Valid look in ui::field renders colored runs
+  let fld = Field::new(text="hi @sam")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = field(
+        root,
+        fld,
+        look=fn(s : String) { (s, [(3, 7, highlight)]) },
+        max_lines=2,
+        label="LookField",
+      )
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let sc = t.scene()
+  let hr = ((highlight >> 24) & 0xFFL).to_double() / 255.0
+  let hg = ((highlight >> 16) & 0xFFL).to_double() / 255.0
+  let hb = ((highlight >> 8) & 0xFFL).to_double() / 255.0
+  let mut found_colored_glyph = false
+  let mut k = 0
+  while k < sc.ninst {
+    let b = k * inst_size
+    if (sc.inst[b + 5] - 1.0).abs() < 0.01 &&
+    (sc.inst[b + 8] - hr).abs() < 0.01 &&
+    (sc.inst[b + 9] - hg).abs() < 0.01 &&
+    (sc.inst[b + 10] - hb).abs() < 0.01 {
+      found_colored_glyph = true
+      break
+    }
+    k += 1
+  }
+  debug_assert(found_colored_glyph, "look span emitted colored glyph run")
+  t.dispose()
+}
+
+test "field_prod 07: shorter selects longest fitting placeholder as width changes" {
+  let box_w = signals::signal(300.0)
+  let fld = Field::new(text="")
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(box_v : view::View) {
+        let _ = box_v.width(view::Live::By(fn() { Some(box_w.get()) }))
+        let _ = field(
+          box_v,
+          fld,
+          placeholder="Type a very long message here",
+          shorter=["Type a message", "Message", "Msg"],
+          font_size=15.0,
+          max_lines=1,
+          label="ShorterField",
+        )
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  // At 300pt: primary (29 chars * 9pt = 261pt) fits
+  t.frame(ms=16.0)
+  debug_assert(opt_str_eq(field_hint_now(fld), "Type a very long message here"), "wide picks primary")
+  // At 150pt: "Type a message" (14 * 9 = 126pt) fits, primary (261pt) does not
+  box_w.set(150.0)
+  t.frame(ms=16.0)
+  t.frame(ms=16.0)
+  debug_assert(opt_str_eq(field_hint_now(fld), "Type a message"), "medium picks longest fitting shorter")
+  // At 80pt: "Message" (7 * 9 = 63pt) fits
+  box_w.set(80.0)
+  t.frame(ms=16.0)
+  t.frame(ms=16.0)
+  debug_assert(opt_str_eq(field_hint_now(fld), "Message"), "narrow picks Message")
+  // At 30pt: "Msg" (3 * 9 = 27pt) fits
+  box_w.set(30.0)
+  t.frame(ms=16.0)
+  t.frame(ms=16.0)
+  debug_assert(opt_str_eq(field_hint_now(fld), "Msg"), "very narrow picks Msg")
+  t.dispose()
+}
+
+test "field_prod 08: files + clipboard kind 9 runs cl_end once even after field unmounts" {
+  let mounted = signals::signal(true)
+  let fld = Field::new(text="")
+  let got_files = ref_new(0)
+  let cl_state_map : Map[Int, Int] = Map::new()
+  let cl_end_counts : Map[Int, Int] = Map::new()
+  let next_cl_id = ref_new(1)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      root.show(fn() { mounted.get() }, fn(slot : view::View) {
+        let _ = field(
+          slot,
+          fld,
+          files=fn(fs : Array[(String, Bytes)]) { got_files.v = got_files.v + fs.length() },
+          label="ClipField",
+        )
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let h = hostapi::host()
+  h.cl_read = fn() {
+    let id = next_cl_id.v
+    next_cl_id.v = id + 1
+    cl_state_map[id] = 0
+    id
+  }
+  h.cl_state = fn(id : Int) {
+    match cl_state_map.get(id) {
+      Some(s) => s
+      None => 0
+    }
+  }
+  h.cl_files = fn(_id : Int) { 1 }
+  h.cl_file_name = fn(_id : Int, _i : Int) { "shot.png" }
+  h.cl_file = fn(_id : Int, _i : Int) { "PNG".to_bytes() }
+  h.cl_end = fn(id : Int) {
+    let prev = match cl_end_counts.get(id) {
+      Some(c) => c
+      None => 0
+    }
+    cl_end_counts[id] = prev + 1
+  }
+
+  // Case 1: mounted field receives pasted file on kind 9, cl_end called once
+  fld.focus()
+  let _ = fld.handle_key(key_of_char('v'), mod_cmd)
+  let id1 = next_cl_id.v - 1
+  debug_assert(got_files.v == 0, "pending async clip_read has not delivered yet")
+  cl_state_map[id1] = 1
+  view_outside_event(9, id1, 1)
+  debug_assert(got_files.v == 1, "mounted field received pasted file")
+  debug_assert(opt_int_eq(cl_end_counts.get(id1), 1), "cl_end called exactly once for mounted field")
+
+  // Case 2: unmount field before kind 9 arrives -> cl_end STILL called once, delivery discarded!
+  let _ = fld.handle_key(key_of_char('v'), mod_cmd)
+  let id2 = next_cl_id.v - 1
+  mounted.set(false)
+  t.frame(ms=16.0)
+  cl_state_map[id2] = 1
+  view_outside_event(9, id2, 1)
+  debug_assert(got_files.v == 1, "unmounted field must NOT receive stale delivery")
+  debug_assert(opt_int_eq(cl_end_counts.get(id2), 1), "cl_end called exactly once even after unmount")
+  t.dispose()
+}
+
+test "field_prod 09: cross-window same-slot NodeId drop Pick single-release ownership" {
+  let show_a = signals::signal(true)
+  let a_got = ref_new(0)
+  let b_got = ref_new(0)
+  let a_held_id = ref_new(0)
+  let pk_state_map : Map[Int, Int] = Map::new()
+  let pk_end_counts : Map[Int, Int] = Map::new()
+  let t = Tester::tree(
+    fn(root : view::View) {
+      root.show(fn() { show_a.get() }, fn(slot : view::View) {
+        let _ = slot.box(fn(zone : view::View) {
+          let _ = zone
+          .over_at(view::Live::Is((Some(0.0), Some(0.0), None, None)))
+          .width(view::Live::Is(Some(200.0)))
+          .height(view::Live::Is(Some(200.0)))
+          let _ = files_into(zone, fn(fs : Array[hostapi::Picked]) {
+            a_got.v = a_got.v + fs.length()
+            if fs.length() > 0 {
+              a_held_id.v = fs[0].held
+            }
+          })
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      let _ = root.box(fn(zone : view::View) {
+        let _ = zone
+        .over_at(view::Live::Is((Some(0.0), Some(0.0), None, None)))
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(200.0)))
+        let _ = files_into(zone, fn(fs : Array[hostapi::Picked]) {
+          b_got.v = b_got.v + fs.length()
+        })
+      })
+    }
+  })
+  let wid_b = window_open_here("drop-b")
+  debug_assert(wid_b > 0, "window B opened")
+  let _ = window_frame(wid_b, 400.0, 300.0, 2.0, 16.0)
+
+  let h = hostapi::host()
+  h.pk_state = fn(id : Int) {
+    match pk_state_map.get(id) {
+      Some(s) => s
+      None => 0
+    }
+  }
+  h.pk_count = fn(_id : Int) { 1 }
+  h.pk_name = fn(_id : Int, _i : Int) { "doc.pdf" }
+  h.pk_info = fn(_id : Int, _i : Int) { "77\t128\t" }
+  h.pk_bytes = fn(_id : Int, _i : Int) { "PDF".to_bytes() }
+  h.pk_end = fn(id : Int) {
+    let prev = match pk_end_counts.get(id) {
+      Some(c) => c
+      None => 0
+    }
+    pk_end_counts[id] = prev + 1
+  }
+
+  // 1) Miss in window A (outside 200x200) -> forget_dropped called exactly once
+  pk_state_map[101] = 0
+  let ok_miss = drop_host_pick(101, x=350.0, y=250.0, wid=0)
+  debug_assert(!ok_miss, "miss returns false")
+  debug_assert(opt_int_eq(pk_end_counts.get(101), 1), "miss calls forget_dropped (pk_end) exactly once")
+
+  // 2) Async hit in window A -> completes while mounted -> Pick::files calls pk_end once (NO double-forget), Picked.held preserved
+  pk_state_map[102] = 0
+  let ok_hit = drop_host_pick(102, x=50.0, y=50.0, wid=0)
+  debug_assert(ok_hit && a_got.v == 0, "pending async drop queued")
+  pk_state_map[102] = 1
+  view_outside_event(3, 102, 1)
+  debug_assert(a_got.v == 1 && b_got.v == 0, "window A received drop, window B untouched")
+  debug_assert(a_held_id.v == 77, "Picked.held handle preserved independently")
+  debug_assert(opt_int_eq(pk_end_counts.get(102), 1), "consumed Pick calls pk_end exactly once (no double forget)")
+
+  // 3) Async hit in window A, then unmount & remount (new gen at same slot) -> stale drop calls forget_dropped once, zero delivery!
+  pk_state_map[103] = 0
+  let ok_stale = drop_host_pick(103, x=50.0, y=50.0, wid=0)
+  debug_assert(ok_stale, "pending stale drop queued")
+  show_a.set(false)
+  t.frame(ms=16.0)
+  show_a.set(true)
+  t.frame(ms=16.0)
+  pk_state_map[103] = 1
+  view_outside_event(3, 103, 1)
+  debug_assert(a_got.v == 1 && b_got.v == 0, "stale gen drop discarded without hitting remounted slot or window B")
+  debug_assert(opt_int_eq(pk_end_counts.get(103), 1), "unmounted/stale drop calls forget_dropped (pk_end) exactly once")
+
+  // 4) Immediate hit in window B -> routes to B only, pk_end count == 1
+  pk_state_map[104] = 1
+  let ok_b = drop_host_pick(104, x=50.0, y=50.0, wid=wid_b)
+  debug_assert(ok_b && b_got.v == 1 && a_got.v == 1, "window B drop routed to B only")
+  debug_assert(opt_int_eq(pk_end_counts.get(104), 1), "window B consumed drop calls pk_end exactly once")
+
+  t.dispose()
+}
+
+// ── Additional Regression Tests (Outside Wakes, Reset Ownership, Scrim Optics, Cross-Window) ─
+
+test "over_scrim 10: scrim with own blur/lens/fade keeps lifted subtree outside its optical scope" {
+  let c_lift = rgba(180, 0, 0, 255)
+  let c_scrim = rgba(0, 60, 0, 155)
+  let c_panel = rgba(0, 0, 100, 255)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(n : view::View) {
+        let _ = n.over(view::Live::Is(true)).ground(view::Live::Is(c_lift)).over_scrim(view::Live::Is(true))
+      })
+      let _ = root.box(fn(s : view::View) {
+        let _ = s
+        .over(view::Live::Is(true))
+        .scrim_under()
+        .ground(view::Live::Is(c_scrim))
+        .blur(view::Live::Is(5.0))
+        .clips(view::Live::Is(true))
+        .fades(view::Live::Is((0.0, 10.0, 0.0, 10.0)))
+        .content_lens(view::Live::Is(paint::ContentLens::{ blur: 3.0, refraction: 0.2, bezel: 2.0, alpha: 1.0 }))
+        let _ = s.box(fn(p : view::View) {
+          let _ = p.over(view::Live::Is(true)).ground(view::Live::Is(c_panel))
+        })
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  let idx_lift = find_rect_index_by_rgb(sc, c_lift)
+  let idx_panel = find_rect_index_by_rgb(sc, c_panel)
+  debug_assert(idx_scrim >= 0 && idx_scrim < idx_lift && idx_lift < idx_panel, "order scrim < lift < panel")
+  let mut depth = 0
+  let mut lift_depth = -1
+  let mut lift_in_lens = false
+  for k in 0..<sc.ninst {
+    let kind = sc.inst[k * inst_size + 5]
+    if kind == 14.0 { depth += 1 }
+    if kind == 15.0 { depth -= 1 }
+    if k == idx_lift { lift_depth = depth }
+    if kind == 8.0 && k < idx_lift && idx_lift <= k + sc.inst[k * inst_size + 12].to_int() {
+      lift_in_lens = true
+    }
+  }
+  debug_assert(lift_depth == 0, "lifted subtree emitted at blur depth 0 outside scrim blur")
+  debug_assert(!lift_in_lens, "lifted subtree emitted outside scrim content_lens")
+  debug_assert(sc.inst[idx_lift * inst_size + 53] == 0.0, "lifted subtree not affected by scrim fades")
+  t.dispose()
+}
+
+test "over_scrim 11: cross-window tree disposal removes owning window floor token cleanly" {
+  let c_lifted = c64(0xCC55, 0x11FF)
+  let c_scrim = c64(0x0000, 0x0066)
+  let t = Tester::tree(fn(_root : view::View) { () }, width=400.0, height=400.0)
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) {
+      let tok = push_over_scrim_floor(fn(_w : Double, _h : Double) { Some((180.0, 220.0)) })
+      let _ = root.owns(fn() { remove_over_scrim_floor(tok) })
+      let _ = root.box(fn(lifted : view::View) {
+        let _ = lifted
+        .over_at(view::Live::Is((Some(20.0), Some(200.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(40.0)))
+        .ground(view::Live::Is(c_lifted))
+        .over_scrim(view::Live::Is(true))
+      })
+      let _ = root.box(fn(scrim : view::View) {
+        let _ = scrim.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+      })
+    }
+  })
+  let wid_b = window_open_here("floor-cross-win")
+  let _ = window_frame(wid_b, 400.0, 400.0, 2.0, 16.0)
+  let before_len = ref_new(-1)
+  in_window(wid_b, fn() { before_len.v = over_scrim_floor_stack.v.length() })
+  debug_assert(before_len.v == 1, "window B has 1 floor entry")
+  // Dispose window B's tree directly from window A
+  match window_tree_of(wid_b) {
+    Some(tr_b) => tr_b.dispose()
+    None => debug_assert(false, "expected window B tree")
+  }
+  let after_len = ref_new(-1)
+  in_window(wid_b, fn() { after_len.v = over_scrim_floor_stack.v.length() })
+  debug_assert(after_len.v == 0, "cross-window dispose cleared window B floor stack")
+  window_close_here(wid_b)
+  t.dispose()
+}
+
+test "field_prod 10: unclaimed kind 3 / kind 9 outside events still request frame wake" {
+  let t = Tester::tree(fn(_root : view::View) { () }, width=200.0, height=200.0)
+  let wakes = ref_new(0)
+  let h = hostapi::host()
+  h.request_frame = fn() { wakes.v = wakes.v + 1 }
+  view_outside_event(3, 9001, 1)
+  let after_pick = wakes.v
+  view_outside_event(9, 9002, 1)
+  let after_clip = wakes.v - after_pick
+  t.dispose()
+  debug_assert(after_pick == 1 && after_clip == 1, "unclaimed kind 3 and kind 9 both request frame")
+}
+
+test "field_prod 11: app reset releases pending drop Pick and preserves pending ClipRead for single cl_end" {
+  let fld = Field::new()
+  let deliveries = ref_new(0)
+  let cl_ends = ref_new(0)
+  let pk_ends = ref_new(0)
+  let ready = ref_new(0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = field(root, fld, files=fn(_fs) { deliveries.v = deliveries.v + 1 })
+      let _ = files_into(root, fn(_fs) { deliveries.v = deliveries.v + 1 })
+    },
+    width=300.0,
+    height=200.0,
+  )
+  let h = hostapi::host()
+  h.cl_read = fn() { 81 }
+  h.cl_state = fn(_id) { ready.v }
+  h.cl_end = fn(_id) { cl_ends.v = cl_ends.v + 1 }
+  h.pk_state = fn(_id) { ready.v }
+  h.pk_end = fn(_id) { pk_ends.v = pk_ends.v + 1 }
+  let _ = fld.handle_key(key_of_char('v'), mod_cmd)
+  debug_assert(drop_host_pick(82), "pending drop queued")
+  set_view_app(fn(_r) { () })
+  ready.v = 1
+  view_outside_event(3, 82, 1)
+  view_outside_event(9, 81, 1)
+  t.dispose()
+  debug_assert(cl_ends.v == 1 && pk_ends.v == 1 && deliveries.v == 0, "reset releases both handles once with zero delivery")
+}
+
+test "field_prod 12: closed and reopened same numeric window ID cannot receive stale drop Pick" {
+  let calls = ref_new(0)
+  let ends = ref_new(0)
+  let state = ref_new(0)
+  let t = Tester::tree(fn(_r : view::View) { () }, width=300.0, height=200.0)
+  let h = hostapi::host()
+  h.window_open_id = fn(_what) { 29 }
+  h.pk_state = fn(_id) { state.v }
+  h.pk_count = fn(_id) { 0 }
+  h.pk_end = fn(_id) { ends.v = ends.v + 1 }
+  set_window_tree(fn(_wid, _what) {
+    fn(r : view::View) {
+      let _ = files_into(r, fn(_fs) { calls.v = calls.v + 1 })
+    }
+  })
+  let a = window_open_here("win-old")
+  let _ = window_frame(a, 300.0, 200.0, 1.0, 16.0)
+  debug_assert(drop_host_pick(33, wid=a), "queued on old window")
+  window_close_here(a)
+  let b = window_open_here("win-new")
+  let _ = window_frame(b, 300.0, 200.0, 1.0, 32.0)
+  state.v = 1
+  view_outside_event(3, 33, 1)
+  view_outside_event(3, 33, 1)
+  t.dispose()
+  debug_assert(calls.v == 0 && ends.v == 1, "reopened window never receives stale Pick, released once")
+}
+
+test "field_prod 13: host drop channel message dispatches dropped files and releases pk_end once" {
+  let calls = ref_new(0)
+  let ends = ref_new(0)
+  let t = Tester::tree(
+    fn(r : view::View) {
+      let _ = files_into(r, fn(_fs) { calls.v = calls.v + 1 })
+    },
+    width=300.0,
+    height=200.0,
+  )
+  let h = hostapi::host()
+  h.pk_state = fn(_id) { 1 }
+  h.pk_count = fn(_id) { 0 }
+  h.pk_end = fn(_id) { ends.v = ends.v + 1 }
+  t.post(host_drop_channel, "{\"type\":\"drop\",\"x\":10,\"y\":10,\"pick\":93,\"paths\":[],\"wid\":0}")
+  view_outside_event(11, 0, 0)
+  t.frame()
+  t.dispose()
+  debug_assert(calls.v == 1 && ends.v == 1, "host drop channel message delivered once and ended once")
+}
+
+test "field_prod 14: clipboard callback claims pending before re-entry and runs in initiating window" {
+  let seen_wid = ref_new(-1)
+  let ends = ref_new(0)
+  let delivered = ref_new(0)
+  let state = ref_new(0)
+  let fld = Field::new()
+  let t = Tester::tree(fn(_r : view::View) { () }, width=300.0, height=200.0)
+  set_window_tree(fn(_wid, _what) {
+    fn(r : view::View) {
+      let _ = field(r, fld, files=fn(_fs) {
+        delivered.v = delivered.v + 1
+        seen_wid.v = current_window_id()
+        if delivered.v == 1 {
+          view_outside_event(9, 45, 1)
+        }
+      })
+    }
+  })
+  let b = window_open_here("clip-win")
+  let _ = window_frame(b, 300.0, 200.0, 1.0, 16.0)
+  let h = hostapi::host()
+  h.cl_read = fn() { 45 }
+  h.cl_state = fn(_id) { state.v }
+  h.cl_files = fn(_id) { 1 }
+  h.cl_file = fn(_id, _i) { "ok".to_bytes() }
+  h.cl_end = fn(_id) {
+    ends.v = ends.v + 1
+    state.v = -1
+  }
+  in_window(b, fn() { let _ = fld.handle_key(key_of_char('v'), mod_cmd) })
+  state.v = 1
+  view_outside_event(9, 45, 1)
+  t.dispose()
+  debug_assert(seen_wid.v == b && ends.v == 1 && delivered.v == 1, "callback ran once in window B without re-entrant double cl_end")
+}
+
+test "field_prod 15: look replacement inserting newline updates caret line layout" {
+  let fld = Field::new(text="a b")
+  let t = Tester::tree(
+    fn(r : view::View) {
+      let _ = field(r, fld, max_lines=3, look=fn(_s) { ("a\nb", []) })
+    },
+    width=300.0,
+    height=200.0,
+  )
+  fld.focus()
+  fld.pick(3, 3)
+  t.frame()
+  let (shown, _) = fld.editor.look_shown()
+  let line = fld.caret_pos().line
+  t.dispose()
+  debug_assert(shown == "a\nb" && line == 1, "look newline replacement moves end caret to line 1")
+}
+
+fn optical_depths_at(sc : Scene, target : Int) -> (Int, Int) {
+  let mut bdepth = 0
+  let mut target_bdepth = -1
+  let mut target_ldepth = 0
+  for k in 0..<sc.ninst {
+    let kind = sc.inst[k * inst_size + 5]
+    if kind == 14.0 { bdepth += 1 }
+    if kind == 15.0 { bdepth -= 1 }
+    if k == target { target_bdepth = bdepth }
+    if kind == 8.0 {
+      let span = sc.inst[k * inst_size + 12].to_int()
+      if span > 0 && k < target && target <= k + span {
+        target_ldepth += 1
+      }
+    }
+  }
+  (target_bdepth, target_ldepth)
+}
+
+test "over_scrim 12: external sibling over_scrim does not inherit scrim parent blur or lens" {
+  let c_lift = rgba(210, 40, 20, 255)
+  let c_scrim = rgba(10, 50, 10, 160)
+  let c_panel = rgba(20, 40, 200, 255)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(n : view::View) {
+        let _ = n.over(view::Live::Is(true)).ground(view::Live::Is(c_lift)).over_scrim(view::Live::Is(true))
+      })
+      let _ = root.box(fn(holder : view::View) {
+        let _ = holder
+        .over(view::Live::Is(true))
+        .blur(view::Live::Is(6.0))
+        .content_lens(view::Live::Is(paint::ContentLens::{ blur: 4.0, refraction: 0.25, bezel: 2.0, alpha: 1.0 }))
+        let _ = holder.box(fn(s : view::View) {
+          let _ = s.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+          let _ = s.box(fn(p : view::View) {
+            let _ = p.over(view::Live::Is(true)).ground(view::Live::Is(c_panel))
+          })
+        })
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  let idx_lift = find_rect_index_by_rgb(sc, c_lift)
+  let idx_panel = find_rect_index_by_rgb(sc, c_panel)
+  debug_assert(idx_scrim >= 0 && idx_scrim < idx_lift && idx_lift < idx_panel, "order scrim < lift < panel")
+  let (lb, ll) = optical_depths_at(sc, idx_lift)
+  let (pb, pl) = optical_depths_at(sc, idx_panel)
+  t.dispose()
+  debug_assert(lb == 0 && ll == 0, "external sibling over_scrim has blur/lens depth 0/0, got \{lb}/\{ll}")
+  debug_assert(pb == 1 && pl == 1, "scrim panel child preserves parent blur/lens depth 1/1, got \{pb}/\{pl}")
+}
+
+test "over_scrim 13: shared optical parent blur and lens apply once to lifted node and scrim panel" {
+  let c_lift = rgba(220, 120, 10, 255)
+  let c_scrim = rgba(15, 70, 25, 160)
+  let c_panel = rgba(40, 30, 210, 255)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(shared : view::View) {
+        let _ = shared
+        .over(view::Live::Is(true))
+        .blur(view::Live::Is(6.0))
+        .content_lens(view::Live::Is(paint::ContentLens::{ blur: 4.0, refraction: 0.25, bezel: 2.0, alpha: 1.0 }))
+        let _ = shared.box(fn(n : view::View) {
+          let _ = n.over(view::Live::Is(true)).ground(view::Live::Is(c_lift)).over_scrim(view::Live::Is(true))
+        })
+        let _ = shared.box(fn(s : view::View) {
+          let _ = s.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+          let _ = s.box(fn(p : view::View) {
+            let _ = p.over(view::Live::Is(true)).ground(view::Live::Is(c_panel))
+          })
+        })
+      })
+    },
+    width=400.0,
+    height=400.0,
+  )
+  let sc = t.scene()
+  let idx_scrim = find_rect_index_by_rgb(sc, c_scrim)
+  let idx_lift = find_rect_index_by_rgb(sc, c_lift)
+  let idx_panel = find_rect_index_by_rgb(sc, c_panel)
+  debug_assert(idx_scrim >= 0 && idx_scrim < idx_lift && idx_lift < idx_panel, "order scrim < lift < panel")
+  let (lb, ll) = optical_depths_at(sc, idx_lift)
+  let (pb, pl) = optical_depths_at(sc, idx_panel)
+  t.dispose()
+  debug_assert(lb == 1 && ll == 1, "shared optical parent applies once (1/1) to lifted node, got \{lb}/\{ll}")
+  debug_assert(pb == 1 && pl == 1, "shared optical parent applies once (1/1) to scrim panel, got \{pb}/\{pl}")
+}
+
+test "field_prod 16: host drop with both pick and paths routes to paths_into, files_into, or words_into with single release" {
+  let got_paths = ref_new("")
+  let path_calls = ref_new(0)
+  let file_calls = ref_new(0)
+  let fld = Field::new()
+  let pk_ends : Map[Int, Int] = Map::new()
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(z_paths : view::View) {
+        let _ = z_paths
+        .over_at(view::Live::Is((Some(0.0), Some(0.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(100.0)))
+        let _ = paths_into(z_paths, fn(ps : Array[DroppedPath]) {
+          path_calls.v = path_calls.v + 1
+          if ps.length() > 0 {
+            got_paths.v = ps[0].path
+          }
+        })
+      })
+      let _ = root.box(fn(z_files : view::View) {
+        let _ = z_files
+        .over_at(view::Live::Is((Some(110.0), Some(0.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(100.0)))
+        let _ = files_into(z_files, fn(_fs : Array[hostapi::Picked]) {
+          file_calls.v = file_calls.v + 1
+        })
+      })
+      let _ = root.box(fn(z_words : view::View) {
+        let _ = z_words
+        .over_at(view::Live::Is((Some(220.0), Some(0.0), None, None)))
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(100.0)))
+        let _ = words_into(z_words, fld)
+      })
+    },
+    width=400.0,
+    height=200.0,
+  )
+  let h = hostapi::host()
+  h.pk_state = fn(_id) { 1 }
+  h.pk_count = fn(_id) { 0 }
+  h.pk_end = fn(id) {
+    let prev = match pk_ends.get(id) {
+      Some(c) => c
+      None => 0
+    }
+    pk_ends[id] = prev + 1
+  }
+  // 1) paths_into target receives paths and releases pick once
+  t.post(host_drop_channel, "{\"type\":\"drop\",\"x\":20,\"y\":20,\"pick\":301,\"paths\":[{\"path\":\"/tmp/a.txt\",\"dir\":false}],\"wid\":0}")
+  view_outside_event(11, 0, 0)
+  t.frame()
+  // 2) files_into target receives Pick and releases pick once
+  t.post(host_drop_channel, "{\"type\":\"drop\",\"x\":130,\"y\":20,\"pick\":302,\"paths\":[\"/tmp/b.txt\"],\"wid\":0}")
+  view_outside_event(11, 0, 0)
+  t.frame()
+  // 3) words_into target receives joined paths text and releases pick once
+  t.post(host_drop_channel, "{\"type\":\"drop\",\"x\":240,\"y\":20,\"pick\":303,\"paths\":[\"/tmp/c.txt\",\"/tmp/d.txt\"],\"wid\":0}")
+  view_outside_event(11, 0, 0)
+  t.frame()
+  t.dispose()
+  debug_assert(path_calls.v == 1 && got_paths.v == "/tmp/a.txt" && opt_int_eq(pk_ends.get(301), 1), "paths_into hit once and pk_end once")
+  debug_assert(file_calls.v == 1 && opt_int_eq(pk_ends.get(302), 1), "files_into hit once and pk_end once")
+  debug_assert(fld.text() == "/tmp/c.txt\n/tmp/d.txt" && opt_int_eq(pk_ends.get(303), 1), "words_into received joined paths and pk_end once")
+}
+
+test "field_prod 17: reactive look changing newline updates caret line immediately" {
+  let multi = signals::signal(false)
+  let fld = Field::new(text="a b")
+  let t = Tester::tree(
+    fn(r : view::View) {
+      let _ = field(
+        r,
+        fld,
+        max_lines=3,
+        look=fn(s) {
+          if multi.get() {
+            ("a\nb", [])
+          } else {
+            (s, [])
+          }
+        },
+      )
+    },
+    width=300.0,
+    height=200.0,
+  )
+  fld.focus()
+  fld.pick(3, 3)
+  t.frame()
+  let line0 = fld.caret_pos().line
+  multi.set(true)
+  t.frame()
+  let line1 = fld.caret_pos().line
+  t.dispose()
+  debug_assert(line0 == 0 && line1 == 1, "reactive look newline switch moves end caret from line 0 to line 1, got \{line0} -> \{line1}")
+}
+
+fn check_host_scanner_blur_balance(sc : Scene, target : Int) -> (Int, Int, Int) {
+  let mut kind15_in_lens = 0
+  for k in 0..<sc.ninst {
+    if sc.inst[k * inst_size + 5] == 8.0 {
+      let span = sc.inst[k * inst_size + 12].to_int()
+      let end_k = if k + span < sc.ninst { k + span } else { sc.ninst - 1 }
+      let mut j = k + 1
+      while j <= end_k {
+        if sc.inst[j * inst_size + 5] == 15.0 {
+          kind15_in_lens += 1
+        }
+        j += 1
+      }
+    }
+  }
+  let mut host_depth = 0
+  let mut target_depth = -1
+  let mut k = 0
+  while k < sc.ninst {
+    let kind = sc.inst[k * inst_size + 5]
+    if k == target {
+      target_depth = host_depth
+    }
+    if kind == 14.0 {
+      host_depth += 1
+      k += 1
+    } else if kind == 15.0 {
+      host_depth -= 1
+      k += 1
+    } else if kind == 8.0 {
+      let span = sc.inst[k * inst_size + 12].to_int()
+      k += 1 + (if span > 0 { span } else { 0 })
+    } else {
+      k += 1
+    }
+  }
+  (kind15_in_lens, target_depth, host_depth)
+}
+
+test "over_scrim 14: LIFO blur/lens suspend keeps kind 15 outside kind 8 child spans under host scanner" {
+  let c_lift = rgba(230, 30, 30, 255)
+  let c_scrim = rgba(10, 40, 10, 160)
+  let c_panel = rgba(20, 60, 220, 255)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(n : view::View) {
+        let _ = n
+        .over_at(view::Live::Is((Some(20.0), Some(20.0), None, None)))
+        .width(view::Live::Is(Some(80.0)))
+        .height(view::Live::Is(Some(80.0)))
+        .ground(view::Live::Is(c_lift))
+        .over_scrim(view::Live::Is(true))
+      })
+      let _ = root.box(fn(holder : view::View) {
+        let _ = holder
+        .over(view::Live::Is(true))
+        .blur(view::Live::Is(6.0))
+        .content_lens(view::Live::Is(paint::ContentLens::{ blur: 4.0, refraction: 0.25, bezel: 2.0, alpha: 1.0 }))
+        let _ = holder.box(fn(s : view::View) {
+          let _ = s.over(view::Live::Is(true)).scrim_under().ground(view::Live::Is(c_scrim))
+          let _ = s.box(fn(p : view::View) {
+            let _ = p
+            .over_at(view::Live::Is((Some(140.0), Some(140.0), None, None)))
+            .width(view::Live::Is(Some(100.0)))
+            .height(view::Live::Is(Some(100.0)))
+            .ground(view::Live::Is(c_panel))
+          })
+        })
+      })
+    },
+    width=300.0,
+    height=300.0,
+  )
+  let sc = t.scene()
+  let idx_lift = find_rect_index_by_rgb(sc, c_lift)
+  debug_assert(idx_lift >= 0, "lifted rect emitted")
+  let (in_lens, lift_depth, end_depth) = check_host_scanner_blur_balance(sc, idx_lift)
+  t.dispose()
+  debug_assert(in_lens == 0, "no kind 15 blur pop may fall inside a kind 8 lens span, got \{in_lens}")
+  debug_assert(lift_depth == 0, "host scanner sees blur depth 0 at external over_scrim node, got \{lift_depth}")
+  debug_assert(end_depth == 0, "host scanner ends frame at blur depth 0, got \{end_depth}")
+}

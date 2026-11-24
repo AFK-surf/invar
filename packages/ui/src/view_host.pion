@@ -933,6 +933,8 @@ fn view_forget_inner(clear_hooks : Bool) -> Bool {
   view_app.last_atlas_gen = -1
   view_app.shown_cursor = -1
   fields_reset()
+  drops_reset()
+  over_scrim_floor_owner.clear()
   streams_and_natives_reset()
   shots_clear()
   reset_glyph_atlas()
@@ -980,6 +982,7 @@ pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
   }
   let my_epoch = ui_ctx_epoch.v
   register_ui_window_kept()
+  ensure_drop_registry_kept()
   match theme {
     Some(tf) => set_tree_theme(tf)
     None => clear_tree_theme()
@@ -1615,7 +1618,9 @@ pub fn field_display_or_hint(id : view::NodeId) -> Option[String] {
       if txt.length() > 0 || comp.length() > 0 {
         Some(tf.field.editor.display_text())
       } else {
-        Some(signals::untracked(tf.hint))
+        let primary = signals::untracked(tf.hint)
+        let sz = signals::untracked(tf.font_size)
+        Some(pick_placeholder(primary, tf.shorter, tf.field.last_max_w, sz))
       }
     }
     None => None
@@ -2133,6 +2138,16 @@ fn encode_view_magnified(
   }
 }
 
+/// Shared ground-emission predicate used by both `encode_held_tree` scrim pre-scan and `encode_drawn_node_direct`.
+fn node_emits_ground(d : view::Drawn, gd : view::GroundShape, node_scale : Double) -> Bool {
+  if d.alpha <= 0.0 || (d.ground & 0xFFL) == 0L {
+    return false
+  }
+  let gw = d.w + gd.dw * node_scale
+  let gh = d.h + gd.dh * node_scale
+  gw > 0.0 && gh > 0.0
+}
+
 fn encode_drawn_node_direct(
   scene : Scene,
   tree_id : Int,
@@ -2221,7 +2236,7 @@ fn encode_drawn_node_direct(
   // then the crisp border rim on top.
   let (ew_raw, ecol) = d.edge
   let ew = ew_raw * ns
-  let has_ground = (d.ground & 0xFFL) != 0L
+  let has_ground = node_emits_ground(d, gd, node_scale)
   let has_edge = ew > 0.0 && (ecol & 0xFFL) != 0L
   match mag {
     Some((msx, msy, mz)) if gd_visible && mz > 0.0 => {
@@ -2520,8 +2535,8 @@ fn encode_drawn_node_direct(
       // Keep the editor in laid-out points: selection and handle overlays are child views scaled by Tree::drawn_held.
       let laid_w = d.w / ns
       let sz = (tf.font_size)()
-      let lh = if tf.line > 0.0 { tf.line } else { sz * 1.4 }
-      if laid_w > 0.0 && (dmath::abs(tf.field.last_max_w - laid_w) > 0.5 || dmath::abs(tf.field.last_font_size - sz) > 0.05 || tf.field.editor.lines.length() == 0) {
+      let lh = field_line_height(sz, tf.line, tf.trim)
+      if laid_w > 0.0 && (dmath::abs(tf.field.last_max_w - laid_w) > 0.5 || dmath::abs(tf.field.last_font_size - sz) > 0.05 || dmath::abs(tf.field.last_line_h - lh) > 0.05 || tf.field.editor.lines.length() == 0) {
         let _ = tf.field.layout_for(laid_w, font_size=sz, line_h=lh)
       }
       if tf.field.focused_sig.untracked() {
@@ -2822,6 +2837,46 @@ fn inst_fade_across(
   }
 }
 
+let over_scrim_floor_next_token : signals::Ref[Int] = ref_new(1)
+let over_scrim_floor_owner : Map[Int, Int] = Map::new()
+let over_scrim_clear : Double = 12.0
+
+/// Push a floor callback `(win_w, win_h) -> Option[(top, tall)]` onto the active window's `over_scrim_floor` stack.
+/// Returns a unique token to pass to `remove_over_scrim_floor`.
+pub fn push_over_scrim_floor(f : (Double, Double) -> Option[(Double, Double)]) -> Int {
+  let tok = over_scrim_floor_next_token.v
+  over_scrim_floor_next_token.v = tok + 1
+  over_scrim_floor_stack.v.push((tok, f))
+  over_scrim_floor_owner[tok] = current_window_id()
+  tok
+}
+
+fn remove_over_scrim_floor_here(token : Int) -> Unit {
+  let stack = over_scrim_floor_stack.v
+  let mut i = stack.length() - 1
+  while i >= 0 {
+    if stack[i].0 == token {
+      array_remove_at(stack, i)
+      return
+    }
+    i -= 1
+  }
+}
+
+/// Remove the `over_scrim_floor` entry matching `token` from its owning window's stack
+/// (supports cross-window tree disposal).
+pub fn remove_over_scrim_floor(token : Int) -> Unit {
+  let owner_opt = over_scrim_floor_owner.get(token)
+  over_scrim_floor_owner.remove(token)
+  match owner_opt {
+    Some(owner_wid) if owner_wid != current_window_id() =>
+    if owner_wid == 0 || window_tree_of(owner_wid).is_some() {
+      in_window(owner_wid, fn() { remove_over_scrim_floor_here(token) })
+    }
+    _ => remove_over_scrim_floor_here(token)
+  }
+}
+
 struct BlurFrame {
   id : view::NodeId
   push_idx : Int
@@ -2832,6 +2887,103 @@ struct BlurFrame {
   mut by0 : Double
   mut bx1 : Double
   mut by1 : Double
+}
+
+struct LensOpenFrame {
+  id : view::NodeId
+  hdr_idx : Int
+  x : Double
+  y : Double
+  w : Double
+  h : Double
+  r0 : Double
+  r1 : Double
+  r2 : Double
+  r3 : Double
+  blur : Double
+  alpha : Double
+  bezel : Double
+  refraction : Double
+  clip : (Double, Double, Double, Double)
+  rc : (Double, Double, Double, Double)
+}
+
+struct DeferredOverScrim {
+  start_i : Int
+  end_i : Int
+  outer_in_clip : (Double, Double, Double, Double)
+  anc_blurs : Array[BlurFrame]
+  anc_lenses : Array[LensOpenFrame]
+  anc_fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))]
+  ink_x : Double
+  ink_y : Double
+  ink_r : Double
+}
+
+enum SuspendedOptical {
+  Blur(BlurFrame)
+  Lens(LensOpenFrame)
+}
+
+fn close_lens_frame(scene : Scene, lf : LensOpenFrame) -> Unit {
+  let child_n = scene.ninst - lf.hdr_idx - 1
+  if child_n > 0 {
+    scene.inst[lf.hdr_idx * inst_size + 12] = child_n.to_double()
+  } else {
+    scene.inst[lf.hdr_idx * inst_size + 12] = 0.0
+    scene.inst[lf.hdr_idx * inst_size + 11] = 0.0
+  }
+}
+
+fn close_optical_while(
+  scene : Scene,
+  tree : view::Tree,
+  blur_stack : Array[BlurFrame],
+  lens_open : Array[LensOpenFrame],
+  deferred_shadows : Array[DeferredGlassShadow],
+  fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))],
+  stop_id : Option[view::NodeId],
+  out : Option[Array[SuspendedOptical]],
+) -> Unit {
+  while true {
+    let b_close = blur_stack.length() > 0 && match stop_id {
+      Some(sid) => !tree.holds_in_order(blur_stack[blur_stack.length() - 1].id, sid)
+      None => true
+    }
+    let l_close = lens_open.length() > 0 && match stop_id {
+      Some(sid) => !tree.holds_in_order(lens_open[lens_open.length() - 1].id, sid)
+      None => true
+    }
+    if !b_close && !l_close {
+      break
+    }
+    let pop_lens = if l_close && !b_close {
+      true
+    } else if !l_close && b_close {
+      false
+    } else {
+      lens_open[lens_open.length() - 1].hdr_idx > blur_stack[blur_stack.length() - 1].push_idx
+    }
+    if pop_lens {
+      match lens_open.pop() {
+        Some(lf) => {
+          close_lens_frame(scene, lf)
+          match out {
+            Some(arr) => arr.push(SuspendedOptical::Lens(lf))
+            None => ()
+          }
+        }
+        None => ()
+      }
+    } else {
+      let top = blur_stack[blur_stack.length() - 1]
+      pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
+      match out {
+        Some(arr) => arr.push(SuspendedOptical::Blur(top))
+        None => ()
+      }
+    }
+  }
 }
 
 fn expand_blur_stack(scene : Scene, blur_stack : Array[BlurFrame], from_idx : Int, to_idx : Int) -> Unit {
@@ -2930,38 +3082,96 @@ fn encode_held_tree(
   let held = tree.drawn_held(scales=scales)
   let n = held.length()
   let n0 = scene.ninst
-  let eff_clip : Array[(Double, Double, Double, Double)] = []
-  let eff_rc : Array[(Double, Double, Double, Double)] = []
+  let win_w = scene.width
+  let win_h = scene.height
+  // Pre-scan for over_scrim lifting only when at least one scrim_under node is alive (zero overhead otherwise).
+  let mut scrim_idx = -1
+  let mut lift_dy = 0.0
+  if tree.scrims_up() {
+    let mut k = 0
+    while k < n {
+      let kd = held[k].0
+      let kns = if k < scales.length() { scales[k] } else { 1.0 }
+      if tree.scrim_of(kd.id) && node_emits_ground(kd, tree.ground_drawn_of(kd.id), kns) {
+        scrim_idx = k
+        break
+      }
+      k += 1
+    }
+    if scrim_idx >= 0 {
+      let mut head = 1.0e300
+      let mut foot = -1.0e300
+      let mut any_lifted = false
+      let mut j = 0
+      while j < scrim_idx {
+        let jd = held[j].0
+        if tree.over_scrim_of(jd.id) {
+          any_lifted = true
+          let root_id = jd.id
+          let mut end_j = j + 1
+          while end_j < scrim_idx && tree.holds_in_order(root_id, held[end_j].0.id) {
+            end_j += 1
+          }
+          let mut m = j
+          while m < end_j {
+            let md = held[m].0
+            if md.alpha > 0.0 && md.w > 0.0 && md.h > 0.0 {
+              head = dmin(head, md.y)
+              foot = dmax(foot, md.y + md.h)
+            }
+            m += 1
+          }
+          j = end_j
+        } else {
+          j += 1
+        }
+      }
+      if !any_lifted {
+        scrim_idx = -1
+      } else {
+        if head > foot {
+          head = 0.0
+          foot = 0.0
+        }
+        let floor_opt = {
+          let st = over_scrim_floor_stack.v
+          if st.length() > 0 {
+            (st[st.length() - 1].1)(win_w, win_h)
+          } else {
+            None
+          }
+        }
+        lift_dy = match floor_opt {
+          Some((top, tall)) if foot + over_scrim_clear > top => {
+            let up = if tall > 0.0 { dmin(1.0, dmax(0.0, (win_h - top) / tall)) } else { 1.0 }
+            let at_rest = win_h - tall - over_scrim_clear - foot
+            dmin(0.0, dmax(dmax(top - over_scrim_clear - foot, at_rest * up), -head))
+          }
+          _ => 0.0
+        }
+        if tree.leaving(held[scrim_idx].0.id) && lift_dy == 0.0 {
+          scrim_idx = -1
+        }
+      }
+    }
+  }
+  let eff_clip : Array[(Double, Double, Double, Double)] = Array::make(n, (0.0, 0.0, 1.0e9, 1.0e9))
+  let eff_rc : Array[(Double, Double, Double, Double)] = Array::make(n, (0.0, 0.0, 0.0, 0.0))
   let deferred_shadows : Array[DeferredGlassShadow] = []
   let fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
   let blur_stack : Array[BlurFrame] = []
   let ink_stack : Array[(view::NodeId, Double, Double, Double)] = []
   let glass_slots : Array[GlassSlot] = []
   let glass_open : Array[Int] = []
-  let lens_open : Array[(view::NodeId, Int)] = []
+  let lens_open : Array[LensOpenFrame] = []
+  let deferred_over_scrim : Array[DeferredOverScrim] = []
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
     while fading.length() > 0 && !tree.holds_in_order(fading[fading.length() - 1].0, d.id) {
       let _ = fading.pop()
     }
-    while blur_stack.length() > 0 && !tree.holds_in_order(blur_stack[blur_stack.length() - 1].id, d.id) {
-      pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
-    }
-    while lens_open.length() > 0 && !tree.holds_in_order(lens_open[lens_open.length() - 1].0, d.id) {
-      match lens_open.pop() {
-        Some((_, hdr_idx)) => {
-          let child_n = scene.ninst - hdr_idx - 1
-          if child_n > 0 {
-            scene.inst[hdr_idx * inst_size + 12] = child_n.to_double()
-          } else {
-            scene.inst[hdr_idx * inst_size + 12] = 0.0
-            scene.inst[hdr_idx * inst_size + 11] = 0.0
-          }
-        }
-        None => ()
-      }
-    }
+    close_optical_while(scene, tree, blur_stack, lens_open, deferred_shadows, fading, Some(d.id), None)
     while glass_open.length() > 0 && !tree.holds_in_order(glass_slots[glass_open[glass_open.length() - 1]].id, d.id) {
       match glass_open.pop() {
         Some(idx) => glass_slots[idx].sub_end = scene.ninst
@@ -2977,6 +3187,36 @@ fn encode_held_tree(
         }
         None => ()
       }
+    }
+    let (in_clip, in_rc) = if holder >= 0 && holder < i {
+      let p = held[holder].0
+      if p.clips {
+        intersect_clip(eff_clip[holder], eff_rc[holder], p.x, p.y, p.x + p.w, p.y + p.h, node_corners_tuple(p))
+      } else {
+        (eff_clip[holder], eff_rc[holder])
+      }
+    } else {
+      ((0.0, 0.0, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
+    }
+    // Defer outermost `over_scrim` subtrees prior to `scrim_idx` into isolated sub-passes after the scrim ground.
+    if scrim_idx >= 0 && i < scrim_idx && tree.over_scrim_of(d.id) {
+      let mut end_i = i + 1
+      while end_i < scrim_idx && tree.holds_in_order(d.id, held[end_i].0.id) {
+        end_i += 1
+      }
+      deferred_over_scrim.push(DeferredOverScrim::{
+        start_i: i,
+        end_i,
+        outer_in_clip: in_clip,
+        anc_blurs: blur_stack.copy(),
+        anc_lenses: lens_open.copy(),
+        anc_fading: fading.copy(),
+        ink_x: scene.ink_x,
+        ink_y: scene.ink_y,
+        ink_r: scene.ink_r,
+      })
+      i = end_i
+      continue
     }
     let node_scale = if i < scales.length() { scales[i] } else { 1.0 }
     let gd = tree.ground_drawn_of(d.id)
@@ -2997,17 +3237,8 @@ fn encode_held_tree(
         scene.ink_r = 0.0
       }
     }
-    let (in_clip, in_rc) = if holder >= 0 && holder < i {
-      let p = held[holder].0
-      if p.clips {
-        intersect_clip(eff_clip[holder], eff_rc[holder], p.x, p.y, p.x + p.w, p.y + p.h, node_corners_tuple(p))
-      } else {
-        (eff_clip[holder], eff_rc[holder])
-      }
-    } else {
-      ((0.0, 0.0, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
-    }
-    let (node_in_clip, node_in_rc) = if d.blur > 0.0 && d.alpha > 0.0 {
+    let scrim_has_blur = d.blur > 0.0 && d.alpha > 0.0
+    let (node_in_clip, node_in_rc) = if scrim_has_blur {
       let fl0 = scene.ninst
       flush_deferred_shadows(scene, deferred_shadows)
       expand_blur_stack(scene, blur_stack, fl0, scene.ninst)
@@ -3029,8 +3260,8 @@ fn encode_held_tree(
     } else {
       (in_clip, in_rc)
     }
-    eff_clip.push(node_in_clip)
-    eff_rc.push(node_in_rc)
+    eff_clip[i] = node_in_clip
+    eff_rc[i] = node_in_rc
     let (draw_clip, draw_rc) = if d.clips_self {
       intersect_clip(node_in_clip, node_in_rc, d.x, d.y, d.x + d.w, d.y + d.h, node_corners_tuple(d))
     } else {
@@ -3115,6 +3346,460 @@ fn encode_held_tree(
         k += 1
       }
     }
+    // Immediately after the scrim node's own ground (and BEFORE opening scrim's lens/fading or encoding
+    // panel children at `scrim_idx + 1`), run completely isolated sub-passes for deferred `over_scrim` subtrees.
+    // Suspend ALL active main-pass blur layers and foreground lenses in strict LIFO order (`push_idx` / `hdr_idx`)
+    // so an inner lens closes before an outer blur emits kind 15, then reopen any suspended layers in reverse
+    // (outer-to-inner) order that still enclose subsequent nodes (`scrim_idx + 1`).
+    if i == scrim_idx && deferred_over_scrim.length() > 0 {
+      let suspended_optical : Array[SuspendedOptical] = []
+      close_optical_while(
+        scene,
+        tree,
+        blur_stack,
+        lens_open,
+        deferred_shadows,
+        fading,
+        None,
+        Some(suspended_optical),
+      )
+      let lifted_at = fn(idx : Int) -> view::Drawn {
+        let orig = held[idx].0
+        if lift_dy == 0.0 { orig } else { view::Drawn::{ ..orig, y: orig.y + lift_dy } }
+      }
+      for def in deferred_over_scrim {
+        let saved_ink_x = scene.ink_x
+        let saved_ink_y = scene.ink_y
+        let saved_ink_r = scene.ink_r
+        scene.ink_x = def.ink_x
+        scene.ink_y = if def.ink_r > 0.0 { def.ink_y + lift_dy } else { def.ink_y }
+        scene.ink_r = def.ink_r
+
+        let sub_deferred_shadows : Array[DeferredGlassShadow] = []
+        let sub_fading : Array[(view::NodeId, (Double, Double, Double, Double), (Double, Double, Double, Double))] = []
+        for af in def.anc_fading {
+          let (by, fbox, fsoft) = af
+          let (fx0, fy0, fx1, fy1) = fbox
+          sub_fading.push((by, (fx0, fy0 + lift_dy, fx1, fy1 + lift_dy), fsoft))
+        }
+        let sub_blur_stack : Array[BlurFrame] = []
+        let sub_ink_stack : Array[(view::NodeId, Double, Double, Double)] = []
+        let sub_glass_slots : Array[GlassSlot] = []
+        let sub_glass_open : Array[Int] = []
+        let sub_lens_open : Array[LensOpenFrame] = []
+
+        let root_ld = lifted_at(def.start_i)
+        for ab in def.anc_blurs {
+          let rclip = (
+            dmin(ab.clip.0, 0.0),
+            dmin(ab.clip.1, 0.0),
+            dmax(ab.clip.2, win_w),
+            dmax(ab.clip.3, win_h),
+          )
+          let push_idx = scene.push_blur_layer(root_ld.x, root_ld.y, root_ld.w, root_ld.h, ab.blur)
+          sub_blur_stack.push(BlurFrame::{
+            id: ab.id,
+            push_idx,
+            blur: ab.blur,
+            clip: rclip,
+            rc: (0.0, 0.0, 0.0, 0.0),
+            bx0: root_ld.x,
+            by0: root_ld.y,
+            bx1: root_ld.x + root_ld.w,
+            by1: root_ld.y + root_ld.h,
+          })
+        }
+        for al in def.anc_lenses {
+          let rclip = (
+            dmin(al.clip.0, 0.0),
+            dmin(al.clip.1, 0.0),
+            dmax(al.clip.2, win_w),
+            dmax(al.clip.3, win_h),
+          )
+          let hdr_idx = scene.push_inst(
+            al.x,
+            al.y + lift_dy,
+            al.w,
+            al.h,
+            al.r0,
+            8.0,
+            0.0,
+            al.blur,
+            c64(0xFFFF, 0xFFFF),
+            al.alpha,
+            0.0,
+            al.bezel,
+            al.refraction,
+            1.0,
+            clip_x=rclip.0,
+            clip_y=rclip.1,
+            clip_x1=rclip.2,
+            clip_y1=rclip.3,
+          )
+          let hoff = hdr_idx * inst_size
+          scene.inst[hoff + 12] = 0.0
+          scene.inst[hoff + 20] = 0.0
+          scene.inst[hoff + 36] = al.r0
+          scene.inst[hoff + 37] = al.r1
+          scene.inst[hoff + 38] = al.r2
+          scene.inst[hoff + 39] = al.r3
+          expand_blur_stack(scene, sub_blur_stack, hdr_idx, hdr_idx + 1)
+          sub_lens_open.push(LensOpenFrame::{
+            ..al,
+            hdr_idx,
+            y: al.y + lift_dy,
+            clip: rclip,
+            rc: (0.0, 0.0, 0.0, 0.0),
+          })
+        }
+
+        let mut idx = def.start_i
+        while idx < def.end_i {
+          let ld = lifted_at(idx)
+          let lholder = held[idx].1
+          while sub_fading.length() > 0 && !tree.holds_in_order(sub_fading[sub_fading.length() - 1].0, ld.id) {
+            let _ = sub_fading.pop()
+          }
+          close_optical_while(scene, tree, sub_blur_stack, sub_lens_open, sub_deferred_shadows, sub_fading, Some(ld.id), None)
+          while sub_glass_open.length() > 0 && !tree.holds_in_order(sub_glass_slots[sub_glass_open[sub_glass_open.length() - 1]].id, ld.id) {
+            match sub_glass_open.pop() {
+              Some(sidx) => sub_glass_slots[sidx].sub_end = scene.ninst
+              None => ()
+            }
+          }
+          while sub_ink_stack.length() > 0 && !tree.holds_in_order(sub_ink_stack[sub_ink_stack.length() - 1].0, ld.id) {
+            match sub_ink_stack.pop() {
+              Some((_, px, py, pr)) => {
+                scene.ink_x = px
+                scene.ink_y = py
+                scene.ink_r = pr
+              }
+              None => ()
+            }
+          }
+          let lns = if idx < scales.length() { scales[idx] } else { 1.0 }
+          let lgd = tree.ground_drawn_of(ld.id)
+          match ld.glass {
+            Some(gl) if gl.liquid && gl.adaptive && gl.strength > 0.001 && !glass_solid() => {
+              sub_ink_stack.push((ld.id, scene.ink_x, scene.ink_y, scene.ink_r))
+              let gx = ld.x + lgd.dx * lns
+              let gy = ld.y + lgd.dy * lns
+              let gw = dmax(0.0, ld.w + lgd.dw * lns)
+              let gh = dmax(0.0, ld.h + lgd.dh * lns)
+              scene.ink_x = gx + gw * 0.5
+              scene.ink_y = gy + gh * 0.5
+              scene.ink_r = dmax(dmin(gw, gh) * 0.5, 1.0)
+            }
+            _ =>
+            if scene.ink_r > 0.0 && ld.ground != 0L && (ld.ground & 0xFFL) >= 0xC0L {
+              sub_ink_stack.push((ld.id, scene.ink_x, scene.ink_y, scene.ink_r))
+              scene.ink_r = 0.0
+            }
+          }
+          let (lin_clip, lin_rc) = if idx == def.start_i {
+            let (ocx0, ocy0, ocx1, ocy1) = def.outer_in_clip
+            (
+              (dmin(ocx0, 0.0), dmin(ocy0, 0.0), dmax(ocx1, win_w), dmax(ocy1, win_h)),
+              (0.0, 0.0, 0.0, 0.0),
+            )
+          } else if lholder >= def.start_i && lholder < idx {
+            let p = lifted_at(lholder)
+            if p.clips {
+              intersect_clip(eff_clip[lholder], eff_rc[lholder], p.x, p.y, p.x + p.w, p.y + p.h, node_corners_tuple(p))
+            } else {
+              (eff_clip[lholder], eff_rc[lholder])
+            }
+          } else {
+            ((0.0, 0.0, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
+          }
+          let (lnode_in_clip, lnode_in_rc) = if ld.blur > 0.0 && ld.alpha > 0.0 {
+            let fl0 = scene.ninst
+            flush_deferred_shadows(scene, sub_deferred_shadows)
+            expand_blur_stack(scene, sub_blur_stack, fl0, scene.ninst)
+            let eff_blur = ld.blur * lns
+            let push_idx = scene.push_blur_layer(ld.x, ld.y, ld.w, ld.h, eff_blur)
+            sub_blur_stack.push(BlurFrame::{
+              id: ld.id,
+              push_idx,
+              blur: eff_blur,
+              clip: lin_clip,
+              rc: lin_rc,
+              bx0: ld.x,
+              by0: ld.y,
+              bx1: ld.x + ld.w,
+              by1: ld.y + ld.h,
+            })
+            ((0.0, 0.0, 1.0e9, 1.0e9), (0.0, 0.0, 0.0, 0.0))
+          } else {
+            (lin_clip, lin_rc)
+          }
+          eff_clip[idx] = lnode_in_clip
+          eff_rc[idx] = lnode_in_rc
+          let (ldraw_clip, ldraw_rc) = if ld.clips_self {
+            intersect_clip(lnode_in_clip, lnode_in_rc, ld.x, ld.y, ld.x + ld.w, ld.y + ld.h, node_corners_tuple(ld))
+          } else {
+            (lnode_in_clip, lnode_in_rc)
+          }
+          let lmag = tree.magnifies_of(ld.id)
+          let lshadow_out = tree.shadow_outside_of(ld.id)
+          let lk0 = scene.ninst
+          encode_drawn_node(
+            scene,
+            tree_id,
+            ld,
+            lgd,
+            lns,
+            frame_no,
+            now,
+            scale,
+            ldraw_clip,
+            ldraw_rc,
+            sub_deferred_shadows,
+            lmag,
+            lk0,
+            lshadow_out,
+            bypass_blocks=bypass_blocks,
+          )
+          if !glass_solid() {
+            match ld.glass {
+              Some(gl) if gl.liquid && gl.layer > 0 && gl.strength > 0.001 => {
+                if lk0 < scene.ninst && scene.inst[lk0 * inst_size + 5] == 6.0 && scene.inst[lk0 * inst_size + 15] > 0.001 {
+                  let si = if lk0 + 1 < scene.ninst && scene.inst[(lk0 + 1) * inst_size + 5] == 2.0 { lk0 + 1 } else { -1 }
+                  let off = lk0 * inst_size
+                  let gx = scene.inst[off]
+                  let gy = scene.inst[off + 1]
+                  let gw = scene.inst[off + 2]
+                  let gh = scene.inst[off + 3]
+                  let (cx0, cy0, cx1, cy1) = ldraw_clip
+                  if gw > 0.0 && gh > 0.0 && gx < cx1 && gx + gw > cx0 && gy < cy1 && gy + gh > cy0 {
+                    let bg = if gl.break_gap > 0.0 { gl.break_gap } else { gl.merge * 0.25 }
+                    let slot_idx = sub_glass_slots.length()
+                    sub_glass_slots.push(GlassSlot::{
+                      layer: gl.layer,
+                      nav_scope: 0,
+                      id: ld.id,
+                      glass_idx: lk0,
+                      shadow_idx: si,
+                      sub_start: lk0,
+                      sub_end: scene.ninst,
+                      x0: gx,
+                      y0: gy,
+                      x1: gx + gw,
+                      y1: gy + gh,
+                      cx0,
+                      cy0,
+                      cx1,
+                      cy1,
+                      merge_max: gl.merge,
+                      break_gap: bg,
+                    })
+                    sub_glass_open.push(slot_idx)
+                  }
+                }
+              }
+              _ => ()
+            }
+          }
+          expand_blur_stack(scene, sub_blur_stack, lk0, scene.ninst)
+          for f in sub_fading {
+            let (by, fbox, fsoft) = f
+            if sub_blur_stack.length() > 0 && !tree.holds_in_order(sub_blur_stack[sub_blur_stack.length() - 1].id, by) {
+              continue
+            }
+            let (fx0, fy0, fx1, fy1) = fbox
+            let (fstart, ftop, fend, ffoot) = fsoft
+            if tree.drawn_clear_of(ld.id, by) {
+              continue
+            }
+            let mut k = lk0
+            while k < scene.ninst {
+              let b = k * inst_size
+              inst_fade(scene.inst, b, fy0, ftop, fy1, ffoot)
+              inst_fade_across(scene.inst, b, fx0, fstart, fx1, fend)
+              k += 1
+            }
+          }
+          let llens = tree.content_lens_of(ld.id)
+          let llens_active = (llens.blur > 0.05 || llens.refraction > 0.05) && ld.alpha > 0.001
+          if llens_active {
+            let (lgx, lgy, lgw, lgh) = if lgd.reshaped() {
+              (
+                ld.x + lgd.dx * lns,
+                ld.y + lgd.dy * lns,
+                dmax(0.0, ld.w + lgd.dw * lns),
+                dmax(0.0, ld.h + lgd.dh * lns),
+              )
+            } else {
+              (ld.x, ld.y, ld.w, ld.h)
+            }
+            let (r0, r1, r2, r3) = match lgd.corners {
+              Some((tl, tr, br, bl)) => (tl * lns, tr * lns, br * lns, bl * lns)
+              None =>
+              match ld.corners {
+                Some((tl, tr, br, bl)) => (tl, tr, br, bl)
+                None => (ld.radius, ld.radius, ld.radius, ld.radius)
+              }
+            }
+            let eff_lblur = llens.blur * lns
+            let eff_lalpha = dclamp(llens.alpha * ld.alpha, 0.0, 1.0)
+            let eff_lbezel = llens.bezel * lns
+            let eff_lrefr = llens.refraction * lns
+            let hdr_idx = scene.push_inst(
+              lgx,
+              lgy,
+              lgw,
+              lgh,
+              r0,
+              8.0,
+              0.0,
+              eff_lblur,
+              c64(0xFFFF, 0xFFFF),
+              eff_lalpha,
+              0.0,
+              eff_lbezel,
+              eff_lrefr,
+              1.0,
+              clip_x=ldraw_clip.0,
+              clip_y=ldraw_clip.1,
+              clip_x1=ldraw_clip.2,
+              clip_y1=ldraw_clip.3,
+            )
+            let hoff = hdr_idx * inst_size
+            scene.inst[hoff + 12] = 0.0
+            scene.inst[hoff + 20] = 0.0
+            scene.inst[hoff + 36] = r0
+            scene.inst[hoff + 37] = r1
+            scene.inst[hoff + 38] = r2
+            scene.inst[hoff + 39] = r3
+            let has_rc = ldraw_rc.0 > 0.0 || ldraw_rc.1 > 0.0 || ldraw_rc.2 > 0.0 || ldraw_rc.3 > 0.0
+            if has_rc {
+              scene.set_clip_corners(hdr_idx, ldraw_rc.0, ldraw_rc.1, ldraw_rc.2, ldraw_rc.3)
+            }
+            expand_blur_stack(scene, sub_blur_stack, hdr_idx, hdr_idx + 1)
+            sub_lens_open.push(LensOpenFrame::{
+              id: ld.id,
+              hdr_idx,
+              x: lgx,
+              y: lgy,
+              w: lgw,
+              h: lgh,
+              r0,
+              r1,
+              r2,
+              r3,
+              blur: eff_lblur,
+              alpha: eff_lalpha,
+              bezel: eff_lbezel,
+              refraction: eff_lrefr,
+              clip: ldraw_clip,
+              rc: ldraw_rc,
+            })
+          }
+          let (lfstart, lftop, lfend, lffoot) = match tree.cut_soft_of(ld.id) {
+            Some((over_top, over_foot, ch)) => (0.0, cut_soft(over_top, ch / 2.0), 0.0, cut_soft(over_foot, ch / 2.0))
+            None => tree.fades_of(ld.id)
+          }
+          if lfstart > 0.0 || lftop > 0.0 || lfend > 0.0 || lffoot > 0.0 {
+            let past = if ld.clips && !ld.clips_self { tree.clips_past_of(ld.id) } else { 0.0 }
+            let fh = dmax(0.0, ld.h + past)
+            sub_fading.push(
+              (
+                ld.id,
+                (ld.x, ld.y, ld.x + ld.w * lns, ld.y + fh * lns),
+                (lfstart * lns, lftop * lns, lfend * lns, lffoot * lns),
+              ),
+            )
+          }
+          idx += 1
+        }
+        while sub_ink_stack.length() > 0 {
+          let _ = sub_ink_stack.pop()
+        }
+        scene.ink_x = saved_ink_x
+        scene.ink_y = saved_ink_y
+        scene.ink_r = saved_ink_r
+        close_optical_while(scene, tree, sub_blur_stack, sub_lens_open, sub_deferred_shadows, sub_fading, None, None)
+        flush_deferred_shadows(scene, sub_deferred_shadows)
+        while sub_glass_open.length() > 0 {
+          match sub_glass_open.pop() {
+            Some(sidx) => sub_glass_slots[sidx].sub_end = scene.ninst
+            None => ()
+          }
+        }
+        for gs in sub_glass_slots {
+          glass_slots.push(gs)
+        }
+      }
+      if scrim_idx + 1 < n {
+        let next_id = held[scrim_idx + 1].0.id
+        let mut si = suspended_optical.length() - 1
+        while si >= 0 {
+          match suspended_optical[si] {
+            SuspendedOptical::Blur(sb) =>
+            if tree.holds_in_order(sb.id, next_id) {
+              let fl0 = scene.ninst
+              flush_deferred_shadows(scene, deferred_shadows)
+              expand_blur_stack(scene, blur_stack, fl0, scene.ninst)
+              let push_idx = scene.push_blur_layer(
+                sb.bx0,
+                sb.by0,
+                dmax(0.0, sb.bx1 - sb.bx0),
+                dmax(0.0, sb.by1 - sb.by0),
+                sb.blur,
+              )
+              blur_stack.push(BlurFrame::{
+                id: sb.id,
+                push_idx,
+                blur: sb.blur,
+                clip: sb.clip,
+                rc: sb.rc,
+                bx0: sb.bx0,
+                by0: sb.by0,
+                bx1: sb.bx1,
+                by1: sb.by1,
+              })
+            }
+            SuspendedOptical::Lens(sl) =>
+            if tree.holds_in_order(sl.id, next_id) {
+              let hdr_idx = scene.push_inst(
+                sl.x,
+                sl.y,
+                sl.w,
+                sl.h,
+                sl.r0,
+                8.0,
+                0.0,
+                sl.blur,
+                c64(0xFFFF, 0xFFFF),
+                sl.alpha,
+                0.0,
+                sl.bezel,
+                sl.refraction,
+                1.0,
+                clip_x=sl.clip.0,
+                clip_y=sl.clip.1,
+                clip_x1=sl.clip.2,
+                clip_y1=sl.clip.3,
+              )
+              let hoff = hdr_idx * inst_size
+              scene.inst[hoff + 12] = 0.0
+              scene.inst[hoff + 20] = 0.0
+              scene.inst[hoff + 36] = sl.r0
+              scene.inst[hoff + 37] = sl.r1
+              scene.inst[hoff + 38] = sl.r2
+              scene.inst[hoff + 39] = sl.r3
+              let has_rc = sl.rc.0 > 0.0 || sl.rc.1 > 0.0 || sl.rc.2 > 0.0 || sl.rc.3 > 0.0
+              if has_rc {
+                scene.set_clip_corners(hdr_idx, sl.rc.0, sl.rc.1, sl.rc.2, sl.rc.3)
+              }
+              expand_blur_stack(scene, blur_stack, hdr_idx, hdr_idx + 1)
+              lens_open.push(LensOpenFrame::{ ..sl, hdr_idx })
+            }
+          }
+          si -= 1
+        }
+      }
+    }
     // Foreground optical lens (kind == 8): offscreen Gaussian defocus + spherical bevel refraction + SDF clip
     // over children; zero overhead when resting (blur <= 0.05 && refraction <= 0.05).
     let lens = tree.content_lens_of(d.id)
@@ -3138,6 +3823,10 @@ fn encode_held_tree(
           None => (d.radius, d.radius, d.radius, d.radius)
         }
       }
+      let eff_lblur = lens.blur * node_scale
+      let eff_lalpha = dclamp(lens.alpha * d.alpha, 0.0, 1.0)
+      let eff_lbezel = lens.bezel * node_scale
+      let eff_lrefr = lens.refraction * node_scale
       let hdr_idx = scene.push_inst(
         lgx,
         lgy,
@@ -3146,12 +3835,12 @@ fn encode_held_tree(
         r0,
         8.0,
         0.0,
-        lens.blur * node_scale,
+        eff_lblur,
         c64(0xFFFF, 0xFFFF),
-        dclamp(lens.alpha * d.alpha, 0.0, 1.0),
+        eff_lalpha,
         0.0,
-        lens.bezel * node_scale,
-        lens.refraction * node_scale,
+        eff_lbezel,
+        eff_lrefr,
         1.0,
         clip_x=draw_clip.0,
         clip_y=draw_clip.1,
@@ -3170,7 +3859,24 @@ fn encode_held_tree(
         scene.set_clip_corners(hdr_idx, draw_rc.0, draw_rc.1, draw_rc.2, draw_rc.3)
       }
       expand_blur_stack(scene, blur_stack, hdr_idx, hdr_idx + 1)
-      lens_open.push((d.id, hdr_idx))
+      lens_open.push(LensOpenFrame::{
+        id: d.id,
+        hdr_idx,
+        x: lgx,
+        y: lgy,
+        w: lgw,
+        h: lgh,
+        r0,
+        r1,
+        r2,
+        r3,
+        blur: eff_lblur,
+        alpha: eff_lalpha,
+        bezel: eff_lbezel,
+        refraction: eff_lrefr,
+        clip: draw_clip,
+        rc: draw_rc,
+      })
     }
     let (fstart, ftop, fend, ffoot) = match tree.cut_soft_of(d.id) {
       Some((over_top, over_foot, ch)) => (0.0, cut_soft(over_top, ch / 2.0), 0.0, cut_soft(over_foot, ch / 2.0))
@@ -3199,24 +3905,8 @@ fn encode_held_tree(
       None => ()
     }
   }
-  while blur_stack.length() > 0 {
-    pop_blur_frame(scene, tree, blur_stack, deferred_shadows, fading)
-  }
+  close_optical_while(scene, tree, blur_stack, lens_open, deferred_shadows, fading, None, None)
   flush_deferred_shadows(scene, deferred_shadows)
-  while lens_open.length() > 0 {
-    match lens_open.pop() {
-      Some((_, hdr_idx)) => {
-        let child_n = scene.ninst - hdr_idx - 1
-        if child_n > 0 {
-          scene.inst[hdr_idx * inst_size + 12] = child_n.to_double()
-        } else {
-          scene.inst[hdr_idx * inst_size + 12] = 0.0
-          scene.inst[hdr_idx * inst_size + 11] = 0.0
-        }
-      }
-      None => ()
-    }
-  }
   while glass_open.length() > 0 {
     match glass_open.pop() {
       Some(idx) => glass_slots[idx].sub_end = scene.ninst
@@ -3901,7 +4591,11 @@ pub fn view_key(code : Int, mods : Int, now : Double) -> Bool {
     _ => false
   }
   if mods == 0 && (code == key_enter || code == key_space) {
-    if focused_is_active_field {
+    let field_leaves_key = match focused_field_ref.v {
+      Some(f) => f.leaves.contains(code)
+      None => false
+    }
+    if focused_is_active_field && !field_leaves_key {
       if !field_composing {
         if tree.stroke(code, mods, now, from=held, facts=facts, scoped_only=true, focus_only=true) {
           return true
@@ -3915,16 +4609,18 @@ pub fn view_key(code : Int, mods : Int, now : Double) -> Bool {
       }
       return true
     }
-    match held {
-      Some(nid) => {
-        let mask = if code == key_enter { view::focus_enter } else { view::focus_space }
-        if (tree.focus_keys_of(nid) & mask) != 0 {
-          if tree.press_focused_at(nid, now) {
-            return true
+    if !focused_is_active_field {
+      match held {
+        Some(nid) => {
+          let mask = if code == key_enter { view::focus_enter } else { view::focus_space }
+          if (tree.focus_keys_of(nid) & mask) != 0 {
+            if tree.press_focused_at(nid, now) {
+              return true
+            }
           }
         }
+        None => ()
       }
-      None => ()
     }
   }
 
@@ -4190,6 +4886,26 @@ pub fn view_back(kind : Int, x : Double, progress : Double, edge : Int) -> Unit 
   })
 }
 
+/// Dispatch an asynchronous host outside event (`set_outside`: 1=image, 3=pick, 9=clipboard, 11=posted, 17=window).
+pub fn view_outside_event(kind : Int, id : Int, _st : Int) -> Unit {
+  if kind == 1 {
+    image_bump_rev()
+    hostapi::request_frame()
+  } else if kind == 3 {
+    let _ = drop_pick_ready(id)
+    hostapi::request_frame()
+  } else if kind == 9 {
+    let _ = field_clip_read_ready(id)
+    hostapi::request_frame()
+  } else if kind == 11 {
+    messages_between()
+  } else if kind == 17 {
+    window_closed_by_host(id)
+  } else {
+    hostapi::request_frame()
+  }
+}
+
 /// Open a pure-tree window and run `tree` until it closes.
 /// `transitions_only` defaults to true so changes outside `view::transition` settle immediately.
 pub fn run(
@@ -4224,18 +4940,9 @@ pub fn run(
     })
     None => ()
   }
-  // Deliver asynchronous host events between frames (MB_OUTSIDE_IMAGE = 1, MB_OUTSIDE_POSTED = 11, MB_OUTSIDE_WINDOW = 17).
-  let _ = hostapi::set_outside(fn(kind : Int, id : Int, _st : Int) -> Unit {
-    if kind == 1 {
-      image_bump_rev()
-      hostapi::request_frame()
-    } else if kind == 11 {
-      messages_between()
-    } else if kind == 17 {
-      window_closed_by_host(id)
-    } else {
-      hostapi::request_frame()
-    }
+  // Deliver asynchronous host events between frames (1=image, 3=pick, 9=clipboard, 11=posted, 17=window).
+  let _ = hostapi::set_outside(fn(kind : Int, id : Int, st : Int) -> Unit {
+    view_outside_event(kind, id, st)
   })
   hostapi::run(
     title,
