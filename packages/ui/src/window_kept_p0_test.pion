@@ -1,0 +1,2408 @@
+// Wave P0-1A unit tests:
+// - Cross-package `signals::Ref[T]` identity & forwarders (`signals`, `view`, `ui`)
+// - `in_window` identity timing, late registration, re-entrancy guard, `window_kept_{ref,map,array}`
+// - Per-tree stable `room_signal()` / `current_tree_room()` & offscreen `encode_tree_scene` isolation
+// - Reactive `window_zoomed()` and `window_snap_state()` aliases with per-window isolation
+
+import "hostapi"
+import "signals"
+import "view"
+
+fn mutate_int_ref(r : signals::Ref[Int], next : Int) -> Unit {
+  r.v = next
+}
+
+test "p0-1a: cross-package Ref[T] mutation and unique phys_id across forwarders" {
+  let r_sig : signals::Ref[Int] = signals::ref_new(1)
+  let r_view : signals::Ref[Int] = view::ref_new(2)
+  let r_ui : signals::Ref[Int] = ref_new(3)
+  let r_str : signals::Ref[String] = view::ref_new("a")
+
+  debug_assert(r_sig.phys_id < r_view.phys_id, "signals::ref_new < view::ref_new")
+  debug_assert(r_view.phys_id < r_ui.phys_id, "view::ref_new < ui::ref_new")
+  debug_assert(r_ui.phys_id < r_str.phys_id, "distinct T phys_id strictly monotonic")
+
+  mutate_int_ref(r_sig, 11)
+  mutate_int_ref(r_view, 22)
+  mutate_int_ref(r_ui, 33)
+  debug_assert(r_sig.v == 11 && r_view.v == 22 && r_ui.v == 33, "cross-package in-place mutation")
+}
+
+test "p0-1a: in_window A -> B(late register) -> A -> B -> C, aliases, self-alias array fresh, signal isolation, and re-entrancy guard" {
+  let _ = windows_reset()
+
+  // Pre-registered containers + aliases
+  let kept_r : signals::Ref[Int] = signals::ref_new(10)
+  let kept_m : Map[String, Int] = Map::new()
+  let kept_m_alias = kept_m
+  let kept_set : Map[String, Unit] = Map::new()
+  let kept_arr_default : Array[Int] = []
+  let kept_arr_alias = kept_arr_default
+  let kept_arr_self : Array[Int] = [7, 8]
+  let kept_sig_ref : signals::Ref[signals::Signal[Int]] = signals::ref_new(signals::signal(0))
+
+  // Track `current_window_id()` observed inside `fresh` and `restore`, plus re-entrancy guard checks
+  let fresh_wids : Array[Int] = []
+  let restore_wids : Array[Int] = []
+  let guard_checked_take : signals::Ref[Bool] = signals::ref_new(false)
+  let guard_checked_restore : signals::Ref[Bool] = signals::ref_new(false)
+  let guard_checked_fresh : signals::Ref[Bool] = signals::ref_new(false)
+
+  window_kept(
+    fn() {
+      debug_assert(
+        window_switch_guard_error("window_kept").is_some() &&
+        window_switch_guard_error("in_window").is_some(),
+        "re-entrancy guard must be active inside take callback",
+      )
+      guard_checked_take.v = true
+      fn() {
+        debug_assert(
+          window_switch_guard_error("window_kept").is_some() &&
+          window_switch_guard_error("in_window").is_some(),
+          "re-entrancy guard must be active inside restore callback",
+        )
+        guard_checked_restore.v = true
+        restore_wids.push(current_window_id())
+      }
+    },
+    fn() {
+      debug_assert(
+        window_switch_guard_error("window_kept").is_some() &&
+        window_switch_guard_error("in_window").is_some(),
+        "re-entrancy guard must be active inside fresh callback",
+      )
+      guard_checked_fresh.v = true
+      fresh_wids.push(current_window_id())
+    },
+  )
+
+  window_kept_ref(kept_r, fn() { current_window_id() * 100 })
+  window_kept_map(kept_m)
+  window_kept_map(kept_set)
+  window_kept_array(kept_arr_default)
+  // Self-aliasing fresh: returns the same array `kept_arr_self` after pushing a window tag!
+  window_kept_array(kept_arr_self, fresh=fn() {
+    let w = current_window_id()
+    kept_arr_self.push(w)
+    kept_arr_self
+  })
+  window_kept_ref(kept_sig_ref, fn() { signals::signal(current_window_id()) })
+
+  // Window A (wid = 0): populate state and attach an effect on A's signal
+  kept_r.v = 11
+  kept_m["k"] = 1
+  kept_set["a_only"] = ()
+  kept_arr_default.push(101)
+  let a_sig_fires : signals::Ref[Int] = signals::ref_new(0)
+  let stop_a = signals::effect(fn() {
+    let _ = kept_sig_ref.v.get()
+    a_sig_fires.v = a_sig_fires.v + 1
+  })
+  debug_assert(a_sig_fires.v == 1, "window A effect runs once initially")
+
+  // Late-registered slot (registered inside B's body!)
+  let late_ref : signals::Ref[Int] = signals::ref_new(-1)
+  let late_fresh_wids : Array[Int] = []
+
+  // Step 1: A (0) -> B (101) with late registration
+  in_window(101, fn() {
+    debug_assert(current_window_id() == 101, "in B body wid == 101")
+    debug_assert(window_switch_guard_error("window_kept").is_none(), "normal body allows window_kept")
+    debug_assert(kept_r.v == 10100, "fresh saw wid == 101")
+    debug_assert(kept_m_alias.length() == 0, "map cleared in place preserving alias")
+    debug_assert(kept_set.length() == 0, "set-map cleared in B")
+    debug_assert(kept_arr_alias.length() == 0, "1-arg array defaults to empty preserving alias")
+    // Self-aliasing fresh preserved elements instead of wiping itself!
+    debug_assert(
+      kept_arr_self.length() == 3 && kept_arr_self[0] == 7 && kept_arr_self[1] == 8 && kept_arr_self[2] == 101,
+      "self-aliasing array fresh must copy before clearing",
+    )
+
+    // Mutate B's state and B's signal (must NOT wake A's effect!)
+    kept_r.v = 202
+    kept_m["k"] = 2
+    kept_set["b_only"] = ()
+    kept_arr_default.push(202)
+    kept_sig_ref.v.set(999)
+    debug_assert(a_sig_fires.v == 1, "mutating B's signal must not wake A's effect")
+
+    // Late registration inside B's body
+    late_ref.v = 555
+    window_kept_ref(late_ref, fn() {
+      let w = current_window_id()
+      late_fresh_wids.push(w)
+      w + 1000
+    })
+  })
+
+  // Step 2: Back in A (0) — A restored, late_ref ran fresh under wid == 0!
+  debug_assert(current_window_id() == 0, "returned to window A (0)")
+  debug_assert(kept_r.v == 11, "A ref restored")
+  match kept_m_alias.get("k") {
+    Some(v) => debug_assert(v == 1, "A map restored via alias")
+    None => debug_assert(false, "A map missing key k")
+  }
+  debug_assert(kept_set.get("a_only").is_some() && kept_set.get("b_only").is_none(), "A set-map restored")
+  debug_assert(kept_arr_alias.length() == 1 && kept_arr_alias[0] == 101, "A array restored via alias")
+  debug_assert(kept_arr_self.length() == 2 && kept_arr_self[0] == 7 && kept_arr_self[1] == 8, "A self-alias array restored")
+  debug_assert(late_ref.v == 1000, "late-registered slot ran fresh for A with wid == 0")
+  debug_assert(late_fresh_wids.length() == 1 && late_fresh_wids[0] == 0, "late fresh saw wid == 0 on return to A")
+
+  // Step 3: Re-enter B (101) — B's saved values (including late_ref == 555) restored!
+  in_window(101, fn() {
+    debug_assert(current_window_id() == 101, "re-entered B")
+    debug_assert(kept_r.v == 202, "B ref restored")
+    match kept_m_alias.get("k") {
+      Some(v) => debug_assert(v == 2, "B map restored")
+      None => debug_assert(false, "B map missing key k")
+    }
+    debug_assert(kept_set.get("b_only").is_some() && kept_set.get("a_only").is_none(), "B set-map restored")
+    debug_assert(kept_arr_alias.length() == 1 && kept_arr_alias[0] == 202, "B array restored")
+    debug_assert(late_ref.v == 555, "B preserved its late-registered value")
+  })
+
+  // Step 4: Open brand new window C (102)
+  in_window(102, fn() {
+    debug_assert(current_window_id() == 102, "entered C")
+    debug_assert(kept_r.v == 10200, "C ref initialized fresh with wid == 102")
+    debug_assert(kept_m_alias.length() == 0, "C map starts empty")
+    debug_assert(kept_arr_alias.length() == 0, "C array starts empty")
+    debug_assert(late_ref.v == 1102, "C late_ref initialized fresh with wid == 102")
+  })
+
+  debug_assert(guard_checked_take.v && guard_checked_restore.v && guard_checked_fresh.v, "all 3 switching callbacks verified guard")
+  // fresh_wids should have observed 101 (B) and 102 (C)
+  debug_assert(fresh_wids.length() == 2 && fresh_wids[0] == 101 && fresh_wids[1] == 102, "fresh saw target wid")
+  // restore_wids should have observed 0 (return A), 101 (re-enter B), 0 (return A), 0 (return A from C)
+  debug_assert(
+    restore_wids.length() == 4 &&
+    restore_wids[0] == 0 &&
+    restore_wids[1] == 101 &&
+    restore_wids[2] == 0 &&
+    restore_wids[3] == 0,
+    "restore saw target wid on every switch",
+  )
+
+  stop_a()
+  let _ = windows_reset()
+}
+
+test "p0-1a: offscreen standalone Tree::new inside 1000px narrow-enabled main window flips 400 -> 1000 -> 400 with zero cross-wakeups" {
+  let main_effect_runs : signals::Ref[Int] = signals::ref_new(0)
+  let main_narrow_seen : signals::Ref[Bool] = signals::ref_new(false)
+  let offscreen_bind_runs : signals::Ref[Int] = signals::ref_new(0)
+  let offscreen_last_label : signals::Ref[String] = signals::ref_new("")
+
+  // 1. Start a 1000px main window with narrow mode enabled
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(
+        view::Live::By(fn() {
+          if tree_narrow() { "main-narrow" } else { "main-wide" }
+        }),
+        look=view::words_plain,
+      )
+    },
+    width=1000.0,
+    height=600.0,
+  )
+  // Default narrow_enabled is false
+  debug_assert(!tree_narrow(), "tree_narrow defaults to false")
+  set_narrow_enabled(true)
+  t.frame()
+  debug_assert(!tree_narrow(), "1000px main window is wide when narrow_below=700")
+  debug_assert(t.find("main-wide").is_some(), "main window renders wide")
+
+  // Attach an effect on the main window reading window_size_now() & tree_narrow()
+  let stop_main_eff = signals::effect(fn() {
+    let _ = window_size_now()
+    main_narrow_seen.v = tree_narrow()
+    main_effect_runs.v = main_effect_runs.v + 1
+  })
+  let main_runs_before_offscreen = main_effect_runs.v
+
+  // 2. Directly build a standalone offscreen tree while the 1000px main window is active
+  let offscreen = view::Tree::new(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b
+          .fill()
+          .ground(
+            view::Live::By(fn() {
+              offscreen_bind_runs.v = offscreen_bind_runs.v + 1
+              if tree_narrow() {
+                offscreen_last_label.v = "narrow"
+                rgba(220, 40, 40, 255)
+              } else {
+                offscreen_last_label.v = "wide"
+                rgba(40, 120, 220, 255)
+              }
+            }),
+          )
+          .words(
+            view::Live::By(fn() {
+              if tree_narrow() { "off-narrow" } else { "off-wide" }
+            }),
+            look=view::words_plain,
+          )
+      })
+    },
+    measure=host_words_measure,
+    measure_runs=host_runs_measure,
+    measure_runs_least=host_runs_least_measure,
+  )
+
+  // Verify room_signal() is exported and distinct from main tree's room_signal()
+  let main_tree = match view_tree() {
+    Some(mt) => mt
+    None => panic("missing main tree")
+  }
+  let (ow0, oh0) = offscreen.room_signal().untracked()
+  debug_assert(ow0 == 0.0 && oh0 == 0.0, "offscreen room starts at (0,0)")
+  let (mw0, mh0) = main_tree.room_signal().untracked()
+  debug_assert(mw0 == 1000.0 && mh0 == 600.0, "main tree room is (1000,600)")
+
+  // 3. Encode the same offscreen tree at 400 -> 1000 -> 400
+  let sc1 = encode_tree_scene(offscreen, 400.0, 600.0, 1.0, 10.0)
+  debug_assert(offscreen_last_label.v == "narrow", "frame 1 (400px) must be narrow")
+  let (ow1, oh1) = offscreen.room_signal().untracked()
+  debug_assert(ow1 == 400.0 && oh1 == 600.0, "offscreen room updated to 400")
+  debug_assert(sc1.ninst > 0, "frame 1 encoded instances")
+  // Check actual drawn box ground color + words for frame 1 (narrow = red)
+  let mut saw_f1_narrow = false
+  for d in offscreen.drawn() {
+    if d.words == "off-narrow" && d.ground == rgba(220, 40, 40, 255) {
+      saw_f1_narrow = true
+    }
+  }
+  debug_assert(saw_f1_narrow, "frame 1 actual drawn style must be narrow red")
+
+  let sc2 = encode_tree_scene(offscreen, 1000.0, 600.0, 1.0, 26.0)
+  debug_assert(offscreen_last_label.v == "wide", "frame 2 (1000px) must be wide")
+  let (ow2, oh2) = offscreen.room_signal().untracked()
+  debug_assert(ow2 == 1000.0 && oh2 == 600.0, "offscreen room updated to 1000")
+  debug_assert(sc2.ninst > 0, "frame 2 encoded instances")
+  let mut saw_f2_wide = false
+  for d in offscreen.drawn() {
+    if d.words == "off-wide" && d.ground == rgba(40, 120, 220, 255) {
+      saw_f2_wide = true
+    }
+  }
+  debug_assert(saw_f2_wide, "frame 2 actual drawn style must be wide blue")
+
+  let sc3 = encode_tree_scene(offscreen, 400.0, 600.0, 1.0, 42.0)
+  debug_assert(offscreen_last_label.v == "narrow", "frame 3 (400px) must flip back to narrow")
+  let (ow3, oh3) = offscreen.room_signal().untracked()
+  debug_assert(ow3 == 400.0 && oh3 == 600.0, "offscreen room updated back to 400")
+  debug_assert(sc3.ninst > 0, "frame 3 encoded instances")
+  let mut saw_f3_narrow = false
+  for d in offscreen.drawn() {
+    if d.words == "off-narrow" && d.ground == rgba(220, 40, 40, 255) {
+      saw_f3_narrow = true
+    }
+  }
+  debug_assert(saw_f3_narrow, "frame 3 actual drawn style must flip back to narrow red")
+
+  // (c) Encoding offscreen tree triggered 0 wakeups on main window effect!
+  debug_assert(
+    main_effect_runs.v == main_runs_before_offscreen,
+    "encoding offscreen tree must trigger 0 main-window effect wakeups",
+  )
+
+  // (b) Resizing main window triggers 0 on_due notifications and 0 recomputations on offscreen tree!
+  let offscreen_due_fires : signals::Ref[Int] = signals::ref_new(0)
+  offscreen.on_due(fn() { offscreen_due_fires.v = offscreen_due_fires.v + 1 })
+  let offscreen_due_before_main_resize = offscreen_due_fires.v
+  let offscreen_runs_before_main_resize = offscreen_bind_runs.v
+  t.resize(500.0, 600.0)
+  t.frame()
+  debug_assert(main_narrow_seen.v, "main window became narrow at 500px")
+  debug_assert(main_effect_runs.v > main_runs_before_offscreen, "main effect woke on main resize")
+  t.resize(1100.0, 600.0)
+  t.frame()
+  debug_assert(!main_narrow_seen.v, "main window became wide at 1100px")
+  debug_assert(
+    offscreen_due_fires.v == offscreen_due_before_main_resize,
+    "resizing main window must trigger 0 on_due notifications on offscreen tree",
+  )
+  // Re-encode offscreen at unchanged 400x600 to prove queued bindings were never marked dirty!
+  let _ = encode_tree_scene(offscreen, 400.0, 600.0, 1.0, 58.0)
+  debug_assert(
+    offscreen_bind_runs.v == offscreen_runs_before_main_resize,
+    "resizing main window must trigger 0 recomputations on offscreen tree",
+  )
+
+  // Verify set_narrow_below breakpoint reactivity
+  set_narrow_below(1200.0)
+  t.frame()
+  debug_assert(tree_narrow(), "1100px is narrow when narrow_below=1200")
+
+  stop_main_eff()
+  offscreen.dispose()
+  t.dispose()
+}
+
+test "p0-1a: window_zoomed() and window_snap_state() reactive aliases isolate per window" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(_b : view::View) { () })
+  })
+
+  let w0_zoom_fires : signals::Ref[Int] = signals::ref_new(0)
+  let w0_snap_fires : signals::Ref[Int] = signals::ref_new(0)
+  let w0_zoom_val : signals::Ref[Bool] = signals::ref_new(false)
+  let w0_snap_val : signals::Ref[Int] = signals::ref_new(0)
+
+  let stop_w0_z = signals::effect(fn() {
+    w0_zoom_val.v = window_zoomed()
+    w0_zoom_fires.v = w0_zoom_fires.v + 1
+  })
+  let stop_w0_s = signals::effect(fn() {
+    w0_snap_val.v = window_snap_state()
+    w0_snap_fires.v = w0_snap_fires.v + 1
+  })
+
+  debug_assert(w0_zoom_fires.v == 1 && !w0_zoom_val.v, "w0 zoomed initial")
+  debug_assert(w0_snap_fires.v == 1 && w0_snap_val.v == 0, "w0 snap initial")
+
+  let w1_zoom_fires : signals::Ref[Int] = signals::ref_new(0)
+  let w1_snap_fires : signals::Ref[Int] = signals::ref_new(0)
+  let w1_zoom_val : signals::Ref[Bool] = signals::ref_new(false)
+  let w1_snap_val : signals::Ref[Int] = signals::ref_new(0)
+  let stop_w1_z : signals::Ref[() -> Unit] = signals::ref_new(fn() { () })
+  let stop_w1_s : signals::Ref[() -> Unit] = signals::ref_new(fn() { () })
+
+  // Set up effects inside window 201
+  in_window(201, fn() {
+    stop_w1_z.v = signals::effect(fn() {
+      w1_zoom_val.v = window_zoomed()
+      w1_zoom_fires.v = w1_zoom_fires.v + 1
+    })
+    stop_w1_s.v = signals::effect(fn() {
+      w1_snap_val.v = window_snap_state()
+      w1_snap_fires.v = w1_snap_fires.v + 1
+    })
+  })
+  debug_assert(w1_zoom_fires.v == 1 && !w1_zoom_val.v, "w1 zoomed initial")
+  debug_assert(w1_snap_fires.v == 1 && w1_snap_val.v == 0, "w1 snap initial")
+
+  // Change host zoomed & snap in window 0 only
+  t.fake.window_zoomed_flag = true
+  t.fake.window_snap_state_val = 2
+  t.frame()
+  debug_assert(w0_zoom_fires.v == 2 && w0_zoom_val.v, "w0 zoomed woke once on change")
+  debug_assert(w0_snap_fires.v == 2 && w0_snap_val.v == 2, "w0 snap woke once on change")
+  debug_assert(w1_zoom_fires.v == 1 && !w1_zoom_val.v, "w1 zoomed unaffected by w0")
+  debug_assert(w1_snap_fires.v == 1 && w1_snap_val.v == 0, "w1 snap unaffected by w0")
+
+  // Same values on next frame -> 0 extra fires
+  t.frame()
+  debug_assert(w0_zoom_fires.v == 2 && w0_snap_fires.v == 2, "unchanged host state causes 0 extra fires")
+
+  // Change host zoomed & snap inside window 201 only
+  in_window(201, fn() {
+    t.fake.window_zoomed_flag = true
+    t.fake.window_snap_state_val = 3
+    host_settings_arrive()
+  })
+  debug_assert(w1_zoom_fires.v == 2 && w1_zoom_val.v, "w1 zoomed woke once")
+  debug_assert(w1_snap_fires.v == 2 && w1_snap_val.v == 3, "w1 snap woke once")
+  debug_assert(w0_zoom_fires.v == 2 && w0_snap_fires.v == 2, "w0 unaffected by w1 change")
+
+  stop_w0_z()
+  stop_w0_s()
+  (stop_w1_z.v)()
+  (stop_w1_s.v)()
+  t.dispose()
+}
+
+test "p0-1a: pre-startup set_narrow_enabled and set_narrow_below survive first Tester::tree and reset on dispose" {
+  set_narrow_enabled(true)
+  set_narrow_below(900.0)
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.words(
+        view::Live::By(fn() {
+          if tree_narrow() { "pre-narrow" } else { "pre-wide" }
+        }),
+        look=view::words_plain,
+      )
+    },
+    width=800.0,
+    height=600.0,
+  )
+  debug_assert(tree_narrow(), "pre-startup narrow_enabled=true and narrow_below=900 must survive first Tester::tree")
+  debug_assert(t.find("pre-narrow").is_some(), "800px < 900px renders narrow")
+  t.dispose()
+  debug_assert(!tree_narrow(), "dispose resets narrow_enabled to false")
+}
+
+test "p0-1a: app-level effect created outside tree does not leak offscreen tree room when triggered during Tree::frame" {
+  let t = Tester::tree(fn(_root : view::View) { () }, width=1000.0, height=600.0)
+  let ping = signals::signal(0)
+  let seen_w = signals::ref_new(0.0)
+  let seen_room_none = signals::ref_new(false)
+  let stop_eff = signals::effect(fn() {
+    let _ = ping.get()
+    seen_room_none.v = view::current_tree_room().is_none()
+    seen_w.v = window_size_now().0
+  })
+  debug_assert(seen_room_none.v && seen_w.v == 1000.0, "app-level effect initially reads main window")
+
+  let off = view::Tree::new(fn(root : view::View) {
+    root.reacts(fn() { window_size_now().0 }, fn(w) {
+      if w == 400.0 {
+        // Trigger app-level effect synchronously while inside off.frame(400, 600)!
+        ping.set(1)
+      }
+    })
+  })
+  let _ = off.frame(400.0, 600.0)
+  debug_assert(seen_room_none.v, "app-level effect must see current_tree_room() == None")
+  debug_assert(seen_w.v == 1000.0, "app-level effect must read main window 1000.0, not offscreen 400.0")
+
+  stop_eff()
+  off.dispose()
+  t.dispose()
+}
+
+test "p0-1a: review isolate computed read" {
+  let t = Tester::tree(fn(_root : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let last = signals::ref_new(0.0)
+  let tr = view::Tree::new(fn(root : view::View) {
+    let m = signals::computed_by(fn(_ : Option[Double]) -> Double {
+      let _ = tick.get()
+      window_size_now().0
+    }, fn(a, b) { a == b })
+    root.reacts(fn() { m.get() }, fn(w) { last.v = w })
+  })
+  let _ = tr.frame(400.0, 600.0)
+  debug_assert(last.v == 400.0, "offscreen width at start")
+  tick.set(1)
+  debug_assert(last.v == 400.0, "offscreen computed must keep own tree room after independent write")
+  tr.dispose()
+  t.dispose()
+}
+
+test "p0-1a: review isolate narrow policy" {
+  let t = Tester::tree(fn(_root : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let last = signals::ref_new(false)
+  let saved : signals::Ref[Option[view::Tree]] = signals::ref_new(None)
+  in_window(123, fn() {
+    set_narrow_enabled(true)
+    let tr = view::Tree::new(fn(root : view::View) {
+      root.reacts(fn() { let _ = tick.get(); tree_narrow() }, fn(b) { last.v = b })
+    })
+    let _ = tr.frame(400.0, 600.0)
+    saved.v = Some(tr)
+  })
+  debug_assert(last.v, "secondary starts narrow")
+  tick.set(1)
+  debug_assert(last.v, "secondary must keep its own narrow policy when triggered from main window")
+  match saved.v { Some(tr) => tr.dispose(); None => () }
+  t.dispose()
+}
+
+test "p0-1a: review late measurement" {
+  let t = Tester::tree(fn(_root : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let seen = signals::ref_new(-2.0)
+  let measure_node : signals::Ref[Option[view::View]] = signals::ref_new(None)
+  let tr = view::Tree::new(fn(root : view::View) {
+    let v = root.box(fn(_b : view::View) { () }).measured(view::Live::By(fn() { tick.get() }), fn(k, _) {
+      seen.v = window_size_now().0
+      (35.0 + k.to_double(), 20.0 + k.to_double())
+    })
+    measure_node.v = Some(v)
+  })
+  let _ = tr.frame(400.0, 600.0)
+  debug_assert(seen.v == 400.0, "framed measurement offscreen")
+  tick.set(1)
+  seen.v = -1.0
+  match measure_node.v { Some(v) => { let _ = v.laid_size() }; None => () }
+  debug_assert(seen.v != -1.0, "pre-frame layout must measure")
+  debug_assert(seen.v == 400.0, "pre-frame measurement must run with owner tree room")
+  tr.dispose()
+  t.dispose()
+}
+
+test "p0-1a: review host aliases detach" {
+  let t = Tester::tree(fn(_root : view::View) { () })
+  let tick = signals::signal(0)
+  let last = signals::ref_new(-1)
+  let lastz = signals::ref_new(false)
+  let stop = signals::ref_new(fn() { () })
+  in_window(123, fn() {
+    t.fake.window_snap_state_val = 3
+    t.fake.window_zoomed_flag = true
+    stop.v = signals::effect(fn() {
+      let _ = tick.get()
+      last.v = window_snap_state()
+      lastz.v = window_zoomed()
+    })
+  })
+  debug_assert(last.v == 3 && lastz.v, "secondary aliases established")
+  t.fake.window_snap_state_val = 0
+  t.fake.window_zoomed_flag = false
+  tick.set(1)
+  debug_assert(last.v == 3 && lastz.v, "secondary effect must keep secondary host state")
+  (stop.v)()
+  t.dispose()
+}
+
+test "p0-1a: review nested tree scopes restore" {
+  let t = Tester::tree(fn(_root : view::View) { () }, width=1000.0)
+  let tr = view::Tree::new(fn(root : view::View) {
+    root.reacts(fn() { window_size_now().0 }, fn(w) {
+      if w == 400.0 {
+        let inside = view::Tree::new(fn(_r : view::View) {
+          debug_assert(window_size_now().0 == 0.0, "nested builder reads own unframed room")
+        })
+        let _ = inside.frame(200.0, 300.0)
+        debug_assert(window_size_now().0 == 400.0, "outer scope restored after nested frame")
+        inside.dispose()
+      }
+    })
+  })
+  let _ = tr.frame(400.0, 600.0)
+  debug_assert(view::current_tree_room().is_none() && window_size_now().0 == 1000.0, "ambient window restored")
+  tr.dispose()
+  t.dispose()
+}
+
+test "early window registration reads destination window width" {
+  let initial = signals::ref_new(-1.0)
+  window_kept_ref(initial, fn() { window_size_now().0 })
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  in_window(77, fn() {
+    debug_assert(window_size_now().0 == 0.0, "new window begins unframed")
+    debug_assert(initial.v == window_size_now().0, "early per-window initializer must see destination window width")
+  })
+  t.dispose()
+}
+
+test "late binding added outside tree build uses target tree room" {
+  let t = Tester::tree(fn(_r : view::View) { () }, width=1000.0)
+  let off = view::Tree::new(fn(_r : view::View) { () })
+  let _ = off.frame(400.0, 600.0)
+  let seen = signals::ref_new(-1.0)
+  off.root().reacts(fn() { window_size_now().0 }, fn(w) { seen.v = w })
+  debug_assert(seen.v == 400.0, "late binding got " + seen.v.to_string())
+  off.dispose()
+  t.dispose()
+}
+
+test "post-build dynamic box binding on offscreen tree reads offscreen room and narrow state" {
+  let t = Tester::tree(fn(_r : view::View) { () }, width=1000.0, height=600.0)
+  set_narrow_enabled(true)
+  t.frame()
+  let off = view::Tree::new(
+    fn(_r : view::View) { () },
+    measure=host_words_measure,
+    measure_runs=host_runs_measure,
+    measure_runs_least=host_runs_least_measure,
+  )
+  let _ = encode_tree_scene(off, 400.0, 600.0, 1.0, 10.0)
+  let seen_w = signals::ref_new(-1.0)
+  let seen_narrow = signals::ref_new(false)
+  let _ = off.root().box(fn(b : view::View) {
+    let _ = b.words(
+      view::Live::By(fn() {
+        seen_w.v = window_size_now().0
+        seen_narrow.v = tree_narrow()
+        if seen_narrow.v { "dyn-narrow" } else { "dyn-wide" }
+      }),
+      look=view::words_plain,
+    )
+  })
+  let _ = encode_tree_scene(off, 400.0, 600.0, 1.0, 26.0)
+  debug_assert(seen_w.v == 400.0, "post-build dynamic box must read offscreen width 400.0")
+  debug_assert(seen_narrow.v, "post-build dynamic box must see narrow=true at 400px")
+  off.dispose()
+  t.dispose()
+}
+
+test "secondary reacts callback reads owner narrow policy" {
+  let t = Tester::tree(fn(_r : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let seen = signals::ref_new(false)
+  let saved : signals::Ref[Option[view::Tree]] = signals::ref_new(None)
+  in_window(123, fn() {
+    set_narrow_enabled(true)
+    let off = view::Tree::new(fn(r : view::View) {
+      r.reacts(fn() { tick.get() }, fn(_) { seen.v = tree_narrow() })
+    })
+    let _ = off.frame(400.0, 600.0)
+    tick.set(1)
+    saved.v = Some(off)
+  })
+  debug_assert(seen.v, "positive control")
+  tick.set(2)
+  debug_assert(seen.v, "callback must keep secondary narrow policy")
+  match saved.v { Some(off) => off.dispose(); None => () }
+  t.dispose()
+}
+
+test "secondary effect cleanup runs in its owner window context" {
+  let t = Tester::tree(fn(_r : view::View) { () })
+  let stop = signals::ref_new(fn() { () })
+  let seen = signals::ref_new(-1)
+  in_window(123, fn() {
+    t.fake.window_snap_state_val = 3
+    host_settings_arrive()
+    stop.v = signals::effect_cleanup(fn() {
+      fn() { seen.v = window_snap_state() }
+    })
+  })
+  t.fake.window_snap_state_val = 0
+  (stop.v)()
+  debug_assert(seen.v == 3, "cleanup read snap " + seen.v.to_string())
+  t.dispose()
+}
+
+test "pre-start primary effect keeps primary window size when triggered in secondary window" {
+  let fake = FakeHost::new(width=1000.0, height=600.0, scale=1.0)
+  let previous = fake.install()
+  let seen = signals::ref_new(-1.0)
+  let tick = signals::signal(0)
+  let stop = signals::effect(fn() { let _ = tick.get(); seen.v = window_size_now().0 })
+  set_view_app(fn(_ : view::View) { () })
+  let _ = view_frame(1000.0, 600.0, 1.0, 0.0)
+  in_window(123, fn() { tick.set(1) })
+  debug_assert(seen.v == 1000.0, "pre-start effect read " + seen.v.to_string())
+  stop()
+  view_forget()
+  let _ = hostapi::set_host(previous)
+}
+
+test "nested computed created during detached secondary effect keeps detached window state" {
+  let t = Tester::tree(fn(_root : view::View) { () })
+  let tick = signals::signal(0)
+  let child : signals::Ref[Option[signals::Computed[Int]]] = signals::ref_new(None)
+  let stop = signals::ref_new(fn() { () })
+  in_window(23, fn() {
+    t.fake.window_snap_state_val = 3
+    host_settings_arrive()
+    stop.v = signals::effect(fn() {
+      if tick.get() > 0 {
+        child.v = Some(signals::computed(fn(_ : Option[Int]) { window_snap_state() }))
+      }
+    })
+  })
+  t.fake.window_snap_state_val = 0
+  tick.set(1)
+  match child.v {
+    Some(c) => {
+      let seen = c.get()
+      debug_assert(seen == 3, "nested computed read snap " + seen.to_string())
+      c.dispose()
+    }
+    None => panic("missing computed")
+  }
+  (stop.v)()
+  t.dispose()
+}
+
+test "explicit secondary window inside primary effect captures secondary window state" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let tick = signals::signal(0)
+  let probe : signals::Ref[Option[signals::Computed[Int]]] = signals::ref_new(None)
+  let stop = signals::effect(fn() {
+    if tick.get() == 1 {
+      in_window(23, fn() {
+        t.fake.window_snap_state_val = 3
+        debug_assert(window_snap_state() == 3, "secondary host setup")
+        probe.v = Some(signals::computed(fn(_ : Option[Int]) { window_snap_state() }))
+      })
+    }
+  })
+  tick.set(1)
+  t.fake.window_snap_state_val = 0
+  match probe.v {
+    Some(c) => {
+      let actual = c.get()
+      debug_assert(actual == 3, "computed created explicitly in secondary window read " + actual.to_string())
+      c.dispose()
+    }
+    None => panic("computed was not created")
+  }
+  stop()
+  t.dispose()
+}
+
+test "explicit return to main window inside secondary effect rerun reads main width" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let actual = signals::ref_new(-1.0)
+  let stop = signals::ref_new(fn() { () })
+  in_window(23, fn() {
+    stop.v = signals::effect(fn() {
+      if tick.get() == 1 {
+        in_window(0, fn() { actual.v = window_size_now().0 })
+      }
+    })
+  })
+  tick.set(1)
+  debug_assert(actual.v == 1000.0, "explicit primary read width " + actual.v.to_string())
+  (stop.v)()
+  t.dispose()
+}
+
+test "explicit return to main window from secondary tree effect clears tree room and reads main width" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let actual = signals::ref_new(-1.0)
+  let saved : signals::Ref[Option[view::Tree]] = signals::ref_new(None)
+  let stop = signals::ref_new(fn() { () })
+  in_window(23, fn() {
+    let tr = view::Tree::new(fn(_ : view::View) {
+      stop.v = signals::effect(fn() {
+        if tick.get() == 1 {
+          in_window(0, fn() { actual.v = window_size_now().0 })
+        }
+      })
+    })
+    let _ = tr.frame(400.0, 600.0)
+    saved.v = Some(tr)
+  })
+  tick.set(1)
+  debug_assert(actual.v == 1000.0, "secondary tree effect switching to main must read 1000.0")
+  (stop.v)()
+  match saved.v { Some(tr) => tr.dispose(); None => () }
+  t.dispose()
+}
+
+test "effect created inside explicit secondary window from primary effect is not detached" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let tick = signals::signal(0)
+  let sec_tick = signals::signal(0)
+  let sec_snap = signals::ref_new(-1)
+  let sec_stop = signals::ref_new(fn() { () })
+  let stop = signals::effect(fn() {
+    if tick.get() == 1 {
+      in_window(23, fn() {
+        t.fake.window_snap_state_val = 2
+        sec_stop.v = signals::effect(fn() {
+          let _ = sec_tick.get()
+          sec_snap.v = window_snap_state()
+        })
+      })
+    }
+  })
+  tick.set(1)
+  debug_assert(sec_snap.v == 2, "initial secondary effect read 2")
+  // Trigger inside window 23: must NOT be detached, so host update 4 is observed!
+  in_window(23, fn() {
+    t.fake.window_snap_state_val = 4
+    sec_tick.set(1)
+  })
+  debug_assert(sec_snap.v == 4, "active secondary effect inside window 23 must observe live host value 4")
+  (sec_stop.v)()
+  stop()
+  t.dispose()
+}
+
+test "scoped computed gives same width through untracked accessor" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let c : signals::Ref[Option[signals::Computed[Double]]] = signals::ref_new(None)
+  let off = view::Tree::new(fn(_ : view::View) {
+    c.v = Some(signals::computed_scoped(
+      fn(_ : Option[Double]) { window_size_now().0 },
+      Some(fn() { Some(window_size_now().0) }),
+    ))
+  })
+  let _ = off.frame(400.0, 600.0)
+  match c.v {
+    Some(held) => {
+      let tracked = signals::ref_new(-1.0)
+      let stop = signals::effect(fn() { tracked.v = held.get() })
+      debug_assert(tracked.v == 400.0, "tracked getter must see its tree")
+      let n = held.untracked()
+      debug_assert(n == 400.0, "untracked accessor got " + n.to_string())
+      stop()
+      held.dispose()
+    }
+    None => panic("missing computed")
+  }
+  off.dispose()
+  t.dispose()
+}
+
+test "fresh callback reads destination size when secondary window is opened from a tree" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let initialized = signals::ref_new(-1.0)
+  window_kept_ref(initialized, fn() { window_size_now().0 })
+  let trigger = signals::signal(0)
+  let off = view::Tree::new(fn(root : view::View) {
+    root.reacts(fn() { trigger.get() }, fn(i) {
+      if i == 1 {
+        in_window(23, fn() {
+          debug_assert(current_window_id() == 23 && window_size_now().0 == 0.0, "fresh window positive control")
+          debug_assert(initialized.v == 0.0, "destination fresh used outer room " + initialized.v.to_string())
+        })
+      }
+    })
+  })
+  let _ = off.frame(400.0, 600.0)
+  trigger.set(1)
+  off.dispose()
+  t.dispose()
+}
+
+test "replacing app from effect preserves later explicit main window entry" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let trigger = signals::signal(0)
+  let replace = signals::effect(fn() {
+    if trigger.get() == 1 { set_view_app(fn(_ : view::View) { () }) }
+  })
+  trigger.set(1)
+  t.frame()
+  let request = signals::signal(0)
+  let observed = signals::ref_new(-1.0)
+  let stop = signals::ref_new(fn() { () })
+  in_window(23, fn() {
+    stop.v = signals::effect(fn() {
+      if request.get() == 1 {
+        in_window(0, fn() { observed.v = window_size_now().0 })
+      }
+    })
+  })
+  request.set(1)
+  debug_assert(observed.v == 1000.0, "after app replacement explicit main entry saw " + observed.v.to_string())
+  (stop.v)()
+  replace()
+  t.dispose()
+}
+
+test "replacing app inside secondary in_window keeps primary and secondary switching consistent" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  in_window(23, fn() {
+    set_view_app(fn(_ : view::View) { () })
+  })
+  debug_assert(current_window_id() == 0, "after set_view_app inside secondary in_window, active window is 0")
+  t.frame()
+  debug_assert(window_size_now().0 == 1000.0, "primary window width is 1000 after frame")
+  let sec_w = signals::ref_new(-1.0)
+  in_window(23, fn() {
+    sec_w.v = window_size_now().0
+  })
+  debug_assert(sec_w.v == 0.0, "fresh secondary window width is 0 after reset")
+  debug_assert(window_size_now().0 == 1000.0, "primary window width remains 1000 after secondary exit")
+  t.dispose()
+}
+
+test "primary snapshot is taken and restored under primary room during detached cross-window switch" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let record = signals::ref_new(false)
+  let saved_w = signals::ref_new(-1.0)
+  let restored_w = signals::ref_new(-1.0)
+  window_kept(fn() {
+    if record.v && current_window_id() == 0 { saved_w.v = window_size_now().0 }
+    fn() {
+      if record.v && current_window_id() == 0 { restored_w.v = window_size_now().0 }
+    }
+  }, fn() { () })
+  let tick = signals::signal(0)
+  let tr : signals::Ref[Option[view::Tree]] = signals::ref_new(None)
+  in_window(23, fn() {
+    let tree = view::Tree::new(fn(root : view::View) {
+      root.reacts(fn() { tick.get() }, fn(i) {
+        if i == 1 { in_window(42, fn() { () }) }
+      })
+    })
+    let _ = tree.frame(400.0, 600.0)
+    tr.v = Some(tree)
+  })
+  record.v = true
+  tick.set(1)
+  record.v = false
+  debug_assert(
+    saved_w.v == 1000.0 && restored_w.v == 1000.0,
+    "primary take/restore widths " + saved_w.v.to_string() + "/" + restored_w.v.to_string(),
+  )
+  match tr.v { Some(tree) => tree.dispose(); None => () }
+  t.dispose()
+}
+
+test "old secondary subscriber stays isolated after replacing app from secondary window" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let seen = signals::ref_new(-1.0)
+  let stop = signals::ref_new(fn() { () })
+  in_window(23, fn() {
+    stop.v = signals::effect(fn() { seen.v = window_size_now().0 })
+    debug_assert(seen.v == 0.0, "old secondary initially unframed")
+    set_view_app(fn(_ : view::View) { () })
+  })
+  t.frame()
+  debug_assert(window_size_now().0 == 1000.0, "replacement main width")
+  debug_assert(seen.v == 0.0, "old secondary subscriber woke with replacement main width " + seen.v.to_string())
+  (stop.v)()
+  t.dispose()
+}
+
+test "old secondary subscriber stays isolated after replacing app from detached secondary effect" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let tick = signals::signal(0)
+  let seen = signals::ref_new(-1.0)
+  let stop_sub = signals::ref_new(fn() { () })
+  let stop_rep = signals::ref_new(fn() { () })
+  in_window(23, fn() {
+    stop_sub.v = signals::effect(fn() { seen.v = window_size_now().0 })
+    stop_rep.v = signals::effect(fn() {
+      if tick.get() == 1 { set_view_app(fn(_ : view::View) { () }) }
+    })
+  })
+  debug_assert(seen.v == 0.0, "old secondary initially unframed")
+  tick.set(1)
+  t.frame()
+  debug_assert(window_size_now().0 == 1000.0, "replacement main width is 1000")
+  debug_assert(seen.v == 0.0, "old secondary subscriber must not wake on replacement main frame")
+  (stop_sub.v)()
+  (stop_rep.v)()
+  t.dispose()
+}
+
+test "window_switch_guard_error blocks lifecycle re-entry during take, restore, and fresh" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let checked_take = signals::ref_new(false)
+  let checked_restore = signals::ref_new(false)
+  let checked_fresh = signals::ref_new(false)
+  let check_all_guarded = fn(phase : String) {
+    debug_assert(window_switch_guard_error("set_view_app").is_some(), phase + ": set_view_app must be guarded")
+    debug_assert(window_switch_guard_error("view_forget").is_some(), phase + ": view_forget must be guarded")
+    debug_assert(window_switch_guard_error("window_open_here").is_some(), phase + ": window_open_here must be guarded")
+    debug_assert(window_switch_guard_error("window_close_here").is_some(), phase + ": window_close_here must be guarded")
+    debug_assert(window_switch_guard_error("in_window").is_some(), phase + ": in_window must be guarded")
+    debug_assert(window_switch_guard_error("window_kept").is_some(), phase + ": window_kept must be guarded")
+  }
+  let check_all_clear = fn(phase : String) {
+    debug_assert(window_switch_guard_error("set_view_app").is_none(), phase + ": set_view_app must be clear")
+    debug_assert(window_switch_guard_error("view_forget").is_none(), phase + ": view_forget must be clear")
+    debug_assert(window_switch_guard_error("window_open_here").is_none(), phase + ": window_open_here must be clear")
+    debug_assert(window_switch_guard_error("window_close_here").is_none(), phase + ": window_close_here must be clear")
+    debug_assert(window_switch_guard_error("in_window").is_none(), phase + ": in_window must be clear")
+    debug_assert(window_switch_guard_error("window_kept").is_none(), phase + ": window_kept must be clear")
+  }
+  window_kept(
+    fn() {
+      checked_take.v = true
+      check_all_guarded("take")
+      fn() {
+        checked_restore.v = true
+        check_all_guarded("restore")
+      }
+    },
+    fn() {
+      checked_fresh.v = true
+      check_all_guarded("fresh")
+    },
+  )
+  check_all_clear("before switch")
+  in_window(23, fn() {
+    check_all_clear("inside body")
+  })
+  check_all_clear("after switch")
+  debug_assert(checked_take.v && checked_restore.v && checked_fresh.v, "all three slot phases ran")
+  t.dispose()
+}
+
+test "secondary app replacement resets primary narrow policy" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=800.0)
+  set_narrow_enabled(true)
+  set_narrow_below(900.0)
+  debug_assert(tree_narrow(), "old primary narrow positive control")
+  in_window(23, fn() { set_view_app(fn(_ : view::View) { () }) })
+  t.frame()
+  debug_assert(!tree_narrow(), "replacement primary retained old enabled flag")
+  set_narrow_enabled(true)
+  debug_assert(!tree_narrow(), "replacement primary retained old breakpoint")
+  t.dispose()
+}
+
+
+test "reset disposes multiple secondary trees with isolated multi-owner cleanups" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "fresh" })
+  let dropped = signals::ref_new(0)
+  let reads : Array[String] = []
+  set_window_tree(fn(_wid : Int, what : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "sec:" + what
+      let _ = root.owns(fn() {
+        dropped.v = dropped.v + 1
+        reads.push(draft.v)
+        draft.v = "cleanup1:" + what
+      })
+      let _ = root.owns(fn() {
+        dropped.v = dropped.v + 1
+        reads.push(draft.v)
+        draft.v = "cleanup2:" + what
+      })
+    }
+  })
+  let a = window_open_here("A")
+  let b = window_open_here("B")
+  guard a > 0 && b > 0 && a != b else { panic("two windows required") }
+  let first = match window_tree_of(a) { Some(tr) => tr; None => panic("missing secondary tree") }
+  let second = match window_tree_of(b) { Some(tr) => tr; None => panic("missing secondary tree") }
+  let next_draft = signals::ref_new("")
+  set_view_app(fn(_ : view::View) { next_draft.v = draft.v })
+  debug_assert(dropped.v == 4 && first.alive() == 0 && second.alive() == 0, "secondary releases: " + dropped.v.to_string())
+  debug_assert(next_draft.v == "primary" && reads.length() == 4, "primary draft preserved across multi-cleanup reset")
+  t.dispose()
+}
+
+test "reset size notification cannot reinstall superseded app" {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=800.0)
+  let armed = signals::ref_new(false)
+  let nested = signals::ref_new(false)
+  let superseded = signals::ref_new(false)
+  let stop = signals::effect(fn() {
+    let w = window_size_now().0
+    if armed.v && w == 0.0 {
+      armed.v = false
+      set_view_app(fn(_ : view::View) { nested.v = true })
+    }
+  })
+  debug_assert(window_size_now().0 == 800.0, "positive control width")
+  armed.v = true
+  set_view_app(fn(_ : view::View) { superseded.v = true })
+  debug_assert(nested.v, "nested app must be built by size observer")
+  debug_assert(!superseded.v, "old builder ran after nested app installation")
+  stop()
+  t.dispose()
+}
+
+fn check_policy_reset_reentry(width : Double) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  set_narrow_enabled(true)
+  set_narrow_below(900.0)
+  let armed = signals::ref_new(false)
+  let last = signals::ref_new(false)
+  let nested = signals::ref_new(false)
+  let superseded = signals::ref_new(false)
+  let stop = signals::ref_new(fn() { () })
+  let off = view::Tree::new(fn(_ : view::View) {
+    stop.v = signals::effect(fn() {
+      let narrow = tree_narrow()
+      last.v = narrow
+      if armed.v && !narrow {
+        armed.v = false
+        set_view_app(fn(_ : view::View) { nested.v = true })
+      }
+    })
+  })
+  let _ = off.frame(width, 600.0)
+  debug_assert(last.v, "positive control: standalone tree was narrow before replacement")
+  armed.v = true
+  set_view_app(fn(_ : view::View) { superseded.v = true })
+  debug_assert(nested.v, "policy change must synchronously install nested app")
+  debug_assert(!superseded.v, "policy observer installed nested app then superseded outer builder ran")
+  (stop.v)()
+  off.dispose()
+  t.dispose()
+}
+
+test "policy resetting breakpoint can install replacement app" { check_policy_reset_reentry(800.0) }
+test "policy resetting enabled flag can install replacement app" { check_policy_reset_reentry(400.0) }
+
+
+test "main builder replacement keeps inner tree and disposes outer" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let dropped = signals::ref_new(0)
+  let inner : signals::Ref[Option[view::View]] = signals::ref_new(None)
+  set_view_app(fn(root : view::View) {
+    let _ = root.owns(fn() { dropped.v = dropped.v + 1 })
+    set_view_app(fn(r : view::View) { inner.v = Some(r) })
+  })
+  debug_assert(dropped.v == 1, "superseded root not released exactly once")
+  match inner.v { Some(r) => debug_assert(r.alive(), "nested root was lost"); None => panic("missing inner") }
+  t.dispose()
+}
+
+test "theme notification keeps inner application" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let armed = signals::ref_new(true)
+  let inner = signals::ref_new(false)
+  let outer = signals::ref_new(false)
+  let stop = signals::effect(fn() {
+    if tree_theme().dark && armed.v {
+      armed.v = false
+      set_view_app(fn(_ : view::View) { inner.v = true })
+    }
+  })
+  set_view_app(fn(_ : view::View) { outer.v = true }, theme=fn() { Theme::dark() })
+  debug_assert(inner.v && !outer.v, "obsolete builder ran after theme replacement")
+  stop()
+  t.dispose()
+}
+
+fn check_host_reset_reentry(which : Int) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  set_system_bars(21.0, 0.0, 0.0, 0.0)
+  set_glass_light_angle(0.7)
+  let armed = signals::ref_new(true)
+  let nested = signals::ref_new(false)
+  let outer = signals::ref_new(false)
+  let stop = signals::effect(fn() {
+    let triggered = if which == 0 { system_bars().top == 0.0 } else if which == 1 { glass_light_angle() == 0.0 } else { window_zoomed() }
+    if armed.v && triggered {
+      armed.v = false
+      set_view_app(fn(_ : view::View) { nested.v = true })
+    }
+  })
+  debug_assert(!nested.v, "baseline did not hold")
+  if which == 2 { t.fake.window_zoomed_flag = true }
+  set_view_app(fn(_ : view::View) { outer.v = true })
+  debug_assert(nested.v, "reset subscriber did not install inner app")
+  debug_assert(!outer.v, "superseded builder ran after reset observer installed inner app")
+  stop()
+  t.dispose()
+}
+
+test "system bars reset observer owns application" { check_host_reset_reentry(0) }
+test "light angle reset observer owns application" { check_host_reset_reentry(1) }
+
+test "secondary builder app replacement never publishes stale tree" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let built = signals::ref_new(false)
+  let dropped = signals::ref_new(0)
+  let opened = signals::ref_new(0)
+  set_window_tree(fn(wid : Int, _name : String) -> (view::View) -> Unit {
+    opened.v = wid
+    fn(root : view::View) {
+      let _ = root.owns(fn() { dropped.v = dropped.v + 1 })
+      set_view_app(fn(_ : view::View) { built.v = true })
+    }
+  })
+  let ret = window_open_here("old secondary")
+  debug_assert(ret == 0, "superseded window_open_here must return 0")
+  debug_assert(opened.v > 0 && built.v && window_shows(opened.v).is_none(), "new app active and old window listing cleared")
+  debug_assert(window_tree_of(opened.v).is_none() && dropped.v == 1, "old window present in tree registry: " + window_tree_of(opened.v).is_some().to_string() + ", cleanup count: " + dropped.v.to_string())
+  t.dispose()
+}
+
+test "window zoom notification during host reset owns application" { check_host_reset_reentry(2) }
+
+
+fn verify_window_open_cancellation(phase : Int) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let allocated = signals::ref_new(0)
+  let built = signals::ref_new(false)
+  let dropped = signals::ref_new(0)
+  let replaced = signals::ref_new(false)
+  let replace = fn() { set_view_app(fn(_ : view::View) { replaced.v = true }) }
+  set_window_tree(fn(wid : Int, _ : String) -> (view::View) -> Unit {
+    allocated.v = wid
+    if phase == 0 { replace() }
+    fn(root : view::View) {
+      built.v = true
+      let _ = root.owns(fn() { dropped.v = dropped.v + 1 })
+      if phase >= 2 { window_close_here(wid) }
+      if phase != 2 { replace() }
+    }
+  })
+  let ret = window_open_here("withdrawn")
+  let wid = allocated.v
+  debug_assert(wid > 0, "host allocated window")
+  debug_assert(built.v == (phase != 0) && replaced.v == (phase != 2), "expected callbacks")
+  let mut closes = 0
+  for line in t.fake.lifecycle_log {
+    if line == "window_close_id:" + wid.to_string() { closes = closes + 1 }
+  }
+  let published = window_tree_of(wid).is_some()
+  debug_assert(ret == 0 && !published && window_shows(wid).is_none() && closes == 1 && dropped.v == (if built.v { 1 } else { 0 }),
+    "return=" + ret.to_string() + " published=" + published.to_string() + " host closes=" + closes.to_string() + " disposed=" + dropped.v.to_string())
+  t.dispose()
+}
+
+test "replacement inside secondary factory cancels before construction" { verify_window_open_cancellation(0) }
+test "replacement inside secondary builder closes allocated host once" { verify_window_open_cancellation(1) }
+test "secondary builder explicitly withdraws its own window" { verify_window_open_cancellation(2) }
+test "secondary builder explicitly closes then replaces app" { verify_window_open_cancellation(3) }
+
+test "superseded host allocation leaves no listing or factory calls" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let factory_calls = signals::ref_new(0)
+  let allocated = signals::ref_new(0)
+  let inner = signals::ref_new(false)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    factory_calls.v = factory_calls.v + 1
+    fn(_ : view::View) { () }
+  })
+  let h = hostapi::host()
+  let allocate = h.window_open_id
+  h.window_open_id = fn(name : String) -> Int {
+    let id = allocate(name)
+    allocated.v = id
+    set_view_app(fn(_ : view::View) { inner.v = true })
+    id
+  }
+  let ret = window_open_here("cancelled at host")
+  h.window_open_id = allocate
+  let wid = allocated.v
+  let listed = window_shows(wid).is_some()
+  let mut closes = 0
+  for line in t.fake.lifecycle_log {
+    if line == "window_close_id:" + wid.to_string() { closes = closes + 1 }
+  }
+  debug_assert(wid > 0 && inner.v, "replacement during allocation must complete")
+  debug_assert(ret == 0 && !listed && closes == 1 && factory_calls.v == 0,
+    "return=" + ret.to_string() + " listed=" + listed.to_string() + " host closes=" + closes.to_string() + " factory calls=" + factory_calls.v.to_string())
+  t.dispose()
+}
+
+
+fn check_reopen_during_open(reuse : Bool, check_value~ : Bool = false) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let h = hostapi::host()
+  let allocate = h.window_open_id
+  let close = h.window_close_id
+  let free_id = signals::ref_new(0)
+  if reuse {
+    h.window_close_id = fn(w : Int) { close(w); free_id.v = w }
+    h.window_open_id = fn(name : String) {
+      if free_id.v > 0 { let w = free_id.v; free_id.v = 0; w } else { allocate(name) }
+    }
+  }
+  let local = signals::ref_new(42)
+  window_kept_ref(local, fn() { -1 })
+  let inner_value = signals::ref_new(-2)
+  let replacement = signals::ref_new(0)
+  let old_id = signals::ref_new(0)
+  let releases = signals::ref_new(0)
+  set_window_tree(fn(wid : Int, what : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      if what == "old" {
+        debug_assert(local.v == -1, "old window received a fresh slot")
+        local.v = 23
+        old_id.v = wid
+        let _ = root.owns(fn() { releases.v = releases.v + 1 })
+        window_close_here(wid)
+        replacement.v = window_open_here("new")
+      } else { inner_value.v = local.v }
+    }
+  })
+  let result = window_open_here("old")
+  let w = replacement.v
+  debug_assert(result == 0 && w > 0 && (w == old_id.v) == reuse && releases.v == 1, "open and ownership controls")
+  debug_assert(window_tree_of(w).is_some(), "replacement has a tree")
+  let listed = match window_shows(w) { Some(tag) => tag == "new"; None => false }
+  if check_value { debug_assert(inner_value.v == -1, "new window inherited old window value " + inner_value.v.to_string()) }
+  debug_assert(listed, "a successful replacement has a tree but lost its listing")
+  window_close_here(w)
+  h.window_open_id = allocate
+  h.window_close_id = close
+  t.dispose()
+}
+
+test "distinct ids preserve nested secondary replacement" { check_reopen_during_open(false) }
+test "reused id preserves nested secondary replacement" { check_reopen_during_open(true) }
+
+test "cancelled builder releases native handle once" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let allocated = signals::ref_new(0)
+  let releases = signals::ref_new(0)
+  set_window_tree(fn(wid : Int, _name : String) -> (view::View) -> Unit {
+    allocated.v = wid
+    fn(root : view::View) {
+      let _ = root.owns(fn() { releases.v = releases.v + 1 })
+      set_view_app(fn(_ : view::View) { () })
+    }
+  })
+  let result = window_open_here("cancelled")
+  let w = allocated.v
+  let mut closes = 0
+  for entry in t.fake.lifecycle_log {
+    if entry == "window_close_id:" + w.to_string() { closes = closes + 1 }
+  }
+  debug_assert(w > 0 && result == 0 && releases.v == 1 && window_tree_of(w).is_none(), "cancelled builder was released")
+  debug_assert(closes == 1, "native closes=" + closes.to_string())
+  t.dispose()
+}
+
+test "immediate slot reuse gets fresh per-window value" { check_reopen_during_open(true, check_value=true) }
+test "distinct slot gets fresh per-window value" { check_reopen_during_open(false, check_value=true) }
+
+
+fn setup_recycled_window_host(_t : Tester) -> () -> Unit {
+  let h = hostapi::host()
+  let allocate = h.window_open_id
+  let close = h.window_close_id
+  let free = signals::ref_new(0)
+  h.window_close_id = fn(w : Int) { close(w); free.v = w }
+  h.window_open_id = fn(name : String) {
+    if free.v == 0 { allocate(name) } else {
+      let w = free.v
+      free.v = 0
+      w
+    }
+  }
+  fn() { h.window_open_id = allocate; h.window_close_id = close }
+}
+
+test "old effect cannot poll replacement host at same numeric id" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let reset_host = setup_recycled_window_host(t)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit { fn(_ : view::View) { () } })
+  let a = window_open_here("old")
+  let tick = signals::signal(0)
+  let observed = signals::ref_new(false)
+  let stop = signals::ref_new(fn() { () })
+  in_window(a, fn() {
+    t.fake.window_zoomed_flag = true
+    stop.v = signals::effect(fn() { let _ = tick.get(); observed.v = window_zoomed() })
+  })
+  debug_assert(a > 0 && observed.v, "old owner was zoomed")
+  window_close_here(a)
+  let b = window_open_here("new")
+  debug_assert(a == b && window_tree_of(b).is_some(), "host reused id after prior close returned")
+  in_window(b, fn() {
+    t.fake.window_zoomed_flag = false
+    debug_assert(!window_zoomed(), "new host is not zoomed")
+    tick.set(1)
+  })
+  debug_assert(observed.v, "old effect observed new instance's native zoom")
+  (stop.v)()
+  window_close_here(b)
+  reset_host()
+  t.dispose()
+}
+
+test "disposing withdrawn secondary root preserves recycled successor" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let reset_host = setup_recycled_window_host(t)
+  let new_id = signals::ref_new(0)
+  let releases = signals::ref_new(0)
+  set_window_tree(fn(w : Int, name : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      if name == "old" {
+        let _ = root.owns(fn() { () })
+        window_close_here(w)
+        new_id.v = window_open_here("new")
+      } else {
+        let _ = root.owns(fn() { releases.v = releases.v + 1 })
+      }
+    }
+  })
+  let ret = window_open_here("old")
+  let b = new_id.v
+  debug_assert(ret == 0 && b > 0, "old cancelled, successor opened")
+  debug_assert(window_tree_of(b).is_some() && window_shows(b).is_some() && releases.v == 0,
+    "successor's registered tree=" + window_tree_of(b).is_some().to_string() + ", successor releases=" + releases.v.to_string())
+  window_close_here(b)
+  reset_host()
+  t.dispose()
+}
+
+fn check_fresh_room_for_instance(reuse : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let reset_host = if reuse { setup_recycled_window_host(t) } else { fn() { () } }
+  let captured = signals::ref_new(-1.0)
+  window_kept_ref(captured, fn() { window_size_now().0 })
+  let seen = signals::ref_new(-1.0)
+  let replacement = signals::ref_new(0)
+  set_window_tree(fn(w : Int, name : String) -> (view::View) -> Unit {
+    fn(_root : view::View) {
+      if name == "old" {
+        let off = view::Tree::new(fn(root : view::View) {
+          root.reacts(fn() { window_size_now().0 }, fn(width) {
+            if width == 400.0 {
+              window_close_here(w)
+              replacement.v = window_open_here("new")
+            }
+          })
+        })
+        let _ = off.frame(400.0, 600.0)
+        off.dispose()
+      } else { seen.v = captured.v }
+    }
+  })
+  let result = window_open_here("old")
+  debug_assert(result == 0 && replacement.v > 0 && window_tree_of(replacement.v).is_some(), "new instance was published")
+  debug_assert(seen.v == 0.0, "new window initializer captured old tree width " + seen.v.to_string())
+  window_close_here(replacement.v)
+  reset_host()
+  t.dispose()
+}
+
+test "fresh callback for reused instance sees new room" { check_fresh_room_for_instance(true) }
+test "fresh callback for distinct instance sees new room" { check_fresh_room_for_instance(false) }
+
+
+fn setup_recycled_close_host() -> () -> Unit {
+  let h = hostapi::host()
+  let open = h.window_open_id
+  let close = h.window_close_id
+  let freed = signals::ref_new(0)
+  h.window_close_id = fn(w : Int) { close(w); freed.v = w }
+  h.window_open_id = fn(name : String) {
+    if freed.v == 0 { open(name) } else { let w = freed.v; freed.v = 0; w }
+  }
+  fn() { h.window_open_id = open; h.window_close_id = close }
+}
+
+test "close listener replacement survives outer close" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let undo = setup_recycled_close_host()
+  let closed = signals::ref_new(0)
+  let successor = signals::ref_new(0)
+  set_window_tree(fn(_w : Int, _name : String) -> (view::View) -> Unit {
+    fn(_root : view::View) { () }
+  })
+  let a = window_open_here("old")
+  debug_assert(a > 0 && window_tree_of(a).is_some(), "old open completed")
+  when_window_closed(fn(w : Int) {
+    if w == a {
+      closed.v = closed.v + 1
+      if closed.v == 1 { successor.v = window_open_here("new") }
+    }
+  })
+  window_close_here(a)
+  let mut calls = 0
+  for line in t.fake.lifecycle_log {
+    if line == "window_close_id:" + a.to_string() { calls = calls + 1 }
+  }
+  let listed = match window_shows(a) { Some(name) => name == "new"; None => false }
+  debug_assert(successor.v == a && window_tree_of(a).is_some(), "new instance opened in close callback")
+  debug_assert(listed, "outer close erased successor listing, native close calls=" + calls.to_string())
+  debug_assert(calls == 1 && closed.v == 1, "native closes=" + calls.to_string() + ", close notifications=" + closed.v.to_string())
+  undo()
+  t.dispose()
+}
+
+test "stale owner outside disposal preserves successor" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let undo = setup_recycled_close_host()
+  let tick = signals::signal(false)
+  let attempts = signals::ref_new(0)
+  let stop = signals::ref_new(fn() { () })
+  set_window_tree(fn(_w : Int, _name : String) -> (view::View) -> Unit {
+    fn(_root : view::View) { () }
+  })
+  let a = window_open_here("old")
+  in_window(a, fn() {
+    stop.v = signals::effect(fn() {
+      if tick.get() { attempts.v = attempts.v + 1; window_close_here(a) }
+    })
+  })
+  window_close_here(a)
+  let b = window_open_here("new")
+  debug_assert(a > 0 && b == a, "new instance reused id")
+  tick.set(true)
+  debug_assert(attempts.v == 1, "one stale owner attempted close")
+  debug_assert(window_tree_of(b).is_some() && window_shows(b).is_some(), "stale effect closed the successor")
+  (stop.v)()
+  undo()
+  t.dispose()
+}
+
+
+test "close from inside secondary window disposes with kept state without running fresh" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft : signals::Ref[String] = signals::ref_new("main")
+  let fresh_runs : signals::Ref[Int] = signals::ref_new(0)
+  window_kept_ref(draft, fn() { fresh_runs.v = fresh_runs.v + 1; "" })
+  let seen : signals::Ref[String] = signals::ref_new("<none>")
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "typed in secondary"
+      let _ = root.owns(fn() { seen.v = draft.v })
+    }
+  })
+  let wid = window_open_here("W")
+  guard wid > 0 else { panic("window required") }
+  let fresh_before = fresh_runs.v
+  in_window(wid, fn() { window_close_here(wid) })
+  debug_assert(seen.v == "typed in secondary", "dispose saw draft '\{seen.v}'")
+  debug_assert(fresh_runs.v == fresh_before, "closing must not run fresh() again (ran \{fresh_runs.v - fresh_before} more)")
+  debug_assert(draft.v == "main", "main window draft restored, got '\{draft.v}'")
+  t.dispose()
+}
+
+test "close from main window disposes secondary with its kept state" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft : signals::Ref[String] = signals::ref_new("main")
+  window_kept_ref(draft, fn() { "" })
+  let seen : signals::Ref[String] = signals::ref_new("<none>")
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "typed in secondary"
+      let _ = root.owns(fn() { seen.v = draft.v })
+    }
+  })
+  let wid = window_open_here("W")
+  guard wid > 0 else { panic("window required") }
+  window_close_here(wid)
+  debug_assert(seen.v == "typed in secondary", "dispose saw draft '\{seen.v}'")
+  debug_assert(draft.v == "main", "main window draft restored, got '\{draft.v}'")
+  t.dispose()
+}
+
+fn check_close_owner_context(from_inside : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let value = signals::ref_new(5)
+  window_kept_ref(value, fn() { -1 })
+  let cleanup = signals::ref_new(-2)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      value.v = 23
+      let _ = root.owns(fn() { cleanup.v = value.v })
+    }
+  })
+  let w = window_open_here("test")
+  debug_assert(w > 0 && value.v == 5, "primary restored after open")
+  if from_inside {
+    in_window(w, fn() {
+      debug_assert(value.v == 23, "active window has its state")
+      window_close_here(w)
+    })
+  } else { window_close_here(w) }
+  debug_assert(cleanup.v == 23, "teardown read " + cleanup.v.to_string() + " instead of owner value 23")
+  t.dispose()
+}
+
+test "close from primary restores secondary state for cleanup" { check_close_owner_context(false) }
+test "close from secondary preserves secondary state for cleanup" { check_close_owner_context(true) }
+
+fn check_normal_close_isolation(check_read : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "empty" })
+  let observed = signals::ref_new("")
+  let owner = signals::ref_new(-1)
+  let drops = signals::ref_new(0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "secondary"
+      let _ = root.owns(fn() {
+        drops.v = drops.v + 1
+        owner.v = current_window_id()
+        observed.v = draft.v
+        draft.v = "cleared by old root"
+      })
+    }
+  })
+  let w = window_open_here("test")
+  debug_assert(w > 0 && draft.v == "primary", "secondary was initialized and primary restored")
+  window_close_here(w)
+  debug_assert(drops.v == 1 && window_tree_of(w).is_none(), "disposal control")
+  if check_read {
+    debug_assert(observed.v == "secondary" && owner.v == w, "cleanup read=" + observed.v + ", window=" + owner.v.to_string())
+  } else {
+    debug_assert(draft.v == "primary", "main draft after cleanup=" + draft.v)
+  }
+  t.dispose()
+}
+
+test "normal close reads secondary state during cleanup" { check_normal_close_isolation(true) }
+test "normal close keeps primary writes isolated from cleanup" { check_normal_close_isolation(false) }
+
+test "reset secondary teardown reads its cached host state" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let installed = signals::ref_new(false)
+  let seen = signals::ref_new(-1)
+  let zoomed = signals::ref_new(false)
+  let drops = signals::ref_new(0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      t.fake.window_snap_state_val = 3
+      t.fake.window_zoomed_flag = true
+      debug_assert(window_snap_state() == 3 && window_zoomed(), "old window has cached native values")
+      let _ = root.owns(fn() {
+        seen.v = window_snap_state()
+        zoomed.v = window_zoomed()
+        drops.v = drops.v + 1
+      })
+    }
+  })
+  let w = window_open_here("old")
+  t.fake.window_snap_state_val = 0
+  t.fake.window_zoomed_flag = false
+  debug_assert(w > 0 && window_snap_state() == 0 && !window_zoomed(), "main native state is different")
+  set_view_app(fn(_ : view::View) { installed.v = true })
+  debug_assert(installed.v && drops.v == 1, "reset released old secondary tree")
+  debug_assert(seen.v == 3 && zoomed.v, "old teardown observed snap=" + seen.v.to_string() + " zoomed=" + zoomed.v.to_string())
+  t.dispose()
+}
+
+
+test "detached secondary effect stays detached after calling in_window(0)" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit { fn(_ : view::View) { () } })
+  let w = window_open_here("sec")
+  let tick = signals::signal(0)
+  let before_snap = signals::ref_new(-1)
+  let before_zoomed = signals::ref_new(false)
+  let inner_snap = signals::ref_new(-1)
+  let inner_zoomed = signals::ref_new(true)
+  let after_snap = signals::ref_new(-1)
+  let after_zoomed = signals::ref_new(false)
+  let stop = signals::ref_new(fn() { () })
+  in_window(w, fn() {
+    t.fake.window_snap_state_val = 2
+    t.fake.window_zoomed_flag = true
+    debug_assert(window_snap_state() == 2 && window_zoomed(), "secondary cached native values")
+    stop.v = signals::effect(fn() {
+      if tick.get() > 0 {
+        before_snap.v = window_snap_state()
+        before_zoomed.v = window_zoomed()
+        in_window(0, fn() {
+          inner_snap.v = window_snap_state()
+          inner_zoomed.v = window_zoomed()
+        })
+        after_snap.v = window_snap_state()
+        after_zoomed.v = window_zoomed()
+      }
+    })
+  })
+  t.fake.window_snap_state_val = 0
+  t.fake.window_zoomed_flag = false
+  debug_assert(window_snap_state() == 0 && !window_zoomed(), "main window native values")
+  tick.set(1)
+  debug_assert(before_snap.v == 2 && before_zoomed.v, "detached effect before in_window(0)")
+  debug_assert(inner_snap.v == 0 && !inner_zoomed.v, "in_window(0) reads native main window")
+  debug_assert(after_snap.v == 2 && after_zoomed.v, "detached effect after in_window(0) must still read cached secondary values")
+  (stop.v)()
+  window_close_here(w)
+  t.dispose()
+}
+
+
+fn check_teardown_nested_in_window(which : Int) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let cleanup = signals::ref_new(false)
+  let phase_snap = signals::ref_new(-1)
+  let back_snap = signals::ref_new(-1)
+  let self_snap = signals::ref_new(-1)
+  let main_snap = signals::ref_new(-1)
+  let count = signals::ref_new(0)
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "new window" })
+  window_kept(fn() {
+    let old = current_window_id()
+    if cleanup.v && old != 0 {
+      phase_snap.v = window_snap_state()
+    }
+    fn() {
+      if cleanup.v && old != 0 { back_snap.v = window_snap_state() }
+    }
+  }, fn() { () })
+  set_window_tree(fn(wid : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      t.fake.window_snap_state_val = 3
+      debug_assert(window_snap_state() == 3, "cache old host")
+      let _ = root.owns(fn() {
+        count.v = count.v + 1
+        cleanup.v = true
+        debug_assert(window_snap_state() == 3, "old root starts detached")
+        if which == 2 {
+          in_window(wid, fn() { self_snap.v = window_snap_state() })
+        } else {
+          in_window(0, fn() {
+            main_snap.v = window_snap_state()
+            draft.v = "written to main"
+          })
+        }
+        cleanup.v = false
+      })
+    }
+  })
+  let w = window_open_here("secondary")
+  t.fake.window_snap_state_val = 0
+  debug_assert(w > 0 && window_snap_state() == 0, "main host active")
+  set_view_app(fn(_ : view::View) { () })
+  debug_assert(count.v == 1, "old tree released once")
+  if which != 2 { debug_assert(main_snap.v == 0, "explicit main reads main host") }
+  if which == 0 { debug_assert(phase_snap.v == 3 && back_snap.v == 3, "old take/restore observed " + phase_snap.v.to_string() + "/" + back_snap.v.to_string()) }
+  if which == 1 { debug_assert(draft.v == "written to main", "main write after teardown: " + draft.v) }
+  if which == 2 { debug_assert(self_snap.v == 3, "same window read " + self_snap.v.to_string()) }
+  t.dispose()
+}
+
+test "detached source take and restore use cached host during teardown" { check_teardown_nested_in_window(0) }
+test "explicit main write survives old root teardown" { check_teardown_nested_in_window(1) }
+test "explicit current window inside old cleanup preserves cached host" { check_teardown_nested_in_window(2) }
+
+
+fn check_reset_preserves_owners(replace : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "fresh" })
+  let who = signals::ref_new(-1)
+  let read = signals::ref_new("")
+  let drops = signals::ref_new(0)
+  let next = signals::ref_new("")
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "secondary"
+      let _ = root.owns(fn() {
+        drops.v = drops.v + 1
+        who.v = current_window_id()
+        read.v = draft.v
+        draft.v = "cleared by secondary"
+      })
+    }
+  })
+  let w = window_open_here("secondary")
+  debug_assert(w > 0 && draft.v == "primary", "main owns its original draft")
+  if !replace { window_close_here(w) }
+  set_view_app(fn(_ : view::View) { next.v = draft.v })
+  debug_assert(drops.v == 1, "secondary cleanup ran once")
+  debug_assert(who.v == w && read.v == "secondary" && next.v == "primary",
+    "cleanup window=" + who.v.to_string() + " read=" + read.v + " replacement read=" + next.v)
+  t.dispose()
+}
+
+test "explicit close preserves both primary and secondary owners" { check_reset_preserves_owners(false) }
+test "app reset preserves both primary and secondary owners" { check_reset_preserves_owners(true) }
+
+fn check_disposing_instance_roundtrip(via_main : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "fresh" })
+  let seen = signals::ref_new("")
+  let snap = signals::ref_new(-1)
+  let released = signals::ref_new(0)
+  set_window_tree(fn(wid : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "secondary"
+      t.fake.window_snap_state_val = 3
+      debug_assert(window_snap_state() == 3, "cached old native state")
+      let _ = root.owns(fn() {
+        released.v = released.v + 1
+        let capture = fn() { in_window(wid, fn() {
+          seen.v = draft.v
+          snap.v = window_snap_state()
+        }) }
+        if via_main { in_window(0, capture) } else { capture() }
+      })
+    }
+  })
+  let w = window_open_here("secondary")
+  debug_assert(w > 0, "secondary opened")
+  t.fake.window_snap_state_val = 0
+  set_view_app(fn(_ : view::View) { () })
+  debug_assert(released.v == 1, "one cleanup")
+  debug_assert(seen.v == "secondary" && snap.v == 3, "old window draft=" + seen.v + " snap=" + snap.v.to_string())
+  t.dispose()
+}
+
+test "direct reentry into disposing instance preserves cached state" { check_disposing_instance_roundtrip(false) }
+test "reentry into disposing instance from explicit main preserves cached state" { check_disposing_instance_roundtrip(true) }
+
+
+fn check_primary_and_secondary_disposal(from_secondary : Bool) -> Unit {
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "fresh" })
+  let who = signals::ref_new(-1)
+  let observed = signals::ref_new("")
+  let secondary = signals::ref_new("")
+  let next = signals::ref_new("")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.owns(fn() {
+      who.v = current_window_id()
+      observed.v = draft.v
+      draft.v = "primary cleanup"
+    })
+  })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      draft.v = "secondary"
+      let _ = root.owns(fn() { secondary.v = draft.v })
+    }
+  })
+  let w = window_open_here("secondary")
+  debug_assert(w > 0 && draft.v == "primary", "initial primary")
+  let replace = fn() { set_view_app(fn(_ : view::View) { next.v = draft.v }) }
+  if from_secondary { in_window(w, replace) } else { replace() }
+  debug_assert(who.v == 0 && observed.v == "primary" && secondary.v == "secondary" && next.v == "primary cleanup",
+    "primary cleanup owner=" + who.v.to_string() + " value=" + observed.v + " secondary=" + secondary.v + " next=" + next.v)
+  t.dispose()
+}
+
+test "main initiates main and secondary disposal in own contexts" { check_primary_and_secondary_disposal(false) }
+test "secondary initiates main and secondary disposal in own contexts" { check_primary_and_secondary_disposal(true) }
+
+fn check_overlay_reset_main_signal(via_effect : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let width = signals::ref_new(-1.0)
+  let tick = signals::signal(0)
+  let replace = fn() { set_view_app(fn(_ : view::View) { () }) }
+  let stop = signals::ref_new(fn() { () })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.owns(fn() { in_window(0, fn() { width.v = window_size_now().0 }) })
+    }
+  })
+  let w = window_open_here("secondary")
+  in_window(w, fn() {
+    stop.v = signals::effect(fn() { if tick.get() > 0 { replace() } })
+  })
+  debug_assert(window_size_now().0 == 1000.0, "main width before reset")
+  if via_effect { tick.set(1) } else { replace() }
+  debug_assert(width.v == 1000.0, "explicit main width during reset=" + width.v.to_string())
+  (stop.v)()
+  t.dispose()
+}
+
+test "reset from main provides real main signal in cleanup" { check_overlay_reset_main_signal(false) }
+test "reset from detached effect provides real main signal in cleanup" { check_overlay_reset_main_signal(true) }
+
+test "cancelled secondary builder cleanup preserves new main" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "fresh" })
+  let who = signals::ref_new(-1)
+  let seen = signals::ref_new("")
+  let owner = signals::ref_new(-1)
+  set_window_tree(fn(wid : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      owner.v = wid
+      draft.v = "secondary"
+      let _ = root.owns(fn() {
+        who.v = current_window_id()
+        seen.v = draft.v
+        draft.v = "secondary cleanup"
+      })
+      set_view_app(fn(_ : view::View) { draft.v = "replacement" })
+    }
+  })
+  let w = window_open_here("cancelled")
+  debug_assert(w == 0 && owner.v > 0, "open cancelled")
+  debug_assert(who.v == owner.v && seen.v == "secondary" && draft.v == "replacement",
+    "cancelled builder cleanup owner=" + who.v.to_string() + " read=" + seen.v + " main=" + draft.v)
+  t.dispose()
+}
+
+
+test "uninterrupted main restore preserves primary cleanup write" {
+  let draft = signals::ref_new("old main")
+  window_kept_ref(draft, fn() { "secondary" })
+  let outer = signals::ref_new(0)
+  let count = signals::ref_new(0)
+  let seen = signals::ref_new("")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.owns(fn() {
+      count.v = count.v + 1
+      seen.v = draft.v
+      draft.v = "old cleanup"
+    })
+  })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(_ : view::View) { () }
+  })
+  let w = window_open_here("secondary")
+  in_window(w, fn() {
+    set_view_app(fn(_ : view::View) { outer.v = outer.v + 1 })
+  })
+  debug_assert(count.v == 1, "old main released once")
+  debug_assert(outer.v == 1 && seen.v == "old main" && draft.v == "old cleanup", "normal release")
+  t.dispose()
+}
+
+fn check_active_secondary_disposal_width(from_main_effect : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  let seen = signals::ref_new(-1.0)
+  let owner = signals::ref_new(-1)
+  let count = signals::ref_new(0)
+  let trigger = signals::signal(0)
+  let replace = fn() { set_view_app(fn(_ : view::View) { () }) }
+  let stop = signals::effect(fn() { if trigger.get() > 0 { replace() } })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.owns(fn() {
+        count.v = count.v + 1
+        seen.v = window_size_now().0
+        owner.v = current_window_id()
+      })
+    }
+  })
+  let w = window_open_here("secondary")
+  let _ = window_frame(w, 400.0, 600.0, 1.0, 10.0)
+  in_window(w, fn() {
+    debug_assert(window_size_now().0 == 400.0, "secondary starts at 400")
+    if from_main_effect { trigger.set(1) } else { replace() }
+  })
+  debug_assert(count.v == 1 && owner.v == w, "cleanup reached the correct window")
+  debug_assert(seen.v == 400.0, "secondary cleanup width=" + seen.v.to_string())
+  stop()
+  t.dispose()
+}
+
+test "active secondary disposes with own width" { check_active_secondary_disposal_width(false) }
+test "active secondary disposes with own width under main effect" { check_active_secondary_disposal_width(true) }
+
+
+test "window_lifecycle_guard_error blocks lifecycle mutations during primary, close, and reset teardowns" {
+  let check_guarded = fn(phase : String) {
+    debug_assert(window_lifecycle_guard_error("set_view_app").is_some(), phase + ": set_view_app must be guarded")
+    debug_assert(window_lifecycle_guard_error("view_forget").is_some(), phase + ": view_forget must be guarded")
+    debug_assert(window_lifecycle_guard_error("window_open_here").is_some(), phase + ": window_open_here must be guarded")
+    debug_assert(window_lifecycle_guard_error("window_close_here").is_some(), phase + ": window_close_here must be guarded")
+    debug_assert(window_switch_guard_error("in_window").is_none(), phase + ": in_window must remain allowed during teardown")
+  }
+  let check_clear = fn(phase : String) {
+    debug_assert(window_lifecycle_guard_error("set_view_app").is_none(), phase + ": set_view_app must be clear")
+    debug_assert(window_lifecycle_guard_error("view_forget").is_none(), phase + ": view_forget must be clear")
+    debug_assert(window_lifecycle_guard_error("window_open_here").is_none(), phase + ": window_open_here must be clear")
+    debug_assert(window_lifecycle_guard_error("window_close_here").is_none(), phase + ": window_close_here must be clear")
+  }
+  let primary_checked = signals::ref_new(false)
+  let close_checked = signals::ref_new(false)
+  let reset_checked = signals::ref_new(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.owns(fn() {
+      check_guarded("primary teardown")
+      primary_checked.v = true
+    })
+  })
+  set_window_tree(fn(_ : Int, what : String) -> (view::View) -> Unit {
+    fn(root : view::View) {
+      let _ = root.owns(fn() {
+        check_guarded("secondary " + what)
+        if what == "close" {
+          close_checked.v = true
+        } else {
+          reset_checked.v = true
+        }
+      })
+    }
+  })
+  check_clear("initial")
+  let w_close = window_open_here("close")
+  let w_reset = window_open_here("reset")
+  debug_assert(w_close > 0 && w_reset > 0, "two secondary windows opened")
+  window_close_here(w_close)
+  check_clear("after window_close_here")
+  set_view_app(fn(_ : view::View) { () })
+  check_clear("after set_view_app")
+  debug_assert(primary_checked.v && close_checked.v && reset_checked.v, "all three teardown paths checked")
+  t.dispose()
+}
+
+
+fn check_superseded_builder_retains_state(secondary : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("primary")
+  window_kept_ref(draft, fn() { "secondary" })
+  let cleaned = signals::ref_new(0)
+  let installs = signals::ref_new(0)
+  let read = signals::ref_new("")
+  let builder = fn(root : view::View) {
+    draft.v = "superseded"
+    let _ = root.owns(fn() {
+      cleaned.v = cleaned.v + 1
+      read.v = draft.v
+      draft.v = "old cleanup"
+    })
+    set_view_app(fn(_ : view::View) {
+      installs.v = installs.v + 1
+      draft.v = "new primary"
+    })
+  }
+  if secondary {
+    set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit { builder })
+    debug_assert(window_open_here("cancelled") == 0, "open cancelled")
+  } else { set_view_app(builder) }
+  debug_assert(cleaned.v == 1 && installs.v == 1, "one release and one new builder")
+  debug_assert(read.v == "superseded" && draft.v == "new primary",
+    "old builder cleanup read=" + read.v + " latest draft=" + draft.v)
+  t.dispose()
+}
+
+test "cancelled secondary builder retains its state during cleanup" { check_superseded_builder_retains_state(true) }
+test "superseded main builder retains its state during cleanup" { check_superseded_builder_retains_state(false) }
+
+test "standalone tree dispose sets view::tree_disposing and blocks lifecycle mutations" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  debug_assert(!view::tree_disposing(), "tree_disposing false before dispose")
+  let checked = signals::ref_new(false)
+  let tr = view::Tree::new(fn(root : view::View) {
+    let _ = root.owns(fn() {
+      debug_assert(view::tree_disposing(), "tree_disposing must be true inside standalone Tree::dispose")
+      debug_assert(window_lifecycle_guard_error("set_view_app").is_some(), "set_view_app guarded in standalone dispose")
+      debug_assert(window_lifecycle_guard_error("view_forget").is_some(), "view_forget guarded in standalone dispose")
+      debug_assert(window_lifecycle_guard_error("window_open_here").is_some(), "window_open_here guarded in standalone dispose")
+      debug_assert(window_lifecycle_guard_error("window_close_here").is_some(), "window_close_here guarded in standalone dispose")
+      debug_assert(window_switch_guard_error("in_window").is_none(), "in_window remains allowed in standalone dispose")
+      checked.v = true
+    })
+  })
+  tr.dispose()
+  debug_assert(checked.v, "standalone cleanup ran")
+  debug_assert(!view::tree_disposing(), "tree_disposing false after dispose")
+  debug_assert(window_lifecycle_guard_error("set_view_app").is_none(), "set_view_app guard cleared after dispose")
+  debug_assert(window_lifecycle_guard_error("view_forget").is_none(), "view_forget guard cleared after dispose")
+  debug_assert(window_lifecycle_guard_error("window_open_here").is_none(), "window_open_here guard cleared after dispose")
+  debug_assert(window_lifecycle_guard_error("window_close_here").is_none(), "window_close_here guard cleared after dispose")
+  t.dispose()
+}
+
+fn check_superseded_builtin_snapshot(secondary : Bool, check_policy : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let snap = signals::ref_new(-1)
+  let zoom = signals::ref_new(false)
+  let cleaned = signals::ref_new(0)
+  let installs = signals::ref_new(0)
+  let builder = fn(root : view::View) {
+    t.fake.window_snap_state_val = 3
+    t.fake.window_zoomed_flag = true
+    debug_assert(window_snap_state() == 3 && window_zoomed(), "cached superseded native state")
+    let _ = root.owns(fn() {
+      cleaned.v = cleaned.v + 1
+      snap.v = window_snap_state()
+      zoom.v = window_zoomed()
+      set_narrow_enabled(false)
+    })
+    set_view_app(fn(_ : view::View) {
+      installs.v = installs.v + 1
+      set_narrow_below(700.0)
+      set_narrow_enabled(true)
+      t.fake.window_snap_state_val = 0
+      t.fake.window_zoomed_flag = false
+      debug_assert(window_snap_state() == 0 && !window_zoomed(), "confirmed replacement cache")
+    })
+  }
+  if secondary {
+    set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit { builder })
+    debug_assert(window_open_here("old") == 0, "cancelled open")
+  } else { set_view_app(builder) }
+  debug_assert(cleaned.v == 1 && installs.v == 1, "single dispose and replacement")
+  if check_policy {
+    t.resize(400.0, 600.0)
+    debug_assert(window_size_now().0 == 400.0, "latest main framed")
+    debug_assert(tree_narrow(), "old cleanup changed replacement narrow policy")
+  } else {
+    debug_assert(snap.v == 3 && zoom.v, "old cleanup snap=" + snap.v.to_string() + " zoom=" + zoom.v.to_string())
+  }
+  t.dispose()
+}
+
+test "cancelled secondary builder cleanup reads its old host state" { check_superseded_builtin_snapshot(true, false) }
+test "superseded primary builder cleanup reads its old host state" { check_superseded_builtin_snapshot(false, false) }
+test "cancelled secondary builder cleanup leaves new narrow policy enabled" { check_superseded_builtin_snapshot(true, true) }
+test "superseded primary builder cleanup leaves new narrow policy enabled" { check_superseded_builtin_snapshot(false, true) }
+
+test "stacked primary builders restore their own scalar drafts and builtin state" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("initial")
+  window_kept_ref(draft, fn() { "fresh" })
+  let seen_draft : Array[String] = []
+  let seen_snap : Array[Int] = []
+  let seen_zoom : Array[Bool] = []
+  set_view_app(fn(a : view::View) {
+    draft.v = "outer"
+    t.fake.window_snap_state_val = 1
+    t.fake.window_zoomed_flag = true
+    debug_assert(window_snap_state() == 1 && window_zoomed(), "outer host state cached")
+    let _ = a.owns(fn() {
+      seen_draft.push(draft.v)
+      seen_snap.push(window_snap_state())
+      seen_zoom.push(window_zoomed())
+      draft.v = "outer cleanup"
+      set_narrow_enabled(false)
+    })
+    set_view_app(fn(b : view::View) {
+      draft.v = "middle"
+      t.fake.window_snap_state_val = 2
+      t.fake.window_zoomed_flag = false
+      debug_assert(window_snap_state() == 2 && !window_zoomed(), "middle host state cached")
+      let _ = b.owns(fn() {
+        seen_draft.push(draft.v)
+        seen_snap.push(window_snap_state())
+        seen_zoom.push(window_zoomed())
+        draft.v = "middle cleanup"
+        set_narrow_enabled(false)
+      })
+      set_view_app(fn(_ : view::View) {
+        draft.v = "winner"
+        set_narrow_below(700.0)
+        set_narrow_enabled(true)
+        t.fake.window_snap_state_val = 0
+        t.fake.window_zoomed_flag = false
+        debug_assert(window_snap_state() == 0 && !window_zoomed(), "winner host state cached")
+      })
+    })
+  })
+  debug_assert(
+    seen_draft.length() == 2 && seen_draft[0] == "middle" && seen_draft[1] == "outer" && draft.v == "winner",
+    "each builder reads own draft",
+  )
+  debug_assert(
+    seen_snap.length() == 2 && seen_snap[0] == 2 && seen_snap[1] == 1,
+    "each builder reads own snap state",
+  )
+  debug_assert(
+    seen_zoom.length() == 2 && !seen_zoom[0] && seen_zoom[1],
+    "each builder reads own zoomed state",
+  )
+  t.resize(400.0, 600.0)
+  debug_assert(tree_narrow(), "winner narrow policy preserved")
+  t.dispose()
+}
+
+test "secondary triggered app replacement preserves superseded primary host state and new narrow policy" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let seen_snap = signals::ref_new(-1)
+  let seen_zoom = signals::ref_new(false)
+  let cleaned = signals::ref_new(0)
+  let installs = signals::ref_new(0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(_ : view::View) {
+      set_view_app(fn(_ : view::View) {
+        installs.v = installs.v + 1
+        set_narrow_below(700.0)
+        set_narrow_enabled(true)
+        t.fake.window_snap_state_val = 0
+        t.fake.window_zoomed_flag = false
+        debug_assert(window_snap_state() == 0 && !window_zoomed(), "replacement primary host state cached")
+      })
+    }
+  })
+  set_view_app(fn(root : view::View) {
+    t.fake.window_snap_state_val = 3
+    t.fake.window_zoomed_flag = true
+    debug_assert(window_snap_state() == 3 && window_zoomed(), "old primary host state cached")
+    let _ = root.owns(fn() {
+      cleaned.v = cleaned.v + 1
+      seen_snap.v = window_snap_state()
+      seen_zoom.v = window_zoomed()
+      set_narrow_enabled(false)
+    })
+    debug_assert(window_open_here("trigger") == 0, "secondary open cancelled by app replacement")
+  })
+  debug_assert(cleaned.v == 1 && installs.v == 1, "single dispose and replacement")
+  debug_assert(seen_snap.v == 3 && seen_zoom.v, "old primary cleanup reads old host state")
+  t.resize(400.0, 600.0)
+  debug_assert(tree_narrow(), "replacement narrow policy preserved after secondary triggered reset")
+  t.dispose()
+}
+
+test "superseded primary builder effect on_cleanup reads old host state and preserves new narrow policy" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let seen_snap = signals::ref_new(-1)
+  let seen_zoom = signals::ref_new(false)
+  let cleaned = signals::ref_new(0)
+  let installs = signals::ref_new(0)
+  set_view_app(fn(root : view::View) {
+    t.fake.window_snap_state_val = 3
+    t.fake.window_zoomed_flag = true
+    debug_assert(window_snap_state() == 3 && window_zoomed(), "old primary host state cached")
+    let _ = root.owns(signals::effect_cleanup(fn() {
+      fn() {
+        cleaned.v = cleaned.v + 1
+        seen_snap.v = window_snap_state()
+        seen_zoom.v = window_zoomed()
+        set_narrow_enabled(false)
+      }
+    }))
+    set_view_app(fn(_ : view::View) {
+      installs.v = installs.v + 1
+      set_narrow_below(700.0)
+      set_narrow_enabled(true)
+      t.fake.window_snap_state_val = 0
+      t.fake.window_zoomed_flag = false
+      debug_assert(window_snap_state() == 0 && !window_zoomed(), "replacement host state cached")
+    })
+  })
+  debug_assert(cleaned.v == 1 && installs.v == 1, "single effect cleanup and replacement")
+  debug_assert(seen_snap.v == 3 && seen_zoom.v, "effect on_cleanup reads old host state")
+  t.resize(400.0, 600.0)
+  debug_assert(tree_narrow(), "effect on_cleanup does not disable replacement narrow policy")
+  t.dispose()
+}
+
+test "superseded primary builder cleanup calling in_window preserves new primary state" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let draft = signals::ref_new("init")
+  window_kept_ref(draft, fn() { "fresh" })
+  let sec_wid = signals::ref_new(0)
+  let seen_sec = signals::ref_new("")
+  let seen_old = signals::ref_new("")
+  let cleaned = signals::ref_new(0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(_ : view::View) {
+      draft.v = "secondary_live"
+    }
+  })
+  set_view_app(fn(root : view::View) {
+    draft.v = "old_primary"
+    let _ = root.owns(fn() {
+      cleaned.v = cleaned.v + 1
+      seen_old.v = draft.v
+      if sec_wid.v != 0 {
+        in_window(sec_wid.v, fn() {
+          seen_sec.v = draft.v
+        })
+      }
+      debug_assert(draft.v == "old_primary", "old primary draft restored after in_window")
+      draft.v = "old_primary_mutated"
+    })
+    set_view_app(fn(_ : view::View) {
+      draft.v = "new_primary"
+      sec_wid.v = window_open_here("sec")
+      debug_assert(sec_wid.v != 0, "new primary opened secondary window")
+      debug_assert(draft.v == "new_primary", "new primary kept its draft after opening secondary")
+    })
+  })
+  debug_assert(cleaned.v == 1, "old primary cleaned once")
+  debug_assert(seen_old.v == "old_primary", "old primary saw its own draft")
+  debug_assert(seen_sec.v == "secondary_live", "in_window read live secondary draft")
+  debug_assert(draft.v == "new_primary", "new primary draft preserved after old cleanup in_window")
+  t.dispose()
+}
+
+fn check_winning_effect_during_superseded_cleanup(during_cleanup : Bool, check_write : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let changed = signals::signal(false)
+  let observed = signals::ref_new(-1)
+  let runs = signals::ref_new(0)
+  set_view_app(fn(old : view::View) {
+    t.fake.window_snap_state_val = 3
+    debug_assert(window_snap_state() == 3, "old host value cached")
+    let _ = old.owns(fn() {
+      if during_cleanup { changed.set(true) }
+    })
+    set_view_app(fn(winner : view::View) {
+      t.fake.window_snap_state_val = 0
+      debug_assert(window_snap_state() == 0, "winner host value cached")
+      set_narrow_below(700.0)
+      set_narrow_enabled(true)
+      let _ = winner.owns(signals::effect(fn() {
+        if changed.get() {
+          runs.v = runs.v + 1
+          observed.v = window_snap_state()
+          set_narrow_enabled(false)
+        }
+      }))
+    })
+  })
+  if !during_cleanup { changed.set(true) }
+  debug_assert(runs.v == 1, "winning effect reran exactly once")
+  if check_write {
+    t.resize(400.0, 600.0)
+    debug_assert(!tree_narrow(), "winning effect failed to disable its own narrow policy")
+  } else {
+    debug_assert(observed.v == 0, "winning effect read snap=" + observed.v.to_string())
+  }
+  t.dispose()
+}
+
+test "winning primary effect reads own snap during old cleanup" { check_winning_effect_during_superseded_cleanup(true, false) }
+test "winning primary effect changes own policy during old cleanup" { check_winning_effect_during_superseded_cleanup(true, true) }
+test "winning primary effect reads own snap after old cleanup" { check_winning_effect_during_superseded_cleanup(false, false) }
+test "winning primary effect changes own policy after old cleanup" { check_winning_effect_during_superseded_cleanup(false, true) }
+
+test "preexisting primary subscriber reads and writes live primary state during superseded cleanup" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let changed = signals::signal(false)
+  let observed = signals::ref_new(-1)
+  let runs = signals::ref_new(0)
+  let stop_ext = signals::effect(fn() {
+    if changed.get() {
+      runs.v = runs.v + 1
+      observed.v = window_snap_state()
+      set_narrow_enabled(false)
+    }
+  })
+  set_view_app(fn(old : view::View) {
+    t.fake.window_snap_state_val = 3
+    debug_assert(window_snap_state() == 3, "old host value cached")
+    let _ = old.owns(fn() {
+      changed.set(true)
+    })
+    set_view_app(fn(_ : view::View) {
+      t.fake.window_snap_state_val = 0
+      debug_assert(window_snap_state() == 0, "winner host value cached")
+      set_narrow_below(700.0)
+      set_narrow_enabled(true)
+    })
+  })
+  stop_ext()
+  debug_assert(runs.v == 1, "external subscriber reran once during old cleanup")
+  debug_assert(observed.v == 0, "external subscriber read winner snap=" + observed.v.to_string())
+  t.resize(400.0, 600.0)
+  debug_assert(!tree_narrow(), "external subscriber disabled winner narrow policy")
+  t.dispose()
+}
+
+test "secondary triggered set_view_app disposes primary tree once and window_tree_of zero returns primary tree" {
+  let primary_disposed = signals::ref_new(0)
+  let secondary_disposed = signals::ref_new(0)
+  let saw_primary_tree_in_secondary = signals::ref_new(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.owns(fn() { primary_disposed.v = primary_disposed.v + 1 })
+  })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(sec : view::View) {
+      saw_primary_tree_in_secondary.v = window_tree_of(0).is_some()
+      let _ = sec.owns(fn() { secondary_disposed.v = secondary_disposed.v + 1 })
+    }
+  })
+  let w1 = window_open_here("panel")
+  debug_assert(w1 > 0 && saw_primary_tree_in_secondary.v, "window_tree_of(0) returns primary tree inside secondary")
+  in_window(w1, fn() {
+    set_view_app(fn(_ : view::View) { () })
+  })
+  debug_assert(primary_disposed.v == 1, "primary tree disposed once, got=" + primary_disposed.v.to_string())
+  debug_assert(secondary_disposed.v == 1, "secondary tree disposed once, got=" + secondary_disposed.v.to_string())
+  debug_assert(window_tree_of(0).is_some(), "new primary tree installed")
+  saw_primary_tree_in_secondary.v = false
+  let w2 = window_open_here("panel2")
+  debug_assert(w2 > 0 && saw_primary_tree_in_secondary.v, "window_tree_of(0) returns new primary tree inside new secondary")
+  t.dispose()
+}
+
+test "window_closed_by_host disposes secondary tree and notifies listeners without host close callback" {
+  let t = Tester::tree(fn(_ : view::View) { () })
+  let disposed = signals::ref_new(0)
+  let closed_wid = signals::ref_new(0)
+  let host_close_calls = signals::ref_new(0)
+  let h = hostapi::host()
+  let orig_close = h.window_close_id
+  h.window_close_id = fn(wid : Int) {
+    host_close_calls.v = host_close_calls.v + 1
+    orig_close(wid)
+  }
+  when_window_closed(fn(wid : Int) { closed_wid.v = wid })
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit {
+    fn(sec : view::View) {
+      let _ = sec.owns(fn() { disposed.v = disposed.v + 1 })
+    }
+  })
+  let w = window_open_here("hosted")
+  debug_assert(w > 0 && window_tree_of(w).is_some(), "secondary opened")
+  window_closed_by_host(w)
+  debug_assert(disposed.v == 1, "window_closed_by_host disposed tree once")
+  debug_assert(closed_wid.v == w, "window_closed_by_host notified when_window_closed")
+  debug_assert(host_close_calls.v == 0, "window_closed_by_host did not call hostapi::window_close_id")
+  debug_assert(window_tree_of(w).is_none(), "window_tree_of cleared after host close")
+  t.dispose()
+}
+
+fn check_window_frame_zero_target(explicit_main_scope : Bool) -> Unit {
+  let t = Tester::tree(fn(_ : view::View) { () }, width=1000.0)
+  set_window_tree(fn(_ : Int, _ : String) -> (view::View) -> Unit { fn(_ : view::View) { () } })
+  let panel = window_open_here("panel")
+  let _ = window_frame(panel, 400.0, 600.0, 1.0, 11.0)
+  let frame_main = fn() { let _ = window_frame(0, 900.0, 600.0, 1.0, 20.0) }
+  in_window(panel, fn() {
+    if explicit_main_scope { in_window(0, frame_main) } else { frame_main() }
+  })
+  let main_w = match window_tree_of(0) { Some(tr) => tr.root().laid_size().0; None => -1.0 }
+  let main_room_w = match window_tree_of(0) { Some(tr) => tr.room_signal().get().0; None => -1.0 }
+  let panel_w = match window_tree_of(panel) { Some(tr) => tr.root().laid_size().0; None => -1.0 }
+  let panel_room_w = match window_tree_of(panel) { Some(tr) => tr.room_signal().get().0; None => -1.0 }
+  debug_assert(
+    main_w == 900.0 && main_room_w == 900.0 && panel_w == 400.0 && panel_room_w == 400.0,
+    "actual main/panel widths=" + main_w.to_string() + "/" + panel_w.to_string(),
+  )
+  t.dispose()
+}
+
+test "window_frame zero inside secondary scope targets primary window" { check_window_frame_zero_target(false) }
+test "window_frame zero with explicit primary scope targets primary window" { check_window_frame_zero_target(true) }

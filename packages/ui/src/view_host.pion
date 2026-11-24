@@ -863,15 +863,43 @@ fn run_before_frame_hooks() -> Unit {
   }
 }
 
-fn view_forget_inner(clear_hooks : Bool) -> Unit {
-  if clear_hooks {
-    clear_before_frame_hooks()
+let replacing_app : signals::Ref[Bool] = ref_new(false)
+
+fn view_forget_inner(clear_hooks : Bool) -> Bool {
+  let prev_replacing = replacing_app.v
+  replacing_app.v = prev_replacing || clear_hooks
+  let start_epoch = ui_ctx_epoch.v
+  let old_tree = primary_view_tree.v
+  primary_view_tree.v = None
+  if window_now.v == 0 {
+    view_app.tree = None
   }
-  match view_app.tree {
-    Some(t) => t.dispose()
+  match old_tree {
+    Some(t) => dispose_primary_tree(t)
     None => ()
   }
-  view_app.tree = None
+  if ui_ctx_epoch.v != start_epoch {
+    replacing_app.v = prev_replacing
+    return false
+  }
+  if !windows_reset() {
+    replacing_app.v = prev_replacing
+    return false
+  }
+  let my_epoch = ui_ctx_epoch.v
+  if clear_hooks {
+    clear_before_frame_hooks()
+    tree_narrow_below_sig.v.set(700.0)
+    if ui_ctx_epoch.v != my_epoch {
+      replacing_app.v = prev_replacing
+      return false
+    }
+    tree_narrow_enabled_sig.v.set(false)
+    if ui_ctx_epoch.v != my_epoch {
+      replacing_app.v = prev_replacing
+      return false
+    }
+  }
   view_app.maker = None
   view_app.scene = Scene::new()
   view_app.dmg = damage::Damage::new()
@@ -903,27 +931,57 @@ fn view_forget_inner(clear_hooks : Bool) -> Unit {
   view_app.last_atlas_gen = -1
   fields_reset()
   streams_and_natives_reset()
-  messages_reset()
-  windows_reset()
   shots_clear()
   reset_glyph_atlas()
-  reset_glass_light_angle()
   view_blocks_reset()
   view_pictures_reset()
+  if !messages_reset_checked(my_epoch) {
+    replacing_app.v = prev_replacing
+    return false
+  }
+  reset_glass_light_angle()
+  if ui_ctx_epoch.v != my_epoch {
+    replacing_app.v = prev_replacing
+    return false
+  }
+  replacing_app.v = prev_replacing
+  true
 }
 
 fn view_forget() -> Unit {
-  view_forget_inner(true)
+  match window_lifecycle_guard_error("view_forget") {
+    Some(msg) => {
+      let _ : Unit = halt::halt(msg)
+    }
+    None => ()
+  }
+  let _ = view_forget_inner(true)
 }
 
 /// Register the pure-tree root builder and optional reactive theme provider.
+/// Calling `set_view_app` while switching windows (`take`/`restore`/`fresh`) or during tree teardown (`root.owns`) halts immediately.
 pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
-  view_forget_inner(view_app.tree.is_some())
+  match window_lifecycle_guard_error("set_view_app") {
+    Some(msg) => {
+      let _ : Unit = halt::halt(msg)
+    }
+    None => ()
+  }
+  let had_app = primary_view_tree.v.is_some() || replacing_app.v
+  if !view_forget_inner(had_app) {
+    return
+  }
+  let my_epoch = ui_ctx_epoch.v
+  register_ui_window_kept()
   match theme {
     Some(tf) => set_tree_theme(tf)
     None => clear_tree_theme()
   }
+  if ui_ctx_epoch.v != my_epoch {
+    return
+  }
   view_app.maker = Some(make)
+  primary_building_epochs.push(my_epoch)
   let tree = view::Tree::new(
     make,
     measure=host_words_measure,
@@ -935,9 +993,29 @@ pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
     // window's start, 2026-11-22)
     time=hostapi::now,
   )
+  let kept_epochs : Array[Int] = []
+  for ep in primary_building_epochs {
+    if ep != my_epoch {
+      kept_epochs.push(ep)
+    }
+  }
+  primary_building_epochs.clear()
+  for ep in kept_epochs {
+    primary_building_epochs.push(ep)
+  }
+  if ui_ctx_epoch.v != my_epoch {
+    let saved_primary_slot = primary_building_saved_slot.get(my_epoch)
+    primary_building_saved_slot.remove(my_epoch)
+    window_open_seq.v = window_open_seq.v + 1
+    let detached_gen = window_open_seq.v
+    dispose_detached_tree(0, detached_gen, tree, saved_primary_slot, primary_epoch=Some(my_epoch))
+    return
+  }
+  primary_building_saved_slot.remove(my_epoch)
   tree.drawn_by(image_ready=image_ready_at, image_ask=image_ask_at)
   tree.on_due(fn() { hostapi::request_frame() })
   view_app.tree = Some(tree)
+  primary_view_tree.v = Some(tree)
 }
 
 fn color_rgba_tuple(c : Int64, alpha_mul : Double) -> (Double, Double, Double, Double) {
@@ -2951,6 +3029,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   view_app.last_h = h
   view_app.last_scale = scale
   view_app.frame_no = view_app.frame_no + 1
+  tree_window_size_sig.v.set((w, h))
   tree_window_corner.v.set(hostapi::window_corner())
   host_settings_arrive()
   messages_arrive()
