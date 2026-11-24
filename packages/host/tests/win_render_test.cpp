@@ -1,0 +1,528 @@
+// Standalone Windows D3D11 WARP shader-bake & Liquid Glass numerical smoke test driver.
+// Zero Pion/MoonBit runtime dependency (uses MB_NO_MOONBIT_H).
+//
+// Build (MSVC Developer Command Prompt):
+//   cl /nologo /O2 /EHsc /DMB_NO_MOONBIT_H /Ipackages/host/native \
+//     packages/host/tests/win_render_test.cpp packages/host/native/win_render.cpp \
+//     /Fe:win_render_test.exe
+//
+// Modes:
+//   --pass1 : expects INVAR_IGNORE_BAKED=1 + empty MBUI_SHADERS=<gen_dir>; compiles all 21
+//             shaders via D3DCompile -> writes <key>.cso to <gen_dir> & runs 5-vector WARP smoke.
+//   --pass2 : expects INVAR_IGNORE_BAKED unset + empty MBUI_SHADERS=<verify_dir>; asserts
+//             baked_hits == 21, disk_hits == 0, runtime_compiles == 0 & runs 5-vector WARP smoke.
+
+#ifndef MB_NO_MOONBIT_H
+#define MB_NO_MOONBIT_H
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "win.h"
+
+static size_t g_test_buf_len = 0;
+
+extern "C" {
+int mb_render_init_offscreen(double w, double h, double scale);
+void invar_win_shader_stats(int *baked_hits, int *disk_hits, int *runtime_compiles);
+void invar_win_shader_stats_reset(void);
+
+size_t invar_test_array_length(const void *p) {
+  (void)p;
+  return g_test_buf_len;
+}
+
+const wchar_t *mb_win_env(const wchar_t *name) {
+  static wchar_t buf[8][MAX_PATH * 2];
+  static int slot = 0;
+  wchar_t *dst = buf[(slot++) & 7];
+  DWORD n = GetEnvironmentVariableW(name, dst, MAX_PATH * 2);
+  if (n == 0 || n >= MAX_PATH * 2) return NULL;
+  return dst;
+}
+
+const wchar_t *mb_win_app_id(void) { return L""; }
+void *mb_image_srv(int id) { (void)id; return NULL; }
+void *mb_stream_srv(int id) { (void)id; return NULL; }
+void mb_text_set_scale(double scale) { (void)scale; }
+int mb_views_count(void) { return 0; }
+void mb_views_draw_under(uint8_t *out, int w, int h, double scale) {
+  (void)out; (void)w; (void)h; (void)scale;
+}
+double mb_app_scale(void) { return 1.0; }
+void mb_host_request_frame(void) {}
+}
+
+static const int INST_SIZE = 60;
+static const int EXPECTED_SHADER_KEYS = 21;
+
+static void push_inst(
+    double *buf, int *count,
+    double x, double y, double w, double h,
+    double radius, double kind, double p6, double p7,
+    double r, double g, double b, double a,
+    double c2a, double c2b, double c2c, double c2d,
+    double tex_id, double pad1, double pad2, double pad3) {
+  double *o = buf + (size_t)(*count) * INST_SIZE;
+  memset(o, 0, sizeof(double) * INST_SIZE);
+  o[0] = x; o[1] = y; o[2] = w; o[3] = h;
+  o[4] = radius; o[5] = kind; o[6] = p6; o[7] = p7;
+  o[8] = r; o[9] = g; o[10] = b; o[11] = a;
+  o[12] = c2a; o[13] = c2b; o[14] = c2c; o[15] = c2d;
+  o[16] = 0.0; o[17] = 0.0; o[18] = 1e9; o[19] = 1e9;
+  o[20] = tex_id; o[21] = pad1; o[22] = pad2; o[23] = pad3;
+  o[36] = radius; o[37] = radius; o[38] = radius; o[39] = radius;
+  (*count)++;
+}
+
+static int render_and_sample(
+    const double *inst, int count,
+    double bg_r, double bg_g, double bg_b,
+    int px, int py,
+    int *out_r, int *out_g, int *out_b) {
+  const int W = 320, H = 240;
+  const double SCALE = 2.0;
+  static uint8_t rgba[320 * 240 * 4];
+  memset(rgba, 0, sizeof rgba);
+  g_test_buf_len = sizeof rgba;
+  int ok = mb_render_pixels_of(inst, count, bg_r, bg_g, bg_b, SCALE, W, H, rgba);
+  if (!ok) return 0;
+  size_t idx = ((size_t)py * W + (size_t)px) * 4;
+  *out_r = rgba[idx + 0];
+  *out_g = rgba[idx + 1];
+  *out_b = rgba[idx + 2];
+  return 1;
+}
+
+static int check_rgb(const char *name, int r, int g, int b, int er, int eg, int eb, int tol) {
+  int dr = abs(r - er), dg = abs(g - eg), db = abs(b - eb);
+  printf("  [%s] %s: got=(%d,%d,%d) expected=(%d,%d,%d) tol=+/-%d\n",
+         (dr <= tol && dg <= tol && db <= tol) ? "PASS" : "FAIL",
+         name, r, g, b, er, eg, eb, tol);
+  return (dr <= tol && dg <= tol && db <= tol) ? 1 : 0;
+}
+
+static int render_rgba(
+    const double *inst, int count,
+    double bg_r, double bg_g, double bg_b,
+    double scale, int w, int h, uint8_t *rgba) {
+  memset(rgba, 0, (size_t)w * (size_t)h * 4);
+  g_test_buf_len = (size_t)w * (size_t)h * 4;
+  return mb_render_pixels_of(inst, count, bg_r, bg_g, bg_b, scale, w, h, rgba);
+}
+
+static int px_luma_of(const uint8_t *rgba, int w, int x, int y) {
+  size_t idx = ((size_t)y * (size_t)w + (size_t)x) * 4;
+  return (rgba[idx] * 2126 + rgba[idx + 1] * 7152 + rgba[idx + 2] * 722) / 10000;
+}
+
+static int run_v8_v9_2d_roi(void) {
+  const int W3 = 480, H3 = 300;
+  const double S3 = 3.0;
+  static uint8_t rgba[480 * 300 * 4];
+  double inst[48 * INST_SIZE];
+  int ok = 1;
+
+  // V8-A: Slider Dark 2D ROI
+  {
+    int n = 0;
+    push_inst(inst, &n, 10.0, 47.0, 70.0, 6.0, 3.0, 0.0, 0.0, 0.0, 0.0, 136.0/255.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 80.0, 47.0, 70.0, 6.0, 3.0, 0.0, 0.0, 0.0, 104.0/255.0, 104.0/255.0, 110.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 51.0, 31.0, 58.0, 38.0, 19.0, 6.0, 1.0, -16.0, 1.0, 1.0, 1.0, 0.0, 1.0, 8.0, 0.0, 1.0, -1.0, 3.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+
+    double best_blue_h = 0.0, best_grey_h = 0.0;
+    double blue_peak_dx = -1.0, grey_peak_dx = -1.0;
+    for (int i = 0; i <= 18; i++) {
+      int xb = 153 + i, xg = 326 - i;
+      double dx_pt = (i + 0.5) / S3;
+      int cntB = 0, cntG = 0;
+      for (int y = 93; y < 207; y++) {
+        size_t ib = ((size_t)y * W3 + (size_t)xb) * 4;
+        if ((int)rgba[ib + 2] - (int)rgba[ib] > 100) cntB++;
+        if (px_luma_of(rgba, W3, xg, y) > 72) cntG++;
+      }
+      if (cntB / S3 > best_blue_h) { best_blue_h = cntB / S3; blue_peak_dx = dx_pt; }
+      if (cntG / S3 > best_grey_h) { best_grey_h = cntG / S3; grey_peak_dx = dx_pt; }
+    }
+    int cnt55_b = 0, cnt55_g = 0;
+    for (int y = 93; y < 207; y++) {
+      size_t i55 = ((size_t)y * W3 + 169) * 4;
+      if ((int)rgba[i55 + 2] - (int)rgba[i55] > 100) cnt55_b++;
+      if (px_luma_of(rgba, W3, 310, y) > 72) cnt55_g++;
+    }
+    double h55_b = cnt55_b / S3, h55_g = cnt55_g / S3;
+    size_t il = (150 * W3 + 237) * 4, ir = (150 * W3 + 243) * 4;
+    size_t it = (105 * W3 + 156) * 4, ib = (195 * W3 + 156) * 4;
+    int split_ok = ((int)rgba[il + 2] - (int)rgba[il] > 100) && ((int)rgba[ir + 2] - (int)rgba[ir] < 25);
+    int zero_blue_ok = ((int)rgba[it + 2] - (int)rgba[it] < 25) && ((int)rgba[ib + 2] - (int)rgba[ib] < 25);
+    int y_hair = px_luma_of(rgba, W3, 240, 93);
+    int y_rim = px_luma_of(rgba, W3, 240, 95);
+    int y_sh = px_luma_of(rgba, W3, 240, 99);
+    int y_dome = px_luma_of(rgba, W3, 240, 120);
+    int y_low = px_luma_of(rgba, W3, 240, 165);
+    int v8a_ok = (best_blue_h >= 10.0 && best_blue_h <= 12.0) &&
+                 (blue_peak_dx >= 0.67 && blue_peak_dx <= 1.33) &&
+                 (best_grey_h >= 10.0 && best_grey_h <= 12.0) &&
+                 (grey_peak_dx >= 0.67 && grey_peak_dx <= 1.33) &&
+                 (h55_b >= 5.6 && h55_b <= 6.4) && (h55_g >= 5.6 && h55_g <= 6.4) &&
+                 split_ok && zero_blue_ok &&
+                 (y_dome < y_low) && (y_rim > y_dome) && (y_rim > y_sh) && (y_hair < y_rim);
+    printf("  [%s] V8-A slider dark 2D ROI: bluePeak=%.2f@%.3f greyPeak=%.2f@%.3f h55=(%.2f,%.2f) 5pt=(%d,%d,%d,%d,%d)\n",
+           v8a_ok ? "PASS" : "FAIL", best_blue_h, blue_peak_dx, best_grey_h, grey_peak_dx, h55_b, h55_g, y_hair, y_rim, y_sh, y_dome, y_low);
+    ok &= v8a_ok;
+  }
+
+  // V8-B: Slider vertical monotonicity (zero folding)
+  {
+    int n = 0;
+    for (int si = 0; si < 38; si++) {
+      push_inst(inst, &n, 45.0, 31.0 + si, 70.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, (double)si / 37.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    push_inst(inst, &n, 51.0, 31.0, 58.0, 38.0, 19.0, 6.0, 1.0, -16.0, 1.0, 1.0, 1.0, 0.0, 1.0, 8.0, 0.0, 1.0, -1.0, 3.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 0.0, 0.0, 0.0, S3, W3, H3, rgba)) return 0;
+    int mono_ok = 1, prev_g = -1;
+    for (int y = 138; y <= 162; y++) {
+      int g = rgba[((size_t)y * W3 + 156) * 4 + 1];
+      if (prev_g >= 0 && g < prev_g - 2) mono_ok = 0;
+      prev_g = g;
+    }
+    printf("  [%s] V8-B slider vertical monotonicity (zero folding)\n", mono_ok ? "PASS" : "FAIL");
+    ok &= mono_ok;
+  }
+
+  // V8-C & V8-D: Light Slider full blue/grey track + 5pt 3D thickness + 124x48 dropRole=0 + role0 zoom=1.18
+  {
+    int n = 0;
+    push_inst(inst, &n, 10.0, 47.0, 70.0, 6.0, 3.0, 0.0, 0.0, 0.0, 0.0, 136.0/255.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 80.0, 47.0, 70.0, 6.0, 3.0, 0.0, 0.0, 0.0, 115.0/255.0, 115.0/255.0, 122.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 51.0, 31.0, 58.0, 38.0, 19.0, 6.0, 1.0, -16.0, 1.0, 1.0, 1.0, 0.0, 1.0, 8.0, 0.0, 1.0, -1.0, 3.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 1.0, 1.0, 1.0, S3, W3, H3, rgba)) return 0;
+    double l_best_b = 0.0, l_best_g = 0.0, l_dx_b = -1.0, l_dx_g = -1.0;
+    for (int i = 0; i <= 18; i++) {
+      int xb = 153 + i, xg = 326 - i;
+      double dx_pt = (i + 0.5) / S3;
+      int cntB = 0, cntG = 0;
+      for (int y = 93; y < 207; y++) {
+        size_t ib = ((size_t)y * W3 + (size_t)xb) * 4;
+        if ((int)rgba[ib + 2] - (int)rgba[ib] > 100) cntB++;
+        int lg = px_luma_of(rgba, W3, xg, y);
+        if (lg > 40 && lg < 175) cntG++;
+      }
+      if (cntB / S3 > l_best_b) { l_best_b = cntB / S3; l_dx_b = dx_pt; }
+      if (cntG / S3 > l_best_g) { l_best_g = cntG / S3; l_dx_g = dx_pt; }
+    }
+    int lc55_b = 0, lc55_g = 0;
+    for (int y = 93; y < 207; y++) {
+      size_t i55 = ((size_t)y * W3 + 169) * 4;
+      if ((int)rgba[i55 + 2] - (int)rgba[i55] > 100) lc55_b++;
+      int lg55 = px_luma_of(rgba, W3, 310, y);
+      if (lg55 > 40 && lg55 < 175) lc55_g++;
+    }
+    double lh55_b = lc55_b / S3, lh55_g = lc55_g / S3;
+    size_t lil = (150 * W3 + 237) * 4, lir = (150 * W3 + 243) * 4;
+    size_t lit = (105 * W3 + 156) * 4, lib = (195 * W3 + 156) * 4;
+    int l_split_ok = ((int)rgba[lil + 2] - (int)rgba[lil] > 100) && ((int)rgba[lir + 2] - (int)rgba[lir] < 25);
+    int l_zero_ok = ((int)rgba[lit + 2] - (int)rgba[lit] < 25) && ((int)rgba[lib + 2] - (int)rgba[lib] < 25);
+    int y_hair = px_luma_of(rgba, W3, 240, 93), y_rim = px_luma_of(rgba, W3, 240, 95);
+    int y_sh = px_luma_of(rgba, W3, 240, 99), y_dome = px_luma_of(rgba, W3, 240, 120), y_low = px_luma_of(rgba, W3, 240, 165);
+    int v8c_ok = (l_best_b >= 10.0 && l_best_b <= 12.0) && (l_dx_b >= 0.67 && l_dx_b <= 1.33) &&
+                 (l_best_g >= 10.0 && l_best_g <= 12.0) && (l_dx_g >= 0.67 && l_dx_g <= 1.33) &&
+                 (lh55_b >= 5.6 && lh55_b <= 6.4) && (lh55_g >= 5.6 && lh55_g <= 6.4) &&
+                 l_split_ok && l_zero_ok &&
+                 (y_hair < y_low - 15) && (y_rim > y_hair) && (y_sh < y_low) && (y_dome < y_low);
+    printf("  [%s] V8-C slider light 2D ROI: bluePeak=%.2f@%.3f greyPeak=%.2f@%.3f h55=(%.2f,%.2f) 5pt=(%d,%d,%d,%d,%d)\n",
+           v8c_ok ? "PASS" : "FAIL", l_best_b, l_dx_b, l_best_g, l_dx_g, lh55_b, lh55_g, y_hair, y_rim, y_sh, y_dome, y_low);
+    ok &= v8c_ok;
+
+    n = 0;
+    push_inst(inst, &n, 10.0, 47.0, 140.0, 6.0, 3.0, 0.0, 0.0, 0.0, 0.0, 136.0/255.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 18.0, 26.0, 124.0, 48.0, 24.0, 6.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 8.0, 0.0, 1.0, -1.0, 3.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+    int cnt = 0;
+    for (int y = 78; y < 222; y++) {
+      size_t i = ((size_t)y * W3 + 57) * 4;
+      if ((int)rgba[i + 2] - (int)rgba[i] > 100) cnt++;
+    }
+    double h_mag = cnt / S3;
+    n = 0;
+    push_inst(inst, &n, 40.0, 31.8, 80.0, 1.0, 0.0, 0.0, 0.0, 0.0, 48.0/255.0, 209.0/255.0, 88.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 40.0, 30.0, 80.0, 40.0, 20.0, 6.0, 1.0, -0.18, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+    size_t ie = (90 * W3 + 240) * 4, im = (150 * W3 + 240) * 4;
+    int edge_gr = (int)rgba[ie + 1] - (int)rgba[ie];
+    int mid_gr = (int)rgba[im + 1] - (int)rgba[im];
+    int v8d_ok = (h_mag < 7.0) && (edge_gr > 40) && (mid_gr < 15);
+    printf("  [%s] V8-D role0 magnifier h=%.2f (<7.0) & zoom=1.18 edgeGR=%d midGR=%d\n", v8d_ok ? "PASS" : "FAIL", h_mag, edge_gr, mid_gr);
+    ok &= v8d_ok;
+  }
+
+  // V9-A: Switch ON 3x 2D ROI (exact 3-row TIR + pinched core + moat from y_top+2 + right outer tip)
+  {
+    int n = 0;
+    push_inst(inst, &n, 48.5, 35.2, 63.0, 28.0, 14.0, 0.0, 0.0, 0.0, 48.0/255.0, 209.0/255.0, 88.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 61.4, 30.0, 59.2, 38.4, 19.2, 6.0, 1.0, -32.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+    size_t i0 = (90 * W3 + 273) * 4, i1 = (91 * W3 + 273) * 4, i2 = (92 * W3 + 273) * 4;
+    int gr0 = (int)rgba[i0 + 1] - (int)rgba[i0];
+    int gr1 = (int)rgba[i1 + 1] - (int)rgba[i1];
+    int gr2 = (int)rgba[i2 + 1] - (int)rgba[i2];
+    int core_top = -1, core_bot = -1;
+    for (int y = 96; y < 199; y++) {
+      size_t iy = ((size_t)y * W3 + 273) * 4;
+      if ((int)rgba[iy + 1] - (int)rgba[iy] > 60) {
+        if (core_top < 0) core_top = y;
+        core_bot = y;
+      }
+    }
+    double core_h = (core_bot - core_top + 1) / S3;
+    double moat_pt = (core_top - 92) / S3;
+    size_t itip = (148 * W3 + 360) * 4;
+    int gr_tip = (int)rgba[itip + 1] - (int)rgba[itip];
+    int v9a_ok = (gr0 < 15) && (gr1 > 60) && (gr2 < 15) && (core_h >= 20.0 && core_h <= 22.5) && (moat_pt >= 6.5) && (gr_tip < 15);
+    printf("  [%s] V9-A switch ON 3x ROI: rows=(%d,%d,%d) core=%.2f moat=%.2f tipGR=%d\n",
+           v9a_ok ? "PASS" : "FAIL", gr0, gr1, gr2, core_h, moat_pt, gr_tip);
+    ok &= v9a_ok;
+  }
+
+  // V9-B: Switch ON 2x phase-shifted green mass
+  {
+    const double phases[2] = { 30.0, 30.25 };
+    int v9b_ok = 1;
+    for (int pi = 0; pi < 2; pi++) {
+      int n = 0;
+      push_inst(inst, &n, 48.5, phases[pi] + 5.2, 63.0, 28.0, 14.0, 0.0, 0.0, 0.0, 48.0/255.0, 209.0/255.0, 88.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(inst, &n, 61.4, phases[pi], 59.2, 38.4, 19.2, 6.0, 1.0, -32.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+      if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, 2.0, 320, 200, rgba)) return 0;
+      int mass = 0;
+      for (int y = 60; y <= 64; y++) {
+        size_t iy = ((size_t)y * 320 + 182) * 4;
+        if (rgba[iy + 1] > rgba[iy]) mass += (int)rgba[iy + 1] - (int)rgba[iy];
+      }
+      if (mass <= 40) v9b_ok = 0;
+    }
+    printf("  [%s] V9-B switch ON 2x phase-shifted integrated green mass\n", v9b_ok ? "PASS" : "FAIL");
+    ok &= v9b_ok;
+  }
+
+  // V9-C: Switch OFF luminance contrast, rim profile & right end-cap inner row (dropDisp=0)
+  {
+    int n = 0;
+    push_inst(inst, &n, 48.5, 35.2, 63.0, 28.0, 14.0, 0.0, 0.0, 0.0, 120.0/255.0, 120.0/255.0, 128.0/255.0, 173.0/255.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 39.4, 30.0, 59.2, 38.4, 19.2, 6.0, 1.0, -32.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+    int yc = px_luma_of(rgba, W3, 10, 10), ycore = px_luma_of(rgba, W3, 207, 148);
+    int yrim = px_luma_of(rgba, W3, 207, 92), ymoat = px_luma_of(rgba, W3, 207, 102);
+    int rc1 = px_luma_of(rgba, W3, 291, 148), rc2 = px_luma_of(rgba, W3, 288, 148), rc3 = px_luma_of(rgba, W3, 285, 148);
+    int v9c_ok = (ycore > yc + 15) && (yrim > ymoat) && (rc1 > yc + 10) && (rc2 > yc + 10) && (rc3 > yc + 10);
+    printf("  [%s] V9-C switch OFF luminance & right cap: card=%d core=%d rim=%d moat=%d rcap=(%d,%d,%d)\n",
+           v9c_ok ? "PASS" : "FAIL", yc, ycore, yrim, ymoat, rc1, rc2, rc3);
+    ok &= v9c_ok;
+  }
+
+  // V9-D: Light Segmented Prism (45pt dropRole=3 over white card)
+  {
+    int n = 0;
+    push_inst(inst, &n, 25.0, 27.0, 110.0, 45.0, 22.5, 6.0, 1.0, -48.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.04, 0.0);
+    if (!render_rgba(inst, n, 1.0, 1.0, 1.0, S3, W3, H3, rgba)) return 0;
+    size_t ibot = (213 * W3 + 240) * 4, icap = (148 * W3 + 78) * 4;
+    int cyan = (int)rgba[ibot + 2] - (int)rgba[ibot];
+    int amber = (int)rgba[icap] - (int)rgba[icap + 2];
+    int v9d_ok = (cyan >= 10) && (amber >= 20);
+    printf("  [%s] V9-D light segmented prism: bottom(B-R)=%d (>=10) cap(R-B)=%d (>=20)\n", v9d_ok ? "PASS" : "FAIL", cyan, amber);
+    ok &= v9d_ok;
+  }
+
+  // V9-E: Switch half-press p = 0.5 / 0.6 / 1.0 (no pinchWeight collapse at p=0.5)
+  {
+    const double ps[3] = { 0.5, 0.6, 1.0 };
+    double hs[3] = { 0.0, 0.0, 0.0 };
+    for (int pi = 0; pi < 3; pi++) {
+      double p = ps[pi];
+      int n = 0;
+      push_inst(inst, &n, 48.5, 35.2, 63.0, 28.0, 14.0, 0.0, 0.0, 0.0, 48.0/255.0, 209.0/255.0, 88.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(inst, &n, 61.4, 30.0, 59.2, 38.4, 19.2, 6.0, 1.0, -32.0, 1.0, 1.0, 1.0, 0.0, p, 9.0 * p, 0.0, 1.0, -1.0, 9.0 * p, 0.0, 0.0);
+      if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+      int top = -1, bot = -1;
+      for (int y = 96; y < 199; y++) {
+        size_t iy = ((size_t)y * W3 + 273) * 4;
+        if ((int)rgba[iy + 1] - (int)rgba[iy] > 60) {
+          if (top < 0) top = y;
+          bot = y;
+        }
+      }
+      hs[pi] = (bot - top + 1) / S3;
+    }
+    int v9e_ok = (hs[0] < 27.0) && (hs[2] < hs[1]) && (hs[1] <= hs[0]);
+    printf("  [%s] V9-E switch half-press pinch: h(0.5)=%.2f h(0.6)=%.2f h(1.0)=%.2f\n", v9e_ok ? "PASS" : "FAIL", hs[0], hs[1], hs[2]);
+    ok &= v9e_ok;
+  }
+
+  return ok;
+}
+
+static int run_warp_smoke(void) {
+  double inst[16 * INST_SIZE];
+  int ok = 1;
+  int r = 0, g = 0, b = 0;
+
+  // Center of glass rect (20, 20, 120, 80) at 2x scale is (80pt, 60pt) = (160px, 120px)
+  const double gx = 20.0, gy = 20.0, gw = 120.0, gh = 80.0, gr = 20.0;
+  const int cx = 160, cy = 120;
+
+  // Vector 1: Dark Regular (#20202067) over #000000 -> (30, 30, 30)
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 2.0,
+              32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+              0.6, 14.0, 0.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 0.0, 0.0, cx, cy, &r, &g, &b)) return 0;
+    ok &= check_rgb("V1 dark regular on #000000", r, g, b, 30, 30, 30, 3);
+  }
+
+  // Vector 2: Dark Regular (#20202067) over #1B1C1F -> (46, 47, 50)
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 2.0,
+              32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+              0.6, 14.0, 0.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 27.0/255.0, 28.0/255.0, 31.0/255.0, cx, cy, &r, &g, &b)) return 0;
+    ok &= check_rgb("V2 dark regular on #1B1C1F", r, g, b, 46, 47, 50, 3);
+  }
+
+  // Vector 3: Dark Adaptive Regular (c2.z = -1.0) over #FFFFFF (t=1) -> (93, 93, 93)
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 2.0,
+              32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+              0.6, 14.0, -1.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 1.0, 1.0, 1.0, cx, cy, &r, &g, &b)) return 0;
+    ok &= check_rgb("V3 dark adaptive regular on #FFFFFF", r, g, b, 93, 93, 93, 3);
+  }
+
+  // Vector 4: Light Regular (#FDFCFD67) over #0088FF -> (40, 154, 255), HSV S >= 0.75
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 2.0,
+              253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
+              0.6, 14.0, 0.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 136.0/255.0, 1.0, cx, cy, &r, &g, &b)) return 0;
+    ok &= check_rgb("V4 light regular on #0088FF", r, g, b, 40, 154, 255, 3);
+    double mx = (double)(r > g ? (r > b ? r : b) : (g > b ? g : b));
+    double mn = (double)(r < g ? (r < b ? r : b) : (g < b ? g : b));
+    double sat = mx > 0.0 ? (mx - mn) / mx : 0.0;
+    printf("  [%s] V4 HSV saturation=%.3f (>= 0.75)\n", sat >= 0.75 ? "PASS" : "FAIL", sat);
+    ok &= (sat >= 0.75);
+  }
+
+  // Vector 5: Pure Clear (regMix=0, #FFFFFF00, blur=0, rim=0) over (0, 255, 64) -> (0, 255, 64)
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 0.0,
+              1.0, 1.0, 1.0, 0.0,
+              0.0, 8.0, 0.0, 1.0,
+              -1.0, 0.0, 0.0, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 1.0, 64.0/255.0, cx, cy, &r, &g, &b)) return 0;
+    ok &= check_rgb("V5 pure clear on (0,255,64)", r, g, b, 0, 255, 64, 2);
+  }
+
+  // Vector 6: High-density Light (#FDFCFDD9, alpha=0xD9) over saturated blue (0, 0.4, 1.0) -> R >= 184
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 2.0,
+              253.0/255.0, 252.0/255.0, 253.0/255.0, 217.0/255.0,
+              0.6, 14.0, 0.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 0.4, 1.0, cx, cy, &r, &g, &b)) return 0;
+    printf("  [%s] V6 high-density light 0xD9 on (0,0.4,1): got=(%d,%d,%d) expected R>=184\n",
+           r >= 184 ? "PASS" : "FAIL", r, g, b);
+    ok &= (r >= 184);
+  }
+
+  // Vector 7: Opaque Light (#FDFCFDFF, alpha=0xFF) over saturated blue (0, 0.4, 1.0) -> (253, 252, 253) +/- 2
+  {
+    int n = 0;
+    push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 2.0,
+              253.0/255.0, 252.0/255.0, 253.0/255.0, 1.0,
+              0.6, 14.0, 0.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 0.0, 0.4, 1.0, cx, cy, &r, &g, &b)) return 0;
+    ok &= check_rgb("V7 opaque light 0xFF on (0,0.4,1)", r, g, b, 253, 252, 253, 2);
+  }
+
+  // Extra pipeline coverage: rect (kind 0), shadow (kind 2), frosted (kind 5), progressive frosted, merged liquid (merge > 0)
+  {
+    int n = 0;
+    push_inst(inst, &n, 4.0, 4.0, 30.0, 30.0, 0.0, 0.0, 0.0, 0.0,
+              0.2, 0.4, 0.8, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 10.0, 50.0, 40.0, 8.0, 2.0, 0.0, 6.0,
+              0.0, 0.0, 0.0, 0.25, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 10.0, 60.0, 60.0, 40.0, 10.0, 5.0, 1.2, 6.0,
+              1.0, 1.0, 1.0, 0.35, 0.0, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 80.0, 60.0, 60.0, 40.0, 10.0, 5.0, 1.25, 8.0,
+              1.0, 1.0, 1.0, 0.50, 0.0, 0.0, 0.0, 1.0, -3.0, 0.0, -1.0, 0.0);
+    push_inst(inst, &n, 80.0, 10.0, 36.0, 36.0, 18.0, 6.0, 1.0, 2.0,
+              32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+              0.6, 14.0, 0.0, 1.0, -4.0, 20.0, 0.06, 12.0);
+    push_inst(inst, &n, 110.0, 10.0, 36.0, 36.0, 18.0, 6.0, 1.0, 2.0,
+              32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+              0.6, 14.0, 0.0, 1.0, -4.0, 20.0, 0.06, 12.0);
+    if (!render_and_sample(inst, n, 0.1, 0.1, 0.12, 20, 20, &r, &g, &b)) return 0;
+  }
+
+  if (!run_v8_v9_2d_roi()) ok = 0;
+  return ok;
+}
+
+int main(int argc, char **argv) {
+  int pass = 0;
+  if (argc >= 2 && strcmp(argv[1], "--pass1") == 0) pass = 1;
+  else if (argc >= 2 && strcmp(argv[1], "--pass2") == 0) pass = 2;
+  else {
+    fprintf(stderr, "usage: win_render_test --pass1 | --pass2\n");
+    return 2;
+  }
+
+  invar_win_shader_stats_reset();
+  if (!mb_render_init_offscreen(160.0, 120.0, 2.0)) {
+    fprintf(stderr, "FAIL: mb_render_init_offscreen failed\n");
+    return 1;
+  }
+
+  int baked = 0, disk = 0, compiled = 0;
+  invar_win_shader_stats(&baked, &disk, &compiled);
+  printf("win_render_test pass=%d stats: baked_hits=%d disk_hits=%d runtime_compiles=%d (expected=%d)\n",
+         pass, baked, disk, compiled, EXPECTED_SHADER_KEYS);
+
+  int ok = 1;
+  if (pass == 1) {
+    if (baked != 0 || disk != 0 || compiled != EXPECTED_SHADER_KEYS) {
+      fprintf(stderr, "FAIL: pass1 expected baked=0 disk=0 runtime_compiles=%d\n", EXPECTED_SHADER_KEYS);
+      ok = 0;
+    }
+  } else {
+    if (baked != EXPECTED_SHADER_KEYS || disk != 0 || compiled != 0) {
+      fprintf(stderr, "FAIL: pass2 expected baked=%d disk=0 runtime_compiles=0\n", EXPECTED_SHADER_KEYS);
+      ok = 0;
+    }
+  }
+
+  if (!run_warp_smoke()) {
+    fprintf(stderr, "FAIL: WARP numerical smoke tests failed\n");
+    ok = 0;
+  }
+
+  if (!ok) return 1;
+  printf("win_render_test pass=%d: ALL PASSED\n", pass);
+  return 0;
+}

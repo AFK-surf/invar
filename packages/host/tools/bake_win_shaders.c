@@ -3,30 +3,63 @@
 // finds them in itself and compiles none as it starts (D3DCompile + D3DReflect of the glass shaders: ~4 s on a first
 // start). A key no longer made by the sources (a shader changed) is simply never asked for: what is not baked is
 // compiled and kept as before. Build with any C compiler: cc -O2 bake_win_shaders.c -o bake_win_shaders
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <dirent.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static char *dup_str(const char *s) {
+  size_t len = strlen(s) + 1;
+  char *out = (char *)malloc(len);
+  if (out) memcpy(out, s, len);
+  return out;
+}
 
 int main(int argc, char **argv) {
   if (argc != 3) {
     fprintf(stderr, "usage: bake_win_shaders <dir> <out.h>\n");
     return 2;
   }
+  char *names[256];
+  int n = 0;
+#ifdef _WIN32
+  char pattern[4096];
+  snprintf(pattern, sizeof pattern, "%s\\*.cso", argv[1]);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) {
+    fprintf(stderr, "bake_win_shaders: cannot open %s\n", argv[1]);
+    return 1;
+  }
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    size_t l = strlen(fd.cFileName);
+    if (l == 20 && !strcmp(fd.cFileName + 16, ".cso") && n < 256) {
+      names[n++] = dup_str(fd.cFileName);
+    }
+  } while (FindNextFileA(h, &fd) && n < 256);
+  FindClose(h);
+#else
   DIR *d = opendir(argv[1]);
   if (!d) {
     perror(argv[1]);
     return 1;
   }
-  char *names[256];
-  int n = 0;
   struct dirent *e;
   while ((e = readdir(d)) && n < 256) {
     size_t l = strlen(e->d_name);
-    if (l == 20 && !strcmp(e->d_name + 16, ".cso")) names[n++] = strdup(e->d_name);
+    if (l == 20 && !strcmp(e->d_name + 16, ".cso")) names[n++] = dup_str(e->d_name);
   }
   closedir(d);
+#endif
   for (int i = 0; i < n; i++)
     for (int j = i + 1; j < n; j++)
       if (strcmp(names[i], names[j]) > 0) {
@@ -34,7 +67,7 @@ int main(int argc, char **argv) {
         names[i] = names[j];
         names[j] = t;
       }
-  FILE *o = fopen(argv[2], "w");
+  FILE *o = fopen(argv[2], "wb");
   if (!o) {
     perror(argv[2]);
     return 1;
