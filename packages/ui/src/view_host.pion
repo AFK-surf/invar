@@ -728,6 +728,7 @@ struct ViewAppState {
   mut last_wheel_phase : Int
   mut last_light_angle : Double
   mut last_atlas_gen : Int
+  mut shown_cursor : Int
 }
 
 let view_app : ViewAppState = ViewAppState::{
@@ -765,6 +766,7 @@ let view_app : ViewAppState = ViewAppState::{
   last_wheel_phase: 0,
   last_light_angle: -999.0,
   last_atlas_gen: -1,
+  shown_cursor: -1,
 }
 
 /// Active pure-tree window Tree (None before app starts or after dispose).
@@ -929,6 +931,7 @@ fn view_forget_inner(clear_hooks : Bool) -> Bool {
   view_app.last_wheel_phase = 0
   view_app.last_light_angle = -999.0
   view_app.last_atlas_gen = -1
+  view_app.shown_cursor = -1
   fields_reset()
   streams_and_natives_reset()
   shots_clear()
@@ -1014,8 +1017,73 @@ pub fn set_view_app(make : (view::View) -> Unit, theme? : () -> Theme) -> Unit {
   primary_building_saved_slot.remove(my_epoch)
   tree.drawn_by(image_ready=image_ready_at, image_ask=image_ask_at)
   tree.on_due(fn() { hostapi::request_frame() })
+  tree.on_cursor(fn() { view_cursor_tell() })
   view_app.tree = Some(tree)
   primary_view_tree.v = Some(tree)
+}
+
+/// Sync the host pointer cursor with the active drag/press node or hovered node under `(pointer_x, pointer_y)`.
+fn view_cursor_tell() -> Unit {
+  let tree = match view_app.tree {
+    Some(t) => t
+    None => return
+  }
+  let cur = match view_app.dragging_node {
+    Some(id) => tree.cursor_of(id)
+    None => match view_app.pressed_node {
+      Some(id) => tree.cursor_of(id)
+      None => match tree.points_now() {
+        Some(id) => tree.cursor_of(id)
+        None => match tree.target_at(view_app.pointer_x, view_app.pointer_y) {
+          view::Target::Dragged(id) => tree.cursor_of(id)
+          view::Target::Pressed(id) => tree.cursor_of(id)
+          view::Target::TopRow(id) => tree.cursor_of(id)
+          _ => view::Cursor::Arrow
+        }
+      }
+    }
+  }
+  let code = view::cursor_code(cur)
+  if code != view_app.shown_cursor {
+    view_app.shown_cursor = code
+    hostapi::set_cursor(code)
+  }
+}
+
+/// Porter-Duff src-over compositing of straight 0xRRGGBBAA `over_c` onto `under`, used when a translucent edge
+/// shares a single kind=0 GPU rect instance with its ground so the border never punches a hole through the fill.
+fn over_rgba(under : Int64, over_c : Int64) -> Int64 {
+  let sa = (over_c & 0xFFL).to_double() / 255.0
+  if sa <= 0.0 {
+    return under
+  }
+  if sa >= 1.0 {
+    return over_c
+  }
+  let da = (under & 0xFFL).to_double() / 255.0
+  if da <= 0.0 {
+    return over_c
+  }
+  let out_a = sa + da * (1.0 - sa)
+  if out_a <= 0.0 {
+    return 0L
+  }
+  let sr = ((over_c >> 24) & 0xFFL).to_double()
+  let sg = ((over_c >> 16) & 0xFFL).to_double()
+  let sb = ((over_c >> 8) & 0xFFL).to_double()
+  let dr = ((under >> 24) & 0xFFL).to_double()
+  let dg = ((under >> 16) & 0xFFL).to_double()
+  let db = ((under >> 8) & 0xFFL).to_double()
+  let k = da * (1.0 - sa)
+  let clamp_b = fn(v : Double) -> Int64 {
+    let i = v.round().to_int64()
+    if i < 0L { 0L } else if i > 255L { 255L } else { i }
+  }
+  let r = clamp_b((sr * sa + dr * k) / out_a)
+  let g = clamp_b((sg * sa + dg * k) / out_a)
+  let b = clamp_b((sb * sa + db * k) / out_a)
+  let a = clamp_b(out_a * 255.0)
+  (r << 24) | (g << 16) | (b << 8) | a
 }
 
 fn color_rgba_tuple(c : Int64, alpha_mul : Double) -> (Double, Double, Double, Double) {
@@ -1431,6 +1499,8 @@ struct ViewBlock {
   rects : Array[paint::Rect]
   node_scale : Double
   scale : Double
+  sub_x : Double
+  sub_y : Double
   atlas_gen : Int
   ninst : Int
   after_ground_n : Int
@@ -1579,11 +1649,15 @@ fn view_block_matches(
   eff_font_size : Double,
   node_scale : Double,
   scale : Double,
+  sub_x : Double,
+  sub_y : Double,
   atlas_gen : Int,
   shadow_out : Bool,
 ) -> Bool {
   blk.gen == d.id.gen &&
   blk.atlas_gen == atlas_gen &&
+  (blk.sub_x - sub_x).abs() < 1.0e-4 &&
+  (blk.sub_y - sub_y).abs() < 1.0e-4 &&
   blk.w == d.w &&
   blk.h == d.h &&
   blk.radius == d.radius &&
@@ -1651,8 +1725,8 @@ fn compose_view_block(
   let (clip_x, clip_y, clip_x1, clip_y1) = clip
   let has_rc = rc.0 > 0.0 || rc.1 > 0.0 || rc.2 > 0.0 || rc.3 > 0.0
   let has_rot = d.turn != 0.0
-  let dx = d.x
-  let dy = d.y
+  let dx = d.x - blk.sub_x
+  let dy = d.y - blk.sub_y
   let src = blk.inst
   let base_inst = scene.ninst
   scene.ensure_inst_len((base_inst + cnt) * inst_size)
@@ -1726,10 +1800,10 @@ fn compose_view_block(
       j += 1
     }
   } else {
-    let gox = dx + gd.dx * node_scale + (d.w + gd.dw * node_scale) * 0.5
-    let goy = dy + gd.dy * node_scale + (d.h + gd.dh * node_scale) * 0.5
-    let ox = dx + d.w * 0.5
-    let oy = dy + d.h * 0.5
+    let gox = d.x + gd.dx * node_scale + (d.w + gd.dw * node_scale) * 0.5
+    let goy = d.y + gd.dy * node_scale + (d.h + gd.dh * node_scale) * 0.5
+    let ox = d.x + d.w * 0.5
+    let oy = d.y + d.h * 0.5
     let mut j = 0
     while j < cnt {
       let sb = j * inst_size
@@ -2080,7 +2154,12 @@ fn encode_drawn_node_direct(
     }
     _ =>
     if gd_visible && (has_ground || has_edge) {
-      let (br, bg_c, bb, ba) = if has_edge { color_rgba_tuple(ecol, d.alpha) } else { (0.0, 0.0, 0.0, 0.0) }
+      let eff_ecol = if has_ground && has_edge && (ecol & 0xFFL) < 0xFFL {
+        over_rgba(d.ground, ecol)
+      } else {
+        ecol
+      }
+      let (br, bg_c, bb, ba) = if has_edge { color_rgba_tuple(eff_ecol, d.alpha) } else { (0.0, 0.0, 0.0, 0.0) }
       let idx = scene.push_inst(
         gd_d.x, gd_d.y, gd_d.w, gd_d.h, gd_d.radius, 0.0,
         if has_edge { ew } else { 0.0 },
@@ -2455,8 +2534,13 @@ fn encode_drawn_node(
   // Scaled by the host's text size so a set_font_scale change misses the cached block and redraws at the new size.
   let eff_font_size = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * font_scale_mul()
   let atlas_gen = glyph_state.epoch
+  let (sub_x, sub_y) = if scale > 0.0 && d.words.length() > 0 {
+    (d.x - (d.x * scale).round() / scale, d.y - (d.y * scale).round() / scale)
+  } else {
+    (0.0, 0.0)
+  }
   match blocks[slot] {
-    Some(blk) if view_block_matches(blk, d, gd, eff_font_size, node_scale, scale, atlas_gen, shadow_out) => {
+    Some(blk) if view_block_matches(blk, d, gd, eff_font_size, node_scale, scale, sub_x, sub_y, atlas_gen, shadow_out) => {
       compose_view_block(scene, blk, d, gd, node_scale, clip, rc)
       view_blocks_state.work.copied = view_blocks_state.work.copied + 1
       view_blocks_state.work.handed = view_blocks_state.work.handed + blk.ninst
@@ -2466,7 +2550,7 @@ fn encode_drawn_node(
   }
   let scratch = view_blocks_state.scratch
   scratch.clear(scene.width, scene.height, scale)
-  let d_local = view::Drawn::{ ..d, x: 0.0, y: 0.0, turn: 0.0 }
+  let d_local = view::Drawn::{ ..d, x: sub_x, y: sub_y, turn: 0.0 }
   let empty_deferred : Array[DeferredGlassShadow] = []
   let (after_ground_n, words_start, words_end, words_square_clip, image_settled) = encode_drawn_node_direct(
     scratch,
@@ -2533,6 +2617,8 @@ fn encode_drawn_node(
     rects: d.rects.copy(),
     node_scale,
     scale,
+    sub_x,
+    sub_y,
     atlas_gen: glyph_state.epoch,
     ninst: scratch.ninst,
     after_ground_n,
@@ -3052,6 +3138,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
     tree.words_again()
   }
   let _ = tree.frame(w, h, now=now)
+  view_cursor_tell()
   let t1 = work_clock_now()
   let la = glass_light_angle_now()
   let light_changed = view_app.frame_no > 1 && (la - view_app.last_light_angle).abs() > 1.0e-6
@@ -3167,6 +3254,11 @@ fn view_events_push(events : Array[(Double, Double, Double)], at : Double, x : D
 /// Note: `mac_app.m` sends `0=down, 1=move, 2=up, 3=cancel` with `btn=0` primary / `btn=2` secondary;
 /// `ui::run` translates `mac_app.m`'s `(kind, btn)` into this convention before calling `view_pointer`.
 pub fn view_pointer(kind : Int, x : Double, y : Double, now : Double, button~ : Int = 1) -> Unit {
+  view_pointer_dispatch(kind, x, y, now, button)
+  view_cursor_tell()
+}
+
+fn view_pointer_dispatch(kind : Int, x : Double, y : Double, now : Double, button : Int) -> Unit {
   if kind <= 3 {
     view_app.pointer_x = x
     view_app.pointer_y = y
