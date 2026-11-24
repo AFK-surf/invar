@@ -59,6 +59,44 @@ assert d['total_passed'] > 0 and d['total_failed'] == 0
 print('OK: test damage (%d passed, %d ms)' % (d['total_passed'], d['elapsed_ms']))
 " "$TST_JSON"
 
+echo "=== 5b. invar check (workspace) + parallel multi-pkg --only-pkg + filter + fail reporting ==="
+WS_CHK_JSON="$("$INVAR" check --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and len(d['packages']) >= 40, f'workspace check failed: {d}'
+print('OK: workspace check (%d packages, %d ms)' % (len(d['packages']), d['elapsed_ms']))
+" "$WS_CHK_JSON"
+
+WS_TST_JSON="$("$INVAR" test --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['total_failed'] == 0 and len(d['packages']) >= 40, f'workspace test failed: {d}'
+zero_pkgs = [p['pkg'] for p in d['packages'] if p['passed'] <= 0]
+assert not zero_pkgs, f'workspace test package name mapping mismatch (0 passed): {zero_pkgs}'
+print('OK: workspace test (%d packages, %d passed, %d ms)' % (len(d['packages']), d['total_passed'], d['elapsed_ms']))
+" "$WS_TST_JSON"
+
+MULTI_TST_JSON="$("$INVAR" test --pkg damage --pkg halt --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['total_failed'] == 0, f'multi-pkg test failed: {d}'
+assert [p['pkg'] for p in d['packages']] == ['damage', 'halt'], f'order mismatch: {d}'
+# damage has ~12 own tests and halt has ~2 own tests; --only-pkg must not re-run transitive deps
+assert d['packages'][0]['passed'] < 40 and d['packages'][1]['passed'] >= 1, f'unexpected counts: {d}'
+print('OK: parallel multi-pkg --only-pkg (%d passed, %d ms)' % (d['total_passed'], d['elapsed_ms']))
+" "$MULTI_TST_JSON"
+
+ZERO_FLT_JSON="$("$INVAR" test --pkg damage --filter __no_such_test_xyz__ --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['total_passed'] == 0 and d['total_failed'] == 0, f'zero-match filter failed: {d}'
+print('OK: zero-match filter')
+" "$ZERO_FLT_JSON"
+
 echo "=== 6. invar new jsx-app + check + test + audit + no-overwrite ==="
 JSX_DIR="$TMP/my_jsx_app"
 NEW_JSX="$("$INVAR" new --template jsx-app --json "$JSX_DIR")"
@@ -99,6 +137,23 @@ d = json.loads(sys.argv[1])
 assert d['ok'] is True and d['error_count'] == 0 and d['warning_count'] == 0, f'jsx-app audit failed: {d}'
 print('OK: jsx-app audit (0 errors, 0 warnings)')
 " "$JSX_AUD"
+
+# Verify failing test propagation in JSON output
+printf '\ntest "intentional_cli_fail" {\n  debug_assert(false, "cli_fail_sentinel")\n}\n' >> "$JSX_DIR/src/main_test.pion"
+FAIL_RC=0
+FAIL_TST="$("$INVAR" test --pkg "$JSX_DIR" --json)" || FAIL_RC=$?
+if [ "$FAIL_RC" -eq 0 ]; then
+  echo "FAIL: invar test should exit non-zero on failing test" >&2
+  exit 1
+fi
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is False and d['total_failed'] == 1, f'expected 1 failure: {d}'
+err = d['packages'][0]['error']
+assert 'intentional_cli_fail' in err and 'cli_fail_sentinel' in err, f'missing fail details: {err}'
+print('OK: jsx-app failing test properly reported')
+" "$FAIL_TST"
 
 echo "=== 7. invar new web-app + invar web build ==="
 WEB_DIR="$TMP/my_web_app"

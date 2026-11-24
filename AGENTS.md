@@ -146,8 +146,8 @@ Install or run the unified CLI (`scripts/install.sh` puts `invar` on `PATH`, or 
 bash scripts/install.sh                            # install `invar` CLI shim
 invar doctor --json                                # verify pionc2, qbe, libpionrt.a, host deps
 invar audit --json                                 # static gates (zero Glass::liquid outside packages/lg, etc.)
-invar check --json                                 # type-check all packages & examples (pass --fmt for pionc fmt --check)
-invar test --json                                  # unit tests across core layers, hostapi, kit, ui, lg, examples
+invar check --json                                 # type-check workspace in one shot (pass --fmt, --pkg, -j/--jobs)
+invar test --json                                  # run deduplicated workspace unit tests in parallel (--pkg defaults to --only-pkg; pass --with-deps or -j/--jobs)
 invar new my_app --template jsx-app                # scaffold a new Pion-JSX + ui::Worker app
 invar web build|dev|check                          # build/serve/verify wasm32 showcase & JS bridge
 invar shot / invar diff                            # deterministic offscreen PNG render & pixel diff

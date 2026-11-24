@@ -6,6 +6,7 @@ Subcommands: doctor, check, test, audit, new, web, shot, diff, host-check, bench
 
 import argparse
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import functools
 import gzip
 import hashlib
@@ -154,6 +155,8 @@ def resolve_pionc():
         "libpionrt": None,
         "wasm_rt": None,
         "subcommands": [],
+        "supports_only_pkg": False,
+        "supports_jobs": False,
     }
     if not pionc_path:
         return info
@@ -186,6 +189,8 @@ def resolve_pionc():
         if re.search(rf"\b{sub}\b", help_text):
             subs.append(sub)
     info["subcommands"] = subs
+    info["supports_only_pkg"] = bool(re.search(r"--only-pkg\b", help_text))
+    info["supports_jobs"] = bool(re.search(r"^\s*pionc\s+test\b[^\n]*--jobs\b", help_text, re.M))
     return info
 
 
@@ -652,6 +657,159 @@ def cmd_doctor(args):
 
 
 # ---------------------------------------------------------------------------
+# Workspace & Parallel Execution Helpers
+# ---------------------------------------------------------------------------
+
+def _default_jobs(requested=0, cap=8):
+    if requested and int(requested) > 0:
+        return int(requested)
+    cpus = os.cpu_count() or 4
+    return max(1, min(cpus, cap))
+
+
+def _parse_workspace_members():
+    """Return set of realpaths listed under [workspace] members in INVAR_ROOT/pion.toml, or None."""
+    ws_toml = os.path.join(INVAR_ROOT, "pion.toml")
+    if not os.path.isfile(ws_toml):
+        return None
+    try:
+        text = open(ws_toml, "r", encoding="utf-8").read()
+    except OSError:
+        return None
+    in_ws = False
+    in_members = False
+    members = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            in_ws = (line == "[workspace]")
+            in_members = False
+            continue
+        if not in_ws:
+            continue
+        if not in_members:
+            m = re.match(r"^members\s*=\s*\[(.*)$", line)
+            if not m:
+                continue
+            rest = m.group(1)
+            in_members = True
+        else:
+            rest = line
+        end_idx = rest.find("]")
+        chunk = rest[:end_idx] if end_idx >= 0 else rest
+        for sm in re.finditer(r'"([^"]+)"', chunk):
+            members.append(os.path.realpath(os.path.join(INVAR_ROOT, sm.group(1))))
+        if end_idx >= 0:
+            in_members = False
+    return set(members) if members else None
+
+
+def _read_pkg_manifest_name(pkg_dir):
+    toml_path = os.path.join(pkg_dir, "pion.toml")
+    if os.path.isfile(toml_path):
+        try:
+            in_pkg = False
+            for raw_line in open(toml_path, "r", encoding="utf-8"):
+                line = raw_line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if line.startswith("["):
+                    in_pkg = (line == "[package]")
+                    continue
+                if in_pkg:
+                    m = re.match(r'^name\s*=\s*"([^"]+)"', line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+    return os.path.basename(os.path.normpath(pkg_dir))
+
+
+def _parse_json_tail(text):
+    """Parse JSON from stdout, tolerating leading non-JSON log lines."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        pass
+    for line in reversed(s.splitlines()):
+        ls = line.strip()
+        if ls.startswith("{") and ls.endswith("}"):
+            try:
+                return json.loads(ls)
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _format_diag_line(d):
+    f = d.get("file", "")
+    line = d.get("line", 0)
+    col = d.get("col", 0)
+    code = d.get("code", "")
+    msg = d.get("message", "")
+    loc = f"{f}:{line}:{col}" if f else ""
+    prefix = f"{loc}: " if loc else ""
+    code_s = f"[{code}] " if code else ""
+    return f"{prefix}{code_s}{msg}".strip()
+
+
+def _map_file_to_pkg_spec(file_path, pkg_dir_pairs):
+    """Map a diagnostic file path to its owning package spec (longest dir prefix wins)."""
+    if not file_path:
+        return None
+    cand = file_path if os.path.isabs(file_path) else os.path.join(INVAR_ROOT, file_path)
+    real = os.path.realpath(cand)
+    for pdir_real, spec in pkg_dir_pairs:
+        if real == pdir_real or real.startswith(pdir_real + os.sep):
+            return spec
+    return None
+
+
+def _filter_stderr_for_pkg(err_text, pdir_real, spec):
+    """Extract stderr lines belonging to one package; fall back to stderr tail if unmatched."""
+    raw = (err_text or "").strip()
+    if not raw:
+        return ""
+    needles = [pdir_real + os.sep]
+    if os.sep != "/":
+        needles.append(pdir_real.replace(os.sep, "/") + "/")
+    try:
+        rel = os.path.relpath(pdir_real, INVAR_ROOT)
+        if rel and not rel.startswith(".."):
+            needles.append(rel + os.sep)
+            needles.append(rel.replace(os.sep, "/") + "/")
+    except ValueError:
+        pass
+    if spec:
+        needles.append("/" + spec + "/")
+    matched = [ln for ln in raw.splitlines() if any(nd in ln for nd in needles)]
+    if matched:
+        return "\n".join(matched).strip()[-1200:]
+    return raw[-1200:]
+
+
+def _run_pkg_fmt_check(pionc_path, env, pdir):
+    pion_files = []
+    src_dir = os.path.join(pdir, "src")
+    if os.path.isdir(src_dir):
+        for r_d, _ds, fs in os.walk(src_dir):
+            for fn in sorted(fs):
+                if fn.endswith(".pion"):
+                    pion_files.append(os.path.join(r_d, fn))
+    if not pion_files:
+        return True, ""
+    rc, out, err, _ = run_cmd([pionc_path, "fmt", "--check"] + pion_files, cwd=INVAR_ROOT, env=env)
+    if rc != 0:
+        return False, (out + err).strip()
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # Subcommand 2: check
 # ---------------------------------------------------------------------------
 
@@ -667,53 +825,175 @@ def cmd_check(args):
     else:
         pkgs, skipped = discover_workspace_pkgs("check")
     t_all = time.monotonic()
+    do_fmt = bool(args.fmt) and not bool(args.no_fmt)
+    jobs = _default_jobs(getattr(args, "jobs", 0))
+
+    ws_members = None if args.pkg else _parse_workspace_members()
+    pkg_real_map = {spec: os.path.realpath(resolve_pkg_dir(spec)) for spec in pkgs}
+    use_ws = (
+        not args.pkg
+        and ws_members is not None
+        and set(pkg_real_map.values()) == ws_members
+    )
+
     results = []
     all_ok = True
+    ws_done = False
+    precomputed_fmt = None
 
-    do_fmt = bool(args.fmt) and not bool(args.no_fmt)
-    for spec in pkgs:
-        pdir = resolve_pkg_dir(spec)
-        t0 = time.monotonic()
-        fmt_ok = True
-        check_ok = True
-        err_msg = ""
-
-        if not os.path.isdir(pdir):
-            all_ok = False
-            results.append({"pkg": spec, "ok": False, "fmt_ok": False, "check_ok": False, "elapsed_ms": 0, "error": f"package directory not found: {pdir}"})
-            continue
-
+    if use_ws:
+        fmt_results = {spec: (True, "") for spec in pkgs}
         if do_fmt:
-            pion_files = []
-            src_dir = os.path.join(pdir, "src")
-            if os.path.isdir(src_dir):
-                for r_d, _ds, fs in os.walk(src_dir):
-                    for fn in sorted(fs):
-                        if fn.endswith(".pion"):
-                            pion_files.append(os.path.join(r_d, fn))
-            if pion_files:
-                rc, out, err, _ = run_cmd([pionc["path"], "fmt", "--check"] + pion_files, cwd=INVAR_ROOT, env=env)
-                if rc != 0:
-                    fmt_ok = False
-                    err_msg = (out + err).strip()
+            workers = min(max(1, len(pkgs)), jobs)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {
+                    ex.submit(_run_pkg_fmt_check, pionc["path"], env, pkg_real_map[spec]): spec
+                    for spec in pkgs
+                }
+                for fut in as_completed(futs):
+                    spec = futs[fut]
+                    fmt_results[spec] = fut.result()
+            precomputed_fmt = fmt_results
 
-        rc, out, err, _ = run_cmd([pionc["path"], "check", pdir], cwd=INVAR_ROOT, env=env)
-        if rc != 0:
-            check_ok = False
-            err_msg = (err_msg + "\n" + (out + err).strip()).strip()
+        rc, out, err, _chk_ms = run_cmd([pionc["path"], "check", "--json", INVAR_ROOT], cwd=INVAR_ROOT, env=env)
+        data = _parse_json_tail(out)
+        pkg_diags = {spec: [] for spec in pkgs}
+        unmapped_diags = []
+        pkg_dir_pairs = sorted(
+            [(pkg_real_map[s], s) for s in pkgs],
+            key=lambda kv: len(kv[0]),
+            reverse=True,
+        )
 
-        pkg_ok = fmt_ok and check_ok
-        if not pkg_ok:
-            all_ok = False
-        ms = int((time.monotonic() - t0) * 1000)
-        results.append({
-            "pkg": spec,
-            "ok": pkg_ok,
-            "fmt_ok": fmt_ok,
-            "check_ok": check_ok,
-            "elapsed_ms": ms,
-            "error": err_msg,
-        })
+        ws_check_ok = (rc == 0)
+        has_diag_list = isinstance(data, dict) and isinstance(data.get("diagnostics"), list)
+        if has_diag_list:
+            if not data.get("ok", True) or data["diagnostics"]:
+                ws_check_ok = False
+            for d in data["diagnostics"]:
+                if not isinstance(d, dict):
+                    unmapped_diags.append(str(d))
+                    continue
+                owner = _map_file_to_pkg_spec(d.get("file", ""), pkg_dir_pairs)
+                line_s = _format_diag_line(d)
+                if owner is not None:
+                    pkg_diags[owner].append(line_s)
+                else:
+                    unmapped_diags.append(line_s)
+        elif rc != 0:
+            ws_check_ok = False
+
+        # Only accept workspace result when either all checks passed cleanly, or every diagnostic
+        # mapped cleanly to its owning package. Otherwise (manifest error, unmapped error, or
+        # non-zero exit with empty diagnostics), fall back to parallel per-package checks so
+        # attribution is exact and unaffected packages still report accurately.
+        mapped_diag_count = sum(len(v) for v in pkg_diags.values())
+        ws_usable = (ws_check_ok and has_diag_list) or (
+            not ws_check_ok and has_diag_list and mapped_diag_count > 0 and len(unmapped_diags) == 0
+        )
+
+        if ws_usable:
+            ws_done = True
+            for spec in pkgs:
+                fmt_ok, fmt_err = fmt_results[spec]
+                diags = pkg_diags[spec]
+                check_ok = (len(diags) == 0)
+                err_parts = []
+                if fmt_err:
+                    err_parts.append(fmt_err)
+                if diags:
+                    err_parts.append("\n".join(diags))
+                pkg_ok = fmt_ok and check_ok
+                if not pkg_ok:
+                    all_ok = False
+                results.append({
+                    "pkg": spec,
+                    "ok": pkg_ok,
+                    "fmt_ok": fmt_ok,
+                    "check_ok": check_ok,
+                    "elapsed_ms": 0,
+                    "error": "\n".join(err_parts).strip(),
+                })
+            if not ws_check_ok:
+                all_ok = False
+
+            if not args.json:
+                for r in results:
+                    status = "PASS" if r["ok"] else "FAIL"
+                    print(f"[{status}] {r['pkg']}")
+                    if r["error"]:
+                        print("  " + r["error"].replace("\n", "\n  "))
+
+    if not ws_done:
+        def _check_one(spec):
+            pdir = resolve_pkg_dir(spec)
+            t0 = time.monotonic()
+            fmt_ok = True
+            check_ok = True
+            err_msg = ""
+
+            if not os.path.isdir(pdir):
+                return {
+                    "pkg": spec,
+                    "ok": False,
+                    "fmt_ok": False,
+                    "check_ok": False,
+                    "elapsed_ms": 0,
+                    "error": f"package directory not found: {pdir}",
+                }
+
+            if do_fmt:
+                if precomputed_fmt is not None and spec in precomputed_fmt:
+                    fmt_ok, fmt_err = precomputed_fmt[spec]
+                else:
+                    fmt_ok, fmt_err = _run_pkg_fmt_check(pionc["path"], env, pdir)
+                if not fmt_ok:
+                    err_msg = fmt_err
+
+            rc, out, err, _ = run_cmd([pionc["path"], "check", pdir], cwd=INVAR_ROOT, env=env)
+            if rc != 0:
+                check_ok = False
+                err_msg = (err_msg + "\n" + (out + err).strip()).strip()
+
+            pkg_ok = fmt_ok and check_ok
+            ms = int((time.monotonic() - t0) * 1000)
+            return {
+                "pkg": spec,
+                "ok": pkg_ok,
+                "fmt_ok": fmt_ok,
+                "check_ok": check_ok,
+                "elapsed_ms": ms,
+                "error": err_msg,
+            }
+
+        workers = min(max(1, len(pkgs)), jobs)
+        by_idx = [None] * len(pkgs)
+        if workers <= 1:
+            for idx, spec in enumerate(pkgs):
+                r = _check_one(spec)
+                by_idx[idx] = r
+                if not r["ok"]:
+                    all_ok = False
+                if not args.json:
+                    status = "PASS" if r["ok"] else "FAIL"
+                    print(f"[{status}] {r['pkg']} ({r['elapsed_ms']} ms)", flush=True)
+                    if r["error"]:
+                        print("  " + r["error"].replace("\n", "\n  "), flush=True)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_check_one, spec): idx for idx, spec in enumerate(pkgs)}
+                for fut in as_completed(futs):
+                    idx = futs[fut]
+                    r = fut.result()
+                    by_idx[idx] = r
+                    if not r["ok"]:
+                        all_ok = False
+                    if not args.json:
+                        status = "PASS" if r["ok"] else "FAIL"
+                        print(f"[{status}] {r['pkg']} ({r['elapsed_ms']} ms)", flush=True)
+                        if r["error"]:
+                            print("  " + r["error"].replace("\n", "\n  "), flush=True)
+        results = by_idx
 
     total_ms = int((time.monotonic() - t_all) * 1000)
     res = {
@@ -726,11 +1006,6 @@ def cmd_check(args):
     if args.json:
         emit_json(res)
     else:
-        for r in results:
-            status = "PASS" if r["ok"] else "FAIL"
-            print(f"[{status}] {r['pkg']} ({r['elapsed_ms']} ms)")
-            if r["error"]:
-                print("  " + r["error"].replace("\n", "\n  "))
         for sk in skipped:
             print(f"[SKIP] {sk['pkg']} ({sk['reason']})")
         print(f"invar check: {'OK' if all_ok else 'FAILED'} ({len(results)} packages, {len(skipped)} skipped, {total_ms} ms)")
@@ -753,36 +1028,227 @@ def cmd_test(args):
     else:
         pkgs, skipped = discover_workspace_pkgs("test")
     t_all = time.monotonic()
+    with_deps = bool(getattr(args, "with_deps", False))
+    req_jobs = int(getattr(args, "jobs", 0) or 0)
+    jobs = _default_jobs(req_jobs)
+
+    # Check if we can run the entire workspace in ONE native `pionc test --json <root>` call
+    # (builds shared CAS objects once, compiles/links & runs all unique package tests in parallel).
+    use_ws = False
+    if not args.pkg and not with_deps:
+        ws_members = _parse_workspace_members()
+        if ws_members is not None:
+            chk_pkgs, _ = discover_workspace_pkgs("check")
+            chk_reals = {os.path.realpath(resolve_pkg_dir(s)) for s in chk_pkgs}
+            skipped_reals = {os.path.realpath(resolve_pkg_dir(sk["pkg"])) for sk in skipped}
+            if chk_reals == ws_members and not (skipped_reals & ws_members):
+                use_ws = True
+
     results = []
     total_passed = 0
     total_failed = 0
     all_ok = True
+    ws_done = False
 
-    for spec in pkgs:
-        pdir = resolve_pkg_dir(spec)
-        t0 = time.monotonic()
-        cmd = [pionc["path"], "test", pdir]
+    if use_ws:
+        cmd = [pionc["path"], "test", "--json"]
         if args.filter:
             cmd += ["--filter", args.filter]
-        rc, out, err, _ = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
-        ms = int((time.monotonic() - t0) * 1000)
-        combined = out + "\n" + err
-        m = re.search(r"test result:\s*\w+\.\s*(\d+)\s+passed;\s*(\d+)\s+failed", combined)
-        passed = int(m.group(1)) if m else 0
-        failed = int(m.group(2)) if m else (0 if rc == 0 else 1)
-        total_passed += passed
-        total_failed += failed
-        pkg_ok = (rc == 0 and failed == 0)
-        if not pkg_ok:
-            all_ok = False
-        results.append({
-            "pkg": spec,
-            "ok": pkg_ok,
-            "passed": passed,
-            "failed": failed,
-            "elapsed_ms": ms,
-            "error": "" if pkg_ok else combined.strip()[-1200:],
-        })
+        if req_jobs > 0 and pionc.get("supports_jobs"):
+            cmd += ["--jobs", str(req_jobs)]
+        cmd.append(INVAR_ROOT)
+
+        rc, out, err, _ws_ms = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
+        data = _parse_json_tail(out)
+        spec_to_dir = {spec: os.path.realpath(resolve_pkg_dir(spec)) for spec in pkgs}
+        spec_to_name = {spec: _read_pkg_manifest_name(spec_to_dir[spec]) for spec in pkgs}
+
+        if isinstance(data, dict) and isinstance(data.get("tests"), list):
+            by_name = {}
+            for t in data["tests"]:
+                if not isinstance(t, dict):
+                    continue
+                pname = t.get("pkg", "")
+                rec = by_name.setdefault(pname, {"passed": 0, "failed": 0, "fail_names": []})
+                if t.get("ok"):
+                    rec["passed"] += 1
+                else:
+                    rec["failed"] += 1
+                    rec["fail_names"].append(t.get("name", "<unnamed>"))
+
+            ws_ok = (rc == 0 and bool(data.get("ok", False)) and int(data.get("failed", 0)) == 0)
+            ws_failed_tests = sum(r["failed"] for r in by_name.values())
+            reported_pkgs = set(data.get("packages") or []) if isinstance(data.get("packages"), list) else set()
+            ws_pkgs_complete = all(n in reported_pkgs for n in spec_to_name.values())
+            # Accept workspace result when all tests passed or concrete per-package test failures
+            # were reported with every expected package accounted for. Otherwise (e.g. a
+            # compile/typecheck/link/manifest error or an older pionc without workspace test
+            # support), fall back to parallel per-package Path B so unaffected packages still run
+            # and every failure is attributed to its exact package.
+            if ws_ok or (ws_failed_tests > 0 and ws_pkgs_complete):
+                ws_done = True
+                seen_names = set()
+                for spec in pkgs:
+                    pname = spec_to_name[spec]
+                    seen_names.add(pname)
+                    rec = by_name.get(pname, {"passed": 0, "failed": 0, "fail_names": []})
+                    passed = rec["passed"]
+                    failed = rec["failed"]
+                    pkg_ok = (failed == 0)
+                    err_msg = ""
+                    if failed > 0:
+                        err_msg = "failed tests: " + ", ".join(rec["fail_names"])
+                        pkg_stderr = _filter_stderr_for_pkg(err, spec_to_dir[spec], spec)
+                        if pkg_stderr:
+                            err_msg = err_msg + "\n" + pkg_stderr
+                    total_passed += passed
+                    total_failed += failed
+                    if not pkg_ok:
+                        all_ok = False
+                    results.append({
+                        "pkg": spec,
+                        "ok": pkg_ok,
+                        "passed": passed,
+                        "failed": failed,
+                        "elapsed_ms": 0,
+                        "error": err_msg,
+                    })
+                # Defensively account for any workspace test package not in discovered `pkgs`
+                for pname, rec in by_name.items():
+                    if pname in seen_names:
+                        continue
+                    passed = rec["passed"]
+                    failed = rec["failed"]
+                    pkg_ok = (failed == 0)
+                    total_passed += passed
+                    total_failed += failed
+                    if not pkg_ok:
+                        all_ok = False
+                    err_msg = ""
+                    if failed > 0:
+                        err_msg = "failed tests: " + ", ".join(rec["fail_names"])
+                        pkg_stderr = _filter_stderr_for_pkg(err, os.path.join(INVAR_ROOT, "packages", pname), pname)
+                        if pkg_stderr:
+                            err_msg = err_msg + "\n" + pkg_stderr
+                    results.append({
+                        "pkg": pname,
+                        "ok": pkg_ok,
+                        "passed": passed,
+                        "failed": failed,
+                        "elapsed_ms": 0,
+                        "error": err_msg,
+                    })
+                if not ws_ok:
+                    all_ok = False
+
+                if not args.json:
+                    for r in results:
+                        status = "PASS" if r["ok"] else "FAIL"
+                        print(f"[{status}] {r['pkg']}: {r['passed']} passed, {r['failed']} failed")
+                        if r["error"]:
+                            print(r["error"])
+
+    if not ws_done:
+        use_only_pkg = bool(pionc.get("supports_only_pkg")) and not with_deps
+        outer_workers = min(max(1, len(pkgs)), jobs)
+        cpu_budget = req_jobs if req_jobs > 0 else (os.cpu_count() or 4)
+        inner_jobs = max(1, cpu_budget // outer_workers)
+
+        def _test_one(spec):
+            pdir = resolve_pkg_dir(spec)
+            t0 = time.monotonic()
+            if not os.path.isdir(pdir):
+                return {
+                    "pkg": spec,
+                    "ok": False,
+                    "passed": 0,
+                    "failed": 1,
+                    "elapsed_ms": 0,
+                    "error": f"package directory not found: {pdir}",
+                }
+            cmd = [pionc["path"], "test", "--json"]
+            if use_only_pkg:
+                cmd.append("--only-pkg")
+            if args.filter:
+                cmd += ["--filter", args.filter]
+            if pionc.get("supports_jobs"):
+                if outer_workers > 1:
+                    cmd += ["--jobs", str(inner_jobs)]
+                elif req_jobs > 0:
+                    cmd += ["--jobs", str(req_jobs)]
+            cmd.append(pdir)
+
+            rc, out, err, _ = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
+            ms = int((time.monotonic() - t0) * 1000)
+            data = _parse_json_tail(out)
+            if isinstance(data, dict) and "passed" in data and "failed" in data:
+                passed = int(data.get("passed", 0))
+                failed = int(data.get("failed", 0))
+                pkg_ok = (rc == 0 and bool(data.get("ok", False)) and failed == 0)
+                if not pkg_ok and failed == 0:
+                    failed = 1
+                err_msg = ""
+                if not pkg_ok:
+                    fail_names = [
+                        t.get("name", "<unnamed>")
+                        for t in (data.get("tests") or [])
+                        if isinstance(t, dict) and not t.get("ok")
+                    ]
+                    parts = []
+                    if fail_names:
+                        parts.append("failed tests: " + ", ".join(fail_names))
+                    tail = (err or "").strip()[-1200:]
+                    if tail:
+                        parts.append(tail)
+                    err_msg = "\n".join(parts).strip() or (out + "\n" + err).strip()[-1200:]
+            else:
+                combined = out + "\n" + err
+                m = re.search(r"test result:\s*\w+\.\s*(\d+)\s+passed;\s*(\d+)\s+failed", combined)
+                passed = int(m.group(1)) if m else 0
+                failed = int(m.group(2)) if m else (0 if rc == 0 else 1)
+                pkg_ok = (rc == 0 and failed == 0)
+                err_msg = "" if pkg_ok else combined.strip()[-1200:]
+
+            return {
+                "pkg": spec,
+                "ok": pkg_ok,
+                "passed": passed,
+                "failed": failed,
+                "elapsed_ms": ms,
+                "error": err_msg,
+            }
+
+        by_idx = [None] * len(pkgs)
+        if outer_workers <= 1:
+            for idx, spec in enumerate(pkgs):
+                r = _test_one(spec)
+                by_idx[idx] = r
+                total_passed += r["passed"]
+                total_failed += r["failed"]
+                if not r["ok"]:
+                    all_ok = False
+                if not args.json:
+                    status = "PASS" if r["ok"] else "FAIL"
+                    print(f"[{status}] {r['pkg']}: {r['passed']} passed, {r['failed']} failed ({r['elapsed_ms']} ms)", flush=True)
+                    if r["error"]:
+                        print(r["error"], flush=True)
+        else:
+            with ThreadPoolExecutor(max_workers=outer_workers) as ex:
+                futs = {ex.submit(_test_one, spec): idx for idx, spec in enumerate(pkgs)}
+                for fut in as_completed(futs):
+                    idx = futs[fut]
+                    r = fut.result()
+                    by_idx[idx] = r
+                    total_passed += r["passed"]
+                    total_failed += r["failed"]
+                    if not r["ok"]:
+                        all_ok = False
+                    if not args.json:
+                        status = "PASS" if r["ok"] else "FAIL"
+                        print(f"[{status}] {r['pkg']}: {r['passed']} passed, {r['failed']} failed ({r['elapsed_ms']} ms)", flush=True)
+                        if r["error"]:
+                            print(r["error"], flush=True)
+        results = by_idx
 
     total_ms = int((time.monotonic() - t_all) * 1000)
     res = {
@@ -796,11 +1262,6 @@ def cmd_test(args):
     if args.json:
         emit_json(res)
     else:
-        for r in results:
-            status = "PASS" if r["ok"] else "FAIL"
-            print(f"[{status}] {r['pkg']}: {r['passed']} passed, {r['failed']} failed ({r['elapsed_ms']} ms)")
-            if r["error"]:
-                print(r["error"])
         for sk in skipped:
             print(f"[SKIP] {sk['pkg']} ({sk['reason']})")
         print(f"invar test: {'OK' if all_ok else 'FAILED'} ({total_passed} passed, {total_failed} failed, {len(skipped)} skipped, {total_ms} ms)")
@@ -3121,6 +3582,7 @@ def build_parser():
     sp.add_argument("--pkg", action="append", default=[], help="Package name or path (repeatable)")
     sp.add_argument("--fmt", action="store_true", help="Also run pionc fmt --check on package .pion files")
     sp.add_argument("--no-fmt", action="store_true", help="Compatibility no-op (fmt check is off by default)")
+    sp.add_argument("-j", "--jobs", type=int, default=0, help="Parallel worker count (0 = auto)")
     sp.set_defaults(func=cmd_check)
 
     # test
@@ -3128,6 +3590,8 @@ def build_parser():
     sp.add_argument("--json", action="store_true", help="Output structured JSON")
     sp.add_argument("--pkg", action="append", default=[], help="Package name or path (repeatable)")
     sp.add_argument("--filter", default="", help="Forward --filter <substr> to pionc test")
+    sp.add_argument("-j", "--jobs", type=int, default=0, help="Parallel worker count (0 = auto)")
+    sp.add_argument("--with-deps", action="store_true", help="Also run transitive dependency tests for --pkg targets")
     sp.set_defaults(func=cmd_test)
 
     # audit
