@@ -1,0 +1,844 @@
+// Declarative text parser for `Style`: `css(...)` and `css_read(...)`.
+// Strict 1:1 token vocabulary matching `tokens.pion` with 0-based UTF-8 byte-offset errors.
+
+import "halt"
+
+/// Parse a declarative `Style` string, halting with a descriptive byte-offset message on error.
+pub fn css(text : String) -> Style {
+  match css_read(text) {
+    Ok(st) => st
+    Err(msg) => halt::halt(msg)
+  }
+}
+
+/// Parse a declarative `Style` string into `Ok(Style)` or `Err("css: <reason> at <byte_offset> in \"<text>\"")`.
+pub fn css_read(text : String) -> Result[Style, String] {
+  let r = Css::{ s: text, i: 0 }
+  let st = CssStates::{
+    narrow: None,
+    dark: None,
+    selected: None,
+    hovered: None,
+    focused: None,
+    pressed: None,
+    disabled: None,
+  }
+  match r.parse_patch(Some(st)) {
+    Ok(base) => Ok(Style::{
+      base,
+      narrow: st.narrow,
+      dark: st.dark,
+      selected: st.selected,
+      hovered: st.hovered,
+      focused: st.focused,
+      pressed: st.pressed,
+      disabled: st.disabled,
+    })
+    Err(e) => Err(e)
+  }
+}
+
+struct Css {
+  s : String
+  mut i : Int
+}
+
+struct CssStates {
+  mut narrow : Option[Patch]
+  mut dark : Option[Patch]
+  mut selected : Option[Patch]
+  mut hovered : Option[Patch]
+  mut focused : Option[Patch]
+  mut pressed : Option[Patch]
+  mut disabled : Option[Patch]
+}
+
+fn Css::fail[T](self : Css, reason : String) -> Result[T, String] {
+  Err("css: \{reason} at \{self.i} in \"\{self.s}\"")
+}
+
+/// Current UTF-8 byte as an Int (0..255), or 0 at end of input.
+fn Css::peek(self : Css) -> Int {
+  if self.i < self.s.length() {
+    self.s.code_unit_at(self.i)
+  } else {
+    0
+  }
+}
+
+fn is_css_ws(b : Int) -> Bool {
+  b == 32 || b == 10 || b == 9 || b == 13
+}
+
+fn is_css_ident(b : Int) -> Bool {
+  (b >= 97 && b <= 122) ||
+  (b >= 65 && b <= 90) ||
+  (b >= 48 && b <= 57) ||
+  b == 95
+}
+
+fn Css::skip_space(self : Css) -> Unit {
+  while self.i < self.s.length() && is_css_ws(self.s.code_unit_at(self.i)) {
+    self.i += 1
+  }
+}
+
+fn Css::name(self : Css) -> Result[String, String] {
+  self.skip_space()
+  let a = self.i
+  while self.i < self.s.length() && is_css_ident(self.s.code_unit_at(self.i)) {
+    self.i += 1
+  }
+  if self.i == a {
+    return self.fail("a name wanted")
+  }
+  Ok(self.s.slice(a, self.i))
+}
+
+fn Css::expect(self : Css, expected : Int, label : String) -> Result[Unit, String] {
+  self.skip_space()
+  if self.peek() != expected {
+    return self.fail("\{label} wanted")
+  }
+  self.i += 1
+  Ok(())
+}
+
+/// Exact powers of ten representable in IEEE-754 binary64 (0..=22).
+fn css_pow10(e : Int) -> Double {
+  match e {
+    0 => 1.0e0
+    1 => 1.0e1
+    2 => 1.0e2
+    3 => 1.0e3
+    4 => 1.0e4
+    5 => 1.0e5
+    6 => 1.0e6
+    7 => 1.0e7
+    8 => 1.0e8
+    9 => 1.0e9
+    10 => 1.0e10
+    11 => 1.0e11
+    12 => 1.0e12
+    13 => 1.0e13
+    14 => 1.0e14
+    15 => 1.0e15
+    16 => 1.0e16
+    17 => 1.0e17
+    18 => 1.0e18
+    19 => 1.0e19
+    20 => 1.0e20
+    21 => 1.0e21
+    22 => 1.0e22
+    _ => 1.0e0
+  }
+}
+
+/// Exact Clinger fast-path decimal parser: mantissa <= 2^53 and |exponent| <= 22.
+/// Rejects NaN, Inf, non-numeric tokens, and inexact precision/exponent ranges.
+fn Css::num(self : Css) -> Result[Double, String] {
+  self.skip_space()
+  let neg = self.peek() == 45
+  if neg {
+    self.i += 1
+  }
+  let most : Int64 = 9007199254740992L // 2^53
+  let mut m : Int64 = 0L
+  let mut e : Int = 0
+  let mut digits = false
+  let mut point = false
+  while self.i < self.s.length() {
+    let b = self.peek()
+    if b >= 48 && b <= 57 {
+      m = m * 10L + (b - 48).to_int64()
+      if m > most {
+        return self.fail("a number with more digits than read exactly")
+      }
+      if point {
+        e -= 1
+      }
+      digits = true
+    } else if b == 95 {
+      ()
+    } else if b == 46 && !point {
+      point = true
+    } else {
+      break
+    }
+    self.i += 1
+  }
+  if !digits {
+    return self.fail("a number wanted")
+  }
+  let eb = self.peek()
+  if eb == 101 || eb == 69 {
+    self.i += 1
+    let eneg = self.peek() == 45
+    if eneg || self.peek() == 43 {
+      self.i += 1
+    }
+    let mut x = 0
+    let a = self.i
+    while self.i < self.s.length() {
+      let d = self.peek()
+      if d >= 48 && d <= 57 {
+        if x < 1000000 {
+          x = x * 10 + (d - 48)
+        }
+        self.i += 1
+      } else {
+        break
+      }
+    }
+    if self.i == a {
+      return self.fail("an exponent wanted")
+    }
+    e += if eneg { -x } else { x }
+  }
+  let v = if e >= 0 && e <= 22 {
+    m.to_double() * css_pow10(e)
+  } else if e < 0 && e >= -22 {
+    m.to_double() / css_pow10(-e)
+  } else {
+    return self.fail("a number with a power of ten not read exactly")
+  }
+  let out = if neg { -v } else { v }
+  if out != out {
+    return self.fail("NaN is not allowed")
+  }
+  Ok(out)
+}
+
+/// Decimal or `0x`/`0X` hex Int64 parser with overflow protection.
+fn Css::int64(self : Css) -> Result[Int64, String] {
+  self.skip_space()
+  let neg = self.peek() == 45
+  if neg {
+    self.i += 1
+  }
+  let hex = self.peek() == 48 &&
+    self.i + 1 < self.s.length() &&
+    (self.s.code_unit_at(self.i + 1) == 120 || self.s.code_unit_at(self.i + 1) == 88)
+  if hex {
+    self.i += 2
+  }
+  let base : Int64 = if hex { 16L } else { 10L }
+  let max_i64 : Int64 = 9223372036854775807L
+  let min_i64 : Int64 = -9223372036854775807L - 1L
+  let mut m : Int64 = 0L
+  let mut digits = false
+  while self.i < self.s.length() {
+    let b = self.peek()
+    if b == 95 {
+      self.i += 1
+      continue
+    }
+    let d : Int = if b >= 48 && b <= 57 {
+      b - 48
+    } else if hex && b >= 97 && b <= 102 {
+      b - 87
+    } else if hex && b >= 65 && b <= 70 {
+      b - 55
+    } else {
+      break
+    }
+    let d64 = d.to_int64()
+    if neg {
+      if m < (min_i64 + d64) / base {
+        return self.fail("a number past an Int64")
+      }
+      m = m * base - d64
+    } else {
+      if m > (max_i64 - d64) / base {
+        return self.fail("a number past an Int64")
+      }
+      m = m * base + d64
+    }
+    digits = true
+    self.i += 1
+  }
+  if !digits {
+    return self.fail("a number wanted")
+  }
+  Ok(m)
+}
+
+fn Css::arg_num(self : Css) -> Result[Double, String] {
+  match self.expect(40, "(") {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let v = match self.num() {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  match self.expect(41, ")") {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(v)
+}
+
+fn Css::arg_int64(self : Css) -> Result[Int64, String] {
+  match self.expect(40, "(") {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  let v = match self.int64() {
+    Ok(n) => n
+    Err(e) => return Err(e)
+  }
+  match self.expect(41, ")") {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
+  Ok(v)
+}
+
+fn Css::parse_bool(self : Css) -> Result[Bool, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "true" => Ok(true)
+    "false" => Ok(false)
+    _ => self.fail("no Bool \{n}")
+  }
+}
+
+fn Css::parse_len(self : Css) -> Result[Len, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "Hug" => Ok(Len::Hug)
+    "Cut" => Ok(Len::Cut)
+    "Full" => Ok(Len::Full)
+    "Grow" => match self.arg_num() { Ok(v) => Ok(Len::Grow(v)); Err(e) => Err(e) }
+    "Fixed" => match self.arg_num() { Ok(v) => Ok(Len::Fixed(v)); Err(e) => Err(e) }
+    "Pct" => match self.arg_num() { Ok(v) => Ok(Len::Pct(v)); Err(e) => Err(e) }
+    "Within" => match self.arg_num() { Ok(v) => Ok(Len::Within(v)); Err(e) => Err(e) }
+    "S0" => Ok(Len::S0)
+    "SPx" => Ok(Len::SPx)
+    "S0_5" => Ok(Len::S0_5)
+    "S1" => Ok(Len::S1)
+    "S1_25" => Ok(Len::S1_25)
+    "S1_5" => Ok(Len::S1_5)
+    "S2" => Ok(Len::S2)
+    "S2_5" => Ok(Len::S2_5)
+    "S3" => Ok(Len::S3)
+    "S3_5" => Ok(Len::S3_5)
+    "S4" => Ok(Len::S4)
+    "S4_5" => Ok(Len::S4_5)
+    "S5" => Ok(Len::S5)
+    "S6" => Ok(Len::S6)
+    "S7" => Ok(Len::S7)
+    "S8" => Ok(Len::S8)
+    "S9" => Ok(Len::S9)
+    "S10" => Ok(Len::S10)
+    "S11" => Ok(Len::S11)
+    "S12" => Ok(Len::S12)
+    "S14" => Ok(Len::S14)
+    "S16" => Ok(Len::S16)
+    "S20" => Ok(Len::S20)
+    "S24" => Ok(Len::S24)
+    "S28" => Ok(Len::S28)
+    "S32" => Ok(Len::S32)
+    "S36" => Ok(Len::S36)
+    "S40" => Ok(Len::S40)
+    "S44" => Ok(Len::S44)
+    "S48" => Ok(Len::S48)
+    "S52" => Ok(Len::S52)
+    "S56" => Ok(Len::S56)
+    "S60" => Ok(Len::S60)
+    "S64" => Ok(Len::S64)
+    "S72" => Ok(Len::S72)
+    "S80" => Ok(Len::S80)
+    "S96" => Ok(Len::S96)
+    _ => self.fail("no Len \{n}")
+  }
+}
+
+fn Css::parse_space(self : Css) -> Result[Space, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "S0" => Ok(Space::S0)
+    "SPx" => Ok(Space::SPx)
+    "S0_5" => Ok(Space::S0_5)
+    "S1" => Ok(Space::S1)
+    "S1_25" => Ok(Space::S1_25)
+    "S1_5" => Ok(Space::S1_5)
+    "S2" => Ok(Space::S2)
+    "S2_5" => Ok(Space::S2_5)
+    "S3" => Ok(Space::S3)
+    "S3_5" => Ok(Space::S3_5)
+    "S4" => Ok(Space::S4)
+    "S4_5" => Ok(Space::S4_5)
+    "S5" => Ok(Space::S5)
+    "S6" => Ok(Space::S6)
+    "S7" => Ok(Space::S7)
+    "S8" => Ok(Space::S8)
+    "S9" => Ok(Space::S9)
+    "S10" => Ok(Space::S10)
+    "S11" => Ok(Space::S11)
+    "S12" => Ok(Space::S12)
+    "S14" => Ok(Space::S14)
+    "S16" => Ok(Space::S16)
+    "S20" => Ok(Space::S20)
+    "S24" => Ok(Space::S24)
+    "S28" => Ok(Space::S28)
+    "S32" => Ok(Space::S32)
+    "S36" => Ok(Space::S36)
+    "S40" => Ok(Space::S40)
+    "S44" => Ok(Space::S44)
+    "S48" => Ok(Space::S48)
+    "S52" => Ok(Space::S52)
+    "S56" => Ok(Space::S56)
+    "S60" => Ok(Space::S60)
+    "S64" => Ok(Space::S64)
+    "S72" => Ok(Space::S72)
+    "S80" => Ok(Space::S80)
+    "S96" => Ok(Space::S96)
+    "Exact" => match self.arg_num() { Ok(v) => Ok(Space::Exact(v)); Err(e) => Err(e) }
+    _ => self.fail("no Space \{n}")
+  }
+}
+
+fn Css::parse_align(self : Css) -> Result[Align, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "AStart" => Ok(Align::Start)
+    "ACenter" => Ok(Align::Center)
+    "AEnd" => Ok(Align::End)
+    "AStretch" => Ok(Align::Stretch)
+    "ABaseline" => Ok(Align::Baseline)
+    "AFirstLine" => Ok(Align::FirstLine)
+    _ => self.fail("no Align \{n}")
+  }
+}
+
+fn Css::parse_justify(self : Css) -> Result[Justify, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "JStart" => Ok(Justify::Start)
+    "JCenter" => Ok(Justify::Center)
+    "JEnd" => Ok(Justify::End)
+    "JBetween" => Ok(Justify::Between)
+    "JAround" => Ok(Justify::Around)
+    "JEvenly" => Ok(Justify::Evenly)
+    _ => self.fail("no Justify \{n}")
+  }
+}
+
+fn Css::parse_radius(self : Css, depth~ : Int = 0) -> Result[Radius, String] {
+  if depth >= 64 {
+    return self.fail("nesting too deep")
+  }
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "Sharp" => Ok(Radius::Sharp)
+    "Sm" => Ok(Radius::Sm)
+    "Base" => Ok(Radius::Base)
+    "Md" => Ok(Radius::Md)
+    "Lg" => Ok(Radius::Lg)
+    "Xl" => Ok(Radius::Xl)
+    "Xl1_5" => Ok(Radius::Xl1_5)
+    "Xl2" => Ok(Radius::Xl2)
+    "Xl3" => Ok(Radius::Xl3)
+    "Xl4" => Ok(Radius::Xl4)
+    "Full" => Ok(Radius::Full)
+    "Inner" => Ok(Radius::Inner)
+    "InnerOr" => {
+      match self.expect(40, "(") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let own = match self.parse_radius(depth=depth + 1) {
+        Ok(r) => r
+        Err(e) => return Err(e)
+      }
+      match self.expect(41, ")") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      Ok(Radius::InnerOr(own))
+    }
+    "Around" => Ok(Radius::Around)
+    "Exact" => match self.arg_num() { Ok(v) => Ok(Radius::Exact(v)); Err(e) => Err(e) }
+    _ => self.fail("no Radius \{n}")
+  }
+}
+
+fn Css::parse_stroke(self : Css) -> Result[Stroke, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "B0" => Ok(Stroke::B0)
+    "B0_5" => Ok(Stroke::B0_5)
+    "B1" => Ok(Stroke::B1)
+    "B1_5" => Ok(Stroke::B1_5)
+    "B2" => Ok(Stroke::B2)
+    "B4" => Ok(Stroke::B4)
+    "B8" => Ok(Stroke::B8)
+    _ => self.fail("no Stroke \{n}")
+  }
+}
+
+fn Css::parse_shadow(self : Css) -> Result[Shadow, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "NoShadow" => Ok(Shadow::NoShadow)
+    "Sm" => Ok(Shadow::Sm)
+    "Base" => Ok(Shadow::Base)
+    "Md" => Ok(Shadow::Md)
+    "Lg" => Ok(Shadow::Lg)
+    "Xl" => Ok(Shadow::Xl)
+    "Cast" => {
+      match self.expect(40, "(") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let blur = match self.num() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(44, ",") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let y = match self.num() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(44, ",") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let c = match self.int64() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(41, ")") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      Ok(Shadow::Cast(blur, y, c))
+    }
+    _ => self.fail("no Shadow \{n}")
+  }
+}
+
+fn Css::parse_opacity(self : Css) -> Result[Opacity, String] {
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "O0" => Ok(Opacity::O0)
+    "O5" => Ok(Opacity::O5)
+    "O10" => Ok(Opacity::O10)
+    "O15" => Ok(Opacity::O15)
+    "O20" => Ok(Opacity::O20)
+    "O25" => Ok(Opacity::O25)
+    "O30" => Ok(Opacity::O30)
+    "O35" => Ok(Opacity::O35)
+    "O40" => Ok(Opacity::O40)
+    "O45" => Ok(Opacity::O45)
+    "O50" => Ok(Opacity::O50)
+    "O55" => Ok(Opacity::O55)
+    "O60" => Ok(Opacity::O60)
+    "O65" => Ok(Opacity::O65)
+    "O70" => Ok(Opacity::O70)
+    "O75" => Ok(Opacity::O75)
+    "O80" => Ok(Opacity::O80)
+    "O85" => Ok(Opacity::O85)
+    "O90" => Ok(Opacity::O90)
+    "O95" => Ok(Opacity::O95)
+    "O100" => Ok(Opacity::O100)
+    "Exact" => match self.arg_num() { Ok(v) => Ok(Opacity::Exact(v)); Err(e) => Err(e) }
+    _ => self.fail("no Opacity \{n}")
+  }
+}
+
+fn Css::parse_color(self : Css, depth~ : Int = 0) -> Result[Color, String] {
+  if depth >= 64 {
+    return self.fail("nesting too deep")
+  }
+  let n = match self.name() {
+    Ok(v) => v
+    Err(e) => return Err(e)
+  }
+  match n {
+    "Clear" => Ok(Color::Clear)
+    "Bg" => Ok(Color::Bg)
+    "Surface" => Ok(Color::Surface)
+    "Raised" => Ok(Color::Raised)
+    "Card" => Ok(Color::Card)
+    "Fg" => Ok(Color::Fg)
+    "Muted" => Ok(Color::Muted)
+    "Subtle" => Ok(Color::Subtle)
+    "Faint" => Ok(Color::Faint)
+    "Line" => Ok(Color::Line)
+    "Border" => Ok(Color::Border)
+    "Accent" => Ok(Color::Accent)
+    "AccentText" => Ok(Color::AccentText)
+    "AccentBg" => Ok(Color::AccentBg)
+    "OnAccent" => Ok(Color::OnAccent)
+    "Primary" => Ok(Color::Primary)
+    "OnPrimary" => Ok(Color::OnPrimary)
+    "Positive" => Ok(Color::Positive)
+    "Danger" => Ok(Color::Danger)
+    "DangerBg" => Ok(Color::DangerBg)
+    "OnDanger" => Ok(Color::OnDanger)
+    "Neutral" => Ok(Color::Neutral)
+    "Hover" => Ok(Color::Hover)
+    "Selected" => Ok(Color::Selected)
+    "Focus" => Ok(Color::Focus)
+    "Scrim" => Ok(Color::Scrim)
+    "Link" => Ok(Color::Link)
+    "ShadowC" => Ok(Color::ShadowC)
+    "Warn" => Ok(Color::Warn)
+    "WarnInk" => Ok(Color::WarnInk)
+    "Tint" => Ok(Color::Tint)
+    "TintStrong" => Ok(Color::TintStrong)
+    "Floating" => Ok(Color::Floating)
+    "Veil" => Ok(Color::Veil)
+    "VeilDeep" => Ok(Color::VeilDeep)
+    "OnVeil" => Ok(Color::OnVeil)
+    "Theater" => Ok(Color::Theater)
+    "Lifted" => Ok(Color::Lifted)
+    "Wash" => Ok(Color::Wash)
+    "Sidebar" => Ok(Color::Sidebar)
+    "ListGround" => Ok(Color::ListGround)
+    "FieldHover" => Ok(Color::FieldHover)
+    "A" => {
+      match self.expect(40, "(") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let c = match self.parse_color(depth=depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(44, ",") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let o = match self.parse_opacity() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(41, ")") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      Ok(Color::A(c, o))
+    }
+    "Over" => {
+      match self.expect(40, "(") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let under = match self.parse_color(depth=depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(44, ",") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      let top = match self.parse_color(depth=depth + 1) {
+        Ok(v) => v
+        Err(e) => return Err(e)
+      }
+      match self.expect(41, ")") {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      Ok(Color::Over(under, top))
+    }
+    "Exact" => match self.arg_int64() { Ok(v) => Ok(Color::Exact(v)); Err(e) => Err(e) }
+    "Data" => match self.arg_int64() { Ok(v) => Ok(Color::Data(v)); Err(e) => Err(e) }
+    _ => self.fail("no Color \{n}")
+  }
+}
+
+struct PatchBuf {
+  mut row : Option[Bool]
+  mut w : Option[Len]
+  mut h : Option[Len]
+  mut min_w : Option[Len]
+  mut max_w : Option[Len]
+  mut min_h : Option[Len]
+  mut max_h : Option[Len]
+  mut p : Option[Space]
+  mut px : Option[Space]
+  mut py : Option[Space]
+  mut pl : Option[Space]
+  mut pr : Option[Space]
+  mut pt : Option[Space]
+  mut pb : Option[Space]
+  mut m : Option[Space]
+  mut mx : Option[Space]
+  mut my : Option[Space]
+  mut ml : Option[Space]
+  mut mr : Option[Space]
+  mut mt : Option[Space]
+  mut mb : Option[Space]
+  mut gap : Option[Space]
+  mut align : Option[Align]
+  mut justify : Option[Justify]
+  mut bg : Option[Color]
+  mut radius : Option[Radius]
+  mut border : Option[Stroke]
+  mut border_color : Option[Color]
+  mut dashed : Option[Bool]
+  mut shadow : Option[Shadow]
+  mut clip : Option[Bool]
+  mut opacity : Option[Opacity]
+}
+
+fn PatchBuf::empty() -> PatchBuf {
+  PatchBuf::{
+    row: None, w: None, h: None, min_w: None, max_w: None, min_h: None, max_h: None,
+    p: None, px: None, py: None, pl: None, pr: None, pt: None, pb: None,
+    m: None, mx: None, my: None, ml: None, mr: None, mt: None, mb: None,
+    gap: None, align: None, justify: None, bg: None, radius: None, border: None,
+    border_color: None, dashed: None, shadow: None, clip: None, opacity: None,
+  }
+}
+
+fn PatchBuf::to_patch(self : PatchBuf) -> Patch {
+  Patch::{
+    row: self.row, w: self.w, h: self.h, min_w: self.min_w, max_w: self.max_w,
+    min_h: self.min_h, max_h: self.max_h,
+    p: self.p, px: self.px, py: self.py, pl: self.pl, pr: self.pr, pt: self.pt, pb: self.pb,
+    m: self.m, mx: self.mx, my: self.my, ml: self.ml, mr: self.mr, mt: self.mt, mb: self.mb,
+    gap: self.gap, align: self.align, justify: self.justify, bg: self.bg, radius: self.radius,
+    border: self.border, border_color: self.border_color, dashed: self.dashed,
+    shadow: self.shadow, clip: self.clip, opacity: self.opacity,
+  }
+}
+
+fn Css::apply_prop(self : Css, buf : PatchBuf, key : String) -> Result[Unit, String] {
+  match key {
+    "row" => match self.parse_bool() { Ok(v) => { buf.row = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "w" => match self.parse_len() { Ok(v) => { buf.w = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "h" => match self.parse_len() { Ok(v) => { buf.h = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "min_w" => match self.parse_len() { Ok(v) => { buf.min_w = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "max_w" => match self.parse_len() { Ok(v) => { buf.max_w = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "min_h" => match self.parse_len() { Ok(v) => { buf.min_h = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "max_h" => match self.parse_len() { Ok(v) => { buf.max_h = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "p" => match self.parse_space() { Ok(v) => { buf.p = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "px" => match self.parse_space() { Ok(v) => { buf.px = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "py" => match self.parse_space() { Ok(v) => { buf.py = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "pl" => match self.parse_space() { Ok(v) => { buf.pl = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "pr" => match self.parse_space() { Ok(v) => { buf.pr = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "pt" => match self.parse_space() { Ok(v) => { buf.pt = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "pb" => match self.parse_space() { Ok(v) => { buf.pb = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "m" => match self.parse_space() { Ok(v) => { buf.m = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "mx" => match self.parse_space() { Ok(v) => { buf.mx = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "my" => match self.parse_space() { Ok(v) => { buf.my = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "ml" => match self.parse_space() { Ok(v) => { buf.ml = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "mr" => match self.parse_space() { Ok(v) => { buf.mr = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "mt" => match self.parse_space() { Ok(v) => { buf.mt = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "mb" => match self.parse_space() { Ok(v) => { buf.mb = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "gap" => match self.parse_space() { Ok(v) => { buf.gap = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "align" => match self.parse_align() { Ok(v) => { buf.align = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "justify" => match self.parse_justify() { Ok(v) => { buf.justify = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "bg" => match self.parse_color() { Ok(v) => { buf.bg = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "radius" => match self.parse_radius() { Ok(v) => { buf.radius = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "border" => match self.parse_stroke() { Ok(v) => { buf.border = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "border_color" => match self.parse_color() { Ok(v) => { buf.border_color = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "dashed" => match self.parse_bool() { Ok(v) => { buf.dashed = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "shadow" => match self.parse_shadow() { Ok(v) => { buf.shadow = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "clip" => match self.parse_bool() { Ok(v) => { buf.clip = Some(v); Ok(()) }; Err(e) => Err(e) }
+    "opacity" => match self.parse_opacity() { Ok(v) => { buf.opacity = Some(v); Ok(()) }; Err(e) => Err(e) }
+    _ => self.fail("no property \{key}")
+  }
+}
+
+fn Css::parse_patch(self : Css, states : Option[CssStates]) -> Result[Patch, String] {
+  let buf = PatchBuf::empty()
+
+  while true {
+    self.skip_space()
+    if self.i >= self.s.length() {
+      if states is None {
+        return self.fail("a block not closed")
+      }
+      break
+    }
+    if self.peek() == 125 {
+      if states is Some(_) {
+        return self.fail("a } closing no block")
+      }
+      self.i += 1
+      break
+    }
+    let key = match self.name() {
+      Ok(k) => k
+      Err(e) => return Err(e)
+    }
+    let next = self.peek()
+    if next == 123 {
+      self.i += 1
+      let st = match states {
+        Some(s) => s
+        None => return self.fail("a block in a block")
+      }
+      let block = match self.parse_patch(None) {
+        Ok(b) => Some(b)
+        Err(e) => return Err(e)
+      }
+      match key {
+        "narrow" => st.narrow = block
+        "dark" => st.dark = block
+        "selected" => st.selected = block
+        "hovered" => st.hovered = block
+        "focused" => st.focused = block
+        "pressed" => st.pressed = block
+        "disabled" => st.disabled = block
+        _ => return self.fail("no state \{key}")
+      }
+    } else if next == 61 {
+      self.i += 1
+      match self.apply_prop(buf, key) {
+        Ok(_) => ()
+        Err(e) => return Err(e)
+      }
+    } else {
+      match key {
+        "row" => buf.row = Some(true)
+        "clip" => buf.clip = Some(true)
+        "dashed" => buf.dashed = Some(true)
+        _ => return self.fail("\{key} with no value")
+      }
+    }
+    let after = self.peek()
+    if self.i < self.s.length() && !is_css_ws(after) && after != 125 {
+      return self.fail("an item not ended by a space")
+    }
+  }
+
+  Ok(buf.to_patch())
+}
