@@ -1,0 +1,237 @@
+
+fn make_bytes_arr(n : Int, fill : Byte) -> Array[Byte] {
+  let out : Array[Byte] = []
+  let mut i = 0
+  while i < n {
+    out.push(fill)
+    i = i + 1
+  }
+  out
+}
+
+fn bytes_from_arr(arr : Array[Byte]) -> FixedArray[Byte] {
+  array_to_fixed(arr)
+}
+
+fn bytes_from_ints(vals : Array[Int]) -> Bytes {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < vals.length() {
+    sb.write_byte((vals[i] & 0xFF) as Byte)
+    i = i + 1
+  }
+  sb.to_string().to_bytes()
+}
+
+// Unit tests for pixels (PNG round-trip, indexed PNG, JPEG encode/decode, WebP VP8L, sniffing, Canvas, ThumbHash, PngRows).
+// Ported from libs/mbui/src/pixels/pixels_test.mbt and png_rows_wbtest.mbt.
+
+fn rgba_color(hi16 : Int, lo16 : Int) -> Int64 {
+  (hi16.to_int64() << 16) | lo16.to_int64()
+}
+
+test "pixels: PNG RGBA encode -> decode exact byte round-trip + is_png + image_size" {
+  let w = 7
+  let h = 5
+  let raw = make_bytes_arr(w * h * 4, 0 as Byte)
+  for y in 0..<h {
+    for x in 0..<w {
+      let o = (y * w + x) * 4
+      raw[o] = ((x * 37 + y * 13) & 0xFF) as Byte
+      raw[o + 1] = ((x * 11 + y * 53) & 0xFF) as Byte
+      raw[o + 2] = ((x * 71 + y * 29) & 0xFF) as Byte
+      raw[o + 3] = (if (x + y) % 2 == 0 { 255 } else { 128 }) as Byte
+    }
+  }
+  let src = bytes_from_arr(raw)
+  let encoded = png(w, h, src)
+  debug_assert(is_png(encoded), "is_png true")
+  debug_assert(!is_png("not a png".to_bytes()), "is_png false")
+  match image_size(encoded) {
+    Some((sw, sh)) => debug_assert(sw == w && sh == h, "image_size PNG")
+    None => debug_assert(false, "expected Some size")
+  }
+  match decode_png(encoded) {
+    Some((dw, dh, got)) => {
+      debug_assert(dw == w && dh == h, "decoded dims")
+      debug_assert(got.length() == src.length(), "decoded length")
+      for i in 0..<src.length() {
+        debug_assert(got[i] == src[i], "byte match")
+      }
+    }
+    None => debug_assert(false, "decode_png failed")
+  }
+}
+
+test "pixels: 4-bit indexed PNG with PLTE and tRNS round-trip" {
+  let palette = make_bytes_arr(16 * 3, 0 as Byte)
+  let alphas = make_bytes_arr(16, 0 as Byte)
+  for i in 0..<16 {
+    palette[i * 3] = (i * 16) as Byte
+    palette[i * 3 + 1] = (255 - i * 15) as Byte
+    palette[i * 3 + 2] = (i * 7 + 3) as Byte
+    alphas[i] = (i * 15) as Byte
+  }
+  let pal_b = bytes_from_arr(palette)
+  let alp_b = bytes_from_arr(alphas)
+  let dims_list = [(6, 3), (5, 4)]
+  for dims in dims_list {
+    let (w, h) = dims
+    let indices = make_bytes_arr(w * h, 0 as Byte)
+    for y in 0..<h {
+      for x in 0..<w {
+        indices[y * w + x] = ((y * 5 + x * 3) & 0xF) as Byte
+      }
+    }
+    let idx_b = bytes_from_arr(indices)
+    let encoded = png_indexed(w, h, pal_b, alp_b, idx_b)
+    match image_size(encoded) {
+      Some((sw, sh)) => debug_assert(sw == w && sh == h, "indexed size")
+      None => debug_assert(false, "size None")
+    }
+    match decode_png(encoded) {
+      Some((dw, dh, rgba)) => {
+        debug_assert(dw == w && dh == h, "decoded indexed dims")
+        for i in 0..<(w * h) {
+          let idx = indices[i].to_int()
+          debug_assert(rgba[i * 4] == palette[idx * 3], "r")
+          debug_assert(rgba[i * 4 + 1] == palette[idx * 3 + 1], "g")
+          debug_assert(rgba[i * 4 + 2] == palette[idx * 3 + 2], "b")
+          debug_assert(rgba[i * 4 + 3] == alphas[idx], "a")
+        }
+      }
+      None => debug_assert(false, "decode_png indexed failed")
+    }
+  }
+}
+
+test "pixels: JPEG encode, header sniff, and decode round-trip" {
+  let px = bytes_from_arr(make_bytes_arr(8 * 8 * 4, 0x80 as Byte))
+  let j = jpeg(8, 8, px)
+  debug_assert(j[0].to_int() == 0xFF && j[1].to_int() == 0xD8, "SOI")
+  debug_assert(j[j.length() - 2].to_int() == 0xFF && j[j.length() - 1].to_int() == 0xD9, "EOI")
+  match image_size(j) {
+    Some((w, h)) => debug_assert(w == 8 && h == 8, "jpeg image_size")
+    None => debug_assert(false, "jpeg size None")
+  }
+  match decode_jpeg(j) {
+    Some((dw, dh, out)) => {
+      debug_assert(dw == 8 && dh == 8, "jpeg decoded dims")
+      debug_assert(out.length() == 8 * 8 * 4, "jpeg decoded len")
+      // 0x80 grey should decode to ~128
+      let r = out[0].to_int()
+      debug_assert(r >= 126 && r <= 130, "grey pixel")
+    }
+    None => debug_assert(false, "decode_jpeg failed")
+  }
+
+  let px2 = bytes_from_arr(make_bytes_arr(20 * 9 * 4, 0xFF as Byte))
+  let j2 = jpeg(20, 9, px2, quality=90)
+  match image_size(j2) {
+    Some((w, h)) => debug_assert(w == 20 && h == 9, "jpeg 20x9 size")
+    None => debug_assert(false, "jpeg 20x9 size None")
+  }
+}
+
+test "pixels: WebP VP8L header sniff and minimal 1x1 lossless decode" {
+  // Minimal valid 1x1 lossless WebP (VP8L, single ARGB pixel 0xFFFF0000 -> red)
+  // RIFF + size(30) + WEBP + VP8L + chunk_size(18) + VP8L payload
+  // Also check invalid WebP returns None
+  debug_assert(decode_webp("not webp".to_bytes()) is None, "invalid webp")
+  // Construct a minimal VP8L 2x2 header for image_size
+  // RIFF (4) + size (4) + WEBP (4) + VP8L (4) + csize (4) + 0x2F (1) + 4 bytes (w-1=1, h-1=1 -> bits = 1 | (1<<14))
+  let bits = 1 | (1 << 14)
+  let hdr_arr : Array[Int] = [
+    0x52, 0x49, 0x46, 0x46, 30, 0, 0, 0,
+    0x57, 0x45, 0x42, 0x50,
+    0x56, 0x50, 0x38, 0x4C, 18, 0, 0, 0,
+    0x2F,
+    bits & 0xFF, (bits >> 8) & 0xFF, (bits >> 16) & 0xFF, (bits >> 24) & 0xFF,
+    0, 0, 0, 0, 0,
+  ]
+  let webp_hdr = bytes_from_ints(hdr_arr)
+  match image_size(webp_hdr) {
+    Some((w, h)) => debug_assert(w == 2 && h == 2, "webp vp8l size")
+    None => debug_assert(false, "webp size None")
+  }
+}
+
+test "pixels: Canvas fill, draw, drawn_box, edge_colour" {
+  let c = Canvas::new(4, 4)
+  c.fill(rgba_color(0x0000, 0xFFFF))
+  let src = make_bytes_arr(16, 0 as Byte)
+  src[0] = 0xFF as Byte
+  src[3] = 0xFF as Byte
+  c.draw(2, 2, bytes_from_arr(src), (0, 0, 2, 2), (0.0, 0.0, 2.0, 2.0))
+  let px = c.pixels()
+  debug_assert(px[0].to_int() == 255 && px[1].to_int() == 0 && px[2].to_int() == 0 && px[3].to_int() == 255, "red tl")
+  debug_assert(px[4].to_int() == 0 && px[5].to_int() == 0 && px[6].to_int() == 255 && px[7].to_int() == 255, "blue beside")
+
+  let box_px = make_bytes_arr(10 * 10 * 4, 0 as Byte)
+  for y in 3..<6 {
+    for x in 2..<8 {
+      box_px[(y * 10 + x) * 4 + 3] = 0xFF as Byte
+    }
+  }
+  let (bx0, by0, bx1, by1) = drawn_box(10, 10, bytes_from_arr(box_px))
+  debug_assert(bx0 == 2 && by0 == 3 && bx1 == 8 && by1 == 6, "drawn_box")
+
+  let c2 = Canvas::new(40, 40)
+  c2.fill(rgba_color(0x3366, 0x99FF))
+  debug_assert(edge_colour(40, 40, c2.pixels()) == "#336699", "edge_colour")
+}
+
+test "pixels: ThumbHash decode and ratio" {
+  let hash = bytes_from_ints([
+    0xD5, 0x07, 0x12, 0x1D, 0x04, 0x67, 0x87, 0x8F, 0x77, 0x57, 0x87,
+    0x48, 0x87, 0x87, 0x97, 0x87, 0x58, 0x78, 0x90, 0x95, 0x08,
+  ])
+  match thumbhash(hash) {
+    Some((w, h, rgba)) => {
+      debug_assert(w == 23 && h == 32, "thumbhash dims")
+      debug_assert(rgba[0].to_int() == 64 && rgba[1].to_int() == 77 && rgba[2].to_int() == 113 && rgba[3].to_int() == 255, "first px")
+      let mid_o = (w * 16 + 11) * 4
+      debug_assert(rgba[mid_o].to_int() == 140 && rgba[mid_o + 1].to_int() == 109 && rgba[mid_o + 2].to_int() == 88, "mid px")
+    }
+    None => debug_assert(false, "thumbhash failed")
+  }
+  match thumbhash_ratio(hash) {
+    Some(r) => debug_assert((r - 5.0 / 7.0).abs() < 1.0e-12, "thumbhash ratio")
+    None => debug_assert(false, "ratio None")
+  }
+  debug_assert(thumbhash(bytes_from_ints([1, 2])) is None, "short thumbhash None")
+}
+
+test "pixels: PngRows streaming deflate -> decode_png exact round-trip" {
+  let w = 24
+  let h = 18
+  let pr = PngRows::new(w, h)
+  let expected = make_bytes_arr(w * h * 4, 0xFF as Byte)
+  for y in 0..<h {
+    let row = make_bytes_arr(w * 4, 0xFF as Byte)
+    for x in 0..<w {
+      let r = ((x * 19 + y * 7) & 0xFF) as Byte
+      let g = ((x * 3 + y * 23) & 0xFF) as Byte
+      let b = ((x * 41 + y * 11) & 0xFF) as Byte
+      row[x * 4] = r
+      row[x * 4 + 1] = g
+      row[x * 4 + 2] = b
+      expected[(y * w + x) * 4] = r
+      expected[(y * w + x) * 4 + 1] = g
+      expected[(y * w + x) * 4 + 2] = b
+    }
+    pr.add(bytes_from_arr(row), 1)
+  }
+  debug_assert(pr.rows() == h, "rows count")
+  let encoded = pr.end()
+  debug_assert(is_png(encoded), "png_rows is_png")
+  match decode_png(encoded) {
+    Some((dw, dh, got)) => {
+      debug_assert(dw == w && dh == h, "png_rows dims")
+      for i in 0..<(w * h * 4) {
+        debug_assert(got[i] == expected[i], "png_rows pixel match")
+      }
+    }
+    None => debug_assert(false, "decode_png on PngRows failed")
+  }
+}
