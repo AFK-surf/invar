@@ -213,3 +213,105 @@ test "film_rejects_invalid_dimensions" {
   )
   debug_assert(!bad_path, "picture must reject empty path")
 }
+
+fn decode_png_rgba(path : String, w : Int, h : Int) -> Array[Byte] {
+  host::install()
+  let img_id = hostapi::image_load(path, 2048)
+  debug_assert(img_id > 0, "image_load must succeed for \{path}")
+  let info = Array::make(4, 0.0)
+  let mut st = hostapi::image_info(img_id, info)
+  let mut tries = 0
+  while st == 0 && tries < 200 {
+    host::pump_main_loop(10.0)
+    st = hostapi::image_info(img_id, info)
+    tries += 1
+  }
+  debug_assert(st == 1, "decoded PNG must reach ready state for \{path}")
+  let px = Array::make(w * h * 4, 0 as Byte)
+  debug_assert(hostapi::image_pixels(img_id, px), "image_pixels must succeed for \{path}")
+  hostapi::image_free(img_id)
+  px
+}
+
+test "film_quad_bezier_long_shallow_translation_invariance_and_sagitta" {
+  // 8000 px wide, 1.0 px sagitta shallow quadratic Bezier (apex at t=0.5 is 1.0 px above chord):
+  //   A = (-3000, 320), B = (1000, 318), C = (5000, 320) -> P(0.5) = (1000, 319).
+  // Verify on real GPU offscreen rendering:
+  //   1. Tile translation by (-512, -256) matches direct full-canvas render pixel-for-pixel (max diff <= 1).
+  //   2. The 1.0 px sagitta at x=1000 is preserved (peak centered at y=319, NOT flattened to chord y=320).
+  let prev = hostapi::host()
+  hostapi::set_host(host::native_host())
+
+  // Frame A: direct full canvas (1024x384 @ 1x) containing [512..768)x[256..384) and the apex region.
+  debug_assert(init_offscreen(1024.0, 384.0, 1.0), "init_offscreen full canvas")
+  let sc_full = ui::Scene::new()
+  sc_full.emit_quad_bezier(-3000.0, 320.0, 1000.0, 318.0, 5000.0, 320.0, 2.0, ui::rgba(255, 255, 255, 255))
+  let (inst_full, cnt_full) = prepare_metal_instances(sc_full)
+  mark_dirty_full()
+  hostapi::present(inst_full, cnt_full, 0.0, 0.0, 0.0)
+  let path_full = "/tmp/invar_film_qbez_full.png"
+  debug_assert(save_snapshot(path_full, transparent=false), "save full qbez snapshot")
+
+  // Frame B: 256x128 tile shifted by (-512, -256), covering [512..768)x[256..384) of Frame A.
+  debug_assert(init_offscreen(256.0, 128.0, 1.0), "init_offscreen tile canvas")
+  let sc_tile = ui::Scene::new()
+  sc_tile.emit_quad_bezier(-3512.0, 64.0, 488.0, 62.0, 4488.0, 64.0, 2.0, ui::rgba(255, 255, 255, 255))
+  let (inst_tile, cnt_tile) = prepare_metal_instances(sc_tile)
+  mark_dirty_full()
+  hostapi::present(inst_tile, cnt_tile, 0.0, 0.0, 0.0)
+  let path_tile = "/tmp/invar_film_qbez_tile.png"
+  debug_assert(save_snapshot(path_tile, transparent=false), "save tile qbez snapshot")
+
+  // Frame C: 256x128 tile centered on the apex x=1000 (shifted by (-872, -256) so apex is at (128, 63)).
+  debug_assert(init_offscreen(256.0, 128.0, 1.0), "init_offscreen apex canvas")
+  let sc_apex = ui::Scene::new()
+  sc_apex.emit_quad_bezier(-3872.0, 64.0, 128.0, 62.0, 4128.0, 64.0, 2.0, ui::rgba(255, 255, 255, 255))
+  let (inst_apex, cnt_apex) = prepare_metal_instances(sc_apex)
+  mark_dirty_full()
+  hostapi::present(inst_apex, cnt_apex, 0.0, 0.0, 0.0)
+  let path_apex = "/tmp/invar_film_qbez_apex.png"
+  debug_assert(save_snapshot(path_apex, transparent=false), "save apex qbez snapshot")
+
+  hostapi::set_host(prev)
+
+  let px_full = decode_png_rgba(path_full, 1024, 384)
+  let px_tile = decode_png_rgba(path_tile, 256, 128)
+  let px_apex = decode_png_rgba(path_apex, 256, 128)
+
+  // 1. Tile vs direct full-canvas comparison over 256x128 overlapping pixels.
+  let mut max_diff = 0
+  let mut lit_pixels = 0
+  let mut y = 0
+  while y < 128 {
+    let mut x = 0
+    while x < 256 {
+      let fi = ((y + 256) * 1024 + (x + 512)) * 4
+      let ti = (y * 256 + x) * 4
+      if px_tile[ti].to_int() > 100 {
+        lit_pixels += 1
+      }
+      let mut ch = 0
+      while ch < 3 {
+        let a = px_full[fi + ch].to_int()
+        let b = px_tile[ti + ch].to_int()
+        let d = if a >= b { a - b } else { b - a }
+        if d > max_diff {
+          max_diff = d
+        }
+        ch += 1
+      }
+      x += 1
+    }
+    y += 1
+  }
+  debug_assert(lit_pixels >= 200, "curve must draw across tile width, got \{lit_pixels} lit pixels")
+  debug_assert(max_diff <= 1, "8000px shallow quad Bezier tile vs direct max channel diff must be <= 1, got \{max_diff}")
+
+  // 2. Sagitta check at apex x=128: curve center is y=63.0 (half-width=1.0, covers y=62..64; pixel center at y+0.5).
+  //    Pixel y=62 (center 62.5, dist 0.5) must be bright (>200), whereas pixel y=64 (center 64.5, dist 1.5)
+  //    must be dark (<30) — if flattened to chord y=64.0, y=62 would be dark and y=64 would be bright.
+  let r_62 = px_apex[(62 * 256 + 128) * 4].to_int()
+  let r_63 = px_apex[(63 * 256 + 128) * 4].to_int()
+  let r_64 = px_apex[(64 * 256 + 128) * 4].to_int()
+  debug_assert(r_62 > 200 && r_63 > 200 && r_64 < 30, "1px sagitta at 8000px apex must stay at y=63 (not chord y=64): y62=\{r_62} y63=\{r_63} y64=\{r_64}")
+}

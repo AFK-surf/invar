@@ -1037,12 +1037,16 @@
     vec2 b = A - 2.0 * B + C;
     vec2 c = a * 2.0;
     vec2 d = A - pos;
+    vec2 ac = C - A;
     float bb = dot(b, b);
-    if (bb <= 1e-6 * max(dot(a, a), 1.0)) {
-      vec2 ac = C - A;
-      float h = clamp(dot(pos - A, ac) / max(dot(ac, ac), 1e-8), 0.0, 1.0);
-      return length(pos - A - ac * h);
+    float t_lin = clamp(dot(pos - A, ac) / max(dot(ac, ac), 1e-12), 0.0, 1.0);
+    // Collinear fallback for normalized [0,1] coords (residual <= ~1.25e-6 * chord length)
+    if (bb <= 1e-10 * max(dot(a, a), 1e-8)) {
+      return length(pos - A - ac * t_lin);
     }
+    vec2 vl = d + (c + b * t_lin) * t_lin;
+    float bestT = t_lin;
+    float res = dot(vl, vl);
     float kk = 1.0 / bb;
     float kx = kk * dot(a, b);
     float ky = kk * (2.0 * dot(a, a) + dot(d, b)) / 3.0;
@@ -1051,14 +1055,14 @@
     float p3 = p * p * p;
     float q = kx * (2.0 * kx * kx - 3.0 * ky) + kz;
     float h = q * q + 4.0 * p3;
-    float res;
     if (h >= 0.0) {
       float sh = sqrt(h);
       vec2 x = (vec2(sh, -sh) - q) * 0.5;
       vec2 uv = sign(x) * pow(max(abs(x), vec2(1e-20)), vec2(1.0 / 3.0));
       float t = clamp(uv.x + uv.y - kx, 0.0, 1.0);
       vec2 v = d + (c + b * t) * t;
-      res = dot(v, v);
+      float dd = dot(v, v);
+      if (dd < res) { res = dd; bestT = t; }
     } else {
       float z = sqrt(-p);
       float denom = min(p * z * 2.0, -1e-12);
@@ -1071,7 +1075,22 @@
       vec2 v0 = d + (c + b * t0) * t0;
       vec2 v1 = d + (c + b * t1) * t1;
       vec2 v2 = d + (c + b * t2) * t2;
-      res = min(dot(v0, v0), min(dot(v1, v1), dot(v2, v2)));
+      float d0 = dot(v0, v0), d1 = dot(v1, v1), d2 = dot(v2, v2);
+      if (d0 < res) { res = d0; bestT = t0; }
+      if (d1 < res) { res = d1; bestT = t1; }
+      if (d2 < res) { res = d2; bestT = t2; }
+    }
+    // 2 safeguarded Newton-Raphson steps eliminate float32 Cardano cancellation on shallow curves
+    for (int ni = 0; ni < 2; ni++) {
+      vec2 vn = d + (c + b * bestT) * bestT;
+      vec2 dp = c + 2.0 * b * bestT;
+      float fp = dot(dp, dp) + 2.0 * dot(vn, b);
+      if (fp > 1e-12) {
+        float nt = clamp(bestT - dot(vn, dp) / fp, 0.0, 1.0);
+        vec2 nv = d + (c + b * nt) * nt;
+        float nd = dot(nv, nv);
+        if (nd < res) { res = nd; bestT = nt; } else { break; }
+      } else { break; }
     }
     return sqrt(res);
   }
@@ -1106,15 +1125,18 @@
     #if ONE_KIND < 0 || ONE_KIND == 10
     if (kind == 10) {
       // a line segment (p.z == 0) or analytic quadratic Bezier stroke (p.z > 0.5, control point in rr.xy)
-      vec2 a = v_rect.xy + v_c2.xy * v_rect.zw, c = v_rect.xy + v_c2.zw * v_rect.zw;
+      // Evaluate in rect-local coordinates (translation-stable to ~1 ulp of world coords).
+      vec2 lp = p - v_rect.xy;
       float d;
       if (v_p.z > 0.5) {
-        vec2 b = v_rect.xy + v_rr.xy * v_rect.zw;
-        d = mb_sd_quad_bezier(p, a, b, c) - v_p.x;
+        float s = max(max(v_rect.z, v_rect.w), 1.0);
+        vec2 sz = v_rect.zw / s;
+        d = mb_sd_quad_bezier(lp / s, v_c2.xy * sz, v_rr.xy * sz, v_c2.zw * sz) * s - v_p.x;
       } else {
+        vec2 a = v_c2.xy * v_rect.zw, c = v_c2.zw * v_rect.zw;
         vec2 ab = c - a;
-        float h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
-        d = length(p - a - ab * h) - v_p.x;
+        float h = clamp(dot(lp - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
+        d = length(lp - a - ab * h) - v_p.x;
       }
       if (v_pad.w > 0.0) col.rgb = mb_adaptive_ink_at(col.rgb, v_pad.yz, v_pad.w * 0.5, v_rect);
       o = vec4(col.rgb, 1.0) * col.a * clamp(0.5 - d * u_scale, 0.0, 1.0);
