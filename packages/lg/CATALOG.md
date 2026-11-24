@@ -2,7 +2,7 @@
 
 > **铁律**：
 > 1. **全高滚动穿透页面壳优先**：建任何页面直接用 `<lg::PageShell>` / `<lg::SplitShell>` + `<lg::BackButton>` + `<lg::BarPillGroup>` + `<lg::Icon>` + `<lg::ComposerBar>`；**严禁手写三段式实色死盒（`[实色顶栏] / [scroll_box] / [实色底栏]`）、严禁实色顶栏横贯分割线、严禁纯文字顶栏胶囊（如 `"Back"`）、严禁框套框输入栏**！
-> 2. **内容层零玻璃**：页面底色、消息流、列表、内容卡片、表单与代码块**一律使用 Content Surfaces（实色纸面 `lg::surface()` / `SurfaceCard` / `SurfaceSection` / `CodeBlock`）**，严禁对页面内容套 `Glass::liquid`。
+> 2. **内容层零玻璃**：页面底色、消息流、列表、内容卡片、表单与代码块**一律使用 Content Surfaces（实色纸面 `lg::surface()` / `SurfaceCard` / `SurfaceSection` / `CodeBlock`）**，严禁对页面内容套 `Glass::liquid`。内容层卡片中的 Switch / Slider / Segmented 遵循原生 iOS 规则：静止态为实色控件，按住拖动时呈现瞬时清澈液滴透镜（在 `glass_solid` / `reduced_motion` 下回退无透镜）。
 > 3. **悬浮层单层玻璃**：下游业务代码严禁直接调用 `paint::Glass::liquid(...)`，所有悬浮导航、工具栏、弹层与交互控件必须 100% 从本目录选用 `lg::*` 组件，并在单测中调用 `lg::assert_apple_ui(t, label="...")`。
 
 ---
