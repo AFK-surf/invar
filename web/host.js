@@ -5737,7 +5737,7 @@
     on(win, 'keyup', modifierKey, true);
     on(win, 'blur', () => tellModifiers(0, true));
     const command = (e) => keysCmd() === 8 ? e.metaKey : e.ctrlKey;
-    const browserKey = (e, c) => command(e) && (browsers.has(c) ||
+    const browserKey = (e, c) => command(e) && ((browsers.has(c) && !(c === 'l' && e.shiftKey)) ||
       (!e.altKey && !(e.ctrlKey && e.metaKey) && ['+', '=', '-', '0'].includes(c)));
     // Cocoa translates these Control keys to editing commands in a field (mac_app.m's doCommandBySelector).
     // The browser's hidden IME field cannot move the app's caret itself, so send the same commands to the editor.

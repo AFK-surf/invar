@@ -219,7 +219,8 @@ assert.ok(H && typeof H.run === "function" && typeof H.setIme === "function" && 
   "host.js exposes __mbhost with run, setIme, imeAction");
 
 const told = [];
-H.run("ime test", noop, noop, noop, noop, (kind, text, a, b) => told.push([kind, text, a, b]));
+const keys = [];
+H.run("ime test", noop, noop, noop, (code, mods) => keys.push([code, mods]), (kind, text, a, b) => told.push([kind, text, a, b]));
 
 const pw = doc.body.children.find((el) => el.tagName === "INPUT");
 assert.ok(pw, "a password input set up beside the textarea");
@@ -295,4 +296,31 @@ assert.equal(pw.value, "", "the password input emptied for the plain field");
 assert.equal(doc.activeElement, ta, "the textarea has the focus again");
 assert.equal(ta.value, "alice", "the plain field's words in the textarea");
 
-console.log("test-host-ime: OK (5 cases)");
+// 6. browserKey: Cmd/Ctrl+Shift+L reaches app (e.g. Lock shortcut) in both window and IME field,
+//    while plain Cmd/Ctrl+L (address bar) and Cmd/Ctrl+Shift+R (hard reload) stay with the browser
+keys.length = 0;
+let ev = ta.dispatch("keydown", { key: "L", metaKey: true, shiftKey: true, ctrlKey: false, altKey: false });
+assert.deepEqual(keys, [[1000 + "l".charCodeAt(0), 9]], `IME Cmd+Shift+L forwarded to app: ${JSON.stringify(keys)}`);
+assert.equal(ev.defaultPrevented, true, "IME Cmd+Shift+L prevents browser default");
+keys.length = 0;
+ev = ta.dispatch("keydown", { key: "l", metaKey: true, shiftKey: false, ctrlKey: false, altKey: false });
+assert.deepEqual(keys, [], "IME Cmd+L left to browser address bar");
+assert.equal(ev.defaultPrevented, false, "IME Cmd+L does not preventDefault");
+ev = ta.dispatch("keydown", { key: "R", metaKey: true, shiftKey: true, ctrlKey: false, altKey: false });
+assert.deepEqual(keys, [], "IME Cmd+Shift+R left to browser hard reload");
+assert.equal(ev.defaultPrevented, false, "IME Cmd+Shift+R does not preventDefault");
+
+H.setIme(false, 0, 0, 0, 0, "", 0, 0);
+keys.length = 0;
+ev = win.dispatch("keydown", { key: "L", metaKey: true, shiftKey: true, ctrlKey: false, altKey: false });
+assert.deepEqual(keys, [[1000 + "l".charCodeAt(0), 9]], `window Cmd+Shift+L forwarded to app: ${JSON.stringify(keys)}`);
+assert.equal(ev.defaultPrevented, true, "window Cmd+Shift+L prevents browser default");
+keys.length = 0;
+ev = win.dispatch("keydown", { key: "l", metaKey: true, shiftKey: false, ctrlKey: false, altKey: false });
+assert.deepEqual(keys, [], "window Cmd+L left to browser address bar");
+assert.equal(ev.defaultPrevented, false, "window Cmd+L does not preventDefault");
+ev = win.dispatch("keydown", { key: "R", metaKey: true, shiftKey: true, ctrlKey: false, altKey: false });
+assert.deepEqual(keys, [], "window Cmd+Shift+R left to browser hard reload");
+assert.equal(ev.defaultPrevented, false, "window Cmd+Shift+R does not preventDefault");
+
+console.log("test-host-ime: OK (6 cases)");
