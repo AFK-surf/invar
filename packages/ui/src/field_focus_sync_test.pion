@@ -1,0 +1,459 @@
+// The focused Field and the tree's focus are one focus: however the tree's focus moves (Tab, a modal layer, an
+// accessibility action, the app's own Tree::focus_to), the Field that has the keys and the host's input method follows.
+
+import "signals"
+import "view"
+
+struct FocusSyncRig {
+  t : Tester
+  tree : view::Tree
+  a : Field
+  b : Field
+  button : view::NodeId
+  submits : signals::Ref[Int]
+  presses : signals::Ref[Int]
+  modal : signals::Signal[Bool]
+  input_on : signals::Signal[Bool]
+}
+
+// Tab order: Field A ("abc"), button, Field B ("xyz").
+fn focus_sync_rig() -> Option[FocusSyncRig] {
+  let a = Field::new(text="abc")
+  let b = Field::new(text="xyz")
+  let submits = ref_new(0)
+  let presses = ref_new(0)
+  let modal = signals::signal(false)
+  let input_on = signals::signal(true)
+  let button : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.in_use(view::Live::By(fn() { input_on.get() }))
+      let _ = field(v, a, max_lines=1, label="A", submitted=fn(_s) { submits.v = submits.v + 1 })
+    })
+    let _ = root.box(fn(v : view::View) {
+      button.v = Some(v.id())
+      let _ = v
+      .width(view::Live::Is(Some(80.0)))
+      .height(view::Live::Is(Some(44.0)))
+      .focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
+      .says(view::Live::Is(Some(view::said(view::Role::Button, label="Go"))))
+      .on_press(fn() { presses.v = presses.v + 1 })
+    })
+    let _ = field(root, b, max_lines=1, label="B")
+    root.show(fn() { modal.get() }, fn(m : view::View) {
+      let _ = m
+      .over(view::Live::Is(true))
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(100.0)))
+      .modal(view::Live::Is(true))
+    })
+  })
+  match (view_tree(), button.v) {
+    (Some(tree), Some(id)) =>
+    Some(FocusSyncRig::{ t, tree, a, b, button: id, submits, presses, modal, input_on })
+    _ => None
+  }
+}
+
+fn focus_sync_made() -> FocusSyncRig {
+  match focus_sync_rig() {
+    Some(r) => r
+    None => panic("no tree")
+  }
+}
+
+test "field focus sync: Tab off a Field takes the keys, Enter and the input method with it" {
+  let r = focus_sync_made()
+  r.t.press("A")
+  debug_assert(r.a.focused() && r.t.fake.ime_active, "A focused, input method on")
+  r.t.press("Tab")
+  debug_assert(node_is(r.tree.focused_now().0, r.button), "Tab goes to the button")
+  debug_assert(!r.a.focused() && !field_has_focus(), "A let go of")
+  debug_assert(!r.t.fake.ime_active, "input method off")
+  view_text(0, "z")
+  debug_assert(r.a.text() == "abc", "A takes no more text, got \{r.a.text()}")
+  r.t.press("Enter")
+  debug_assert(r.presses.v == 1 && r.submits.v == 0, "Enter presses the button, not A's submit")
+  r.t.dispose()
+}
+
+test "field focus sync: Shift+Tab back to a Field focuses it for typing, shown as moved by the keyboard" {
+  let r = focus_sync_made()
+  let _ = r.tree.focus_to(Some(r.button))
+  r.t.key(key_tab, mods=mod_shift_key)
+  let (held, visible) = r.tree.focused_now()
+  debug_assert(same_focus(held, r.a.tree_node) && visible, "tree focus on A, shown")
+  debug_assert(r.a.focused() && r.t.fake.ime_active, "A focused, input method on")
+  r.t.type_text("z")
+  debug_assert(r.a.text() == "abcz", "A takes the text, got \{r.a.text()}")
+  r.t.press("Enter")
+  debug_assert(r.submits.v == 1 && r.presses.v == 0, "Enter submits A")
+  r.t.dispose()
+}
+
+test "field focus sync: from one Field to the next by Tab, the input method takes the next one's text" {
+  let a = Field::new(text="abc")
+  let b = Field::new(text="xyz")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, a, max_lines=1, label="A")
+    let _ = field(root, b, max_lines=1, label="B")
+  })
+  t.press("A")
+  t.press("Tab")
+  debug_assert(!a.focused() && b.focused(), "A let go of, B focused")
+  debug_assert(t.fake.ime_active && t.fake.ime_text == "xyz", "input method on B's text, got \{t.fake.ime_text}")
+  t.type_text("!")
+  debug_assert(a.text() == "abc" && b.text() == "xyz!", "only B takes the text")
+  t.key(key_tab, mods=mod_shift_key)
+  debug_assert(a.focused() && !b.focused() && t.fake.ime_text == "abc", "and back")
+  t.dispose()
+}
+
+test "field focus sync: a modal layer over a focused Field lets it go" {
+  let r = focus_sync_made()
+  r.t.press("A")
+  r.modal.set(true)
+  r.t.frame()
+  debug_assert(!r.a.focused() && !r.t.fake.ime_active, "A let go of, input method off")
+  r.t.type_text("z")
+  r.t.press("Enter")
+  debug_assert(r.a.text() == "abc" && r.submits.v == 0, "nothing reaches A under the modal layer")
+  r.modal.set(false)
+  r.t.frame()
+  debug_assert(r.a.focused() && r.t.fake.ime_active, "given back as the modal layer goes")
+  debug_assert(same_focus(r.tree.focused_now().0, r.a.tree_node), "with the tree's focus")
+  r.t.type_text("z")
+  debug_assert(r.a.text() == "abcz", "and takes text again, got \{r.a.text()}")
+  r.t.dispose()
+}
+
+test "field focus sync: the app moving the tree's focus itself leaves no Field behind" {
+  // Told at once as a key or text comes, before any frame.
+  let r = focus_sync_made()
+  r.t.press("A")
+  let _ = r.tree.focus_to(Some(r.button))
+  view_text(0, "z")
+  debug_assert(r.a.text() == "abc" && !r.a.focused() && !r.t.fake.ime_active, "text does not reach A")
+  r.t.press("A")
+  let _ = r.tree.focus_to(Some(r.button), visible=true)
+  let _ = view_key(key_enter, 0, r.t.fake.now_ms)
+  debug_assert(r.presses.v == 1 && r.submits.v == 0 && !r.a.focused(), "Enter presses the button")
+  // And by the next frame where none comes.
+  r.t.press("A")
+  let _ = r.tree.focus_to(None)
+  r.t.draw()
+  debug_assert(!r.a.focused() && !r.t.fake.ime_active, "let go of by the frame")
+  debug_assert(r.tree.focused_now().0 is None, "the tree's focus left on none")
+  r.t.dispose()
+}
+
+test "field focus sync: View::ask_focus and View::focus_let_go move the Field's focus with the tree's" {
+  let r = focus_sync_made()
+  let (va, vb) = match (r.a.tree_node, r.b.tree_node) {
+    (Some(x), Some(y)) => (r.tree.view_of(x), r.tree.view_of(y))
+    _ => (None, None)
+  }
+  match (va, vb) {
+    (Some(av), Some(bv)) => {
+      debug_assert(av.ask_focus(visible=true) && r.a.focused() && r.t.fake.ime_text == "abc", "A asked for")
+      debug_assert(bv.ask_focus() && r.b.focused() && !r.a.focused() && r.t.fake.ime_text == "xyz", "B asked for")
+      bv.focus_let_go()
+      debug_assert(!r.b.focused() && !r.t.fake.ime_active, "let go of")
+    }
+    _ => debug_assert(false, "field nodes")
+  }
+  r.t.dispose()
+}
+
+test "field focus sync: a Field taken out of use is let go of" {
+  let r = focus_sync_made()
+  r.t.press("A")
+  r.input_on.set(false)
+  r.t.frame()
+  debug_assert(!r.a.focused() && !r.t.fake.ime_active, "let go of as it takes no input")
+  r.t.dispose()
+}
+
+test "field focus sync: a Field focused before it is mounted keeps the focus and is given the tree's" {
+  let fld = Field::new(text="abc")
+  fld.focus()
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=1, label="A")
+    let _ = root.box(fn(v : view::View) {
+      let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+  })
+  fld.focus()
+  t.type_text("z")
+  debug_assert(fld.focused() && fld.text() == "abcz", "keeps taking text, got \{fld.text()}")
+  match view_tree() {
+    Some(tree) => debug_assert(same_focus(tree.focused_now().0, fld.tree_node), "tree focus on it")
+    None => debug_assert(false, "tree")
+  }
+  t.press("Tab")
+  debug_assert(!fld.focused(), "and Tab leaves it")
+  t.dispose()
+}
+
+test "field focus sync: a layer that takes the focus as it opens gives it back to the Field as it goes" {
+  let fld = Field::new(text="abc")
+  let open = signals::signal(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=1, label="A")
+    root.show(fn() { open.get() }, fn(p : view::View) {
+      let _ = p
+      .over(view::Live::Is(true))
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(100.0)))
+      let _ = p.focus_opens_first().modal(view::Live::Is(true))
+      let _ = p.box(fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+      })
+    })
+  })
+  t.press("A")
+  open.set(true)
+  debug_assert(!fld.focused() && !t.fake.ime_active, "let go of as the layer takes the focus")
+  t.frame()
+  t.type_text("z")
+  debug_assert(fld.text() == "abc", "takes no text under it")
+  open.set(false)
+  t.frame()
+  debug_assert(fld.focused() && t.fake.ime_active, "given back with the input method")
+  t.type_text("z")
+  debug_assert(fld.text() == "abcz", "takes text again, got \{fld.text()}")
+  t.dispose()
+}
+
+test "field focus sync: a Field asked for by a focused button as its panel opens takes the focus" {
+  let fld = Field::new(text="abc")
+  let open = signals::signal(false)
+  let button : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      button.v = Some(v.id())
+      let _ = v
+      .width(view::Live::Is(Some(80.0)))
+      .height(view::Live::Is(Some(44.0)))
+      .focusable(view::Live::Is(true), keys=view::focus_enter)
+      .on_press(fn() {
+        fld.focus()
+        open.set(true)
+      })
+    })
+    root.show(fn() { open.get() }, fn(p : view::View) {
+      let _ = p
+      .over(view::Live::Is(true))
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(100.0)))
+      .modal(view::Live::Is(true))
+      let _ = p.focus_opens_first()
+      let _ = p.box(fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+      })
+      let _ = field(p, fld, max_lines=1, label="A")
+    })
+  })
+  t.press("Tab")
+  t.press("Enter")
+  t.frame()
+  debug_assert(fld.focused() && t.fake.ime_active, "the panel's Field keeps the focus")
+  match view_tree() {
+    Some(tree) => debug_assert(same_focus(tree.focused_now().0, fld.tree_node), "tree focus on it")
+    None => debug_assert(false, "tree")
+  }
+  t.type_text("z")
+  debug_assert(fld.text() == "abcz", "and takes the text, got \{fld.text()}")
+  open.set(false)
+  t.frame()
+  debug_assert(!fld.focused() && !t.fake.ime_active, "let go of with its panel")
+  t.dispose()
+}
+
+test "field focus sync: a modal layer gone gives a Field nothing back where it was let go of meanwhile" {
+  let r = focus_sync_made()
+  r.t.press("A")
+  r.modal.set(true)
+  r.t.frame()
+  r.a.let_go()
+  r.modal.set(false)
+  r.t.frame()
+  debug_assert(!r.a.focused() && r.tree.focused_now().0 is None, "left on none")
+  r.t.dispose()
+}
+
+test "field focus sync: a modal layer that leaves typing to the Field under it keeps it typed in" {
+  let fld = Field::new(text="abc")
+  let open = signals::signal(false)
+  let opener : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=1, label="A")
+    let _ = root.box(fn(v : view::View) {
+      opener.v = Some(v.id())
+      let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+    root.show(fn() { open.get() }, fn(p : view::View) {
+      let _ = p
+      .over(view::Live::Is(true))
+      .width(view::Live::Is(Some(200.0)))
+      .height(view::Live::Is(Some(100.0)))
+      match opener.v {
+        Some(id) => { let _ = p.opened_by(view::Opener::ByNode(id)) }
+        None => ()
+      }
+      let _ = p.focus_opens_first().leaves_typing().modal(view::Live::Is(true))
+      let _ = p.box(fn(v : view::View) {
+        let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+      })
+    })
+  })
+  t.press("A")
+  open.set(true)
+  t.frame()
+  debug_assert(fld.focused() && t.fake.ime_active, "kept under the layer")
+  t.type_text("q")
+  debug_assert(fld.text() == "abcq", "typed in under the layer, got \{fld.text()}")
+  t.key(key_code_backspace)
+  debug_assert(fld.text() == "abc" && fld.focused(), "its keys too, got \{fld.text()}")
+  open.set(false)
+  t.frame()
+  debug_assert(fld.focused() && t.fake.ime_active, "kept as the layer goes")
+  match view_tree() {
+    Some(tree) => debug_assert(same_focus(tree.focused_now().0, fld.tree_node), "tree focus back on it")
+    None => debug_assert(false, "tree")
+  }
+  t.type_text("w")
+  debug_assert(fld.text() == "abcw", "typed in after, got \{fld.text()}")
+  t.dispose()
+}
+
+test "field focus sync: the app moving the tree's focus to another Field has that one typed in at once" {
+  let r = focus_sync_made()
+  r.t.press("A")
+  let _ = r.tree.focus_to(r.b.tree_node)
+  view_text(0, "!")
+  debug_assert(!r.a.focused() && r.b.focused() && r.t.fake.ime_text != "abc", "B has the keys and the input method")
+  debug_assert(r.a.text() == "abc" && r.b.text() == "xyz!", "text goes to B, got \{r.b.text()}")
+  let _ = r.tree.focus_to(r.a.tree_node)
+  let _ = view_key(key_code_backspace, 0, r.t.fake.now_ms)
+  debug_assert(r.a.focused() && !r.b.focused() && r.a.text() == "ab", "keys go to A, got \{r.a.text()}")
+  r.t.dispose()
+}
+
+test "field focus sync: View::focus_let_go lets go of a Field that waits for the tree's focus" {
+  let r = focus_sync_made()
+  r.input_on.set(false)
+  r.t.frame()
+  r.a.focus()
+  debug_assert(r.a.focused() && r.tree.focused_now().0 is None, "waits out of use")
+  r.input_on.set(true)
+  match r.tree.view_of(r.button) {
+    Some(v) => v.focus_let_go()
+    None => debug_assert(false, "button")
+  }
+  debug_assert(!r.a.focused() && r.tree.focused_now().0 is None, "let go of")
+  r.t.frame()
+  debug_assert(!r.a.focused() && r.tree.focused_now().0 is None, "and not taken after")
+  r.t.dispose()
+}
+
+test "field focus sync: a Field of another window moves no focus of this window's tree" {
+  let here = Field::new(text="abc")
+  let there = Field::new(text="xyz")
+  let t = Tester::tree(fn(root : view::View) { let _ = field(root, here, max_lines=1, label="A") })
+  set_window_tree(fn(_wid : Int, _what : String) {
+    fn(root : view::View) { let _ = field(root, there, max_lines=1, label="B") }
+  })
+  let wid = window_open_here("secondary")
+  debug_assert(wid > 0, "window opens")
+  let _ = window_frame(wid, 400.0, 300.0, 2.0, 10.0)
+  t.frame()
+  match view_tree() {
+    Some(tree) => {
+      debug_assert(same_focus(here.tree_node, there.tree_node), "both nodes have one id")
+      there.focus()
+      debug_assert(tree.focused_now().0 is None, "this tree's focus left alone")
+      there.let_go()
+      t.press("A")
+      there.let_go()
+      debug_assert(same_focus(tree.focused_now().0, here.tree_node) && here.focused(), "nor let go of")
+    }
+    None => debug_assert(false, "tree")
+  }
+  t.dispose()
+}
+
+test "field focus sync: a Field asked for as its panel opens takes keys and text before the next frame" {
+  let a = Field::new(text="abc")
+  let c = Field::new()
+  let open = signals::signal(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, a, max_lines=1, label="A")
+    root.show(fn() { open.get() }, fn(p : view::View) { let _ = field(p, c, max_lines=1, label="C") })
+  })
+  t.press("A")
+  c.focus()
+  open.set(true)
+  view_text(0, "xy")
+  let _ = view_key(key_code_backspace, 0, t.fake.now_ms)
+  debug_assert(c.text() == "x" && a.text() == "abc", "C takes them, got C \{c.text()}, A \{a.text()}")
+  debug_assert(c.focused() && !a.focused(), "C has the keys, not A")
+  t.frame()
+  debug_assert(c.focused() && !a.focused() && t.fake.ime_active, "and keeps them")
+  match view_tree() {
+    Some(tree) => debug_assert(same_focus(tree.focused_now().0, c.tree_node), "with the tree's focus")
+    None => debug_assert(false, "tree")
+  }
+  t.dispose()
+}
+
+test "field focus sync: a Field asked for before its panel opens is not lost to the one before it" {
+  let a = Field::new(text="abc")
+  let c = Field::new()
+  let open = signals::signal(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, a, max_lines=1, label="A")
+    root.show(fn() { open.get() }, fn(p : view::View) { let _ = field(p, c, max_lines=1, label="C") })
+  })
+  t.press("A")
+  c.focus()
+  view_text(0, "xy")
+  let _ = view_key(key_code_backspace, 0, t.fake.now_ms)
+  t.frame()
+  t.type_text("z")
+  debug_assert(c.text() == "xz" && a.text() == "abc", "C takes them, got C \{c.text()}, A \{a.text()}")
+  debug_assert(c.focused() && !a.focused(), "A does not take the keys back")
+  open.set(true)
+  t.frame()
+  match view_tree() {
+    Some(tree) => debug_assert(same_focus(tree.focused_now().0, c.tree_node), "tree focus on C as it comes")
+    None => debug_assert(false, "tree")
+  }
+  debug_assert(c.focused(), "still C")
+  t.dispose()
+}
+
+test "field focus sync: a button the app moved the focus to from a Field, gone, gives the Field nothing back" {
+  let fld = Field::new(text="abc")
+  let there = signals::signal(true)
+  let button : signals::Ref[Option[view::NodeId]] = ref_new(None)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = field(root, fld, max_lines=1, label="A")
+    root.show(fn() { there.get() }, fn(v : view::View) {
+      button.v = Some(v.id())
+      let _ = v.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(44.0))).focusable(view::Live::Is(true))
+    })
+  })
+  t.press("A")
+  match view_tree() {
+    Some(tree) => {
+      debug_assert(tree.focus_to(button.v), "moved to the button")
+      there.set(false)
+      t.frame()
+      debug_assert(!fld.focused() && tree.focused_now().0 is None, "left on none")
+    }
+    None => debug_assert(false, "tree")
+  }
+  debug_assert(!t.fake.ime_active, "input method off")
+  t.dispose()
+}
