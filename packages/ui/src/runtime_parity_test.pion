@@ -865,3 +865,173 @@ test "d3: multi-window isolates ViewBlock and View::picture caches across window
   window_close_here(wid)
   t.dispose()
 }
+
+test "d4: text glyphs snap to physical pixels with quarter-pixel phase and tabular style at 1.5x" {
+  let ox : signals::Signal[Double] = signals::signal(10.25)
+  let oy : signals::Signal[Double] = signals::signal(20.33)
+  let seen_keys : Array[Int] = []
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(b : view::View) {
+      let _ = b
+      .offset(view::Live::By(fn() { (ox.get(), oy.get()) }))
+      .words(view::Live::Is("1234"), ink=0xFFFFFFFFL, look=view::WordsLook::{ ..view::words_plain, size: 13.0, line: 18.0, wrap: false })
+    })
+  }, width=300.0, height=100.0, scale=1.5)
+  let h = hostapi::host()
+  let orig_glyph = h.glyph
+  h.glyph = fn(key : Int, out : Array[Double]) {
+    seen_keys.push(key)
+    orig_glyph(key, out)
+  }
+  reset_glyph_atlas()
+  view_blocks_reset()
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  debug_assert((t.fake.last_shape_style & hostapi::style_tabular) == hostapi::style_tabular, "default theme tabular sets style_tabular")
+  let sc = t.scene()
+  let mut glyphs = 0
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    if (sc.inst[b + 5] - 1.0).abs() < 0.01 {
+      let px = sc.inst[b] * 1.5
+      let py = sc.inst[b + 1] * 1.5
+      debug_assert((px - px.round()).abs() < 0.01, "glyph x must land on physical pixel at 1.5x, got px=\{px}")
+      debug_assert((py - py.round()).abs() < 0.01, "glyph y must land on physical pixel at 1.5x, got py=\{py}")
+      glyphs += 1
+    }
+    i += 1
+  }
+  debug_assert(glyphs == 4, "expected 4 glyph quads, got \{glyphs}")
+  let mut has_phase = false
+  for k in seen_keys {
+    if ((k >> 26) & 3) != 0 {
+      has_phase = true
+    }
+  }
+  debug_assert(has_phase, "fractional 1.5x pen position must encode non-zero quarter-pixel phase in bits 26..27")
+  // Shift by exact whole physical pixels (2/1.5 pt): ViewBlock cache hits and glyphs stay snapped.
+  view_paint_work_reset()
+  ox.set(10.25 + 2.0 / 1.5)
+  t.frame(ms=16.0)
+  debug_assert(view_paint_work_now().copied > 0, "whole-pixel shift reuses cached ViewBlock")
+  let sc2 = t.scene()
+  let mut j = 0
+  while j < sc2.ninst {
+    let b = j * inst_size
+    if (sc2.inst[b + 5] - 1.0).abs() < 0.01 {
+      let px = sc2.inst[b] * 1.5
+      let py = sc2.inst[b + 1] * 1.5
+      debug_assert((px - px.round()).abs() < 0.01 && (py - py.round()).abs() < 0.01, "cached ViewBlock glyph stays snapped")
+    }
+    j += 1
+  }
+  t.dispose()
+}
+
+test "d5: view_cursor_tell syncs host cursor on hover and reactive View::cursor change" {
+  let brush = signals::signal(false)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(canvas : view::View) {
+      let _ = canvas
+      .width(view::Live::Is(Some(120.0)))
+      .height(view::Live::Is(Some(80.0)))
+      .presses(view::Live::Is(true))
+      .on_drag(fn(_) { })
+      .cursor(view::Live::By(fn() {
+        if brush.get() { Some(view::Cursor::Crosshair) } else { Some(view::Cursor::Arrow) }
+      }))
+    })
+    let _ = root.box(fn(zone : view::View) {
+      let _ = zone
+      .width(view::Live::Is(Some(60.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .points(view::Live::Is(true))
+      .cursor(view::Live::Is(Some(view::Cursor::ResizeX)))
+    })
+  }, width=240.0, height=160.0)
+  t.frame(ms=16.0)
+  view_pointer(0, 40.0, 40.0, 16.0)
+  debug_assert(t.fake.cursor_id == 0, "expected Arrow (0) before selecting brush, got \{t.fake.cursor_id}")
+  // Changing cursor reactively while pointer is stationary must push Crosshair (7) immediately via Tree::on_cursor.
+  brush.set(true)
+  debug_assert(t.fake.cursor_id == 7, "expected Crosshair (7) after selecting brush, got \{t.fake.cursor_id}")
+  // Hovering a hover-only points(true) node shows its cursor (ResizeX = 3).
+  view_pointer(0, 20.0, 95.0, 24.0)
+  debug_assert(t.fake.cursor_id == 3, "expected ResizeX (3) over points(true) zone, got \{t.fake.cursor_id}")
+  // Moving pointer outside interactive zones restores Arrow (0).
+  view_pointer(0, 200.0, 140.0, 32.0)
+  debug_assert(t.fake.cursor_id == 0, "expected Arrow (0) outside canvas, got \{t.fake.cursor_id}")
+  t.dispose()
+}
+
+test "d6: translucent edge over ground composites src-over instead of punching a hole" {
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(panel : view::View) {
+      let _ = panel
+      .width(view::Live::Is(Some(100.0)))
+      .height(view::Live::Is(Some(40.0)))
+      .radius(view::Live::Is(12.0))
+      .ground(view::Live::Is(0x18191DF7L))
+      .edge(view::Live::Is((1.0, 0xFFFFFF2EL)))
+    })
+  }, width=200.0, height=100.0)
+  t.frame(ms=16.0)
+  let sc = t.scene()
+  let mut found = false
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    if (sc.inst[b + 5] - 0.0).abs() < 0.01 && sc.inst[b + 6] > 0.5 {
+      // Border alpha must reflect src-over (~0.974), NOT raw 0x2E/255 (~0.180), and RGB ~67/255 (~0.263).
+      debug_assert(sc.inst[b + 15] > 0.90, "expected composited border alpha > 0.90, got \{sc.inst[b + 15]}")
+      debug_assert(sc.inst[b + 12] > 0.20 && sc.inst[b + 12] < 0.35, "expected composited border R ~0.26, got \{sc.inst[b + 12]}")
+      found = true
+    }
+    i += 1
+  }
+  debug_assert(found, "expected edged panel instance")
+  t.dispose()
+}
+
+test "d7: sibling reacts scheduling at_moment(cause_at) runs after sibling show mounts in same batch" {
+  let ver : signals::Signal[Int] = signals::signal(0)
+  let target_ref : signals::Ref[Option[view::View]] = ref_new(None)
+  let measured : Array[Double] = []
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(tabs : view::View) {
+      let _ = tabs.row(view::Live::Is(true))
+      tabs.reacts(fn() { (0, ver.get(), 0) }, fn(_) {
+        let at = tabs.cause_at()
+        let _ = tabs.at_moment(at, fn() {
+          match target_ref.v {
+            Some(target) => {
+              let (_, _, iw, _) = target.laid_window_now()
+              measured.push(iw)
+            }
+            None => ()
+          }
+        })
+      })
+      let _ = tabs.box(fn(b : view::View) {
+        target_ref.v = Some(b)
+        let _ = b.row(view::Live::Is(true)).gap(view::Live::Is(4.0))
+        let _ = b.box(fn(lbl : view::View) {
+          let _ = lbl.width(view::Live::Is(Some(40.0))).height(view::Live::Is(Some(20.0)))
+        })
+        b.show(fn() { ver.get() > 0 }, fn(dot : view::View) {
+          let _ = dot.width(view::Live::Is(Some(5.0))).height(view::Live::Is(Some(5.0)))
+        }, at_once=true)
+      })
+    })
+  }, width=300.0, height=80.0)
+  t.frame(ms=16.0)
+  signals::start_batch()
+  ver.set(1)
+  signals::end_batch()
+  t.frame(ms=16.0)
+  debug_assert(measured.length() >= 2, "expected at least 2 measurements, got \{measured.length()}")
+  let last_w = measured[measured.length() - 1]
+  debug_assert(last_w >= 48.0, "expected widened width >= 48 after sibling show mounts dot, got \{last_w}")
+  t.dispose()
+}

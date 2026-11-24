@@ -43,6 +43,71 @@ fn text_raster_scale(node_scale : Double) -> Double {
   }
 }
 
+/// Quarter-pixel step nearest a glyph's pen at `tx` device pixels (`col + sub_dx == qf / 4`).
+/// 1e-9 breaks exact N + 0.5 ties upward so whole-pixel shifts keep the exact same phase at non-dyadic scales.
+fn glyph_qf(tx : Double) -> Double {
+  (tx * 4.0 + 0.5 + 1.0e-9).floor()
+}
+
+/// Whole device-pixel column a glyph of quarter-pixel step `qf` is placed on.
+fn glyph_col_of(qf : Double) -> Double {
+  ((qf + 2.0) * 0.25).floor()
+}
+
+/// Quarter-pixel subpixel phase (0=0, 1=+0.25, 2=-0.5, 3=-0.25) for `qf`, encoded into glyph key bits 26..27.
+fn glyph_sub_of(qf : Double) -> Int {
+  match (qf - glyph_col_of(qf) * 4.0).to_int() {
+    1 => 1
+    -2 => 2
+    -1 => 3
+    _ => 0
+  }
+}
+
+/// Stamp horizontal quarter-pixel phase (bits 26..27) onto `key` for an unzoomed glyph at `laid_x` points (`sc` px/pt).
+fn glyph_sub_at(key : Int, laid_x : Double, sc : Double, z : Double) -> Int {
+  if key < 0 || z != 1.0 || sc <= 0.0 {
+    return key
+  }
+  (key & 0x03FFFFFF) | (glyph_sub_of(glyph_qf(laid_x * sc)) << 26)
+}
+
+/// Snap a point coordinate to the nearest physical device pixel at `sc` px/pt.
+fn on_pixels(x : Double, sc : Double) -> Double {
+  if sc <= 0.0 {
+    x
+  } else {
+    (x * sc).round() / sc
+  }
+}
+
+/// Snap a glyph quad's horizontal origin to the exact device-pixel column matching `glyph_sub_at`, plus integer-pixel `ox`.
+fn on_glyph_col(x : Double, ox : Double, sc : Double, z~ : Double = 1.0) -> Double {
+  if sc <= 0.0 {
+    return x + ox
+  }
+  let col = if z == 1.0 { glyph_col_of(glyph_qf(x * sc)) / sc } else { on_pixels(x, sc) }
+  col + (ox * sc).round() / sc
+}
+
+/// Snap a glyph quad's vertical origin (`top` + `base` + `oy`) to an exact physical device pixel row.
+/// Keeps `base` tie-breaking invariant under whole-pixel shifts of `top`.
+fn on_glyph_row(top : Double, base : Double, oy : Double, sc : Double) -> Double {
+  if sc <= 0.0 {
+    return top + base + oy
+  }
+  let t = top * sc
+  let tp = t.round()
+  let f = t - tp
+  (tp + (f + base * sc + 0.5 + 1.0e-6).floor() + (oy * sc + 0.5).floor()) / sc
+}
+
+/// Default text style flags from active theme (`tabular` numerals + `no_ligatures` when tracking is non-zero).
+fn view_words_style_bits(spacing : Double) -> Int {
+  (if tree_theme().tabular { hostapi::style_tabular } else { 0 }) |
+  (if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 })
+}
+
 /// Slice a UTF-8 String by UTF-16 code-unit range `[u16_start, u16_end)` (CoreText cluster ranges).
 fn utf16_slice(s : String, u16_start : Int, u16_end : Int) -> String {
   if u16_end <= u16_start || s.length() == 0 {
@@ -642,12 +707,16 @@ fn emit_glyph_quad(
   clip_x1 : Double,
   clip_y1 : Double,
   quad_scale~ : Double = 1.0,
+  snap_top~ : Option[(Double, Double)] = None,
 ) -> Unit {
   let kind = if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 }
   // apple_text.m:697: e->oy = -(b.origin.y + b.size.height) (negative above baseline)
   // (drawn `quad_scale` times the size it was rasterized at; the atlas rectangle it reads stays the one it fills)
-  let gx = pen_x + slot.ox * quad_scale
-  let gy = baseline_y + slot.oy * quad_scale
+  let (gx, gy) = match snap_top {
+    Some((top, base)) if quad_scale == 1.0 && scale > 0.0 =>
+      (on_glyph_col(pen_x, slot.ox, scale, z=1.0), on_glyph_row(top, base, slot.oy, scale))
+    _ => (pen_x + slot.ox * quad_scale, baseline_y + slot.oy * quad_scale)
+  }
   let idx = scene.push_inst(
     gx,
     gy,
@@ -755,7 +824,7 @@ fn encode_words(
   let weight = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
   let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
-  let style_bits = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
+  let style_bits = view_words_style_bits(spacing)
   let (asc_r, desc_r) = measure_metrics(sz_r, weight, style_bits)
   let asc = asc_r * qs
   let desc = desc_r * qs
@@ -873,7 +942,8 @@ fn encode_words(
       } else {
         d.x
       }
-      let baseline_y = d.y + line_idx.to_double() * line_h + base_off
+      let line_top = d.y + line_idx.to_double() * line_h
+      let baseline_y = line_top + base_off
       let ink_r = ((d.ink >> 24) & 0xFFL).to_double() / 255.0
       let ink_g = ((d.ink >> 16) & 0xFFL).to_double() / 255.0
       let ink_b = ((d.ink >> 8) & 0xFFL).to_double() / 255.0
@@ -883,27 +953,40 @@ fn encode_words(
       while k < end {
         let adv = advs[k] * qs + spacing
         let gkey = gkeys[k]
-        match resolve_glyph(gkey, scale) {
-          Some(slot) =>
-          scene.push_glyph_inst(
-            pen_x + pad + slot.ox * qs,
-            baseline_y + slot.oy * qs,
-            slot.gw * qs,
-            slot.gh * qs,
-            if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
-            ink_r,
-            ink_g,
-            ink_b,
-            ink_a,
-            slot.u,
-            slot.v,
-            slot.gw * scale,
-            slot.gh * scale,
-            eff_clip_x,
-            eff_clip_y,
-            eff_clip_x1,
-            eff_clip_y1,
-          )
+        let laid_x = pen_x + pad
+        let sub_key = glyph_sub_at(gkey, laid_x, scale, qs)
+        match resolve_glyph(sub_key, scale) {
+          Some(slot) => {
+            let qx = if qs == 1.0 && scale > 0.0 {
+              on_glyph_col(laid_x, slot.ox * qs, scale, z=qs)
+            } else {
+              laid_x + slot.ox * qs
+            }
+            let qy = if qs == 1.0 && scale > 0.0 {
+              on_glyph_row(line_top, base_off, slot.oy * qs, scale)
+            } else {
+              baseline_y + slot.oy * qs
+            }
+            scene.push_glyph_inst(
+              qx,
+              qy,
+              slot.gw * qs,
+              slot.gh * qs,
+              if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
+              ink_r,
+              ink_g,
+              ink_b,
+              ink_a,
+              slot.u,
+              slot.v,
+              slot.gw * scale,
+              slot.gh * scale,
+              eff_clip_x,
+              eff_clip_y,
+              eff_clip_x1,
+              eff_clip_y1,
+            )
+          }
           None => ()
         }
         pen_x = pen_x + adv
@@ -1170,7 +1253,7 @@ fn encode_runs(
   let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
   let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
-  let lig_bit = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
+  let lig_bit = view_words_style_bits(spacing)
   let (base_asc_r, base_desc_r) = measure_metrics(base_sz_r, base_w, lig_bit)
   let base_asc = base_asc_r * qs
   let base_desc = base_desc_r * qs
@@ -1248,11 +1331,13 @@ fn encode_runs(
     while k < vl.end {
       let cl = layout.clusters[k]
       if (cl.rink & 0xFFL) != 0L {
-        match resolve_glyph(cl.gkey, scale) {
+        let laid_x = pen_x + pad + cl.pad_l
+        let sub_key = glyph_sub_at(cl.gkey, laid_x, scale, qs)
+        match resolve_glyph(sub_key, scale) {
           Some(slot) =>
           emit_glyph_quad(
             scene,
-            pen_x + pad + cl.pad_l,
+            laid_x,
             baseline_y,
             slot,
             cl.rink,
@@ -1263,6 +1348,7 @@ fn encode_runs(
             clip_x1,
             clip_y1,
             quad_scale=qs,
+            snap_top=if qs == 1.0 && scale > 0.0 { Some((line_y, base_off)) } else { None },
           )
           None => ()
         }
@@ -1290,7 +1376,7 @@ pub fn host_words_measure(
   let sz = base_sz * s
   let weight = if look.weight > 0 { look.weight } else { 400 }
   let spacing = view_spacing(s, look)
-  let style_bits = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
+  let style_bits = view_words_style_bits(spacing)
   let (asc, desc) = measure_metrics(sz, weight, style_bits)
   let line_h = if look.line > 0.0 {
     look.line * s
@@ -1417,7 +1503,7 @@ pub fn host_runs_measure(
   let base_sz = (if look.size > 0.0 { look.size } else { tree_theme().font }) * s
   let base_w = if look.weight > 0 { look.weight } else { 400 }
   let spacing = view_spacing(s, look)
-  let lig_bit = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
+  let lig_bit = view_words_style_bits(spacing)
   let (asc, desc) = measure_metrics(base_sz, base_w, lig_bit)
   let line_h = if look.line > 0.0 {
     look.line * s
@@ -1457,7 +1543,7 @@ pub fn host_runs_least_measure(
   let base_sz = (if look.size > 0.0 { look.size } else { tree_theme().font }) * s
   let base_w = if look.weight > 0 { look.weight } else { 400 }
   let spacing = view_spacing(s, look)
-  let lig_bit = if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 }
+  let lig_bit = view_words_style_bits(spacing)
 
   let clusters : Array[RunsCluster] = []
   let para_ranges : Array[(Int, Int)] = []
@@ -1608,12 +1694,22 @@ pub fn Scene::draw_text_run(
   while k < n {
     let adv = sbuf[k * 4 + 2] + tracking
     let gkey = sbuf[k * 4 + 3].to_int()
-    match resolve_glyph(gkey, scale) {
+    let laid_x = x + (pen_x + pad) * draw_scale
+    let sub_key = glyph_sub_at(gkey, laid_x, scale, draw_scale)
+    match resolve_glyph(sub_key, scale) {
       Some(slot) => {
         if slot.gw > 0.0 && slot.gh > 0.0 {
           let kind = if slot.color { 3.0 } else { 1.0 }
-          let qx = x + (pen_x + pad + slot.ox) * draw_scale
-          let qy = baseline_y + slot.oy * draw_scale
+          let qx = if draw_scale == 1.0 && scale > 0.0 {
+            on_glyph_col(laid_x, slot.ox, scale, z=1.0)
+          } else {
+            x + (pen_x + pad + slot.ox) * draw_scale
+          }
+          let qy = if draw_scale == 1.0 && scale > 0.0 {
+            on_glyph_row(y, asc, slot.oy, scale)
+          } else {
+            baseline_y + slot.oy * draw_scale
+          }
           let qw = slot.gw * draw_scale
           let qh = slot.gh * draw_scale
           let _ = self.push_inst(
