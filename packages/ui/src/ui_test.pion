@@ -4677,3 +4677,266 @@ test "a Field under View::scale(1.5) scales selection, caret, IME and edit menu 
   debug_assert(st_near(em_b.w, em_a.w * 1.5) && st_near(em_b.h, em_a.h * 1.5), "edit_menu_rect 1.5x: \{em_b.w}x\{em_b.h} vs \{em_a.w}x\{em_a.h}")
   t.dispose()
 }
+
+test "view_key dispatches focused context-scoped keymap bindings before Field::handle_key without letting global or sibling bindings hijack typing" {
+  let step_up = ref_new(0)
+  let step_down = ref_new(0)
+  let global_up = ref_new(0)
+  let sibling_up = ref_new(0)
+  let not_field_home = ref_new(0)
+  let chord_done = ref_new(0)
+  let num_fld = Field::new(text="42")
+  let plain_fld = Field::new(text="hello")
+  let km = view::Keymap::new([
+    // Global catch-all (Always): must NOT hijack a focused Field.
+    view::Binding::{ keys: [view::Stroke::{ code: key_code_up, mods: 0 }], action: "global.up", when: view::KeyWhen::Always },
+    // Global 2-key chord: Cmd+K then 'c' (code 99).
+    view::Binding::{
+      keys: [view::Stroke::{ code: 107, mods: mod_cmd }, view::Stroke::{ code: 99, mods: 0 }],
+      action: "global.chord",
+      when: view::KeyWhen::Always,
+    },
+    // Sibling-scoped context: must NOT fire when focus is in an unrelated Field.
+    view::Binding::{ keys: [view::Stroke::{ code: key_code_up, mods: 0 }], action: "sibling.up", when: view::KeyWhen::In("SiblingPanel") },
+    // Explicit focus-chain context (e.g. numeric input / Combobox): MUST win over Field ArrowUp/ArrowDown.
+    view::Binding::{ keys: [view::Stroke::{ code: key_code_up, mods: 0 }], action: "num.step_up", when: view::KeyWhen::In("NumberField") },
+    view::Binding::{ keys: [view::Stroke::{ code: key_code_down, mods: 0 }], action: "num.step_down", when: view::KeyWhen::In("NumberField") },
+    // Combobox-style Not(In("Field")) exclusion: must still yield Home to Field::handle_key.
+    view::Binding::{
+      keys: [view::Stroke::{ code: key_code_home, mods: 0 }],
+      action: "num.home",
+      when: view::KeyWhen::All([view::KeyWhen::In("NumberField"), view::KeyWhen::Not(view::KeyWhen::In("Field"))]),
+    },
+  ])
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.keymap(view::Live::Is(km))
+      .on_action("global.up", fn(_a : view::ActionAt) { global_up.v = global_up.v + 1; true })
+      .on_action("global.chord", fn(_a : view::ActionAt) { chord_done.v = chord_done.v + 1; true })
+    let _ = root.box(fn(num_wrap : view::View) {
+      let _ = num_wrap
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(36.0)))
+        .key_context("NumberField")
+        .on_action("num.step_up", fn(_a : view::ActionAt) { step_up.v = step_up.v + 1; true })
+        .on_action("num.step_down", fn(_a : view::ActionAt) { step_down.v = step_down.v + 1; true })
+        .on_action("num.home", fn(_a : view::ActionAt) { not_field_home.v = not_field_home.v + 1; true })
+      let _ = field(num_wrap, num_fld, max_lines=1)
+    })
+    let _ = root.box(fn(plain_wrap : view::View) {
+      let _ = plain_wrap.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(plain_wrap, plain_fld, max_lines=1)
+    })
+    let _ = root.box(fn(sib : view::View) {
+      let _ = sib
+        .width(view::Live::Is(Some(100.0)))
+        .height(view::Live::Is(Some(36.0)))
+        .key_context("SiblingPanel")
+        .on_action("sibling.up", fn(_a : view::ActionAt) { sibling_up.v = sibling_up.v + 1; true })
+    })
+  })
+  // 1. Focused inside NumberField: ArrowUp / ArrowDown hit context-scoped actions before Field::handle_key.
+  num_fld.focus()
+  t.frame()
+  t.key(key_code_up)
+  t.key(key_code_down)
+  debug_assert(step_up.v == 1 && step_down.v == 1, "focused NumberField ArrowUp/Down fired scoped actions: \{step_up.v}/\{step_down.v}")
+  debug_assert(global_up.v == 0 && sibling_up.v == 0, "global/sibling did not fire")
+  // Home with All([In("NumberField"), Not(In("Field"))]) yields to Field::handle_key (moves caret to 0).
+  num_fld.pick(2, 2)
+  t.key(key_code_home)
+  debug_assert(not_field_home.v == 0 && num_fld.selection().1 == 0, "Not(In(\"Field\")) yields Home to Field, caret=\{num_fld.selection().1}")
+  // 2. Focused inside plain Field: neither global Always nor SiblingPanel In("SiblingPanel") hijacks ArrowUp.
+  plain_fld.focus()
+  plain_fld.pick(5, 5)
+  t.frame()
+  t.key(key_code_up)
+  debug_assert(global_up.v == 0, "Always binding must not hijack plain Field ArrowUp")
+  debug_assert(sibling_up.v == 0, "unrelated sibling context must not hijack plain Field ArrowUp")
+  debug_assert(step_up.v == 1, "unfocused NumberField context must not fire")
+  debug_assert(plain_fld.selection().1 == 0, "plain Field handled ArrowUp itself, caret=\{plain_fld.selection().1}")
+  // 3. During IME composition, scoped binding does not steal keys from active composition.
+  num_fld.focus()
+  t.frame()
+  let _ = view_text(1, "ni", a=2, b=0)
+  debug_assert(num_fld.composing(), "num_fld is composing")
+  t.key(key_code_up)
+  debug_assert(step_up.v == 1, "active IME composition keeps ArrowUp from scoped keymap")
+  let _ = view_text(1, "", a=0, b=0)
+  // 4. Multi-key chord continuation (Cmd+K then 'c') works in a focused Field, while an unmatched
+  //    follow-up (Cmd+K then ArrowUp) clears the chord and still obeys scoped_only (no Always hijack).
+  plain_fld.focus()
+  plain_fld.pick(5, 5)
+  t.frame()
+  t.key(107, mods=mod_cmd)
+  t.key(99)
+  debug_assert(chord_done.v == 1, "Cmd+K then c completed pending chord inside focused Field")
+  t.key(107, mods=mod_cmd)
+  t.key(key_code_up)
+  debug_assert(global_up.v == 0, "unmatched chord fallback must not fire Always ArrowUp in focused Field")
+  debug_assert(plain_fld.selection().1 == 0, "unmatched chord fallback yielded ArrowUp to plain Field")
+  t.dispose()
+}
+
+test "view_key preserves multiline Field editing keys despite ancestor context bindings" {
+  let app_hits = ref_new(0)
+  let multi_fld = Field::new(text="ab\ncd")
+  let km = view::Keymap::new([
+    view::Binding::{ keys: [view::Stroke::{ code: key_code_down, mods: 0 }], action: "app.down", when: view::KeyWhen::In("App") },
+    view::Binding::{ keys: [view::Stroke::{ code: key_code_backspace, mods: 0 }], action: "app.bs", when: view::KeyWhen::In("App") },
+  ])
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.keymap(view::Live::Is(km)).key_context("App")
+      .on_action("app.down", fn(_a : view::ActionAt) { app_hits.v = app_hits.v + 1; true })
+      .on_action("app.bs", fn(_a : view::ActionAt) { app_hits.v = app_hits.v + 100; true })
+    let _ = root.box(fn(mw : view::View) {
+      let _ = mw.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(120.0)))
+      let _ = field(mw, multi_fld, max_lines=5)
+    })
+  })
+  multi_fld.focus()
+  t.frame()
+  multi_fld.pick(1, 1)
+  t.key(key_code_down)
+  debug_assert(app_hits.v == 0 && multi_fld.selection().1 > 2, "multiline Field kept ArrowDown: app=\{app_hits.v} caret=\{multi_fld.selection().1}")
+  multi_fld.pick(5, 5)
+  t.key(key_code_backspace)
+  debug_assert(app_hits.v == 0 && multi_fld.text_sig.untracked() == "ab\nc", "multiline Field kept Backspace: app=\{app_hits.v} text=\{multi_fld.text_sig.untracked()}")
+  t.dispose()
+}
+
+test "view_key supports focus-chain on_key for single-line Field, avoids double-calling declining actions, and clears scoped chords" {
+  let esc_calls = ref_new(0)
+  let combo_hits = ref_new(0)
+  let sibling_on_key_hits = ref_new(0)
+  let chord_dd_hits = ref_new(0)
+  let combo_fld = Field::new(text="ab")
+  let chord_fld = Field::new(text="ab")
+  let km = view::Keymap::new([
+    view::Binding::{ keys: [view::Stroke::{ code: key_escape, mods: 0 }], action: "x.decline", when: view::KeyWhen::In("DeclineBox") },
+    view::Binding::{
+      keys: [view::Stroke::{ code: key_code_down, mods: 0 }, view::Stroke::{ code: key_code_down, mods: 0 }],
+      action: "chord.dd",
+      when: view::KeyWhen::In("ChordBox"),
+    },
+  ])
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.keymap(view::Live::Is(km))
+    let _ = root.box(fn(cw : view::View) {
+      let _ = cw.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(40.0)))
+        .key_context("DeclineBox")
+        .on_action("x.decline", fn(_a : view::ActionAt) { esc_calls.v = esc_calls.v + 1; false })
+        .on_key(fn(k : view::Key) -> Bool {
+          if k.code == key_code_down && k.mods == 0 {
+            combo_hits.v = combo_hits.v + 1
+            true
+          } else {
+            false
+          }
+        })
+      let _ = field(cw, combo_fld, max_lines=1)
+    })
+    let _ = root.box(fn(chw : view::View) {
+      let _ = chw.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(40.0)))
+        .key_context("ChordBox")
+        .on_action("chord.dd", fn(_a : view::ActionAt) { chord_dd_hits.v = chord_dd_hits.v + 1; true })
+      let _ = field(chw, chord_fld, max_lines=1)
+    })
+    let _ = root.box(fn(sib : view::View) {
+      let _ = sib.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+        .on_key(fn(k : view::Key) -> Bool {
+          if k.code == key_code_down && k.mods == 0 {
+            sibling_on_key_hits.v = sibling_on_key_hits.v + 1
+            true
+          } else {
+            false
+          }
+        })
+    })
+  })
+  // Probe B: single-line Field inside Combobox-style on_key receives ArrowDown (and sibling on_key does NOT).
+  combo_fld.focus()
+  t.frame()
+  t.key(key_code_down)
+  debug_assert(combo_hits.v == 1 && sibling_on_key_hits.v == 0, "focus-chain on_key won ArrowDown: combo=\{combo_hits.v} sib=\{sibling_on_key_hits.v}")
+  // Probe C: declining scoped Escape action is called at most once (Step 4 only, not Step 2 + Step 4).
+  t.key(key_escape)
+  debug_assert(esc_calls.v == 1, "declining Escape action called exactly once, got \{esc_calls.v}")
+  // Probe D: single-line scoped chord prefix (ArrowDown) followed by ArrowLeft cancels pending chord and moves caret left.
+  chord_fld.focus()
+  t.frame()
+  chord_fld.pick(1, 1)
+  t.key(key_code_down)
+  t.key(key_code_left)
+  let pending_after = match view_tree() {
+    Some(tr) => tr.keys_pending().length()
+    None => -1
+  }
+  debug_assert(pending_after == 0 && chord_dd_hits.v == 0 && chord_fld.selection().1 == 0, "chord cleared and ArrowLeft moved caret: pending=\{pending_after} caret=\{chord_fld.selection().1}")
+  t.dispose()
+}
+
+test "view_key keeps active Field Enter and Space inside focus chain (no leak to global Always or sibling on_key)" {
+  let global_enter = ref_new(0)
+  let sib_enter = ref_new(0)
+  let sib_space = ref_new(0)
+  let default_fired = ref_new(0)
+  let fld = Field::new(text="hi")
+  let dlg_fld = Field::new(text="ok")
+  let dlg_open = signals::signal(false)
+  let km = view::Keymap::new([
+    view::Binding::{ keys: [view::Stroke::{ code: key_enter, mods: 0 }], action: "global.enter", when: view::KeyWhen::Always },
+  ])
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.keymap(view::Live::Is(km))
+      .on_action("global.enter", fn(_a : view::ActionAt) { global_enter.v = global_enter.v + 1; true })
+    let _ = root.box(fn(fw : view::View) {
+      let _ = fw.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(40.0)))
+      let _ = field(fw, fld, max_lines=1)
+    })
+    let _ = root.box(fn(sib : view::View) {
+      let _ = sib.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+        .on_key(fn(k : view::Key) -> Bool {
+          if k.code == key_enter && k.mods == 0 {
+            sib_enter.v = sib_enter.v + 1
+            true
+          } else if k.code == key_space && k.mods == 0 {
+            sib_space.v = sib_space.v + 1
+            true
+          } else {
+            false
+          }
+        })
+    })
+    let _ = root.show(
+      fn() { dlg_open.get() },
+      fn(dlg : view::View) {
+        let _ = dlg.modal(view::Live::Is(true)).width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(120.0)))
+        let _ = field(dlg, dlg_fld, max_lines=1)
+        let _ = dlg.box(fn(btn : view::View) {
+          let _ = btn.width(view::Live::Is(Some(80.0))).height(view::Live::Is(Some(32.0)))
+            .default_press(view::Live::Is(true))
+            .on_press(fn() { default_fired.v = default_fired.v + 1 })
+        })
+      },
+      at_once=true,
+    )
+  })
+  fld.focus()
+  t.frame()
+  // Probe E & E2: Enter in single-line Field without on_submitted must not hit global Always or sibling on_key.
+  t.key(key_enter)
+  debug_assert(global_enter.v == 0, "active Field Enter must not leak to global Always binding")
+  debug_assert(sib_enter.v == 0, "active Field Enter must not leak to sibling on_key")
+  // Probe F: Space key code in active Field must not leak to sibling on_key.
+  t.key(key_space)
+  debug_assert(sib_space.v == 0, "active Field Space must not leak to sibling on_key")
+  // Modal dialog default_press still fires when pressing Enter inside a dialog Field without on_submitted.
+  dlg_open.set(true)
+  t.frame()
+  dlg_fld.focus()
+  t.frame()
+  t.key(key_enter)
+  debug_assert(global_enter.v == 0, "modal Field Enter still does not leak to global Always")
+  debug_assert(default_fired.v == 1, "modal Field Enter triggers dialog default_press button")
+  t.dispose()
+}

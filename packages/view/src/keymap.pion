@@ -46,6 +46,14 @@ pub fn key_when_holds(self : KeyWhen, has : (String) -> Bool) -> Bool {
 }
 
 ///|
+/// Whether `self` requires at least one context to hold (i.e. does not match in the empty context set).
+/// Used to distinguish explicit context-scoped bindings (`In(ctx)`, `All([In(ctx), ...])`) from global
+/// catch-all bindings (`Always`, `Not(In(...))`) when a text field holds focus.
+pub fn key_when_scoped(self : KeyWhen) -> Bool {
+  !key_when_holds(self, fn(_) { false })
+}
+
+///|
 /// A predicate as written: names, `!`, `&&`, `||` (`&&` binding closer) and brackets, `Chat && !Field`; "" Always;
 /// None where it is not one.
 pub fn key_when_parse(text : String) -> Option[KeyWhen] {
@@ -300,7 +308,8 @@ pub fn View::key_context(self : View, name : String) -> View {
 ///|
 /// What it does for `action` (by its keys where the keymap binds them where it is, or asked by name): run at its
 /// moment, as one change outside any tracking; true where it took it, which nothing else is told of then, false passing
-/// it on outwards. `can`: whether it can now (read as it is asked; where not, passed by as if it said nothing).
+/// it on outwards (returning false should not leave irreversible side effects). `can`: whether it can now (read as it
+/// is asked; where not, passed by as if it said nothing).
 pub fn View::on_action(self : View, action : String, f : (ActionAt) -> Bool, can~ : () -> Bool = fn() { true }) -> View {
   match self.key_node() {
     Some(k) => k.actions.push((action, f, can))
@@ -409,10 +418,16 @@ fn Tree::keys_end(self : Tree, why : KeysEnd) -> Unit {
 }
 
 ///|
+/// Whether a multi-key chord sequence is currently pending (untracked, safe inside key dispatch).
+pub fn Tree::has_pending_keys(self : Tree) -> Bool {
+  self.keyed.pending.untracked().length() > 0
+}
+
+///|
 /// The nodes that do actions as a key from `from` (the node with the focus, or what hosts it; None: none has it) asks
-/// them: `from` and what holds it, the innermost first, those that may take input; then the rest that may, the one
-/// drawn last first.
-fn Tree::action_nodes(self : Tree, from : Option[NodeId]) -> Array[Int] {
+/// them: `from` and what holds it, the innermost first, those that may take input; then (unless `focus_only`) the rest
+/// that may, the one drawn last first.
+fn Tree::action_nodes(self : Tree, from : Option[NodeId], focus_only~ : Bool = false) -> Array[Int] {
   let book = self.keyed
   let mine = fn(i : Int) {
     match book.nodes.get(i) {
@@ -433,7 +448,7 @@ fn Tree::action_nodes(self : Tree, from : Option[NodeId]) -> Array[Int] {
     }
     _ => ()
   }
-  if self.nodes.length() > 0 && self.nodes[0].live {
+  if !focus_only && self.nodes.length() > 0 && self.nodes[0].live {
     let rest : Array[Int] = []
     self.topmost_from(0, fn(_) { true }, rest)
     for i in rest {
@@ -507,6 +522,9 @@ pub fn Tree::stroke(
   at : Double,
   from~ : Option[NodeId] = None,
   facts~ : Array[String] = [],
+  scoped_only~ : Bool = false,
+  focus_only~ : Bool = false,
+  pending_only~ : Bool = false,
 ) -> Bool {
   if self.nodes.length() == 0 || !self.nodes[0].live {
     return false
@@ -524,28 +542,47 @@ pub fn Tree::stroke(
     if (under.length() > 0) && opt_ne(book.pending_from, from) {
       self.keys_end(FocusMoved)
     }
-    took.v = self.stroke_now(s, t, from, facts)
+    took.v = self.stroke_now(s, t, from, facts, scoped_only, focus_only, pending_only)
   })
   took.v
 }
 
 ///|
 /// Tree::stroke's, in its event.
-fn Tree::stroke_now(self : Tree, s : Stroke, t : Double, from : Option[NodeId], facts : Array[String]) -> Bool {
+fn Tree::stroke_now(
+  self : Tree,
+  s : Stroke,
+  t : Double,
+  from : Option[NodeId],
+  facts : Array[String],
+  scoped_only : Bool,
+  focus_only : Bool,
+  pending_only : Bool,
+) -> Bool {
   let book = self.keyed
   let under = book.pending.untracked()
+  if pending_only && under.length() == 0 {
+    return false
+  }
   let keys = array_push_copy(under, s)
-  let nodes = self.action_nodes(from)
+  let single_scoped = scoped_only && under.length() == 0
+  let single_focus = focus_only && under.length() == 0
+  let nodes = self.action_nodes(from, focus_only=single_focus)
   let bindings = book.map.bindings
   // (whole: each node in turn, its later bindings first, the first that takes it; the app's, then where none of them
   // took it a column's own keys, as an old view's list took what no action did: scroll_keys.mbt)
-  for pass in [bindings, scroll_bindings] {
+  let passes = if single_scoped { [bindings] } else { [bindings, scroll_bindings] }
+  for pass in passes {
     for i in nodes {
       let mut b = pass.length() - 1
       while b >= 0 {
         let bd = pass[b]
         b = b - 1
-        guard strokes_eq(bd.keys, keys) && key_when_holds(bd.when, fn(name) { self.key_has(i, facts, name) }) else { continue }
+        guard (!single_scoped || key_when_scoped(bd.when)) &&
+          strokes_eq(bd.keys, keys) &&
+          key_when_holds(bd.when, fn(name) { self.key_has(i, facts, name) }) else {
+          continue
+        }
         for f in self.action_at(i, bd.action) {
           guard self.nodes[i].live else { break }
           if signals::untracked(fn() -> Bool { f(ActionAt::{ action: bd.action, at: t, keys, by: Keys }) }) {
@@ -559,6 +596,7 @@ fn Tree::stroke_now(self : Tree, s : Stroke, t : Double, from : Option[NodeId], 
   // (begun: a longer binding it goes on with, where some node does its action)
   let goes_on = array_any(nodes, fn(i) {
     array_any(bindings, fn(bd) {
+      (!single_scoped || key_when_scoped(bd.when)) &&
       bd.keys.length() > keys.length() &&
       strokes_begin(bd.keys, keys) &&
       key_when_holds(bd.when, fn(name) { self.key_has(i, facts, name) }) &&
@@ -588,7 +626,10 @@ fn Tree::stroke_now(self : Tree, s : Stroke, t : Double, from : Option[NodeId], 
     return true
   }
   self.keys_end(Unmatched)
-  self.stroke_now(s, t, from, facts)
+  if pending_only {
+    return false
+  }
+  self.stroke_now(s, t, from, facts, scoped_only, focus_only, false)
 }
 
 ///|

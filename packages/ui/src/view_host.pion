@@ -3297,12 +3297,16 @@ pub fn view_key(code : Int, mods : Int, now : Double) -> Bool {
   }
   let (held, _) = tree.focused_now()
   let facts : Array[String] = []
+  let mut field_composing = false
+  let mut field_multiline = false
   let field_active = match focused_field_ref.v {
     Some(f) if f.focused_sig.untracked() => {
       facts.push("Field")
       if f.text_sig.untracked().length() == 0 {
         facts.push("FieldEmpty")
       }
+      field_composing = f.composing()
+      field_multiline = f.editor.config.multiline
       true
     }
     _ => false
@@ -3317,11 +3321,37 @@ pub fn view_key(code : Int, mods : Int, now : Double) -> Bool {
     return tree_focus_step(tree, if backward { -1 } else { 1 })
   }
 
-  // 2. Focused Field: Cmd/Ctrl shortcuts try Keymap stroke first, else Field::handle_key
+  // 2. Focused Field:
+  //    - Cmd/Ctrl shortcuts try the full Keymap first.
+  //    - Otherwise (when not mid-IME-composition):
+  //      * For unmodified ArrowUp / ArrowDown in a single-line Field, let enclosing focus-chain
+  //        context-scoped Keymap bindings (e.g. numeric steppers, Combobox) and focus-chain
+  //        `on_key` handlers (e.g. default Combobox) run before Field collapses them to line
+  //        start/end, without letting global `Always` bindings or unrelated sibling panels
+  //        preempt Field before it handles the key.
+  //      * For all other unmodified keys (and multiline ArrowUp/ArrowDown), only continue or
+  //        clear an already-pending multi-key chord (`pending_only=true`) so Field keeps full
+  //        priority over editing keys (Backspace, arrows, Home/End, Enter, etc.).
   if field_active {
     let has_cmd_or_ctrl = (mods & (mod_cmd | mod_ctrl)) != 0
-    if has_cmd_or_ctrl && tree.stroke(code, mods, now, from=held, facts=facts) {
-      return true
+    if has_cmd_or_ctrl {
+      if tree.stroke(code, mods, now, from=held, facts=facts) {
+        return true
+      }
+    } else if !field_composing {
+      let single_line_up_down = !field_multiline && mods == 0 && (code == key_code_up || code == key_code_down)
+      if single_line_up_down {
+        if tree.stroke(code, mods, now, from=held, facts=facts, scoped_only=true, focus_only=true) {
+          return true
+        }
+        if held is Some(_) && tree.key_at(code, mods, now, within=held) {
+          return true
+        }
+      } else if tree.has_pending_keys() {
+        if tree.stroke(code, mods, now, from=held, facts=facts, pending_only=true) {
+          return true
+        }
+      }
     }
     match focused_field_ref.v {
       Some(f) => {
@@ -3333,8 +3363,34 @@ pub fn view_key(code : Int, mods : Int, now : Double) -> Bool {
     }
   }
 
-  // 3. Focused node Enter / Space press
+  // 3. Focused node Enter / Space press:
+  //    - When the focused node is the already-active Field (and Field::handle_key returned false,
+  //      e.g. Enter with no `on_submitted`), do not invoke its click-to-focus `on_press` and do not
+  //      leak Enter/Space into global Always bindings or unrelated sibling `on_key` handlers:
+  //      route strictly within the focus chain (scoped keymap -> focus-chain on_key -> default press)
+  //      and consume.
+  let focused_is_active_field = field_active && match (held, focused_field_ref.v) {
+    (Some(nid), Some(f)) => match f.tree_node {
+      Some(fnid) => nid == fnid
+      None => false
+    }
+    _ => false
+  }
   if mods == 0 && (code == key_enter || code == key_space) {
+    if focused_is_active_field {
+      if !field_composing {
+        if tree.stroke(code, mods, now, from=held, facts=facts, scoped_only=true, focus_only=true) {
+          return true
+        }
+        if held is Some(_) && tree.key_at(code, mods, now, within=held) {
+          return true
+        }
+      }
+      if code == key_enter {
+        let _ = tree.press_default_at(now, from=held)
+      }
+      return true
+    }
     match held {
       Some(nid) => {
         let mask = if code == key_enter { view::focus_enter } else { view::focus_space }
