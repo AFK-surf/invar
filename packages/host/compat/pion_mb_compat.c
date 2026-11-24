@@ -1234,6 +1234,7 @@ void *pion_host_native_result(int32_t id) {
   return mb_str_to_pion(mb_host_native_result(id));
 }
 
+// Test-only helper used by host_test.pion to remove temporary snapshot PNGs.
 int32_t pion_host_remove_file(const char *path, int64_t len) {
   if (!path || len <= 0 || len >= 4096) return 0;
   char buf[4096];
