@@ -1114,6 +1114,89 @@ function buildHtmlPage(programs) {
           v11Ok ? '3x<=10/12, 2x<=12/14, wall+emerald, top 5.00/5.20pt, frost dEps<=2 dBlur<=8 dCross<=90' : JSON.stringify(v11Summary));
       }
 
+      // V12-Apple-Panel-Glass: Light 0xFDFCFDBFL bright-bg chroma + 1.5pt cushion rim & 0xFDFCFDFFL uniformity
+      {
+        const lumaF = (res, x, y) => {
+          const [r, g, b] = res.at(x, y);
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        };
+        const bubbleBg = () => [211, 232, 253];
+        const bf = run2D(160, 120, 2, bubbleBg, {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 191 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const [cr, , cb] = bf.at(160, 88);
+        const centerChroma = cb - cr;
+        const topL = lumaF(bf, 160, 43);
+        const centerL = lumaF(bf, 160, 88);
+        const ff = run2D(160, 120, 2, null, {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 1.0], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const dLff = Math.abs(lumaF(ff, 160, 43) - lumaF(ff, 160, 88));
+        // 3. Light monotonicity over gray 0.60 vs 0.72: 0xBF L(0.72) >= L(0.60) + 2.0, and 0xCD (frost=0.3) L(0.72) >= L(0.60)
+        const g60 = run2D(160, 120, 2, () => [153, 153, 153], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 191 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const g72 = run2D(160, 120, 2, () => [184, 184, 184], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 191 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const lG60 = lumaF(g60, 160, 88);
+        const lG72 = lumaF(g72, 160, 88);
+        const cd60 = run2D(160, 120, 2, () => [153, 153, 153], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 205 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const cd72 = run2D(160, 120, 2, () => [184, 184, 184], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 205 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const lCd60 = lumaF(cd60, 160, 88);
+        const lCd72 = lumaF(cd72, 160, 88);
+        // 4. Dark 0xA8 chroma=0.03 vs chroma=0.0 over saturated blue (60, 120, 210): B-R diff >= 8
+        const satBlue = () => [60, 120, 210];
+        const a8c3 = run2D(160, 120, 2, satBlue, {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [32 / 255, 32 / 255, 32 / 255, 168 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+        });
+        const a8c0 = run2D(160, 120, 2, null, {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
+          col: [32 / 255, 32 / 255, 32 / 255, 168 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.0,
+        });
+        const [a3r, , a3b] = a8c3.at(160, 88);
+        const [a0r, , a0b] = a8c0.at(160, 88);
+        const darkA8Diff = (a3b - a3r) - (a0b - a0r);
+        // 5. Dark 0xCC (Sheet/Drawer, chroma=0.0) over saturated blue (60, 120, 210): zero drift (B-R ~ 45)
+        const cc0 = run2D(160, 120, 2, null, {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 12.0,
+          col: [32 / 255, 32 / 255, 32 / 255, 204 / 255], rim: 0.6, bezel: 20, refract: 24, chroma: 0.0,
+        });
+        const [ccr, , ccb] = cc0.at(160, 88);
+        const darkCC = ccb - ccr;
+        // 6. Regular controls (chroma=0.06) under contrast=true (0x85) and frost=0.5 (0xAB): bit-for-bit max_abs_diff == 0 vs chroma=0.0
+        const ctrlMaxDiff = (col, bgFn) => {
+          const r6 = run2D(160, 120, 2, bgFn, { x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.0, col, rim: 0.6, bezel: 14, refract: 20, chroma: 0.06 });
+          const r0 = run2D(160, 120, 2, null, { x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.0, col, rim: 0.6, bezel: 14, refract: 20, chroma: 0.0 });
+          let md = 0;
+          for (let py = 40; py <= 200; py++) {
+            for (let px = 40; px <= 280; px++) {
+              const p6 = r6.at(px, py), p0 = r0.at(px, py);
+              for (let c = 0; c < 3; c++) md = Math.max(md, Math.abs(p6[c] - p0[c]));
+            }
+          }
+          return md;
+        };
+        const dL85 = ctrlMaxDiff([253 / 255, 252 / 255, 253 / 255, 133 / 255], bubbleBg);
+        const dLAB = ctrlMaxDiff([253 / 255, 252 / 255, 253 / 255, 171 / 255], bubbleBg);
+        const dDAB = ctrlMaxDiff([32 / 255, 32 / 255, 32 / 255, 171 / 255], satBlue);
+        const v12Ok = centerChroma >= 22 && (topL - centerL) >= 4.0 && dLff <= 3.0 && lG72 >= lG60 + 2.0 && lCd72 >= lCd60 && darkA8Diff >= 8 && darkCC >= 41 && darkCC <= 49 && dL85 === 0 && dLAB === 0 && dDAB === 0;
+        pushVec('V12-Apple-Panel-Glass (0xBF/0xCD mono, 0xFF, dark 0xA8/0xCC, ctrl 0-diff)', v12Ok,
+          [centerChroma, Number((topL - centerL).toFixed(1)), Number(dLff.toFixed(2)), Number(lG60.toFixed(1)), Number(lG72.toFixed(1)), Number(lCd60.toFixed(1)), Number(lCd72.toFixed(1)), darkA8Diff, darkCC, dL85, dLAB, dDAB],
+          '0xBF B-R>=22 dRim>=4 L72>=L60+2 0xCD L72>=L60, 0xFF |dL|<=3, darkA8 d>=8, darkCC [41..49], ctrlDiff=(0,0,0)');
+      }
+
       gl.deleteTexture(bdTex);
       gl.deleteProgram(bgProg);
       gl.deleteShader(bgVs);
@@ -1124,7 +1207,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 11,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 12,
       passed,
       total: programs.length,
       drawPassed,
@@ -1239,7 +1322,7 @@ runCheck()
     if (JSON_MODE) {
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     } else {
-      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V9) — ${report.ok ? 'PASS' : 'FAIL'}`);
+      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V12) — ${report.ok ? 'PASS' : 'FAIL'}`);
       if (report.renderer) console.log(`  renderer: ${report.renderer}`);
       if (report.version) console.log(`  version : ${report.version}`);
       for (const r of report.results || []) {
