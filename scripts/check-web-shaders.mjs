@@ -635,11 +635,16 @@ function buildHtmlPage(programs) {
           const idx = (fy * W2 + x) * 4;
           return [out[idx], out[idx + 1], out[idx + 2]];
         };
+        const rgbaAt = (x, y) => {
+          const fy = H2 - 1 - y;
+          const idx = (fy * W2 + x) * 4;
+          return [out[idx], out[idx + 1], out[idx + 2], out[idx + 3]];
+        };
         const lumaAt = (x, y) => {
           const [r, g, b] = at(x, y);
           return Math.floor((r * 2126 + g * 7152 + b * 722) / 10000);
         };
-        return { at, lumaAt, W2, H2 };
+        return { at, rgbaAt, lumaAt, W2, H2 };
       };
 
       const pushVec = (name, ok, got, expected) => {
@@ -815,8 +820,8 @@ function buildHtmlPage(programs) {
         const segTxtC0 = run2D(160, 100, 3, null,
           { x: 25, y: 27, w: 110, h: 45, r: 22.5, blurSlot: -48, rim: 1, bezel: 9, refract: 9, chroma: 0.0 });
         let maxTxtDiff = 0;
-        for (let ty = 135; ty <= 162; ty++) {
-          for (let tx = 216; tx <= 264; tx++) {
+        for (let ty = 132; ty <= 165; ty++) {
+          for (let tx = 210; tx <= 270; tx++) {
             const c1 = segTxtC1.at(tx, ty), c0 = segTxtC0.at(tx, ty);
             const d = Math.max(Math.abs(c1[0] - c0[0]), Math.abs(c1[1] - c0[1]), Math.abs(c1[2] - c0[2]));
             if (d > maxTxtDiff) maxTxtDiff = d;
@@ -829,27 +834,25 @@ function buildHtmlPage(programs) {
           return (dx * dx + dy * dy <= 22 * 22) ? [42, 42, 48] : [16, 16, 20];
         };
         const tabBgIcon = (x, y) => {
-          if (x >= 114 && x <= 122 && y >= 42 && y <= 58) return [255, 149, 0];
+          if (x >= 110.0 && x <= 112.6 && y >= 28.0 && y <= 72.0) return [255, 149, 0];
           return tabBgEmpty(x, y);
         };
-        const tabE = run2D(160, 100, 3, tabBgEmpty,
+        const tabEmpty = run2D(160, 100, 3, tabBgEmpty,
           { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
-        const tabI = run2D(160, 100, 3, tabBgIcon,
+        const tabIcon = run2D(160, 100, 3, tabBgIcon,
           { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
-        let maxIconDelta = 0;
-        for (let iy = 132; iy <= 168; iy++) {
-          for (let ix = 330; ix <= 351; ix++) {
-            const ce = tabE.at(ix, iy), ci = tabI.at(ix, iy);
-            const d = Math.abs(ci[0] - ce[0]) + Math.abs(ci[1] - ce[1]) + Math.abs(ci[2] - ce[2]);
-            if (d > maxIconDelta) maxIconDelta = d;
-          }
-        }
+        const c1 = tabIcon.at(349, 150), c0 = tabEmpty.at(349, 150);
+        const capDelta = Math.abs(c1[0] - c0[0]) + Math.abs(c1[1] - c0[1]) + Math.abs(c1[2] - c0[2]);
+        const g1x = tabIcon.at(349, 87), g0x = tabEmpty.at(349, 87);
+        const gate0SameX = Math.abs(g1x[0] - g0x[0]) + Math.abs(g1x[1] - g0x[1]) + Math.abs(g1x[2] - g0x[2]);
+        const g1c = tabIcon.at(311, 87), g0c = tabEmpty.at(311, 87);
+        const gate0InCap = Math.abs(g1c[0] - g0c[0]) + Math.abs(g1c[1] - g0c[1]) + Math.abs(g1c[2] - g0c[2]);
 
         const v9Ok = gr0 < 15 && gr1 > 60 && gr2 < 15 && coreH >= 20 && coreH <= 22.5 && moat >= 6.5 &&
-          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && maxIconDelta >= 40 && halfOk;
+          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && capDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && halfOk;
         pushVec('V9 switch ON/OFF/half, light segmented & role4 tab 2D ROI', v9Ok,
-          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, maxIconDelta, Number(h50.toFixed(2))],
-          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, tabDelta>=40');
+          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, capDelta, gate0SameX, gate0InCap, Number(h50.toFixed(2))],
+          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, capDelta>=40, gate0=0');
       }
 
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)
@@ -889,23 +892,21 @@ function buildHtmlPage(programs) {
           rim: 0.6, bezel: 14, refract: 18, chroma: 0.06,
         });
         const ydMid = lumaF(regD, 160, 120), ydTop = lumaF(regD, 160, 41);
-        const v10DarkRef = [
-          [160,40,79,79,81],[160,41,62,62,64],[160,42,54,54,56],[160,43,51,51,53],[160,44,48,48,50],
-          [160,45,48,48,50],[160,46,47,47,49],[160,47,48,48,50],[160,48,47,47,49],[160,49,47,47,49],
-          [272,120,46,46,48],[273,120,47,47,49],[274,120,46,46,48],[275,120,47,47,49],
-          [276,120,46,46,48],[277,120,47,47,49],[278,120,47,47,49],[279,120,47,47,49],
-          [278,84,47,47,49],[277,76,48,48,50],[274,68,48,48,50],[270,61,48,48,51],[265,55,49,49,51],
-          [259,50,51,51,53],[252,46,53,53,55],[244,43,59,59,61],[238,42,59,59,61],[234,41,68,68,70],
-        ];
-        let v10DarkMaxDiff = 0;
-        for (const [px, py, er, eg, eb] of v10DarkRef) {
-          const [gr, gg, gb] = regD.at(px, py);
-          v10DarkMaxDiff = Math.max(v10DarkMaxDiff, Math.abs(gr - er), Math.abs(gg - eg), Math.abs(gb - eb));
+        let h1 = 2166136261 >>> 0, h2 = 5381 >>> 0;
+        for (let ry = 38; ry <= 122; ry++) {
+          for (let rx = 160; rx <= 283; rx++) {
+            const px4 = regD.rgbaAt(rx, ry);
+            for (let ch = 0; ch < 4; ch++) {
+              h1 = Math.imul(h1 ^ px4[ch], 16777619) >>> 0;
+              h2 = (Math.imul(h2, 33) ^ px4[ch]) >>> 0;
+            }
+          }
         }
-        const v10Ok = maxD2 <= 14.0 && sideMin >= 190.0 && sideMin <= 215.0 && ydTop > ydMid + 5.0 && v10DarkMaxDiff <= 1;
-        pushVec('V10 regular glass Light AA & Dark 28pt baseline (@2x, R=24)', v10Ok,
-          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), v10DarkMaxDiff],
-          'lightD2<=14, sideMin [190,215], darkTop>darkMid+5, dark28MaxDiff<=1');
+        const v10DarkHashOk = (h1 === 811113702 && h2 === 3136138768);
+        const v10Ok = maxD2 <= 14.0 && sideMin >= 190.0 && sideMin <= 215.0 && ydTop > ydMid + 5.0 && v10DarkHashOk;
+        pushVec('V10 regular glass Light AA & Dark ROI RGBA8 exact (@2x, R=24)', v10Ok,
+          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), h1, h2],
+          'lightD2<=14, sideMin [190,215], darkTop>darkMid+5, darkROI=(811113702,3136138768) max_abs_diff==0');
       }
 
       // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
@@ -980,7 +981,7 @@ function buildHtmlPage(programs) {
             const moat = best / 3.0;
             if (dx === 6 || dx === 8) { if (moat !== 0.0) hornOk = false; }
             else if (dx === 10) { if (moat < 1.5 || moat > 4.5) hornOk = false; }
-            else { if (moat < prevHorn - 0.35 || moat > prevHorn + 3.5) hornOk = false; }
+            else { if (moat < prevHorn - 0.35 || moat > prevHorn + 3.5) hornOk = false; if (dx === 20 && moat < 7.0) hornOk = false; }
             prevHorn = moat;
           }
           let centerOk = true;

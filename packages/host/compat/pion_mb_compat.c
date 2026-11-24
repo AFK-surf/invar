@@ -1233,3 +1233,11 @@ int32_t pion_host_native_call(const char *name, int64_t name_len, const char *pa
 void *pion_host_native_result(int32_t id) {
   return mb_str_to_pion(mb_host_native_result(id));
 }
+
+int32_t pion_host_remove_file(const char *path, int64_t len) {
+  if (!path || len <= 0 || len >= 4096) return 0;
+  char buf[4096];
+  memcpy(buf, path, (size_t)len);
+  buf[len] = '\0';
+  return remove(buf) == 0 ? 1 : 0;
+}

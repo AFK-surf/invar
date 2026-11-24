@@ -345,8 +345,8 @@ static int run_v8_v9_2d_roi(void) {
     push_inst(inst, &n, 25.0, 27.0, 110.0, 45.0, 22.5, 6.0, 1.0, -48.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 1.0, 1.0, 1.0, S3, W3, H3, rgba_c0)) return 0;
     int max_txt_diff = 0;
-    for (int ty = 135; ty <= 162; ty++) {
-      for (int tx = 216; tx <= 264; tx++) {
+    for (int ty = 132; ty <= 165; ty++) {
+      for (int tx = 210; tx <= 270; tx++) {
         size_t k = ((size_t)ty * W3 + (size_t)tx) * 4;
         for (int c = 0; c < 3; c++) {
           int d = abs((int)rgba[k + c] - (int)rgba_c0[k + c]);
@@ -360,28 +360,26 @@ static int run_v8_v9_2d_roi(void) {
     ok &= v9d_ok;
   }
 
-  // V9-Tab: Role 4 Tab moving icon bevel refraction delta
+  // V9-Tab: Role 4 Tab barIconGate isolation (fixed refract=9.0, icon at x_right-6.7pt strictly inward of readback x_right-1.5pt)
   {
-    static uint8_t rgba_e[W3 * H3 * 4];
+    static uint8_t rgba_empty[W3 * H3 * 4];
     int n = 0;
     push_inst(inst, &n, 10.0, 28.0, 140.0, 44.0, 22.0, 0.0, 0.0, 0.0, 42.0/255.0, 42.0/255.0, 48.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 30.0, 25.0, 88.0, 50.0, 25.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
-    if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba_e)) return 0;
+    if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba_empty)) return 0;
     n = 0;
     push_inst(inst, &n, 10.0, 28.0, 140.0, 44.0, 22.0, 0.0, 0.0, 0.0, 42.0/255.0, 42.0/255.0, 48.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    push_inst(inst, &n, 114.0, 42.0, 8.0, 16.0, 3.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 110.0, 28.0, 2.6, 44.0, 1.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 30.0, 25.0, 88.0, 50.0, 25.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba)) return 0;
-    int max_icon_delta = 0;
-    for (int iy = 132; iy <= 168; iy++) {
-      for (int ix = 330; ix <= 351; ix++) {
-        size_t k = ((size_t)iy * W3 + (size_t)ix) * 4;
-        int d = abs((int)rgba[k] - (int)rgba_e[k]) + abs((int)rgba[k+1] - (int)rgba_e[k+1]) + abs((int)rgba[k+2] - (int)rgba_e[k+2]);
-        if (d > max_icon_delta) max_icon_delta = d;
-      }
-    }
-    int v9tab_ok = (max_icon_delta >= 40);
-    printf("  [%s] V9-Tab Role 4 barIconGate moving icon delta=%d (>=40)\n", v9tab_ok ? "PASS" : "FAIL", max_icon_delta);
+    size_t k_cap = ((size_t)150 * W3 + 349) * 4;
+    int cap_delta = abs((int)rgba[k_cap] - (int)rgba_empty[k_cap]) + abs((int)rgba[k_cap+1] - (int)rgba_empty[k_cap+1]) + abs((int)rgba[k_cap+2] - (int)rgba_empty[k_cap+2]);
+    size_t k_g0x = ((size_t)87 * W3 + 349) * 4;
+    int gate0_same_x = abs((int)rgba[k_g0x] - (int)rgba_empty[k_g0x]) + abs((int)rgba[k_g0x+1] - (int)rgba_empty[k_g0x+1]) + abs((int)rgba[k_g0x+2] - (int)rgba_empty[k_g0x+2]);
+    size_t k_g0c = ((size_t)87 * W3 + 311) * 4;
+    int gate0_in_cap = abs((int)rgba[k_g0c] - (int)rgba_empty[k_g0c]) + abs((int)rgba[k_g0c+1] - (int)rgba_empty[k_g0c+1]) + abs((int)rgba[k_g0c+2] - (int)rgba_empty[k_g0c+2]);
+    int v9tab_ok = (cap_delta >= 40) && (gate0_same_x == 0) && (gate0_in_cap == 0);
+    printf("  [%s] V9-Tab Role 4 barIconGate isolation (fixed refract=9, icon@x_right-6.7pt): capDelta=%d (>=40) gate0=(%d,%d) (==0)\n", v9tab_ok ? "PASS" : "FAIL", cap_delta, gate0_same_x, gate0_in_cap);
     ok &= v9tab_ok;
   }
 
@@ -447,27 +445,22 @@ static int run_v8_v9_2d_roi(void) {
               0.6, 14.0, 0.0, 1.0, -1.0, 18.0, 0.06, 0.0);
     if (!render_rgba(inst, n, 28.0/255.0, 28.0/255.0, 30.0/255.0, 2.0, 320, 240, rgba)) return 0;
     double yd_mid = luma_f(rgba, 320, 160, 120), yd_top = luma_f(rgba, 320, 160, 41);
-    static const int v10_dark_ref[28][5] = {
-      {160,40,79,79,81},{160,41,62,62,64},{160,42,54,54,56},{160,43,51,51,53},{160,44,48,48,50},
-      {160,45,48,48,50},{160,46,47,47,49},{160,47,48,48,50},{160,48,47,47,49},{160,49,47,47,49},
-      {272,120,46,46,48},{273,120,47,47,49},{274,120,46,46,48},{275,120,47,47,49},
-      {276,120,46,46,48},{277,120,47,47,49},{278,120,47,47,49},{279,120,47,47,49},
-      {278,84,47,47,49},{277,76,48,48,50},{274,68,48,48,50},{270,61,48,48,51},{265,55,49,49,51},
-      {259,50,51,51,53},{252,46,53,53,55},{244,43,59,59,61},{238,42,59,59,61},{234,41,68,68,70},
-    };
-    int v10_dark_diff = 0;
-    for (int pi = 0; pi < 28; pi++) {
-      size_t idx = ((size_t)v10_dark_ref[pi][1] * 320 + (size_t)v10_dark_ref[pi][0]) * 4;
-      int dr = abs((int)rgba[idx] - v10_dark_ref[pi][2]);
-      int dg = abs((int)rgba[idx + 1] - v10_dark_ref[pi][3]);
-      int db = abs((int)rgba[idx + 2] - v10_dark_ref[pi][4]);
-      if (dr > v10_dark_diff) v10_dark_diff = dr;
-      if (dg > v10_dark_diff) v10_dark_diff = dg;
-      if (db > v10_dark_diff) v10_dark_diff = db;
+    uint32_t h1 = 2166136261u, h2 = 5381u;
+    for (int ry = 38; ry <= 122; ry++) {
+      for (int rx = 160; rx <= 283; rx++) {
+        size_t idx = ((size_t)ry * 320 + (size_t)rx) * 4;
+        for (int ch = 0; ch < 4; ch++) {
+          uint32_t b = rgba[idx + ch];
+          h1 = (h1 ^ b) * 16777619u;
+          h2 = (h2 * 33u) ^ b;
+        }
+      }
     }
-    int v10_ok = (max_d2 <= 14.0) && (side_min >= 190.0 && side_min <= 215.0) && (yd_top > yd_mid + 5.0) && (v10_dark_diff <= 1);
-    printf("  [%s] V10 regular glass AA & dark 28pt baseline: light_d2=%.2f (<=14) side_min=%.1f ([190,215]) dark_top=%.1f>mid=%.1f dark28_max_diff=%d\n",
-           v10_ok ? "PASS" : "FAIL", max_d2, side_min, yd_top, yd_mid, v10_dark_diff);
+    // Exact pre-v8 (0c02853a) D3D11 WARP full rounded-corner ROI RGBA8 hash (strict max_abs_diff == 0, 42160 bytes)
+    int v10_hash_ok = (h1 == 3135229502u && h2 == 158418064u);
+    int v10_ok = (max_d2 <= 14.0) && (side_min >= 190.0 && side_min <= 215.0) && (yd_top > yd_mid + 5.0) && v10_hash_ok;
+    printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([190,215]) dark_top=%.1f>mid=%.1f roi_hash=(%u,%u)\n",
+           v10_ok ? "PASS" : "FAIL", max_d2, side_min, yd_top, yd_mid, h1, h2);
     ok &= v10_ok;
   }
 
@@ -538,7 +531,7 @@ static int run_v8_v9_2d_roi(void) {
         double moat = best / 3.0;
         if (dxs[di] == 6 || dxs[di] == 8) { if (moat != 0.0) horn_ok = 0; }
         else if (dxs[di] == 10) { if (moat < 1.5 || moat > 4.5) horn_ok = 0; }
-        else { if (moat < prev_horn - 0.35 || moat > prev_horn + 3.5) horn_ok = 0; }
+        else { if (moat < prev_horn - 0.35 || moat > prev_horn + 3.5) horn_ok = 0; if (dxs[di] == 20 && moat < 7.0) horn_ok = 0; }
         prev_horn = moat;
       }
       int center_ok = 1;
