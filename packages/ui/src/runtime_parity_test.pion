@@ -4,6 +4,7 @@
 // - D3: NativeView, Stream, NativeTerminal, and Multi-Window tree lifecycle with zero handle leaks
 
 import "hostapi"
+import "pixels"
 import "signals"
 import "text"
 import "view"
@@ -635,6 +636,161 @@ test "image_ready_at and keys_system fallback work on reactive trees" {
   debug_assert(!image_ready_at(key, 64.0), "image not ready before load")
   image_ask_at(key, 64.0)
   debug_assert(image_ready_at(key, 64.0), "image_ready_at sees decoded image after image_ask_at")
+  forget_image(key)
+  t.dispose()
+}
+
+test "view picture emits vector bands, preserves layer alpha under tint, and bypasses ViewBlock cache" {
+  let vec = pixels::Vector::{
+    w: 24.0,
+    h: 24.0,
+    layers: [
+      pixels::VectorPath::{
+        d: "M2 2H22V22H2Z",
+        fill: rgba(0xFF, 0xFF, 0xFF, 0x80),
+        stroke: 0L,
+        width: 0.0,
+        even_odd: false,
+        sx: 1.0,
+        sy: 1.0,
+        tx: 0.0,
+        ty: 0.0,
+      },
+    ],
+  }
+  let tint_sig = signals::signal(rgba(0x33, 0xCC, 0x66, 0xFF))
+  set_view_blocks_enabled(true)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+      .width(view::Live::Is(Some(24.0)))
+      .height(view::Live::Is(Some(24.0)))
+      .picture(view::Live::Is(Some(vec)))
+      .tint(view::Live::By(fn() { tint_sig.get() }))
+    })
+  }, width=100.0, height=100.0)
+  let sc = t.scene()
+  let mut bands = 0
+  let mut seg_packs = 0
+  let mut saw_r = -1.0
+  let mut saw_g = -1.0
+  let mut saw_a = -1.0
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    let kind = sc.inst[b + 5]
+    if (kind - 11.0).abs() < 0.01 {
+      bands += 1
+      saw_r = sc.inst[b + 8]
+      saw_g = sc.inst[b + 9]
+      saw_a = sc.inst[b + 11]
+    } else if (kind - 12.0).abs() < 0.01 {
+      seg_packs += 1
+    }
+    i += 1
+  }
+  debug_assert(bands > 0 && seg_packs > 0, "View::picture must emit kind=11 bands and kind=12 seg packs")
+  // Tinted layer keeps its 0x80 (~0.502) alpha multiplied with tint alpha (0xFF) and takes tint RGB
+  debug_assert((saw_r - 0x33.to_double() / 255.0).abs() < 0.02, "picture band carries tint red")
+  debug_assert((saw_g - 0xCC.to_double() / 255.0).abs() < 0.02, "picture band carries tint green")
+  debug_assert((saw_a - 0x80.to_double() / 255.0).abs() < 0.03, "picture tint preserves layer alpha")
+  t.dispose()
+}
+
+test "runs_look applies code_ground, code_ink, code_scale, link color, and keeps alpha-0 run transparent" {
+  let runs = [
+    text::Run::{ ..text::plain("code"), code: true },
+    text::Run::{ ..text::plain("hidden"), color: rgba(0xFF, 0xFF, 0xFF, 0x00) },
+    text::Run::{ ..text::plain("go"), link: "https://example.com" },
+  ]
+  let look = view::WordsLook::{ ..view::words_plain, size: 12.0, line: 18.0, wrap: false }
+  let rlook = view::RunsLook::{
+    ..view::runs_plain,
+    code_ink: rgba(0xAA, 0xBB, 0xCC, 0xFF),
+    code_ground: rgba(0xFF, 0xFF, 0xFF, 0x20),
+    code_scale: 0.85,
+    link: rgba(0x11, 0x88, 0xEE, 0xFF),
+  }
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+      .width(view::Live::Is(Some(240.0)))
+      .words_runs(view::Live::Is(runs), ink=rgba(0xF0, 0xF0, 0xF0, 0xFF), look=look)
+      .runs_look(view::Live::Is(rlook))
+    })
+  }, width=300.0, height=100.0)
+  let sc = t.scene()
+  let mut code_bg_seen = false
+  let mut code_glyphs = 0
+  let mut link_glyphs = 0
+  let mut total_glyphs = 0
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    let kind = sc.inst[b + 5]
+    if kind == 0.0 && (sc.inst[b + 11] - 0x20.to_double() / 255.0).abs() < 0.02 {
+      code_bg_seen = true
+    } else if (kind - 1.0).abs() < 0.01 {
+      total_glyphs += 1
+      if (sc.inst[b + 8] - 0xAA.to_double() / 255.0).abs() < 0.02 {
+        code_glyphs += 1
+      }
+      if (sc.inst[b + 8] - 0x11.to_double() / 255.0).abs() < 0.02 {
+        link_glyphs += 1
+      }
+    }
+    i += 1
+  }
+  debug_assert(code_bg_seen, "runs_look.code_ground must emit inline code background pill")
+  debug_assert(code_glyphs == 4, "code run glyphs must use runs_look.code_ink")
+  debug_assert(link_glyphs == 2, "link run glyphs must use runs_look.link")
+  // "hidden" (alpha=0) must emit 0 glyphs (only 4 + 2 = 6 total)
+  debug_assert(total_glyphs == 6, "alpha-0 run must stay invisible instead of falling back to default ink")
+  t.dispose()
+}
+
+test "image_contains letterboxes and image_covers crops UVs by aspect ratio" {
+  let key = "mem:fit-test"
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+      .width(view::Live::Is(Some(100.0)))
+      .height(view::Live::Is(Some(100.0)))
+      .image(view::Live::Is(Some((key, "", 256))))
+      .image_contains(view::Live::Is(true))
+    })
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+      .width(view::Live::Is(Some(100.0)))
+      .height(view::Live::Is(Some(100.0)))
+      .image(view::Live::Is(Some((key, "", 256))))
+      .image_covers(view::Live::Is(true))
+    })
+  }, width=200.0, height=250.0)
+  // FakeHost decodes 200x100 (2:1) image into two 100x100 boxes
+  let h = hostapi::host()
+  h.image_info = fn(_id : Int, out : Array[Double]) -> Int {
+    out[0] = 200.0
+    out[1] = 100.0
+    1
+  }
+  add_image(key, Bytes::new(8))
+  t.frame(ms=16.0)
+  let sc = t.scene()
+  let img_rects : Array[(Double, Double, Double, Double, Double, Double)] = []
+  let mut i = 0
+  while i < sc.ninst {
+    let b = i * inst_size
+    if (sc.inst[b + 5] - 4.0).abs() < 0.01 {
+      img_rects.push((sc.inst[b + 1], sc.inst[b + 2], sc.inst[b + 3], sc.inst[b + 12], sc.inst[b + 14], sc.inst[b + 15]))
+    }
+    i += 1
+  }
+  debug_assert(img_rects.length() == 2, "expected 2 image instances")
+  // First (contain): 200x100 inside 100x100 -> 100x50 centered at y=25
+  debug_assert((img_rects[0].0 - 25.0).abs() < 0.5 && (img_rects[0].1 - 100.0).abs() < 0.5 && (img_rects[0].2 - 50.0).abs() < 0.5, "image_contains centers 2:1 image to 100x50 at y=25")
+  // Second (cover): 200x100 inside 100x100 -> u0=0.25, du=0.5, dv=1.0
+  debug_assert((img_rects[1].3 - 0.25).abs() < 0.01 && (img_rects[1].4 - 0.5).abs() < 0.01 && (img_rects[1].5 - 1.0).abs() < 0.01, "image_covers crops UVs to u0=0.25, du=0.5")
   forget_image(key)
   t.dispose()
 }

@@ -909,6 +909,7 @@ fn view_forget_inner(clear_hooks : Bool) -> Unit {
   reset_glyph_atlas()
   reset_glass_light_angle()
   view_blocks_reset()
+  view_pictures_reset()
 }
 
 fn view_forget() -> Unit {
@@ -1334,6 +1335,9 @@ struct ViewBlock {
   clips_self : Bool
   image : Option[(String, String, Int)]
   image_in : Option[((Double, Double, Double, Double), Int64)]
+  image_cover : Bool
+  image_contain : Bool
+  image_cover_at : Option[(Double, Double)]
   ring_w : Double
   ring_gap : Double
   ring_col : Int64
@@ -1436,6 +1440,14 @@ fn opt_image_eq(
   }
 }
 
+fn opt_pair_eq(a : Option[(Double, Double)], b : Option[(Double, Double)]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some((a0, a1)), Some((b0, b1))) => a0 == b0 && a1 == b1
+    _ => false
+  }
+}
+
 fn opt_image_in_eq(
   a : Option[((Double, Double, Double, Double), Int64)],
   b : Option[((Double, Double, Double, Double), Int64)],
@@ -1531,6 +1543,9 @@ fn view_block_matches(
   opt_quad_eq(blk.gd_corners, gd.corners) &&
   opt_image_eq(blk.image, d.image) &&
   opt_image_in_eq(blk.image_in, d.image_in) &&
+  blk.image_cover == d.image_cover &&
+  blk.image_contain == d.image_contain &&
+  opt_pair_eq(blk.image_cover_at, d.image_cover_at) &&
   rects_eq(blk.rects, d.rects)
 }
 
@@ -2029,10 +2044,53 @@ fn encode_drawn_node_direct(
         }
       }
       match resolved {
-        Some((hid, _iw, _ih)) => {
+        Some((hid, iw, ih)) => {
+          let mut ix = d.x
+          let mut iy = d.y
+          let mut rw = d.w
+          let mut rh = d.h
+          let mut u0 = 0.0
+          let mut v0 = 0.0
+          let mut du = 1.0
+          let mut dv = 1.0
+          if iw > 0.0 && ih > 0.0 && d.w > 0.0 && d.h > 0.0 {
+            match d.image_cover_at {
+              Some((ax, ay)) => {
+                let across = dclamp(ax, 0.0, 1.0)
+                let down = dclamp(ay, 0.0, 1.0)
+                let ir = iw / ih
+                let br = d.w / d.h
+                if ir > br {
+                  du = br / ir
+                  u0 = (1.0 - du) * across
+                } else if ir < br {
+                  dv = ir / br
+                  v0 = (1.0 - dv) * down
+                }
+              }
+              None =>
+                if d.image_cover {
+                  let ir = iw / ih
+                  let br = d.w / d.h
+                  if ir > br {
+                    du = br / ir
+                    u0 = (1.0 - du) * 0.5
+                  } else if ir < br {
+                    dv = ir / br
+                    v0 = (1.0 - dv) * 0.5
+                  }
+                } else if d.image_contain {
+                  let k = dmin(d.w / iw, d.h / ih)
+                  rw = iw * k
+                  rh = ih * k
+                  ix = d.x + (d.w - rw) * 0.5
+                  iy = d.y + (d.h - rh) * 0.5
+                }
+            }
+          }
           let idx = scene.push_inst(
-            d.x, d.y, d.w, d.h, d.radius, 4.0, 0.0, 0.0, c64(0xFFFF, 0xFFFF), d.alpha,
-            0.0, 0.0, 1.0, 1.0,
+            ix, iy, rw, rh, d.radius, 4.0, 0.0, 0.0, c64(0xFFFF, 0xFFFF), d.alpha,
+            u0, v0, du, dv,
             clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
             tex_id=hid.to_double(),
           )
@@ -2109,9 +2167,23 @@ fn encode_drawn_node_direct(
     scene.set_corners(ridx, r.corners.0 * ns, r.corners.1 * ns, r.corners.2 * ns, r.corners.3 * ns)
   }
 
-  // 7b. Vector shapes (kind = 11.0 bands + kind = 12.0 frame-tail segment packs)
-  if d.shapes.length() > 0 {
-    encode_shapes(scene, d, ns, clip_x, clip_y, clip_x1, clip_y1)
+  // 7b. Vector shapes + vector pictures (kind = 11.0 bands + kind = 12.0 frame-tail segment packs)
+  let pic_shapes : Array[paint::Shape] = match d.picture {
+    None => {
+      let _ = view_pictures.remove(d.id)
+      []
+    }
+    Some(p) => {
+      let laid_w = if ns > 0.0 { d.w / ns } else { d.w }
+      if laid_w > 0.0 && p.w > 0.0 {
+        view_picture_shapes(d.id, p, laid_w, scale)
+      } else {
+        []
+      }
+    }
+  }
+  if d.shapes.length() > 0 || pic_shapes.length() > 0 {
+    encode_shapes(scene, d, pic_shapes, ns, clip_x, clip_y, clip_x1, clip_y1)
   }
 
   // 8. Polylines (delegated to Scene::emit_line rotated capsules)
@@ -2279,6 +2351,7 @@ fn encode_drawn_node(
   d.glass.is_none() &&
   d.lines.length() == 0 &&
   d.shapes.length() == 0 &&
+  d.picture.is_none() &&
   d.runs.length() == 0 &&
   d.blur <= 0.0 &&
   scene.ink_r <= 0.0 &&
@@ -2364,6 +2437,9 @@ fn encode_drawn_node(
     clips_self: d.clips_self,
     image: d.image,
     image_in: d.image_in,
+    image_cover: d.image_cover,
+    image_contain: d.image_contain,
+    image_cover_at: d.image_cover_at,
     ring_w: d.ring.0,
     ring_gap: d.ring.1,
     ring_col: d.ring.2,
