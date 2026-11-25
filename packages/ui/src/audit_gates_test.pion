@@ -452,3 +452,126 @@ test "inputrec: InputTape record -> to_lines -> from_lines -> deterministic repl
     "deserialized tape replay reproduces identical final state",
   )
 }
+
+test "gate 9: shadow_halo matches GPU 3*blur+2 quad spread and shadow_clip_faults catches viewport and ancestor clip truncation" {
+  // 1. shadow_halo math
+  let z = shadow_halo(0.0, 2.0)
+  debug_assert(z.0 == 0.0 && z.1 == 0.0 && z.2 == 0.0 && z.3 == 0.0, "zero blur yields zero halo")
+  let h14 = shadow_halo(14.0, 4.0)
+  debug_assert(h14.0 == 44.0 && h14.1 == 40.0 && h14.2 == 44.0 && h14.3 == 48.0, "14pt blur, dy=4 yields (44, 40, 44, 48)")
+  let h8 = shadow_halo(8.0, 2.0)
+  debug_assert(h8.0 == 26.0 && h8.1 == 24.0 && h8.2 == 26.0 && h8.3 == 28.0, "8pt blur, dy=2 yields (26, 24, 26, 28)")
+
+  // 2. Transparent floating popup with tight 4pt top margin gets caught on viewport edge
+  let t_bad_vp = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(pill : view::View) {
+        let _ = pill
+        .over_at(view::Live::Is((Some(40.0), Some(4.0), None, None)))
+        .width(view::Live::Is(Some(140.0)))
+        .height(view::Live::Is(Some(24.0)))
+        .radius(view::Live::Is(7.0))
+        .ground(view::Live::Is(rgba(59, 21, 24, 245)))
+        .shadow(view::Live::Is((8.0, 2.0, rgba(0, 0, 0, 102))))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="DiscardPill"))))
+      })
+    },
+    width=220.0,
+    height=100.0,
+  )
+  let bad_vp = t_bad_vp.shadow_clip_faults()
+  debug_assert(any_fault_prefix(bad_vp, "shadow_clip:"), "expected viewport top shadow_clip fault")
+  debug_assert(str_contains(bad_vp[0], "top shadow") && str_contains(bad_vp[0], "viewport"), "expected top viewport message")
+  t_bad_vp.dispose()
+
+  // 3. Same floating pill padded with shadow_halo passes strict 3-sigma check
+  let (hl, ht, hr, hb) = shadow_halo(8.0, 2.0)
+  let t_good_vp = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(wrap : view::View) {
+        let _ = wrap.padding(view::Live::Is((hl, ht, hr, hb)))
+        let _ = wrap.box(fn(pill : view::View) {
+          let _ = pill
+          .width(view::Live::Is(Some(140.0)))
+          .height(view::Live::Is(Some(24.0)))
+          .radius(view::Live::Is(7.0))
+          .ground(view::Live::Is(rgba(59, 21, 24, 245)))
+          .shadow(view::Live::Is((8.0, 2.0, rgba(0, 0, 0, 102))))
+          .says(view::Live::Is(Some(view::said(view::Role::Group, label="DiscardPill"))))
+        })
+      })
+    },
+    width=140.0 + hl + hr,
+    height=24.0 + ht + hb,
+  )
+  t_good_vp.assert_shadow_clip(sigma=3.0, label="halo-padded-popup")
+  t_good_vp.dispose()
+
+  // 4. Ancestor .clips(true) cutting off child card's shadow is caught by both shadow_clip_faults and ui_craft_audit
+  let t_clip = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(frame : view::View) {
+        let _ = frame
+        .over_at(view::Live::Is((Some(40.0), Some(40.0), None, None)))
+        .width(view::Live::Is(Some(200.0)))
+        .height(view::Live::Is(Some(100.0)))
+        .pad(view::Live::Is(4.0))
+        .clips(view::Live::Is(true))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="TightFrame"))))
+        let _ = frame.box(fn(card : view::View) {
+          let _ = card
+          .width(view::Live::Is(Some(120.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .radius(view::Live::Is(8.0))
+          .ground(view::Live::Is(rgba(30, 32, 38, 255)))
+          .shadow(view::Live::Is((12.0, 4.0, rgba(0, 0, 0, 120))))
+          .says(view::Live::Is(Some(view::said(view::Role::Group, label="FloatingCard"))))
+        })
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  let clip_faults = t_clip.shadow_clip_faults(include_viewport=false)
+  debug_assert(any_fault_prefix(clip_faults, "shadow_clip:"), "expected ancestor clip shadow_clip fault")
+  debug_assert(str_contains(clip_faults[0], "clip(TightFrame)"), "expected TightFrame culprit in fault message")
+  debug_assert(any_fault_prefix(t_clip.ui_craft_audit(), "shadow_clip:"), "expected ui_craft_audit to surface severe ancestor shadow clip")
+  t_clip.dispose()
+
+  // 5. Full-width edge-docked sheet does not false-positive on its docked bottom/side edges
+  let t_dock = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(sheet : view::View) {
+        let _ = sheet
+        .over_at(view::Live::Is((Some(0.0), None, Some(0.0), Some(0.0))))
+        .height(view::Live::Is(Some(120.0)))
+        .ground(view::Live::Is(rgba(30, 32, 38, 255)))
+        .shadow(view::Live::Is((12.0, -4.0, rgba(0, 0, 0, 96))))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="BottomSheet"))))
+      })
+    },
+    width=400.0,
+    height=300.0,
+  )
+  t_dock.assert_shadow_clip(label="docked-bottom-sheet")
+  t_dock.dispose()
+
+  // 6. Narrow floating pill placed flush at (0, 0) (forgot halo padding) IS still caught
+  let t_flush = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(pill : view::View) {
+        let _ = pill
+        .width(view::Live::Is(Some(120.0)))
+        .height(view::Live::Is(Some(32.0)))
+        .ground(view::Live::Is(rgba(30, 32, 38, 255)))
+        .shadow(view::Live::Is((8.0, 2.0, rgba(0, 0, 0, 102))))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="FlushPill"))))
+      })
+    },
+    width=260.0,
+    height=120.0,
+  )
+  let flush_faults = t_flush.shadow_clip_faults()
+  debug_assert(flush_faults.length() == 2, "expected left and top shadow_clip faults at (0,0)")
+  t_flush.dispose()
+}
