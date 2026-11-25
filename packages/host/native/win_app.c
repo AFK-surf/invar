@@ -155,6 +155,7 @@ static void win_put_back(int wid) {
 }
 // the window being made (CreateWindowExW: its first messages, before its HWND is known), -1 none; the windows' class
 static int win_making = -1;
+static int render_ready;
 static WCHAR win_class[300];
 static int32_t (*window_key)(int32_t, int32_t);
 
@@ -1250,7 +1251,7 @@ static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       break;
     case WM_CHAR: char_in((WCHAR)wp); return 0;
     case WM_SETFOCUS:
-      mb_cb.key(0, mods_now());
+      if (render_ready) mb_cb.key(0, mods_now());
       catch_keys_focus(1);
       if (ws->ime_active) {
         CreateCaret(h, NULL, 1, (int)lround(ws->caret[3] * ws->scale));
@@ -1260,7 +1261,8 @@ static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KILLFOCUS:
       // (the pointer it held let go of, seen again)
       if (lock_win == win_active) lock_set(0);
-      mb_cb.key(0, 0); catch_keys_focus(0); DestroyCaret(); return 0;
+      if (render_ready) mb_cb.key(0, 0);
+      catch_keys_focus(0); DestroyCaret(); return 0;
     case WM_IME_SETCONTEXT:
       // we draw the composition ourselves; the system draws the candidates
       lp &= ~(LPARAM)ISC_SHOWUICOMPOSITIONWINDOW;
@@ -1431,6 +1433,7 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
     center_hwnd(hwnd);
   }
   if (!mb_render_init(hwnd)) exit(1);
+  render_ready = 1;
   // (held: out of sight till the app shows it, mb_host_window_show; shown at once where DWM cannot cloak it)
   if (window_held && !window_shown && !cloak(hwnd, TRUE)) window_shown = 1;
   if (!window_hidden) ShowWindow(hwnd, show);
