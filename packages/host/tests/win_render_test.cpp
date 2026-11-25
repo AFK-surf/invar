@@ -488,11 +488,12 @@ static int run_v8_v9_2d_roi(void) {
         }
       }
     }
+    int v10_hash_ok = (h1 == 1108764322u && h2 == 2268395216u);
     int v10_ok = (max_d2 <= 14.0) && (side_min >= 195.0 && side_min <= 222.0) &&
                  (light_top_l >= light_mid_l - 0.5) &&
                  (yd_mid >= 54.0 && yd_mid <= 63.0) &&
-                 (yd_top > yd_mid + 20.0) && (yd_side < yd_mid - 10.0) && (h1 != 0u);
-    printf("  [%s] V10 regular glass AA & dark ROI: light_d2=%.2f (<=14) side_min=%.1f ([195,222]) light_top=%.1f>=mid=%.1f dark_top=%.1f>mid=%.1f>side=%.1f roi_hash=(%u,%u)\n",
+                 (yd_top > yd_mid + 20.0) && (yd_side < yd_mid - 10.0) && v10_hash_ok;
+    printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([195,222]) light_top=%.1f>=mid=%.1f dark_top=%.1f>mid=%.1f>side=%.1f roi_hash=(%u,%u)\n",
            v10_ok ? "PASS" : "FAIL", max_d2, side_min, light_top_l, light_mid_l, yd_top, yd_mid, yd_side, h1, h2);
     ok &= v10_ok;
   }
