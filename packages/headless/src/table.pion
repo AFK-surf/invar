@@ -117,12 +117,16 @@ pub struct DataGrid {
   rev : signals::Signal[Int]
   row_keys : () -> Array[String]
   col_keys : () -> Array[String]
+  rtl : () -> Bool
   on_sort : Option[(String, headless_core::SortDir) -> Unit]
   on_selection_change : Option[(Array[String]) -> Unit]
   on_column_resize : Option[(String, Double) -> Unit]
   on_load_more : Option[() -> Unit]
   on_page_change : Option[(Int) -> Unit]
-  cell_nodes : Array[(String, String, view::View)]
+  disabled_rows : Map[String, (Option[view::NodeId], () -> Bool)]
+  cell_nodes : Map[String, Map[String, view::View]]
+  first_cell_id : signals::Ref[Option[view::NodeId]]
+  real_focus : signals::Ref[Option[(String, String)]]
 }
 
 fn DataGrid::bump(self : DataGrid) -> Unit {
@@ -133,6 +137,19 @@ pub fn DataGrid::node(self : DataGrid) -> view::View {
   self.node
 }
 
+/// Register or update a reactive disabled predicate for `row_key`.
+pub fn DataGrid::set_row_disabled(self : DataGrid, row_key : String, disabled : () -> Bool) -> Unit {
+  self.disabled_rows[row_key] = (None, disabled)
+}
+
+/// Whether `row_key` is currently disabled (untracked).
+pub fn DataGrid::is_row_disabled(self : DataGrid, row_key : String) -> Bool {
+  match self.disabled_rows.get(row_key) {
+    Some((_, f)) => signals::untracked(f)
+    None => false
+  }
+}
+
 pub fn DataGrid::is_selected(self : DataGrid, row_key : String) -> Bool {
   let _ = self.rev.get()
   self.state.is_selected(row_key)
@@ -141,7 +158,7 @@ pub fn DataGrid::is_selected(self : DataGrid, row_key : String) -> Bool {
 /// The selected row keys (a copy: changing it never changes the grid's own).
 pub fn DataGrid::selected_rows(self : DataGrid) -> Array[String] {
   let _ = self.rev.get()
-  self.state.selected_rows.copy()
+  self.state.selected_rows()
 }
 
 /// Whether the keyboard's focus is in the grid (its cells, headers, or the grid itself), untracked: the grid takes
@@ -165,17 +182,28 @@ pub fn DataGrid::sort_of(self : DataGrid, col_key : String) -> headless_core::So
   self.state.sort_of(col_key)
 }
 
+/// Read stored column width if explicitly resized (reactive).
+pub fn DataGrid::column_width_opt(self : DataGrid, col_key : String) -> Option[Double] {
+  let _ = self.rev.get()
+  self.state.column_width_opt(col_key)
+}
+
 pub fn DataGrid::column_width(self : DataGrid, col_key : String, default_w~ : Double = 120.0) -> Double {
   let _ = self.rev.get()
   self.state.column_width(col_key, default_w=default_w)
 }
 
 fn DataGrid::focus_cell_node(self : DataGrid, rk : String, ck : String) -> Unit {
-  for entry in self.cell_nodes {
-    if entry.0 == rk && entry.1 == ck && entry.2.alive() {
-      let _ = entry.2.ask_focus(visible=true)
-      return
-    }
+  match self.cell_nodes.get(rk) {
+    Some(cols) =>
+      match cols.get(ck) {
+        Some(v) =>
+          if v.alive() {
+            let _ = v.ask_focus(visible=true)
+          }
+        None => ()
+      }
+    None => ()
   }
 }
 
@@ -191,11 +219,16 @@ pub fn DataGrid::toggle_sort(self : DataGrid, col_key : String) -> headless_core
 
 pub fn DataGrid::select_row(self : DataGrid, row_key : String, shift_range~ : Bool = false) -> Bool {
   let rows = signals::untracked(self.row_keys)
-  let ok = self.state.select_row(rows, row_key, shift_range=shift_range)
+  let ok = self.state.select_row(
+    rows,
+    row_key,
+    shift_range=shift_range,
+    is_disabled=fn(k : String) -> Bool { self.is_row_disabled(k) },
+  )
   if ok {
     self.bump()
     match self.on_selection_change {
-      Some(f) => f(self.state.selected_rows.copy())
+      Some(f) => f(self.state.selected_rows())
       None => ()
     }
   }
@@ -204,11 +237,14 @@ pub fn DataGrid::select_row(self : DataGrid, row_key : String, shift_range~ : Bo
 
 pub fn DataGrid::select_all(self : DataGrid) -> Bool {
   let rows = signals::untracked(self.row_keys)
-  let ok = self.state.select_all(rows)
+  let ok = self.state.select_all(
+    rows,
+    is_disabled=fn(k : String) -> Bool { self.is_row_disabled(k) },
+  )
   if ok {
     self.bump()
     match self.on_selection_change {
-      Some(f) => f(self.state.selected_rows.copy())
+      Some(f) => f(self.state.selected_rows())
       None => ()
     }
   }
@@ -267,6 +303,7 @@ pub fn data_grid(
   look : (view::View, DataGrid) -> Unit,
   selection_mode~ : headless_core::TableSelectionMode = headless_core::TableSelectionMode::Multiple,
   has_more~ : Bool = false,
+  rtl~ : () -> Bool = fn() { false },
   on_sort? : (String, headless_core::SortDir) -> Unit,
   on_selection_change? : (Array[String]) -> Unit,
   on_column_resize? : (String, Double) -> Unit,
@@ -283,12 +320,16 @@ pub fn data_grid(
       rev: signals::signal(0),
       row_keys,
       col_keys,
+      rtl,
       on_sort,
       on_selection_change,
       on_column_resize,
       on_load_more,
       on_page_change,
-      cell_nodes: [],
+      disabled_rows: Map::new(),
+      cell_nodes: Map::new(),
+      first_cell_id: view::ref_new(None),
+      real_focus: view::ref_new(None),
     }
     look(v, dg)
     let is_multi = selection_mode == headless_core::TableSelectionMode::Multiple
@@ -300,6 +341,14 @@ pub fn data_grid(
       // (a key is the grid's only while the focus is in it: a sibling's arrows never move its cells or the focus)
       if !dg.owns_focus() {
         return false
+      }
+      // Sync logical 2D focus from real cell focus (Tab, Shift+Tab, or AT focus) before handling grid keys.
+      match dg.real_focus.v {
+        Some((rk, ck)) =>
+          if !dg.state.is_focused_cell(rk, ck) {
+            dg.state.set_focus(rk, ck)
+          }
+        None => ()
       }
       let rows = signals::untracked(row_keys)
       let cols = signals::untracked(col_keys)
@@ -319,14 +368,15 @@ pub fn data_grid(
         }
       }
       if k.mods == 0 {
+        let is_rtl = signals::untracked(rtl)
         let moved : Option[(String, String)] = if k.code == group_key_up {
           dg.state.move_focus(rows, cols, -1, 0)
         } else if k.code == group_key_down {
           dg.state.move_focus(rows, cols, 1, 0)
         } else if k.code == grid_key_left {
-          dg.state.move_focus(rows, cols, 0, -1)
+          dg.state.move_focus(rows, cols, 0, if is_rtl { 1 } else { -1 })
         } else if k.code == grid_key_right {
-          dg.state.move_focus(rows, cols, 0, 1)
+          dg.state.move_focus(rows, cols, 0, if is_rtl { -1 } else { 1 })
         } else if k.code == group_key_home {
           dg.state.jump_focus(rows, cols, false, false)
         } else if k.code == group_key_end {
@@ -375,18 +425,20 @@ pub fn DataGrid::column_header(
   let setup = fn(v : view::View) {
     let sort_fn = fn() -> headless_core::SortDir { self.sort_of(col_key) }
     look(v, sort_fn)
-    let _ = v
-    .presses(view::Live::Is(sortable))
-    .focusable(view::Live::Is(sortable), keys=view::focus_enter | view::focus_space)
-    .says(view::Live::By(fn() -> Option[view::Said] {
+    let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
       let s = if sortable { headless_core::sort_dir_aria(sort_fn()) } else { None }
       Some(view::said(view::Role::ColumnHeader, label=label(), sort=s))
     }))
-    .on_press(fn() {
-      if sortable {
+    // Only bind press/sort handlers when sortable so non-sortable headers never disable
+    // descendant pointer targets (such as a column resizer drag handle).
+    if sortable {
+      let _ = v
+      .presses(view::Live::Is(true))
+      .focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
+      .on_press(fn() {
         let _ = self.toggle_sort(col_key)
-      }
-    })
+      })
+    }
   }
   if in_node {
     setup(parent)
@@ -403,6 +455,8 @@ pub fn DataGrid::column_resizer(
   col_key : String,
   look : (view::View) -> Unit,
   default_w~ : Double = 120.0,
+  initial_width? : () -> Double,
+  rtl~ : () -> Bool = fn() { false },
   min_w~ : Double = 40.0,
   max_w~ : Double = 1200.0,
   in_node~ : Bool = false,
@@ -419,11 +473,23 @@ pub fn DataGrid::column_resizer(
       0.0,
       press=fn(d : view::Drag) {
         start_x.v = d.wx
-        start_w.v = self.state.column_width(col_key, default_w=default_w)
+        start_w.v = match self.state.column_width_opt(col_key) {
+          Some(w) => w
+          None =>
+            match initial_width {
+              Some(f) => {
+                let measured = f()
+                if measured > 0.0 { measured } else { default_w }
+              }
+              None => default_w
+            }
+        }
       },
       drag=fn(d : view::Drag) {
         if d.kind == view::DragIs::Moved {
-          let _ = self.resize_column(col_key, start_w.v + (d.wx - start_x.v), min_w=min_w, max_w=max_w)
+          let raw_dx = d.wx - start_x.v
+          let dx = if signals::untracked(rtl) || signals::untracked(self.rtl) { -raw_dx } else { raw_dx }
+          let _ = self.resize_column(col_key, start_w.v + dx, min_w=min_w, max_w=max_w)
         }
       },
     )
@@ -436,20 +502,31 @@ pub fn DataGrid::column_resizer(
   }
 }
 
-/// Mount a data row (`Role::Row`) with reactive `selected` state.
+/// Mount a data row (`Role::Row`) with reactive `selected` and `disabled` state.
 pub fn DataGrid::row(
   self : DataGrid,
   parent : view::View,
   row_key : String,
   look : (view::View, () -> Bool) -> Unit,
+  disabled~ : () -> Bool = fn() { false },
   in_node~ : Bool = false,
   made_for? : String,
   loc~ : String = "",
 ) -> view::View {
   let setup = fn(v : view::View) {
+    let vid = v.id()
+    self.disabled_rows[row_key] = (Some(vid), disabled)
+    let _ = v.owns(fn() {
+      match self.disabled_rows.get(row_key) {
+        Some((Some(owner_id), _)) => if owner_id == vid { self.disabled_rows.remove(row_key) }
+        _ => ()
+      }
+    })
     let is_sel = fn() -> Bool { self.is_selected(row_key) }
     look(v, is_sel)
-    let _ = v.says(view::Live::By(fn() -> Option[view::Said] {
+    let _ = v
+    .presses(view::Live::By(fn() -> Bool { !disabled() }))
+    .says(view::Live::By(fn() -> Option[view::Said] {
       Some(view::said(view::Role::Row, selected=is_sel()))
     }))
   }
@@ -474,19 +551,60 @@ pub fn DataGrid::cell(
   loc~ : String = "",
 ) -> view::View {
   let setup = fn(v : view::View) {
-    self.cell_nodes.push((row_key, col_key, v))
+    let vid = v.id()
+    if self.first_cell_id.v is None {
+      self.first_cell_id.v = Some(vid)
+    }
+    match self.cell_nodes.get(row_key) {
+      Some(cols) => cols[col_key] = v
+      None => {
+        let cols : Map[String, view::View] = Map::new()
+        cols[col_key] = v
+        self.cell_nodes[row_key] = cols
+      }
+    }
     let _ = v.owns(fn() {
-      view::array_retain(self.cell_nodes, fn(e : (String, String, view::View)) -> Bool { e.2.id() != v.id() })
+      match self.cell_nodes.get(row_key) {
+        Some(cols) => {
+          match cols.get(col_key) {
+            Some(cur) => if cur.id() == vid { cols.remove(col_key) }
+            None => ()
+          }
+          if cols.length() == 0 {
+            self.cell_nodes.remove(row_key)
+          }
+        }
+        None => ()
+      }
+      match self.first_cell_id.v {
+        Some(fid) => if fid == vid { self.first_cell_id.v = None }
+        None => ()
+      }
+      match self.real_focus.v {
+        Some((rk, ck)) => if rk == row_key && ck == col_key { self.real_focus.v = None }
+        None => ()
+      }
     })
     let is_foc = fn() -> Bool {
       let _ = self.rev.get()
-      self.state.is_focused_cell(row_key, col_key)
+      v.focused() || self.state.is_focused_cell(row_key, col_key)
     }
     let is_tab = fn() -> Bool {
       let _ = self.rev.get()
       match (self.state.focus_row, self.state.focus_col) {
         (Some(rk), Some(ck)) => rk == row_key && ck == col_key
-        _ => self.cell_nodes.length() > 0 && self.cell_nodes[0].2.id() == v.id()
+        _ => {
+          let rows = signals::untracked(self.row_keys)
+          let cols = signals::untracked(self.col_keys)
+          if rows.length() > 0 && cols.length() > 0 {
+            rows[0] == row_key && cols[0] == col_key
+          } else {
+            match self.first_cell_id.v {
+              Some(fid) => fid == vid
+              None => false
+            }
+          }
+        }
       }
     }
     look(v, is_foc)
@@ -498,10 +616,27 @@ pub fn DataGrid::cell(
       Some(view::said(view::Role::GridCell, label=label(), selected=self.is_selected(row_key)))
     }))
     .on_press(fn() {
+      if self.is_row_disabled(row_key) {
+        return
+      }
       self.state.set_focus(row_key, col_key)
       self.bump()
       let _ = v.ask_focus(visible=false)
     })
+    v.reacts(
+      fn() -> Bool { v.focused() },
+      fn(focused : Bool) -> Unit {
+        if focused {
+          self.real_focus.v = Some((row_key, col_key))
+        } else {
+          match self.real_focus.v {
+            Some((rk, ck)) => if rk == row_key && ck == col_key { self.real_focus.v = None }
+            None => ()
+          }
+        }
+      },
+      at_start=false,
+    )
   }
   if in_node {
     setup(parent)

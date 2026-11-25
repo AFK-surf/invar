@@ -1,0 +1,823 @@
+// Aura Wave 1.5A — Autocomplete compound component (Builder + Pion-JSX).
+// Built on `headless::selector` (filterable=true), `ui::Field`, `w0_popover_shell`, `w0_field_shell`.
+// Trigger displays selected value with clear button & chevron; popover embeds an `AutocompleteFilter`
+// search input (flush 2pt focus ring) above the filtered `ListBox`. Preserves `selected_keys`
+// across filtering, maintains virtual focus (`controls` + `active_descendant`) on the filter field,
+// guards IME composition, and supports full RTL.
+
+import "headless"
+import "headless_core"
+import "signals"
+import "ui"
+import "view"
+
+struct XAutocompleteCtx {
+  sel : headless::Selector[String]
+  fld : ui::Field
+  idx : XSelectIndex
+  filter_get : () -> XFilterResult
+  variant : AuraFieldVariant
+  full_width : Bool
+  multiple : Bool
+  invalid : view::Live[Bool]
+  disabled_get : () -> Bool
+  rtl_get : () -> Bool
+  label_get : () -> String
+  placeholder_get : () -> String
+  filter_placeholder : view::Live[String]
+  trigger_ref : signals::Ref[Option[view::View]]
+  filter_ref : signals::Ref[Option[view::View]]
+  popover_width : Option[Double]
+  gap : Double
+  placement : headless::Placement
+  on_clear : Option[() -> Unit]
+  force_trigger_focus : Bool
+  force_filter_focused : Bool
+  force_active_ring : Bool
+}
+
+let x_autocomplete_ctx_lent : view::Lent[XAutocompleteCtx] = view::Lent::new()
+
+/// Aura `AutocompleteValue` (Builder API): displays the selected item(s) label or placeholder inside `AutocompleteTrigger`.
+pub fn autocomplete_value_node(
+  parent : view::View,
+  placeholder? : String,
+  loc~ : String = "",
+) -> view::View {
+  let ctx_opt = parent.lent(x_autocomplete_ctx_lent)
+  parent.box(loc=loc, fn(v : view::View) -> Unit {
+    let rtl_get = fn() -> Bool {
+      match ctx_opt {
+        Some(c) => (c.rtl_get)()
+        None => aura_rtl(v)
+      }
+    }
+    let _ = v
+      .grow(view::Live::Is(1.0))
+      .shrink(view::Live::Is(1.0))
+      .min_width(view::Live::Is(Some(0.0)))
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::By(fn() -> view::Lies {
+        if rtl_get() { view::Lies::End } else { view::Lies::Start }
+      }))
+      .points(view::Live::Is(false))
+
+    let is_empty = fn() -> Bool {
+      match ctx_opt {
+        Some(c) => c.sel.selected_keys().length() == 0
+        None => true
+      }
+    }
+    let text_get = fn() -> String {
+      match ctx_opt {
+        Some(c) => {
+          let keys = c.sel.selected_keys()
+          if keys.length() == 0 {
+            match placeholder {
+              Some(p) => p
+              None => (c.placeholder_get)()
+            }
+          } else {
+            c.idx.selection_display_text(keys)
+          }
+        }
+        None => match placeholder { Some(p) => p; None => "" }
+      }
+    }
+    let _ = v
+      .words(view::Live::By(text_get), look=x_words_look(14.0, 400, 20.0))
+      .words_look(view::Live::By(fn() -> view::WordsLook { x_words_look(14.0, 400, 20.0, rtl=rtl_get()) }))
+      .ink(view::Live::By(fn() -> Int64 {
+        let pal = aura_theme(v).palette
+        if is_empty() { pal.field_placeholder } else { pal.field_foreground }
+      }))
+  })
+}
+
+/// Pion-JSX `<aura::AutocompleteValue>` wrapper.
+pub fn AutocompleteValue(
+  parent : view::View,
+  placeholder? : String,
+  loc~ : String = "",
+) -> view::View {
+  autocomplete_value_node(parent, placeholder?=placeholder, loc=loc)
+}
+
+/// Aura `AutocompleteIndicator` (Builder API): chevron indicator that rotates when open and flips side in RTL.
+pub fn autocomplete_indicator_node(
+  parent : view::View,
+  loc~ : String = "",
+) -> view::View {
+  let ctx_opt = parent.lent(x_autocomplete_ctx_lent)
+  let _ = loc
+  let open_get = fn() -> Bool {
+    match ctx_opt {
+      Some(c) => c.sel.is_open()
+      None => false
+    }
+  }
+  let rtl_get = fn() -> Bool {
+    match ctx_opt {
+      Some(c) => (c.rtl_get)()
+      None => aura_rtl(parent)
+    }
+  }
+  x_chevron_node(parent, open_get, rtl_get)
+}
+
+/// Pion-JSX `<aura::AutocompleteIndicator>` wrapper.
+pub fn AutocompleteIndicator(
+  parent : view::View,
+  loc~ : String = "",
+) -> view::View {
+  autocomplete_indicator_node(parent, loc=loc)
+}
+
+/// Aura `AutocompleteClearButton` (Builder API): clears selection and filter query without opening the popover.
+pub fn autocomplete_clear_button_node(
+  parent : view::View,
+  label~ : String = "Clear selection",
+  loc~ : String = "",
+) -> view::View {
+  match parent.lent(x_autocomplete_ctx_lent) {
+    Some(c) =>
+      x_clear_button_node(
+        parent,
+        fn() -> Bool { c.sel.selected_keys().length() > 0 },
+        c.disabled_get,
+        fn() -> Unit {
+          c.fld.set("")
+          c.sel.clear(clear_query=true)
+          match c.on_clear {
+            Some(f) => f()
+            None => ()
+          }
+        },
+        label=label,
+        loc=loc,
+      )
+    None => parent.box(fn(_v : view::View) { () }, loc=loc)
+  }
+}
+
+/// Pion-JSX `<aura::AutocompleteClearButton>` wrapper.
+pub fn AutocompleteClearButton(
+  parent : view::View,
+  label~ : String = "Clear selection",
+  loc~ : String = "",
+) -> view::View {
+  autocomplete_clear_button_node(parent, label=label, loc=loc)
+}
+
+/// Aura `AutocompleteTrigger` (Builder API): field-styled trigger button with focus-visible gap ring.
+pub fn autocomplete_trigger_node(
+  parent : view::View,
+  content? : (view::View) -> Unit,
+  clearable~ : Bool = false,
+  force_focus_visible~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  match parent.lent(x_autocomplete_ctx_lent) {
+    Some(c) => {
+      let sel = c.sel
+      let dis_get = c.disabled_get
+      let rtl_get = c.rtl_get
+      let variant = c.variant
+      let invalid = c.invalid
+      let lbl_get = c.label_get
+      let full_width = c.full_width
+      let force_trig = force_focus_visible || c.force_trigger_focus
+      let trigger_ref = c.trigger_ref
+      parent.box(loc=loc, fn(tv : view::View) -> Unit {
+        trigger_ref.v = Some(tv)
+        sel.add_scope(tv)
+        sel.guard_press(tv)
+        let able = fn() -> Bool { !dis_get() }
+        let _ = tv
+          .row(view::Live::Is(true))
+          .row_reverse(view::Live::By(rtl_get))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .gap(view::Live::Is(6.0))
+          .min_height(view::Live::Is(Some(36.0)))
+          .padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
+            if rtl_get() { (28.0, 6.0, 12.0, 6.0) } else { (12.0, 6.0, 28.0, 6.0) }
+          }))
+          .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(tv) }))
+          .radius(view::Live::By(fn() -> Double { aura_theme(tv).field_radius }))
+          .ground(view::Live::By(fn() -> Int64 {
+            let pal = aura_theme(tv).palette
+            let dis = dis_get()
+            let hov = !dis && !aura_is_coarse_pointer(tv) && tv.pointed()
+            x_trigger_bg(tv, pal, variant, hov, invalid.eval())
+          }))
+          .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+            if aura_field_effective_variant(tv, variant) is AuraFieldVariant::Primary {
+              aura_surface_shadows(aura_theme(tv).config.dark)
+            } else {
+              []
+            }
+          }))
+          .group_alpha(view::Live::By(fn() -> Double {
+            if dis_get() { aura_theme(tv).disabled_opacity } else { 1.0 }
+          }))
+          .presses(view::Live::By(able))
+          .focusable(view::Live::By(able), keys=0)
+          .says(view::Live::By(fn() -> Option[view::Said] {
+            Some(view::said(
+              view::Role::Combobox,
+              label=lbl_get(),
+              expanded=sel.is_open(),
+              controls=sel.controls_id(),
+              active_descendant=sel.active_descendant_id(),
+            ))
+          }))
+          .on_press(fn() -> Unit {
+            if able() {
+              let _ = tv.ask_focus(visible=false)
+              sel.set_open(!sel.is_open())
+            }
+          })
+          .on_key(fn(k : view::Key) -> Bool {
+            if !tv.focus_within() {
+              return false
+            }
+            if !sel.is_open() && k.mods == 0 && (k.code == headless_core::key_space || k.code == headless_core::key_enter || k.code == headless_core::key_down || k.code == headless_core::key_up) {
+              sel.set_open(true)
+              return true
+            }
+            sel.handle_key(k, tv.cause_at())
+          })
+        if full_width {
+          let _ = tv.fills_across(view::Live::Is(true))
+        }
+        x_apply_trigger_ring(tv, invalid, force_focus_visible=force_trig)
+        match content {
+          Some(ch) => ch(tv)
+          None => {
+            let _ = autocomplete_value_node(tv)
+            if clearable {
+              let _ = autocomplete_clear_button_node(tv)
+            }
+            let _ = autocomplete_indicator_node(tv)
+          }
+        }
+      })
+    }
+    None => parent.box(fn(_v : view::View) { () }, loc=loc)
+  }
+}
+
+/// Pion-JSX `<aura::AutocompleteTrigger>` wrapper.
+pub fn AutocompleteTrigger(
+  parent : view::View,
+  clearable~ : Bool = false,
+  force_focus_visible~ : Bool = false,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  autocomplete_trigger_node(parent, content?=children, clearable=clearable, force_focus_visible=force_focus_visible, loc=loc)
+}
+
+/// Aura `AutocompleteFilter` (Builder API): embedded search filter field inside `AutocompletePopover`.
+/// Carries flush 2pt focus ring, Magnifier icon, virtual focus (`controls` + `active_descendant`),
+/// IME composition guard, and Escape focus return to `AutocompleteTrigger`.
+pub fn autocomplete_filter_node(
+  parent : view::View,
+  placeholder? : view::Live[String],
+  force_focused~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  match parent.lent(x_autocomplete_ctx_lent) {
+    Some(c) => {
+      let sel = c.sel
+      let fld = c.fld
+      let dis_get = c.disabled_get
+      let rtl_get = c.rtl_get
+      let trigger_ref = c.trigger_ref
+      let filter_ref = c.filter_ref
+      let ph = match placeholder { Some(p) => p; None => c.filter_placeholder }
+      let ph_get = ph.to_getter()
+      let foc_force = force_focused || c.force_filter_focused
+      parent.box(loc=loc, fn(wrap : view::View) -> Unit {
+        let _ = wrap
+          .fills_across(view::Live::Is(true))
+          .padding(view::Live::Is((12.0, 4.0, 12.0, 4.0)))
+        let shell = w0_field_shell(
+          wrap,
+          variant=AuraFieldVariant::Primary,
+          invalid=view::Live::Is(false),
+          disabled=view::Live::By(dis_get),
+          height=36.0,
+          pad_x=0.0,
+          force_focused=foc_force,
+          content=fn(grp : view::View) -> Unit {
+            let _ = grp
+              .row(view::Live::Is(true))
+              .row_reverse(view::Live::By(rtl_get))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .gap(view::Live::Is(6.0))
+              .padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
+                if rtl_get() { (8.0, 0.0, 0.0, 0.0) } else { (0.0, 0.0, 8.0, 0.0) }
+              }))
+            let _ = aura_icon_node(
+              grp,
+              AuraIconKind::Magnifier,
+              size=16.0,
+              ink=fn() -> Int64 { aura_theme(grp).palette.field_placeholder },
+            )
+            let fnode = ui::field(
+              grp,
+              fld,
+              placeholder_by=ph_get,
+              size_by=fn() -> Double { 14.0 },
+              rtl_by=rtl_get,
+              line=20.0,
+              min_lines=1,
+              max_lines=1,
+              enter_sends=false,
+              leaves=[
+                headless_core::key_down,
+                headless_core::key_up,
+                headless_core::key_enter,
+                headless_core::key_escape,
+                headless_core::key_tab,
+                headless_core::key_page_up,
+                headless_core::key_page_down,
+              ],
+              label=signals::untracked(ph_get),
+              colors_by=fn() -> (Int64, Int64, Int64) {
+                let pal = aura_theme(grp).palette
+                (pal.field_foreground, pal.field_placeholder, pal.focus)
+              },
+              edit=fn(e : ui::FieldEdit) -> Unit {
+                if dis_get() {
+                  if fld.text() != e.was {
+                    fld.set(e.was)
+                  }
+                  return
+                }
+                sel.set_query(e.now, open_if_closed=false)
+              },
+            )
+            filter_ref.v = Some(fnode)
+            let _ = fnode
+              .grow(view::Live::Is(1.0))
+              .shrink(view::Live::Is(1.0))
+              .min_width(view::Live::Is(Some(0.0)))
+              .focusable(view::Live::By(fn() -> Bool { !dis_get() }), keys=0)
+              .presses(view::Live::By(fn() -> Bool { !dis_get() }))
+              .says(view::Live::By(fn() -> Option[view::Said] {
+                let acts : Array[view::Action] = if dis_get() { [] } else { [view::Action::SetText("")] }
+                Some(view::said(
+                  view::Role::Combobox,
+                  label=ph_get(),
+                  value=fld.text(),
+                  expanded=sel.is_open(),
+                  controls=sel.controls_id(),
+                  active_descendant=sel.active_descendant_id(),
+                  actions=acts,
+                ))
+              }))
+              .on_key(fn(k : view::Key) -> Bool {
+                if !fnode.focus_within() {
+                  return false
+                }
+                if fld.composing() {
+                  return false
+                }
+                let is_esc = k.code == headless_core::key_escape && k.mods == 0
+                let handled = sel.handle_key(k, fnode.cause_at())
+                if is_esc && handled {
+                  match trigger_ref.v {
+                    Some(tv) => {
+                      let _ = tv.ask_focus(visible=true)
+                    }
+                    None => ()
+                  }
+                }
+                handled
+              })
+            fnode.reacts(
+              fn() -> Bool { fnode.focused() },
+              fn(foc : Bool) -> Unit {
+                if foc && !fld.focused() && !dis_get() {
+                  fld.focus()
+                }
+              },
+            )
+            let _ = fnode.owns(fn() -> Unit {
+              match filter_ref.v {
+                Some(cur) if cur.id() == fnode.id() => filter_ref.v = None
+                _ => ()
+              }
+            })
+            let _ = x_clear_button_node(
+              grp,
+              fn() -> Bool { fld.text() != "" },
+              dis_get,
+              fn() -> Unit {
+                fld.set("")
+                sel.set_query("", open_if_closed=false)
+              },
+              label="Clear filter",
+              guard_sel=sel,
+            )
+          },
+        )
+        let _ = shell.fills_across(view::Live::Is(true))
+      })
+    }
+    None => parent.box(fn(_v : view::View) { () }, loc=loc)
+  }
+}
+
+/// Pion-JSX `<aura::AutocompleteFilter>` wrapper.
+pub fn AutocompleteFilter(
+  parent : view::View,
+  placeholder? : view::Live[String],
+  placeholder_by? : () -> String,
+  force_focused~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let ph : Option[view::Live[String]] = match placeholder_by {
+    Some(f) => Some(view::Live::By(f))
+    None => placeholder
+  }
+  autocomplete_filter_node(parent, placeholder?=ph, force_focused=force_focused, loc=loc)
+}
+
+/// Aura `AutocompletePopover` (Builder API): portal-mounted overlay with `AutocompleteFilter` + filtered `ListBox`.
+pub fn autocomplete_popover_node(
+  parent : view::View,
+  content? : (view::View, headless::Selector[String]) -> Unit,
+  placement? : headless::Placement,
+  gap? : Double,
+  width? : Double,
+  loc~ : String = "",
+) -> view::View {
+  let _ = loc
+  match parent.lent(x_autocomplete_ctx_lent) {
+    Some(c) => {
+      let eff_placement = match placement { Some(p) => p; None => c.placement }
+      let eff_gap = match gap { Some(g) => g; None => c.gap }
+      let eff_w = match width { Some(w) => Some(w); None => c.popover_width }
+      x_mount_selector_popover(
+        parent,
+        fn() -> Bool { c.sel.is_open() },
+        c.trigger_ref,
+        eff_placement,
+        eff_gap,
+        eff_w,
+        c.rtl_get,
+        pad_top=8.0,
+        fn(panel : view::View) -> Unit {
+          c.sel.add_scope(panel)
+          let _ = panel.lends(x_autocomplete_ctx_lent, c)
+          let _ = autocomplete_filter_node(panel)
+          x_mount_scrollable_listbox(
+            panel,
+            c.sel,
+            fn() -> Double { x_popover_list_max_height(parent, c.trigger_ref, eff_gap, 52.0) },
+            fn(lv : view::View) -> Unit {
+              match content {
+                Some(ch) => ch(lv, c.sel)
+                None =>
+                  x_render_selector_options(
+                    lv,
+                    c.sel,
+                    c.idx,
+                    c.filter_get,
+                    c.rtl_get,
+                    show_active_ring=true,
+                    force_active_ring=c.force_active_ring,
+                  )
+              }
+            },
+          )
+          // Move keyboard focus into the embedded filter field when opened (unless disabled).
+          if !(c.disabled_get)() && !c.force_filter_focused {
+            let _ = panel.at_moment(panel.cause_at(), fn() -> Unit {
+              match c.filter_ref.v {
+                Some(fv) if fv.alive() => {
+                  let _ = fv.ask_focus(visible=false)
+                  c.fld.focus()
+                }
+                _ => ()
+              }
+            })
+          }
+        },
+      )
+      parent
+    }
+    None => parent
+  }
+}
+
+/// Pion-JSX `<aura::AutocompletePopover>` wrapper.
+pub fn AutocompletePopover(
+  parent : view::View,
+  placement? : headless::Placement,
+  gap? : Double,
+  width? : Double,
+  children? : (view::View, headless::Selector[String]) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  autocomplete_popover_node(parent, content?=children, placement?=placement, gap?=gap, width?=width, loc=loc)
+}
+
+/// Aura `Autocomplete` compound selector (Builder API).
+pub fn autocomplete_node(
+  parent : view::View,
+  items : Array[AuraSelectOption],
+  label~ : view::Live[String] = view::Live::Is(""),
+  placeholder~ : view::Live[String] = view::Live::Is("Select an option"),
+  filter_placeholder~ : view::Live[String] = view::Live::Is("Filter..."),
+  description~ : view::Live[String] = view::Live::Is(""),
+  error~ : view::Live[String] = view::Live::Is(""),
+  field? : ui::Field,
+  initial_selected~ : Array[String] = [],
+  selected_keys? : () -> Array[String],
+  multiple~ : Bool = false,
+  clearable~ : Bool = false,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  required~ : Bool = false,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  rtl~ : Bool = false,
+  dir~ : String = "",
+  default_open~ : Bool = false,
+  open? : () -> Bool,
+  placement~ : headless::Placement = headless::Placement::BelowStart,
+  gap~ : Double = 8.0,
+  popover_width? : Double,
+  force_trigger_focus~ : Bool = false,
+  force_filter_focused~ : Bool = false,
+  force_active_ring~ : Bool = false,
+  on_open_change? : (Bool) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_query_change? : (String) -> Unit,
+  on_clear? : () -> Unit,
+  selector_ref? : signals::Ref[Option[headless::Selector[String]]],
+  field_ref? : signals::Ref[Option[ui::Field]],
+  content? : (view::View, headless::Selector[String]) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let idx = XSelectIndex::new(items)
+  let fld = match field {
+    Some(f) => f
+    None => ui::Field::new(text="")
+  }
+  match field_ref {
+    Some(r) => r.v = Some(fld)
+    None => ()
+  }
+  let lbl_get = label.to_getter()
+  let ph_get = placeholder.to_getter()
+  let desc_get = description.to_getter()
+  let err_get = error.to_getter()
+  let dis_get = disabled.to_getter()
+  let eff_dis = fn() -> Bool { x_effective_disabled(parent, dis_get) }
+  let trigger_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let filter_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let sel_holder : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+
+  let filter_memo = x_make_filter_memo(idx, fn() -> String {
+    match sel_holder.v {
+      Some(s) => s.query()
+      None => ""
+    }
+  })
+  let filter_get = fn() -> XFilterResult { filter_memo.get() }
+  let all_k = fn() -> Array[String] { idx.all_keys }
+  let vis_k = fn() -> Array[String] { filter_memo.get().keys }
+  let eff_lbl = fn() -> String {
+    let l = lbl_get()
+    if l != "" { l } else { ph_get() }
+  }
+
+  headless::selector(
+    parent,
+    eff_lbl,
+    all_k,
+    vis_k,
+    fn(k : String) -> String { idx.label_of(k) },
+    fn(root : view::View, sel : headless::Selector[String]) -> Unit {
+      sel_holder.v = Some(sel)
+      match selector_ref {
+        Some(r) => r.v = Some(sel)
+        None => ()
+      }
+      let eff_rtl = fn() -> Bool { x_effective_rtl(root, rtl, dir) }
+      let eff_inv = fn() -> Bool { invalid.eval() || err_get() != "" }
+
+      let ctx = XAutocompleteCtx::{
+        sel,
+        fld,
+        idx,
+        filter_get,
+        variant,
+        full_width,
+        multiple,
+        invalid: view::Live::By(eff_inv),
+        disabled_get: eff_dis,
+        rtl_get: eff_rtl,
+        label_get: eff_lbl,
+        placeholder_get: ph_get,
+        filter_placeholder,
+        trigger_ref,
+        filter_ref,
+        popover_width,
+        gap,
+        placement,
+        on_clear,
+        force_trigger_focus,
+        force_filter_focused,
+        force_active_ring,
+      }
+      let _ = root.lends(x_autocomplete_ctx_lent, ctx)
+      let _ = root.gap(view::Live::Is(4.0))
+      if full_width {
+        let _ = root.fills_across(view::Live::Is(true))
+      }
+
+      match content {
+        Some(ch) => ch(root, sel)
+        None => {
+          let _ = root.show(
+            fn() -> Bool { lbl_get() != "" },
+            fn(lw : view::View) -> Unit {
+              let _ = lw
+                .fills_across(view::Live::Is(true))
+                .row(view::Live::Is(true))
+                .lies_along(view::Live::By(fn() -> view::Lies {
+                  if eff_rtl() { view::Lies::End } else { view::Lies::Start }
+                }))
+              let _ = label_node(lw, label, required=required, disabled=view::Live::By(eff_dis))
+            },
+            at_once=true,
+          )
+          let _ = autocomplete_trigger_node(root, clearable=clearable, force_focus_visible=force_trigger_focus)
+          let _ = autocomplete_popover_node(root)
+          let _ = root.show(
+            fn() -> Bool { !eff_inv() && desc_get() != "" },
+            fn(dv : view::View) -> Unit { let _ = description_node(dv, description) },
+            at_once=true,
+          )
+          let _ = root.show(
+            fn() -> Bool { eff_inv() && err_get() != "" },
+            fn(ev : view::View) -> Unit { let _ = error_message_node(ev, error) },
+            at_once=true,
+          )
+        }
+      }
+
+      if default_open && open is None {
+        sel.set_open(true)
+      }
+    },
+    initial_selected=initial_selected,
+    multiple=multiple,
+    filterable=true,
+    key_disabled=fn(k : String) -> Bool { idx.disabled_of(k) },
+    disabled=eff_dis,
+    composing=fn() -> Bool { fld.composing() },
+    open_by?=open,
+    selected_by?=selected_keys,
+    on_open_change=fn(is_open : Bool) -> Unit {
+      if !is_open {
+        match trigger_ref.v {
+          Some(tv) if tv.alive() => {
+            if fld.focused() {
+              let _ = tv.ask_focus(visible=false)
+            }
+          }
+          _ => ()
+        }
+      }
+      match on_open_change {
+        Some(f) => f(is_open)
+        None => ()
+      }
+    },
+    on_selection_change=fn(keys : Array[String]) -> Unit {
+      if multiple {
+        match (sel_holder.v, filter_ref.v) {
+          (Some(s), Some(fv)) =>
+            if signals::untracked(fn() -> Bool { s.is_open() }) && !s.owns_focus() && fv.alive() {
+              let _ = fv.ask_focus(visible=false)
+              fld.focus()
+            }
+          _ => ()
+        }
+      } else {
+        // Return keyboard focus to trigger after pointer-clicking an option in single-select.
+        match trigger_ref.v {
+          Some(tv) if tv.alive() && !tv.focused() => {
+            let _ = tv.ask_focus(visible=false)
+          }
+          _ => ()
+        }
+      }
+      match on_selection_change {
+        Some(f) => f(keys)
+        None => ()
+      }
+    },
+    on_query_change?=on_query_change,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::Autocomplete>` wrapper.
+pub fn Autocomplete(
+  parent : view::View,
+  items~ : Array[AuraSelectOption] = [],
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  into placeholder~ : view::Live[String] = .Is("Select an option"),
+  placeholder_by? : () -> String,
+  into filter_placeholder~ : view::Live[String] = .Is("Filter..."),
+  filter_placeholder_by? : () -> String,
+  into description~ : view::Live[String] = .Is(""),
+  description_by? : () -> String,
+  into error~ : view::Live[String] = .Is(""),
+  error_by? : () -> String,
+  field? : ui::Field,
+  initial_selected~ : Array[String] = [],
+  selected_keys? : () -> Array[String],
+  multiple~ : Bool = false,
+  clearable~ : Bool = false,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  required~ : Bool = false,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  rtl~ : Bool = false,
+  dir~ : String = "",
+  default_open~ : Bool = false,
+  open? : () -> Bool,
+  placement~ : headless::Placement = headless::Placement::BelowStart,
+  gap~ : Double = 8.0,
+  popover_width? : Double,
+  force_trigger_focus~ : Bool = false,
+  force_filter_focused~ : Bool = false,
+  force_active_ring~ : Bool = false,
+  on_open_change? : (Bool) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_query_change? : (String) -> Unit,
+  on_clear? : () -> Unit,
+  selector_ref? : signals::Ref[Option[headless::Selector[String]]],
+  field_ref? : signals::Ref[Option[ui::Field]],
+  children? : (view::View, headless::Selector[String]) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  let ph = match placeholder_by { Some(f) => view::Live::By(f); None => placeholder }
+  let fph = match filter_placeholder_by { Some(f) => view::Live::By(f); None => filter_placeholder }
+  let d = match description_by { Some(f) => view::Live::By(f); None => description }
+  let e = match error_by { Some(f) => view::Live::By(f); None => error }
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  autocomplete_node(
+    parent,
+    items,
+    label=l,
+    placeholder=ph,
+    filter_placeholder=fph,
+    description=d,
+    error=e,
+    field?=field,
+    initial_selected=initial_selected,
+    selected_keys?=selected_keys,
+    multiple=multiple,
+    clearable=clearable,
+    variant=variant,
+    full_width=full_width,
+    required=required,
+    invalid=inv,
+    disabled=dis,
+    rtl=rtl,
+    dir=dir,
+    default_open=default_open,
+    open?=open,
+    placement=placement,
+    gap=gap,
+    popover_width?=popover_width,
+    force_trigger_focus=force_trigger_focus,
+    force_filter_focused=force_filter_focused,
+    force_active_ring=force_active_ring,
+    on_open_change?=on_open_change,
+    on_selection_change?=on_selection_change,
+    on_query_change?=on_query_change,
+    on_clear?=on_clear,
+    selector_ref?=selector_ref,
+    field_ref?=field_ref,
+    content?=children,
+    loc=loc,
+  )
+}

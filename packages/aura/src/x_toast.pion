@@ -1,0 +1,861 @@
+// Wave 1.5 Track 1.5B: Toast notification system (Builder + Pion-JSX).
+// Built on `headless::toaster` with multi-placement independent queues, in-place same-id updates,
+// 5 semantic variants, countdown progress bar mapping, action/close slots, and reduced-motion stillness.
+
+import "headless"
+import "paint"
+import "signals"
+import "view"
+
+/// Toast semantic variant (`Default`, `Accent`, `Success`, `Warning`, `Danger`).
+#derive(Eq)
+pub enum AuraToastVariant {
+  Default
+  Accent
+  Success
+  Warning
+  Danger
+}
+
+/// Toast region placement (6 screen anchors: top/bottom × start/center/end).
+#derive(Eq)
+pub enum AuraToastPlacement {
+  TopStart
+  TopCenter
+  TopEnd
+  BottomStart
+  BottomCenter
+  BottomEnd
+}
+
+/// Data record for one queued toast notification.
+pub struct AuraToastData {
+  pub id : String
+  pub variant : AuraToastVariant
+  pub title : String
+  pub description : String
+  pub duration_ms : Double
+  pub action_label : String
+  pub closable : Bool
+  pub show_indicator : Bool
+  pub progress : Option[Double]
+  pub placement : AuraToastPlacement
+}
+
+fn x_opt_f64_eq(a : Option[Double], b : Option[Double]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+impl view::ViewEq for AuraToastData {
+  fn eq(self : AuraToastData, other : AuraToastData) -> Bool {
+    self.id == other.id &&
+    self.variant == other.variant &&
+    self.title == other.title &&
+    self.description == other.description &&
+    self.duration_ms == other.duration_ms &&
+    self.action_label == other.action_label &&
+    self.closable == other.closable &&
+    self.show_indicator == other.show_indicator &&
+    x_opt_f64_eq(self.progress, other.progress) &&
+    self.placement == other.placement
+  }
+}
+
+/// Construct an `AuraToastData` record.
+pub fn AuraToastData::new(
+  id : String,
+  title : String,
+  description~ : String = "",
+  variant~ : AuraToastVariant = AuraToastVariant::Default,
+  duration_ms~ : Double = 4000.0,
+  action_label~ : String = "",
+  closable~ : Bool = true,
+  show_indicator~ : Bool = true,
+  progress? : Double,
+  placement~ : AuraToastPlacement = AuraToastPlacement::BottomEnd,
+) -> AuraToastData {
+  AuraToastData::{
+    id,
+    variant,
+    title,
+    description,
+    duration_ms,
+    action_label,
+    closable,
+    show_indicator,
+    progress,
+    placement,
+  }
+}
+
+/// Reactive toast queue supporting independent placement lanes and in-place same-`id` updates.
+pub struct ToastQueue {
+  items_sig : signals::Signal[Array[AuraToastData]]
+  max_visible : Int
+}
+
+/// Create a new `ToastQueue` with optional `max_visible` cap (default 3).
+pub fn ToastQueue::new(
+  initial~ : Array[AuraToastData] = [],
+  max_visible~ : Int = 3,
+) -> ToastQueue {
+  let cap = if max_visible < 1 { 1 } else { max_visible }
+  ToastQueue::{
+    items_sig: signals::signal_by(initial.copy(), fn(_a : Array[AuraToastData], _b : Array[AuraToastData]) -> Bool { false }),
+    max_visible: cap,
+  }
+}
+
+/// Reactive snapshot of all queued toasts.
+pub fn ToastQueue::items(self : ToastQueue) -> Array[AuraToastData] {
+  self.items_sig.get()
+}
+
+/// Reactive snapshot of queued toasts belonging to `placement` (independent lane).
+pub fn ToastQueue::items_for(self : ToastQueue, placement : AuraToastPlacement) -> Array[AuraToastData] {
+  let all = self.items_sig.get()
+  let out : Array[AuraToastData] = []
+  for it in all {
+    if it.placement == placement {
+      out.push(it)
+    }
+  }
+  out
+}
+
+/// Total number of toasts currently in the queue.
+pub fn ToastQueue::len(self : ToastQueue) -> Int {
+  self.items_sig.get().length()
+}
+
+/// Push a toast into the queue; if a toast with the same `id` already exists,
+/// update it in place without creating a duplicate stack entry.
+pub fn ToastQueue::push(self : ToastQueue, item : AuraToastData) -> Unit {
+  let cur = self.items_sig.untracked()
+  let next : Array[AuraToastData] = []
+  let mut replaced = false
+  for existing in cur {
+    if existing.id == item.id {
+      next.push(item)
+      replaced = true
+    } else {
+      next.push(existing)
+    }
+  }
+  if !replaced {
+    next.push(item)
+  }
+  self.items_sig.set(next)
+}
+
+/// Convenience alias for `ToastQueue::push` (upsert by `id`).
+pub fn ToastQueue::add(self : ToastQueue, item : AuraToastData) -> Unit {
+  self.push(item)
+}
+
+/// Update an existing toast by `id` (or insert if absent).
+pub fn ToastQueue::update(self : ToastQueue, item : AuraToastData) -> Unit {
+  self.push(item)
+}
+
+/// Dismiss the toast with matching `id`.
+pub fn ToastQueue::dismiss(self : ToastQueue, id : String) -> Unit {
+  let cur = self.items_sig.untracked()
+  let next : Array[AuraToastData] = []
+  for existing in cur {
+    if existing.id != id {
+      next.push(existing)
+    }
+  }
+  self.items_sig.set(next)
+}
+
+/// Clear all toasts (or only those in `placement` when specified).
+pub fn ToastQueue::clear(self : ToastQueue, placement? : AuraToastPlacement) -> Unit {
+  match placement {
+    None => self.items_sig.set([])
+    Some(pl) => {
+      let cur = self.items_sig.untracked()
+      let next : Array[AuraToastData] = []
+      for existing in cur {
+        if existing.placement != pl {
+          next.push(existing)
+        }
+      }
+      self.items_sig.set(next)
+    }
+  }
+}
+
+fn x_toast_words(size : Double, weight : Int, line : Double, wrap~ : Bool = false) -> view::WordsLook {
+  view::WordsLook::{ ..view::words_plain, size, weight, line, wrap }
+}
+
+fn x_toast_clamp01(v : Double) -> Double {
+  if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v }
+}
+
+fn x_toast_accent_fg(pal : AuraPalette, variant : AuraToastVariant) -> Int64 {
+  match variant {
+    AuraToastVariant::Default => pal.overlay_foreground
+    AuraToastVariant::Accent => pal.accent_soft_foreground
+    AuraToastVariant::Success => pal.success_soft_foreground
+    AuraToastVariant::Warning => pal.warning_soft_foreground
+    AuraToastVariant::Danger => pal.danger_soft_foreground
+  }
+}
+
+fn x_toast_bar_color(pal : AuraPalette, variant : AuraToastVariant) -> Int64 {
+  match variant {
+    AuraToastVariant::Default => pal.foreground
+    AuraToastVariant::Accent => pal.accent
+    AuraToastVariant::Success => pal.success
+    AuraToastVariant::Warning => pal.warning
+    AuraToastVariant::Danger => pal.danger
+  }
+}
+
+fn x_toast_default_icon(variant : AuraToastVariant) -> AuraIconKind {
+  match variant {
+    AuraToastVariant::Default | AuraToastVariant::Accent => AuraIconKind::CircleInfo
+    AuraToastVariant::Success => AuraIconKind::CircleCheck
+    AuraToastVariant::Warning => AuraIconKind::TriangleExclamation
+    AuraToastVariant::Danger => AuraIconKind::CircleExclamation
+  }
+}
+
+fn x_toast_placement_key(pl : AuraToastPlacement) -> String {
+  match pl {
+    AuraToastPlacement::TopStart => "top-start"
+    AuraToastPlacement::TopCenter => "top-center"
+    AuraToastPlacement::TopEnd => "top-end"
+    AuraToastPlacement::BottomStart => "bottom-start"
+    AuraToastPlacement::BottomCenter => "bottom-center"
+    AuraToastPlacement::BottomEnd => "bottom-end"
+  }
+}
+
+fn x_toast_region_edges(
+  pl : AuraToastPlacement,
+  rtl : Bool,
+  inset : Double,
+) -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+  let is_top = match pl {
+    AuraToastPlacement::TopStart | AuraToastPlacement::TopCenter | AuraToastPlacement::TopEnd => true
+    _ => false
+  }
+  let top_e : Option[Double] = if is_top { Some(inset) } else { None }
+  let bot_e : Option[Double] = if is_top { None } else { Some(inset) }
+  match pl {
+    AuraToastPlacement::TopStart | AuraToastPlacement::BottomStart =>
+      if rtl { (None, top_e, Some(inset), bot_e) } else { (Some(inset), top_e, None, bot_e) }
+    AuraToastPlacement::TopEnd | AuraToastPlacement::BottomEnd =>
+      if rtl { (Some(inset), top_e, None, bot_e) } else { (None, top_e, Some(inset), bot_e) }
+    AuraToastPlacement::TopCenter | AuraToastPlacement::BottomCenter =>
+      (Some(inset), top_e, Some(inset), bot_e)
+  }
+}
+
+let x_toast_variant_lent : view::Lent[() -> AuraToastVariant] = view::Lent::new()
+
+/// Toast leading icon indicator (4pt padding, 16pt status icon aligned to first line).
+pub fn toast_indicator_node(
+  parent : view::View,
+  variant? : AuraToastVariant,
+  icon? : AuraIconKind,
+  content? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(node : view::View) -> Unit {
+    let eff_variant = fn() -> AuraToastVariant {
+      match variant {
+        Some(v) => v
+        None =>
+          match node.lent(x_toast_variant_lent) {
+            Some(f) => f()
+            None => AuraToastVariant::Default
+          }
+      }
+    }
+    let _ = node
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+      .pad(view::Live::Is(4.0))
+      .shrink(view::Live::Is(0.0))
+    match content {
+      Some(f) => f(node)
+      None => {
+        let _ = node.box(fn(ic_host : view::View) -> Unit {
+          let _ = ic_host
+            .width(view::Live::Is(Some(16.0)))
+            .height(view::Live::Is(Some(16.0)))
+            .shrink(view::Live::Is(0.0))
+            .points(view::Live::Is(false))
+            .shapes(view::Live::By(fn() -> Array[paint::Shape] {
+              let kind = match icon {
+                Some(k) => k
+                None => x_toast_default_icon(eff_variant())
+              }
+              aura_icon_shapes(kind, 16.0, 0x010101FFL)
+            }))
+            .tint(view::Live::By(fn() -> Int64 {
+              x_toast_accent_fg(aura_theme(ic_host).palette, eff_variant())
+            }))
+        })
+      }
+    }
+  })
+}
+
+/// Pion-JSX `<aura::ToastIndicator>` wrapper.
+pub fn ToastIndicator(
+  parent : view::View,
+  variant? : AuraToastVariant,
+  icon? : AuraIconKind,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  toast_indicator_node(parent, variant?=variant, icon?=icon, content?=children, loc=loc)
+}
+
+/// Toast content column (flexible column with zero min-width, start-aligned).
+pub fn toast_content_node(
+  parent : view::View,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(node : view::View) -> Unit {
+    let _ = node
+      .grow(view::Live::Is(1.0))
+      .shrink(view::Live::Is(1.0))
+      .min_width(view::Live::Is(Some(0.0)))
+      .lines_up(view::Live::By(fn() -> Option[view::Along] {
+        Some(if aura_rtl(node) { view::Along::End } else { view::Along::Start })
+      }))
+      .gap(view::Live::Is(0.0))
+    content(node)
+  })
+}
+
+/// Pion-JSX `<aura::ToastContent>` wrapper.
+pub fn ToastContent(
+  parent : view::View,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  toast_content_node(parent, content=children, loc=loc)
+}
+
+/// Toast title (`14pt` Medium, `20pt` line-height, semantic variant tint).
+pub fn toast_title_node(
+  parent : view::View,
+  text : view::Live[String],
+  variant? : AuraToastVariant,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(w : view::View) -> Unit {
+    let eff_variant = fn() -> AuraToastVariant {
+      match variant {
+        Some(v) => v
+        None =>
+          match w.lent(x_toast_variant_lent) {
+            Some(f) => f()
+            None => AuraToastVariant::Default
+          }
+      }
+    }
+    let look = x_toast_words(14.0, 500, 20.0, wrap=true)
+    let _ = w
+      .words(text, look=look)
+      .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(w)) }))
+      .ink(view::Live::By(fn() -> Int64 {
+        x_toast_accent_fg(aura_theme(w).palette, eff_variant())
+      }))
+  })
+}
+
+/// Pion-JSX `<aura::ToastTitle>` wrapper.
+pub fn ToastTitle(
+  parent : view::View,
+  into text~ : view::Live[String] = .Is(""),
+  text_by? : () -> String,
+  variant? : AuraToastVariant,
+  loc~ : String = "",
+) -> view::View {
+  let t = match text_by { Some(f) => view::Live::By(f); None => text }
+  toast_title_node(parent, t, variant?=variant, loc=loc)
+}
+
+/// Toast description (`14pt` Regular, `20pt` line-height, `--muted`).
+pub fn toast_description_node(
+  parent : view::View,
+  text : view::Live[String],
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(w : view::View) -> Unit {
+    let look = x_toast_words(14.0, 400, 20.0, wrap=true)
+    let _ = w
+      .words(text, look=look)
+      .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(w)) }))
+      .ink(view::Live::By(fn() -> Int64 { aura_theme(w).palette.muted }))
+  })
+}
+
+/// Pion-JSX `<aura::ToastDescription>` wrapper.
+pub fn ToastDescription(
+  parent : view::View,
+  into text~ : view::Live[String] = .Is(""),
+  text_by? : () -> String,
+  loc~ : String = "",
+) -> view::View {
+  let t = match text_by { Some(f) => view::Live::By(f); None => text }
+  toast_description_node(parent, t, loc=loc)
+}
+
+/// Toast action button (`Sm` secondary pill button).
+pub fn toast_action_button_node(
+  parent : view::View,
+  label : view::Live[String],
+  on_press~ : () -> Unit = fn() { () },
+  variant~ : AuraButtonVariant = AuraButtonVariant::Secondary,
+  loc~ : String = "",
+) -> view::View {
+  button_node(
+    parent,
+    label,
+    on_press=on_press,
+    variant=variant,
+    size=AuraButtonSize::Sm,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::ToastActionButton>` wrapper.
+pub fn ToastActionButton(
+  parent : view::View,
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  on_press~ : () -> Unit = fn() { () },
+  variant~ : AuraButtonVariant = AuraButtonVariant::Secondary,
+  loc~ : String = "",
+) -> view::View {
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  toast_action_button_node(parent, l, on_press=on_press, variant=variant, loc=loc)
+}
+
+/// Toast close button (compact circular dismiss button with full hit target ergonomics).
+pub fn toast_close_button_node(
+  parent : view::View,
+  on_press~ : () -> Unit = fn() { () },
+  label~ : String = "Dismiss notification",
+  loc~ : String = "",
+) -> view::View {
+  close_button_node(
+    parent,
+    on_press=on_press,
+    label=label,
+    size=AuraButtonSize::Sm,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::ToastCloseButton>` wrapper.
+pub fn ToastCloseButton(
+  parent : view::View,
+  on_press~ : () -> Unit = fn() { () },
+  label~ : String = "Dismiss notification",
+  loc~ : String = "",
+) -> view::View {
+  toast_close_button_node(parent, on_press=on_press, label=label, loc=loc)
+}
+
+/// Standalone Aura `Toast` surface (Builder API).
+/// Matches overlay shadow, circular `min(32, card_radius)` corners, 16pt horizontal / 12pt vertical padding,
+/// dark-mode inset rim, optional countdown progress bar, action button, and close button.
+pub fn toast_node(
+  parent : view::View,
+  variant~ : AuraToastVariant = AuraToastVariant::Default,
+  variant_by? : () -> AuraToastVariant,
+  title? : view::Live[String],
+  description? : view::Live[String],
+  show_indicator~ : Bool = true,
+  show_indicator_by? : () -> Bool,
+  icon? : AuraIconKind,
+  action_label? : view::Live[String],
+  on_action? : () -> Unit,
+  show_close~ : Bool = false,
+  show_close_by? : () -> Bool,
+  on_close? : () -> Unit,
+  on_button_mount? : (view::View) -> Unit,
+  announce~ : Bool = true,
+  progress? : () -> Option[Double],
+  width~ : Double = 380.0,
+  content? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let eff_variant = match variant_by {
+    Some(f) => f
+    None => fn() -> AuraToastVariant { variant }
+  }
+  let eff_show_ind = match show_indicator_by {
+    Some(f) => f
+    None => fn() -> Bool { show_indicator }
+  }
+  let eff_show_close = match show_close_by {
+    Some(f) => f
+    None => fn() -> Bool { show_close }
+  }
+  let mount_btn = fn(btn : view::View) -> Unit {
+    match on_button_mount {
+      Some(f) => f(btn)
+      None => ()
+    }
+  }
+  let ov_sig = signals::signal(AuraSurfaceLevel::Overlay)
+  parent.box(loc=loc, fn(card : view::View) -> Unit {
+    let rad = view::Live::By(fn() -> Double {
+      let r = aura_theme(card).card_radius
+      if r > 32.0 { 32.0 } else { r }
+    })
+    let _ = aura_provide_surface(card, ov_sig)
+    let _ = card
+      .lends(x_toast_variant_lent, eff_variant)
+      .width(view::Live::Is(Some(width)))
+      .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(card) }))
+      .radius(rad)
+      .ground(view::Live::By(fn() -> Int64 { aura_theme(card).palette.surface }))
+      .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+        aura_overlay_shadows(aura_theme(card).config.dark)
+      }))
+    if announce {
+      let _ = card.says(view::Live::By(fn() -> Option[view::Said] {
+        let lbl = match title { Some(t) => t.eval(); None => "Notification" }
+        let desc = match description { Some(d) => d.eval(); None => "" }
+        Some(view::said(view::Role::Status, label=lbl, description=desc))
+      }))
+    }
+    w0_mount_dark_overlay_rim(card, rad)
+
+    // Main horizontal row: indicator + content + optional action/close
+    let _ = card.box(fn(row : view::View) -> Unit {
+      let _ = row
+        .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(row) }))
+        .lines_up(view::Live::Is(Some(view::Along::Start)))
+        .fills_across(view::Live::Is(true))
+        .gap(view::Live::Is(6.0))
+        .pad_xy(16.0, 12.0)
+      match content {
+        Some(f) => f(row)
+        None => {
+          match show_indicator_by {
+            Some(_) => {
+              let _ = row.show(eff_show_ind, fn(ih : view::View) -> Unit {
+                let _ = ih.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).shrink(view::Live::Is(0.0))
+                let _ = toast_indicator_node(ih, icon?=icon)
+              })
+            }
+            None =>
+              if show_indicator {
+                let _ = toast_indicator_node(row, icon?=icon)
+              }
+          }
+          let _ = toast_content_node(row, content=fn(col : view::View) -> Unit {
+            match title {
+              Some(t) => { let _ = toast_title_node(col, t) }
+              None => ()
+            }
+            match description {
+              Some(d) => {
+                let _ = col.show(fn() -> Bool { d.eval() != "" }, fn(dh : view::View) -> Unit {
+                  let _ = toast_description_node(dh, d)
+                })
+              }
+              None => ()
+            }
+          })
+          if action_label is Some(_) || show_close || show_close_by is Some(_) {
+            let has_tail = fn() -> Bool {
+              let has_act = match action_label {
+                Some(al) => al.eval() != ""
+                None => false
+              }
+              has_act || eff_show_close()
+            }
+            let _ = row.show(has_tail, fn(tail : view::View) -> Unit {
+              let _ = tail
+                .row(view::Live::Is(true))
+                .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(tail) }))
+                .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                .gap(view::Live::Is(8.0))
+                .shrink(view::Live::Is(0.0))
+              match action_label {
+                Some(al) => {
+                  let _ = tail.show(fn() -> Bool { al.eval() != "" }, fn(ah : view::View) -> Unit {
+                    let _ = ah.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).shrink(view::Live::Is(0.0))
+                    let act_fn = match on_action { Some(f) => f; None => fn() { () } }
+                    let btn = toast_action_button_node(ah, al, on_press=act_fn)
+                    mount_btn(btn)
+                  })
+                }
+                None => ()
+              }
+              let _ = tail.show(eff_show_close, fn(ch : view::View) -> Unit {
+                let _ = ch.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).shrink(view::Live::Is(0.0))
+                let close_fn = match on_close { Some(f) => f; None => fn() { () } }
+                let btn = toast_close_button_node(ch, on_press=close_fn)
+                mount_btn(btn)
+              })
+            })
+          }
+        }
+      }
+    })
+
+    // Optional countdown progress bar mapped to 0.0..=1.0
+    match progress {
+      Some(prog_fn) => {
+        let _ = card.show(
+          fn() -> Bool { prog_fn() is Some(_) },
+          fn(bar_host : view::View) -> Unit {
+            let _ = bar_host
+              .fills_across(view::Live::Is(true))
+              .pad_xy(16.0, 0.0)
+              .margin(view::Live::Is((0.0, 0.0, 0.0, 6.0)))
+            let _ = bar_host.box(fn(track : view::View) -> Unit {
+              let _ = track
+                .row(view::Live::Is(true))
+                .fills_across(view::Live::Is(true))
+                .height(view::Live::Is(Some(3.0)))
+                .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(track) }))
+                .radius(view::Live::Is(1.5))
+                .clips(view::Live::Is(true))
+                .points(view::Live::Is(false))
+                .ground(view::Live::By(fn() -> Int64 { aura_theme(track).palette.default_bg }))
+              let _ = track.box(fn(fill : view::View) -> Unit {
+                let _ = fill
+                  .grow(view::Live::By(fn() -> Double {
+                    match prog_fn() {
+                      Some(p) => x_toast_clamp01(p)
+                      None => 0.0
+                    }
+                  }))
+                  .shrink(view::Live::Is(1.0))
+                  .basis(view::Live::Is(Some(0.0)))
+                  .height(view::Live::Is(Some(3.0)))
+                  .points(view::Live::Is(false))
+                  .ground(view::Live::By(fn() -> Int64 {
+                    x_toast_bar_color(aura_theme(fill).palette, eff_variant())
+                  }))
+              })
+              let _ = track.box(fn(rem : view::View) -> Unit {
+                let _ = rem
+                  .grow(view::Live::By(fn() -> Double {
+                    match prog_fn() {
+                      Some(p) => 1.0 - x_toast_clamp01(p)
+                      None => 1.0
+                    }
+                  }))
+                  .shrink(view::Live::Is(1.0))
+                  .basis(view::Live::Is(Some(0.0)))
+                  .height(view::Live::Is(Some(3.0)))
+                  .points(view::Live::Is(false))
+              })
+            })
+          },
+        )
+      }
+      None => ()
+    }
+  })
+}
+
+/// Pion-JSX `<aura::Toast>` wrapper.
+pub fn Toast(
+  parent : view::View,
+  variant~ : AuraToastVariant = AuraToastVariant::Default,
+  variant_by? : () -> AuraToastVariant,
+  title? : view::Live[String],
+  title_by? : () -> String,
+  description? : view::Live[String],
+  description_by? : () -> String,
+  show_indicator~ : Bool = true,
+  icon? : AuraIconKind,
+  action_label? : view::Live[String],
+  on_action? : () -> Unit,
+  show_close~ : Bool = false,
+  on_close? : () -> Unit,
+  announce~ : Bool = true,
+  progress? : () -> Option[Double],
+  width~ : Double = 380.0,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let t : Option[view::Live[String]] = match title_by { Some(f) => Some(view::Live::By(f)); None => title }
+  let d : Option[view::Live[String]] = match description_by { Some(f) => Some(view::Live::By(f)); None => description }
+  toast_node(
+    parent,
+    variant=variant,
+    variant_by?=variant_by,
+    title?=t,
+    description?=d,
+    show_indicator=show_indicator,
+    icon?=icon,
+    action_label?=action_label,
+    on_action?=on_action,
+    show_close=show_close,
+    on_close?=on_close,
+    announce=announce,
+    progress?=progress,
+    width=width,
+    content?=children,
+    loc=loc,
+  )
+}
+
+/// Aura `ToastProvider` (Builder API): mounts an independent `headless::toaster` region
+/// at `placement` bound to `queue` (or all 6 placements when `all_placements=true`).
+pub fn toast_provider_node(
+  parent : view::View,
+  queue : ToastQueue,
+  placement~ : AuraToastPlacement = AuraToastPlacement::BottomEnd,
+  all_placements~ : Bool = false,
+  width~ : Double = 380.0,
+  gap~ : Double = 10.0,
+  inset~ : Double = 16.0,
+  key_prefix~ : String = "aura-toast",
+  on_action~ : (String) -> Unit = fn(_id : String) { () },
+  on_dismiss~ : (String) -> Unit = fn(_id : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let placements : Array[AuraToastPlacement] = if all_placements {
+    [
+      AuraToastPlacement::TopStart,
+      AuraToastPlacement::TopCenter,
+      AuraToastPlacement::TopEnd,
+      AuraToastPlacement::BottomStart,
+      AuraToastPlacement::BottomCenter,
+      AuraToastPlacement::BottomEnd,
+    ]
+  } else {
+    [placement]
+  }
+
+  parent.box(loc=loc, fn(host : view::View) -> Unit {
+    let _ = host
+      .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), Some(0.0), Some(0.0)))
+      .points(view::Live::Is(false))
+    for pl in placements {
+      let lane_pl = pl
+      let lane_key = "\{key_prefix}-\{x_toast_placement_key(lane_pl)}"
+      let is_center = lane_pl is AuraToastPlacement::TopCenter || lane_pl is AuraToastPlacement::BottomCenter
+      let _ = headless::toaster(
+        host,
+        fn() -> Array[AuraToastData] {
+          let lane = queue.items_for(lane_pl)
+          let n = lane.length()
+          if n <= queue.max_visible {
+            lane
+          } else {
+            let start = n - queue.max_visible
+            let out : Array[AuraToastData] = []
+            let mut i = start
+            while i < n {
+              out.push(lane[i])
+              i += 1
+            }
+            out
+          }
+        },
+        fn(it : AuraToastData) -> String { it.id },
+        fn(it : AuraToastData) -> (String, String) { (it.title, it.description) },
+        fn(it : AuraToastData) -> Double { it.duration_ms },
+        fn(reg : view::View) -> Unit {
+          let _ = reg
+            .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+              x_toast_region_edges(lane_pl, aura_rtl(reg), inset)
+            }))
+            .points(view::Live::Is(false))
+            .gap(view::Live::Is(gap))
+            .lines_up(view::Live::Is(Some(if is_center { view::Along::Middle } else { view::Along::End })))
+        },
+        fn(row : view::View, ti : headless::ToastItem[AuraToastData]) -> Unit {
+          let _ = row
+            .points(view::Live::Is(true))
+            .shift(view::Live::By(fn() -> (Double, Double) {
+              if aura_reduced_motion(row) {
+                (0.0, 0.0)
+              } else {
+                (ti.dx(), 0.0)
+              }
+            }))
+          let cur = fn() -> AuraToastData { ti.toast() }
+          let _ = toast_node(
+            row,
+            variant_by=fn() -> AuraToastVariant { cur().variant },
+            title=view::Live::By(fn() -> String { cur().title }),
+            description=view::Live::By(fn() -> String { cur().description }),
+            show_indicator_by=fn() -> Bool { cur().show_indicator },
+            action_label=view::Live::By(fn() -> String { cur().action_label }),
+            on_action=fn() -> Unit { ti.trigger_action() },
+            show_close_by=fn() -> Bool { cur().closable },
+            on_close=fn() -> Unit { ti.close() },
+            on_button_mount=fn(btn : view::View) -> Unit { ti.holds_focus(btn) },
+            announce=false,
+            progress=fn() -> Option[Double] {
+              let d = cur()
+              match d.progress {
+                Some(p) => Some(p)
+                None => if d.duration_ms > 0.0 { ti.remaining_fraction() } else { None }
+              }
+            },
+            width=width,
+          )
+        },
+        fn(id : String) -> Unit {
+          on_action(id)
+          queue.dismiss(id)
+        },
+        fn(id : String) -> Unit {
+          queue.dismiss(id)
+          on_dismiss(id)
+        },
+        key=lane_key,
+        label="Notifications",
+      )
+    }
+  })
+}
+
+/// Pion-JSX `<aura::ToastProvider>` wrapper.
+pub fn ToastProvider(
+  parent : view::View,
+  queue~ : ToastQueue,
+  placement~ : AuraToastPlacement = AuraToastPlacement::BottomEnd,
+  all_placements~ : Bool = false,
+  width~ : Double = 380.0,
+  gap~ : Double = 10.0,
+  inset~ : Double = 16.0,
+  key_prefix~ : String = "aura-toast",
+  on_action~ : (String) -> Unit = fn(_id : String) { () },
+  on_dismiss~ : (String) -> Unit = fn(_id : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  toast_provider_node(
+    parent,
+    queue,
+    placement=placement,
+    all_placements=all_placements,
+    width=width,
+    gap=gap,
+    inset=inset,
+    key_prefix=key_prefix,
+    on_action=on_action,
+    on_dismiss=on_dismiss,
+    loc=loc,
+  )
+}

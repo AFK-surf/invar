@@ -1,0 +1,942 @@
+// Wave 1.5 Track 1.5B: Table compound data grid (Builder + Pion-JSX).
+// Built on `headless::data_grid` with stable `row_key`/`col_key` 2D keyboard focus,
+// `aria-sort` cycling, single/multi/select-all/Shift-range selection, column resize drag,
+// load-more sentinel, footer pagination, and Primary/Secondary visual variants.
+
+import "headless"
+import "headless_core"
+import "signals"
+import "ui"
+import "view"
+
+/// Table visual variant (`Primary`: tinted outer shell with rounded surface body card;
+/// `Secondary`: standalone rounded header strip with flat bordered body rows).
+#derive(Eq)
+pub enum AuraTableVariant {
+  Primary
+  Secondary
+}
+
+/// Re-exported sort direction helper for callers.
+pub fn aura_sort_none() -> headless_core::SortDir { headless_core::SortDir::None }
+pub fn aura_sort_asc() -> headless_core::SortDir { headless_core::SortDir::Ascending }
+pub fn aura_sort_desc() -> headless_core::SortDir { headless_core::SortDir::Descending }
+
+/// Re-exported table selection mode helpers for callers.
+pub fn aura_table_sel_none() -> headless_core::TableSelectionMode { headless_core::TableSelectionMode::None }
+pub fn aura_table_sel_single() -> headless_core::TableSelectionMode { headless_core::TableSelectionMode::Single }
+pub fn aura_table_sel_multiple() -> headless_core::TableSelectionMode { headless_core::TableSelectionMode::Multiple }
+
+struct XTableCtx {
+  variant : AuraTableVariant
+  grid : signals::Ref[Option[headless::DataGrid]]
+}
+
+let x_table_ctx_lent : view::Lent[XTableCtx] = view::Lent::new()
+let x_table_row_key_lent : view::Lent[String] = view::Lent::new()
+
+fn x_table_words(size : Double, weight : Int, line : Double, wrap~ : Bool = false) -> view::WordsLook {
+  view::WordsLook::{ ..view::words_plain, size, weight, line, wrap }
+}
+
+fn x_table_ctx_of(v : view::View) -> Option[XTableCtx] {
+  v.lent(x_table_ctx_lent)
+}
+
+fn x_table_grid_of(v : view::View) -> Option[headless::DataGrid] {
+  match x_table_ctx_of(v) {
+    Some(ctx) => ctx.grid.v
+    None => None
+  }
+}
+
+fn x_table_variant_of(v : view::View) -> AuraTableVariant {
+  match x_table_ctx_of(v) {
+    Some(ctx) => ctx.variant
+    None => AuraTableVariant::Primary
+  }
+}
+
+fn x_table_with_alpha(c : Int64, alpha01 : Double) -> Int64 {
+  let a = (alpha01 * 255.0).round().to_int64()
+  let clamped = if a < 0L { 0L } else if a > 255L { 255L } else { a }
+  (c & 0xFFFFFF00L) | clamped
+}
+
+// ============================================================================
+// 1. Table (outer `.table-root`)
+// ============================================================================
+
+/// Aura `Table` root container (Builder API).
+/// Primary variant renders `surface_secondary` background, 4pt horizontal/bottom padding, `radius = min(32, radius * 2.5)` (20pt).
+pub fn table_node(
+  parent : view::View,
+  variant~ : AuraTableVariant = AuraTableVariant::Primary,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  let ctx = XTableCtx::{ variant, grid: view::ref_new(None) }
+  parent.box(loc=loc, fn(root : view::View) -> Unit {
+    let _ = root
+      .lends(x_table_ctx_lent, ctx)
+      .fills_across(view::Live::Is(true))
+      .clips(view::Live::Is(true))
+    match variant {
+      AuraTableVariant::Primary => {
+        let _ = root
+          .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(root) }))
+          .radius(view::Live::By(fn() -> Double {
+            let r = aura_theme(root).radius * 2.5
+            if r > 32.0 { 32.0 } else { r }
+          }))
+          .padding(view::Live::Is((4.0, 0.0, 4.0, 4.0)))
+          .ground(view::Live::By(fn() -> Int64 { aura_theme(root).palette.surface_secondary }))
+      }
+      AuraTableVariant::Secondary => ()
+    }
+    content(root)
+  })
+}
+
+/// Pion-JSX `<aura::Table>` wrapper.
+pub fn Table(
+  parent : view::View,
+  variant~ : AuraTableVariant = AuraTableVariant::Primary,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_node(parent, variant=variant, content=children, loc=loc)
+}
+
+// ============================================================================
+// 2. TableScrollContainer
+// ============================================================================
+
+/// Aura `TableScrollContainer` (Builder API): bounded horizontal/vertical scroll wrapper.
+pub fn table_scroll_container_node(
+  parent : view::View,
+  max_height? : Double,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  match max_height {
+    Some(mh) => {
+      let wrap = parent.box(loc=loc, fn(h : view::View) -> Unit {
+        let _ = h.fills_across(view::Live::Is(true)).height(view::Live::Is(Some(mh)))
+        let _ = ui::scroll_box(h, fn(inner : view::View) -> Unit {
+          let _ = inner.fills_across(view::Live::Is(true))
+          content(inner)
+        })
+      })
+      wrap
+    }
+    None =>
+      parent.box(loc=loc, fn(v : view::View) -> Unit {
+        let _ = v.fills_across(view::Live::Is(true))
+        content(v)
+      })
+  }
+}
+
+/// Pion-JSX `<aura::TableScrollContainer>` wrapper.
+pub fn TableScrollContainer(
+  parent : view::View,
+  max_height? : Double,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_scroll_container_node(parent, max_height?=max_height, content=children, loc=loc)
+}
+
+// ============================================================================
+// 3. TableResizableContainer
+// ============================================================================
+
+/// Aura `TableResizableContainer` (Builder API): container enabling interactive column resizing.
+pub fn table_resizable_container_node(
+  parent : view::View,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(v : view::View) -> Unit {
+    let _ = v.fills_across(view::Live::Is(true))
+    content(v)
+  })
+}
+
+/// Pion-JSX `<aura::TableResizableContainer>` wrapper.
+pub fn TableResizableContainer(
+  parent : view::View,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_resizable_container_node(parent, content=children, loc=loc)
+}
+
+// ============================================================================
+// 4. TableContent (wires `headless::data_grid`)
+// ============================================================================
+
+/// Aura `TableContent` (Builder API): mounts `headless::data_grid` (`Role::Grid`) and exposes
+/// the `DataGrid` controller to descendant `TableHeader`, `TableColumn`, `TableBody`, `TableRow`,
+/// `TableCell`, `TableColumnResizer`, `TableLoadMore`, and `TableFooter` slots.
+pub fn table_content_node(
+  parent : view::View,
+  row_keys : () -> Array[String],
+  col_keys : () -> Array[String],
+  label~ : String = "Data table",
+  selection_mode~ : headless_core::TableSelectionMode = headless_core::TableSelectionMode::Multiple,
+  has_more~ : Bool = false,
+  on_sort? : (String, headless_core::SortDir) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_column_resize? : (String, Double) -> Unit,
+  on_load_more? : () -> Unit,
+  on_page_change? : (Int) -> Unit,
+  on_ready? : (headless::DataGrid) -> Unit,
+  content~ : (view::View, headless::DataGrid) -> Unit = fn(_v : view::View, _dg : headless::DataGrid) { () },
+  loc~ : String = "",
+) -> view::View {
+  headless::data_grid(
+    parent,
+    fn() -> String { label },
+    row_keys,
+    col_keys,
+    fn(v : view::View, dg : headless::DataGrid) -> Unit {
+      let _ = v.fills_across(view::Live::Is(true))
+      match x_table_ctx_of(v) {
+        Some(ctx) => ctx.grid.v = Some(dg)
+        None => {
+          let fallback = XTableCtx::{ variant: AuraTableVariant::Primary, grid: view::ref_new(Some(dg)) }
+          let _ = v.lends(x_table_ctx_lent, fallback)
+        }
+      }
+      match on_ready {
+        Some(f) => f(dg)
+        None => ()
+      }
+      content(v, dg)
+    },
+    selection_mode=selection_mode,
+    has_more=has_more,
+    rtl=fn() -> Bool { aura_rtl(parent) },
+    on_sort?=on_sort,
+    on_selection_change?=on_selection_change,
+    on_column_resize?=on_column_resize,
+    on_load_more?=on_load_more,
+    on_page_change?=on_page_change,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::TableContent>` wrapper.
+pub fn TableContent(
+  parent : view::View,
+  row_keys~ : () -> Array[String],
+  col_keys~ : () -> Array[String],
+  label~ : String = "Data table",
+  selection_mode~ : headless_core::TableSelectionMode = headless_core::TableSelectionMode::Multiple,
+  has_more~ : Bool = false,
+  on_sort? : (String, headless_core::SortDir) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_column_resize? : (String, Double) -> Unit,
+  on_load_more? : () -> Unit,
+  on_page_change? : (Int) -> Unit,
+  on_ready? : (headless::DataGrid) -> Unit,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_content_node(
+    parent,
+    row_keys,
+    col_keys,
+    label=label,
+    selection_mode=selection_mode,
+    has_more=has_more,
+    on_sort?=on_sort,
+    on_selection_change?=on_selection_change,
+    on_column_resize?=on_column_resize,
+    on_load_more?=on_load_more,
+    on_page_change?=on_page_change,
+    on_ready?=on_ready,
+    content=fn(v : view::View, _dg : headless::DataGrid) { children(v) },
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 5. TableHeader
+// ============================================================================
+
+/// Aura `TableHeader` row (Builder API).
+pub fn table_header_node(
+  parent : view::View,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(hdr : view::View) -> Unit {
+    let variant = x_table_variant_of(hdr)
+    let _ = hdr
+      .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(hdr) }))
+      .fills_across(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .says(view::Live::Is(Some(view::said(view::Role::Row))))
+    match variant {
+      AuraTableVariant::Primary => {
+        let _ = hdr.ground(view::Live::By(fn() -> Int64 { aura_theme(hdr).palette.surface_secondary }))
+      }
+      AuraTableVariant::Secondary => {
+        let _ = hdr
+          .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(hdr) }))
+          .radius(view::Live::By(fn() -> Double {
+            let r = aura_theme(hdr).radius * 2.0
+            if r > 32.0 { 32.0 } else { r }
+          }))
+          .clips(view::Live::Is(true))
+          .ground(view::Live::By(fn() -> Int64 { aura_theme(hdr).palette.surface_secondary }))
+      }
+    }
+    content(hdr)
+  })
+}
+
+/// Pion-JSX `<aura::TableHeader>` wrapper.
+pub fn TableHeader(
+  parent : view::View,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_header_node(parent, content=children, loc=loc)
+}
+
+// ============================================================================
+// 6. TableColumn & 7. TableColumnResizer
+// ============================================================================
+
+/// Aura `TableColumnResizer` drag handle (Builder API).
+/// Wired to `DataGrid::column_resizer` with centered 1pt hairline that highlights on hover/drag.
+pub fn table_column_resizer_node(
+  parent : view::View,
+  col_key : String,
+  default_w~ : Double = 140.0,
+  initial_width? : () -> Double,
+  min_w~ : Double = 60.0,
+  max_w~ : Double = 600.0,
+  loc~ : String = "",
+) -> view::View {
+  match x_table_grid_of(parent) {
+    Some(dg) =>
+      dg.column_resizer(
+        parent,
+        col_key,
+        fn(res : view::View) -> Unit {
+          let _ = res
+            .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+              if aura_rtl(res) {
+                (Some(0.0), Some(0.0), None, Some(0.0))
+              } else {
+                (None, Some(0.0), Some(0.0), Some(0.0))
+              }
+            }))
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .lies_along(view::Live::Is(view::Lies::Middle))
+            .width(view::Live::Is(Some(12.0)))
+            .says(view::Live::Is(Some(view::said(view::Role::Separator, label="Resize \{col_key} column"))))
+          let _ = res.box(fn(bar : view::View) -> Unit {
+            let _ = bar
+              .width(view::Live::By(fn() -> Option[Double] {
+                Some(if res.pressed() || (!aura_is_coarse_pointer(res) && res.pointed()) { 2.0 } else { 1.0 })
+              }))
+              .height(view::Live::By(fn() -> Option[Double] {
+                if res.pressed() || (!aura_is_coarse_pointer(res) && res.pointed()) { None } else { Some(16.0) }
+              }))
+              .fills_across(view::Live::By(fn() -> Bool {
+                res.pressed() || (!aura_is_coarse_pointer(res) && res.pointed())
+              }))
+              .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(bar) }))
+              .radius(view::Live::Is(1.0))
+              .points(view::Live::Is(false))
+              .ground(view::Live::By(fn() -> Int64 {
+                let pal = aura_theme(bar).palette
+                if res.pressed() || (!aura_is_coarse_pointer(res) && res.pointed()) {
+                  pal.accent
+                } else {
+                  pal.separator
+                }
+              }))
+          })
+        },
+        default_w=default_w,
+        initial_width?=initial_width,
+        rtl=fn() -> Bool { aura_rtl(parent) },
+        min_w=min_w,
+        max_w=max_w,
+        loc=loc,
+      )
+    None => parent.box(loc=loc, fn(_v : view::View) { () })
+  }
+}
+
+/// Pion-JSX `<aura::TableColumnResizer>` wrapper.
+pub fn TableColumnResizer(
+  parent : view::View,
+  col_key~ : String,
+  default_w~ : Double = 140.0,
+  min_w~ : Double = 60.0,
+  max_w~ : Double = 600.0,
+  loc~ : String = "",
+) -> view::View {
+  table_column_resizer_node(parent, col_key, default_w=default_w, min_w=min_w, max_w=max_w, loc=loc)
+}
+
+fn x_apply_col_sizing(node : view::View, dg_opt : Option[headless::DataGrid], col_key : String, width : Option[Double], flex_grow : Double) -> Unit {
+  match width {
+    Some(w) => {
+      let _ = node
+        .width(view::Live::By(fn() -> Option[Double] {
+          match dg_opt {
+            Some(dg) => Some(dg.column_width(col_key, default_w=w))
+            None => Some(w)
+          }
+        }))
+        .shrink(view::Live::Is(0.0))
+    }
+    None => {
+      let resized_w = fn() -> Option[Double] {
+        match dg_opt {
+          Some(dg) => dg.column_width_opt(col_key)
+          None => None
+        }
+      }
+      let _ = node
+        .width(view::Live::By(resized_w))
+        .grow(view::Live::By(fn() -> Double {
+          if resized_w() is Some(_) { 0.0 } else { flex_grow }
+        }))
+        .shrink(view::Live::By(fn() -> Double {
+          if resized_w() is Some(_) { 0.0 } else { 1.0 }
+        }))
+        .basis(view::Live::By(fn() -> Option[Double] {
+          if resized_w() is Some(_) { None } else { Some(0.0) }
+        }))
+        .min_width(view::Live::By(fn() -> Option[Double] {
+          if resized_w() is Some(_) { None } else { Some(0.0) }
+        }))
+    }
+  }
+}
+
+/// Aura `TableColumn` header cell (Builder API).
+/// Wired to `DataGrid::column_header` with `aria-sort` (`none`/`ascending`/`descending`),
+/// sort chevron indicator, end-edge 16pt vertical hairline separator (hidden on last column
+/// or when `resizable=true`), and 16pt horizontal / 10pt vertical padding.
+pub fn table_column_node(
+  parent : view::View,
+  col_key : String,
+  label : view::Live[String],
+  sortable~ : Bool = false,
+  resizable~ : Bool = false,
+  is_last~ : Bool = false,
+  width? : Double,
+  flex_grow~ : Double = 1.0,
+  min_w~ : Double = 60.0,
+  max_w~ : Double = 600.0,
+  content? : (view::View, () -> headless_core::SortDir) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let lbl_get = label.to_getter()
+  let dg_opt = x_table_grid_of(parent)
+  let build_col = fn(col : view::View, sort_fn : () -> headless_core::SortDir) -> Unit {
+    x_apply_col_sizing(col, dg_opt, col_key, width, flex_grow)
+    let _ = col
+      .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(col) }))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Between))
+      .pad_xy(16.0, 10.0)
+      .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(col) }))
+      .radius(view::Live::Is(8.0))
+      .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+        if col.focus_shown() {
+          (2.0, 0.0, aura_theme(col).palette.focus)
+        } else {
+          (0.0, 0.0, 0L)
+        }
+      }))
+    match content {
+      Some(f) => f(col, sort_fn)
+      None => {
+        let _ = col.box(fn(tw : view::View) -> Unit {
+          let look = x_table_words(12.0, 500, 16.0)
+          let _ = tw
+            .words(label, look=look)
+            .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(tw)) }))
+            .ink(view::Live::By(fn() -> Int64 {
+              let pal = aura_theme(tw).palette
+              if sortable && !aura_is_coarse_pointer(col) && col.pointed() {
+                pal.foreground
+              } else {
+                pal.muted
+              }
+            }))
+        })
+        if sortable {
+          let _ = col.show(
+            fn() -> Bool { sort_fn() != headless_core::SortDir::None },
+            fn(ind : view::View) -> Unit {
+              let _ = ind
+                .width(view::Live::Is(Some(12.0)))
+                .height(view::Live::Is(Some(12.0)))
+                .shrink(view::Live::Is(0.0))
+                .points(view::Live::Is(false))
+                .shapes(view::Live::By(fn() -> Array[paint::Shape] {
+                  let kind = if sort_fn() == headless_core::SortDir::Descending {
+                    AuraIconKind::ChevronDown
+                  } else {
+                    AuraIconKind::ChevronUp
+                  }
+                  aura_icon_shapes(kind, 12.0, 0x010101FFL)
+                }))
+                .tint(view::Live::By(fn() -> Int64 { aura_theme(ind).palette.foreground }))
+            },
+          )
+        }
+      }
+    }
+    if resizable {
+      let def_w = match width { Some(w) => w; None => 140.0 }
+      let _ = table_column_resizer_node(
+        col,
+        col_key,
+        default_w=def_w,
+        initial_width=fn() -> Double { col.rect().2 },
+        min_w=min_w,
+        max_w=max_w,
+      )
+    } else if !is_last {
+      // Short 16pt centered vertical hairline separator on end edge
+      let _ = col.box(fn(sep_wrap : view::View) -> Unit {
+        let _ = sep_wrap
+          .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+            if aura_rtl(sep_wrap) {
+              (Some(0.0), Some(0.0), None, Some(0.0))
+            } else {
+              (None, Some(0.0), Some(0.0), Some(0.0))
+            }
+          }))
+          .row(view::Live::Is(true))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .width(view::Live::Is(Some(1.0)))
+          .points(view::Live::Is(false))
+        let _ = sep_wrap.box(fn(sep : view::View) -> Unit {
+          let _ = sep
+            .width(view::Live::Is(Some(1.0)))
+            .height(view::Live::Is(Some(16.0)))
+            .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(sep) }))
+            .radius(view::Live::Is(0.5))
+            .points(view::Live::Is(false))
+            .ground(view::Live::By(fn() -> Int64 { aura_theme(sep).palette.separator }))
+        })
+      })
+    }
+  }
+  match dg_opt {
+    Some(dg) => dg.column_header(parent, col_key, lbl_get, build_col, sortable=sortable, loc=loc)
+    None =>
+      parent.box(loc=loc, fn(col : view::View) -> Unit {
+        build_col(col, fn() -> headless_core::SortDir { headless_core::SortDir::None })
+        let _ = col.says(view::Live::By(fn() -> Option[view::Said] {
+          Some(view::said(view::Role::ColumnHeader, label=lbl_get()))
+        }))
+      })
+  }
+}
+
+/// Pion-JSX `<aura::TableColumn>` wrapper.
+pub fn TableColumn(
+  parent : view::View,
+  col_key~ : String,
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  sortable~ : Bool = false,
+  resizable~ : Bool = false,
+  is_last~ : Bool = false,
+  width? : Double,
+  flex_grow~ : Double = 1.0,
+  min_w~ : Double = 60.0,
+  max_w~ : Double = 600.0,
+  children? : (view::View, () -> headless_core::SortDir) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  table_column_node(
+    parent,
+    col_key,
+    l,
+    sortable=sortable,
+    resizable=resizable,
+    is_last=is_last,
+    width?=width,
+    flex_grow=flex_grow,
+    min_w=min_w,
+    max_w=max_w,
+    content?=children,
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 8. TableBody
+// ============================================================================
+
+/// Aura `TableBody` container (Builder API).
+/// Primary variant renders the white/dark rounded surface card (`radius = min(32, radius * 2)` = 16pt)
+/// with subtle surface shadow in light mode.
+pub fn table_body_node(
+  parent : view::View,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(body : view::View) -> Unit {
+    let variant = x_table_variant_of(body)
+    let _ = body.fills_across(view::Live::Is(true))
+    match variant {
+      AuraTableVariant::Primary => {
+        let _ = body
+          .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(body) }))
+          .radius(view::Live::By(fn() -> Double {
+            let r = aura_theme(body).radius * 2.0
+            if r > 32.0 { 32.0 } else { r }
+          }))
+          .clips(view::Live::Is(true))
+          .ground(view::Live::By(fn() -> Int64 { aura_theme(body).palette.surface }))
+        content(body)
+        // Reserve 1pt transparent bottom slot (no visible divider) so last row matches uniform row height.
+        let _ = body.box(fn(pad : view::View) -> Unit {
+          let _ = pad
+            .fills_across(view::Live::Is(true))
+            .height(view::Live::Is(Some(1.0)))
+            .points(view::Live::Is(false))
+        })
+      }
+      AuraTableVariant::Secondary => content(body)
+    }
+  })
+}
+
+/// Pion-JSX `<aura::TableBody>` wrapper.
+pub fn TableBody(
+  parent : view::View,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_body_node(parent, content=children, loc=loc)
+}
+
+// ============================================================================
+// 9. TableRow
+// ============================================================================
+
+/// Aura `TableRow` (Builder API): wired to `DataGrid::row`, with bottom row hairline
+/// (omitted on last row in Primary variant), hover tint, and selected highlight.
+pub fn table_row_node(
+  parent : view::View,
+  row_key : String,
+  is_last~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  content~ : (view::View, () -> Bool) -> Unit = fn(_v : view::View, _sel : () -> Bool) { () },
+  loc~ : String = "",
+) -> view::View {
+  let dg_opt = x_table_grid_of(parent)
+  let build_row = fn(row : view::View, is_sel : () -> Bool) -> Unit {
+    let variant = x_table_variant_of(row)
+    let _ = row
+      .lends(x_table_row_key_lent, row_key)
+      .fills_across(view::Live::Is(true))
+      .group_alpha(view::Live::By(fn() -> Double {
+        if disabled() { aura_theme(row).disabled_opacity } else { 1.0 }
+      }))
+      .ground(view::Live::By(fn() -> Int64 {
+        let pal = aura_theme(row).palette
+        let hov = !disabled() && !aura_is_coarse_pointer(row) && row.pointed_in()
+        if is_sel() {
+          pal.accent_soft
+        } else if hov {
+          match variant {
+            AuraTableVariant::Primary => x_table_with_alpha(pal.default_bg, 0.45)
+            AuraTableVariant::Secondary => x_table_with_alpha(pal.default_bg, 0.5)
+          }
+        } else {
+          match variant {
+            AuraTableVariant::Primary => pal.surface
+            AuraTableVariant::Secondary => 0x00000000L
+          }
+        }
+      }))
+    let _ = row.box(fn(cells_row : view::View) -> Unit {
+      let _ = cells_row
+        .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(cells_row) }))
+        .fills_across(view::Live::Is(true))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      content(cells_row, is_sel)
+    })
+    let show_sep = match variant {
+      AuraTableVariant::Primary => !is_last
+      AuraTableVariant::Secondary => true
+    }
+    if show_sep {
+      let _ = row.box(fn(line : view::View) -> Unit {
+        let _ = line
+          .fills_across(view::Live::Is(true))
+          .height(view::Live::Is(Some(1.0)))
+          .points(view::Live::Is(false))
+          .ground(view::Live::By(fn() -> Int64 {
+            x_table_with_alpha(aura_theme(line).palette.separator_tertiary, 0.5)
+          }))
+      })
+    }
+  }
+  match dg_opt {
+    Some(dg) => dg.row(parent, row_key, build_row, disabled=disabled, loc=loc)
+    None =>
+      parent.box(loc=loc, fn(row : view::View) -> Unit {
+        build_row(row, fn() { false })
+        let _ = row
+          .presses(view::Live::By(fn() -> Bool { !disabled() }))
+          .says(view::Live::Is(Some(view::said(view::Role::Row))))
+      })
+  }
+}
+
+/// Pion-JSX `<aura::TableRow>` wrapper.
+pub fn TableRow(
+  parent : view::View,
+  row_key~ : String,
+  is_last~ : Bool = false,
+  disabled~ : () -> Bool = fn() { false },
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_row_node(
+    parent,
+    row_key,
+    is_last=is_last,
+    disabled=disabled,
+    content=fn(v : view::View, _sel : () -> Bool) { children(v) },
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 10. TableCell
+// ============================================================================
+
+/// Aura `TableCell` (Builder API): wired to `DataGrid::cell` with stable `(row_key, col_key)`
+/// 2D focus, 16pt horizontal / 12pt vertical padding, 14pt foreground typography, and focus-visible inset ring.
+pub fn table_cell_node(
+  parent : view::View,
+  col_key : String,
+  row_key? : String,
+  text? : view::Live[String],
+  label~ : String = "",
+  width? : Double,
+  flex_grow~ : Double = 1.0,
+  select_on_press~ : Bool = false,
+  content? : (view::View, () -> Bool) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let dg_opt = x_table_grid_of(parent)
+  let rk = match row_key {
+    Some(r) => r
+    None =>
+      match parent.lent(x_table_row_key_lent) {
+        Some(r) => r
+        None => ""
+      }
+  }
+  let aria_lbl = fn() -> String {
+    if label != "" {
+      label
+    } else {
+      match text {
+        Some(t) => t.eval()
+        None => col_key
+      }
+    }
+  }
+  let build_cell = fn(cell : view::View, is_foc : () -> Bool) -> Unit {
+    x_apply_col_sizing(cell, dg_opt, col_key, width, flex_grow)
+    let _ = cell
+      .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(cell) }))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .min_height(view::Live::Is(Some(45.0)))
+      .pad_xy(16.0, 12.0)
+      .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(cell) }))
+      .radius(view::Live::Is(8.0))
+      .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+        if cell.focus_shown() {
+          (2.0, 0.0, aura_theme(cell).palette.focus)
+        } else {
+          (0.0, 0.0, 0L)
+        }
+      }))
+    match content {
+      Some(f) => f(cell, is_foc)
+      None =>
+        match text {
+          Some(t) => {
+            let _ = cell.box(fn(tw : view::View) -> Unit {
+              let look = x_table_words(14.0, 400, 20.0)
+              let _ = tw
+                .words(t, look=look)
+                .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(tw)) }))
+                .ink(view::Live::By(fn() -> Int64 { aura_theme(tw).palette.foreground }))
+            })
+          }
+          None => ()
+        }
+    }
+  }
+  match dg_opt {
+    Some(dg) => {
+      let c = dg.cell(parent, rk, col_key, aria_lbl, build_cell, loc=loc)
+      if select_on_press {
+        let _ = c.on_press(fn() -> Unit {
+          if dg.is_row_disabled(rk) {
+            return
+          }
+          dg.state.set_focus(rk, col_key)
+          let _ = dg.select_row(rk)
+          let _ = c.ask_focus(visible=false)
+        })
+      }
+      c
+    }
+    None =>
+      parent.box(loc=loc, fn(cell : view::View) -> Unit {
+        build_cell(cell, fn() { false })
+        let _ = cell.says(view::Live::By(fn() -> Option[view::Said] {
+          Some(view::said(view::Role::Cell, label=aria_lbl()))
+        }))
+      })
+  }
+}
+
+/// Pion-JSX `<aura::TableCell>` wrapper.
+pub fn TableCell(
+  parent : view::View,
+  col_key~ : String,
+  row_key? : String,
+  text? : view::Live[String],
+  text_by? : () -> String,
+  label~ : String = "",
+  width? : Double,
+  flex_grow~ : Double = 1.0,
+  select_on_press~ : Bool = false,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let t : Option[view::Live[String]] = match text_by { Some(f) => Some(view::Live::By(f)); None => text }
+  let c : Option[(view::View, () -> Bool) -> Unit] = match children {
+    Some(f) => Some(fn(v : view::View, _foc : () -> Bool) { f(v) })
+    None => None
+  }
+  table_cell_node(
+    parent,
+    col_key,
+    row_key?=row_key,
+    text?=t,
+    label=label,
+    width?=width,
+    flex_grow=flex_grow,
+    select_on_press=select_on_press,
+    content?=c,
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 11. TableLoadMore
+// ============================================================================
+
+/// Aura `TableLoadMore` sentinel/action row (Builder API): triggers `DataGrid::load_more()` or `on_load_more`.
+pub fn table_load_more_node(
+  parent : view::View,
+  label~ : String = "Load more",
+  loading~ : () -> Bool = fn() { false },
+  on_load_more? : () -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let dg_opt = x_table_grid_of(parent)
+  parent.box(loc=loc, fn(row : view::View) -> Unit {
+    let _ = row
+      .row(view::Live::Is(true))
+      .fills_across(view::Live::Is(true))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .gap(view::Live::Is(8.0))
+      .pad_xy(16.0, 12.0)
+      .says(view::Live::Is(Some(view::said(view::Role::Row))))
+    let _ = row.show(loading, fn(sp : view::View) -> Unit {
+      let _ = spinner_node(sp, size=AuraSpinnerSize::Sm, color=AuraSpinnerColor::Accent)
+    })
+    let _ = button_node(
+      row,
+      view::Live::Is(label),
+      on_press=fn() -> Unit {
+        match on_load_more {
+          Some(f) => f()
+          None =>
+            match dg_opt {
+              Some(dg) => dg.load_more()
+              None => ()
+            }
+        }
+      },
+      variant=AuraButtonVariant::Ghost,
+      size=AuraButtonSize::Sm,
+      disabled=view::Live::By(loading),
+    )
+  })
+}
+
+/// Pion-JSX `<aura::TableLoadMore>` wrapper.
+pub fn TableLoadMore(
+  parent : view::View,
+  label~ : String = "Load more",
+  loading~ : () -> Bool = fn() { false },
+  on_load_more? : () -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  table_load_more_node(parent, label=label, loading=loading, on_load_more?=on_load_more, loc=loc)
+}
+
+// ============================================================================
+// 12. TableFooter
+// ============================================================================
+
+/// Aura `TableFooter` bar (Builder API): sits beneath `TableBody` on `surface_secondary` (16pt horizontal / 10pt vertical padding).
+pub fn table_footer_node(
+  parent : view::View,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(ftr : view::View) -> Unit {
+    let _ = ftr
+      .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(ftr) }))
+      .fills_across(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Between))
+      .gap(view::Live::Is(8.0))
+      .pad_xy(16.0, 10.0)
+    content(ftr)
+  })
+}
+
+/// Pion-JSX `<aura::TableFooter>` wrapper.
+pub fn TableFooter(
+  parent : view::View,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  table_footer_node(parent, content=children, loc=loc)
+}

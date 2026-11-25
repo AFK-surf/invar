@@ -1,0 +1,1451 @@
+// Comprehensive unit & interaction tests for Wave 1.5 Track 1.5B:
+// Toast, Table, ColorPicker, DatePicker, DateRangePicker (Builder + Pion-JSX, A11y,
+// stable row_key/col_key focus & selection across sort, live color sync, RTL, reduced_motion,
+// and `aura::assert_aura_ui` craft gate).
+
+import "halt"
+import "headless"
+import "headless_core"
+import "signals"
+import "ui"
+import "view"
+
+fn x15b_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    halt::saying("x15b_test", msg)
+  }
+}
+
+fn x15b_opt_str_eq(a : Option[String], b : String) -> Bool {
+  match a {
+    Some(s) => s == b
+    None => false
+  }
+}
+
+fn x15b_opt_int_eq(a : Option[Int], b : Int) -> Bool {
+  match a {
+    Some(n) => n == b
+    None => false
+  }
+}
+
+fn x15b_press_a11y(t : ui::Tester, label : String, msg : String) -> Unit {
+  x15b_assert(t.get(label) is Some(_), msg)
+  t.press(label)
+  t.frame(ms=16.0)
+}
+
+fn x15b_setup_root(root : view::View, dark : Bool, reduced_motion~ : Bool = false, rtl~ : Bool = false) -> Unit {
+  let cfg = signals::signal(AuraConfig::{ ..AuraConfig::default(), dark, reduced_motion, rtl })
+  ui::set_tree_theme(fn() -> ui::Theme { aura_ui_theme(cfg.get()) })
+  let _ = aura_provide_config(root, cfg)
+}
+
+// ============================================================================
+// 1. Toast tests: multi-placement independent queues, same-id upsert, 5 variants,
+//    countdown progress, action/close, reduced_motion stillness, Builder + JSX
+// ============================================================================
+
+test "x15b_01_toast_multi_placement_same_id_update_and_variants" {
+  let q = ToastQueue::new(max_visible=4)
+  q.push(AuraToastData::new(
+    "build-1",
+    "Build queued",
+    description="Waiting for worker.",
+    variant=AuraToastVariant::Accent,
+    progress=0.25,
+    placement=AuraToastPlacement::BottomEnd,
+  ))
+  q.push(AuraToastData::new(
+    "top-1",
+    "Sync warning",
+    description="Check network latency.",
+    variant=AuraToastVariant::Warning,
+    placement=AuraToastPlacement::TopStart,
+  ))
+  q.push(AuraToastData::new(
+    "top-2",
+    "Fatal error",
+    description="Disk quota exceeded.",
+    variant=AuraToastVariant::Danger,
+    placement=AuraToastPlacement::TopEnd,
+  ))
+
+  x15b_assert(q.len() == 3, "initial queue should have 3 items")
+  x15b_assert(q.items_for(AuraToastPlacement::BottomEnd).length() == 1, "BottomEnd lane has 1 item")
+  x15b_assert(q.items_for(AuraToastPlacement::TopStart).length() == 1, "TopStart lane has 1 item")
+  x15b_assert(q.items_for(AuraToastPlacement::TopEnd).length() == 1, "TopEnd lane has 1 item")
+
+  // Same-id update must NOT duplicate stack
+  q.push(AuraToastData::new(
+    "build-1",
+    "Build succeeded",
+    description="packages/aura passed all checks.",
+    variant=AuraToastVariant::Success,
+    progress=1.0,
+    action_label="View",
+    placement=AuraToastPlacement::BottomEnd,
+  ))
+  x15b_assert(q.len() == 3, "same-id update must not duplicate toast entry")
+  x15b_assert(q.items_for(AuraToastPlacement::BottomEnd).length() == 1, "BottomEnd lane still has 1 entry")
+  x15b_assert(q.items_for(AuraToastPlacement::BottomEnd)[0].title == "Build succeeded", "title must update in place")
+
+  let acted_ids : Array[String] = []
+  let dismissed_ids : Array[String] = []
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false, reduced_motion=true)
+    let _ = ToastProvider(
+      root,
+      queue=q,
+      all_placements=true,
+      on_action=fn(id : String) { acted_ids.push(id) },
+      on_dismiss=fn(id : String) { dismissed_ids.push(id) },
+    )
+    // Also exercise standalone JSX Toast (offset below TopStart lane to avoid overlap)
+    let _ = root.box(fn(box_v : view::View) -> Unit {
+      let _ = box_v.padding(view::Live::Is((16.0, 140.0, 16.0, 16.0))).gap(view::Live::Is(8.0))
+      let _ = Toast(
+        box_v,
+        variant=AuraToastVariant::Default,
+        title=view::Live::Is("Standalone Info"),
+        description=view::Live::Is("Custom slot check"),
+        progress=fn() -> Option[Double] { Some(0.6) },
+      )
+    })
+  }, width=1200.0, height=800.0)
+
+  t.frame()
+  assert_aura_ui(t, label="x15b-toast-reduced-motion")
+  x15b_assert(t.find("Build succeeded") is Some(_), "updated toast title must render")
+  x15b_assert(t.find("packages/aura passed all checks.") is Some(_), "updated toast description must render")
+  x15b_assert(t.find("Sync warning") is Some(_), "TopStart lane toast must render")
+  x15b_assert(t.find("Fatal error") is Some(_), "TopEnd lane toast must render")
+  x15b_assert(t.find("Standalone Info") is Some(_), "standalone JSX toast must render")
+
+  // Trigger action button on build-1
+  x15b_press_a11y(t, "View", "View action button must be present")
+  x15b_assert(acted_ids.length() == 1 && acted_ids[0] == "build-1", "action callback must fire with toast id")
+  x15b_assert(q.items_for(AuraToastPlacement::BottomEnd).length() == 0, "acting on toast must dismiss it from queue")
+
+  // Clear TopStart lane independently without touching TopEnd
+  q.clear(placement=AuraToastPlacement::TopStart)
+  t.frame(ms=16.0)
+  x15b_assert(q.items_for(AuraToastPlacement::TopStart).length() == 0, "TopStart lane cleared")
+  x15b_assert(q.items_for(AuraToastPlacement::TopEnd).length() == 1, "TopEnd lane untouched")
+  t.dispose()
+}
+
+// ============================================================================
+// 2. Table tests: 2D keyboard focus, aria-sort, single/multi/Shift/select-all,
+//    HARD ASSERTION: sort preserves selected row_key set & focused cell,
+//    column resize, load-more & pagination callbacks
+// ============================================================================
+
+struct X15bRow {
+  key : String
+  name : String
+  role : String
+  status : String
+}
+
+test "x15b_02_table_sort_preserves_selection_and_focus_cell_and_interactions" {
+  let rows_sig : signals::Signal[Array[X15bRow]] = signals::signal_by(
+    [
+      X15bRow::{ key: "r-ada", name: "Ada Lovelace", role: "Architect", status: "Active" },
+      X15bRow::{ key: "r-alan", name: "Alan Turing", role: "Verifier", status: "Review" },
+      X15bRow::{ key: "r-grace", name: "Grace Hopper", role: "Compiler", status: "Active" },
+    ],
+    fn(_a : Array[X15bRow], _b : Array[X15bRow]) -> Bool { false },
+  )
+  let cols : Array[String] = ["name", "role", "status"]
+  let grid_ref : signals::Ref[Option[headless::DataGrid]] = view::ref_new(None)
+  let sort_events : Array[(String, headless_core::SortDir)] = []
+  let sel_events : Array[Array[String]] = []
+  let resize_events : Array[(String, Double)] = []
+  let load_more_count = view::ref_new(0)
+  let page_events : Array[Int] = []
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(16.0))
+    let _ = Table(root, variant=AuraTableVariant::Primary, children=fn(tbl : view::View) -> Unit {
+      let _ = TableScrollContainer(tbl, children=fn(sc : view::View) -> Unit {
+        let _ = TableResizableContainer(sc, children=fn(rc : view::View) -> Unit {
+          let _ = TableContent(
+            rc,
+            row_keys=fn() -> Array[String] {
+              let out : Array[String] = []
+              for r in rows_sig.get() {
+                out.push(r.key)
+              }
+              out
+            },
+            col_keys=fn() -> Array[String] { cols },
+            label="Team directory",
+            selection_mode=aura_table_sel_multiple(),
+            has_more=true,
+            on_sort=fn(ck : String, dir : headless_core::SortDir) -> Unit {
+              sort_events.push((ck, dir))
+              let cur = rows_sig.untracked()
+              let next : Array[X15bRow] = if dir == headless_core::SortDir::Descending {
+                [cur[2], cur[1], cur[0]]
+              } else if dir == headless_core::SortDir::Ascending {
+                [cur[0], cur[1], cur[2]]
+              } else {
+                [cur[1], cur[2], cur[0]]
+              }
+              rows_sig.set(next)
+              match grid_ref.v {
+                Some(dg) => dg.reconcile()
+                None => ()
+              }
+            },
+            on_selection_change=fn(keys : Array[String]) { sel_events.push(keys) },
+            on_column_resize=fn(ck : String, w : Double) { resize_events.push((ck, w)) },
+            on_load_more=fn() { load_more_count.v = load_more_count.v + 1 },
+            on_page_change=fn(p : Int) { page_events.push(p) },
+            on_ready=fn(dg : headless::DataGrid) { grid_ref.v = Some(dg) },
+            children=fn(tc : view::View) -> Unit {
+              let _ = TableHeader(tc, children=fn(hdr : view::View) -> Unit {
+                let _ = TableColumn(hdr, col_key="name", label=view::Live::Is("Name"), sortable=true, resizable=true, width=220.0)
+                let _ = TableColumn(hdr, col_key="role", label=view::Live::Is("Role"), sortable=true)
+                let _ = TableColumn(hdr, col_key="status", label=view::Live::Is("Status"), is_last=true)
+              })
+              let _ = TableBody(tc, children=fn(tb : view::View) -> Unit {
+                tb.each(
+                  fn() -> Array[X15bRow] { rows_sig.get() },
+                  fn(r : X15bRow) -> String { r.key },
+                  fn(row_host : view::View, r_sig : signals::Signal[X15bRow]) -> Unit {
+                    let row_data = r_sig.untracked()
+                    let _ = TableRow(row_host, row_key=row_data.key, children=fn(tr : view::View) -> Unit {
+                      let _ = TableCell(tr, col_key="name", text=view::Live::Is(row_data.name), width=220.0)
+                      let _ = TableCell(tr, col_key="role", text=view::Live::Is(row_data.role))
+                      let _ = TableCell(tr, col_key="status", label=row_data.status, children=fn(c : view::View) -> Unit {
+                        let _ = Chip(
+                          c,
+                          label=view::Live::Is(row_data.status),
+                          variant=AuraChipVariant::Soft,
+                          color=if row_data.status == "Active" { AuraStatusColor::Success } else { AuraStatusColor::Accent },
+                        )
+                      })
+                    })
+                  },
+                )
+                let _ = TableLoadMore(tb, label="Load more members")
+              })
+            },
+          )
+        })
+      })
+      let _ = TableFooter(tbl, children=fn(ftr : view::View) -> Unit {
+        let _ = button_node(
+          ftr,
+          view::Live::Is("Next page"),
+          on_press=fn() -> Unit {
+            match grid_ref.v {
+              Some(dg) => dg.set_page(2)
+              None => ()
+            }
+          },
+          variant=AuraButtonVariant::Ghost,
+          size=AuraButtonSize::Sm,
+        )
+      })
+    })
+  }, width=900.0, height=600.0)
+
+  t.frame()
+  assert_aura_ui(t, label="x15b-table-primary")
+
+  let dg = match grid_ref.v {
+    Some(g) => g
+    None => {
+      x15b_assert(false, "DataGrid handle must be populated")
+      return
+    }
+  }
+
+  // Click cell ("r-ada", "name") to establish 2D focus, then move right + down to ("r-alan", "role")
+  x15b_press_a11y(t, "Ada Lovelace", "Ada Lovelace cell must exist")
+  x15b_assert(x15b_opt_str_eq(dg.focus_row(), "r-ada") && x15b_opt_str_eq(dg.focus_col(), "name"), "initial click focuses (r-ada, name)")
+
+  t.key(headless_core::key_right)
+  t.frame(ms=16.0)
+  t.key(headless_core::key_down)
+  t.frame(ms=16.0)
+  x15b_assert(x15b_opt_str_eq(dg.focus_row(), "r-alan") && x15b_opt_str_eq(dg.focus_col(), "role"), "2D arrow nav must land on (r-alan, role)")
+
+  // Select r-ada and r-grace (multi-selection)
+  let _ = dg.select_row("r-ada")
+  let _ = dg.select_row("r-grace")
+  t.frame(ms=16.0)
+  x15b_assert(dg.is_selected("r-ada") && dg.is_selected("r-grace") && !dg.is_selected("r-alan"), "r-ada and r-grace selected")
+
+  // Toggle sort on "name": None -> Ascending -> Descending (reorders rows!)
+  let d1 = dg.toggle_sort("name")
+  t.frame(ms=16.0)
+  x15b_assert(d1 == headless_core::SortDir::Ascending, "first sort toggle -> Ascending")
+  x15b_assert(dg.sort_of("name") == headless_core::SortDir::Ascending, "aria-sort ascending")
+
+  let d2 = dg.toggle_sort("name")
+  t.frame(ms=16.0)
+  x15b_assert(d2 == headless_core::SortDir::Descending, "second sort toggle -> Descending")
+  x15b_assert(rows_sig.untracked()[0].key == "r-grace", "rows reordered so r-grace is first")
+
+  // HARD ASSERTION: after sorting reorders rows, selected row_key set AND focused cell MUST stay stable!
+  x15b_assert(dg.selected_rows().length() == 2, "selected row count preserved after sort")
+  x15b_assert(dg.is_selected("r-ada") && dg.is_selected("r-grace"), "selected row_key set preserved after sort")
+  x15b_assert(!dg.is_selected("r-alan"), "unselected row stays unselected after sort")
+  x15b_assert(x15b_opt_str_eq(dg.focus_row(), "r-alan"), "focused row_key must remain r-alan after sort")
+  x15b_assert(x15b_opt_str_eq(dg.focus_col(), "role"), "focused col_key must remain role after sort")
+
+  // Shift-range expansion & select-all
+  let _ = dg.select_row("r-alan", shift_range=true)
+  x15b_assert(dg.selected_rows().length() == 3, "shift-range must select intermediate row")
+  let _ = dg.select_all()
+  x15b_assert(dg.selected_rows().length() == 3, "select-all selects all 3 rows")
+
+  // Column resize + clamping
+  let w_resized = dg.resize_column("name", 280.0, min_w=60.0, max_w=600.0)
+  x15b_assert(w_resized == 280.0 && dg.column_width("name", default_w=220.0) == 280.0, "column width updated")
+  x15b_assert(resize_events.length() == 1 && resize_events[0].0 == "name", "on_column_resize fired")
+
+  // Load more + Footer pagination callbacks
+  x15b_press_a11y(t, "Load more members", "Load more button must exist")
+  x15b_assert(load_more_count.v == 1, "on_load_more callback must fire")
+
+  x15b_press_a11y(t, "Next page", "Next page button must exist")
+  x15b_assert(page_events.length() == 1 && page_events[0] == 2, "on_page_change callback must fire with page 2")
+  t.dispose()
+}
+
+// ============================================================================
+// 3. ColorPicker tests: trigger, expanded popover, live sync across
+//    ColorArea / ColorSlider / ColorField / ColorSwatchPicker, Escape close
+// ============================================================================
+
+test "x15b_03_color_picker_popover_sync_and_escape" {
+  let color_sig = signals::signal_by(
+    aura_color_hsva(210.0, 0.80, 0.90, alpha=1.0),
+    fn(a : headless_core::ColorModel, b : headless_core::ColorModel) -> Bool { a == b },
+  )
+  let open_sig = signals::signal(false)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = ColorPicker(
+      root,
+      model=fn() { color_sig.get() },
+      on_change=fn(m : headless_core::ColorModel) { color_sig.set(m) },
+      label="Pick Accent Color",
+      open=fn() { open_sig.get() },
+      set_open=fn(b : Bool) { open_sig.set(b) },
+    )
+  }, width=800.0, height=700.0)
+
+  t.frame()
+  assert_aura_ui(t, label="x15b-color-picker-closed")
+  x15b_assert(!open_sig.untracked(), "ColorPicker starts closed")
+
+  // Click trigger to open popover
+  x15b_press_a11y(t, "Pick Accent Color", "ColorPicker trigger must render")
+  x15b_assert(open_sig.untracked(), "clicking trigger opens ColorPickerPopover")
+  assert_aura_ui(t, label="x15b-color-picker-open")
+  x15b_assert(t.find("Hue") is Some(_), "Hue slider must mount inside popover")
+  x15b_assert(t.find("Alpha") is Some(_), "Alpha slider must mount inside popover")
+  x15b_assert(t.find("Hex Color") is Some(_), "Hex Color field must mount inside popover")
+
+  // Click green preset swatch #17C964 -> live syncs model
+  x15b_press_a11y(t, "#17C964", "preset swatch #17C964 must exist in popover")
+  x15b_assert(color_sig.untracked().to_hex() == "#17C964", "clicking preset swatch must update shared ColorModel")
+
+  // Escape closes popover
+  t.key(headless_core::key_escape)
+  t.frame(ms=16.0)
+  x15b_assert(!open_sig.untracked(), "Escape must close ColorPickerPopover")
+  t.dispose()
+}
+
+// ============================================================================
+// 4. DatePicker & DateRangePicker tests: trigger, popover selection fills
+//    segments immediately, Escape closes, RTL mirroring
+// ============================================================================
+
+test "x15b_04_date_picker_select_fills_segments_escape_and_rtl" {
+  let dt_sig = signals::signal_by(
+    aura_segmented_date(2026, 11, 24),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let open_sig = signals::signal(false)
+  let rtl_sig = signals::signal(false)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    let cfg = signals::signal(AuraConfig::light())
+    ui::set_tree_theme(fn() -> ui::Theme { aura_ui_theme(cfg.get()) })
+    let _ = aura_provide_config(root, cfg)
+    root.reacts(fn() -> Bool { rtl_sig.get() }, fn(r : Bool) -> Unit {
+      cfg.set(AuraConfig::{ ..cfg.untracked(), rtl: r })
+    })
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(360.0)))
+    let _ = DatePicker(
+      root,
+      value=fn() { dt_sig.get() },
+      on_change=fn(v : headless_core::SegmentedDateTime) { dt_sig.set(v) },
+      label="DatePicker",
+      open=fn() { open_sig.get() },
+      set_open=fn(b : Bool) { open_sig.set(b) },
+      today=fn() { Some(aura_date(2026, 11, 24)) },
+    )
+  }, width=800.0, height=700.0)
+
+  t.frame()
+  assert_aura_ui(t, label="x15b-date-picker-closed")
+  x15b_assert(t.find("2026") is Some(_), "DatePicker displays initial year segment")
+
+  // Click calendar trigger button
+  x15b_press_a11y(t, "Open DatePicker calendar", "DatePickerTrigger must exist")
+  x15b_assert(open_sig.untracked(), "DatePickerPopover opens on trigger click")
+  assert_aura_ui(t, label="x15b-date-picker-open")
+
+  // Pick 2026-11-15 -> fills segments and auto-closes
+  x15b_press_a11y(t, "2026-11-15", "day cell 2026-11-15 must exist in popover")
+  x15b_assert(x15b_opt_int_eq(dt_sig.untracked().day, 15), "picking date fills day segment immediately")
+  x15b_assert(!open_sig.untracked(), "picking date closes DatePickerPopover")
+
+  // Re-open via trigger and close with Escape
+  x15b_press_a11y(t, "Open DatePicker calendar", "DatePickerTrigger must reopen popover")
+  x15b_assert(open_sig.untracked(), "popover reopened")
+  t.key(headless_core::key_escape)
+  t.frame(ms=16.0)
+  x15b_assert(!open_sig.untracked(), "Escape closes DatePickerPopover")
+
+  // RTL mirroring smoke check
+  rtl_sig.set(true)
+  t.frame(ms=16.0)
+  assert_aura_ui(t, label="x15b-date-picker-rtl")
+  t.dispose()
+}
+
+test "x15b_05_date_range_picker_two_click_fills_segments_and_escape" {
+  let start_sig = signals::signal_by(
+    aura_segmented_date(2026, 11, 10),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let end_sig = signals::signal_by(
+    aura_segmented_date(2026, 11, 18),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let open_sig = signals::signal(false)
+
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, true)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(380.0)))
+    let _ = DateRangePicker(
+      root,
+      start_value=fn() { start_sig.get() },
+      end_value=fn() { end_sig.get() },
+      on_change=fn(s : headless_core::SegmentedDateTime, e : headless_core::SegmentedDateTime) -> Unit {
+        start_sig.set(s)
+        end_sig.set(e)
+      },
+      label="DateRangePicker",
+      open=fn() { open_sig.get() },
+      set_open=fn(b : Bool) { open_sig.set(b) },
+      today=fn() { Some(aura_date(2026, 11, 24)) },
+    )
+  }, width=800.0, height=700.0)
+
+  t.frame()
+  assert_aura_ui(t, label="x15b-date-range-picker-closed-dark")
+
+  // Open popover
+  x15b_press_a11y(t, "Open DateRangePicker calendar", "DateRangePickerTrigger must exist")
+  x15b_assert(open_sig.untracked(), "DateRangePickerPopover opens on trigger click")
+  assert_aura_ui(t, label="x15b-date-range-picker-open-dark")
+
+  // Two-click range selection (Nov 5 -> Nov 12) fills start & end segments and closes popover
+  x15b_press_a11y(t, "2026-11-05", "2026-11-05 cell must exist")
+  x15b_assert(open_sig.untracked(), "first click keeps range popover open")
+
+  x15b_press_a11y(t, "2026-11-12", "2026-11-12 cell must exist")
+  x15b_assert(x15b_opt_int_eq(start_sig.untracked().day, 5), "start date day updated to 5")
+  x15b_assert(x15b_opt_int_eq(end_sig.untracked().day, 12), "end date day updated to 12")
+  x15b_assert(!open_sig.untracked(), "completing range closes DateRangePickerPopover")
+  t.dispose()
+}
+
+// ============================================================================
+// 5. Wave 1.5 R2-B regression tests: DatePicker/DateRangePicker validation,
+//    ColorPicker alpha/presets/dark contrast, Toast focus-pause/status/upsert,
+//    Table disabled rows / unsortable flex resize / RTL / 8k-row O(n) perf.
+// ============================================================================
+
+extern "C" fn x15b_cpu_clock() -> Int64 = "clock"
+
+fn x15b_abs(v : Double) -> Double {
+  if v < 0.0 { -v } else { v }
+}
+
+fn x15b_focused_is(t : ui::Tester, label : String, role : view::Role) -> Bool {
+  match (ui::view_tree(), t.get(label, role=role)) {
+    (Some(tr), Some(d)) => {
+      let (fid, _) = tr.focused_now()
+      match fid {
+        Some(id) => id == d.id
+        None => false
+      }
+    }
+    _ => false
+  }
+}
+
+test "x15b_06_date_picker_readonly_bounds_unavailable_and_no_hardcoded_date" {
+  // 1) read_only blocks trigger open AND calendar click write
+  let dt_ro = signals::signal_by(
+    aura_segmented_date(2026, 11, 24),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let t_ro = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(360.0)))
+    let _ = DatePicker(
+      root,
+      value=fn() { dt_ro.get() },
+      on_change=fn(v : headless_core::SegmentedDateTime) { dt_ro.set(v) },
+      label="Due",
+      read_only=fn() { true },
+      today=fn() { Some(aura_date(2026, 11, 24)) },
+    )
+  }, width=800.0, height=700.0)
+  t_ro.frame(ms=16.0)
+  t_ro.press("Open Due calendar")
+  t_ro.frame(ms=16.0)
+  x15b_assert(t_ro.get("2026-11-15") is None, "read_only DatePicker trigger must not open calendar")
+  x15b_assert(x15b_opt_int_eq(dt_ro.untracked().day, 24), "read_only DatePicker must keep day 24")
+  t_ro.dispose()
+
+  // Even when forced open via default_open=true, read_only calendar click must not mutate value
+  let t_ro2 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(360.0)))
+    let _ = DatePicker(
+      root,
+      value=fn() { dt_ro.get() },
+      on_change=fn(v : headless_core::SegmentedDateTime) { dt_ro.set(v) },
+      label="Due",
+      read_only=fn() { true },
+      default_open=true,
+      today=fn() { Some(aura_date(2026, 11, 24)) },
+    )
+  }, width=800.0, height=700.0)
+  t_ro2.frame(ms=16.0)
+  if t_ro2.get("2026-11-15") is Some(_) {
+    t_ro2.press("2026-11-15")
+    t_ro2.frame(ms=16.0)
+  }
+  x15b_assert(x15b_opt_int_eq(dt_ro.untracked().day, 24), "read_only DatePicker calendar click must not write")
+  t_ro2.dispose()
+
+  // 2) Keyboard Up/Down respects min, max, is_unavailable, while Backspace draft is allowed
+  let dt_b = signals::signal_by(
+    aura_segmented_date(2026, 11, 24),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let t_b = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(360.0)))
+    let _ = DatePicker(
+      root,
+      value=fn() { dt_b.get() },
+      on_change=fn(v : headless_core::SegmentedDateTime) { dt_b.set(v) },
+      min=aura_date(2026, 11, 20),
+      max=aura_date(2026, 11, 24),
+      is_unavailable=fn(d : headless_core::IsoDate) -> Bool { d.day == 23 },
+      today=fn() { Some(aura_date(2026, 11, 24)) },
+    )
+  }, width=800.0, height=700.0)
+  t_b.frame(ms=16.0)
+  t_b.press("Day")
+  t_b.key(headless_core::key_up)
+  t_b.frame(ms=16.0)
+  x15b_assert(x15b_opt_int_eq(dt_b.untracked().day, 24), "keyboard Up must not exceed max")
+  t_b.key(headless_core::key_down)
+  t_b.frame(ms=16.0)
+  x15b_assert(x15b_opt_int_eq(dt_b.untracked().day, 24), "keyboard Down must not land on unavailable day 23")
+  t_b.key(headless_core::key_backspace)
+  t_b.frame(ms=16.0)
+  x15b_assert(dt_b.untracked().day is None, "clearing segment to draft state must be allowed")
+  t_b.dispose()
+
+  // 3) Empty value + today=None must NOT fall back to hardcoded 2026-11-24; respects min when provided
+  let dt_empty = signals::signal_by(
+    headless_core::SegmentedDateTime::empty(),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let t_e1 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(360.0)))
+    let _ = DatePicker(root, value=fn() { dt_empty.get() }, on_change=fn(v) { dt_empty.set(v) }, label="Empty")
+  }, width=800.0, height=700.0)
+  t_e1.frame(ms=16.0)
+  x15b_press_a11y(t_e1, "Open Empty calendar", "empty date picker trigger must exist")
+  x15b_assert(t_e1.get("2026-11-24") is None, "empty DatePicker with today=None must not show hardcoded 2026-11-24")
+  t_e1.dispose()
+
+  let t_e2 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(360.0)))
+    let _ = DatePicker(
+      root,
+      value=fn() { dt_empty.get() },
+      on_change=fn(v) { dt_empty.set(v) },
+      label="Bounded",
+      min=aura_date(2025, 3, 10),
+    )
+  }, width=800.0, height=700.0)
+  t_e2.frame(ms=16.0)
+  x15b_press_a11y(t_e2, "Open Bounded calendar", "bounded date picker trigger must exist")
+  x15b_assert(t_e2.get("2025-03-10") is Some(_), "empty DatePicker with min must open on min month")
+  t_e2.dispose()
+}
+
+test "x15b_07_date_range_picker_readonly_bounds_and_order_validation" {
+  let s_sig = signals::signal_by(
+    aura_segmented_date(2026, 11, 15),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  let e_sig = signals::signal_by(
+    aura_segmented_date(2026, 11, 15),
+    fn(a : headless_core::SegmentedDateTime, b : headless_core::SegmentedDateTime) -> Bool { a.eq(b) },
+  )
+  // read_only blocks trigger
+  let t_ro = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(380.0)))
+    let _ = DateRangePicker(
+      root,
+      start_value=fn() { s_sig.get() },
+      end_value=fn() { e_sig.get() },
+      on_change=fn(s, e) { s_sig.set(s); e_sig.set(e) },
+      label="Trip",
+      read_only=fn() { true },
+    )
+  }, width=800.0, height=700.0)
+  t_ro.frame(ms=16.0)
+  t_ro.press("Open Trip calendar")
+  t_ro.frame(ms=16.0)
+  x15b_assert(t_ro.get("2026-11-10") is None, "read_only DateRangePicker trigger must not open calendar")
+  t_ro.dispose()
+
+  // Keyboard Up on start segment when start == end must be rejected (start <= end invariant)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(24.0)).width(view::Live::Is(Some(380.0)))
+    let _ = DateRangePicker(
+      root,
+      start_value=fn() { s_sig.get() },
+      end_value=fn() { e_sig.get() },
+      on_change=fn(s, e) { s_sig.set(s); e_sig.set(e) },
+      min=aura_date(2026, 11, 10),
+      max=aura_date(2026, 11, 15),
+    )
+  }, width=800.0, height=700.0)
+  t.frame(ms=16.0)
+  t.press("Day")
+  t.key(headless_core::key_up)
+  t.frame(ms=16.0)
+  x15b_assert(x15b_opt_int_eq(s_sig.untracked().day, 15), "DateRangePicker start must not exceed end via keyboard Up")
+  t.key(headless_core::key_down)
+  t.frame(ms=16.0)
+  x15b_assert(x15b_opt_int_eq(s_sig.untracked().day, 14), "DateRangePicker valid start step down to 14 must commit")
+  t.dispose()
+}
+
+test "x15b_08_color_picker_hex_preserves_alpha_and_short_preset_selected" {
+  let c = signals::signal_by(
+    aura_color_rgba(0.5, 0.4, 0.3, alpha=0.25),
+    fn(a : headless_core::ColorModel, b : headless_core::ColorModel) -> Bool { a == b },
+  )
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, true)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = ColorPicker(
+      root,
+      model=fn() { c.get() },
+      on_change=fn(n : headless_core::ColorModel) { c.set(n) },
+      presets=["#abc", "#27272A"],
+      default_open=true,
+    )
+  }, width=600.0, height=700.0)
+  t.set_a11y(true)
+  t.frame(ms=16.0)
+  assert_aura_ui(t, label="x15b-color-picker-dark-open")
+
+  // 6-digit hex edit must preserve alpha == 0.25
+  let fld = match t.get("Hex Color", role=view::Role::TextField) {
+    Some(v) => v
+    None => halt::saying("x15b_08", "hex field missing")
+  }
+  let tr = match ui::view_tree() {
+    Some(tree) => tree
+    None => halt::saying("x15b_08", "tree missing")
+  }
+  let told = ui::view_a11y_told()
+  let _ = ui::a11y_sync(tr, told, force_full=true)
+  let wid = told.wire_id(fld.id)
+  let ok6 = ui::a11y_handle_action("{\"action\":\"set_text\",\"id\":\{wid},\"text\":\"#00FF00\"}")
+  x15b_assert(ok6, "set_text #00FF00 must succeed")
+  t.frame(ms=16.0)
+  x15b_assert(c.untracked().to_hex() == "#00FF00", "6-digit hex must update RGB")
+  x15b_assert(x15b_abs(c.untracked().alpha - 0.25) < 0.01, "6-digit hex must preserve existing alpha")
+
+  // 8-digit hex edit must update alpha
+  let ok8 = ui::a11y_handle_action("{\"action\":\"set_text\",\"id\":\{wid},\"text\":\"#00FF0080\"}")
+  x15b_assert(ok8, "set_text #00FF0080 must succeed")
+  t.frame(ms=16.0)
+  x15b_assert(x15b_abs(c.untracked().alpha - (128.0 / 255.0)) < 0.01, "8-digit hex must update alpha")
+
+  // Short preset #abc must match #AABBCC and expose selected=true
+  x15b_press_a11y(t, "#abc", "preset #abc must exist")
+  x15b_assert(c.untracked().to_hex() == "#AABBCC", "clicking #abc must set #AABBCC")
+  let mut sw_selected = false
+  for sn in tr.said_order() {
+    match sn.said {
+      Some(sd) =>
+        if sd.role == view::Role::Option && sd.label == "#abc" {
+          match sd.selected {
+            Some(true) => sw_selected = true
+            _ => ()
+          }
+        }
+      None => ()
+    }
+  }
+  x15b_assert(sw_selected, "preset #abc must report selected=true after normalization")
+  t.dispose()
+}
+
+test "x15b_09_toast_focus_pauses_single_status_action_no_dismiss_and_reactive_upsert" {
+  let q = ToastQueue::new()
+  q.push(AuraToastData::new("t1", "Saved draft", description="d", action_label="Undo", duration_ms=1000.0, closable=false))
+  let dismissed : Array[String] = []
+  let acted : Array[String] = []
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false, reduced_motion=true)
+    let _ = button_node(root, view::Live::Is("Outside"))
+    let _ = ToastProvider(
+      root,
+      queue=q,
+      on_action=fn(id : String) { acted.push(id) },
+      on_dismiss=fn(id : String) { dismissed.push(id) },
+    )
+  }, width=900.0, height=600.0)
+  t.set_a11y(true)
+  t.frame(ms=16.0)
+
+  // 1) Exactly one Role::Status node for "Saved draft"
+  let mut n_status = 0
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) =>
+            if sd.role == view::Role::Status && sd.label == "Saved draft" {
+              n_status = n_status + 1
+            }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  x15b_assert(n_status == 1, "ToastProvider must expose exactly 1 Role::Status node (got \{n_status})")
+  x15b_assert(t.get("Dismiss notification") is None, "closable=false must hide close button initially")
+
+  // 2) Tab to Undo button -> keyboard focus pauses timeout beyond duration_ms
+  let mut tabs = 0
+  while tabs < 6 && !x15b_focused_is(t, "Undo", view::Role::Button) {
+    t.key(headless_core::key_tab)
+    t.frame(ms=16.0)
+    tabs += 1
+  }
+  x15b_assert(x15b_focused_is(t, "Undo", view::Role::Button), "Tab must reach Undo button")
+  t.move_to(2.0, 2.0)
+  t.run_for(2500.0)
+  x15b_assert(q.len() == 1 && dismissed.length() == 0, "focused toast button must pause auto-dismiss (WCAG 2.2.1)")
+
+  // 3) Reactive same-id upsert updates closable=true and resets timeout
+  q.push(AuraToastData::new("t1", "Saved draft v2", action_label="Undo", duration_ms=1000.0, closable=true))
+  t.frame(ms=16.0)
+  x15b_assert(t.get("Dismiss notification") is Some(_), "same-id upsert with closable=true must mount close button reactively")
+
+  // 4) Clicking action fires on_action ONLY (never on_dismiss)
+  x15b_press_a11y(t, "Undo", "Undo button must be clickable")
+  x15b_assert(acted.length() == 1 && acted[0] == "t1", "action must fire on_action")
+  x15b_assert(dismissed.length() == 0, "clicking action must NOT fire on_dismiss")
+
+  // 5) Blur resumes timer and expires toast
+  q.push(AuraToastData::new("t2", "Timed notice", action_label="Keep", duration_ms=800.0))
+  t.frame(ms=16.0)
+  let mut tabs2 = 0
+  while tabs2 < 6 && !x15b_focused_is(t, "Keep", view::Role::Button) {
+    t.key(headless_core::key_tab)
+    t.frame(ms=16.0)
+    tabs2 += 1
+  }
+  x15b_assert(x15b_focused_is(t, "Keep", view::Role::Button), "Tab must focus Keep")
+  t.run_for(1500.0)
+  x15b_assert(q.len() == 1, "toast stays alive while Keep is focused")
+  // Move keyboard focus away to Outside button -> timer resumes and expires
+  let mut tabs3 = 0
+  while tabs3 < 6 && !x15b_focused_is(t, "Outside", view::Role::Button) {
+    t.key(headless_core::key_tab)
+    t.frame(ms=16.0)
+    tabs3 += 1
+  }
+  x15b_assert(x15b_focused_is(t, "Outside", view::Role::Button), "Tab must move focus to Outside button")
+  t.move_to(2.0, 2.0)
+  t.run_for(1200.0)
+  x15b_assert(q.len() == 0 && dismissed.length() == 1, "toast must expire after focus leaves")
+  t.dispose()
+}
+
+test "x15b_10_table_disabled_row_flex_unsortable_resize_rtl_and_8k_perf" {
+  // 1) Disabled row + non-sortable flex column drag resize
+  let dgref : signals::Ref[Option[headless::DataGrid]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = root.pad(view::Live::Is(16.0))
+    let _ = Table(root, children=fn(tbl : view::View) -> Unit {
+      let _ = TableContent(
+        tbl,
+        row_keys=fn() { ["r1", "r2", "r3"] },
+        col_keys=fn() { ["a", "b"] },
+        on_ready=fn(g : headless::DataGrid) { dgref.v = Some(g) },
+        children=fn(v : view::View) -> Unit {
+          let _ = TableHeader(v, children=fn(h : view::View) -> Unit {
+            let _ = TableColumn(h, col_key="a", label=view::Live::Is("A"), resizable=true)
+            let _ = TableColumn(h, col_key="b", label=view::Live::Is("B"), is_last=true)
+          })
+          let _ = TableBody(v, children=fn(body : view::View) -> Unit {
+            let _ = TableRow(body, row_key="r1", children=fn(tr : view::View) -> Unit {
+              let _ = TableCell(tr, col_key="a", text=view::Live::Is("Enabled 1"), select_on_press=true)
+              let _ = TableCell(tr, col_key="b", text=view::Live::Is("B1"))
+            })
+            let _ = TableRow(body, row_key="r2", disabled=fn() { true }, children=fn(tr : view::View) -> Unit {
+              let _ = TableCell(tr, col_key="a", text=view::Live::Is("Disabled cell"), select_on_press=true)
+              let _ = TableCell(tr, col_key="b", text=view::Live::Is("B2"))
+            })
+            let _ = TableRow(body, row_key="r3", is_last=true, children=fn(tr : view::View) -> Unit {
+              let _ = TableCell(tr, col_key="a", text=view::Live::Is("Enabled 3"), select_on_press=true)
+              let _ = TableCell(tr, col_key="b", text=view::Live::Is("B3"))
+            })
+          })
+        },
+      )
+    })
+  }, width=800.0, height=600.0)
+  t.set_a11y(true)
+  t.frame(ms=16.0)
+  let dg = match dgref.v { Some(g) => g; None => halt::saying("x15b_10", "no dg") }
+
+  // Role::Row must expose disabled=true for r2
+  let mut disabled_rows_seen = 0
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) => if sd.role == view::Role::Row && sn.disabled { disabled_rows_seen = disabled_rows_seen + 1 }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  x15b_assert(disabled_rows_seen == 1, "disabled TableRow must expose Role::Row disabled=true")
+
+  // Disabled row cannot be selected via press, direct select_row, shift_range, or select_all
+  t.press("Disabled cell")
+  t.frame(ms=16.0)
+  x15b_assert(!dg.is_selected("r2"), "pressing disabled cell must not select row")
+  x15b_assert(!dg.select_row("r2"), "select_row on disabled row must return false")
+  let _ = dg.select_row("r1")
+  let _ = dg.select_row("r3", shift_range=true)
+  x15b_assert(dg.is_selected("r1") && dg.is_selected("r3") && !dg.is_selected("r2"), "shift-range must skip disabled row")
+  let _ = dg.select_all()
+  x15b_assert(dg.selected_rows().length() == 2 && !dg.is_selected("r2"), "select_all must skip disabled row")
+
+  // Non-sortable flex column drag resize must widen both header and body cell
+  let hdr_before = match t.get("A", role=view::Role::ColumnHeader) { Some(d) => d; None => halt::saying("x15b_10", "no A") }
+  let res_h = match t.get("Resize a column", role=view::Role::Separator) { Some(d) => d; None => halt::saying("x15b_10", "no res") }
+  t.drag(res_h.x + res_h.w * 0.5, res_h.y + res_h.h * 0.5, res_h.x + res_h.w * 0.5 + 70.0, res_h.y + res_h.h * 0.5, steps=8)
+  t.frame(ms=16.0)
+  let hdr_after = match t.get("A", role=view::Role::ColumnHeader) { Some(d) => d; None => halt::saying("x15b_10", "no A2") }
+  let cell_after = match t.get("Enabled 1", role=view::Role::GridCell) { Some(d) => d; None => halt::saying("x15b_10", "no cell") }
+  x15b_assert(hdr_after.w > hdr_before.w + 50.0, "non-sortable flex column drag must widen header (\{hdr_before.w} -> \{hdr_after.w})")
+  x15b_assert(x15b_abs(cell_after.w - hdr_after.w) < 1.5, "body cell width must match resized flex column header")
+  t.dispose()
+
+  // 2) RTL resizer side + mirrored drag delta + RTL left/right keyboard nav
+  let dg_rtl_ref : signals::Ref[Option[headless::DataGrid]] = view::ref_new(None)
+  let t_rtl = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false, rtl=true)
+    let _ = root.pad(view::Live::Is(16.0))
+    let _ = Table(root, children=fn(tbl : view::View) -> Unit {
+      let _ = TableContent(
+        tbl,
+        row_keys=fn() { ["r1"] },
+        col_keys=fn() { ["name", "role"] },
+        on_ready=fn(g : headless::DataGrid) { dg_rtl_ref.v = Some(g) },
+        children=fn(tc : view::View) -> Unit {
+          let _ = TableHeader(tc, children=fn(hdr : view::View) -> Unit {
+            let _ = TableColumn(hdr, col_key="name", label=view::Live::Is("Name"), sortable=true, resizable=true, width=220.0)
+            let _ = TableColumn(hdr, col_key="role", label=view::Live::Is("Role"), is_last=true)
+          })
+          let _ = TableBody(tc, children=fn(tb : view::View) -> Unit {
+            let _ = TableRow(tb, row_key="r1", is_last=true, children=fn(tr : view::View) -> Unit {
+              let _ = TableCell(tr, col_key="name", text=view::Live::Is("Ada"), width=220.0)
+              let _ = TableCell(tr, col_key="role", text=view::Live::Is("Arch"))
+            })
+          })
+        },
+      )
+    })
+  }, width=900.0, height=400.0)
+  t_rtl.frame(ms=16.0)
+  let dg_rtl = match dg_rtl_ref.v { Some(g) => g; None => halt::saying("x15b_10", "no dg_rtl") }
+  let col_rtl = match t_rtl.get("Name", role=view::Role::ColumnHeader) { Some(d) => d; None => halt::saying("x15b_10", "no rtl col") }
+  let res_rtl = match t_rtl.get("Resize name column", role=view::Role::Separator) { Some(d) => d; None => halt::saying("x15b_10", "no rtl res") }
+  x15b_assert(res_rtl.x < col_rtl.x + col_rtl.w * 0.5, "RTL resizer must sit on left (logical end) edge of column")
+  let rx = res_rtl.x + res_rtl.w * 0.5
+  let ry = res_rtl.y + res_rtl.h * 0.5
+  t_rtl.drag(rx, ry, rx - 40.0, ry, steps=8)
+  t_rtl.frame(ms=16.0)
+  let w_rtl = dg_rtl.column_width("name", default_w=220.0)
+  x15b_assert(x15b_abs(w_rtl - 260.0) < 2.0, "RTL dragging resizer left by 40pt must widen column to 260 (got \{w_rtl})")
+  x15b_assert(dg_rtl.sort_of("name") == headless_core::SortDir::None, "resizing sortable column must not toggle sort")
+
+  // RTL arrow navigation: Left moves to next logical column ("role"), Right moves back ("name")
+  x15b_press_a11y(t_rtl, "Ada", "Ada cell must exist in RTL table")
+  t_rtl.key(headless_core::key_left)
+  t_rtl.frame(ms=16.0)
+  x15b_assert(x15b_opt_str_eq(dg_rtl.focus_col(), "role"), "RTL Left arrow must advance to next column")
+  t_rtl.key(headless_core::key_right)
+  t_rtl.frame(ms=16.0)
+  x15b_assert(x15b_opt_str_eq(dg_rtl.focus_col(), "name"), "RTL Right arrow must return to previous column")
+  t_rtl.dispose()
+
+  // 3) 8,000-row Shift-range selection O(n) performance check (< 50ms)
+  let big_rows : Array[String] = []
+  let mut ri = 0
+  while ri < 8000 {
+    big_rows.push("row-\{ri}")
+    ri += 1
+  }
+  let big_st = headless_core::TableGridState::new()
+  let _ = big_st.select_row(big_rows, big_rows[0])
+  let t0 = x15b_cpu_clock()
+  let _ = big_st.select_row(big_rows, big_rows[7999], shift_range=true)
+  let t1 = x15b_cpu_clock()
+  let elapsed_ms = (t1 - t0) / 1000L
+  x15b_assert(big_st.selected_count() == 8000 && big_st.selected_rows().length() == 8000, "8k shift-range must select all 8000 rows")
+  x15b_assert(elapsed_ms < 50L, "8k shift-range must be O(n) < 50ms (took \{elapsed_ms}ms)")
+
+  // 4) Astra P1-4: O(1) TableGridState::is_selected lookup across 8,000 selected rows
+  let t2 = x15b_cpu_clock()
+  let mut sel_hits = 0
+  let mut qi = 0
+  while qi < 8000 {
+    if big_st.is_selected(big_rows[qi]) {
+      sel_hits += 1
+    }
+    qi += 1
+  }
+  let t3 = x15b_cpu_clock()
+  let lookup_ms = (t3 - t2) / 1000L
+  x15b_assert(sel_hits == 8000, "all 8000 rows must report selected")
+  x15b_assert(lookup_ms < 30L, "8k is_selected lookups must be O(1) < 30ms (took \{lookup_ms}ms)")
+}
+
+test "w15b-r3: table tab+space, toast countdown progress, rgba presets, tz today & uncontrolled pickers" {
+  // 1) Astra P1-3: Tab into Table focuses first cell -> immediate Space selects first row
+  let dg_ref : signals::Ref[Option[headless::DataGrid]] = view::ref_new(None)
+  let t_tab = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = table_node(root, content=fn(tbl : view::View) -> Unit {
+      let _ = table_content_node(
+        tbl,
+        fn() { ["r0"] },
+        fn() { ["c0"] },
+        on_ready=fn(dg : headless::DataGrid) { dg_ref.v = Some(dg) },
+        content=fn(tc : view::View, _dg : headless::DataGrid) -> Unit {
+          let _ = table_header_node(tc, content=fn(hdr : view::View) -> Unit {
+            let _ = table_column_node(hdr, "c0", view::Live::Is("Col"), is_last=true)
+          })
+          let _ = table_body_node(tc, content=fn(tb : view::View) -> Unit {
+            let _ = table_row_node(tb, "r0", is_last=true, content=fn(tr : view::View, _sel : () -> Bool) -> Unit {
+              let _ = table_cell_node(tr, "c0", text=view::Live::Is("First"))
+            })
+          })
+        },
+      )
+    })
+  }, width=500.0, height=300.0)
+  t_tab.frame()
+  let dg = match dg_ref.v { Some(d) => d; None => halt::saying("x15b", "missing dg") }
+  t_tab.key(headless_core::key_tab)
+  t_tab.frame(ms=16.0)
+  x15b_assert(x15b_focused_is(t_tab, "First", view::Role::GridCell), "Tab must focus First cell")
+  t_tab.key(headless_core::key_space)
+  t_tab.frame(ms=16.0)
+  x15b_assert(dg.is_selected("r0"), "Space immediately after Tab into Table must select r0")
+  t_tab.dispose()
+
+  // 2) Astra P2-1: Timed Toast countdown progress ticks at midpoint, pauses on hover, and explicit progress wins
+  let q = ToastQueue::new()
+  q.push(AuraToastData::new("timed-1", "Timed", duration_ms=1000.0))
+  let t_prog = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ToastProvider(root, queue=q, key_prefix="r3-prog")
+  }, width=500.0, height=400.0)
+  t_prog.frame(ms=0.0)
+  t_prog.frame(ms=500.0)
+  // Find the 3pt-tall countdown track's fill box inside the toast card
+  let mut found_half = false
+  let mut max_bar_w = 0.0
+  for inst in t_prog.drawn_instances() {
+    // Track fill has height ~3.0pt
+    if x15b_abs(inst[3] - 3.0) < 0.25 && inst[2] > 50.0 {
+      if inst[2] > max_bar_w {
+        max_bar_w = inst[2]
+      }
+      if inst[2] > 120.0 && inst[2] < 220.0 {
+        found_half = true
+      }
+    }
+  }
+  x15b_assert(found_half, "Timed Toast at 500/1000ms must render ~half-width countdown bar (max_bar_w=\{max_bar_w})")
+  t_prog.dispose()
+
+  // 3) Astra P2-2: 8-digit RGBA presets match & preserve explicit alpha without dual selection
+  let cp_m = signals::signal_by(
+    headless_core::ColorModel::from_rgba(0xAA.to_double() / 255.0, 0xBB.to_double() / 255.0, 0xCC.to_double() / 255.0, alpha=1.0),
+    fn(a, b) { a == b },
+  )
+  let t_rgba = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ColorPicker(
+      root,
+      model=fn() { cp_m.get() },
+      on_change=fn(m) { cp_m.set(m) },
+      presets=["#AABBCC80", "#AABBCCFF"],
+      default_open=true,
+    )
+  }, width=500.0, height=600.0)
+  t_rgba.set_a11y(true)
+  t_rgba.frame()
+  x15b_press_a11y(t_rgba, "#AABBCC80", "8-digit RGBA preset #AABBCC80 must exist")
+  t_rgba.frame(ms=16.0)
+  x15b_assert(x15b_abs(cp_m.get().alpha - (128.0 / 255.0)) < 0.02, "Clicking #AABBCC80 must preserve alpha ~0.502, got \{cp_m.get().alpha}")
+  let mut sel_swatches = 0
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) => {
+            if sd.role == view::Role::Option {
+              match sd.selected {
+                Some(true) => sel_swatches = sel_swatches + 1
+                _ => ()
+              }
+            }
+          }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  x15b_assert(sel_swatches == 1, "Only one RGBA preset must be selected, got \{sel_swatches}")
+  t_rgba.dispose()
+
+  // 3b) Astra R3 P2-2 + Opus R4 mount-order fix: Mixed 6-digit (#AABBCC) + 8-digit (#AABBCC80) presets
+  // select strictly ONE option BOTH on initial mount (with #AABBCC80 already selected!) AND after click.
+  let cp_mix_mount = signals::signal_by(
+    headless_core::ColorModel::from_rgba(
+      0xAA.to_double() / 255.0,
+      0xBB.to_double() / 255.0,
+      0xCC.to_double() / 255.0,
+      alpha=128.0 / 255.0,
+    ),
+    fn(a, b) { a == b },
+  )
+  let t_mix_mount = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ColorPicker(
+      root,
+      model=fn() { cp_mix_mount.get() },
+      on_change=fn(m) { cp_mix_mount.set(m) },
+      presets=["#AABBCC", "#AABBCC80"],
+      default_open=true,
+    )
+  }, width=500.0, height=600.0)
+  t_mix_mount.set_a11y(true)
+  t_mix_mount.frame()
+  let mut mount_sel_count = 0
+  let mut mount_sel_name = ""
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) => {
+            if sd.role == view::Role::Option {
+              match sd.selected {
+                Some(true) => {
+                  mount_sel_count = mount_sel_count + 1
+                  mount_sel_name = sd.label
+                }
+                _ => ()
+              }
+            }
+          }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  x15b_assert(mount_sel_count == 1 && mount_sel_name == "#AABBCC80", "Initial mount with #AABBCC before #AABBCC80 must select only #AABBCC80, got count=\{mount_sel_count} name=\{mount_sel_name}")
+  t_mix_mount.dispose()
+
+  // 3b-ia) Dynamic swatch addition: starting with only ["#AABBCC"] and selected "#AABBCC80" falls back to #AABBCC;
+  // dynamically mounting "#AABBCC80" must reactively transfer selection so ONLY "#AABBCC80" is selected!
+  let dyn_show_exact = signals::signal(false)
+  let t_dyn = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = headless::color_swatch_picker(
+      root,
+      fn() { "Dynamic Swatches" },
+      fn() { Some("#AABBCC80") },
+      fn(_hex) { () },
+      fn(v : view::View, sp : headless::ColorSwatchPicker) {
+        let _ = sp.swatch(v, "#AABBCC", fn() { "#AABBCC" }, fn(_sv, _sel) { () })
+        v.show(fn() { dyn_show_exact.get() }, fn(host : view::View) {
+          let _ = sp.swatch(host, "#AABBCC80", fn() { "#AABBCC80" }, fn(_sv, _sel) { () })
+        })
+      },
+    )
+  }, width=400.0, height=300.0)
+  t_dyn.set_a11y(true)
+  t_dyn.frame()
+  let count_dyn_sel = fn() -> (Int, String) {
+    let mut cnt = 0
+    let mut nm = ""
+    match ui::view_tree() {
+      Some(tr) => {
+        for sn in tr.said_order() {
+          match sn.said {
+            Some(sd) => {
+              if sd.role == view::Role::Option {
+                match sd.selected {
+                  Some(true) => {
+                    cnt = cnt + 1
+                    nm = sd.label
+                  }
+                  _ => ()
+                }
+              }
+            }
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+    (cnt, nm)
+  }
+  let (c_before, n_before) = count_dyn_sel()
+  x15b_assert(c_before == 1 && n_before == "#AABBCC", "Before dynamic mount, 6-digit fallback selects #AABBCC, got \{c_before} \{n_before}")
+  dyn_show_exact.set(true)
+  t_dyn.frame(ms=16.0)
+  let (c_after, n_after) = count_dyn_sel()
+  x15b_assert(c_after == 1 && n_after == "#AABBCC80", "After dynamically adding #AABBCC80, strictly only #AABBCC80 must be selected, got \{c_after} \{n_after}")
+  dyn_show_exact.set(false)
+  t_dyn.frame(ms=16.0)
+  let (c_removed, n_removed) = count_dyn_sel()
+  x15b_assert(c_removed == 1 && n_removed == "#AABBCC", "After dynamically removing #AABBCC80, fallback returns to #AABBCC, got \{c_removed} \{n_removed}")
+  t_dyn.dispose()
+
+  // 3b-ii) Astra R4 P1: 256-preset ColorPicker color change must be O(N) (< 25ms) via group-level Computed + pre-parsed swatches
+  let big_presets : Array[String] = []
+  let hex_digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"]
+  let mut bi = 0
+  while bi < 256 {
+    let hi = (bi / 16) % 16
+    let lo = bi % 16
+    let h1 = hex_digits[hi]
+    let h2 = hex_digits[lo]
+    big_presets.push("#\{h1}\{h2}4080")
+    bi += 1
+  }
+  let cp_256 = signals::signal_by(
+    headless_core::ColorModel::from_rgba(0.1, 0.2, 0.3, alpha=1.0),
+    fn(a, b) { a == b },
+  )
+  let t_256 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ColorPicker(
+      root,
+      model=fn() { cp_256.get() },
+      on_change=fn(m) { cp_256.set(m) },
+      presets=big_presets,
+      default_open=true,
+    )
+  }, width=500.0, height=700.0)
+  t_256.frame()
+  let c0 = x15b_cpu_clock()
+  cp_256.set(headless_core::ColorModel::from_rgba(0.95, 0.15, 0.25, alpha=1.0))
+  t_256.frame(ms=16.0)
+  let c1 = x15b_cpu_clock()
+  let cp_ms = (c1 - c0) / 1000L
+  x15b_assert(cp_ms < 25L, "256-preset ColorPicker color update must be O(N) < 25ms, took \{cp_ms}ms")
+  // Astra R5 P1: whole-tree dispose of open 256-preset ColorPicker must clear registry once (O(N), < 40ms)
+  let d0 = x15b_cpu_clock()
+  t_256.dispose()
+  let d1 = x15b_cpu_clock()
+  let dispose_ms = (d1 - d0) / 1000L
+  x15b_assert(dispose_ms < 40L, "256-preset ColorPicker whole-tree dispose must be O(N) < 40ms, took \{dispose_ms}ms")
+
+  // Astra R6 P2-1: synchronous read of `is_sel()` inside custom swatch `look` on initial mount
+  let sync_look_saw = view::ref_new(false)
+  let t_sync_look = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = headless::color_swatch_picker(
+      root,
+      fn() { "Static Swatch" },
+      fn() { Some("#AABBCC") },
+      fn(_hex) { () },
+      fn(v : view::View, sp : headless::ColorSwatchPicker) {
+        let _ = sp.swatch(v, "#AABBCC", fn() { "#AABBCC" }, fn(sv : view::View, is_sel : () -> Bool) {
+          let initial = is_sel()
+          sync_look_saw.v = initial
+          let _ = sv.words(
+            view::Live::Is(if initial { "Selected preset" } else { "Available preset" }),
+            look=view::words_plain,
+          )
+        })
+      },
+    )
+  }, width=320.0, height=200.0)
+  t_sync_look.frame()
+  x15b_assert(sync_look_saw.v && t_sync_look.find("Selected preset") is Some(_), "Synchronous is_sel() inside swatch look on initial mount must return true for exact match")
+  t_sync_look.dispose()
+
+  // Astra R7 P2 (case 1): mutating controlled selected -> None before group look returns must update reactive UI & a11y
+  let r7_clear_sig : signals::Signal[String] = signals::signal("#AABBCC")
+  let t_r7_clear = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = headless::color_swatch_picker(
+      root,
+      fn() { "Clear In Look" },
+      fn() {
+        let s = r7_clear_sig.get()
+        if s == "" { None } else { Some(s) }
+      },
+      fn(h) { r7_clear_sig.set(h) },
+      fn(v : view::View, sp : headless::ColorSwatchPicker) {
+        let _ = sp.swatch(v, "#AABBCC", fn() { "#AABBCC" }, fn(sv : view::View, is_sel : () -> Bool) {
+          let _ = sv.words(
+            view::Live::By(fn() { if is_sel() { "Chosen" } else { "Idle" } }),
+            look=view::words_plain,
+          )
+        })
+        r7_clear_sig.set("")
+      },
+    )
+  }, width=320.0, height=200.0)
+  t_r7_clear.set_a11y(true)
+  t_r7_clear.frame()
+  t_r7_clear.frame(ms=100.0)
+  x15b_assert(t_r7_clear.find("Idle") is Some(_) && t_r7_clear.find("Chosen") is None, "Clearing controlled selected before group look returns must render Idle on first frame")
+  let mut clear_a11y_sel = false
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) => {
+            if sd.role == view::Role::Option {
+              match sd.selected {
+                Some(true) => clear_a11y_sel = true
+                _ => ()
+              }
+            }
+          }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  x15b_assert(!clear_a11y_sel, "Clearing controlled selected before group look returns must report a11y selected=false")
+  t_r7_clear.dispose()
+
+  // Astra R7 P2 (case 2): setting controlled selected inside group look before registering swatch must be visible to sync is_sel()
+  let r7_init_sig : signals::Signal[String] = signals::signal("")
+  let r7_init_saw = view::ref_new(false)
+  let t_r7_init = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = headless::color_swatch_picker(
+      root,
+      fn() { "Init In Look" },
+      fn() {
+        let s = r7_init_sig.get()
+        if s == "" { None } else { Some(s) }
+      },
+      fn(h) { r7_init_sig.set(h) },
+      fn(v : view::View, sp : headless::ColorSwatchPicker) {
+        r7_init_sig.set("#AABBCC")
+        let _ = sp.swatch(v, "#AABBCC", fn() { "#AABBCC" }, fn(sv : view::View, is_sel : () -> Bool) {
+          let initial = is_sel()
+          r7_init_saw.v = initial
+          let _ = sv.words(
+            view::Live::Is(if initial { "InitSelected" } else { "InitIdle" }),
+            look=view::words_plain,
+          )
+        })
+      },
+    )
+  }, width=320.0, height=200.0)
+  t_r7_init.frame()
+  x15b_assert(r7_init_saw.v && t_r7_init.find("InitSelected") is Some(_), "Setting controlled selected in group look before swatch registration must return true from sync is_sel()")
+  t_r7_init.dispose()
+
+  // Also verify real Escape popover close of 256-preset ColorPicker stays O(N) (< 40ms) and actually closes panel
+  let t_256_esc = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ColorPicker(
+      root,
+      model=fn() { cp_256.get() },
+      on_change=fn(m) { cp_256.set(m) },
+      presets=big_presets,
+      default_open=true,
+    )
+  }, width=500.0, height=700.0)
+  t_256_esc.frame()
+  x15b_assert(t_256_esc.find("Hue") is Some(_), "256-preset ColorPicker popover must be mounted before Escape")
+  let e0 = x15b_cpu_clock()
+  t_256_esc.key(headless_core::key_escape)
+  t_256_esc.frame(ms=16.0)
+  let e1 = x15b_cpu_clock()
+  let esc_ms = (e1 - e0) / 1000L
+  x15b_assert(t_256_esc.find("Hue") is None, "Real headless_core::key_escape must close 256-preset ColorPicker popover")
+  x15b_assert(esc_ms < 40L, "256-preset ColorPicker Escape close must be O(N) < 40ms, took \{esc_ms}ms")
+  t_256_esc.dispose()
+
+  let cp_mix = signals::signal_by(
+    headless_core::ColorModel::from_rgba(0xAA.to_double() / 255.0, 0xBB.to_double() / 255.0, 0xCC.to_double() / 255.0, alpha=1.0),
+    fn(a, b) { a == b },
+  )
+  let t_mix = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ColorPicker(
+      root,
+      model=fn() { cp_mix.get() },
+      on_change=fn(m) { cp_mix.set(m) },
+      presets=["#AABBCC", "#AABBCC80"],
+      default_open=true,
+    )
+  }, width=500.0, height=600.0)
+  t_mix.set_a11y(true)
+  t_mix.frame()
+  x15b_press_a11y(t_mix, "#AABBCC80", "Mixed 8-digit preset #AABBCC80 must exist")
+  t_mix.frame(ms=16.0)
+  x15b_assert(x15b_abs(cp_mix.get().alpha - (128.0 / 255.0)) < 0.02, "Mixed preset #AABBCC80 must preserve alpha ~0.502")
+  let mut mix_sel_count = 0
+  let mut mix_sel_name = ""
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) => {
+            if sd.role == view::Role::Option {
+              match sd.selected {
+                Some(true) => {
+                  mix_sel_count = mix_sel_count + 1
+                  mix_sel_name = sd.label
+                }
+                _ => ()
+              }
+            }
+          }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  x15b_assert(mix_sel_count == 1 && mix_sel_name == "#AABBCC80", "Mixed 6/8-digit presets must select only #AABBCC80, got count=\{mix_sel_count} name=\{mix_sel_name}")
+  t_mix.dispose()
+
+  // 3c) Astra R3 P2-1: TableGridState unified write path & snapshot isolation
+  let ts_iso = headless_core::TableGridState::new()
+  let _ = ts_iso.select_row(["x", "y", "z"], "x")
+  let snap = ts_iso.selected_rows()
+  snap.clear()
+  snap.push("y")
+  x15b_assert(ts_iso.is_selected("x") && !ts_iso.is_selected("y") && ts_iso.selected_rows().length() == 1, "Mutating selected_rows() snapshot must not diverge state")
+  ts_iso.set_selected_rows(["y", "y"])
+  x15b_assert(!ts_iso.is_selected("x") && ts_iso.is_selected("y") && ts_iso.selected_count() == 1, "set_selected_rows must atomically update list and O(1) index")
+
+  // 4) Opus P2-1 / Astra P2-3: Timezone-aware x_dp_host_today() at 2026-11-30 16:30 UTC with +480m (+08:00) -> 2026-12-01
+  let h = hostapi::host()
+  let prev_wall = h.wall_ms
+  let prev_tz = h.utc_offset_min
+  h.wall_ms = fn() -> Double { 1796056200000.0 }
+  h.utc_offset_min = fn(_ms : Double) -> Int { 480 }
+  let local_today = x_dp_host_today()
+  h.wall_ms = prev_wall
+  h.utc_offset_min = prev_tz
+  match local_today {
+    Some(d) => x15b_assert(d.year == 2026 && d.month == 12 && d.day == 1, "Expected 2026-12-01 at UTC+8, got \{d.year}-\{d.month}-\{d.day}")
+    None => halt::saying("x15b", "x_dp_host_today returned None")
+  }
+
+  // 5) Astra P2-4: Uncontrolled ColorPicker, DatePicker, DateRangePicker
+  let cp_changes = view::ref_new(0)
+  let dp_changes = view::ref_new(0)
+  let drp_changes = view::ref_new(0)
+  let t_unc = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15b_setup_root(root, false)
+    let _ = ColorPicker(
+      root,
+      default_model=headless_core::ColorModel::from_rgba(1.0, 0.0, 0.0, alpha=1.0),
+      on_change=fn(_m) { cp_changes.v = cp_changes.v + 1 },
+      presets=["#FF0000", "#00FF00"],
+      default_open=true,
+    )
+    let _ = DatePicker(
+      root,
+      default_value=aura_segmented_date(2026, 11, 20),
+      on_change=fn(_v) { dp_changes.v = dp_changes.v + 1 },
+      label="Unc Date",
+    )
+    let _ = DateRangePicker(
+      root,
+      default_start_value=aura_segmented_date(2026, 11, 10),
+      default_end_value=aura_segmented_date(2026, 11, 15),
+      on_change=fn(_a, _b) { drp_changes.v = drp_changes.v + 1 },
+      label="Unc Range",
+    )
+  }, width=600.0, height=700.0)
+  t_unc.frame()
+  x15b_press_a11y(t_unc, "#00FF00", "uncontrolled ColorPicker green preset")
+  t_unc.frame(ms=16.0)
+  x15b_assert(cp_changes.v == 1, "Uncontrolled ColorPicker must fire on_change")
+  x15b_assert(t_unc.find("20") is Some(_), "Uncontrolled DatePicker renders default day 20")
+  x15b_assert(t_unc.find("15") is Some(_), "Uncontrolled DateRangePicker renders default end day 15")
+  t_unc.dispose()
+}
