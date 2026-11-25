@@ -3593,10 +3593,15 @@ void mb_host_a11y_tree(moonbit_string_t s) {
     });
 }
 
+// Fall back to NSUserDefaults "AppleInterfaceStyle" before [NSApplication sharedApplication] initializes NSApp.
 int32_t mb_host_system_dark(void) {
-  NSAppearanceName n = [NSApp.effectiveAppearance
-      bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
-  return [n isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
+  NSAppearance *app = NSApp ? NSApp.effectiveAppearance : nil;
+  if (app) {
+    NSAppearanceName n = [app bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+    return [n isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
+  }
+  NSString *style = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+  return (style && [style caseInsensitiveCompare:@"Dark"] == NSOrderedSame) ? 1 : 0;
 }
 
 // Sharing out (@hostapi.share): the system's sharing picker over the window, the words or the file (kept in a folder
