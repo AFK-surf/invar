@@ -657,6 +657,7 @@ static ID3D11ShaderResourceView *texture_of(const uint8_t *px, UINT w, UINT h) {
   td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
   D3D11_SUBRESOURCE_DATA init = {px, w * 4, 0};
   ID3D11Device *dev = (ID3D11Device *)mb_render_device();
+  if (!dev) return NULL;
   ID3D11Texture2D *tex = NULL;
   ID3D11ShaderResourceView *srv = NULL;
   if (FAILED(dev->CreateTexture2D(&td, &init, &tex)) || FAILED(dev->CreateShaderResourceView(tex, NULL, &srv))) srv = NULL;
