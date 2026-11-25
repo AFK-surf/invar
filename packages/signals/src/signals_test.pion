@@ -300,8 +300,260 @@ test "stress create and destroy 2000 scopes/effects/watches with zero leaked lin
   }
   c1.dispose()
   debug_assert(acc[0] > 0, "stress ran")
-  // All temporary effects, scopes, watches, and links must be recycled
+  // All temporary effects, scopes, watches, signals, computeds, and links must be recycled
   debug_assert(live_link_count() == base_links, "zero leaked links")
-  // Only root signal + c1 computed remain (+2)
-  debug_assert(live_node_count() == base_nodes + 2, "zero leaked nodes")
+  debug_assert(live_node_count() == base_nodes, "zero leaked nodes")
+}
+
+test "on-demand slot allocation and zero leak across Signal, Computed, DerivedSignal, Watch, effect_scope" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let base_watches = g.watches.length()
+
+  // Creating idle Signals, Computeds, and DerivedSignals allocates zero graph slots
+  let idle_s = signal(10)
+  let idle_c = computed(fn(_p : Option[Int]) -> Int { idle_s.get() + 1 })
+  let idle_d = derived_signal(fn(_p : Option[Int]) -> Int { idle_s.get() * 2 })
+  debug_assert(live_node_count() == base_nodes, "idle creation allocates 0 slots")
+  idle_s.set(20)
+  debug_assert(idle_s.untracked() == 20, "unwatched set/get works without slot")
+  debug_assert(live_node_count() == base_nodes, "unwatched set/get still 0 slots")
+  let _ = (idle_c, idle_d)
+
+  // Multi-round subscribe/update/unsubscribe loop
+  let acc = [0]
+  for i in 0..<200 {
+    let s = signal(i)
+    let c = computed(fn(_p : Option[Int]) -> Int { s.get() * 3 })
+    let c_const = computed(fn(_p : Option[Int]) -> Int { 7 })
+    let d = derived_signal(fn(_p : Option[Int]) -> Int { s.get() + 5 })
+    let stop = effect_scope(fn() -> Unit {
+      let _ = effect(fn() -> Unit {
+        acc[0] += c.get() + c_const.get() + d.get()
+      })
+      let w = watch(fn() -> Unit { acc[0] += 1 })
+      let _ = w.read(fn() -> Int { c.get() + d.get() })
+    })
+    s.set(i + 1)
+    d.set(i + 100)
+    stop()
+    d.dispose()
+    debug_assert(live_link_count() == base_links, "round links back to baseline")
+    debug_assert(live_node_count() == base_nodes, "round nodes back to baseline")
+  }
+  debug_assert(acc[0] > 0, "multi-round loop ran")
+  // Watch slots must be reused via free_watches rather than growing linearly with 200 rounds
+  debug_assert(g.watches.length() <= base_watches + 4, "watch slots reused without unbounded growth")
+
+  // Stale Watch handle after watch_id reuse must stay gone and must not corrupt the new Watch
+  let w1 = watch(fn() -> Unit { () })
+  let s_reuse = signal(1)
+  let _ = w1.read(fn() -> Int { s_reuse.get() })
+  w1.stop()
+  debug_assert(w1.gone() && w1.is_stale(), "w1 gone after stop")
+  let w2 = watch(fn() -> Unit { () })
+  let _ = w2.read(fn() -> Int { s_reuse.get() })
+  debug_assert(!w2.gone() && !w2.is_stale(), "w2 fresh after reusing watch slot")
+  debug_assert(w1.gone() && w1.is_stale(), "w1 still gone after slot reuse")
+  w1.touch()
+  w1.stop()
+  debug_assert(!w2.gone() && !w2.is_stale(), "stale w1 operations must not affect w2")
+  w2.stop()
+  debug_assert(live_link_count() == base_links, "links clean after watch reuse check")
+  debug_assert(live_node_count() == base_nodes, "nodes clean after watch reuse check")
+}
+
+test "edge cases: batch set then unwatch, re-subscribe, on_unwatched, computed_scoped, reentrant dispose, on_untracked_read" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+
+  // 1. Batch set followed by immediate unwatch before flush must preserve new value
+  let bs = signal(1)
+  let b_seen = [0]
+  let b_stop = effect(fn() -> Unit { b_seen[0] = bs.get() })
+  debug_assert(b_seen[0] == 1 && bs.watched(), "batch signal watched")
+  batch(fn() -> Unit {
+    bs.set(42)
+    b_stop()
+  })
+  debug_assert(!bs.watched(), "batch signal unwatched")
+  debug_assert(bs.untracked() == 42, "batch set preserved after unwatch")
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "batch unwatch clean")
+
+  // 2. Re-subscribing previously unwatched Signal and Computed restores full reactivity
+  let rs = signal(10)
+  let rc = computed(fn(_p : Option[Int]) -> Int { rs.get() * 2 })
+  let r_seen : Array[Int] = []
+  let stop1 = effect(fn() -> Unit { r_seen.push(rc.get()) })
+  debug_assert(r_seen.length() == 1 && r_seen[0] == 20, "first sub initial")
+  stop1()
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "released after first stop")
+  rs.set(15)
+  debug_assert(live_node_count() == base_nodes, "unwatched set keeps 0 nodes")
+  let stop2 = effect(fn() -> Unit { r_seen.push(rc.get()) })
+  debug_assert(r_seen.length() == 2 && r_seen[1] == 30, "resubscribe sees updated value")
+  rs.set(25)
+  debug_assert(r_seen.length() == 3 && r_seen[2] == 50, "resubscribe reacts to subsequent sets")
+  stop2()
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "released after second stop")
+
+  // 3. on_unwatched registered before any subscription fires on every unwatch cycle
+  let us = signal(0)
+  let unwatched_hits = [0]
+  us.on_unwatched(fn() -> Unit { unwatched_hits[0] += 1 })
+  debug_assert(live_node_count() == base_nodes, "on_unwatched does not allocate slot eagerly")
+  let u1 = effect(fn() -> Unit { let _ = us.get() })
+  u1()
+  debug_assert(unwatched_hits[0] == 1, "on_unwatched fired cycle 1")
+  debug_assert(live_node_count() == base_nodes, "slot freed after on_unwatched cycle 1")
+  let u2 = effect(fn() -> Unit { let _ = us.get() })
+  u2()
+  debug_assert(unwatched_hits[0] == 2, "on_unwatched fired cycle 2")
+  debug_assert(live_node_count() == base_nodes, "slot freed after on_unwatched cycle 2")
+
+  // 4. computed_scoped untracked read releases slot immediately
+  let ss = signal(5)
+  let sc = computed_scoped(fn(_p : Option[Int]) -> Int { ss.get() + 1 }, None)
+  debug_assert(sc.untracked() == 6, "computed_scoped untracked read")
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "computed_scoped released after untracked read")
+
+  // 5. Re-entrant Computed::dispose inside its own getter releases slot cleanly
+  let re_s = signal(7)
+  let re_box : TestBox[Computed[Int]] = TestBox::{ item: None }
+  let re_c = computed(fn(_p : Option[Int]) -> Int {
+    let v = re_s.get()
+    match re_box.item {
+      Some(c) => c.dispose()
+      None => ()
+    }
+    v * 10
+  })
+  re_box.item = Some(re_c)
+  debug_assert(re_c.untracked() == 70, "reentrant dispose returns value")
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "reentrant dispose releases slot")
+
+  // 6. on_untracked_read fires for unallocated Signal without allocating a node slot
+  let ut_s = signal(99)
+  let ut_hits = [0]
+  let ut_ids : Array[Int] = []
+  set_on_untracked_read(Some(fn(n : ReactiveNode) -> Unit {
+    ut_hits[0] += 1
+    ut_ids.push(n.id)
+  }))
+  let v = ut_s.get()
+  set_on_untracked_read(None)
+  debug_assert(v == 99 && ut_hits[0] == 1 && ut_ids[0] == -1, "on_untracked_read fires for unallocated signal")
+  debug_assert(live_node_count() == base_nodes, "untracked read did not allocate slot")
+}
+
+test "adversarial: reentrant on_unwatched slot reuse must not kill newly allocated Watch (P1)" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let base_watches = g.watches.length()
+
+  let us = signal(1)
+  let nested_done = [false]
+  let w1_box : TestBox[Watch] = TestBox::{ item: None }
+  let w2_box : TestBox[Watch] = TestBox::{ item: None }
+  us.on_unwatched(fn() -> Unit {
+    if !nested_done[0] {
+      nested_done[0] = true
+      // Nested subscribe + stop frees `us`'s node_id inside the outer on_unwatched callback
+      let stop_inner = effect(fn() -> Unit { let _ = us.get() })
+      stop_inner()
+      // Allocate two watches so one reuses the freed node_id of `us`
+      let w1 = watch(fn() -> Unit { () })
+      let w2 = watch(fn() -> Unit { () })
+      w1_box.item = Some(w1)
+      w2_box.item = Some(w2)
+    }
+  })
+
+  let stop_outer = effect(fn() -> Unit { let _ = us.get() })
+  stop_outer()
+
+  let w1 = match w1_box.item {
+    Some(w) => w
+    None => panic("missing w1")
+  }
+  let w2 = match w2_box.item {
+    Some(w) => w
+    None => panic("missing w2")
+  }
+  debug_assert(!w1.gone(), "w1 must stay alive after outer unwatched_node returns")
+  debug_assert(!w2.gone(), "w2 must stay alive after outer unwatched_node returns")
+  w1.stop()
+  w2.stop()
+  debug_assert(live_node_count() == base_nodes, "nodes back to baseline after stopping w1/w2")
+  debug_assert(live_link_count() == base_links, "links back to baseline after stopping w1/w2")
+
+  // Verify watch slots are reused cleanly
+  let w3 = watch(fn() -> Unit { () })
+  w3.stop()
+  debug_assert(g.watches.length() <= base_watches + 2, "free_watches reused after P1 probe")
+}
+
+test "adversarial: zero-dep Computed stays cached across unwatch/resubscribe until invalidated (P2-1)" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let runs = [0]
+  let c = computed(fn(_p : Option[Int]) -> Int {
+    runs[0] += 1
+    100 + runs[0]
+  })
+  let seen : Array[Int] = []
+  let stop1 = effect(fn() -> Unit { seen.push(c.get()) })
+  debug_assert(runs[0] == 1 && seen.length() == 1 && seen[0] == 101, "initial zero-dep compute")
+  stop1()
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "zero-dep computed slot released")
+
+  // Re-subscribing without invalidation must NOT re-run getter
+  let stop2 = effect(fn() -> Unit { seen.push(c.get()) })
+  debug_assert(runs[0] == 1 && seen.length() == 2 && seen[1] == 101, "zero-dep computed cached across resubscribe")
+  stop2()
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "released again")
+
+  // Explicit invalidate while unwatched forces recomputation on next subscribe
+  c.invalidate()
+  let stop3 = effect(fn() -> Unit { seen.push(c.get()) })
+  debug_assert(runs[0] == 2 && seen.length() == 3 && seen[2] == 102, "invalidate triggers recompute on resubscribe")
+  stop3()
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "clean after invalidate cycle")
+}
+
+test "adversarial: Watch/effect self-stop before reading unallocated Signal must not self-loop (P2-2)" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+
+  // Case A: Watch::read stops itself then reads an unallocated Signal
+  let s1 = signal(7)
+  let w = watch(fn() -> Unit { () })
+  let got1 = w.read(fn() -> Int {
+    w.stop()
+    s1.get()
+  })
+  debug_assert(got1 == 7 && w.gone(), "self-stopped watch read returns value")
+  debug_assert(live_node_count() == base_nodes, "no self-loop node leak in Watch::read")
+  debug_assert(live_link_count() == base_links, "no self-loop link leak in Watch::read")
+
+  // Case B: effect stops itself during re-run then reads an unallocated Signal
+  let trigger_s = signal(0)
+  let s2 = signal(99)
+  let stop_box : TestBox[() -> Unit] = TestBox::{ item: None }
+  let seen = [0]
+  let stop_eff = effect(fn() -> Unit {
+    let v = trigger_s.get()
+    if v > 0 {
+      match stop_box.item {
+        Some(stop) => stop()
+        None => ()
+      }
+      seen[0] = s2.get()
+    }
+  })
+  stop_box.item = Some(stop_eff)
+  trigger_s.set(1)
+  debug_assert(seen[0] == 99, "self-stopped effect read returns value")
+  debug_assert(live_node_count() == base_nodes, "no self-loop node leak in effect")
+  debug_assert(live_link_count() == base_links, "no self-loop link leak in effect")
 }

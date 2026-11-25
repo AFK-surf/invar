@@ -41,10 +41,12 @@ struct SignalState[T] {
   mut current : T
   mut pending : T
   same : (T, T) -> Bool
+  mut node_id : Int
+  mut holds : Bool
+  mut on_unwatched_cb : Option[() -> Unit]
 }
 
 pub struct Signal[T] {
-  node_id : Int
   state : SignalState[T]
 }
 
@@ -52,6 +54,9 @@ struct ComputedState[T] {
   mut value : Option[T]
   getter : (Option[T]) -> T
   same : (T, T) -> Bool
+  mut node_id : Int
+  mut holds : Bool
+  mut cached_clean : Bool
   mut untracked_dispose : Bool
   mut read_dependency : Option[Computed[Unit]]
   mut untracked_read : Option[() -> Option[T]]
@@ -100,7 +105,6 @@ fn capture_reactive_context() -> Option[() -> (() -> Unit)] {
 }
 
 pub struct Computed[T] {
-  node_id : Int
   state : ComputedState[T]
 }
 
@@ -174,18 +178,23 @@ fn notify_node(first : Int) -> Unit {
 
 fn unwatched_node(node_id : Int) -> Unit {
   let slot = g.nodes[node_id]
+  let gen = slot.gen
   if slot.kind == kind_computed {
     if (slot.flags & flag_recursed_check) != 0 || computed_extra_reading(node_id) {
       slot.flags = slot.flags | flag_unwatch_after_update
-    } else if slot.deps >= 0 {
-      slot.flags = flag_mutable | flag_dirty
-      dispose_all_deps_in_reverse(node_id)
+    } else {
+      if slot.deps >= 0 {
+        slot.flags = flag_mutable | flag_dirty
+        dispose_all_deps_in_reverse(node_id)
+      }
+      release_node_slot(node_id, gen)
     }
   } else if slot.kind == kind_signal {
     match slot.cleanup {
       Some(f) => untracked(f)
       None => ()
     }
+    release_node_slot(node_id, gen)
   } else if slot.kind == kind_effect {
     effect_oper(node_id)
   } else {
@@ -195,6 +204,7 @@ fn unwatched_node(node_id : Int) -> Unit {
 
 fn finish_computed_read(node_id : Int) -> Unit {
   let slot = g.nodes[node_id]
+  let gen = slot.gen
   if (slot.flags & (flag_unwatch_after_update | flag_dispose_after_update)) == 0 {
     return
   }
@@ -215,6 +225,9 @@ fn finish_computed_read(node_id : Int) -> Unit {
       Some(f) => f()
       None => ()
     }
+  }
+  if (disposed_during_read || unwatched_during_read) && g.nodes[node_id].alive && g.nodes[node_id].gen == gen {
+    release_node_slot(node_id, gen)
   }
 }
 
@@ -286,13 +299,35 @@ pub fn signal_ref[T](initial : T) -> Signal[T] {
   signal_by(initial, fn(_a : T, _b : T) -> Bool { false })
 }
 
-pub fn signal_by[T](initial : T, same : (T, T) -> Bool) -> Signal[T] {
-  let state = SignalState::{ current: initial, pending: initial, same }
+fn ensure_signal_slot[T](state : SignalState[T]) -> Int {
+  if state.node_id >= 0 {
+    return state.node_id
+  }
   let upd : (Int) -> Bool = fn(nid : Int) -> Bool {
     update_signal(nid, state)
   }
-  let node_id = alloc_node(flag_mutable, kind_signal, None, -1, Some(upd))
-  Signal::{ node_id, state }
+  let id = alloc_node(flag_mutable, kind_signal, None, -1, Some(upd))
+  let slot = g.nodes[id]
+  slot.cleanup = state.on_unwatched_cb
+  slot.holds = state.holds
+  slot.on_free = Some(fn() -> Unit {
+    state.current = state.pending
+    state.node_id = -1
+  })
+  state.node_id = id
+  id
+}
+
+pub fn signal_by[T](initial : T, same : (T, T) -> Bool) -> Signal[T] {
+  let state = SignalState::{
+    current: initial,
+    pending: initial,
+    same,
+    node_id: -1,
+    holds: false,
+    on_unwatched_cb: None,
+  }
+  Signal::{ state }
 }
 
 pub fn computed[T : Eq](getter : (Option[T]) -> T) -> Computed[T] {
@@ -307,23 +342,49 @@ pub fn computed_by[T](getter : (Option[T]) -> T, same : (T, T) -> Bool) -> Compu
   computed_by_at(getter, same, "")
 }
 
+fn ensure_computed_slot[T](state : ComputedState[T]) -> Int {
+  if state.node_id >= 0 {
+    return state.node_id
+  }
+  let init_flags = if state.cached_clean {
+    flag_mutable
+  } else {
+    match state.value {
+      Some(_) => flag_mutable | flag_dirty
+      None => flag_none
+    }
+  }
+  let upd : (Int) -> Bool = fn(nid : Int) -> Bool {
+    update_computed(nid, state)
+  }
+  let id = alloc_node(init_flags, kind_computed, None, -1, Some(upd))
+  let slot = g.nodes[id]
+  slot.holds = state.holds
+  slot.on_free = Some(fn() -> Unit {
+    let s = g.nodes[id]
+    state.cached_clean = s.deps < 0 && (s.flags & (flag_dirty | flag_pending)) == 0 && state.value.is_some()
+    state.node_id = -1
+  })
+  state.node_id = id
+  id
+}
+
 pub fn computed_by_at[T](getter : (Option[T]) -> T, same : (T, T) -> Bool, loc : String) -> Computed[T] {
   let ctx_enter = capture_reactive_context()
   let state = ComputedState::{
     value: None,
     getter,
     same,
+    node_id: -1,
+    holds: false,
+    cached_clean: false,
     untracked_dispose: false,
     read_dependency: None,
     untracked_read: None,
     made_at: loc,
     ctx_enter,
   }
-  let upd : (Int) -> Bool = fn(nid : Int) -> Bool {
-    update_computed(nid, state)
-  }
-  let node_id = alloc_node(flag_none, kind_computed, None, -1, Some(upd))
-  Computed::{ node_id, state }
+  Computed::{ state }
 }
 
 pub fn memo[K : Eq, V : Eq](input : () -> K, compute : (K) -> V) -> Computed[V] {
@@ -379,7 +440,7 @@ pub fn computed_scoped_by[T](
   untracked_read : Option[() -> Option[T]],
 ) -> Computed[T] {
   let c = computed_by(getter, same)
-  holds_up(c.node_id)
+  c.state.holds = true
   c.state.untracked_dispose = true
   c.state.untracked_read = untracked_read
   c
@@ -731,10 +792,14 @@ fn report_untracked_read(node_id : Int) -> Unit {
   }
 }
 
+fn has_live_active_sub() -> Bool {
+  g.active_sub >= 0 && g.nodes[g.active_sub].alive
+}
+
 pub fn Computed::get[T](self : Computed[T]) -> T {
-  let node_id = self.node_id
   let state = self.state
-  if g.active_sub < 0 {
+  let has_sub = has_live_active_sub()
+  if !has_sub {
     match state.untracked_read {
       Some(read) => {
         let r = match state.ctx_enter {
@@ -754,13 +819,14 @@ pub fn Computed::get[T](self : Computed[T]) -> T {
       None => ()
     }
   }
-  if g.active_sub >= 0 {
+  if has_sub {
     match state.read_dependency {
       Some(dep) => { let _ = dep.get() }
       None => ()
     }
   }
-  let is_untracked = state.untracked_dispose && g.active_sub < 0
+  let node_id = ensure_computed_slot(state)
+  let is_untracked = state.untracked_dispose && !has_sub
   let flags = g.nodes[node_id].flags
   let stale = if (flags & flag_dirty) != 0 {
     true
@@ -775,7 +841,7 @@ pub fn Computed::get[T](self : Computed[T]) -> T {
     false
   }
   if stale {
-    if update_computed(node_id, state) {
+    if update_computed(node_id, state) && state.node_id == node_id {
       let subs = g.nodes[node_id].subs
       if subs >= 0 {
         shallow_propagate(subs)
@@ -802,20 +868,36 @@ pub fn Computed::get[T](self : Computed[T]) -> T {
     finish_computed_read(node_id)
     computed_afters_due()
   }
-  track(node_id)
+  if state.node_id >= 0 {
+    track(state.node_id)
+  }
   let value = match state.value {
     Some(v) => v
     None => halt::saying("a computed read as its first value is worked out: " + state.made_at, loc="signals.pion")
   }
-  if is_untracked && g.nodes[node_id].subs < 0 {
-    unwatched_node(node_id)
+  if is_untracked && state.node_id >= 0 && g.nodes[state.node_id].subs < 0 {
+    unwatched_node(state.node_id)
   }
   value
 }
 
 pub fn Signal::get[T](self : Signal[T]) -> T {
-  let node_id = self.node_id
   let state = self.state
+  let has_sub = has_live_active_sub()
+  if !has_sub && state.node_id < 0 {
+    if g.untracked_depth == 0 {
+      match g.on_untracked_read {
+        Some(tell) => tell(ReactiveNode::{ id: -1, gen: 0 })
+        None => ()
+      }
+    }
+    return state.current
+  }
+  let node_id = if has_sub {
+    ensure_signal_slot(state)
+  } else {
+    state.node_id
+  }
   if (g.nodes[node_id].flags & flag_dirty) != 0 {
     if update_signal(node_id, state) {
       let subs = g.nodes[node_id].subs
@@ -836,12 +918,28 @@ pub fn Signal::set[T](self : Signal[T], value : T) -> Unit {
   self.set_at(value, "")
 }
 
+fn record_set(loc : String) -> Unit {
+  if g.watch_read_depth > 0 && g.watch_read_sets.length() < 4 {
+    g.watch_read_sets.push(loc)
+  }
+  g.set_at = loc
+  g.sets_count += 1
+}
+
 pub fn Signal::set_at[T](self : Signal[T], value : T, loc : String) -> Unit {
   let state = self.state
   let changed = !(state.same)(state.pending, value)
+  let node_id = state.node_id
+  if node_id < 0 {
+    state.pending = value
+    state.current = value
+    if changed {
+      record_set(loc)
+    }
+    return
+  }
   state.pending = value
   if changed {
-    let node_id = self.node_id
     g.nodes[node_id].flags = flag_mutable | flag_dirty
     tell_set(node_id, loc)
   }
@@ -853,11 +951,7 @@ pub fn Signal::update[T](self : Signal[T], f : (T) -> T) -> Unit {
 }
 
 fn tell_set(node_id : Int, loc : String) -> Unit {
-  if g.watch_read_depth > 0 && g.watch_read_sets.length() < 4 {
-    g.watch_read_sets.push(loc)
-  }
-  g.set_at = loc
-  g.sets_count += 1
+  record_set(loc)
   let subs = g.nodes[node_id].subs
   if subs >= 0 {
     let was_has = g.has_setting
@@ -874,11 +968,11 @@ fn tell_set(node_id : Int, loc : String) -> Unit {
 }
 
 fn track(dep : Int) -> Unit {
-  let sub = g.active_sub
-  if sub < 0 {
+  if !has_live_active_sub() {
     report_untracked_read(dep)
     return
   }
+  let sub = g.active_sub
   let sub_slot = g.nodes[sub]
   let tail = sub_slot.deps_tail
   if tail >= 0 && g.links[tail].dep == dep {
@@ -937,12 +1031,18 @@ fn effect_scope_oper(e : Int) -> Unit {
   }
   let kind = g.nodes[e].kind
   if kind == kind_watch && g.nodes[e].watch_id >= 0 {
-    let o = g.watches[g.nodes[e].watch_id]
+    let wid = g.nodes[e].watch_id
+    g.nodes[e].watch_id = -1
+    let o = g.watches[wid]
     o.stale = true
     o.gone = true
+    o.resting = false
+    o.marked_by = ""
+    o.set_by.clear()
     o.changed = None
     o.marked = None
     o.ctx_enter = None
+    g.free_watches.push(wid)
   }
   g.nodes[e].flags = flag_none
   dispose_all_deps_in_reverse(e)
@@ -978,19 +1078,29 @@ pub fn Computed::peek[T](self : Computed[T]) -> Option[T] {
 }
 
 pub fn Computed::dispose[T](self : Computed[T]) -> Unit {
-  let node_id = self.node_id
+  self.state.cached_clean = false
+  let node_id = self.state.node_id
+  if node_id < 0 {
+    self.state.ctx_enter = None
+    return
+  }
   if (g.nodes[node_id].flags & flag_recursed_check) != 0 || computed_extra_reading(node_id) {
     g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dispose_after_update
-    g.nodes[node_id].on_dispose = Some(fn() -> Unit { self.state.ctx_enter = None })
+    g.nodes[node_id].on_dispose = Some(fn() -> Unit {
+      self.state.cached_clean = false
+      self.state.ctx_enter = None
+    })
   } else {
     self.state.ctx_enter = None
     g.nodes[node_id].on_dispose = None
+    g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dirty
     unwatched_node(node_id)
   }
 }
 
 pub fn Signal::watched[T](self : Signal[T]) -> Bool {
-  g.nodes[self.node_id].subs >= 0
+  let node_id = self.state.node_id
+  node_id >= 0 && g.nodes[node_id].subs >= 0
 }
 
 pub fn Signal::read[T](self : Signal[T]) -> ReadSignal[T] {
@@ -998,7 +1108,8 @@ pub fn Signal::read[T](self : Signal[T]) -> ReadSignal[T] {
 }
 
 pub fn Signal::watched_awake[T](self : Signal[T]) -> Bool {
-  has_awake_sub(self.node_id, [])
+  let node_id = self.state.node_id
+  node_id >= 0 && has_awake_sub(node_id, [])
 }
 
 fn has_awake_sub(node_id : Int, seen : Array[Int]) -> Bool {
@@ -1034,12 +1145,18 @@ fn has_awake_sub(node_id : Int, seen : Array[Int]) -> Bool {
 }
 
 pub fn Signal::on_unwatched[T](self : Signal[T], f : () -> Unit) -> Unit {
-  g.nodes[self.node_id].cleanup = Some(f)
-  holds_up(self.node_id)
+  self.state.on_unwatched_cb = Some(f)
+  self.state.holds = true
+  let nid = self.state.node_id
+  if nid >= 0 {
+    g.nodes[nid].cleanup = Some(f)
+    holds_up(nid)
+  }
 }
 
 pub fn Computed::watched[T](self : Computed[T]) -> Bool {
-  g.nodes[self.node_id].subs >= 0
+  let node_id = self.state.node_id
+  node_id >= 0 && g.nodes[node_id].subs >= 0
 }
 
 pub fn Computed::read[T](self : Computed[T]) -> ReadSignal[T] {
@@ -1084,15 +1201,18 @@ pub fn Computed::untracked[T](self : Computed[T]) -> T {
 }
 
 fn release_unwatched_resource(node_id : Int) -> Unit {
-  if g.nodes[node_id].holds && g.nodes[node_id].subs < 0 {
+  if node_id >= 0 && g.nodes[node_id].alive && g.nodes[node_id].holds && g.nodes[node_id].subs < 0 {
     unwatched_node(node_id)
   }
 }
 
 fn Computed::get_releasing[T](self : Computed[T]) -> T {
   let value = self.get()
-  if g.active_sub < 0 {
-    release_unwatched_resource(self.node_id)
+  if !has_live_active_sub() {
+    let nid = self.state.node_id
+    if nid >= 0 {
+      release_unwatched_resource(nid)
+    }
   }
   value
 }
@@ -1105,7 +1225,11 @@ fn Computed::untracked_releasing[T](self : Computed[T]) -> T {
 }
 
 pub fn Computed::invalidate[T](self : Computed[T]) -> Unit {
-  let node_id = self.node_id
+  self.state.cached_clean = false
+  let node_id = self.state.node_id
+  if node_id < 0 {
+    return
+  }
   g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dirty
   let subs = g.nodes[node_id].subs
   if subs >= 0 {
@@ -1117,25 +1241,38 @@ pub fn Computed::invalidate[T](self : Computed[T]) -> Unit {
 }
 
 pub fn Computed::reading[T, U](self : Computed[T], f : () -> U) -> U {
-  g.computed_extra_reads.push(self.node_id)
+  let node_id = ensure_computed_slot(self.state)
+  g.computed_extra_reads.push(node_id)
   let prev = g.active_sub
-  g.active_sub = self.node_id
+  g.active_sub = node_id
   let v = f()
   g.active_sub = prev
   let _ = g.computed_extra_reads.pop()
-  finish_computed_read(self.node_id)
+  finish_computed_read(node_id)
   v
 }
 
 pub fn Computed::lend[T, U](self : Computed[T], to : Computed[U]) -> Unit {
-  let mut l = g.nodes[self.node_id].deps
+  let from_id = self.state.node_id
+  if from_id < 0 {
+    return
+  }
+  let mut l = g.nodes[from_id].deps
+  if l < 0 {
+    return
+  }
+  let to_id = ensure_computed_slot(to.state)
   while l >= 0 {
-    link_nodes(g.links[l].dep, to.node_id, g.cycle)
+    link_nodes(g.links[l].dep, to_id, g.cycle)
     l = g.links[l].next_dep
   }
 }
 
 // ── Watch & rest ─────────────────────────────────────────────────────────────
+
+fn watch_alive(w : Watch) -> Bool {
+  g.nodes[w.node_id].alive && g.nodes[w.node_id].gen == w.node_gen
+}
 
 fn watch_told(o : WatchSlot) -> Unit {
   if o.resting {
@@ -1153,17 +1290,36 @@ fn watch_told(o : WatchSlot) -> Unit {
 
 pub fn watch(changed : () -> Unit) -> Watch {
   let ctx_enter = capture_reactive_context()
-  let wid = g.watches.length()
-  g.watches.push(WatchSlot::{
-    changed: Some(changed),
-    marked: None,
-    stale: true,
-    gone: false,
-    marked_by: "",
-    set_by: [],
-    resting: false,
-    ctx_enter,
-  })
+  let wid = match g.free_watches.pop() {
+    Some(id) => {
+      let o = g.watches[id]
+      o.gen += 1
+      o.changed = Some(changed)
+      o.marked = None
+      o.stale = true
+      o.gone = false
+      o.marked_by = ""
+      o.set_by.clear()
+      o.resting = false
+      o.ctx_enter = ctx_enter
+      id
+    }
+    None => {
+      let id = g.watches.length()
+      g.watches.push(WatchSlot::{
+        gen: 1,
+        changed: Some(changed),
+        marked: None,
+        stale: true,
+        gone: false,
+        marked_by: "",
+        set_by: [],
+        resting: false,
+        ctx_enter,
+      })
+      id
+    }
+  }
   let node_id = alloc_node(flag_none, kind_watch, None, wid, None)
   let node_gen = g.nodes[node_id].gen
   if g.owner >= 0 {
@@ -1175,6 +1331,9 @@ pub fn watch(changed : () -> Unit) -> Watch {
 
 /// Run `f` inside the reactive context captured when this `Watch` was created (no-op if stopped).
 pub fn Watch::in_context[T](self : Watch, f : () -> T) -> T {
+  if !watch_alive(self) {
+    return f()
+  }
   let own = g.watches[self.watch_id]
   if own.gone {
     return f()
@@ -1191,6 +1350,9 @@ pub fn Watch::in_context[T](self : Watch, f : () -> T) -> T {
 }
 
 pub fn Watch::read[T](self : Watch, f : () -> T) -> T {
+  if !watch_alive(self) {
+    return untracked(f)
+  }
   let own = g.watches[self.watch_id]
   if own.gone {
     return untracked(f)
@@ -1229,8 +1391,7 @@ pub fn Watch::read[T](self : Watch, f : () -> T) -> T {
   }
   g.active_sub = prev_sub
   g.watch_read_depth -= 1
-  if own.gone || !g.nodes[e].alive || g.nodes[e].gen != self.node_gen {
-    own.stale = true
+  if !watch_alive(self) || own.gone {
     return v
   }
   g.nodes[e].flags = g.nodes[e].flags & bit_not(flag_recursed_check)
@@ -1250,48 +1411,59 @@ pub fn Watch::read[T](self : Watch, f : () -> T) -> T {
 }
 
 pub fn Watch::set_as_read(self : Watch) -> Array[String] {
+  if !watch_alive(self) {
+    return []
+  }
   g.watches[self.watch_id].set_by.copy()
 }
 
 pub fn Watch::changed_as_read(self : Watch) -> Bool {
-  if !g.nodes[self.node_id].alive || g.nodes[self.node_id].gen != self.node_gen {
+  if !watch_alive(self) {
     return false
   }
   (g.nodes[self.node_id].flags & (flag_dirty | flag_pending)) != 0
 }
 
 pub fn Watch::is_stale(self : Watch) -> Bool {
+  if !watch_alive(self) {
+    return true
+  }
   g.watches[self.watch_id].stale
 }
 
 pub fn Watch::touch(self : Watch) -> Unit {
-  g.watches[self.watch_id].stale = true
-}
-
-pub fn Watch::gone(self : Watch) -> Bool {
-  g.watches[self.watch_id].gone
-}
-
-pub fn Watch::resting(self : Watch) -> Bool {
-  g.watches[self.watch_id].resting
-}
-
-pub fn Watch::stop(self : Watch) -> Unit {
-  if g.nodes[self.node_id].alive && g.nodes[self.node_id].gen == self.node_gen {
-    effect_scope_oper(self.node_id)
+  if !watch_alive(self) {
+    return
   }
   g.watches[self.watch_id].stale = true
 }
 
+pub fn Watch::gone(self : Watch) -> Bool {
+  !watch_alive(self)
+}
+
+pub fn Watch::resting(self : Watch) -> Bool {
+  if !watch_alive(self) {
+    return false
+  }
+  g.watches[self.watch_id].resting
+}
+
+pub fn Watch::stop(self : Watch) -> Unit {
+  if watch_alive(self) {
+    effect_scope_oper(self.node_id)
+  }
+}
+
 pub fn Watch::changed_now(self : Watch) -> Bool {
+  if !watch_alive(self) {
+    return true
+  }
   let own = g.watches[self.watch_id]
   if own.stale {
     return true
   }
   let e = self.node_id
-  if !g.nodes[e].alive || g.nodes[e].gen != self.node_gen {
-    return true
-  }
   let flags = g.nodes[e].flags
   if (flags & flag_dirty) != 0 {
     return true
@@ -1307,6 +1479,9 @@ pub fn Watch::changed_now(self : Watch) -> Bool {
 }
 
 pub fn Watch::on_marked(self : Watch, f : () -> Unit) -> Unit {
+  if !watch_alive(self) {
+    return
+  }
   g.watches[self.watch_id].marked = Some(f)
 }
 
@@ -1315,14 +1490,16 @@ pub fn rest(owner : ReactiveNode) -> () -> Unit {
 }
 
 pub fn rest_with(owner : ReactiveNode, drop_holds : Bool) -> () -> Unit {
-  let rested : Array[Int] = []
+  let rested : Array[(Int, Int)] = []
   if owner.id >= 0 && g.nodes[owner.id].alive && g.nodes[owner.id].gen == owner.gen {
     rest_in(owner.id, rested, drop_holds)
   }
   fn() -> Unit {
-    for wid in rested {
+    for entry in rested {
+      let wid = entry.0
+      let wgen = entry.1
       let o = g.watches[wid]
-      if o.resting {
+      if o.gen == wgen && o.resting {
         o.resting = false
         if o.stale && !o.gone {
           o.stale = false
@@ -1333,7 +1510,7 @@ pub fn rest_with(owner : ReactiveNode, drop_holds : Bool) -> () -> Unit {
   }
 }
 
-fn rest_in(e : Int, rested : Array[Int], drop_holds : Bool) -> Unit {
+fn rest_in(e : Int, rested : Array[(Int, Int)], drop_holds : Bool) -> Unit {
   let mut l = g.nodes[e].deps
   while l >= 0 {
     let d = g.links[l].dep
@@ -1349,7 +1526,7 @@ fn rest_in(e : Int, rested : Array[Int], drop_holds : Bool) -> Unit {
             o.stale = true
           }
           o.resting = true
-          rested.push(wid)
+          rested.push((wid, o.gen))
         } else if drop_holds && g.nodes[d].holds && g.nodes[d].deps >= 0 {
           dispose_all_deps_in_reverse(d)
           o.stale = true
