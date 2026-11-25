@@ -1,0 +1,752 @@
+// Track 1B range & quantity components:
+// Slider (single-thumb & dual-thumb Range, track fill, step dots, mark labels, output value) and Meter (`Role::Meter`).
+// Uses pure flex-ratio proportional layout so fill bars and thumbs are pixel-exact on frame 0 with zero `rect()` lag.
+
+import "dmath"
+import "headless"
+import "signals"
+import "view"
+
+/// Mark label on a `Slider` track.
+#derive(Eq)
+pub struct AuraSliderMark {
+  pub value : Double
+  pub label : String
+}
+
+fn b_format_slider_num(v : Double, step : Double, min : Double) -> String {
+  let whole = step >= 1.0 && step == dmath::round(step) && min == dmath::round(min)
+  if whole {
+    dmath::round(v).to_int().to_string()
+  } else {
+    v.to_string()
+  }
+}
+
+fn b_slider_thumb_visual(
+  parent : view::View,
+  dragging_get : () -> Bool,
+  disabled_get : () -> Bool,
+  focus_shown_get : () -> Bool,
+  force_focus_visible : Bool,
+) -> Unit {
+  let _ = parent
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .lies_along(view::Live::Is(view::Lies::Middle))
+    .width(view::Live::Is(Some(28.0)))
+    .height(view::Live::Is(Some(20.0)))
+    .shrink(view::Live::Is(0.0))
+    .corner_circular(view::Live::Is(true))
+    .radius(view::Live::Is(10.0))
+    .ground(view::Live::By(fn() -> Int64 { aura_theme(parent).palette.accent }))
+    .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+      let active = force_focus_visible || focus_shown_get()
+      if active {
+        let th = aura_theme(parent)
+        (2.0, th.ring_offset_width, th.palette.focus)
+      } else {
+        (0.0, 0.0, 0L)
+      }
+    }))
+    .ring_gap_color(view::Live::By(fn() -> Int64 {
+      let active = force_focus_visible || focus_shown_get()
+      if active { aura_theme(parent).palette.background } else { 0L }
+    }))
+  // Inner visible thumb (`24x16pt`, `rounded-lg` = 8pt, `--accent-foreground`, `shadow-field`)
+  let _ = parent.box(fn(inner : view::View) -> Unit {
+    let _ = inner
+      .width(view::Live::Is(Some(24.0)))
+      .height(view::Live::Is(Some(16.0)))
+      .points(view::Live::Is(false))
+      .corner_circular(view::Live::Is(true))
+      .radius(view::Live::Is(8.0))
+      .scale(view::Live::By(fn() -> Double {
+        if !aura_reduced_motion(inner) && dragging_get() && !disabled_get() { 0.9 } else { 1.0 }
+      }))
+      .ground(view::Live::By(fn() -> Int64 { aura_theme(inner).palette.accent_foreground }))
+      .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+        aura_surface_shadows(aura_theme(inner).config.dark)
+      }))
+  })
+}
+
+fn b_flex_spacer(parent : view::View, weight : () -> Double) -> view::View {
+  parent.box(fn(sp : view::View) -> Unit {
+    let _ = sp
+      .grow(view::Live::By(fn() -> Double {
+        let w = weight()
+        if w > 0.0 { w } else { 0.0 }
+      }))
+      .shrink(view::Live::Is(1.0))
+      .basis(view::Live::Is(Some(0.0)))
+      .min_width(view::Live::Is(Some(0.0)))
+      .points(view::Live::Is(false))
+  })
+}
+
+fn b_slider_marks_row(
+  parent : view::View,
+  marks : Array[AuraSliderMark],
+  min : Double,
+  max : Double,
+  is_active : (Double) -> Bool,
+) -> Unit {
+  if marks.length() == 0 {
+    return
+  }
+  let span = max - min
+  let _ = parent.box(fn(mrow : view::View) -> Unit {
+    let _ = mrow
+      .fills_across(view::Live::Is(true))
+      .height(view::Live::Is(Some(16.0)))
+      .points(view::Live::Is(false))
+    for m in marks {
+      let mv = m.value
+      let ratio = if span > 0.0 {
+        let r = (mv - min) / span
+        if r < 0.0 { 0.0 } else if r > 1.0 { 1.0 } else { r }
+      } else {
+        0.0
+      }
+      let _ = mrow.box(fn(layer : view::View) -> Unit {
+        let _ = layer
+          .over(view::Live::Is(true))
+          .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(layer) }))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .pad_xy(12.0, 0.0)
+          .points(view::Live::Is(false))
+        let _ = b_flex_spacer(layer, fn() -> Double { ratio })
+        let _ = layer.box(fn(ml : view::View) -> Unit {
+          let look = b_words_look(12.0, 400, 16.0, false)
+          let _ = ml
+            .shrink(view::Live::Is(0.0))
+            .points(view::Live::Is(false))
+            .words(view::Live::Is(m.label), look=look)
+            .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(ml)) }))
+            .ink(view::Live::By(fn() -> Int64 {
+              let pal = aura_theme(ml).palette
+              if is_active(mv) { pal.foreground } else { pal.muted }
+            }))
+        })
+        let _ = b_flex_spacer(layer, fn() -> Double { 1.0 - ratio })
+      })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 16. Slider (`slider_node` / `Slider` & `range_slider_node` / `RangeSlider`)
+// ---------------------------------------------------------------------------
+
+/// Aura single-thumb `Slider` (integrates `headless::slider`, supports track fill, marks, and output label).
+pub fn slider_node(
+  parent : view::View,
+  value : view::Live[Double],
+  on_change : (Double) -> Unit,
+  label~ : view::Live[String] = view::Live::Is(""),
+  min~ : Double = 0.0,
+  max~ : Double = 100.0,
+  step~ : Double = 1.0,
+  show_output~ : Bool = true,
+  output_text? : (Double) -> String,
+  marks~ : Array[AuraSliderMark] = [],
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  force_focus_visible~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let val_get = value.to_getter()
+  let lbl_get = label.to_getter()
+  let dis_local = disabled.to_getter()
+  let fmt = match output_text {
+    Some(f) => f
+    None => fn(v : Double) -> String { b_format_slider_num(v, step, min) }
+  }
+
+  parent.box(loc=loc, fn(root : view::View) -> Unit {
+    let eff_dis = fn() -> Bool { b_effective_disabled(root, dis_local) }
+    let _ = root
+      .fills_across(view::Live::Is(true))
+      .gap(view::Live::Is(4.0))
+      .group_alpha(view::Live::By(fn() -> Double {
+        if eff_dis() { aura_theme(root).disabled_opacity } else { 1.0 }
+      }))
+    // Header row: label (left) + output (right)
+    if lbl_get() != "" || show_output {
+      let _ = root.box(fn(hdr : view::View) -> Unit {
+        let _ = hdr
+          .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(hdr) }))
+          .fills_across(view::Live::Is(true))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .lies_along(view::Live::Is(view::Lies::Between))
+        let _ = hdr.box(fn(lv : view::View) -> Unit {
+          let look = b_words_look(14.0, 500, 20.0, false)
+          let _ = lv
+            .words(label, look=look)
+            .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(lv)) }))
+            .ink(view::Live::By(fn() -> Int64 { aura_theme(lv).palette.foreground }))
+        })
+        if show_output {
+          let _ = hdr.box(fn(ov : view::View) -> Unit {
+            let look = b_words_look(14.0, 500, 20.0, false)
+            let _ = ov
+              .margin(view::Live::Is((0.0, 0.0, 4.0, 0.0)))
+              .words(
+                view::Live::By(fn() -> String { fmt(headless::slider_snap(val_get(), min, max, step)) }),
+                look=look,
+              )
+              .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(ov)) }))
+              .ink(view::Live::By(fn() -> Int64 { aura_theme(ov).palette.foreground }))
+          })
+        }
+      })
+    }
+    // Interactive slider track (`h=20pt`, `rounded-xl` = 10pt pill, `bg-default`)
+    let _ = headless::slider(
+      root,
+      fn() -> String { let l = lbl_get(); if l != "" { l } else { "Slider" } },
+      val_get,
+      min=min,
+      max=max,
+      step=step,
+      on_change,
+      fn(track : view::View, sl : headless::Slider) -> Unit {
+        let _ = track
+          .fills_across(view::Live::Is(true))
+          .height(view::Live::Is(Some(20.0)))
+          .corner_circular(view::Live::Is(true))
+          .radius(view::Live::Is(10.0))
+          .ground(view::Live::By(fn() -> Int64 { aura_theme(track).palette.default_bg }))
+        // Start-end accent cap (`12pt` matching HeroUI `border-s-accent` border-x-[12px]) + proportional fill
+        let _ = track.box(fn(fill_row : view::View) -> Unit {
+          let _ = fill_row
+            .over(view::Live::Is(true))
+            .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(fill_row) }))
+            .points(view::Live::Is(false))
+            .padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
+              if aura_rtl(fill_row) { (12.0, 0.0, 0.0, 0.0) } else { (0.0, 0.0, 12.0, 0.0) }
+            }))
+          // Start cap (12pt) + fill grow(part) combined in one pill up to thumb center
+          let _ = fill_row.box(fn(fill : view::View) -> Unit {
+            let _ = fill
+              .row(view::Live::Is(true))
+              .grow(view::Live::By(fn() -> Double { sl.part() }))
+              .shrink(view::Live::Is(1.0))
+              .basis(view::Live::Is(Some(12.0)))
+              .height(view::Live::Is(Some(20.0)))
+              .points(view::Live::Is(false))
+              .corner_circular(view::Live::Is(true))
+              .corners(view::Live::By(fn() -> Option[(Double, Double, Double, Double)] {
+                if aura_rtl(fill) { Some((0.0, 10.0, 10.0, 0.0)) } else { Some((10.0, 0.0, 0.0, 10.0)) }
+              }))
+              .ground(view::Live::By(fn() -> Int64 { aura_theme(fill).palette.accent }))
+          })
+          let _ = b_flex_spacer(fill_row, fn() -> Double { 1.0 - sl.part() })
+        })
+        // Thumb positioned via flex ratio inside full width: 24pt slot centered at `12 + part*(W-24)` (mirrored in RTL)
+        let _ = track.box(fn(thumb_row : view::View) -> Unit {
+          let _ = thumb_row
+            .over(view::Live::Is(true))
+            .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(thumb_row) }))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .points(view::Live::Is(false))
+          let _ = b_flex_spacer(thumb_row, fn() -> Double { sl.part() })
+          let _ = thumb_row.box(fn(slot : view::View) -> Unit {
+            let _ = slot
+              .width(view::Live::Is(Some(24.0)))
+              .height(view::Live::Is(Some(20.0)))
+              .shrink(view::Live::Is(0.0))
+              .points(view::Live::Is(false))
+            let _ = slot.box(fn(thumb : view::View) -> Unit {
+              let _ = thumb
+                .over(view::Live::Is(true), edges=(Some(-2.0), Some(0.0), None, None))
+                .points(view::Live::Is(false))
+              b_slider_thumb_visual(
+                thumb,
+                fn() -> Bool { sl.pressed() },
+                fn() -> Bool { sl.disabled() },
+                fn() -> Bool { sl.focus_shown() },
+                force_focus_visible,
+              )
+            })
+          })
+          let _ = b_flex_spacer(thumb_row, fn() -> Double { 1.0 - sl.part() })
+        })
+      },
+      thumb_room=24.0,
+      rtl_by=fn() -> Bool { aura_rtl(root) },
+      disabled=eff_dis,
+      value_text=fmt,
+    )
+    // Optional mark labels positioned proportionally by `mark.value`
+    b_slider_marks_row(root, marks, min, max, fn(mv : Double) -> Bool { val_get() >= mv })
+  })
+}
+
+/// Pion-JSX `<aura::Slider>` wrapper (single-thumb; for dual-thumb range use `<aura::RangeSlider>`).
+pub fn Slider(
+  parent : view::View,
+  into value~ : view::Live[Double] = .Is(0.0),
+  value_by? : () -> Double,
+  on_change~ : (Double) -> Unit = fn(_v : Double) { () },
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  min~ : Double = 0.0,
+  max~ : Double = 100.0,
+  step~ : Double = 1.0,
+  show_output~ : Bool = true,
+  output_text? : (Double) -> String,
+  marks~ : Array[AuraSliderMark] = [],
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  force_focus_visible~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let v = match value_by { Some(f) => view::Live::By(f); None => value }
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  slider_node(
+    parent,
+    v,
+    on_change,
+    label=l,
+    min=min,
+    max=max,
+    step=step,
+    show_output=show_output,
+    output_text?=output_text,
+    marks=marks,
+    disabled=dis,
+    force_focus_visible=force_focus_visible,
+    loc=loc,
+  )
+}
+
+/// Aura dual-thumb `RangeSlider` (integrates `headless::range_slider` with anti-crossing `min_gap`).
+pub fn range_slider_node(
+  parent : view::View,
+  low : view::Live[Double],
+  high : view::Live[Double],
+  on_change : (Double, Double) -> Unit,
+  label~ : view::Live[String] = view::Live::Is(""),
+  low_label~ : String = "Minimum",
+  high_label~ : String = "Maximum",
+  min~ : Double = 0.0,
+  max~ : Double = 100.0,
+  step~ : Double = 1.0,
+  min_gap~ : Double = 0.0,
+  show_output~ : Bool = true,
+  output_text? : (Double, Double) -> String,
+  marks~ : Array[AuraSliderMark] = [],
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  force_focus_visible~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let lo_get = low.to_getter()
+  let hi_get = high.to_getter()
+  let lbl_get = label.to_getter()
+  let dis_local = disabled.to_getter()
+  let fmt_pair = match output_text {
+    Some(f) => f
+    None =>
+      fn(a : Double, b : Double) -> String {
+        let sa = b_format_slider_num(a, step, min)
+        let sb = b_format_slider_num(b, step, min)
+        "\{sa} \u{2013} \{sb}"
+      }
+  }
+
+  parent.box(loc=loc, fn(root : view::View) -> Unit {
+    let eff_dis = fn() -> Bool { b_effective_disabled(root, dis_local) }
+    let _ = root
+      .fills_across(view::Live::Is(true))
+      .gap(view::Live::Is(4.0))
+      .group_alpha(view::Live::By(fn() -> Double {
+        if eff_dis() { aura_theme(root).disabled_opacity } else { 1.0 }
+      }))
+    if lbl_get() != "" || show_output {
+      let _ = root.box(fn(hdr : view::View) -> Unit {
+        let _ = hdr
+          .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(hdr) }))
+          .fills_across(view::Live::Is(true))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .lies_along(view::Live::Is(view::Lies::Between))
+        let _ = hdr.box(fn(lv : view::View) -> Unit {
+          let look = b_words_look(14.0, 500, 20.0, false)
+          let _ = lv
+            .words(label, look=look)
+            .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(lv)) }))
+            .ink(view::Live::By(fn() -> Int64 { aura_theme(lv).palette.foreground }))
+        })
+        if show_output {
+          let _ = hdr.box(fn(ov : view::View) -> Unit {
+            let look = view::WordsLook::{ ..b_words_look(14.0, 500, 20.0, false), tracking: view::Spacing::Points(0.5) }
+            let _ = ov
+              .margin(view::Live::Is((0.0, 0.0, 3.0, 0.0)))
+              .words(
+                view::Live::By(fn() -> String { fmt_pair(lo_get(), hi_get()) }),
+                look=look,
+              )
+              .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(ov)) }))
+              .ink(view::Live::By(fn() -> Int64 { aura_theme(ov).palette.foreground }))
+          })
+        }
+      })
+    }
+    // Outer visual shell holds the full-width 20pt pill and insets the interactive track by 12pt per side
+    // so `headless::range_slider`'s `[0, rw]` drag space matches the thumb-center travel range 1:1 (zero press drift).
+    let _ = root.box(fn(outer_track : view::View) -> Unit {
+      let _ = outer_track
+        .fills_across(view::Live::Is(true))
+        .height(view::Live::Is(Some(36.0)))
+        .margin(view::Live::Is((0.0, -8.0, 0.0, -8.0)))
+        .pad_xy(12.0, 0.0)
+      // Visual 20pt pill track spanning full outer width, centered vertically at y=8
+      let _ = outer_track.box(fn(vis_track : view::View) -> Unit {
+        let _ = vis_track
+          .over(view::Live::Is(true), edges=(Some(0.0), Some(8.0), Some(0.0), None))
+          .height(view::Live::Is(Some(20.0)))
+          .points(view::Live::Is(false))
+          .corner_circular(view::Live::Is(true))
+          .radius(view::Live::Is(10.0))
+          .ground(view::Live::By(fn() -> Int64 { aura_theme(vis_track).palette.default_bg }))
+      })
+      let _ = headless::range_slider(
+        outer_track,
+        fn() -> String { let l = lbl_get(); if l != "" { l } else { "Range slider" } },
+        lo_get,
+        hi_get,
+        min=min,
+        max=max,
+        step=step,
+        on_change,
+        fn(track : view::View, rs : headless::RangeSlider) -> Unit {
+          let _ = track
+            .fills_across(view::Live::Is(true))
+            .height(view::Live::Is(Some(36.0)))
+          // Accent range fill between low and high thumb centers (spans `track` directly with zero extra inset)
+          let _ = track.box(fn(fill_row : view::View) -> Unit {
+            let _ = fill_row
+              .over(view::Live::Is(true), edges=(Some(0.0), Some(8.0), Some(0.0), None))
+              .height(view::Live::Is(Some(20.0)))
+              .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(fill_row) }))
+              .points(view::Live::Is(false))
+            let _ = b_flex_spacer(fill_row, fn() -> Double { rs.low_part() })
+            let _ = fill_row.box(fn(fill : view::View) -> Unit {
+              let _ = fill
+                .grow(view::Live::By(fn() -> Double {
+                  let d = rs.high_part() - rs.low_part()
+                  if d > 0.0 { d } else { 0.0 }
+                }))
+                .shrink(view::Live::Is(1.0))
+                .basis(view::Live::Is(Some(0.0)))
+                .height(view::Live::Is(Some(20.0)))
+                .points(view::Live::Is(false))
+                .ground(view::Live::By(fn() -> Int64 { aura_theme(fill).palette.accent }))
+            })
+            let _ = b_flex_spacer(fill_row, fn() -> Double { 1.0 - rs.high_part() })
+          })
+          // Low thumb row: 0-width anchor at `part * rw`, 36x36 thumb centered on anchor (`left = -18`)
+          let _ = track.box(fn(lo_row : view::View) -> Unit {
+            let _ = lo_row
+              .over(view::Live::Is(true))
+              .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(lo_row) }))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .points(view::Live::Is(false))
+            let _ = b_flex_spacer(lo_row, fn() -> Double { rs.low_part() })
+            let _ = lo_row.box(fn(slot : view::View) -> Unit {
+              let _ = slot
+                .width(view::Live::Is(Some(0.0)))
+                .height(view::Live::Is(Some(36.0)))
+                .shrink(view::Live::Is(0.0))
+                .points(view::Live::Is(false))
+              let _ = rs.thumb(
+                slot,
+                headless::RangeThumb::Low,
+                fn() -> String { low_label },
+                fn(th_v : view::View, st : headless::RangeThumbState) -> Unit {
+                  let _ = th_v
+                    .over(view::Live::Is(true), edges=(Some(-18.0), Some(0.0), None, None))
+                    .row(view::Live::Is(true))
+                    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                    .lies_along(view::Live::Is(view::Lies::Middle))
+                    .width(view::Live::Is(Some(36.0)))
+                    .height(view::Live::Is(Some(36.0)))
+                  let _ = th_v.box(fn(vis : view::View) -> Unit {
+                    let _ = vis.points(view::Live::Is(false))
+                    b_slider_thumb_visual(
+                      vis,
+                      fn() -> Bool { st.pressed() },
+                      fn() -> Bool { st.disabled() },
+                      fn() -> Bool { st.focus_shown() },
+                      force_focus_visible,
+                    )
+                  })
+                },
+              )
+            })
+            let _ = b_flex_spacer(lo_row, fn() -> Double { 1.0 - rs.low_part() })
+          })
+          // High thumb row: 0-width anchor at `part * rw`, 36x36 thumb centered on anchor (`left = -18`)
+          let _ = track.box(fn(hi_row : view::View) -> Unit {
+            let _ = hi_row
+              .over(view::Live::Is(true))
+              .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(hi_row) }))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .points(view::Live::Is(false))
+            let _ = b_flex_spacer(hi_row, fn() -> Double { rs.high_part() })
+            let _ = hi_row.box(fn(slot : view::View) -> Unit {
+              let _ = slot
+                .width(view::Live::Is(Some(0.0)))
+                .height(view::Live::Is(Some(36.0)))
+                .shrink(view::Live::Is(0.0))
+                .points(view::Live::Is(false))
+              let _ = rs.thumb(
+                slot,
+                headless::RangeThumb::High,
+                fn() -> String { high_label },
+                fn(th_v : view::View, st : headless::RangeThumbState) -> Unit {
+                  let _ = th_v
+                    .over(view::Live::Is(true), edges=(Some(-18.0), Some(0.0), None, None))
+                    .row(view::Live::Is(true))
+                    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                    .lies_along(view::Live::Is(view::Lies::Middle))
+                    .width(view::Live::Is(Some(36.0)))
+                    .height(view::Live::Is(Some(36.0)))
+                  let _ = th_v.box(fn(vis : view::View) -> Unit {
+                    let _ = vis.points(view::Live::Is(false))
+                    b_slider_thumb_visual(
+                      vis,
+                      fn() -> Bool { st.pressed() },
+                      fn() -> Bool { st.disabled() },
+                      fn() -> Bool { st.focus_shown() },
+                      false,
+                    )
+                  })
+                },
+              )
+            })
+            let _ = b_flex_spacer(hi_row, fn() -> Double { 1.0 - rs.high_part() })
+          })
+        },
+        min_gap=min_gap,
+        rtl_by=fn() -> Bool { aura_rtl(root) },
+        disabled=eff_dis,
+      )
+    })
+    b_slider_marks_row(root, marks, min, max, fn(mv : Double) -> Bool { mv >= lo_get() && mv <= hi_get() })
+  })
+}
+
+/// Pion-JSX `<aura::RangeSlider>` wrapper.
+pub fn RangeSlider(
+  parent : view::View,
+  into low~ : view::Live[Double] = .Is(25.0),
+  low_by? : () -> Double,
+  into high~ : view::Live[Double] = .Is(75.0),
+  high_by? : () -> Double,
+  on_change~ : (Double, Double) -> Unit = fn(_a : Double, _b : Double) { () },
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  low_label~ : String = "Minimum",
+  high_label~ : String = "Maximum",
+  min~ : Double = 0.0,
+  max~ : Double = 100.0,
+  step~ : Double = 1.0,
+  min_gap~ : Double = 0.0,
+  show_output~ : Bool = true,
+  output_text? : (Double, Double) -> String,
+  marks~ : Array[AuraSliderMark] = [],
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  force_focus_visible~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let lo = match low_by { Some(f) => view::Live::By(f); None => low }
+  let hi = match high_by { Some(f) => view::Live::By(f); None => high }
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  range_slider_node(
+    parent,
+    lo,
+    hi,
+    on_change,
+    label=l,
+    low_label=low_label,
+    high_label=high_label,
+    min=min,
+    max=max,
+    step=step,
+    min_gap=min_gap,
+    show_output=show_output,
+    output_text?=output_text,
+    marks=marks,
+    disabled=dis,
+    force_focus_visible=force_focus_visible,
+    loc=loc,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 17. Meter (`meter_node` / `Meter`)
+// ---------------------------------------------------------------------------
+
+/// Semantic fill color for `Meter`.
+#derive(Eq)
+pub enum AuraMeterColor {
+  Default
+  Accent
+  Success
+  Warning
+  Danger
+}
+
+/// Height scale for `Meter` (`Sm`=4pt, `Md`=8pt, `Lg`=12pt).
+#derive(Eq)
+pub enum AuraMeterSize {
+  Sm
+  Md
+  Lg
+}
+
+fn b_meter_metrics(size : AuraMeterSize) -> (Double, Double) {
+  match size {
+    AuraMeterSize::Sm => (4.0, 2.0)
+    AuraMeterSize::Md => (8.0, 4.0)
+    AuraMeterSize::Lg => (12.0, 6.0)
+  }
+}
+
+fn b_meter_fill_color(pal : AuraPalette, color : AuraMeterColor) -> Int64 {
+  match color {
+    AuraMeterColor::Default => pal.default_foreground
+    AuraMeterColor::Accent => pal.accent
+    AuraMeterColor::Success => pal.success
+    AuraMeterColor::Warning => pal.warning
+    AuraMeterColor::Danger => pal.danger
+  }
+}
+
+/// Aura `Meter` quantity indicator integrating `headless::meter` (`Role::Meter`).
+pub fn meter_node(
+  parent : view::View,
+  value : view::Live[Double],
+  label~ : view::Live[String] = view::Live::Is(""),
+  min~ : Double = 0.0,
+  max~ : Double = 100.0,
+  color~ : AuraMeterColor = AuraMeterColor::Accent,
+  size~ : AuraMeterSize = AuraMeterSize::Md,
+  show_output~ : Bool = true,
+  value_text? : (Double, Double) -> String,
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  loc~ : String = "",
+) -> view::View {
+  let val_get = value.to_getter()
+  let lbl_get = label.to_getter()
+  let dis_get = disabled.to_getter()
+  let (bar_h, bar_r) = b_meter_metrics(size)
+
+  headless::meter(
+    parent,
+    fn() -> String { let l = lbl_get(); if l != "" { l } else { "Meter" } },
+    val_get,
+    fn(root : view::View, m : headless::Meter) -> Unit {
+      let _ = root
+        .fills_across(view::Live::Is(true))
+        .gap(view::Live::Is(4.0))
+        .group_alpha(view::Live::By(fn() -> Double {
+          if b_effective_disabled(root, dis_get) { aura_theme(root).disabled_opacity } else { 1.0 }
+        }))
+      if lbl_get() != "" || show_output {
+        let _ = root.box(fn(hdr : view::View) -> Unit {
+          let _ = hdr
+            .row(view::Live::Is(true))
+            .fills_across(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .lies_along(view::Live::Is(view::Lies::Between))
+          let _ = hdr.box(fn(lv : view::View) -> Unit {
+            let _ = lv
+              .words(label, look=b_words_look(14.0, 500, 20.0, false))
+              .ink(view::Live::By(fn() -> Int64 { aura_theme(lv).palette.foreground }))
+          })
+          if show_output {
+            let _ = hdr.box(fn(ov : view::View) -> Unit {
+              let _ = ov
+                .margin(view::Live::Is((0.0, 0.0, 2.5, 0.0)))
+                .words(
+                  view::Live::By(fn() -> String { m.value_text() }),
+                  look=b_words_look(14.0, 500, 20.0, false),
+                )
+                .ink(view::Live::By(fn() -> Int64 { aura_theme(ov).palette.foreground }))
+            })
+          }
+        })
+      }
+      // Track (`bar_h`, `bar_r`, `bg-default`) + proportional Fill via flex grow
+      let _ = root.box(fn(track : view::View) -> Unit {
+        let _ = track
+          .row(view::Live::Is(true))
+          .fills_across(view::Live::Is(true))
+          .height(view::Live::Is(Some(bar_h)))
+          .clips(view::Live::Is(true))
+          .corner_circular(view::Live::Is(true))
+          .radius(view::Live::Is(bar_r))
+          .ground(view::Live::By(fn() -> Int64 { aura_theme(track).palette.default_bg }))
+        let _ = track.box(fn(fill : view::View) -> Unit {
+          let _ = fill
+            .grow(view::Live::By(fn() -> Double { m.ratio() }))
+            .shrink(view::Live::Is(1.0))
+            .basis(view::Live::Is(Some(0.0)))
+            .min_width(view::Live::Is(Some(0.0)))
+            .height(view::Live::Is(Some(bar_h)))
+            .points(view::Live::Is(false))
+            .corner_circular(view::Live::Is(true))
+            .radius(view::Live::Is(bar_r))
+            .ground(view::Live::By(fn() -> Int64 {
+              b_meter_fill_color(aura_theme(fill).palette, color)
+            }))
+        })
+        let _ = b_flex_spacer(track, fn() -> Double { 1.0 - m.ratio() })
+      })
+    },
+    min=min,
+    max=max,
+    value_text?=value_text,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::Meter>` wrapper.
+pub fn Meter(
+  parent : view::View,
+  into value~ : view::Live[Double] = .Is(0.0),
+  value_by? : () -> Double,
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  min~ : Double = 0.0,
+  max~ : Double = 100.0,
+  color~ : AuraMeterColor = AuraMeterColor::Accent,
+  size~ : AuraMeterSize = AuraMeterSize::Md,
+  show_output~ : Bool = true,
+  value_text? : (Double, Double) -> String,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  loc~ : String = "",
+) -> view::View {
+  let v = match value_by { Some(f) => view::Live::By(f); None => value }
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  meter_node(
+    parent,
+    v,
+    label=l,
+    min=min,
+    max=max,
+    color=color,
+    size=size,
+    show_output=show_output,
+    value_text?=value_text,
+    disabled=dis,
+    loc=loc,
+  )
+}

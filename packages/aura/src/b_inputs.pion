@@ -1,0 +1,1055 @@
+// Track 1B form input components: Input, TextArea, TextField, InputGroup (with Prefix/Suffix/Input).
+// Uses `w0_field_shell`, `w0_apply_field_focus_ring`, `ui::Field`, `headless::TextField`, and `headless::Form`.
+
+import "headless"
+import "signals"
+import "ui"
+import "view"
+
+/// Shared form context lent by `form_node` so nested `TextField` / `FieldError` can auto-register and route errors.
+let b_form_lent : view::Lent[headless::Form] = view::Lent::new()
+
+/// Read the enclosing `headless::Form`, if any.
+pub fn aura_form_of(v : view::View) -> Option[headless::Form] {
+  v.lent(b_form_lent)
+}
+
+fn b_words_look(size : Double, weight : Int, line : Double, wrap : Bool) -> view::WordsLook {
+  view::WordsLook::{ ..view::words_plain, size, weight, line, wrap }
+}
+
+fn b_effective_disabled(v : view::View, local : () -> Bool) -> Bool {
+  local() || headless::form_disabled_inherited(v)
+}
+
+fn b_secret_mask(raw : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let n = raw.length()
+  while i < n {
+    sb.write_string("\u{2022}")
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn b_field_variant_bg(v : view::View, pal : AuraPalette, variant : AuraFieldVariant, hovered : Bool, focused : Bool, invalid : Bool) -> Int64 {
+  if hovered && !focused && !invalid {
+    match variant {
+      AuraFieldVariant::Primary => pal.field_hover
+      AuraFieldVariant::Secondary => pal.default_hover
+      AuraFieldVariant::Auto =>
+        if !aura_has_surface_context(v) {
+          pal.field_hover
+        } else {
+          match aura_surface_level_of(v) {
+            AuraSurfaceLevel::Transparent => pal.field_hover
+            _ => pal.default_hover
+          }
+        }
+    }
+  } else {
+    aura_field_bg(v, pal, variant)
+  }
+}
+
+fn b_apply_field_surface(
+  shell : view::View,
+  variant : AuraFieldVariant,
+  invalid_get : () -> Bool,
+  disabled_get : () -> Bool,
+  force_focused : Bool,
+) -> Unit {
+  let _ = shell
+    .ground(view::Live::By(fn() -> Int64 {
+      let pal = aura_theme(shell).palette
+      let dis = b_effective_disabled(shell, disabled_get)
+      let foc = force_focused || shell.focused() || shell.focus_within()
+      let inv = invalid_get()
+      let hov = !dis && !aura_is_coarse_pointer(shell) && shell.pointed()
+      b_field_variant_bg(shell, pal, variant, hov, foc, inv)
+    }))
+    .group_alpha(view::Live::By(fn() -> Double {
+      if b_effective_disabled(shell, disabled_get) {
+        aura_theme(shell).disabled_opacity
+      } else {
+        1.0
+      }
+    }))
+}
+
+fn b_mount_ui_field(
+  parent : view::View,
+  fld : ui::Field,
+  placeholder : view::Live[String],
+  label_get : () -> String,
+  multiline : Bool,
+  min_lines : Int,
+  max_lines : Int,
+  disabled_get : () -> Bool,
+  read_only_get : () -> Bool,
+  secret : Bool,
+  on_change : (String) -> Unit,
+  on_submit : (String) -> Unit,
+  font_size_opt : Option[Double],
+  line_h_opt : Option[Double],
+  loc : String,
+  description_get~ : () -> String = fn() { "" },
+  leaves~ : Array[Int] = [],
+  rtl_by? : () -> Bool,
+) -> view::View {
+  let ph_get = placeholder.to_getter()
+  let fs_fn = fn() -> Double {
+    match font_size_opt {
+      Some(s) => s
+      None => {
+        if aura_config_of(parent).density is AuraDensity::Touch {
+          16.0
+        } else {
+          let rw = parent.tree.room_signal().get().0
+          if rw <= 0.0 || aura_is_sm(parent) { 14.0 } else { 16.0 }
+        }
+      }
+    }
+  }
+  let lh_val = match line_h_opt {
+    Some(lh) => lh
+    None => 20.0
+  }
+  let fnode = ui::field(
+    parent,
+    fld,
+    placeholder_by=ph_get,
+    size_by=fs_fn,
+    rtl_by=match rtl_by {
+      Some(f) => f
+      None => fn() -> Bool { aura_rtl(parent) }
+    },
+    line=lh_val,
+    min_lines=if multiline { min_lines } else { 1 },
+    max_lines=if multiline { max_lines } else { 1 },
+    enter_sends=!multiline,
+    leaves=leaves,
+    secret=secret,
+    label=signals::untracked(label_get),
+    colors_by=fn() -> (Int64, Int64, Int64) {
+      let pal = aura_theme(parent).palette
+      (pal.field_foreground, pal.field_placeholder, pal.focus)
+    },
+    edit=fn(e : ui::FieldEdit) -> Unit {
+      if b_effective_disabled(parent, disabled_get) || read_only_get() {
+        if fld.text() != e.was {
+          fld.set(e.was)
+        }
+        return
+      }
+      on_change(e.now)
+    },
+    submitted=fn(cur : String) -> Unit {
+      if !b_effective_disabled(parent, disabled_get) && !read_only_get() {
+        on_submit(cur)
+      }
+    },
+  )
+  let eff_dis = fn() -> Bool { b_effective_disabled(fnode, disabled_get) }
+  let _ = fnode
+    .grow(view::Live::Is(1.0))
+    .shrink(view::Live::Is(1.0))
+    .min_width(view::Live::Is(Some(0.0)))
+    .focusable(view::Live::By(fn() -> Bool { !eff_dis() }), keys=view::focus_enter | view::focus_space)
+    .presses(view::Live::By(fn() -> Bool { !eff_dis() }))
+    .says(view::Live::By(fn() -> Option[view::Said] {
+      let l = label_get()
+      let lbl = if l.length() > 0 { l } else { ph_get() }
+      let desc = description_get()
+      let raw = fld.text()
+      let sem_val = if secret { b_secret_mask(raw) } else { raw }
+      let acts : Array[view::Action] = if eff_dis() || read_only_get() {
+        []
+      } else {
+        [view::Action::SetText("")]
+      }
+      Some(view::said(view::Role::TextField, label=lbl, description=desc, value=sem_val, actions=acts))
+    }))
+  fnode.reacts(
+    fn() -> Bool { fnode.focused() },
+    fn(foc : Bool) -> Unit {
+      if foc && !fld.focused() && !eff_dis() {
+        fld.focus()
+      }
+    },
+  )
+  let _ = loc
+  fnode
+}
+
+// ---------------------------------------------------------------------------
+// 1. Input (`input_node` / `Input`)
+// ---------------------------------------------------------------------------
+
+fn b_input_with_editor(
+  parent : view::View,
+  fld : ui::Field,
+  placeholder : view::Live[String],
+  label_get : () -> String,
+  description_get : () -> String,
+  variant : AuraFieldVariant,
+  full_width : Bool,
+  invalid : view::Live[Bool],
+  disabled : view::Live[Bool],
+  read_only : view::Live[Bool],
+  secret : Bool,
+  height : Option[Double],
+  pad_x : Double,
+  force_focused : Bool,
+  on_change : (String) -> Unit,
+  on_submit : (String) -> Unit,
+  loc : String,
+) -> (view::View, view::View) {
+  let inv_get = invalid.to_getter()
+  let dis_get = disabled.to_getter()
+  let ro_get = read_only.to_getter()
+  let editor_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let shell = w0_field_shell(
+    parent,
+    variant=variant,
+    invalid=invalid,
+    disabled=disabled,
+    height?=height,
+    pad_x=pad_x,
+    force_focused=force_focused,
+    loc=loc,
+    content=fn(inner : view::View) -> Unit {
+      let fv = b_mount_ui_field(
+        inner,
+        fld,
+        placeholder,
+        label_get,
+        false,
+        1,
+        1,
+        dis_get,
+        ro_get,
+        secret,
+        on_change,
+        on_submit,
+        None,
+        Some(20.0),
+        loc,
+        description_get=description_get,
+      )
+      editor_ref.v = Some(fv)
+    },
+  )
+  b_apply_field_surface(shell, variant, inv_get, dis_get, force_focused)
+  if full_width {
+    let _ = shell.fills_across(view::Live::Is(true))
+  }
+  let fv = match editor_ref.v {
+    Some(v) => v
+    None => shell
+  }
+  (shell, fv)
+}
+
+/// Aura `Input` single-line text input (Builder API).
+/// Defaults to `.Primary` (`--field-background` + 3-layer light shadow); `.Secondary` uses `--default` with no shadow;
+/// `.Auto` follows enclosing `SurfaceContext`.
+pub fn input_node(
+  parent : view::View,
+  field? : ui::Field,
+  value~ : String = "",
+  placeholder~ : view::Live[String] = view::Live::Is(""),
+  label~ : String = "",
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  read_only~ : view::Live[Bool] = view::Live::Is(false),
+  secret~ : Bool = false,
+  height? : Double,
+  pad_x~ : Double = 12.0,
+  force_focused~ : Bool = false,
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let fld = match field {
+    Some(f) => f
+    None => ui::Field::new(text=value)
+  }
+  let (shell, _) = b_input_with_editor(
+    parent,
+    fld,
+    placeholder,
+    fn() -> String { label },
+    fn() -> String { "" },
+    variant,
+    full_width,
+    invalid,
+    disabled,
+    read_only,
+    secret,
+    height,
+    pad_x,
+    force_focused,
+    on_change,
+    on_submit,
+    loc,
+  )
+  shell
+}
+
+/// Pion-JSX `<aura::Input>` wrapper.
+pub fn Input(
+  parent : view::View,
+  field? : ui::Field,
+  value~ : String = "",
+  into placeholder~ : view::Live[String] = .Is(""),
+  placeholder_by? : () -> String,
+  label~ : String = "",
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  into read_only~ : view::Live[Bool] = .Is(false),
+  read_only_by? : () -> Bool,
+  secret~ : Bool = false,
+  height? : Double,
+  pad_x~ : Double = 12.0,
+  force_focused~ : Bool = false,
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let ph = match placeholder_by { Some(f) => view::Live::By(f); None => placeholder }
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  let ro = match read_only_by { Some(f) => view::Live::By(f); None => read_only }
+  input_node(
+    parent,
+    field?=field,
+    value=value,
+    placeholder=ph,
+    label=label,
+    variant=variant,
+    full_width=full_width,
+    invalid=inv,
+    disabled=dis,
+    read_only=ro,
+    secret=secret,
+    height?=height,
+    pad_x=pad_x,
+    force_focused=force_focused,
+    on_change=on_change,
+    on_submit=on_submit,
+    loc=loc,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 2. TextArea (`textarea_node` / `TextArea`)
+// ---------------------------------------------------------------------------
+
+fn b_textarea_with_editor(
+  parent : view::View,
+  fld : ui::Field,
+  placeholder : view::Live[String],
+  label_get : () -> String,
+  description_get : () -> String,
+  variant : AuraFieldVariant,
+  full_width : Bool,
+  rows : Int,
+  max_rows : Int,
+  min_height : Option[Double],
+  invalid : view::Live[Bool],
+  disabled : view::Live[Bool],
+  read_only : view::Live[Bool],
+  force_focused : Bool,
+  on_change : (String) -> Unit,
+  on_submit : (String) -> Unit,
+  loc : String,
+) -> (view::View, view::View) {
+  let inv_get = invalid.to_getter()
+  let dis_get = disabled.to_getter()
+  let ro_get = read_only.to_getter()
+  let min_l = if rows < 1 { 1 } else { rows }
+  let max_l = if max_rows < min_l { min_l } else { max_rows }
+  let min_h = match min_height {
+    Some(h) => h
+    None => {
+      let computed = min_l.to_double() * 20.0 + 16.0
+      if computed < 38.0 { 38.0 } else { computed }
+    }
+  }
+  let editor_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let shell = parent.box(loc=loc, fn(node : view::View) -> Unit {
+    let _ = node
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Start)))
+      .pad_xy(12.0, 8.0)
+      .min_height(view::Live::Is(Some(min_h)))
+      .corner_circular(view::Live::Is(true))
+      .radius(view::Live::By(fn() -> Double { aura_theme(node).field_radius }))
+      .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+        if aura_field_effective_variant(node, variant) is AuraFieldVariant::Primary {
+          aura_surface_shadows(aura_theme(node).config.dark)
+        } else {
+          []
+        }
+      }))
+    b_apply_field_surface(node, variant, inv_get, dis_get, force_focused)
+    let _ = w0_apply_field_focus_ring(node, invalid, force_focused=force_focused)
+    let fv = b_mount_ui_field(
+      node,
+      fld,
+      placeholder,
+      label_get,
+      true,
+      min_l,
+      max_l,
+      dis_get,
+      ro_get,
+      false,
+      on_change,
+      on_submit,
+      None,
+      Some(20.0),
+      loc,
+      description_get=description_get,
+    )
+    editor_ref.v = Some(fv)
+  })
+  if full_width {
+    let _ = shell.fills_across(view::Live::Is(true))
+  }
+  let fv = match editor_ref.v {
+    Some(v) => v
+    None => shell
+  }
+  (shell, fv)
+}
+
+/// Aura `TextArea` multi-line text input (Builder API).
+/// Uses circular field corners (`field_radius`), 3-layer field shadow in light mode, and `w0_apply_field_focus_ring`.
+pub fn textarea_node(
+  parent : view::View,
+  field? : ui::Field,
+  value~ : String = "",
+  placeholder~ : view::Live[String] = view::Live::Is(""),
+  label~ : String = "",
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  rows~ : Int = 2,
+  max_rows~ : Int = 8,
+  min_height? : Double,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  read_only~ : view::Live[Bool] = view::Live::Is(false),
+  force_focused~ : Bool = false,
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let fld = match field {
+    Some(f) => f
+    None => ui::Field::new(text=value)
+  }
+  let (shell, _) = b_textarea_with_editor(
+    parent,
+    fld,
+    placeholder,
+    fn() -> String { label },
+    fn() -> String { "" },
+    variant,
+    full_width,
+    rows,
+    max_rows,
+    min_height,
+    invalid,
+    disabled,
+    read_only,
+    force_focused,
+    on_change,
+    on_submit,
+    loc,
+  )
+  shell
+}
+
+/// Pion-JSX `<aura::TextArea>` wrapper.
+pub fn TextArea(
+  parent : view::View,
+  field? : ui::Field,
+  value~ : String = "",
+  into placeholder~ : view::Live[String] = .Is(""),
+  placeholder_by? : () -> String,
+  label~ : String = "",
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  rows~ : Int = 2,
+  max_rows~ : Int = 8,
+  min_height? : Double,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  into read_only~ : view::Live[Bool] = .Is(false),
+  read_only_by? : () -> Bool,
+  force_focused~ : Bool = false,
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let ph = match placeholder_by { Some(f) => view::Live::By(f); None => placeholder }
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  let ro = match read_only_by { Some(f) => view::Live::By(f); None => read_only }
+  textarea_node(
+    parent,
+    field?=field,
+    value=value,
+    placeholder=ph,
+    label=label,
+    variant=variant,
+    full_width=full_width,
+    rows=rows,
+    max_rows=max_rows,
+    min_height?=min_height,
+    invalid=inv,
+    disabled=dis,
+    read_only=ro,
+    force_focused=force_focused,
+    on_change=on_change,
+    on_submit=on_submit,
+    loc=loc,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 3. TextField (`text_field_node` / `TextField`)
+// ---------------------------------------------------------------------------
+
+/// Aura `TextField` composite field (`Label` + `Input`/`TextArea` + `Description` + `FieldError`).
+/// Integrates `headless::TextField` and automatically registers with any enclosing `headless::Form` when `name != ""`.
+pub fn text_field_node(
+  parent : view::View,
+  label~ : view::Live[String] = view::Live::Is(""),
+  name~ : String = "",
+  field? : ui::Field,
+  value~ : String = "",
+  placeholder~ : view::Live[String] = view::Live::Is(""),
+  description~ : view::Live[String] = view::Live::Is(""),
+  error~ : view::Live[String] = view::Live::Is(""),
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  multiline~ : Bool = false,
+  rows~ : Int = 2,
+  full_width~ : Bool = true,
+  required~ : Bool = false,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  read_only~ : view::Live[Bool] = view::Live::Is(false),
+  secret~ : Bool = false,
+  force_focused~ : Bool = false,
+  validate? : (String) -> Option[String],
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  content? : (view::View, headless::TextField) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let fld = match field {
+    Some(f) => f
+    None => ui::Field::new(text=value)
+  }
+  let lbl_get = label.to_getter()
+  let desc_get = description.to_getter()
+  let err_get = error.to_getter()
+  let inv_get = invalid.to_getter()
+  let dis_get = disabled.to_getter()
+  let ro_get = read_only.to_getter()
+  let enclosing_form = parent.lent(b_form_lent)
+
+  parent.box(loc=loc, fn(root : view::View) -> Unit {
+    let eff_dis = fn() -> Bool { b_effective_disabled(root, dis_get) }
+    let form_err_get = fn() -> String {
+      match enclosing_form {
+        Some(f) => if name != "" { f.error_of(name) } else { "" }
+        None => ""
+      }
+    }
+    let eff_inv = fn() -> Bool {
+      inv_get() || form_err_get() != ""
+    }
+    let eff_err = fn() -> String {
+      let fe = form_err_get()
+      if fe != "" { fe } else if inv_get() { err_get() } else { "" }
+    }
+    match enclosing_form {
+      Some(f) =>
+        if name != "" {
+          let vfn = match validate {
+            Some(vf) => vf
+            None => fn(_s : String) -> Option[String] { None }
+          }
+          let _ = f.register_field(name, fn() -> String { fld.text() }, validate=vfn, owner=root)
+        }
+      None => ()
+    }
+    let htf = headless::TextField::new(
+      lbl_get,
+      description=desc_get,
+      error=eff_err,
+      invalid=eff_inv,
+      required=fn() -> Bool { required },
+      disabled=eff_dis,
+      read_only=ro_get,
+    )
+    if full_width {
+      let _ = root.fills_across(view::Live::Is(true))
+    }
+    match content {
+      Some(custom) => custom(root, htf)
+      None => {
+        let _ = root.show(
+          fn() -> Bool { lbl_get() != "" },
+          fn(lw : view::View) -> Unit {
+            let _ = lw.padding(view::Live::Is((0.0, 0.0, 0.0, 4.0)))
+            let lv_node = htf.label(lw, fn(lv : view::View) -> Unit {
+              let _ = lv.row(view::Live::Is(true)).lines_up(view::Live::Is(Some(view::Along::Middle))).gap(view::Live::Is(2.0))
+              let _ = lv.box(fn(w : view::View) -> Unit {
+                let _ = w
+                  .points(view::Live::Is(false))
+                  .words(label, look=b_words_look(14.0, 500, 20.0, false))
+                  .ink(view::Live::By(fn() -> Int64 {
+                    let pal = aura_theme(w).palette
+                    if eff_inv() { pal.danger } else { pal.foreground }
+                  }))
+              })
+              if required {
+                let _ = lv.box(fn(star : view::View) -> Unit {
+                  let _ = star
+                    .points(view::Live::Is(false))
+                    .words(view::Live::Is("*"), look=b_words_look(14.0, 500, 20.0, false))
+                    .ink(view::Live::By(fn() -> Int64 { aura_theme(star).palette.danger }))
+                })
+              }
+            })
+            let _ = lv_node.on_press(fn() -> Unit {
+              if !eff_dis() {
+                let _ = htf.focus()
+                fld.focus()
+              }
+            })
+          },
+        )
+        let (_, editor_view) = if multiline {
+          b_textarea_with_editor(
+            root,
+            fld,
+            placeholder,
+            lbl_get,
+            fn() -> String { htf.said_description() },
+            variant,
+            full_width,
+            rows,
+            8,
+            None,
+            view::Live::By(eff_inv),
+            view::Live::By(eff_dis),
+            read_only,
+            force_focused,
+            on_change,
+            on_submit,
+            loc,
+          )
+        } else {
+          b_input_with_editor(
+            root,
+            fld,
+            placeholder,
+            lbl_get,
+            fn() -> String { htf.said_description() },
+            variant,
+            full_width,
+            view::Live::By(eff_inv),
+            view::Live::By(eff_dis),
+            read_only,
+            secret,
+            None,
+            12.0,
+            force_focused,
+            on_change,
+            on_submit,
+            loc,
+          )
+        }
+        htf.control_node(editor_view)
+        let _ = root.show(
+          fn() -> Bool { !eff_inv() && desc_get() != "" },
+          fn(dv : view::View) -> Unit {
+            let _ = dv.fills_across(view::Live::Is(true)).padding(view::Live::Is((0.0, 4.0, 0.0, 0.0)))
+            let _ = description_node(dv, description)
+          },
+        )
+        let _ = root.show(
+          fn() -> Bool { eff_inv() && eff_err() != "" },
+          fn(ev : view::View) -> Unit {
+            let _ = ev
+              .fills_across(view::Live::Is(true))
+              .padding(view::Live::Is((0.0, 4.0, 0.0, 0.0)))
+              .margin(view::Live::Is((4.0, 0.0, 0.0, 0.0)))
+            let _ = error_message_node(ev, view::Live::By(eff_err))
+          },
+        )
+      }
+    }
+  })
+}
+
+/// Pion-JSX `<aura::TextField>` wrapper.
+pub fn TextField(
+  parent : view::View,
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  name~ : String = "",
+  field? : ui::Field,
+  value~ : String = "",
+  into placeholder~ : view::Live[String] = .Is(""),
+  placeholder_by? : () -> String,
+  into description~ : view::Live[String] = .Is(""),
+  description_by? : () -> String,
+  into error~ : view::Live[String] = .Is(""),
+  error_by? : () -> String,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  multiline~ : Bool = false,
+  rows~ : Int = 2,
+  full_width~ : Bool = true,
+  required~ : Bool = false,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  into read_only~ : view::Live[Bool] = .Is(false),
+  read_only_by? : () -> Bool,
+  secret~ : Bool = false,
+  force_focused~ : Bool = false,
+  validate? : (String) -> Option[String],
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  let ph = match placeholder_by { Some(f) => view::Live::By(f); None => placeholder }
+  let d = match description_by { Some(f) => view::Live::By(f); None => description }
+  let e = match error_by { Some(f) => view::Live::By(f); None => error }
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  let ro = match read_only_by { Some(f) => view::Live::By(f); None => read_only }
+  let custom = match children {
+    Some(ch) => Some(fn(v : view::View, _tf : headless::TextField) -> Unit { ch(v) })
+    None => None
+  }
+  text_field_node(
+    parent,
+    label=l,
+    name=name,
+    field?=field,
+    value=value,
+    placeholder=ph,
+    description=d,
+    error=e,
+    variant=variant,
+    multiline=multiline,
+    rows=rows,
+    full_width=full_width,
+    required=required,
+    invalid=inv,
+    disabled=dis,
+    read_only=ro,
+    secret=secret,
+    force_focused=force_focused,
+    validate?=validate,
+    on_change=on_change,
+    on_submit=on_submit,
+    content?=custom,
+    loc=loc,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 4. InputGroup (`input_group_node` / `InputGroup` + Prefix / Suffix / Input)
+// ---------------------------------------------------------------------------
+
+struct BInputGroupCtx {
+  disabled_get : () -> Bool
+}
+
+let b_input_group_lent : view::Lent[BInputGroupCtx] = view::Lent::new()
+
+/// Aura `InputGroup` single-shell container with `focus_within` ring (Builder API).
+pub fn input_group_node(
+  parent : view::View,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  height? : Double,
+  force_focused~ : Bool = false,
+  content~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  let inv_get = invalid.to_getter()
+  let dis_get = disabled.to_getter()
+  let shell = w0_field_shell(
+    parent,
+    variant=variant,
+    invalid=invalid,
+    disabled=disabled,
+    height?=height,
+    pad_x=0.0,
+    force_focused=force_focused,
+    loc=loc,
+    content=fn(inner : view::View) -> Unit {
+      let _ = inner
+        .row_reverse(view::Live::By(fn() -> Bool { aura_rtl(inner) }))
+        .gap(view::Live::Is(0.0))
+      let _ = inner.lends(b_input_group_lent, BInputGroupCtx::{ disabled_get: fn() -> Bool { b_effective_disabled(inner, dis_get) } })
+      content(inner)
+    },
+  )
+  b_apply_field_surface(shell, variant, inv_get, dis_get, force_focused)
+  if full_width {
+    let _ = shell.fills_across(view::Live::Is(true))
+  }
+  shell
+}
+
+/// Pion-JSX `<aura::InputGroup>` wrapper.
+pub fn InputGroup(
+  parent : view::View,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  height? : Double,
+  force_focused~ : Bool = false,
+  children~ : (view::View) -> Unit = fn(_v : view::View) { () },
+  loc~ : String = "",
+) -> view::View {
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  input_group_node(
+    parent,
+    variant=variant,
+    full_width=full_width,
+    invalid=inv,
+    disabled=dis,
+    height?=height,
+    force_focused=force_focused,
+    content=children,
+    loc=loc,
+  )
+}
+
+/// Aura `InputGroupPrefix` slot (Builder API).
+pub fn input_group_prefix_node(
+  parent : view::View,
+  text? : view::Live[String],
+  content? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(node : view::View) -> Unit {
+    let _ = node
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+      .shrink(view::Live::Is(0.0))
+      .padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
+        if aura_rtl(node) { (10.5, 0.0, 12.0, 0.0) } else { (12.0, 0.0, 12.0, 0.0) }
+      }))
+    match content {
+      Some(c) => c(node)
+      None =>
+        match text {
+          Some(t) => {
+            let _ = node.box(fn(w : view::View) -> Unit {
+              let look = b_words_look(14.0, 400, 20.0, false)
+              let _ = w
+                .points(view::Live::Is(false))
+                .words(t, look=look)
+                .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(w)) }))
+                .ink(view::Live::By(fn() -> Int64 { aura_theme(w).palette.field_placeholder }))
+            })
+          }
+          None => ()
+        }
+    }
+  })
+}
+
+/// Pion-JSX `<aura::InputGroupPrefix>` wrapper.
+pub fn InputGroupPrefix(
+  parent : view::View,
+  into text~ : view::Live[String] = .Is(""),
+  text_by? : () -> String,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let t = match text_by { Some(f) => Some(view::Live::By(f)); None => Some(text) }
+  input_group_prefix_node(parent, text?=t, content?=children, loc=loc)
+}
+
+/// Aura `InputGroupSuffix` slot (Builder API).
+pub fn input_group_suffix_node(
+  parent : view::View,
+  text? : view::Live[String],
+  content? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(node : view::View) -> Unit {
+    let _ = node
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+      .shrink(view::Live::Is(0.0))
+      .pad_xy(12.0, 0.0)
+    match content {
+      Some(c) => c(node)
+      None =>
+        match text {
+          Some(t) => {
+            let _ = node.box(fn(w : view::View) -> Unit {
+              let look = b_words_look(14.0, 400, 20.0, false)
+              let _ = w
+                .points(view::Live::Is(false))
+                .words(t, look=look)
+                .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(w)) }))
+                .ink(view::Live::By(fn() -> Int64 { aura_theme(w).palette.field_placeholder }))
+            })
+          }
+          None => ()
+        }
+    }
+  })
+}
+
+/// Pion-JSX `<aura::InputGroupSuffix>` wrapper.
+pub fn InputGroupSuffix(
+  parent : view::View,
+  into text~ : view::Live[String] = .Is(""),
+  text_by? : () -> String,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let t = match text_by { Some(f) => Some(view::Live::By(f)); None => Some(text) }
+  input_group_suffix_node(parent, text?=t, content?=children, loc=loc)
+}
+
+/// Aura `InputGroupInput` inner borderless `ui::Field` inside an `InputGroup` (Builder API).
+pub fn input_group_input_node(
+  parent : view::View,
+  field? : ui::Field,
+  value~ : String = "",
+  placeholder~ : view::Live[String] = view::Live::Is(""),
+  label~ : String = "",
+  has_prefix~ : Bool = false,
+  has_suffix~ : Bool = false,
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  read_only~ : view::Live[Bool] = view::Live::Is(false),
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let fld = match field {
+    Some(f) => f
+    None => ui::Field::new(text=value)
+  }
+  let dis_local = disabled.to_getter()
+  let ro_get = read_only.to_getter()
+  let ctx = parent.lent(b_input_group_lent)
+  let dis_get = fn() -> Bool {
+    let from_ctx = match ctx {
+      Some(c) => (c.disabled_get)()
+      None => false
+    }
+    dis_local() || from_ctx
+  }
+  let pad_l = if has_prefix { 0.0 } else { 12.0 }
+  let pad_r = if has_suffix { 0.0 } else { 12.0 }
+  parent.box(loc=loc, fn(wrap : view::View) -> Unit {
+    let _ = wrap
+      .row(view::Live::Is(true))
+      .fills_across(view::Live::Is(true))
+      .min_height(view::Live::Is(Some(36.0)))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .grow(view::Live::Is(1.0))
+      .shrink(view::Live::Is(1.0))
+      .min_width(view::Live::Is(Some(0.0)))
+      .padding(view::Live::Is((pad_l, 0.0, pad_r, 0.0)))
+      .on_press(fn() -> Unit {
+        if !dis_get() && !ro_get() {
+          fld.focus()
+        }
+      })
+    let _ = b_mount_ui_field(
+      wrap,
+      fld,
+      placeholder,
+      fn() -> String { label },
+      false,
+      1,
+      1,
+      dis_get,
+      ro_get,
+      false,
+      on_change,
+      on_submit,
+      None,
+      Some(20.0),
+      loc,
+      rtl_by=fn() -> Bool { aura_rtl(wrap) },
+    )
+  })
+}
+
+/// Pion-JSX `<aura::InputGroupInput>` wrapper.
+pub fn InputGroupInput(
+  parent : view::View,
+  field? : ui::Field,
+  value~ : String = "",
+  into placeholder~ : view::Live[String] = .Is(""),
+  placeholder_by? : () -> String,
+  label~ : String = "",
+  has_prefix~ : Bool = false,
+  has_suffix~ : Bool = false,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  into read_only~ : view::Live[Bool] = .Is(false),
+  read_only_by? : () -> Bool,
+  on_change~ : (String) -> Unit = fn(_s : String) { () },
+  on_submit~ : (String) -> Unit = fn(_s : String) { () },
+  loc~ : String = "",
+) -> view::View {
+  let ph = match placeholder_by { Some(f) => view::Live::By(f); None => placeholder }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  let ro = match read_only_by { Some(f) => view::Live::By(f); None => read_only }
+  input_group_input_node(
+    parent,
+    field?=field,
+    value=value,
+    placeholder=ph,
+    label=label,
+    has_prefix=has_prefix,
+    has_suffix=has_suffix,
+    disabled=dis,
+    read_only=ro,
+    on_change=on_change,
+    on_submit=on_submit,
+    loc=loc,
+  )
+}

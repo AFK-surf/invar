@@ -1,0 +1,1475 @@
+// Ported from HeroUI v3 (v3.2.8 @ c3373a1, Apache-2.0):
+// Track 1D Color Family components (6 leaves):
+// 9.  ColorSwatch
+// 10. ColorSwatchPicker
+// 11. ColorArea (100% pure-GPU fades for HSV, RGB, HSL, and all channel planes)
+// 12. ColorSlider
+// 13. ColorField
+// 14. ColorInputGroup
+
+import "color"
+import "dmath"
+import "headless"
+import "headless_core"
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+/// Convenience constructors for Aura color models & channels (so callers need not import `headless_core`).
+pub fn aura_color_hsva(h : Double, s : Double, v : Double, alpha~ : Double = 1.0) -> headless_core::ColorModel {
+  headless_core::ColorModel::from_hsva(h, s, v, alpha=alpha)
+}
+
+pub fn aura_color_rgba(r : Double, g : Double, b : Double, alpha~ : Double = 1.0) -> headless_core::ColorModel {
+  headless_core::ColorModel::from_rgba(r, g, b, alpha=alpha)
+}
+
+pub fn aura_ch_hue() -> headless_core::ColorChannel { headless_core::ColorChannel::Hue }
+pub fn aura_ch_saturation() -> headless_core::ColorChannel { headless_core::ColorChannel::Saturation }
+pub fn aura_ch_brightness() -> headless_core::ColorChannel { headless_core::ColorChannel::Brightness }
+pub fn aura_ch_red() -> headless_core::ColorChannel { headless_core::ColorChannel::Red }
+pub fn aura_ch_green() -> headless_core::ColorChannel { headless_core::ColorChannel::Green }
+pub fn aura_ch_blue() -> headless_core::ColorChannel { headless_core::ColorChannel::Blue }
+pub fn aura_ch_alpha() -> headless_core::ColorChannel { headless_core::ColorChannel::Alpha }
+
+// ============================================================================
+// 9. ColorSwatch (color-swatch.css)
+// ============================================================================
+
+/// ColorSwatch / ColorSwatchPicker size scale (`Xs=16`, `Sm=24`, `Md=32`, `Lg=36`, `Xl=40`).
+#derive(Eq)
+pub enum AuraColorSwatchSize {
+  Xs
+  Sm
+  Md
+  Lg
+  Xl
+}
+
+/// ColorSwatch / ColorSwatchPicker shape (`Circle`, `Square`).
+#derive(Eq)
+pub enum AuraColorSwatchShape {
+  Circle
+  Square
+}
+
+fn d_swatch_dim(size : AuraColorSwatchSize) -> Double {
+  match size {
+    AuraColorSwatchSize::Xs => 16.0
+    AuraColorSwatchSize::Sm => 24.0
+    AuraColorSwatchSize::Md => 32.0
+    AuraColorSwatchSize::Lg => 36.0
+    AuraColorSwatchSize::Xl => 40.0
+  }
+}
+
+fn d_swatch_radius(size : AuraColorSwatchSize, shape : AuraColorSwatchShape) -> Double {
+  match shape {
+    AuraColorSwatchShape::Circle => d_swatch_dim(size) * 0.5
+    AuraColorSwatchShape::Square => 6.0
+  }
+}
+
+/// Aura `ColorSwatch` (Builder API): transparency checkerboard + color overlay + inset 1px border.
+pub fn color_swatch_node(
+  parent : view::View,
+  color_val : view::Live[Int64],
+  size~ : AuraColorSwatchSize = AuraColorSwatchSize::Md,
+  shape~ : AuraColorSwatchShape = AuraColorSwatchShape::Circle,
+  label~ : String = "Color swatch",
+  loc~ : String = "",
+) -> view::View {
+  let dim = d_swatch_dim(size)
+  let rad = d_swatch_radius(size, shape)
+  let col_get = color_val.to_getter()
+  parent.box(loc=loc, fn(node : view::View) -> Unit {
+    let _ = node
+      .width(view::Live::Is(Some(dim)))
+      .height(view::Live::Is(Some(dim)))
+      .shrink(view::Live::Is(0.0))
+      .corner_circular(view::Live::Is(true))
+      .radius(view::Live::Is(rad))
+      .clips(view::Live::Is(true))
+      .says(view::Live::Is(Some(view::said(view::Role::Image, label=label))))
+    // Clipped fill child (so parent's circular clips(true) clips both checkerboard and color overlay)
+    let _ = node.box(fn(fill : view::View) -> Unit {
+      let _ = fill
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(dim)))
+        .height(view::Live::Is(Some(dim)))
+        .points(view::Live::Is(false))
+        .rects(view::Live::By(fn() -> Array[paint::Rect] {
+          let c = col_get()
+          if (c & 0xFFL) == 0xFFL {
+            [paint::rect(0.0, 0.0, dim, dim, color=c)]
+          } else {
+            let out = d_checkerboard_rects(dim, dim, tile=8.0)
+            out.push(paint::rect(0.0, 0.0, dim, dim, color=c))
+            out
+          }
+        }))
+    })
+    // Inset 1px subtle border over color
+    let _ = node.box(fn(rim : view::View) -> Unit {
+      let _ = rim
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(dim)))
+        .height(view::Live::Is(Some(dim)))
+        .points(view::Live::Is(false))
+        .corner_circular(view::Live::Is(true))
+        .radius(view::Live::Is(rad))
+        .edge(view::Live::Is((1.0, 0x0000001AL)))
+    })
+  })
+}
+
+/// Pion-JSX `<aura::ColorSwatch>` wrapper.
+pub fn ColorSwatch(
+  parent : view::View,
+  into color~ : view::Live[Int64] = .Is(0x0485F7FFL),
+  color_by? : () -> Int64,
+  size~ : AuraColorSwatchSize = AuraColorSwatchSize::Md,
+  shape~ : AuraColorSwatchShape = AuraColorSwatchShape::Circle,
+  label~ : String = "Color swatch",
+  loc~ : String = "",
+) -> view::View {
+  let c = match color_by { Some(f) => view::Live::By(f); None => color }
+  color_swatch_node(parent, c, size=size, shape=shape, label=label, loc=loc)
+}
+
+// ============================================================================
+// 10. ColorSwatchPicker (color-swatch-picker.css, wired to headless::color_swatch_picker)
+// ============================================================================
+
+fn d_parse_hex_rgba(hex : String) -> Int64 {
+  match headless_core::color_parse_hex(hex) {
+    Some(m) => m.to_rgba8()
+    None => 0x000000FFL
+  }
+}
+
+fn d_swatch_picker_border_w(size : AuraColorSwatchSize) -> Double {
+  match size {
+    AuraColorSwatchSize::Xs => 1.0
+    AuraColorSwatchSize::Sm | AuraColorSwatchSize::Md => 2.0
+    AuraColorSwatchSize::Lg | AuraColorSwatchSize::Xl => 3.0
+  }
+}
+
+/// Aura `ColorSwatchPicker` (Builder API), wired to `headless::color_swatch_picker`.
+/// Selected item shows a colored outer ring, `0.77` scaled inner swatch, and adaptive contrast checkmark.
+pub fn color_swatch_picker_node(
+  parent : view::View,
+  colors : Array[String],
+  selected : () -> Option[String],
+  on_select : (String) -> Unit,
+  size~ : AuraColorSwatchSize = AuraColorSwatchSize::Md,
+  shape~ : AuraColorSwatchShape = AuraColorSwatchShape::Circle,
+  columns~ : Int = 6,
+  gap~ : Double = 8.0,
+  label~ : String = "Color swatches",
+  disabled~ : () -> Bool = fn() { false },
+  loc~ : String = "",
+) -> view::View {
+  let dim = d_swatch_dim(size)
+  let bw = d_swatch_picker_border_w(size)
+  let inner_dim = dim - bw * 2.0
+  let item_rad = match shape {
+    AuraColorSwatchShape::Circle => dim * 0.5
+    AuraColorSwatchShape::Square => if size is AuraColorSwatchSize::Xs { 6.0 } else if size is AuraColorSwatchSize::Sm { 8.0 } else { 12.0 }
+  }
+  let inner_rad = match shape {
+    AuraColorSwatchShape::Circle => inner_dim * 0.5
+    AuraColorSwatchShape::Square => if size is AuraColorSwatchSize::Xs { 4.0 } else { 8.0 }
+  }
+  let check_sz = dim / 3.0
+
+  headless::color_swatch_picker(
+    parent,
+    fn() -> String { label },
+    selected,
+    on_select,
+    fn(root : view::View, sp : headless::ColorSwatchPicker) -> Unit {
+      let _ = root
+        .row(view::Live::Is(true))
+        .wrap_on(line_gap=gap)
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .gap(view::Live::Is(gap))
+      for hex in colors {
+        let rgba = d_parse_hex_rgba(hex)
+        let light_swatch = d_is_light_color(rgba)
+        let _ = sp.swatch(
+          root,
+          hex,
+          fn() -> String { hex },
+          fn(item : view::View, is_sel : () -> Bool) -> Unit {
+            let _ = item
+              .row(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .lies_along(view::Live::Is(view::Lies::Middle))
+              .width(view::Live::Is(Some(dim)))
+              .height(view::Live::Is(Some(dim)))
+              .shrink(view::Live::Is(0.0))
+              .corner_circular(view::Live::Is(true))
+              .radius(view::Live::Is(item_rad))
+              .edge(view::Live::By(fn() -> (Double, Int64) {
+                if is_sel() { (bw, rgba) } else { (0.0, 0L) }
+              }))
+              .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+                if is_sel() { aura_surface_shadows(aura_theme(item).config.dark) } else { [] }
+              }))
+              .group_alpha(view::Live::By(fn() -> Double {
+                if disabled() { aura_theme(item).disabled_opacity } else { 1.0 }
+              }))
+            let _ = w0_apply_control_focus_ring(item)
+            // Inner swatch (scales to 0.77 when selected to reveal gap)
+            let _ = item.box(fn(sw : view::View) -> Unit {
+              let _ = sw
+                .width(view::Live::Is(Some(inner_dim)))
+                .height(view::Live::Is(Some(inner_dim)))
+                .shrink(view::Live::Is(0.0))
+                .points(view::Live::Is(false))
+                .corner_circular(view::Live::Is(true))
+                .radius(view::Live::Is(inner_rad))
+                .clips(view::Live::Is(true))
+                .scale(view::Live::By(fn() -> Double { if is_sel() { 0.77 } else { 1.0 } }))
+                .ground(view::Live::Is(rgba))
+            })
+            // Selected checkmark indicator
+            let _ = item.box(fn(ind : view::View) -> Unit {
+              let _ = ind
+                .over(view::Live::Is(true))
+                .row(view::Live::Is(true))
+                .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                .lies_along(view::Live::Is(view::Lies::Middle))
+                .points(view::Live::Is(false))
+              let _ = ind.show(is_sel, fn(chk_host : view::View) -> Unit {
+                let _ = aura_icon_node(
+                  chk_host,
+                  AuraIconKind::Check,
+                  size=check_sz,
+                  ink=fn() -> Int64 { if light_swatch { 0x000000FFL } else { 0xFFFFFFFFL } },
+                )
+              })
+            })
+          },
+        )
+      }
+    },
+    columns=columns,
+    disabled=disabled,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::ColorSwatchPicker>` wrapper.
+pub fn ColorSwatchPicker(
+  parent : view::View,
+  colors~ : Array[String] = [],
+  selected~ : () -> Option[String] = fn() { None },
+  on_select~ : (String) -> Unit = fn(_s : String) { () },
+  size~ : AuraColorSwatchSize = AuraColorSwatchSize::Md,
+  shape~ : AuraColorSwatchShape = AuraColorSwatchShape::Circle,
+  columns~ : Int = 6,
+  gap~ : Double = 8.0,
+  label~ : String = "Color swatches",
+  disabled~ : () -> Bool = fn() { false },
+  loc~ : String = "",
+) -> view::View {
+  color_swatch_picker_node(
+    parent,
+    colors,
+    selected,
+    on_select,
+    size=size,
+    shape=shape,
+    columns=columns,
+    gap=gap,
+    label=label,
+    disabled=disabled,
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 11. ColorArea (color-area.css, wired to headless::color_area)
+// ============================================================================
+
+/// Mount one pure-GPU horizontal 2-stop gradient segment (`left_color` -> `right_color`)
+/// of fixed width `seg_w` and height `seg_h` using `View::fades` (zero CPU pixel/PNG encoding).
+fn d_area_gpu_seg(
+  parent : view::View,
+  seg_w : Double,
+  seg_h : Double,
+  left_color : view::Live[Int64],
+  right_color : view::Live[Int64],
+) -> Unit {
+  let _ = parent.box(fn(seg : view::View) -> Unit {
+    let _ = seg
+      .width(view::Live::Is(Some(seg_w)))
+      .height(view::Live::Is(Some(seg_h)))
+      .shrink(view::Live::Is(0.0))
+      .points(view::Live::Is(false))
+      .ground(right_color)
+    let _ = seg.box(fn(fade_wrap : view::View) -> Unit {
+      let _ = fade_wrap
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(seg_w)))
+        .height(view::Live::Is(Some(seg_h)))
+        .points(view::Live::Is(false))
+        .fades(view::Live::Is((0.0, 0.0, seg_w, 0.0)))
+      let _ = fade_wrap.box(fn(fill : view::View) -> Unit {
+        let _ = fill
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(seg_w)))
+          .height(view::Live::Is(Some(seg_h)))
+          .points(view::Live::Is(false))
+          .ground(left_color)
+      })
+    })
+  })
+}
+
+/// Mount one pure-GPU vertical 2-stop gradient segment (`top_color` -> `bottom_color`).
+fn d_area_gpu_seg_v(
+  parent : view::View,
+  seg_w : Double,
+  seg_h : Double,
+  top_color : view::Live[Int64],
+  bottom_color : view::Live[Int64],
+) -> Unit {
+  let _ = parent.box(fn(seg : view::View) -> Unit {
+    let _ = seg
+      .width(view::Live::Is(Some(seg_w)))
+      .height(view::Live::Is(Some(seg_h)))
+      .shrink(view::Live::Is(0.0))
+      .points(view::Live::Is(false))
+      .ground(bottom_color)
+    let _ = seg.box(fn(fade_wrap : view::View) -> Unit {
+      let _ = fade_wrap
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(seg_w)))
+        .height(view::Live::Is(Some(seg_h)))
+        .points(view::Live::Is(false))
+        .fades(view::Live::Is((0.0, 0.0, 0.0, seg_h)))
+      let _ = fade_wrap.box(fn(fill : view::View) -> Unit {
+        let _ = fill
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(seg_w)))
+          .height(view::Live::Is(Some(seg_h)))
+          .points(view::Live::Is(false))
+          .ground(top_color)
+      })
+    })
+  })
+}
+
+/// Mount a single solid overlay fading from `alpha=1` at `(x0, y0)` to `alpha=0` at `(x1, y1)`.
+fn d_area_fade_overlay(
+  plane : view::View,
+  ox : Double,
+  oy : Double,
+  w : Double,
+  h : Double,
+  x0 : Double,
+  y0 : Double,
+  x1 : Double,
+  y1 : Double,
+  col : view::Live[Int64],
+) -> Unit {
+  let _ = plane.box(fn(wrap : view::View) -> Unit {
+    let _ = wrap
+      .over(view::Live::Is(true), edges=(Some(ox), Some(oy), None, None))
+      .width(view::Live::Is(Some(w)))
+      .height(view::Live::Is(Some(h)))
+      .points(view::Live::Is(false))
+      .fades(view::Live::Is((x0, y0, x1, y1)))
+    let _ = wrap.box(fn(fill : view::View) -> Unit {
+      let _ = fill
+        .over(view::Live::Is(true))
+        .width(view::Live::Is(Some(w)))
+        .height(view::Live::Is(Some(h)))
+        .points(view::Live::Is(false))
+        .ground(col)
+    })
+  })
+}
+
+/// Mount a horizontal 6-segment Hue strip (`0°..360°`) with colors supplied by `hue_col(deg)`.
+fn d_area_hue_row(plane : view::View, size : Double, hue_col : (Double) -> Int64) -> Unit {
+  let seg_w = size / 6.0
+  let _ = plane.box(fn(row : view::View) -> Unit {
+    let _ = row
+      .over(view::Live::Is(true))
+      .row(view::Live::Is(true))
+      .width(view::Live::Is(Some(size)))
+      .height(view::Live::Is(Some(size)))
+      .points(view::Live::Is(false))
+    let mut sx = 0
+    while sx < 6 {
+      let h0 = sx.to_double() * 60.0
+      let h1 = (sx + 1).to_double() * 60.0
+      d_area_gpu_seg(
+        row,
+        seg_w,
+        size,
+        view::Live::By(fn() -> Int64 { hue_col(h0) }),
+        view::Live::By(fn() -> Int64 { hue_col(h1) }),
+      )
+      sx += 1
+    }
+  })
+}
+
+/// Mount a vertical 6-segment Hue column (`360°` top -> `0°` bottom) with colors supplied by `hue_col(deg)`.
+fn d_area_hue_col(plane : view::View, size : Double, hue_col : (Double) -> Int64) -> Unit {
+  let seg_h = size / 6.0
+  let _ = plane.box(fn(col : view::View) -> Unit {
+    let _ = col
+      .over(view::Live::Is(true))
+      .width(view::Live::Is(Some(size)))
+      .height(view::Live::Is(Some(size)))
+      .points(view::Live::Is(false))
+    let mut sy = 0
+    while sy < 6 {
+      let h_top = 360.0 - sy.to_double() * 60.0
+      let h_bot = 360.0 - (sy + 1).to_double() * 60.0
+      d_area_gpu_seg_v(
+        col,
+        size,
+        seg_h,
+        view::Live::By(fn() -> Int64 { hue_col(h_top) }),
+        view::Live::By(fn() -> Int64 { hue_col(h_bot) }),
+      )
+      sy += 1
+    }
+  })
+}
+
+/// Exact W3C HSL vertical Lightness overlay (`L=1` white at top, `L=0.5` transparent at middle, `L=0` black at bottom).
+fn d_area_hsl_l_overlay_v(plane : view::View, size : Double) -> Unit {
+  let half = size * 0.5
+  d_area_fade_overlay(plane, 0.0, 0.0, size, half, 0.0, 0.0, 0.0, half, view::Live::Is(0xFFFFFFFFL))
+  d_area_fade_overlay(plane, 0.0, half, size, half, 0.0, half, 0.0, 0.0, view::Live::Is(0x000000FFL))
+}
+
+/// Exact W3C HSL horizontal Lightness overlay (`L=0` black at left, `L=0.5` transparent at middle, `L=1` white at right).
+fn d_area_hsl_l_overlay_h(plane : view::View, size : Double) -> Unit {
+  let half = size * 0.5
+  d_area_fade_overlay(plane, 0.0, 0.0, half, size, 0.0, 0.0, half, 0.0, view::Live::Is(0x000000FFL))
+  d_area_fade_overlay(plane, half, 0.0, half, size, half, 0.0, 0.0, 0.0, view::Live::Is(0xFFFFFFFFL))
+}
+
+fn d_area_opaque_rgba(
+  base : headless_core::ColorModel,
+  x_ch : headless_core::ColorChannel,
+  y_ch : headless_core::ColorChannel,
+  tx : Double,
+  ty : Double,
+) -> Int64 {
+  let m = base.with_channel_norm(y_ch, ty).with_channel_norm(x_ch, tx)
+  (m.to_rgba8() & 0xFFFFFF00L) | 0xFFL
+}
+
+fn d_area_hsl_opaque(h : Double, s : Double, l : Double) -> Int64 {
+  (headless_core::ColorModel::from_hsla(h, s, l).to_rgba8() & 0xFFFFFF00L) | 0xFFL
+}
+
+fn d_area_hsv_opaque(h : Double, s : Double, v : Double) -> Int64 {
+  (headless_core::ColorModel::from_hsva(h, s, v).to_rgba8() & 0xFFFFFF00L) | 0xFFL
+}
+
+/// Aura `ColorArea` 2D color plane (Builder API), wired to `headless::color_area`.
+/// Renders 100% on GPU with zero CPU PNG encoding across all color spaces:
+/// - HSV (`Saturation` × `Brightness` and Hue/S/B pairs): exact algebraic pure-GPU `fades` (~7–16 instances).
+/// - HSL (`Hue × Lightness`, `Hue × HslSaturation`, `HslSaturation × Lightness` & axis swaps):
+///   exact W3C HSL algebraic pure-GPU `fades` (~8–16 instances, 0 CPU PNG, 0 quantization error).
+/// - RGB / arbitrary `(x_channel, y_channel)`: 64 integer-aligned horizontal pure-GPU `fades` strips.
+pub fn color_area_node(
+  parent : view::View,
+  model : () -> headless_core::ColorModel,
+  on_change : (headless_core::ColorModel) -> Unit,
+  x_channel~ : headless_core::ColorChannel = headless_core::ColorChannel::Saturation,
+  y_channel~ : headless_core::ColorChannel = headless_core::ColorChannel::Brightness,
+  size~ : Double = 224.0,
+  label~ : String = "Color area",
+  disabled~ : () -> Bool = fn() { false },
+  loc~ : String = "",
+) -> view::View {
+  let is_hsv_sb = x_channel == headless_core::ColorChannel::Saturation && y_channel == headless_core::ColorChannel::Brightness
+  let is_hsl_hl = x_channel == headless_core::ColorChannel::Hue && y_channel == headless_core::ColorChannel::Lightness
+  let is_hsl_lh = x_channel == headless_core::ColorChannel::Lightness && y_channel == headless_core::ColorChannel::Hue
+  let is_hsl_hs = x_channel == headless_core::ColorChannel::Hue && y_channel == headless_core::ColorChannel::HslSaturation
+  let is_hsl_sh = x_channel == headless_core::ColorChannel::HslSaturation && y_channel == headless_core::ColorChannel::Hue
+  let is_hsl_sl = x_channel == headless_core::ColorChannel::HslSaturation && y_channel == headless_core::ColorChannel::Lightness
+  let is_hsl_ls = x_channel == headless_core::ColorChannel::Lightness && y_channel == headless_core::ColorChannel::HslSaturation
+  let is_hsv_hs = x_channel == headless_core::ColorChannel::Hue && y_channel == headless_core::ColorChannel::Saturation
+  let is_hsv_hb = x_channel == headless_core::ColorChannel::Hue && y_channel == headless_core::ColorChannel::Brightness
+  let thumb_d = 16.0
+  let rad = 16.0
+
+  headless::color_area(
+    parent,
+    fn() -> String { label },
+    x_channel,
+    y_channel,
+    model,
+    on_change,
+    fn(root : view::View, ca : headless::ColorArea) -> Unit {
+      let _ = root
+        .width(view::Live::Is(Some(size)))
+        .height(view::Live::Is(Some(size)))
+        .shrink(view::Live::Is(0.0))
+        .corner_circular(view::Live::Is(true))
+        .radius(view::Live::Is(rad))
+        .group_alpha(view::Live::By(fn() -> Double {
+          if disabled() { aura_theme(root).disabled_opacity } else { 1.0 }
+        }))
+      // Clipped gradient plane
+      let _ = root.box(fn(plane : view::View) -> Unit {
+        let _ = plane
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(size)))
+          .height(view::Live::Is(Some(size)))
+          .corner_circular(view::Live::Is(true))
+          .radius(view::Live::Is(rad))
+          .clips(view::Live::Is(true))
+          .points(view::Live::Is(false))
+        if is_hsv_sb {
+          // Base pure hue + white left-to-right fade + black bottom-to-top fade = exact HSV S/B
+          let _ = plane.ground(view::Live::By(fn() -> Int64 {
+            let m = model()
+            headless_core::ColorModel::from_hsva(m.h, 1.0, 1.0).to_rgba8()
+          }))
+          d_area_fade_overlay(plane, 0.0, 0.0, size, size, 0.0, 0.0, size, 0.0, view::Live::Is(0xFFFFFFFFL))
+          d_area_fade_overlay(plane, 0.0, 0.0, size, size, 0.0, size, 0.0, 0.0, view::Live::Is(0x000000FFL))
+        } else if is_hsl_hl {
+          // Exact W3C HSL Hue × Lightness: 6-seg Hue at (S=s, L=0.5) + top white fade + bottom black fade (~16 instances).
+          d_area_hue_row(plane, size, fn(deg : Double) -> Int64 {
+            let (_, sl, _, _) = model().to_hsla()
+            d_area_hsl_opaque(deg, sl, 0.5)
+          })
+          d_area_hsl_l_overlay_v(plane, size)
+        } else if is_hsl_lh {
+          // Exact W3C HSL Lightness × Hue: 6-seg vertical Hue at (S=s, L=0.5) + left black fade + right white fade.
+          d_area_hue_col(plane, size, fn(deg : Double) -> Int64 {
+            let (_, sl, _, _) = model().to_hsla()
+            d_area_hsl_opaque(deg, sl, 0.5)
+          })
+          d_area_hsl_l_overlay_h(plane, size)
+        } else if is_hsl_hs {
+          // Exact W3C HSL Hue × HslSaturation: 6-seg Hue at (S=1, L=l) + vertical neutral gray (l,l,l) fade.
+          d_area_hue_row(plane, size, fn(deg : Double) -> Int64 {
+            let (_, _, l, _) = model().to_hsla()
+            d_area_hsl_opaque(deg, 1.0, l)
+          })
+          d_area_fade_overlay(plane, 0.0, 0.0, size, size, 0.0, size, 0.0, 0.0, view::Live::By(fn() -> Int64 {
+            let (_, _, l, _) = model().to_hsla()
+            d_area_hsl_opaque(0.0, 0.0, l)
+          }))
+        } else if is_hsl_sh {
+          // Exact W3C HSL HslSaturation × Hue: 6-seg vertical Hue at (S=1, L=l) + horizontal neutral gray fade.
+          d_area_hue_col(plane, size, fn(deg : Double) -> Int64 {
+            let (_, _, l, _) = model().to_hsla()
+            d_area_hsl_opaque(deg, 1.0, l)
+          })
+          d_area_fade_overlay(plane, 0.0, 0.0, size, size, 0.0, 0.0, size, 0.0, view::Live::By(fn() -> Int64 {
+            let (_, _, l, _) = model().to_hsla()
+            d_area_hsl_opaque(0.0, 0.0, l)
+          }))
+        } else if is_hsl_sl {
+          // Exact W3C HSL HslSaturation × Lightness: 1 horizontal segment (gray -> pure hue at L=0.5) + vertical L overlay.
+          d_area_gpu_seg(
+            plane,
+            size,
+            size,
+            view::Live::Is(0x808080FFL),
+            view::Live::By(fn() -> Int64 { d_area_hsl_opaque(model().h, 1.0, 0.5) }),
+          )
+          d_area_hsl_l_overlay_v(plane, size)
+        } else if is_hsl_ls {
+          // Exact W3C HSL Lightness × HslSaturation: 1 vertical segment + horizontal L overlay.
+          d_area_gpu_seg_v(
+            plane,
+            size,
+            size,
+            view::Live::By(fn() -> Int64 { d_area_hsl_opaque(model().h, 1.0, 0.5) }),
+            view::Live::Is(0x808080FFL),
+          )
+          d_area_hsl_l_overlay_h(plane, size)
+        } else if is_hsv_hs {
+          // Exact HSV Hue × Saturation: 6-seg Hue at (S=1, V=v) + vertical gray (v,v,v) fade.
+          d_area_hue_row(plane, size, fn(deg : Double) -> Int64 {
+            d_area_hsv_opaque(deg, 1.0, model().v)
+          })
+          d_area_fade_overlay(plane, 0.0, 0.0, size, size, 0.0, size, 0.0, 0.0, view::Live::By(fn() -> Int64 {
+            d_area_hsv_opaque(0.0, 0.0, model().v)
+          }))
+        } else if is_hsv_hb {
+          // Exact HSV Hue × Brightness: 6-seg Hue at (S=s, V=1) + vertical black fade.
+          d_area_hue_row(plane, size, fn(deg : Double) -> Int64 {
+            d_area_hsv_opaque(deg, model().s, 1.0)
+          })
+          d_area_fade_overlay(plane, 0.0, 0.0, size, size, 0.0, size, 0.0, 0.0, view::Live::Is(0x000000FFL))
+        } else {
+          // Pure-GPU RGB / arbitrary channel pair: 64 integer-aligned horizontal GPU gradient strips.
+          let n_strips = 64
+          let n_x_segs = if x_channel == headless_core::ColorChannel::Hue {
+            6
+          } else if x_channel == headless_core::ColorChannel::Lightness {
+            2
+          } else {
+            1
+          }
+          let mut iy = 0
+          while iy < n_strips {
+            let y0 = (size * iy.to_double() / n_strips.to_double()).round()
+            let y1 = (size * (iy + 1).to_double() / n_strips.to_double()).round()
+            if y1 <= y0 {
+              iy += 1
+              continue
+            }
+            let sh = (y1 - y0) + (if iy + 1 < n_strips { 1.0 } else { 0.0 })
+            let ty = if size > 1.0 {
+              d_clamp01(1.0 - (y0 + (y1 - y0) * 0.5) / size)
+            } else {
+              1.0 - iy.to_double() / (n_strips - 1).to_double()
+            }
+            if n_x_segs == 1 {
+              let _ = plane.box(fn(strip : view::View) -> Unit {
+                let _ = strip
+                  .over(view::Live::Is(true), edges=(Some(0.0), Some(y0), None, None))
+                  .width(view::Live::Is(Some(size)))
+                  .height(view::Live::Is(Some(sh)))
+                  .points(view::Live::Is(false))
+                  .ground(view::Live::By(fn() -> Int64 {
+                    d_area_opaque_rgba(model(), x_channel, y_channel, 1.0, ty)
+                  }))
+                let _ = strip.box(fn(fade_wrap : view::View) -> Unit {
+                  let _ = fade_wrap
+                    .over(view::Live::Is(true))
+                    .width(view::Live::Is(Some(size)))
+                    .height(view::Live::Is(Some(sh)))
+                    .points(view::Live::Is(false))
+                    .fades(view::Live::Is((0.0, 0.0, size, 0.0)))
+                  let _ = fade_wrap.box(fn(fill : view::View) -> Unit {
+                    let _ = fill
+                      .over(view::Live::Is(true))
+                      .width(view::Live::Is(Some(size)))
+                      .height(view::Live::Is(Some(sh)))
+                      .points(view::Live::Is(false))
+                      .ground(view::Live::By(fn() -> Int64 {
+                        d_area_opaque_rgba(model(), x_channel, y_channel, 0.0, ty)
+                      }))
+                  })
+                })
+              })
+            } else {
+              let seg_w = size / n_x_segs.to_double()
+              let _ = plane.box(fn(strip_row : view::View) -> Unit {
+                let _ = strip_row
+                  .over(view::Live::Is(true), edges=(Some(0.0), Some(y0), None, None))
+                  .row(view::Live::Is(true))
+                  .width(view::Live::Is(Some(size)))
+                  .height(view::Live::Is(Some(sh)))
+                  .points(view::Live::Is(false))
+                let mut sx = 0
+                while sx < n_x_segs {
+                  let tx0 = sx.to_double() / n_x_segs.to_double()
+                  let tx1 = (sx + 1).to_double() / n_x_segs.to_double()
+                  d_area_gpu_seg(
+                    strip_row,
+                    seg_w,
+                    sh,
+                    view::Live::By(fn() -> Int64 {
+                      d_area_opaque_rgba(model(), x_channel, y_channel, tx0, ty)
+                    }),
+                    view::Live::By(fn() -> Int64 {
+                      d_area_opaque_rgba(model(), x_channel, y_channel, tx1, ty)
+                    }),
+                  )
+                  sx += 1
+                }
+              })
+            }
+            iy += 1
+          }
+        }
+        // Inset 1px subtle border over plane
+        let _ = plane.box(fn(rim : view::View) -> Unit {
+          let _ = rim
+            .over(view::Live::Is(true))
+            .width(view::Live::Is(Some(size)))
+            .height(view::Live::Is(Some(size)))
+            .points(view::Live::Is(false))
+            .corner_circular(view::Live::Is(true))
+            .radius(view::Live::Is(rad))
+            .edge(view::Live::Is((1.0, 0x0000001AL)))
+        })
+      })
+      // Draggable circular thumb (size-4 = 16pt, border: 3px solid white, subtle outer ring)
+      let _ = root.box(fn(thumb_layer : view::View) -> Unit {
+        let _ = thumb_layer
+          .over(view::Live::Is(true))
+          .width(view::Live::Is(Some(size)))
+          .height(view::Live::Is(Some(size)))
+          .points(view::Live::Is(false))
+        let _ = thumb_layer.box(fn(thumb : view::View) -> Unit {
+          let _ = thumb
+            .width(view::Live::Is(Some(thumb_d)))
+            .height(view::Live::Is(Some(thumb_d)))
+            .shrink(view::Live::Is(0.0))
+            .points(view::Live::Is(false))
+            .corner_circular(view::Live::Is(true))
+            .radius(view::Live::Is(thumb_d * 0.5))
+            .ground(view::Live::By(fn() -> Int64 {
+              let c = model().to_rgba8()
+              (c & 0xFFFFFF00L) | 0xFFL
+            }))
+            .edge(view::Live::Is((3.0, 0xFFFFFFFFL)))
+            .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+              if root.focus_shown() {
+                let th = aura_theme(root)
+                (2.0, th.ring_offset_width, th.palette.focus)
+              } else {
+                (1.0, 0.0, 0x0000001AL)
+              }
+            }))
+            .ring_gap_color(view::Live::By(fn() -> Int64 {
+              if root.focus_shown() { aura_theme(root).palette.background } else { 0L }
+            }))
+            .margin(view::Live::By(fn() -> (Double, Double, Double, Double) {
+              let tx = ca.x_norm() * size - thumb_d * 0.5
+              let ty = (1.0 - ca.y_norm()) * size - thumb_d * 0.5
+              (tx, ty, 0.0, 0.0)
+            }))
+        })
+      })
+    },
+    disabled=disabled,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::ColorArea>` wrapper.
+pub fn ColorArea(
+  parent : view::View,
+  model~ : () -> headless_core::ColorModel,
+  on_change~ : (headless_core::ColorModel) -> Unit = fn(_m : headless_core::ColorModel) { () },
+  x_channel~ : headless_core::ColorChannel = headless_core::ColorChannel::Saturation,
+  y_channel~ : headless_core::ColorChannel = headless_core::ColorChannel::Brightness,
+  size~ : Double = 224.0,
+  label~ : String = "Color area",
+  disabled~ : () -> Bool = fn() { false },
+  loc~ : String = "",
+) -> view::View {
+  color_area_node(
+    parent,
+    model,
+    on_change,
+    x_channel=x_channel,
+    y_channel=y_channel,
+    size=size,
+    label=label,
+    disabled=disabled,
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 12. ColorSlider (color-slider.css, wired to headless::color_slider)
+// ============================================================================
+
+fn d_slider_output_text(channel : headless_core::ColorChannel, m : headless_core::ColorModel) -> String {
+  match channel {
+    headless_core::ColorChannel::Hue => "\{m.channel(channel).round().to_int()}°"
+    headless_core::ColorChannel::Alpha
+    | headless_core::ColorChannel::Saturation
+    | headless_core::ColorChannel::Brightness
+    | headless_core::ColorChannel::HslSaturation
+    | headless_core::ColorChannel::Lightness => "\{(m.channel(channel) * 100.0).round().to_int()}%"
+    headless_core::ColorChannel::Red
+    | headless_core::ColorChannel::Green
+    | headless_core::ColorChannel::Blue => "\{m.channel(channel).round().to_int()}"
+  }
+}
+
+fn d_slider_color_at(channel : headless_core::ColorChannel, base : headless_core::ColorModel, t : Double) -> Int64 {
+  let tc = d_clamp01(t)
+  match channel {
+    headless_core::ColorChannel::Hue =>
+      headless_core::ColorModel::from_hsva(tc * 360.0, 1.0, 1.0).to_rgba8()
+    headless_core::ColorChannel::Alpha => {
+      let c = base.to_rgba8()
+      d_with_alpha(c, tc)
+    }
+    _ => {
+      let m2 = base.with_channel_norm(channel, tc)
+      (m2.to_rgba8() & 0xFFFFFF00L) | 0xFFL
+    }
+  }
+}
+
+/// Mount one pure-GPU horizontal 2-stop gradient segment (`left_color` -> `right_color`)
+/// using `View::fades` (zero CPU pixel/PNG encoding).
+fn d_slider_gpu_seg(
+  parent : view::View,
+  track_h : Double,
+  left_color : view::Live[Int64],
+  right_color : view::Live[Int64],
+) -> Unit {
+  let _ = parent.box(fn(seg : view::View) -> Unit {
+    let _ = seg
+      .grow(view::Live::Is(1.0))
+      .shrink(view::Live::Is(1.0))
+      .basis(view::Live::Is(Some(0.0)))
+      .height(view::Live::Is(Some(track_h)))
+      .points(view::Live::Is(false))
+      .ground(right_color)
+    let _ = seg.box(fn(fade_wrap : view::View) -> Unit {
+      let _ = fade_wrap
+        .over(view::Live::Is(true))
+        .points(view::Live::Is(false))
+        .fades(view::Live::By(fn() -> (Double, Double, Double, Double) {
+          let w = match seg.laid_size_told() {
+            Some((sw, _)) => if sw > 0.0 { sw } else { 1.0 }
+            None => 1.0
+          }
+          (0.0, 0.0, w, 0.0)
+        }))
+      let _ = fade_wrap.box(fn(fill : view::View) -> Unit {
+        let _ = fill
+          .over(view::Live::Is(true))
+          .points(view::Live::Is(false))
+          .ground(left_color)
+      })
+    })
+  })
+}
+
+/// Center-aligned 8x8pt `#EFEFEF` checkerboard tiles over `#F7F7F7` for the Alpha slider track.
+fn d_alpha_checker_rects(w : Double, h : Double) -> Array[paint::Rect] {
+  if !(w > 0.0 && h > 0.0) {
+    return []
+  }
+  let tile = 8.0
+  let cx = w * 0.5
+  let cy = h * 0.5
+  let ix0 = ((-cx) / tile).floor().to_int()
+  let ix1 = ((w - cx) / tile).ceil().to_int()
+  let iy0 = ((-cy) / tile).floor().to_int()
+  let iy1 = ((h - cy) / tile).ceil().to_int()
+  let out : Array[paint::Rect] = []
+  let mut iy = iy0
+  while iy < iy1 {
+    let y0 = d_clamp(cy + iy.to_double() * tile, 0.0, h)
+    let y1 = d_clamp(cy + (iy + 1).to_double() * tile, 0.0, h)
+    if y1 > y0 {
+      let mut ix = ix0
+      while ix < ix1 {
+        if ((ix + iy) % 2 + 2) % 2 == 1 {
+          let x0 = d_clamp(cx + ix.to_double() * tile, 0.0, w)
+          let x1 = d_clamp(cx + (ix + 1).to_double() * tile, 0.0, w)
+          if x1 > x0 {
+            out.push(paint::rect(x0, y0, x1 - x0, y1 - y0, color=0xEFEFEFFFL))
+          }
+        }
+        ix += 1
+      }
+    }
+    iy += 1
+  }
+  out
+}
+
+/// Mount the pure-GPU track gradient for `ColorSlider` (zero PNG encoding, 0ms CPU).
+fn d_mount_slider_gpu_bar(
+  bar : view::View,
+  channel : headless_core::ColorChannel,
+  model : () -> headless_core::ColorModel,
+  track_h : Double,
+  cap_w : Double,
+) -> Unit {
+  if channel == headless_core::ColorChannel::Alpha {
+    // Base #F7F7F7 + center-aligned 8x8 #EFEFEF checkerboard
+    let _ = bar
+      .ground(view::Live::Is(0xF7F7F7FFL))
+      .rects(view::Live::By(fn() -> Array[paint::Rect] {
+        match bar.laid_size_told() {
+          Some((bw, bh)) => d_alpha_checker_rects(bw, bh)
+          None => []
+        }
+      }))
+    let _ = bar.box(fn(row : view::View) -> Unit {
+      let _ = row
+        .over(view::Live::Is(true))
+        .row(view::Live::Is(true))
+        .points(view::Live::Is(false))
+      // Left 10pt transparent cap (pure checkerboard)
+      let _ = row.box(fn(lcap : view::View) -> Unit {
+        let _ = lcap.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false))
+      })
+      // Middle flex span: transparent (left) -> opaque base RGB (right) via left-fade
+      let _ = row.box(fn(mid : view::View) -> Unit {
+        let _ = mid
+          .grow(view::Live::Is(1.0))
+          .shrink(view::Live::Is(1.0))
+          .basis(view::Live::Is(Some(0.0)))
+          .height(view::Live::Is(Some(track_h)))
+          .points(view::Live::Is(false))
+        let _ = mid.box(fn(fade_wrap : view::View) -> Unit {
+          let _ = fade_wrap
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .fades(view::Live::By(fn() -> (Double, Double, Double, Double) {
+              let w = match mid.laid_size_told() {
+                Some((mw, _)) => if mw > 0.0 { mw } else { 1.0 }
+                None => 1.0
+              }
+              (w, 0.0, 0.0, 0.0)
+            }))
+          let _ = fade_wrap.box(fn(fill : view::View) -> Unit {
+            let _ = fill
+              .over(view::Live::Is(true))
+              .points(view::Live::Is(false))
+              .ground(view::Live::By(fn() -> Int64 {
+                (model().to_rgba8() & 0xFFFFFF00L) | 0xFFL
+              }))
+          })
+        })
+      })
+      // Right 10pt opaque color cap
+      let _ = row.box(fn(rcap : view::View) -> Unit {
+        let _ = rcap
+          .width(view::Live::Is(Some(cap_w)))
+          .height(view::Live::Is(Some(track_h)))
+          .shrink(view::Live::Is(0.0))
+          .points(view::Live::Is(false))
+          .ground(view::Live::By(fn() -> Int64 {
+            (model().to_rgba8() & 0xFFFFFF00L) | 0xFFL
+          }))
+      })
+    })
+    return
+  }
+
+  let _ = bar.box(fn(row : view::View) -> Unit {
+    let _ = row
+      .over(view::Live::Is(true))
+      .row(view::Live::Is(true))
+      .points(view::Live::Is(false))
+    match channel {
+      headless_core::ColorChannel::Hue => {
+        // Left 10pt red cap + 6 equal 60deg GPU fade segments + right 10pt red cap
+        let _ = row.box(fn(c : view::View) -> Unit {
+          let _ = c.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false)).ground(view::Live::Is(0xFF0000FFL))
+        })
+        d_slider_gpu_seg(row, track_h, view::Live::Is(0xFF0000FFL), view::Live::Is(0xFFFF00FFL))
+        d_slider_gpu_seg(row, track_h, view::Live::Is(0xFFFF00FFL), view::Live::Is(0x00FF00FFL))
+        d_slider_gpu_seg(row, track_h, view::Live::Is(0x00FF00FFL), view::Live::Is(0x00FFFFFFL))
+        d_slider_gpu_seg(row, track_h, view::Live::Is(0x00FFFFFFL), view::Live::Is(0x0000FFFFL))
+        d_slider_gpu_seg(row, track_h, view::Live::Is(0x0000FFFFL), view::Live::Is(0xFF00FFFFL))
+        d_slider_gpu_seg(row, track_h, view::Live::Is(0xFF00FFFFL), view::Live::Is(0xFF0000FFL))
+        let _ = row.box(fn(c : view::View) -> Unit {
+          let _ = c.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false)).ground(view::Live::Is(0xFF0000FFL))
+        })
+      }
+      headless_core::ColorChannel::Lightness => {
+        // Left cap + 2-segment 3-stop GPU fade (0 -> 0.5 -> 1) + right cap
+        let c0 = view::Live::By(fn() -> Int64 { d_slider_color_at(channel, model(), 0.0) })
+        let c5 = view::Live::By(fn() -> Int64 { d_slider_color_at(channel, model(), 0.5) })
+        let c1 = view::Live::By(fn() -> Int64 { d_slider_color_at(channel, model(), 1.0) })
+        let _ = row.box(fn(c : view::View) -> Unit {
+          let _ = c.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false)).ground(c0)
+        })
+        d_slider_gpu_seg(row, track_h, c0, c5)
+        d_slider_gpu_seg(row, track_h, c5, c1)
+        let _ = row.box(fn(c : view::View) -> Unit {
+          let _ = c.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false)).ground(c1)
+        })
+      }
+      _ => {
+        // Red / Green / Blue / Saturation / Brightness / HslSaturation: left cap + 2-stop GPU fade + right cap
+        let c0 = view::Live::By(fn() -> Int64 { d_slider_color_at(channel, model(), 0.0) })
+        let c1 = view::Live::By(fn() -> Int64 { d_slider_color_at(channel, model(), 1.0) })
+        let _ = row.box(fn(c : view::View) -> Unit {
+          let _ = c.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false)).ground(c0)
+        })
+        d_slider_gpu_seg(row, track_h, c0, c1)
+        let _ = row.box(fn(c : view::View) -> Unit {
+          let _ = c.width(view::Live::Is(Some(cap_w))).height(view::Live::Is(Some(track_h))).shrink(view::Live::Is(0.0)).points(view::Live::Is(false)).ground(c1)
+        })
+      }
+    }
+  })
+}
+
+/// Aura `ColorSlider` (Builder API), wired to `headless::color_slider`.
+/// Renders Hue rainbow, Alpha checkerboard gradient, or RGB/HSL/HSV channel bar with end caps and thumb.
+pub fn color_slider_node(
+  parent : view::View,
+  channel : headless_core::ColorChannel,
+  model : () -> headless_core::ColorModel,
+  on_change : (headless_core::ColorModel) -> Unit,
+  label~ : String = "",
+  show_output~ : Bool = true,
+  output_text? : (headless_core::ColorModel) -> String,
+  disabled~ : () -> Bool = fn() { false },
+  loc~ : String = "",
+) -> view::View {
+  let track_h = 20.0
+  let cap_w = 10.0
+  let thumb_d = 16.0
+
+  parent.box(loc=loc, fn(outer : view::View) -> Unit {
+    let _ = outer
+      .fills_across(view::Live::Is(true))
+      .gap(view::Live::Is(4.0))
+      .group_alpha(view::Live::By(fn() -> Double {
+        if disabled() { aura_theme(outer).disabled_opacity } else { 1.0 }
+      }))
+    if label != "" || show_output {
+      let _ = outer.box(fn(hdr : view::View) -> Unit {
+        let _ = hdr
+          .row(view::Live::Is(true))
+          .fills_across(view::Live::Is(true))
+          .lies_along(view::Live::Is(view::Lies::Between))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        if label != "" {
+          let _ = d_text_box(
+            hdr,
+            view::Live::Is(label),
+            d_words_look(14.0, 500, 20.0),
+            view::Live::By(fn() -> Int64 { aura_theme(hdr).palette.foreground }),
+          )
+        } else {
+          let _ = hdr.box(fn(_sp : view::View) { () })
+        }
+        if show_output {
+          let _ = d_text_box(
+            hdr,
+            view::Live::By(fn() -> String {
+              let m = model()
+              match output_text {
+                Some(f) => f(m)
+                None => d_slider_output_text(channel, m)
+              }
+            }),
+            d_words_look(14.0, 500, 20.0),
+            view::Live::By(fn() -> Int64 { aura_theme(hdr).palette.foreground }),
+          )
+        }
+      })
+    }
+    let _ = headless::color_slider(
+      outer,
+      fn() -> String { if label != "" { label } else { "Color slider" } },
+      channel,
+      model,
+      on_change,
+      fn(track : view::View, cs : headless::ColorSlider) -> Unit {
+        let _ = track
+          .fills_across(view::Live::Is(true))
+          .height(view::Live::Is(Some(track_h)))
+          .corner_circular(view::Live::Is(true))
+          .radius(view::Live::Is(track_h * 0.5))
+        // Clipped pure-GPU gradient track bar (View::fades + paint::rect, zero CPU PNG encoding)
+        let _ = track.box(fn(bar : view::View) -> Unit {
+          let _ = bar
+            .over(view::Live::Is(true))
+            .points(view::Live::Is(false))
+            .corner_circular(view::Live::Is(true))
+            .radius(view::Live::Is(track_h * 0.5))
+            .clips(view::Live::Is(true))
+          d_mount_slider_gpu_bar(bar, channel, model, track_h, cap_w)
+          let _ = bar.box(fn(rim : view::View) -> Unit {
+            let _ = rim
+              .over(view::Live::Is(true))
+              .points(view::Live::Is(false))
+              .corner_circular(view::Live::Is(true))
+              .radius(view::Live::Is(track_h * 0.5))
+              .edge(view::Live::Is((1.0, 0x0000001AL)))
+          })
+        })
+        // Flex-positioned circular thumb traveling [cap_w .. w - cap_w] (works on Frame 0 at any width)
+        let _ = track.box(fn(thumb_row : view::View) -> Unit {
+          let _ = thumb_row
+            .over(view::Live::Is(true))
+            .row(view::Live::Is(true))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .pad_xy(cap_w - thumb_d * 0.5, 0.0)
+            .points(view::Live::Is(false))
+          let _ = thumb_row.box(fn(sp_l : view::View) -> Unit {
+            let _ = sp_l
+              .grow(view::Live::By(fn() -> Double { cs.norm() }))
+              .shrink(view::Live::Is(1.0))
+              .basis(view::Live::Is(Some(0.0)))
+              .points(view::Live::Is(false))
+          })
+          let _ = thumb_row.box(fn(thumb : view::View) -> Unit {
+            let _ = thumb
+              .width(view::Live::Is(Some(thumb_d)))
+              .height(view::Live::Is(Some(thumb_d)))
+              .shrink(view::Live::Is(0.0))
+              .points(view::Live::Is(false))
+              .corner_circular(view::Live::Is(true))
+              .radius(view::Live::Is(thumb_d * 0.5))
+              .ground(view::Live::By(fn() -> Int64 {
+                let m = model()
+                let c = d_slider_color_at(channel, m, cs.norm())
+                if channel == headless_core::ColorChannel::Alpha {
+                  d_mix_over(0xF7F7F7FFL, c, cs.norm())
+                } else {
+                  c
+                }
+              }))
+              .edge(view::Live::Is((3.0, 0xFFFFFFFFL)))
+              .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+                if aura_theme(track).config.dark {
+                  [view::Shadow::drop(1.5, 1.0, 0x00000033L)]
+                } else {
+                  [view::Shadow::drop(1.5, 1.0, 0x00000026L), view::Shadow::drop(0.5, 0.0, 0x00000014L)]
+                }
+              }))
+              .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+                if track.focus_shown() {
+                  let th = aura_theme(track)
+                  (2.0, th.ring_offset_width, th.palette.focus)
+                } else {
+                  (1.0, 0.0, 0x0000001AL)
+                }
+              }))
+              .ring_gap_color(view::Live::By(fn() -> Int64 {
+                if track.focus_shown() { aura_theme(track).palette.background } else { 0L }
+              }))
+          })
+          let _ = thumb_row.box(fn(sp_r : view::View) -> Unit {
+            let _ = sp_r
+              .grow(view::Live::By(fn() -> Double { 1.0 - cs.norm() }))
+              .shrink(view::Live::Is(1.0))
+              .basis(view::Live::Is(Some(0.0)))
+              .points(view::Live::Is(false))
+          })
+        })
+      },
+      disabled=disabled,
+    )
+  })
+}
+
+/// Pion-JSX `<aura::ColorSlider>` wrapper.
+pub fn ColorSlider(
+  parent : view::View,
+  channel~ : headless_core::ColorChannel = headless_core::ColorChannel::Hue,
+  model~ : () -> headless_core::ColorModel,
+  on_change~ : (headless_core::ColorModel) -> Unit = fn(_m : headless_core::ColorModel) { () },
+  label~ : String = "",
+  show_output~ : Bool = true,
+  output_text? : (headless_core::ColorModel) -> String,
+  disabled~ : () -> Bool = fn() { false },
+  loc~ : String = "",
+) -> view::View {
+  color_slider_node(
+    parent,
+    channel,
+    model,
+    on_change,
+    label=label,
+    show_output=show_output,
+    output_text?=output_text,
+    disabled=disabled,
+    loc=loc,
+  )
+}
+
+// ============================================================================
+// 13. ColorField & 14. ColorInputGroup (color-field.css, color-input-group.css)
+// ============================================================================
+
+/// Aura `ColorInputGroup` parent compound slot (Builder API).
+/// Reuses `w0_field_shell` for single outer `focus_within` / `invalid` ring with optional prefix & suffix.
+pub fn color_input_group_node(
+  parent : view::View,
+  field : ui::Field,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  placeholder~ : String = "#000000",
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  prefix? : (view::View) -> Unit,
+  suffix? : (view::View) -> Unit,
+  on_edited? : (String) -> Unit,
+  on_submitted? : (String) -> Unit,
+  label~ : String = "Color value",
+  force_focused~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let eff_dis = disabled.to_getter()
+  let shell = w0_field_shell(
+    parent,
+    variant=variant,
+    invalid=invalid,
+    disabled=disabled,
+    height=36.0,
+    pad_x=12.0,
+    force_focused=force_focused,
+    content=fn(row : view::View) -> Unit {
+      match prefix {
+        Some(p) => {
+          let _ = row.box(fn(ph : view::View) -> Unit {
+            let _ = ph
+              .row(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .shrink(view::Live::Is(0.0))
+            p(ph)
+          })
+        }
+        None => ()
+      }
+      let _ = row.box(fn(inp_wrap : view::View) -> Unit {
+        let _ = inp_wrap.grow(view::Live::Is(1.0)).shrink(view::Live::Is(1.0)).min_width(view::Live::Is(Some(0.0)))
+        let fv = ui::field(
+          inp_wrap,
+          field,
+          placeholder=placeholder,
+          font_size=14.0,
+          line=20.0,
+          min_lines=1,
+          max_lines=1,
+          colors_by=fn() -> (Int64, Int64, Int64) {
+            let pal = aura_theme(inp_wrap).palette
+            (pal.field_foreground, pal.field_placeholder, pal.accent)
+          },
+          edit=fn(e : ui::FieldEdit) -> Unit {
+            if eff_dis() {
+              field.set(e.was)
+              return
+            }
+            match on_edited {
+              Some(f) => f(e.now)
+              None => ()
+            }
+          },
+          submitted=fn(s : String) -> Unit {
+            if eff_dis() {
+              return
+            }
+            match on_submitted {
+              Some(f) => f(s)
+              None => ()
+            }
+          },
+          label=label,
+        )
+        let _ = fv
+          .fills_across(view::Live::Is(true))
+          .presses(view::Live::By(fn() -> Bool { !eff_dis() }))
+          .focusable(view::Live::By(fn() -> Bool { !eff_dis() }), keys=view::focus_enter | view::focus_space)
+          .points(view::Live::By(fn() -> Bool { !eff_dis() }))
+          .says(view::Live::By(fn() -> Option[view::Said] {
+            let lbl = if label.length() > 0 { label } else { placeholder }
+            let raw = field.text()
+            let dis_now = eff_dis()
+            let acts : Array[view::Action] = if dis_now { [] } else { [view::Action::SetText("")] }
+            Some(view::said(view::Role::TextField, label=lbl, value=raw, actions=acts))
+          }))
+      })
+      match suffix {
+        Some(s) => {
+          let _ = row.box(fn(sh : view::View) -> Unit {
+            let _ = sh
+              .row(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .shrink(view::Live::Is(0.0))
+            s(sh)
+          })
+        }
+        None => ()
+      }
+    },
+    loc=loc,
+  )
+  let _ = shell.fills_across(view::Live::Is(true))
+  shell
+}
+
+/// Pion-JSX `<aura::ColorInputGroup>` wrapper.
+pub fn ColorInputGroup(
+  parent : view::View,
+  field~ : ui::Field,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  placeholder~ : String = "#000000",
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  prefix? : (view::View) -> Unit,
+  suffix? : (view::View) -> Unit,
+  on_edited? : (String) -> Unit,
+  on_submitted? : (String) -> Unit,
+  label~ : String = "Color value",
+  force_focused~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  color_input_group_node(
+    parent,
+    field,
+    variant=variant,
+    placeholder=placeholder,
+    invalid=inv,
+    disabled=dis,
+    prefix?=prefix,
+    suffix?=suffix,
+    on_edited?=on_edited,
+    on_submitted?=on_submitted,
+    label=label,
+    force_focused=force_focused,
+    loc=loc,
+  )
+}
+
+/// Aura `ColorField` (Builder API): label + `ColorInputGroup` with hex parsing & validation + description/error.
+pub fn color_field_node(
+  parent : view::View,
+  model : () -> headless_core::ColorModel,
+  on_change : (headless_core::ColorModel) -> Unit,
+  label~ : String = "",
+  description~ : String = "",
+  error_message~ : String = "Invalid hex color",
+  placeholder~ : String = "#0485F7",
+  show_swatch~ : Bool = true,
+  include_alpha~ : Bool = false,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  field_ref? : ui::Field,
+  loc~ : String = "",
+) -> view::View {
+  let fmt_hex = fn(m : headless_core::ColorModel) -> String {
+    m.to_hex(include_alpha=include_alpha)
+  }
+  let fld = match field_ref {
+    Some(f) => f
+    None => ui::Field::new(text=fmt_hex(signals::untracked(model)))
+  }
+  let parse_invalid = signals::signal(false)
+  let inv_get = invalid.to_getter()
+  let dis_get = disabled.to_getter()
+  let eff_invalid = view::Live::By(fn() -> Bool { inv_get() || parse_invalid.get() })
+
+  let handle_text = fn(raw : String) -> Unit {
+    if dis_get() {
+      return
+    }
+    match headless_core::color_parse_hex(raw) {
+      Some(parsed) => {
+        parse_invalid.set(false)
+        on_change(parsed)
+      }
+      None => parse_invalid.set(raw != "")
+    }
+  }
+
+  parent.box(loc=loc, fn(col : view::View) -> Unit {
+    let _ = col.fills_across(view::Live::Is(true)).gap(view::Live::Is(4.0))
+    // Keep field text in sync with controlled external `model()` updates without clobbering
+    // invalid intermediate typing while the user is actively focused; once blurred, reconcile
+    // immediately to the latest external model without firing `on_change`.
+    col.reacts_by(
+      fn() -> (String, Bool) { (fmt_hex(model()), fld.focused()) },
+      fn(a : (String, Bool), b : (String, Bool)) -> Bool { a.0 == b.0 && a.1 == b.1 },
+      fn(st : (String, Bool)) -> Unit {
+        let (new_hex, is_focused) = st
+        let cur_txt = signals::untracked(fn() { fld.text() })
+        match headless_core::color_parse_hex(cur_txt) {
+          Some(parsed) =>
+            if fmt_hex(parsed) != new_hex {
+              fld.set(new_hex)
+              parse_invalid.set(false)
+            }
+          None =>
+            if !is_focused {
+              fld.set(new_hex)
+              parse_invalid.set(false)
+            }
+        }
+      },
+      at_start=true,
+    )
+    if label != "" {
+      let _ = label_node(col, view::Live::Is(label), disabled=disabled)
+    }
+    let pref : Option[(view::View) -> Unit] = if show_swatch {
+      Some(fn(ph : view::View) -> Unit {
+        let _ = color_swatch_node(
+          ph,
+          view::Live::By(fn() -> Int64 { model().to_rgba8() }),
+          size=AuraColorSwatchSize::Xs,
+          shape=AuraColorSwatchShape::Circle,
+          label="Selected color",
+        )
+      })
+    } else {
+      None
+    }
+    let _ = color_input_group_node(
+      col,
+      fld,
+      variant=variant,
+      placeholder=placeholder,
+      invalid=eff_invalid,
+      disabled=disabled,
+      prefix?=pref,
+      on_edited=handle_text,
+      on_submitted=handle_text,
+      label=if label != "" { label } else { "Color" },
+    )
+    if description != "" {
+      let _ = col.show(fn() -> Bool { !eff_invalid.eval() }, fn(d : view::View) -> Unit {
+        let _ = description_node(d, view::Live::Is(description))
+      })
+    }
+    let _ = field_error_node(col, view::Live::Is(error_message), visible=eff_invalid)
+  })
+}
+
+/// Pion-JSX `<aura::ColorField>` wrapper.
+pub fn ColorField(
+  parent : view::View,
+  model~ : () -> headless_core::ColorModel,
+  on_change~ : (headless_core::ColorModel) -> Unit = fn(_m : headless_core::ColorModel) { () },
+  label~ : String = "",
+  description~ : String = "",
+  error_message~ : String = "Invalid hex color",
+  placeholder~ : String = "#0485F7",
+  show_swatch~ : Bool = true,
+  include_alpha~ : Bool = false,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  field_ref? : ui::Field,
+  loc~ : String = "",
+) -> view::View {
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  color_field_node(
+    parent,
+    model,
+    on_change,
+    label=label,
+    description=description,
+    error_message=error_message,
+    placeholder=placeholder,
+    show_swatch=show_swatch,
+    include_alpha=include_alpha,
+    variant=variant,
+    invalid=inv,
+    disabled=dis,
+    field_ref?=field_ref,
+    loc=loc,
+  )
+}

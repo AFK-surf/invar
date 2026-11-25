@@ -62,6 +62,8 @@ pub struct Field {
   pub mut secret : Bool
   pub mut trim : Bool
   pub mut words : Bool
+  pub mut rtl : Bool
+  rtl_sig : signals::Signal[Bool]
   pub mut leaves : Array[Int]
   pub mut ime_action : Int
   pub mut last_font_size : Double
@@ -70,6 +72,10 @@ pub struct Field {
   pub mut last_win_x : Double
   pub mut last_win_y : Double
   pub mut last_win_scale : Double
+  /// Visual BiDi caret affinity: when `caret_upstream && caret_aff_off == editor.caret`,
+  /// prefer the trailing edge of the cluster ending at `caret` (e.g. at RTL/LTR run boundaries).
+  mut caret_aff_off : Int
+  mut caret_upstream : Bool
   /// The tree node of it that had the tree's focus since it was last given the focus (none: not had yet, `focus_from`
   /// what had the tree's focus as it was given it).
   mut focus_held : Option[view::NodeId]
@@ -132,6 +138,8 @@ pub fn Field::new(text~ : String = "") -> Field {
     secret: false,
     trim: false,
     words: false,
+    rtl: false,
+    rtl_sig: signals::signal(false),
     leaves: [],
     ime_action: 0,
     last_font_size: 15.0,
@@ -140,6 +148,8 @@ pub fn Field::new(text~ : String = "") -> Field {
     last_win_x: 0.0,
     last_win_y: 0.0,
     last_win_scale: 1.0,
+    caret_aff_off: -1,
+    caret_upstream: false,
     focus_held: None,
     focus_from: None,
     focus_back: None,
@@ -389,6 +399,8 @@ fn Field::notify_edit(self : Field, from : Int, was : String, now : String) -> U
 
 pub fn Field::set(self : Field, text : String, caret? : Int) -> Unit {
   self.sync_config()
+  self.caret_aff_off = -1
+  self.caret_upstream = false
   self.editor.set(text, caret?=caret)
 }
 
@@ -396,6 +408,8 @@ pub fn Field::set(self : Field, text : String, caret? : Int) -> Unit {
 /// one undo step, and `on_edited` / `on_edit` fire once when the text changes.
 pub fn Field::replace_from_user(self : Field, text : String, now~ : Double = work_clock_now()) -> Unit {
   self.sync_config()
+  self.caret_aff_off = -1
+  self.caret_upstream = false
   let was = self.editor.text
   if self.editor.is_composing() {
     self.editor.compose_cancel()
@@ -433,7 +447,17 @@ pub fn Field::follow(self : Field, text : String, generation~ : Int = 0) -> Unit
 }
 
 pub fn Field::pick(self : Field, from : Int, to : Int) -> Unit {
+  self.caret_aff_off = -1
+  self.caret_upstream = false
   self.editor.set_selection(from, to)
+}
+
+/// Set selection/caret while preserving explicit BiDi visual boundary affinity (`upstream=true`
+/// anchors the caret on the trailing edge of the cluster ending at `to`).
+pub fn Field::pick_with_affinity(self : Field, from : Int, to : Int, upstream : Bool) -> Unit {
+  self.editor.set_selection(from, to)
+  self.caret_aff_off = self.editor.caret
+  self.caret_upstream = upstream
 }
 
 pub fn Field::take(self : Field) -> String {
@@ -705,6 +729,8 @@ fn field_back_from_modal(tree : view::Tree) -> Unit {
 /// Insert text at current caret/selection (commits active IME composition as an atomic undo step).
 pub fn Field::insert(self : Field, ins : String) -> Unit {
   self.sync_config()
+  self.caret_aff_off = -1
+  self.caret_upstream = false
   let was = self.editor.text
   let (lo, _) = self.editor.selection_range()
   let now = work_clock_now()
@@ -729,11 +755,16 @@ pub fn Field::compose(self : Field, s : String) -> Unit {
   } else {
     self.editor.compose_update(s, sel_start=0, sel_end=s.length())
   }
+  if self.focused_sig.untracked() {
+    self.sync_ime()
+  }
 }
 
 /// Delete selection or one grapheme cluster before caret.
 pub fn Field::backspace(self : Field) -> Unit {
   self.sync_config()
+  self.caret_aff_off = -1
+  self.caret_upstream = false
   let was = self.editor.text
   self.editor.backspace(now=work_clock_now())
   if self.editor.text != was {
@@ -744,6 +775,8 @@ pub fn Field::backspace(self : Field) -> Unit {
 /// Delete selection or one grapheme cluster after caret.
 pub fn Field::delete_forward(self : Field) -> Unit {
   self.sync_config()
+  self.caret_aff_off = -1
+  self.caret_upstream = false
   let was = self.editor.text
   self.editor.delete_forward(now=work_clock_now())
   if self.editor.text != was {
@@ -855,14 +888,415 @@ pub fn Field::select_line_at(self : Field, pos : Int) -> (Int, Int) {
   self.editor.select_line_at(pos)
 }
 
+pub fn Field::set_rtl(self : Field, on : Bool) -> Unit {
+  self.rtl = on
+  self.rtl_sig.set(on)
+}
+
+pub fn Field::is_rtl(self : Field) -> Bool {
+  let _ = self.rtl_sig.get()
+  self.rtl
+}
+
+fn Field::line_idx_for_y(self : Field, y : Double) -> Int {
+  let n = self.editor.lines.length()
+  if n <= 1 {
+    return 0
+  }
+  let mut i = 0
+  while i < n {
+    let ln = self.editor.lines[i]
+    if y >= ln.y && y < ln.y + ln.height {
+      return i
+    }
+    i += 1
+  }
+  if y < 0.0 { 0 } else { n - 1 }
+}
+
+fn Field::rtl_line_layout(self : Field, line_idx : Int) -> (BidiLineLayout, Double, Int, Int, Double, Double) {
+  self.editor.ensure_lines()
+  let n = self.editor.lines.length()
+  if n == 0 {
+    return (BidiLineLayout::{ clusters: [], items: [], width: 0.0 }, self.last_max_w, 0, 0, 0.0, self.last_line_h)
+  }
+  let idx = if line_idx < 0 { 0 } else if line_idx >= n { n - 1 } else { line_idx }
+  let ln = self.editor.lines[idx]
+  let src = self.editor.display_text()
+  let bs = if ln.byte_start < 0 { 0 } else if ln.byte_start > src.length() { src.length() } else { ln.byte_start }
+  let be = if ln.byte_end < bs { bs } else if ln.byte_end > src.length() { src.length() } else { ln.byte_end }
+  let line_str = src.slice(bs, be)
+  let sz = if self.last_font_size > 0.0 { self.last_font_size } else { 15.0 }
+  let bl = bidi_layout_line(line_str, true, sz, 400, 0, 1.0, 0.0)
+  let start_x = if self.last_max_w > bl.width { self.last_max_w - bl.width } else { 0.0 }
+  (bl, start_x, bs, be, ln.y, ln.height)
+}
+
+fn Field::has_upstream_affinity(self : Field, pos : Int) -> Bool {
+  self.caret_upstream && self.caret_aff_off == pos
+}
+
+fn Field::line_idx_for_display_off(self : Field, disp_pos : Int, upstream : Bool) -> Int {
+  let n = self.editor.lines.length()
+  if n <= 1 {
+    return 0
+  }
+  let mut i = 0
+  while i < n {
+    let ln = self.editor.lines[i]
+    if disp_pos >= ln.byte_start && disp_pos <= ln.byte_end {
+      // Soft-wrap boundary: `disp_pos == ln.byte_end == next.byte_start`.
+      // `upstream=true` stays on the trailing edge of line `i`;
+      // `upstream=false` lands on the leading edge of line `i + 1`.
+      if disp_pos == ln.byte_end && !ln.hard_break && i + 1 < n && self.editor.lines[i + 1].byte_start == disp_pos {
+        if upstream {
+          return i
+        } else {
+          return i + 1
+        }
+      }
+      return i
+    }
+    i += 1
+  }
+  if disp_pos <= 0 { 0 } else { n - 1 }
+}
+
+fn Field::rtl_caret_pos_for_display(
+  self : Field,
+  disp_pos : Int,
+  clamp_caret : Bool,
+  upstream : Bool,
+) -> editor::CaretPos {
+  self.editor.ensure_lines()
+  let line_idx = self.line_idx_for_display_off(disp_pos, upstream)
+  let (bl, start_x, lbs, lbe, ly, lh) = self.rtl_line_layout(line_idx)
+  let rel = if disp_pos < lbs {
+    0
+  } else if disp_pos > lbe {
+    lbe - lbs
+  } else {
+    disp_pos - lbs
+  }
+  let raw_x = if bl.clusters.length() == 0 {
+    if self.last_max_w > 0.0 { self.last_max_w } else { 0.0 }
+  } else {
+    let mut found = false
+    let mut vx = start_x
+    if upstream {
+      for c in bl.clusters {
+        if c.byte_end == rel {
+          vx = start_x + (if c.rtl { c.vis_x0 } else { c.vis_x1 })
+          found = true
+          break
+        }
+      }
+      if !found {
+        for c in bl.clusters {
+          if c.byte_start <= rel && rel < c.byte_end {
+            vx = start_x + (if c.rtl { c.vis_x1 } else { c.vis_x0 })
+            found = true
+            break
+          }
+        }
+      }
+    } else {
+      for c in bl.clusters {
+        if c.byte_start <= rel && rel < c.byte_end {
+          vx = start_x + (if c.rtl { c.vis_x1 } else { c.vis_x0 })
+          found = true
+          break
+        }
+      }
+      if !found {
+        for c in bl.clusters {
+          if c.byte_end == rel {
+            vx = start_x + (if c.rtl { c.vis_x0 } else { c.vis_x1 })
+            found = true
+            break
+          }
+        }
+      }
+    }
+    if !found {
+      if rel <= 0 { start_x + bl.width } else { start_x }
+    } else {
+      vx
+    }
+  }
+  let x = if clamp_caret && self.last_max_w > 0.0 {
+    let max_x = if self.last_max_w > 1.5 { self.last_max_w - 1.5 } else { self.last_max_w }
+    if raw_x > max_x { max_x } else if raw_x < 0.0 { 0.0 } else { raw_x }
+  } else {
+    raw_x
+  }
+  editor::CaretPos::{ x, y: ly, line: line_idx, height: lh }
+}
+
+fn Field::rtl_caret_pos_for(self : Field, pos : Int, clamp_caret : Bool) -> editor::CaretPos {
+  self.rtl_caret_pos_for_display(self.editor.to_display_off(pos), clamp_caret, false)
+}
+
+/// Hit-test `(x, y)` returning `(raw_byte_offset, upstream_affinity)`.
+/// At BiDi direction boundaries where a single logical byte maps to two visual edges,
+/// `upstream_affinity=true` preserves the trailing edge of the hit cluster.
+pub fn Field::hit_test_with_affinity(self : Field, x : Double, y : Double) -> (Int, Bool) {
+  self.sync_config()
+  if !self.rtl {
+    return self.editor.hit_test_with_upstream(x, y)
+  }
+  self.editor.ensure_lines()
+  let li = self.line_idx_for_y(y)
+  let (bl, start_x, lbs, _, _, _) = self.rtl_line_layout(li)
+  let cn = bl.clusters.length()
+  if cn == 0 {
+    return (self.editor.from_display_off(lbs), false)
+  }
+  let rel_x = x - start_x
+  if rel_x <= 0.0 {
+    let c0 = bl.clusters[0]
+    let (off, up) = if c0.rtl { (c0.byte_end, true) } else { (c0.byte_start, false) }
+    return (self.editor.from_display_off(lbs + off), up)
+  }
+  if rel_x >= bl.width {
+    let clast = bl.clusters[cn - 1]
+    let (off, up) = if clast.rtl { (clast.byte_start, false) } else { (clast.byte_end, true) }
+    return (self.editor.from_display_off(lbs + off), up)
+  }
+  let mut best_idx = cn - 1
+  let mut k = 0
+  while k < cn {
+    let c = bl.clusters[k]
+    if rel_x <= c.vis_x1 {
+      best_idx = k
+      break
+    }
+    k += 1
+  }
+  let c = bl.clusters[best_idx]
+  let mid = (c.vis_x0 + c.vis_x1) * 0.5
+  let (off, up) = if c.rtl {
+    if rel_x < mid { (c.byte_end, true) } else { (c.byte_start, false) }
+  } else {
+    if rel_x < mid { (c.byte_start, false) } else { (c.byte_end, true) }
+  }
+  (self.editor.from_display_off(lbs + off), up)
+}
+
+pub fn Field::hit_test(self : Field, x : Double, y : Double) -> Int {
+  self.hit_test_with_affinity(x, y).0
+}
+
+fn Field::rtl_move_horizontal(self : Field, dir_right : Bool, extend : Bool) -> Unit {
+  self.editor.ensure_lines()
+  let nlines = self.editor.lines.length()
+  if nlines == 0 {
+    return
+  }
+  if !extend && self.editor.has_selection() {
+    let (lo, hi) = self.editor.selection_range()
+    let dlo = self.editor.to_display_off(lo)
+    let dhi = self.editor.to_display_off(hi)
+    let mut found_edge = false
+    let mut best_line = 0
+    let mut best_x = 0.0
+    let mut best_disp = lo
+    let mut best_up = false
+    let mut li = 0
+    while li < nlines {
+      let ln = self.editor.lines[li]
+      if dhi > ln.byte_start && dlo < ln.byte_end {
+        let (bl, start_x, lbs, _, _, _) = self.rtl_line_layout(li)
+        for c in bl.clusters {
+          let cbs = lbs + c.byte_start
+          let cbe = lbs + c.byte_end
+          if cbe > dlo && cbs < dhi {
+            if !dir_right {
+              // Visual Left collapse: visually leftmost edge of selected region (on last spanned line).
+              let ex = start_x + c.vis_x0
+              let edisp = lbs + (if c.rtl { c.byte_end } else { c.byte_start })
+              let eup = c.rtl
+              if !found_edge || li > best_line || (li == best_line && ex < best_x) {
+                found_edge = true
+                best_line = li
+                best_x = ex
+                best_disp = edisp
+                best_up = eup
+              }
+            } else {
+              // Visual Right collapse: visually rightmost edge of selected region (on first spanned line).
+              let ex = start_x + c.vis_x1
+              let edisp = lbs + (if c.rtl { c.byte_start } else { c.byte_end })
+              let eup = !c.rtl
+              if !found_edge || li < best_line || (li == best_line && ex > best_x) {
+                found_edge = true
+                best_line = li
+                best_x = ex
+                best_disp = edisp
+                best_up = eup
+              }
+            }
+          }
+        }
+      }
+      li += 1
+    }
+    let target = if found_edge { self.editor.from_display_off(best_disp) } else if dir_right { lo } else { hi }
+    let up = if found_edge { best_up } else { false }
+    self.pick_with_affinity(target, target, up)
+    if self.focused_sig.untracked() {
+      self.sync_ime()
+    }
+    return
+  }
+  let cur_disp = self.editor.display_caret()
+  let cur_up = self.editor.marked.length() == 0 && self.has_upstream_affinity(self.editor.caret)
+  let cur_cp = self.rtl_caret_pos_for_display(cur_disp, false, cur_up)
+  let (bl, start_x, lbs, _, _, _) = self.rtl_line_layout(cur_cp.line)
+  let cn = bl.clusters.length()
+  let mut found = false
+  let mut target_disp = cur_disp
+  let mut target_up = false
+  if !dir_right {
+    // Visual Left: step across the rightmost non-empty cluster whose left edge lies strictly left of cur_cp.x.
+    let mut k = cn - 1
+    while k >= 0 {
+      let c = bl.clusters[k]
+      if c.byte_end > c.byte_start && start_x + c.vis_x0 < cur_cp.x - 0.01 {
+        target_disp = lbs + (if c.rtl { c.byte_end } else { c.byte_start })
+        target_up = c.rtl
+        found = true
+        break
+      }
+      k -= 1
+    }
+    if !found && cur_cp.line + 1 < nlines {
+      let (nbl, _, nlbs, _, _, _) = self.rtl_line_layout(cur_cp.line + 1)
+      if nbl.clusters.length() > 0 {
+        let cl = nbl.clusters[nbl.clusters.length() - 1]
+        let start_disp = nlbs + (if cl.rtl { cl.byte_start } else { cl.byte_end })
+        if start_disp == cur_disp {
+          // Soft-wrap boundary shares `cur_disp` between previous line's end and next line's start:
+          // advance one visual cluster into the next line so repeated Left traverses every grapheme.
+          target_disp = nlbs + (if cl.rtl { cl.byte_end } else { cl.byte_start })
+          target_up = cl.rtl
+        } else {
+          target_disp = start_disp
+          target_up = !cl.rtl
+        }
+        found = true
+      } else {
+        target_disp = nlbs
+        target_up = false
+        found = true
+      }
+    }
+  } else {
+    // Visual Right: step across the leftmost non-empty cluster whose right edge lies strictly right of cur_cp.x.
+    let mut k = 0
+    while k < cn {
+      let c = bl.clusters[k]
+      if c.byte_end > c.byte_start && start_x + c.vis_x1 > cur_cp.x + 0.01 {
+        target_disp = lbs + (if c.rtl { c.byte_start } else { c.byte_end })
+        target_up = !c.rtl
+        found = true
+        break
+      }
+      k += 1
+    }
+    if !found && cur_cp.line > 0 {
+      let (pbl, _, plbs, _, _, _) = self.rtl_line_layout(cur_cp.line - 1)
+      if pbl.clusters.length() > 0 {
+        let c0 = pbl.clusters[0]
+        let end_disp = plbs + (if c0.rtl { c0.byte_end } else { c0.byte_start })
+        if end_disp == cur_disp {
+          // Soft-wrap boundary shares `cur_disp`: step one visual cluster back into the previous line.
+          target_disp = plbs + (if c0.rtl { c0.byte_start } else { c0.byte_end })
+          target_up = !c0.rtl
+        } else {
+          target_disp = end_disp
+          target_up = c0.rtl
+        }
+        found = true
+      } else {
+        target_disp = plbs
+        target_up = false
+        found = true
+      }
+    }
+  }
+  if found {
+    let target_raw = self.editor.from_display_off(target_disp)
+    let next_anchor = if extend { self.editor.anchor } else { target_raw }
+    self.pick_with_affinity(next_anchor, target_raw, target_up)
+    if self.focused_sig.untracked() {
+      self.sync_ime()
+    }
+  }
+}
+
 pub fn Field::selection_rects(self : Field) -> Array[paint::Rect] {
   self.sync_config()
-  self.editor.selection_rects(color=self.sel_color)
+  if !self.rtl {
+    return self.editor.selection_rects(color=self.sel_color)
+  }
+  if !self.editor.has_selection() {
+    return []
+  }
+  self.editor.ensure_lines()
+  let (lo, hi) = self.editor.selection_range()
+  let dlo = self.editor.to_display_off(lo)
+  let dhi = self.editor.to_display_off(hi)
+  let out : Array[paint::Rect] = []
+  let nlines = self.editor.lines.length()
+  let mut li = 0
+  while li < nlines {
+    let ln = self.editor.lines[li]
+    if dhi > ln.byte_start && dlo < ln.byte_end {
+      let (bl, start_x, lbs, _, ly, lh) = self.rtl_line_layout(li)
+      let mut has_seg = false
+      let mut seg_x0 = 0.0
+      let mut seg_x1 = 0.0
+      for c in bl.clusters {
+        let cbs = lbs + c.byte_start
+        let cbe = lbs + c.byte_end
+        if cbe > dlo && cbs < dhi {
+          let x0 = start_x + c.vis_x0
+          let x1 = start_x + c.vis_x1
+          if has_seg && x0 - seg_x1 <= 0.5 {
+            seg_x1 = x1
+          } else {
+            if has_seg && seg_x1 > seg_x0 {
+              out.push(paint::Rect::{ x: seg_x0, y: ly, w: seg_x1 - seg_x0, h: lh, color: self.sel_color })
+            }
+            has_seg = true
+            seg_x0 = x0
+            seg_x1 = x1
+          }
+        }
+      }
+      if has_seg && seg_x1 > seg_x0 {
+        out.push(paint::Rect::{ x: seg_x0, y: ly, w: seg_x1 - seg_x0, h: lh, color: self.sel_color })
+      }
+    }
+    li += 1
+  }
+  out
 }
 
 pub fn Field::caret_pos(self : Field) -> editor::CaretPos {
   self.sync_config()
-  self.editor.caret_pos(self.editor.caret)
+  let raw_off = if self.editor.marked.length() == 0 {
+    self.editor.caret
+  } else {
+    self.editor.caret + self.editor.marked_sel_end
+  }
+  if !self.rtl {
+    return self.editor.caret_pos(raw_off)
+  }
+  let disp_pos = self.editor.display_caret()
+  let up = self.editor.marked.length() == 0 && self.has_upstream_affinity(self.editor.caret)
+  self.rtl_caret_pos_for_display(disp_pos, true, up)
 }
 
 pub fn Field::handles(
@@ -870,7 +1304,32 @@ pub fn Field::handles(
   style~ : editor::HandleStyle = editor::HandleStyle::Android,
 ) -> Option[(editor::SelectionHandle, editor::SelectionHandle)] {
   self.sync_config()
-  editor::selection_handles_of(self.editor, style=style)
+  match editor::selection_handles_of(self.editor, style=style) {
+    None => None
+    Some((sh, eh)) =>
+      if !self.rtl {
+        Some((sh, eh))
+      } else {
+        let (lo, hi) = self.editor.selection_range()
+        let scp = self.rtl_caret_pos_for(lo, false)
+        let ecp = self.rtl_caret_pos_for(hi, false)
+        let sdx = scp.x - sh.tip_x
+        let edx = ecp.x - eh.tip_x
+        let sh2 = editor::SelectionHandle::{
+          ..sh,
+          tip_x: scp.x,
+          knob_cx: sh.knob_cx + sdx,
+          hit_rect: paint::Rect::{ ..sh.hit_rect, x: sh.hit_rect.x + sdx },
+        }
+        let eh2 = editor::SelectionHandle::{
+          ..eh,
+          tip_x: ecp.x,
+          knob_cx: eh.knob_cx + edx,
+          hit_rect: paint::Rect::{ ..eh.hit_rect, x: eh.hit_rect.x + edx },
+        }
+        Some((sh2, eh2))
+      }
+  }
 }
 
 pub fn Field::loupe(
@@ -933,10 +1392,21 @@ pub fn Field::handle_key(self : Field, code : Int, mods : Int) -> Bool {
     return true
   }
 
+  if self.rtl && !primary && !alt && !self.editor.is_composing() && (code == key_code_left || code == key_code_right) {
+    self.rtl_move_horizontal(code == key_code_right, shift)
+    return true
+  }
+
   let was = self.editor.text
+  let prev_caret = self.editor.caret
+  let prev_anchor = self.editor.anchor
   let handled = self.editor.handle_key(code, mods, platform, now=work_clock_now())
   if !handled {
     return false
+  }
+  if self.editor.text != was || self.editor.caret != prev_caret || self.editor.anchor != prev_anchor {
+    self.caret_aff_off = -1
+    self.caret_upstream = false
   }
   match self.editor.take_submitted() {
     Some(s) =>
@@ -1235,6 +1705,7 @@ pub fn field(
   size_by? : () -> Double,
   colors_by? : () -> (Int64, Int64, Int64),
   placeholder_by? : () -> String,
+  rtl_by? : () -> Bool,
   label~ : String = "",
 ) -> view::View {
   let sz_fn = match size_by {
@@ -1318,6 +1789,18 @@ pub fn field(
       )
       None => ()
     }
+    match rtl_by {
+      Some(rfn) =>
+      f.reacts_by(
+        rfn,
+        fn(a : Bool, b : Bool) -> Bool { a == b },
+        fn(r : Bool) -> Unit {
+          fld.set_rtl(r)
+          hostapi::request_frame()
+        },
+      )
+      None => ()
+    }
     let min_h = line_h * (if min_lines > 0 { min_lines } else { 1 }).to_double()
     let _ = f.min_height(view::Live::Is(Some(min_h)))
     let _ = f.focusable(view::Live::Is(true), keys=view::focus_enter | view::focus_space)
@@ -1365,6 +1848,9 @@ pub fn field(
         look=wlook,
       )
     }
+    let _ = f.words_look(view::Live::By(fn() {
+      view::WordsLook::{ ..wlook, rtl: fld.is_rtl() }
+    }))
     let _ = f.ink(view::Live::By(fn() {
       let (ink, ph, _) = colors_fn()
       if fld.text().length() > 0 || fld.composing() { ink } else { ph }

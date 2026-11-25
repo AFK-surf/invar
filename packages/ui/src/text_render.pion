@@ -854,6 +854,545 @@ pub fn ellipsize_text(
   ""
 }
 
+/// Encode a Unicode code point as UTF-8 bytes into `sb`.
+fn bidi_push_cp(sb : StringBuilder, cp : Int) -> Unit {
+  if cp < 0x80 {
+    sb.write_byte((cp & 0x7F) as Byte)
+  } else if cp < 0x800 {
+    sb.write_byte((0xC0 | ((cp >> 6) & 0x1F)) as Byte)
+    sb.write_byte((0x80 | (cp & 0x3F)) as Byte)
+  } else if cp < 0x10000 {
+    sb.write_byte((0xE0 | ((cp >> 12) & 0x0F)) as Byte)
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)) as Byte)
+    sb.write_byte((0x80 | (cp & 0x3F)) as Byte)
+  } else {
+    sb.write_byte((0xF0 | ((cp >> 18) & 0x07)) as Byte)
+    sb.write_byte((0x80 | ((cp >> 12) & 0x3F)) as Byte)
+    sb.write_byte((0x80 | ((cp >> 6) & 0x3F)) as Byte)
+    sb.write_byte((0x80 | (cp & 0x3F)) as Byte)
+  }
+}
+
+/// Whether `cp` belongs to a strong RTL script (Hebrew, Arabic, Syriac, Thaana, etc.) whose words
+/// are rasterized whole via `hostapi::text_key` to preserve RTL order, contextual joining, ligatures,
+/// and OpenType GPOS combining-mark (niqqud / harakat) positioning without dotted-circle fallback.
+fn bidi_is_rtl_script(cp : Int) -> Bool {
+  (cp >= 0x0590 && cp <= 0x08FF) ||
+  (cp >= 0xFB1D && cp <= 0xFDFF) ||
+  (cp >= 0xFE70 && cp <= 0xFEFF) ||
+  (cp >= 0x10800 && cp <= 0x10FFF) ||
+  (cp >= 0x1E800 && cp <= 0x1EFFF)
+}
+
+/// Whether `cp` stays attached to an RTL script word token (RTL letters, niqqud/harakat, ZWJ/ZWNJ).
+fn bidi_is_rtl_word_cp(cp : Int) -> Bool {
+  bidi_is_rtl_script(cp) ||
+  cp == 0x200C ||
+  cp == 0x200D ||
+  (cp >= 0x0300 && cp <= 0x036F) ||
+  (cp >= 0xFE00 && cp <= 0xFE0F)
+}
+
+/// One visual cluster inside a BiDi-laid-out line, shared by `encode_words` and RTL `Field`.
+pub struct BidiVisualCluster {
+  pub byte_start : Int
+  pub byte_end : Int
+  pub vis_x0 : Double
+  pub vis_x1 : Double
+  pub rtl : Bool
+}
+
+/// One visual glyph/word quad to emit for a BiDi-laid-out line.
+struct BidiDrawItem {
+  gkey : Int
+  vis_x : Double
+  adv : Double
+}
+
+/// Complete visual layout of one line under UAX #9 BiDi, shared between rendering and Field editing.
+pub struct BidiLineLayout {
+  pub clusters : Array[BidiVisualCluster]
+  items : Array[BidiDrawItem]
+  pub width : Double
+}
+
+/// Build a UTF-8 substring and UTF-16->original-UTF-8-byte table for codepoints `cps[a..<b]`.
+fn bidi_build_segment(
+  cps : Array[Int],
+  cp_starts : Array[Int],
+  cp_ends : Array[Int],
+  a : Int,
+  b : Int,
+  mirror : Bool,
+) -> (String, Array[Int]) {
+  let sb = StringBuilder::new()
+  let u16_to_byte : Array[Int] = []
+  let mut k = a
+  while k < b {
+    let cp = if mirror { text::mirror(cps[k]) } else { cps[k] }
+    u16_to_byte.push(cp_starts[k])
+    if cp >= 0x10000 {
+      u16_to_byte.push(cp_starts[k])
+    }
+    bidi_push_cp(sb, cp)
+    k += 1
+  }
+  if b > a {
+    u16_to_byte.push(cp_ends[b - 1])
+  } else {
+    u16_to_byte.push(0)
+  }
+  (sb.to_string(), u16_to_byte)
+}
+
+fn bidi_u16_byte(tbl : Array[Int], u16_idx : Int) -> Int {
+  let n = tbl.length()
+  if n == 0 {
+    return 0
+  }
+  if u16_idx <= 0 {
+    tbl[0]
+  } else if u16_idx >= n {
+    tbl[n - 1]
+  } else {
+    tbl[u16_idx]
+  }
+}
+
+/// Shape `seg` with `shape_line_cached`; when no native shaper is installed (headless Tester),
+/// synthesize per-codepoint clusters with `measure_text_width` advances so RTL Field layout works identically.
+fn bidi_shape_or_fallback(
+  seg : String,
+  sz_r : Double,
+  weight : Int,
+  style_bits : Int,
+) -> ShapedLine {
+  let rsl = shape_line_cached(seg, sz_r, weight, style_bits)
+  if rsl.n > 0 || seg.length() == 0 {
+    return rsl
+  }
+  let locs : Array[Int] = []
+  let advs : Array[Double] = []
+  let gkeys : Array[Int] = []
+  let n = seg.length()
+  let mut i = 0
+  let mut u16 = 0
+  while i < n {
+    let b0 = seg.code_unit_at(i)
+    let mut step = 1
+    let mut ustep = 1
+    if b0 < 0x80 {
+      step = 1
+    } else if (b0 & 0xE0) == 0xC0 && i + 1 < n {
+      step = 2
+    } else if (b0 & 0xF0) == 0xE0 && i + 2 < n {
+      step = 3
+    } else if (b0 & 0xF8) == 0xF0 && i + 3 < n {
+      step = 4
+      ustep = 2
+    }
+    let next_i = if i + step <= n { i + step } else { n }
+    let sub = seg.slice(i, next_i)
+    let adv = measure_text_width(sub, sz_r, weight=weight, style_bits=style_bits)
+    locs.push(u16)
+    advs.push(if adv > 0.0 { adv } else { sz_r * 0.52 })
+    gkeys.push(-1)
+    i = next_i
+    u16 += ustep
+  }
+  ShapedLine::{ n: locs.length(), locs, advs, gkeys }
+}
+
+/// Snap raw byte range `[bs, be)` to enclosing UAX #29 extended grapheme cluster boundaries `gbounds` in O(log m).
+fn bidi_snap_grapheme_range(gbounds : Array[Int], bs : Int, be : Int) -> (Int, Int) {
+  let m = gbounds.length()
+  if m < 2 {
+    return (bs, be)
+  }
+  let mut lo = 0
+  let mut hi = m - 1
+  while lo < hi {
+    let mid = (lo + hi + 1) / 2
+    if gbounds[mid] <= bs {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  let gs = gbounds[lo]
+  let ge = if lo + 1 < m && gbounds[lo + 1] >= be {
+    gbounds[lo + 1]
+  } else {
+    let mut glo = lo + 1
+    let mut ghi = m - 1
+    while glo < ghi {
+      let mid = (glo + ghi) / 2
+      if gbounds[mid] >= be {
+        ghi = mid
+      } else {
+        glo = mid + 1
+      }
+    }
+    if glo < m { gbounds[glo] } else { gbounds[m - 1] }
+  }
+  (gs, ge)
+}
+
+/// Merge adjacent visual clusters belonging to the same UAX #29 extended grapheme cluster
+/// (e.g. Pango splitting Hebrew niqqud or Arabic harakat into separate base + zero-width mark glyphs).
+/// Preserves exact rendering `items` while ensuring every caret/selection boundary is a valid grapheme stop.
+fn bidi_merge_grapheme_clusters(line : String, raw : Array[BidiVisualCluster]) -> Array[BidiVisualCluster] {
+  if raw.length() == 0 {
+    return raw
+  }
+  let gbounds = text::graphemes(line)
+  if gbounds.length() < 2 {
+    return raw
+  }
+  let out : Array[BidiVisualCluster] = []
+  for c in raw {
+    if c.byte_end <= c.byte_start {
+      continue
+    }
+    let (gs, ge) = bidi_snap_grapheme_range(gbounds, c.byte_start, c.byte_end)
+    if ge <= gs {
+      continue
+    }
+    let n = out.length()
+    if n > 0 {
+      let prev = out[n - 1]
+      if prev.rtl == c.rtl && gs < prev.byte_end && ge > prev.byte_start {
+        out[n - 1] = BidiVisualCluster::{
+          byte_start: if gs < prev.byte_start { gs } else { prev.byte_start },
+          byte_end: if ge > prev.byte_end { ge } else { prev.byte_end },
+          vis_x0: dmin(prev.vis_x0, c.vis_x0),
+          vis_x1: dmax(prev.vis_x1, c.vis_x1),
+          rtl: prev.rtl,
+        }
+        continue
+      }
+    }
+    out.push(BidiVisualCluster::{
+      byte_start: gs,
+      byte_end: ge,
+      vis_x0: c.vis_x0,
+      vis_x1: c.vis_x1,
+      rtl: c.rtl,
+    })
+  }
+  out
+}
+
+/// Shape and lay out one visual line under UAX #9 BiDi (`rtl=true` => base level 1).
+/// Shared by `encode_words` (rendering) and RTL `Field` (caret, hit_test, selection, handles, IME).
+/// - Even-level runs emit clusters left-to-right.
+/// - Odd-level non-joining runs (Hebrew with niqqud, punctuation/neutrals) apply L4 mirroring and
+///   emit shaped clusters right-to-left (preserving combining marks inside each cluster).
+/// - Odd-level joining runs (Arabic/Syriac/Thaana) split into joining words and non-joining tokens
+///   in reverse visual order, rasterizing each joining word whole via `hostapi::text_key` while
+///   mapping its shaped clusters right-to-left for exact cursor/selection metrics.
+pub fn bidi_layout_line(
+  line : String,
+  rtl : Bool,
+  sz_r : Double,
+  weight : Int,
+  style_bits : Int,
+  qs : Double,
+  spacing : Double,
+) -> BidiLineLayout {
+  let clusters : Array[BidiVisualCluster] = []
+  let items : Array[BidiDrawItem] = []
+  if line.length() == 0 {
+    return BidiLineLayout::{ clusters, items, width: 0.0 }
+  }
+  let n = line.length()
+  let run_levels : Array[Int] = []
+  let run_cps : Array[Array[Int]] = []
+  let run_starts : Array[Array[Int]] = []
+  let run_ends : Array[Array[Int]] = []
+  let ll = if rtl {
+    let bd = text::bidi_new(line, 1)
+    bd.line_levels(0, n)
+  } else {
+    []
+  }
+  let mut i = 0
+  while i < n {
+    let lv = if rtl {
+      if i < ll.length() { ll[i] } else { 1 }
+    } else {
+      0
+    }
+    let b0 = line.code_unit_at(i)
+    let mut cp = b0
+    let mut step = 1
+    if b0 < 0x80 {
+      cp = b0
+      step = 1
+    } else if (b0 & 0xE0) == 0xC0 && i + 1 < n {
+      cp = ((b0 & 0x1F) << 6) | (line.code_unit_at(i + 1) & 0x3F)
+      step = 2
+    } else if (b0 & 0xF0) == 0xE0 && i + 2 < n {
+      cp = ((b0 & 0x0F) << 12) | ((line.code_unit_at(i + 1) & 0x3F) << 6) | (line.code_unit_at(i + 2) & 0x3F)
+      step = 3
+    } else if (b0 & 0xF8) == 0xF0 && i + 3 < n {
+      cp = ((b0 & 0x07) << 18) | ((line.code_unit_at(i + 1) & 0x3F) << 12) | ((line.code_unit_at(i + 2) & 0x3F) << 6) | (line.code_unit_at(i + 3) & 0x3F)
+      step = 4
+    }
+    let next_i = if i + step <= n { i + step } else { n }
+    if run_levels.length() > 0 && run_levels[run_levels.length() - 1] == lv {
+      let last = run_levels.length() - 1
+      run_cps[last].push(cp)
+      run_starts[last].push(i)
+      run_ends[last].push(next_i)
+    } else {
+      run_levels.push(lv)
+      run_cps.push([cp])
+      run_starts.push([i])
+      run_ends.push([next_i])
+    }
+    i = next_i
+  }
+  let order = if rtl {
+    text::visual_order(run_levels)
+  } else {
+    let o : Array[Int] = []
+    for k in 0..<run_levels.length() {
+      o.push(k)
+    }
+    o
+  }
+  let mut pen_x = 0.0
+  for idx in order {
+    let lv = run_levels[idx]
+    let cps = run_cps[idx]
+    let starts = run_starts[idx]
+    let ends = run_ends[idx]
+    let m = cps.length()
+    if m == 0 {
+      continue
+    }
+    if lv % 2 == 0 {
+      // Even-level (LTR) run: forward shaping and emission.
+      let (seg, u16_tbl) = bidi_build_segment(cps, starts, ends, 0, m, false)
+      let rsl = bidi_shape_or_fallback(seg, sz_r, weight, style_bits)
+      let mut rk = 0
+      while rk < rsl.n {
+        let u0 = rsl.locs[rk]
+        let cx0 = pen_x
+        let mut adv_sum = 0.0
+        while rk < rsl.n && rsl.locs[rk] == u0 {
+          let adv = rsl.advs[rk] * qs + spacing
+          items.push(BidiDrawItem::{ gkey: rsl.gkeys[rk], vis_x: pen_x, adv })
+          pen_x = pen_x + adv
+          adv_sum = adv_sum + adv
+          rk += 1
+        }
+        let u1 = if rk < rsl.n { rsl.locs[rk] } else { u16_tbl.length() - 1 }
+        let bs = bidi_u16_byte(u16_tbl, u0)
+        let be = bidi_u16_byte(u16_tbl, u1)
+        if be > bs {
+          clusters.push(BidiVisualCluster::{ byte_start: bs, byte_end: be, vis_x0: cx0, vis_x1: cx0 + adv_sum, rtl: false })
+        }
+      }
+    } else {
+      // Odd-level (RTL) run: check whether it contains any RTL script (Hebrew/Arabic/Syriac/Thaana).
+      let mut has_rtl = false
+      for cp in cps {
+        if bidi_is_rtl_script(cp) {
+          has_rtl = true
+          break
+        }
+      }
+      if has_rtl {
+        // Split into contiguous RTL-word tokens vs non-RTL tokens (spaces, brackets, punctuation),
+        // then place tokens right-to-left. Each RTL word is rasterized whole via `hostapi::text_key`
+        // so Pango/CoreText handle RTL glyph order, Arabic cursive joining, and niqqud/harakat GPOS.
+        let tok_a : Array[Int] = []
+        let tok_b : Array[Int] = []
+        let tok_word : Array[Bool] = []
+        let mut p = 0
+        while p < m {
+          let is_w = bidi_is_rtl_word_cp(cps[p])
+          let a = p
+          p += 1
+          while p < m && bidi_is_rtl_word_cp(cps[p]) == is_w {
+            p += 1
+          }
+          let mut actual_w = false
+          if is_w {
+            let mut q = a
+            while q < p {
+              if bidi_is_rtl_script(cps[q]) {
+                actual_w = true
+                break
+              }
+              q += 1
+            }
+          }
+          tok_a.push(a)
+          tok_b.push(p)
+          tok_word.push(actual_w)
+        }
+        let mut ti = tok_a.length() - 1
+        while ti >= 0 {
+          let a = tok_a[ti]
+          let b = tok_b[ti]
+          if tok_word[ti] {
+            // Whole RTL word: shape for advance & cluster bounds, draw whole via hostapi::text_key.
+            let (word, u16_tbl) = bidi_build_segment(cps, starts, ends, a, b, false)
+            let rsl = bidi_shape_or_fallback(word, sz_r, weight, style_bits)
+            let mut word_w = 0.0
+            let mut rk = 0
+            while rk < rsl.n {
+              word_w = word_w + rsl.advs[rk] * qs + spacing
+              rk += 1
+            }
+            let wkey = hostapi::text_key(word, sz_r, weight, style_bits)
+            items.push(BidiDrawItem::{ gkey: wkey, vis_x: pen_x, adv: word_w })
+            let mut cx = pen_x
+            let mut next_u = u16_tbl.length() - 1
+            let mut ck = rsl.n - 1
+            while ck >= 0 {
+              let u0 = rsl.locs[ck]
+              let mut adv_sum = rsl.advs[ck] * qs + spacing
+              while ck > 0 && rsl.locs[ck - 1] == u0 {
+                ck -= 1
+                adv_sum = adv_sum + rsl.advs[ck] * qs + spacing
+              }
+              let bs = bidi_u16_byte(u16_tbl, u0)
+              let be = bidi_u16_byte(u16_tbl, next_u)
+              if be > bs {
+                clusters.push(BidiVisualCluster::{ byte_start: bs, byte_end: be, vis_x0: cx, vis_x1: cx + adv_sum, rtl: true })
+              }
+              cx = cx + adv_sum
+              if u0 < next_u {
+                next_u = u0
+              }
+              ck -= 1
+            }
+            pen_x = pen_x + word_w
+          } else {
+            // Non-joining token inside an odd run: apply L4 mirroring and emit clusters right-to-left.
+            let (seg, u16_tbl) = bidi_build_segment(cps, starts, ends, a, b, true)
+            let rsl = bidi_shape_or_fallback(seg, sz_r, weight, style_bits)
+            let mut rk = rsl.n - 1
+            while rk >= 0 {
+              let adv = rsl.advs[rk] * qs + spacing
+              let u0 = rsl.locs[rk]
+              let u1 = if rk + 1 < rsl.n { rsl.locs[rk + 1] } else { u16_tbl.length() - 1 }
+              let bs = bidi_u16_byte(u16_tbl, u0)
+              let be = bidi_u16_byte(u16_tbl, u1)
+              items.push(BidiDrawItem::{ gkey: rsl.gkeys[rk], vis_x: pen_x, adv })
+              clusters.push(BidiVisualCluster::{ byte_start: bs, byte_end: be, vis_x0: pen_x, vis_x1: pen_x + adv, rtl: true })
+              pen_x = pen_x + adv
+              rk -= 1
+            }
+          }
+          ti -= 1
+        }
+      } else {
+        // Odd-level non-joining run (Hebrew with niqqud, punctuation/neutrals):
+        // Apply L4 mirroring, shape in logical order (so base+combining marks stay in one cluster),
+        // and emit clusters in reverse order right-to-left.
+        let (seg, u16_tbl) = bidi_build_segment(cps, starts, ends, 0, m, true)
+        let rsl = bidi_shape_or_fallback(seg, sz_r, weight, style_bits)
+        let mut rk = rsl.n - 1
+        while rk >= 0 {
+          let adv = rsl.advs[rk] * qs + spacing
+          let u0 = rsl.locs[rk]
+          let u1 = if rk + 1 < rsl.n { rsl.locs[rk + 1] } else { u16_tbl.length() - 1 }
+          let bs = bidi_u16_byte(u16_tbl, u0)
+          let be = bidi_u16_byte(u16_tbl, u1)
+          items.push(BidiDrawItem::{ gkey: rsl.gkeys[rk], vis_x: pen_x, adv })
+          clusters.push(BidiVisualCluster::{ byte_start: bs, byte_end: be, vis_x0: pen_x, vis_x1: pen_x + adv, rtl: true })
+          pen_x = pen_x + adv
+          rk -= 1
+        }
+      }
+    }
+  }
+  BidiLineLayout::{ clusters: bidi_merge_grapheme_clusters(line, clusters), items, width: pen_x }
+}
+
+/// Resolve UAX #9 BiDi visual runs for one visual line with explicit paragraph base direction
+/// (`rtl=true` => base level 1, `rtl=false` => LTR pass-through).
+/// Returns `(visual_run_text, embedding_level)` in left-to-right visual order, with L4 mirroring
+/// applied to odd-level runs and non-RTL-script odd-level runs (e.g. `"://"` -> `"//:"`) reversed.
+pub fn bidi_visual_runs(line : String, rtl : Bool) -> Array[(String, Int)] {
+  if line.length() == 0 {
+    return []
+  }
+  if !rtl {
+    return [(line, 0)]
+  }
+  let bd = text::bidi_new(line, 1)
+  let ll = bd.line_levels(0, line.length())
+  let run_levels : Array[Int] = []
+  let run_cps : Array[Array[Int]] = []
+  let n = line.length()
+  let mut i = 0
+  while i < n {
+    let lv = if i < ll.length() { ll[i] } else { 1 }
+    let b0 = line.code_unit_at(i)
+    let mut cp = b0
+    let mut step = 1
+    if b0 < 0x80 {
+      cp = b0
+      step = 1
+    } else if (b0 & 0xE0) == 0xC0 && i + 1 < n {
+      cp = ((b0 & 0x1F) << 6) | (line.code_unit_at(i + 1) & 0x3F)
+      step = 2
+    } else if (b0 & 0xF0) == 0xE0 && i + 2 < n {
+      cp = ((b0 & 0x0F) << 12) | ((line.code_unit_at(i + 1) & 0x3F) << 6) | (line.code_unit_at(i + 2) & 0x3F)
+      step = 3
+    } else if (b0 & 0xF8) == 0xF0 && i + 3 < n {
+      cp = ((b0 & 0x07) << 18) | ((line.code_unit_at(i + 1) & 0x3F) << 12) | ((line.code_unit_at(i + 2) & 0x3F) << 6) | (line.code_unit_at(i + 3) & 0x3F)
+      step = 4
+    }
+    if run_levels.length() > 0 && run_levels[run_levels.length() - 1] == lv {
+      run_cps[run_cps.length() - 1].push(cp)
+    } else {
+      run_levels.push(lv)
+      run_cps.push([cp])
+    }
+    i += step
+  }
+  let order = text::visual_order(run_levels)
+  let out : Array[(String, Int)] = []
+  for idx in order {
+    let lv = run_levels[idx]
+    let cps = run_cps[idx]
+    let sb = StringBuilder::new()
+    if lv % 2 == 0 {
+      for cp in cps {
+        bidi_push_cp(sb, cp)
+      }
+    } else {
+      let mut has_rtl = false
+      for cp in cps {
+        if bidi_is_rtl_script(cp) {
+          has_rtl = true
+          break
+        }
+      }
+      if has_rtl {
+        for cp in cps {
+          bidi_push_cp(sb, text::mirror(cp))
+        }
+      } else {
+        let mut k = cps.length() - 1
+        while k >= 0 {
+          bidi_push_cp(sb, text::mirror(cps[k]))
+          k -= 1
+        }
+      }
+    }
+    out.push((sb.to_string(), lv))
+  }
+  out
+}
+
 /// Shape and emit real glyph quads (kind=1.0 mono / 3.0 color / 7.0 adaptive) for `d.words`.
 /// Returns true when words were clipped to their own box with square corners (`rc = 0`).
 fn encode_words(
@@ -913,6 +1452,7 @@ fn encode_words(
       line_idx += 1
       continue
     }
+    let mut active_raw = raw
     let mut sl = shape_line_cached(raw, sz_r, weight, style_bits)
     let mut line_overflow = false
     if !wrap && d.w > 0.0 && sl.n > 0 {
@@ -927,6 +1467,7 @@ fn encode_words(
         if !d.ellipsis_past {
           let ell = ellipsize_text(raw, d.w / qs, sz_r, weight=weight, style_bits=style_bits, tracking=spacing / qs)
           if ell.length() > 0 {
+            active_raw = ell
             sl = shape_line_cached(ell, sz_r, weight, style_bits)
           }
         }
@@ -949,8 +1490,8 @@ fn encode_words(
     let eff_clip_x1 = if use_box_clip { dmin(clip_x1, d.x + d.w) } else { clip_x1 }
     let eff_clip_y1 = if use_box_clip && d.h > 0.0 { dmin(clip_y1, d.y + d.h) } else { clip_y1 }
     // Partition shaped clusters into visual lines (UAX #14 + kinsoku wrapping by d.w if wrap=true)
-    let cps = utf16_codepoints(raw)
-    let breaks = if wrap { utf16_break_table(raw, cps) } else { [] }
+    let cps = utf16_codepoints(active_raw)
+    let breaks = if wrap { utf16_break_table(active_raw, cps) } else { [] }
     let mut start = 0
     while start < n {
       if max_lines > 0 && line_idx >= max_lines {
@@ -993,60 +1534,117 @@ fn encode_words(
         line_w = advs[start] * qs + spacing
         end = start + 1
       }
-      let start_x = if d.words_center && d.w > line_w {
-        d.x + (d.w - line_w) * 0.5
-      } else {
-        d.x
-      }
       let line_top = d.y + line_idx.to_double() * line_h
       let baseline_y = line_top + base_off
       let ink_r = ((d.ink >> 24) & 0xFFL).to_double() / 255.0
       let ink_g = ((d.ink >> 16) & 0xFFL).to_double() / 255.0
       let ink_b = ((d.ink >> 8) & 0xFFL).to_double() / 255.0
       let ink_a = ((d.ink & 0xFFL).to_double() / 255.0) * dclamp(d.alpha, 0.0, 1.0)
-      let mut pen_x = start_x
-      let mut k = start
-      while k < end {
-        let adv = advs[k] * qs + spacing
-        let gkey = gkeys[k]
-        let laid_x = pen_x + pad
-        let sub_key = glyph_sub_at(gkey, laid_x, scale, qs)
-        match resolve_glyph(sub_key, scale) {
-          Some(slot) => {
-            let qx = if qs == 1.0 && scale > 0.0 {
-              on_glyph_col(laid_x, slot.ox * qs, scale, z=qs)
-            } else {
-              laid_x + slot.ox * qs
-            }
-            let qy = if qs == 1.0 && scale > 0.0 {
-              on_glyph_row(line_top, base_off, slot.oy * qs, scale)
-            } else {
-              baseline_y + slot.oy * qs
-            }
-            scene.push_glyph_inst(
-              qx,
-              qy,
-              slot.gw * qs,
-              slot.gh * qs,
-              if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
-              ink_r,
-              ink_g,
-              ink_b,
-              ink_a,
-              slot.u,
-              slot.v,
-              slot.gw * scale,
-              slot.gh * scale,
-              eff_clip_x,
-              eff_clip_y,
-              eff_clip_x1,
-              eff_clip_y1,
-            )
-          }
-          None => ()
+      if d.words_look.rtl {
+        // UAX #9 BiDi paragraph base direction (dir = 1): shared visual layout + joining whole-word shaping.
+        let u16_s = locs[start]
+        let u16_e = if end < n { locs[end] } else { cps.length() }
+        let line_str = utf16_slice(active_raw, u16_s, u16_e)
+        let bl = bidi_layout_line(line_str, true, sz_r, weight, style_bits, qs, spacing)
+        let vis_line_w = bl.width
+        let start_x = if d.words_center && d.w > vis_line_w {
+          d.x + (d.w - vis_line_w) * 0.5
+        } else if d.w > vis_line_w {
+          d.x + (d.w - vis_line_w)
+        } else {
+          d.x
         }
-        pen_x = pen_x + adv
-        k += 1
+        for item in bl.items {
+          if item.gkey < 0 {
+            continue
+          }
+          let laid_x = start_x + item.vis_x + pad
+          let sub_key = glyph_sub_at(item.gkey, laid_x, scale, qs)
+          match resolve_glyph(sub_key, scale) {
+            Some(slot) => {
+              let qx = if qs == 1.0 && scale > 0.0 {
+                on_glyph_col(laid_x, slot.ox * qs, scale, z=qs)
+              } else {
+                laid_x + slot.ox * qs
+              }
+              let qy = if qs == 1.0 && scale > 0.0 {
+                on_glyph_row(line_top, base_off, slot.oy * qs, scale)
+              } else {
+                baseline_y + slot.oy * qs
+              }
+              scene.push_glyph_inst(
+                qx,
+                qy,
+                slot.gw * qs,
+                slot.gh * qs,
+                if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
+                ink_r,
+                ink_g,
+                ink_b,
+                ink_a,
+                slot.u,
+                slot.v,
+                slot.gw * scale,
+                slot.gh * scale,
+                eff_clip_x,
+                eff_clip_y,
+                eff_clip_x1,
+                eff_clip_y1,
+              )
+            }
+            None => ()
+          }
+        }
+      } else {
+        let start_x = if d.words_center && d.w > line_w {
+          d.x + (d.w - line_w) * 0.5
+        } else {
+          d.x
+        }
+        let mut pen_x = start_x
+        let mut k = start
+        while k < end {
+          let adv = advs[k] * qs + spacing
+          let gkey = gkeys[k]
+          let laid_x = pen_x + pad
+          let sub_key = glyph_sub_at(gkey, laid_x, scale, qs)
+          match resolve_glyph(sub_key, scale) {
+            Some(slot) => {
+              let qx = if qs == 1.0 && scale > 0.0 {
+                on_glyph_col(laid_x, slot.ox * qs, scale, z=qs)
+              } else {
+                laid_x + slot.ox * qs
+              }
+              let qy = if qs == 1.0 && scale > 0.0 {
+                on_glyph_row(line_top, base_off, slot.oy * qs, scale)
+              } else {
+                baseline_y + slot.oy * qs
+              }
+              scene.push_glyph_inst(
+                qx,
+                qy,
+                slot.gw * qs,
+                slot.gh * qs,
+                if slot.color { 3.0 } else if scene.ink_r > 0.0 { 7.0 } else { 1.0 },
+                ink_r,
+                ink_g,
+                ink_b,
+                ink_a,
+                slot.u,
+                slot.v,
+                slot.gw * scale,
+                slot.gh * scale,
+                eff_clip_x,
+                eff_clip_y,
+                eff_clip_x1,
+                eff_clip_y1,
+              )
+            }
+            None => ()
+          }
+          pen_x = pen_x + adv
+          k += 1
+        }
       }
       line_idx += 1
       start = end
@@ -1074,6 +1672,10 @@ struct RunsCluster {
   u16_off : Int
   rink : Int64
   run_bg : Int64
+  text : String
+  rsz : Double
+  rweight : Int
+  rstyle : Int
 }
 
 fn space_break_allowed_runs(clusters : Array[RunsCluster], p_end : Int, space_idx : Int) -> Bool {
@@ -1183,12 +1785,14 @@ fn layout_runs(
           let mut k = 0
           while k < n {
             let loc = sbuf[k * 4].to_int()
+            let cl_len = sbuf[k * 4 + 1].to_int()
             let pl = if k == 0 && si == 0 { room } else { 0.0 }
             let pr = if k == n - 1 && si == sub_lines.length() - 1 { room } else { 0.0 }
             let adv = sbuf[k * 4 + 2] * quad_scale + spacing + pl + pr
             let gkey = sbuf[k * 4 + 3].to_int()
             let cu = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
-            clusters.push(RunsCluster::{ adv, pad_l: pl, gkey, cu, u16_off: para_u16_base + loc, rink, run_bg })
+            let ctext = utf16_slice(seg, loc, loc + cl_len)
+            clusters.push(RunsCluster::{ adv, pad_l: pl, gkey, cu, u16_off: para_u16_base + loc, rink, run_bg, text: ctext, rsz, rweight, rstyle })
             k += 1
           }
         }
@@ -1344,17 +1948,209 @@ fn encode_runs(
     let vl = layout.lines[line_idx]
     let line_y = d.y + line_idx.to_double() * line_h
     let baseline_y = line_y + base_off
+    // Resolve visual cluster order (BiDi UAX #9 when rtl=true, logical order otherwise).
+    // Keep per-cluster background spans (`vis_bgs`) decoupled from merged whole-word RTL glyph
+    // items (`vis_clusters`) so partial-word highlights render over the exact target letters while
+    // Arabic cursive joining and Hebrew niqqud remain intact via `hostapi::text_key`.
+    let vis_clusters : Array[RunsCluster] = []
+    let vis_bgs : Array[(Double, Int64)] = []
+    let mut vis_line_w = 0.0
+    if d.words_look.rtl && vl.end > vl.start {
+      let line_sb = StringBuilder::new()
+      let cl_byte_starts : Array[Int] = []
+      let mut ci = vl.start
+      while ci < vl.end {
+        cl_byte_starts.push(line_sb.to_string().length())
+        line_sb.write_string(layout.clusters[ci].text)
+        ci += 1
+      }
+      let line_s = line_sb.to_string()
+      let bd = text::bidi_new(line_s, 1)
+      let ll = bd.line_levels(0, line_s.length())
+      let r_levels : Array[Int] = []
+      let r_lists : Array[Array[RunsCluster]] = []
+      let mut cj = vl.start
+      while cj < vl.end {
+        let bo = cl_byte_starts[cj - vl.start]
+        let lv = if bo < ll.length() { ll[bo] } else { 1 }
+        let cl = layout.clusters[cj]
+        if r_levels.length() > 0 && r_levels[r_levels.length() - 1] == lv {
+          r_lists[r_lists.length() - 1].push(cl)
+        } else {
+          r_levels.push(lv)
+          r_lists.push([cl])
+        }
+        cj += 1
+      }
+      let r_order = text::visual_order(r_levels)
+      for ridx in r_order {
+        let lv = r_levels[ridx]
+        let list = r_lists[ridx]
+        if lv % 2 == 0 {
+          for cl in list {
+            vis_clusters.push(cl)
+            vis_bgs.push((cl.adv, cl.run_bg))
+            vis_line_w = vis_line_w + cl.adv
+          }
+        } else {
+          // Odd-level RTL run: group contiguous same-font/ink RTL-script word clusters into whole-word
+          // text_key (preserving Arabic cursive joining even when `run_bg` changes mid-word), while
+          // emitting per-cluster background spans in visual right-to-left order.
+          let mut has_j = false
+          for cl in list {
+            if bidi_is_rtl_script(cl.cu) {
+              has_j = true
+              break
+            }
+          }
+          if has_j {
+            let lm = list.length()
+            let t_a : Array[Int] = []
+            let t_b : Array[Int] = []
+            let t_j : Array[Bool] = []
+            let mut p = 0
+            while p < lm {
+              let is_j = bidi_is_rtl_word_cp(list[p].cu)
+              let a = p
+              p += 1
+              while p < lm && bidi_is_rtl_word_cp(list[p].cu) == is_j &&
+                    (!is_j || (list[p].rsz == list[a].rsz && list[p].rweight == list[a].rweight && list[p].rstyle == list[a].rstyle && list[p].rink == list[a].rink)) {
+                p += 1
+              }
+              let mut actual_j = false
+              if is_j {
+                let mut q = a
+                while q < p {
+                  if bidi_is_rtl_script(list[q].cu) {
+                    actual_j = true
+                    break
+                  }
+                  q += 1
+                }
+              }
+              t_a.push(a)
+              t_b.push(p)
+              t_j.push(actual_j)
+            }
+            let mut ti = t_a.length() - 1
+            while ti >= 0 {
+              let a = t_a[ti]
+              let b = t_b[ti]
+              if t_j[ti] {
+                let wsb = StringBuilder::new()
+                let cl_u16_starts : Array[Int] = []
+                let cl_u16_ends : Array[Int] = []
+                let mut u16_cur = 0
+                let mut q = a
+                while q < b {
+                  let ct = list[q].text
+                  cl_u16_starts.push(u16_cur)
+                  u16_cur = u16_cur + utf16_codepoints(ct).length()
+                  cl_u16_ends.push(u16_cur)
+                  wsb.write_string(ct)
+                  q += 1
+                }
+                let word_str = wsb.to_string()
+                let first_cl = list[a]
+                let rsl = bidi_shape_or_fallback(word_str, first_cl.rsz, first_cl.rweight, first_cl.rstyle)
+                let mut wadv = 0.0
+                if rsl.n > 0 {
+                  let mut ck = rsl.n - 1
+                  while ck >= 0 {
+                    let cadv = rsl.advs[ck] * qs + spacing
+                    let u0 = rsl.locs[ck]
+                    let mut bg_col = first_cl.run_bg
+                    let mut mi = 0
+                    while mi < cl_u16_starts.length() {
+                      if u0 >= cl_u16_starts[mi] && u0 < cl_u16_ends[mi] {
+                        bg_col = list[a + mi].run_bg
+                        break
+                      }
+                      mi += 1
+                    }
+                    vis_bgs.push((cadv, bg_col))
+                    wadv = wadv + cadv
+                    ck -= 1
+                  }
+                } else {
+                  let mut rq = b - 1
+                  while rq >= a {
+                    vis_bgs.push((list[rq].adv, list[rq].run_bg))
+                    wadv = wadv + list[rq].adv
+                    rq -= 1
+                  }
+                }
+                let wkey = hostapi::text_key(word_str, first_cl.rsz, first_cl.rweight, first_cl.rstyle)
+                vis_clusters.push(RunsCluster::{ ..first_cl, adv: wadv, gkey: wkey })
+                vis_line_w = vis_line_w + wadv
+              } else {
+                let mut q = b - 1
+                while q >= a {
+                  let cl = list[q]
+                  let mcp = text::mirror(cl.cu)
+                  let gk = if mcp != cl.cu {
+                    let msb = StringBuilder::new()
+                    bidi_push_cp(msb, mcp)
+                    hostapi::text_key(msb.to_string(), cl.rsz, cl.rweight, cl.rstyle)
+                  } else {
+                    cl.gkey
+                  }
+                  vis_clusters.push(RunsCluster::{ ..cl, gkey: gk })
+                  vis_bgs.push((cl.adv, cl.run_bg))
+                  vis_line_w = vis_line_w + cl.adv
+                  q -= 1
+                }
+              }
+              ti -= 1
+            }
+          } else {
+            let mut q = list.length() - 1
+            while q >= 0 {
+              let cl = list[q]
+              let mcp = text::mirror(cl.cu)
+              let gk = if mcp != cl.cu {
+                let msb = StringBuilder::new()
+                bidi_push_cp(msb, mcp)
+                hostapi::text_key(msb.to_string(), cl.rsz, cl.rweight, cl.rstyle)
+              } else {
+                cl.gkey
+              }
+              vis_clusters.push(RunsCluster::{ ..cl, gkey: gk })
+              vis_bgs.push((cl.adv, cl.run_bg))
+              vis_line_w = vis_line_w + cl.adv
+              q -= 1
+            }
+          }
+        }
+      }
+    } else {
+      let mut ci = vl.start
+      while ci < vl.end {
+        let cl = layout.clusters[ci]
+        vis_clusters.push(cl)
+        vis_bgs.push((cl.adv, cl.run_bg))
+        vis_line_w = vis_line_w + cl.adv
+        ci += 1
+      }
+    }
+    let eff_line_w = if vis_line_w > 0.0 { vis_line_w } else { vl.width }
+    let line_start_x = if d.words_look.rtl && !d.words_center && d.w > eff_line_w {
+      d.x + (d.w - eff_line_w)
+    } else if d.words_center && d.w > eff_line_w {
+      d.x + (d.w - eff_line_w) * 0.5
+    } else {
+      d.x
+    }
     // Emit merged highlight spans behind the line's glyphs (one rounded pill per contiguous same-bg span).
-    let mut bg_x = d.x
+    let mut bg_x = line_start_x
     let mut span_col = 0L
     let mut span_x = 0.0
     let mut span_w = 0.0
-    let mut bk = vl.start
-    while bk < vl.end {
-      let cl = layout.clusters[bk]
-      let has_bg = (cl.run_bg & 0xFFL) != 0L
-      if has_bg && cl.run_bg == span_col {
-        span_w = span_w + cl.adv
+    for bg_item in vis_bgs {
+      let (item_adv, item_bg) = bg_item
+      let has_bg = (item_bg & 0xFFL) != 0L
+      if has_bg && item_bg == span_col {
+        span_w = span_w + item_adv
       } else {
         if span_col != 0L && span_w > 0.0 {
           let _ = scene.push_inst(
@@ -1364,16 +2160,15 @@ fn encode_runs(
           )
         }
         if has_bg {
-          span_col = cl.run_bg
+          span_col = item_bg
           span_x = bg_x
-          span_w = cl.adv
+          span_w = item_adv
         } else {
           span_col = 0L
           span_w = 0.0
         }
       }
-      bg_x = bg_x + cl.adv
-      bk += 1
+      bg_x = bg_x + item_adv
     }
     if span_col != 0L && span_w > 0.0 {
       let _ = scene.push_inst(
@@ -1382,11 +2177,9 @@ fn encode_runs(
         clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
       )
     }
-    let mut pen_x = d.x
-    let mut k = vl.start
-    while k < vl.end {
-      let cl = layout.clusters[k]
-      if (cl.rink & 0xFFL) != 0L {
+    let mut pen_x = line_start_x
+    for cl in vis_clusters {
+      if cl.gkey >= 0 && (cl.rink & 0xFFL) != 0L {
         let laid_x = pen_x + pad + cl.pad_l
         let sub_key = glyph_sub_at(cl.gkey, laid_x, scale, qs)
         match resolve_glyph(sub_key, scale) {
@@ -1410,7 +2203,6 @@ fn encode_runs(
         }
       }
       pen_x = pen_x + cl.adv
-      k += 1
     }
     line_idx += 1
   }
