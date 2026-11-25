@@ -1,0 +1,1305 @@
+// Aura Wave 1.5A — Select compound component (Builder + Pion-JSX) and shared selector helpers.
+// Built on `headless::selector`, `w0_popover_shell`, `w0_field_shell`, `label_node`, `description_node`,
+// and `error_message_node`. Zero liquid glass, circular corners everywhere, full RTL and A11y support.
+
+import "headless"
+import "headless_core"
+import "signals"
+import "ui"
+import "view"
+
+/// Option descriptor shared by `Select`, `ComboBox`, and `Autocomplete`.
+pub struct AuraSelectOption {
+  pub key : String
+  pub label : String
+  pub description : Option[String]
+  pub icon : Option[AuraIconKind]
+  pub disabled : Bool
+  pub section : Option[String]
+}
+
+/// Construct an `AuraSelectOption` with optional description, leading icon, disabled flag, and section title.
+pub fn AuraSelectOption::new(
+  key : String,
+  label : String,
+  description? : String,
+  icon? : AuraIconKind,
+  disabled~ : Bool = false,
+  section? : String,
+) -> AuraSelectOption {
+  AuraSelectOption::{ key, label, description, icon, disabled, section }
+}
+
+// ===========================================================================
+// Shared Wave 1.5A internal helpers (`x_` prefix)
+// ===========================================================================
+
+fn x_words_look(
+  size : Double,
+  weight : Int,
+  line : Double,
+  wrap~ : Bool = false,
+  rtl~ : Bool = false,
+) -> view::WordsLook {
+  view::WordsLook::{ ..view::words_plain, size, weight, line, wrap, rtl }
+}
+
+fn x_ascii_lower(s : String) -> String {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_char((c + 32).unsafe_to_char())
+    } else {
+      sb.write_char(c.unsafe_to_char())
+    }
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn x_str_contains_ci(haystack : String, needle : String) -> Bool {
+  if needle == "" {
+    return true
+  }
+  x_ascii_lower(haystack).contains(x_ascii_lower(needle))
+}
+
+fn x_effective_rtl(v : view::View, rtl : Bool, dir : String) -> Bool {
+  if dir == "rtl" {
+    true
+  } else if dir == "ltr" {
+    false
+  } else {
+    rtl || aura_rtl(v)
+  }
+}
+
+fn x_effective_disabled(v : view::View, local : () -> Bool) -> Bool {
+  local() || headless::form_disabled_inherited(v)
+}
+
+struct XFilterResult {
+  query : String
+  keys : Array[String]
+  key_set : Map[String, Bool]
+  section_set : Map[String, Bool]
+}
+
+struct XSelectIndex {
+  items : Array[AuraSelectOption]
+  by_key : Map[String, AuraSelectOption]
+  disabled_map : Map[String, Bool]
+  lower_labels : Array[String]
+  all_keys : Array[String]
+  all_key_set : Map[String, Bool]
+  all_section_set : Map[String, Bool]
+  seen_sections : Array[String]
+  section_buckets : Map[String, Array[AuraSelectOption]]
+  unsectioned : Array[AuraSelectOption]
+  has_sections : Bool
+}
+
+fn XSelectIndex::new(items : Array[AuraSelectOption]) -> XSelectIndex {
+  let by_key : Map[String, AuraSelectOption] = Map::new()
+  let disabled_map : Map[String, Bool] = Map::new()
+  let lower_labels : Array[String] = []
+  let all_keys : Array[String] = []
+  let all_key_set : Map[String, Bool] = Map::new()
+  let all_section_set : Map[String, Bool] = Map::new()
+  let seen_sections : Array[String] = []
+  let section_buckets : Map[String, Array[AuraSelectOption]] = Map::new()
+  let unsectioned : Array[AuraSelectOption] = []
+  let mut has_sections = false
+  for opt in items {
+    by_key[opt.key] = opt
+    disabled_map[opt.key] = opt.disabled
+    lower_labels.push(x_ascii_lower(opt.label))
+    all_keys.push(opt.key)
+    all_key_set[opt.key] = true
+    match opt.section {
+      Some(sec) => {
+        has_sections = true
+        if !all_section_set.contains(sec) {
+          all_section_set[sec] = true
+          seen_sections.push(sec)
+          section_buckets[sec] = [opt]
+        } else {
+          match section_buckets.get(sec) {
+            Some(bucket) => bucket.push(opt)
+            None => section_buckets[sec] = [opt]
+          }
+        }
+      }
+      None => unsectioned.push(opt)
+    }
+  }
+  XSelectIndex::{
+    items,
+    by_key,
+    disabled_map,
+    lower_labels,
+    all_keys,
+    all_key_set,
+    all_section_set,
+    seen_sections,
+    section_buckets,
+    unsectioned,
+    has_sections,
+  }
+}
+
+fn XSelectIndex::label_of(self : XSelectIndex, key : String) -> String {
+  match self.by_key.get(key) {
+    Some(opt) => opt.label
+    None => key
+  }
+}
+
+fn XSelectIndex::disabled_of(self : XSelectIndex, key : String) -> Bool {
+  match self.disabled_map.get(key) {
+    Some(b) => b
+    None => false
+  }
+}
+
+fn XSelectIndex::all_result(self : XSelectIndex) -> XFilterResult {
+  XFilterResult::{
+    query: "",
+    keys: self.all_keys,
+    key_set: self.all_key_set,
+    section_set: self.all_section_set,
+  }
+}
+
+fn XSelectIndex::filter(self : XSelectIndex, query : String) -> XFilterResult {
+  if query == "" {
+    return self.all_result()
+  }
+  let q_low = x_ascii_lower(query)
+  let keys : Array[String] = []
+  let key_set : Map[String, Bool] = Map::new()
+  let section_set : Map[String, Bool] = Map::new()
+  let n = self.items.length()
+  let mut i = 0
+  while i < n {
+    if self.lower_labels[i].contains(q_low) {
+      let opt = self.items[i]
+      keys.push(opt.key)
+      key_set[opt.key] = true
+      match opt.section {
+        Some(sec) => section_set[sec] = true
+        None => ()
+      }
+    }
+    i += 1
+  }
+  XFilterResult::{ query, keys, key_set, section_set }
+}
+
+fn x_make_filter_memo(
+  idx : XSelectIndex,
+  query_get : () -> String,
+) -> signals::Computed[XFilterResult] {
+  signals::memo_by(
+    query_get,
+    fn(q : String) -> XFilterResult { idx.filter(q) },
+    fn(a : String, b : String) -> Bool { a == b },
+    fn(a : XFilterResult, b : XFilterResult) -> Bool { a.query == b.query },
+  )
+}
+
+fn XSelectIndex::selection_display_text(self : XSelectIndex, keys : Array[String]) -> String {
+  if keys.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < keys.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(self.label_of(keys[i]))
+    i += 1
+  }
+  sb.to_string()
+}
+
+fn x_trigger_bg(
+  v : view::View,
+  pal : AuraPalette,
+  variant : AuraFieldVariant,
+  hovered : Bool,
+  invalid : Bool,
+) -> Int64 {
+  if hovered && !invalid {
+    match variant {
+      AuraFieldVariant::Primary => pal.field_hover
+      AuraFieldVariant::Secondary => pal.default_hover
+      AuraFieldVariant::Auto =>
+        if !aura_has_surface_context(v) {
+          pal.field_hover
+        } else {
+          match aura_surface_level_of(v) {
+            AuraSurfaceLevel::Transparent => pal.field_hover
+            _ => pal.default_hover
+          }
+        }
+    }
+  } else {
+    aura_field_bg(v, pal, variant)
+  }
+}
+
+fn x_apply_trigger_ring(
+  node : view::View,
+  invalid : view::Live[Bool],
+  force_focus_visible~ : Bool = false,
+) -> Unit {
+  let _ = node
+    .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+      let inv = invalid.eval()
+      let foc_vis = force_focus_visible || node.focus_shown()
+      let th = aura_theme(node)
+      if inv && (foc_vis || node.focused()) {
+        (2.0, 0.0, th.palette.danger)
+      } else if inv {
+        (1.0, 0.0, th.palette.danger)
+      } else if foc_vis {
+        (2.0, th.ring_offset_width, th.palette.focus)
+      } else {
+        (0.0, 0.0, 0L)
+      }
+    }))
+    .ring_gap_color(view::Live::By(fn() -> Int64 {
+      let inv = invalid.eval()
+      let foc_vis = force_focus_visible || node.focus_shown()
+      if !inv && foc_vis {
+        aura_theme(node).palette.background
+      } else {
+        0L
+      }
+    }))
+}
+
+fn x_chevron_node(
+  parent : view::View,
+  open_get : () -> Bool,
+  rtl_get : () -> Bool,
+  ink_get~ : () -> Int64 = fn() -> Int64 { aura_theme(parent).palette.field_placeholder },
+) -> view::View {
+  parent.box(fn(ind : view::View) -> Unit {
+    let _ = ind
+      .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+        if rtl_get() {
+          (Some(8.0), Some(0.0), None, Some(0.0))
+        } else {
+          (None, Some(0.0), Some(8.0), Some(0.0))
+        }
+      }))
+      .width(view::Live::Is(Some(16.0)))
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::Is(view::Lies::Middle))
+      .points(view::Live::Is(false))
+    let _ = ind.show(
+      open_get,
+      fn(up_v : view::View) -> Unit {
+        let _ = aura_icon_node(up_v, AuraIconKind::ChevronUp, size=16.0, ink=ink_get)
+      },
+      at_once=true,
+    )
+    let _ = ind.show(
+      fn() -> Bool { !open_get() },
+      fn(dn_v : view::View) -> Unit {
+        let _ = aura_icon_node(dn_v, AuraIconKind::ChevronDown, size=16.0, ink=ink_get)
+      },
+      at_once=true,
+    )
+  })
+}
+
+fn x_clear_button_node(
+  parent : view::View,
+  has_value : () -> Bool,
+  disabled_get : () -> Bool,
+  on_clear : () -> Unit,
+  label~ : String = "Clear selection",
+  guard_sel? : headless::Selector[String],
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(host : view::View) -> Unit {
+    let _ = host
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .shrink(view::Live::Is(0.0))
+    let _ = host.show(
+      has_value,
+      fn(slot : view::View) -> Unit {
+        let _ = slot
+          .row(view::Live::Is(true))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+          .lies_along(view::Live::Is(view::Lies::Middle))
+          .shrink(view::Live::Is(0.0))
+        let btn_v = headless::button(
+          slot,
+          fn() -> String { label },
+          fn(_v : view::View) -> Unit {
+            if !disabled_get() {
+              on_clear()
+            }
+          },
+          fn(btn : view::View, b : headless::Button) -> Unit {
+            let _ = btn
+              .row(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .lies_along(view::Live::Is(view::Lies::Middle))
+              .width(view::Live::Is(Some(20.0)))
+              .height(view::Live::Is(Some(20.0)))
+              .shrink(view::Live::Is(0.0))
+              .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(btn) }))
+              .radius(view::Live::Is(10.0))
+              .scale(view::Live::By(fn() -> Double {
+                if !aura_reduced_motion(btn) && !b.disabled() && b.pressed() { 0.93 } else { 1.0 }
+              }))
+              .ground(view::Live::By(fn() -> Int64 {
+                let pal = aura_theme(btn).palette
+                let hov = !b.disabled() && !aura_is_coarse_pointer(btn) && b.hovered()
+                if hov { pal.default_hover } else { 0x00000000L }
+              }))
+            let _ = aura_icon_node(
+              btn,
+              AuraIconKind::Xmark,
+              size=14.0,
+              ink=fn() -> Int64 { aura_theme(btn).palette.muted },
+            )
+          },
+          disabled=disabled_get,
+          loc=loc,
+        )
+        match guard_sel {
+          Some(s) => s.guard_press(btn_v)
+          None => ()
+        }
+      },
+      at_once=true,
+    )
+  })
+}
+
+fn x_render_selector_options(
+  lv : view::View,
+  sel : headless::Selector[String],
+  idx : XSelectIndex,
+  filter_get : () -> XFilterResult,
+  rtl_get : () -> Bool,
+  show_active_ring~ : Bool = true,
+  force_active_ring~ : Bool = false,
+  empty_label~ : String = "No results found",
+) -> Unit {
+  let mount_one = fn(host : view::View, opt : AuraSelectOption) -> Unit {
+    let k = opt.key
+    let _ = host.show(
+      fn() -> Bool { filter_get().key_set.contains(k) },
+      fn(slot : view::View) -> Unit {
+        let _ = slot.fills_across(view::Live::Is(true))
+        let _ = sel.option(
+          slot,
+          k,
+          fn() -> String { opt.label },
+          fn(row : view::View, is_active : () -> Bool, is_sel : () -> Bool) -> Unit {
+            let _ = row
+              .row(view::Live::Is(true))
+              .row_reverse(view::Live::By(rtl_get))
+              .fills_across(view::Live::Is(true))
+              .lines_up(view::Live::Is(Some(view::Along::Middle)))
+              .min_height(view::Live::Is(Some(36.0)))
+              .padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
+                if rtl_get() { (28.0, 6.0, 10.0, 6.0) } else { (10.0, 6.0, 28.0, 6.0) }
+              }))
+              .gap(view::Live::Is(10.0))
+              .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(row) }))
+              .radius(view::Live::Is(16.0))
+              .scale(view::Live::By(fn() -> Double {
+                if !aura_reduced_motion(row) && !opt.disabled && row.pressed() { 0.98 } else { 1.0 }
+              }))
+              .ground(view::Live::By(fn() -> Int64 {
+                if !opt.disabled && !aura_is_coarse_pointer(row) && row.pointed() {
+                  aura_theme(row).palette.default_bg
+                } else {
+                  0x00000000L
+                }
+              }))
+              .group_alpha(view::Live::By(fn() -> Double {
+                if opt.disabled || sel.disabled() { aura_theme(row).disabled_opacity } else { 1.0 }
+              }))
+
+            if show_active_ring {
+              let _ = row
+                .ring(view::Live::By(fn() -> (Double, Double, Int64) {
+                  let act = is_active() && (force_active_ring || sel.focus_in_scope())
+                  if act {
+                    let th = aura_theme(row)
+                    (2.0, th.ring_offset_width, th.palette.focus)
+                  } else {
+                    (0.0, 0.0, 0L)
+                  }
+                }))
+                .ring_gap_color(view::Live::By(fn() -> Int64 {
+                  let act = is_active() && (force_active_ring || sel.focus_in_scope())
+                  if act { aura_theme(row).palette.background } else { 0L }
+                }))
+            }
+
+            match opt.icon {
+              Some(ik) => {
+                let _ = aura_icon_node(
+                  row,
+                  ik,
+                  size=16.0,
+                  ink=fn() -> Int64 { aura_theme(row).palette.muted },
+                )
+              }
+              None => ()
+            }
+
+            let _ = row.box(fn(col : view::View) -> Unit {
+              let _ = col
+                .grow(view::Live::Is(1.0))
+                .shrink(view::Live::Is(1.0))
+                .min_width(view::Live::Is(Some(0.0)))
+                .lines_up(view::Live::By(fn() -> Option[view::Along] {
+                  Some(if rtl_get() { view::Along::End } else { view::Along::Start })
+                }))
+                .points(view::Live::Is(false))
+              let _ = col
+                .words(view::Live::Is(opt.label), look=x_words_look(14.0, 400, 20.0))
+                .words_look(view::Live::By(fn() -> view::WordsLook { x_words_look(14.0, 400, 20.0, rtl=rtl_get()) }))
+                .ink(view::Live::By(fn() -> Int64 { aura_theme(col).palette.foreground }))
+              match opt.description {
+                Some(desc) => {
+                  let _ = col
+                    .words(view::Live::Is(desc), look=x_words_look(12.0, 400, 16.0, wrap=true))
+                    .words_look(view::Live::By(fn() -> view::WordsLook { x_words_look(12.0, 400, 16.0, wrap=true, rtl=rtl_get()) }))
+                    .ink(view::Live::By(fn() -> Int64 { aura_theme(col).palette.muted }))
+                }
+                None => ()
+              }
+            })
+
+            let _ = row.box(fn(ind : view::View) -> Unit {
+              let _ = ind
+                .over_at(view::Live::By(fn() -> (Option[Double], Option[Double], Option[Double], Option[Double]) {
+                  if rtl_get() {
+                    (Some(8.0), Some(0.0), None, Some(0.0))
+                  } else {
+                    (None, Some(0.0), Some(8.0), Some(0.0))
+                  }
+                }))
+                .width(view::Live::Is(Some(16.0)))
+                .row(view::Live::Is(true))
+                .lines_up(view::Live::Is(Some(view::Along::Middle)))
+                .lies_along(view::Live::Is(view::Lies::Middle))
+                .points(view::Live::Is(false))
+              let _ = ind.show(
+                is_sel,
+                fn(chk : view::View) -> Unit {
+                  let _ = aura_icon_node(
+                    chk,
+                    AuraIconKind::Check,
+                    size=12.0,
+                    ink=fn() -> Int64 { aura_theme(chk).palette.default_foreground },
+                  )
+                },
+                at_once=true,
+              )
+            })
+          },
+        )
+      },
+      at_once=true,
+    )
+  }
+
+  if idx.has_sections {
+    for sec in idx.seen_sections {
+      let _ = lv.show(
+        fn() -> Bool { filter_get().section_set.contains(sec) },
+        fn(sec_v : view::View) -> Unit {
+          let _ = sec_v
+            .fills_across(view::Live::Is(true))
+            .gap(view::Live::Is(4.0))
+            .says(view::Live::Is(Some(view::said(view::Role::Group, label=sec))))
+          let _ = sec_v.box(fn(hdr : view::View) -> Unit {
+            let _ = hdr
+              .fills_across(view::Live::Is(true))
+              .padding(view::Live::Is((10.0, 6.0, 10.0, 2.0)))
+              .lines_up(view::Live::By(fn() -> Option[view::Along] {
+                Some(if rtl_get() { view::Along::End } else { view::Along::Start })
+              }))
+              .points(view::Live::Is(false))
+              .says(view::Live::Is(Some(view::said(view::Role::Heading, label=sec))))
+            let _ = hdr
+              .words(view::Live::Is(sec), look=x_words_look(12.0, 500, 16.0))
+              .words_look(view::Live::By(fn() -> view::WordsLook { x_words_look(12.0, 500, 16.0, rtl=rtl_get()) }))
+              .ink(view::Live::By(fn() -> Int64 { aura_theme(hdr).palette.muted }))
+          })
+          match idx.section_buckets.get(sec) {
+            Some(bucket) => {
+              for opt in bucket {
+                mount_one(sec_v, opt)
+              }
+            }
+            None => ()
+          }
+        },
+        at_once=true,
+      )
+    }
+    for opt in idx.unsectioned {
+      mount_one(lv, opt)
+    }
+  } else {
+    for opt in idx.items {
+      mount_one(lv, opt)
+    }
+  }
+
+  let _ = lv.show(
+    fn() -> Bool { filter_get().keys.length() == 0 },
+    fn(emp : view::View) -> Unit {
+      let _ = emp
+        .fills_across(view::Live::Is(true))
+        .row(view::Live::Is(true))
+        .lies_along(view::Live::Is(view::Lies::Middle))
+        .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        .pad_xy(10.0, 12.0)
+        .points(view::Live::Is(false))
+      let _ = emp
+        .words(view::Live::Is(empty_label), look=x_words_look(14.0, 400, 20.0))
+        .ink(view::Live::By(fn() -> Int64 { aura_theme(emp).palette.muted }))
+    },
+    at_once=true,
+  )
+}
+
+fn x_popover_list_max_height(
+  host : view::View,
+  anchor_ref : signals::Ref[Option[view::View]],
+  gap : Double,
+  header_reserve : Double,
+) -> Double {
+  let root = host.tree.root()
+  let root_h = match root.laid_size_told() {
+    Some((_, h)) if h > 0.0 => h
+    _ => root.rect().3
+  }
+  let avail = if root_h <= 0.0 {
+    320.0
+  } else {
+    let side_avail = match anchor_ref.v {
+      Some(op) => {
+        let _ = op.laid_size_told()
+        let r = op.rect()
+        let below = root_h - (r.1 + r.3 + gap + 8.0)
+        let above = r.1 - gap - 8.0
+        if below >= above { below } else { above }
+      }
+      None => root_h - 16.0
+    }
+    let capped = if side_avail > root_h - 16.0 { root_h - 16.0 } else { side_avail }
+    let list_h = capped - header_reserve
+    if list_h < 80.0 {
+      let floor_h = root_h - 16.0 - header_reserve
+      if floor_h > 40.0 { floor_h } else { 40.0 }
+    } else {
+      list_h
+    }
+  }
+  if avail < 320.0 { avail } else { 320.0 }
+}
+
+fn x_mount_scrollable_listbox(
+  panel : view::View,
+  sel : headless::Selector[String],
+  max_h_get : () -> Double,
+  body : (view::View) -> Unit,
+) -> Unit {
+  let sc = view::Scroll::new()
+  let sv = ui::scroll_box(
+    panel,
+    fn(inner : view::View) -> Unit {
+      let _ = sel.listbox(
+        inner,
+        fn(lv : view::View) -> Unit {
+          let _ = lv
+            .fills_across(view::Live::Is(true))
+            .pad(view::Live::Is(6.0))
+            .gap(view::Live::Is(4.0))
+          body(lv)
+        },
+      )
+    },
+    scroll=sc,
+    fill=false,
+  )
+  let _ = sv
+    .fills_across(view::Live::Is(true))
+    .min_height(view::Live::Is(Some(0.0)))
+    .shrink(view::Live::Is(1.0))
+    .max_height(view::Live::By(fn() -> Option[Double] { Some(max_h_get()) }))
+  let last_scrolled : signals::Ref[Option[String]] = view::ref_new(None)
+  sv.reacts_by(
+    fn() -> (Option[String], Double, Double, Double) {
+      let ak = sel.active_key()
+      let sv_h = match sv.laid_size_told() {
+        Some(sz) => sz.1
+        None => 0.0
+      }
+      let reach = sc.reach()
+      let ov_h = match sel.active_option_view() {
+        Some(ov) =>
+          match ov.laid_size_told() {
+            Some(sz) => sz.1
+            None => 0.0
+          }
+        None => 0.0
+      }
+      (ak, sv_h, reach, ov_h)
+    },
+    fn(a : (Option[String], Double, Double, Double), b : (Option[String], Double, Double, Double)) -> Bool {
+      let ak_eq = match (a.0, b.0) {
+        (None, None) => true
+        (Some(x), Some(y)) => x == y
+        _ => false
+      }
+      ak_eq && a.1 == b.1 && a.2 == b.2 && a.3 == b.3
+    },
+    fn(st : (Option[String], Double, Double, Double)) -> Unit {
+      let ak = st.0
+      let already = match (ak, last_scrolled.v) {
+        (Some(x), Some(y)) => x == y
+        _ => false
+      }
+      if already {
+        return
+      }
+      match sel.active_option_view() {
+        Some(ov) => {
+          let vr = sv.rect()
+          let or = ov.rect()
+          if vr.3 > 0.0 && or.3 > 0.0 {
+            let pad = 6.0
+            let in_view = or.1 >= vr.1 + pad && or.1 + or.3 <= vr.1 + vr.3 - pad
+            if in_view {
+              last_scrolled.v = ak
+            } else if sc.reach() > 0.0 {
+              let cur = sc.at(sv.tree)
+              let max_sc = sc.reach()
+              if or.1 < vr.1 + pad {
+                let next = cur - (vr.1 + pad - or.1)
+                sc.put(if next < 0.0 { 0.0 } else { next })
+              } else if or.1 + or.3 > vr.1 + vr.3 - pad {
+                let next = cur + (or.1 + or.3 - (vr.1 + vr.3 - pad))
+                sc.put(if next > max_sc { max_sc } else { next })
+              }
+              last_scrolled.v = ak
+            }
+          }
+        }
+        None => ()
+      }
+    },
+    at_start=true,
+  )
+}
+
+fn x_mount_selector_popover(
+  host : view::View,
+  open_get : () -> Bool,
+  anchor_ref : signals::Ref[Option[view::View]],
+  placement : headless::Placement,
+  gap : Double,
+  popover_width : Option[Double],
+  rtl_get : () -> Bool,
+  pad_top~ : Double = 0.0,
+  build_panel : (view::View) -> Unit,
+) -> Unit {
+  let root = host.tree.root()
+  let portal_tie = root.show_scoped(
+    open_get,
+    fn(portal : view::View) -> Unit {
+      let _ = portal
+        .over(view::Live::Is(true), edges=(Some(0.0), Some(0.0), Some(0.0), Some(0.0)))
+        .points(view::Live::Is(false))
+      c_inherit_aura_config(host, portal)
+
+      let (b_side, b_along) = c_placement_to_beside(placement, rtl=signals::untracked(rtl_get))
+      let _ = portal.box(fn(layer_v : view::View) -> Unit {
+        let _ = layer_v.points(view::Live::Is(true))
+        match popover_width {
+          Some(w) => {
+            let _ = layer_v.width(view::Live::Is(Some(w)))
+          }
+          None =>
+            match anchor_ref.v {
+              Some(op) => {
+                let _ = layer_v.min_width(view::Live::By(fn() -> Option[Double] {
+                  let r = op.rect()
+                  if r.2 > 0.0 { Some(r.2) } else { Some(220.0) }
+                }))
+              }
+              None => {
+                let _ = layer_v.min_width(view::Live::Is(Some(220.0)))
+              }
+            }
+        }
+        match anchor_ref.v {
+          Some(op) => {
+            let _ = layer_v.beside(op.id(), side=b_side, along=b_along, offset=gap, padding=8.0)
+          }
+          None => {
+            let _ = layer_v.over(view::Live::Is(true), edges=(Some(0.0), Some(gap), None, None))
+          }
+        }
+        let shell = w0_popover_shell(
+          layer_v,
+          radius=22.0,
+          pad=0.0,
+          gap=0.0,
+          content=fn(panel : view::View) -> Unit {
+            let _ = panel.fills_across(view::Live::Is(true))
+            if pad_top > 0.0 {
+              let _ = panel.padding(view::Live::Is((0.0, pad_top, 0.0, 0.0)))
+            }
+            build_panel(panel)
+          },
+        )
+        let _ = shell.fills_across(view::Live::Is(true))
+      })
+    },
+    at_once=true,
+  )
+  portal_tie(host)
+}
+
+// ===========================================================================
+// Select Context & Compound Components
+// ===========================================================================
+
+struct XSelectCtx {
+  sel : headless::Selector[String]
+  idx : XSelectIndex
+  all_res : XFilterResult
+  variant : AuraFieldVariant
+  full_width : Bool
+  invalid : view::Live[Bool]
+  disabled_get : () -> Bool
+  rtl_get : () -> Bool
+  placeholder_get : () -> String
+  trigger_ref : signals::Ref[Option[view::View]]
+  popover_width : Option[Double]
+  gap : Double
+  placement : headless::Placement
+  on_clear : Option[() -> Unit]
+  force_trigger_focus : Bool
+  force_active_ring : Bool
+}
+
+let x_select_ctx_lent : view::Lent[XSelectCtx] = view::Lent::new()
+
+/// Aura `SelectValue` (Builder API): displays the selected item(s) label or placeholder inside `SelectTrigger`.
+pub fn select_value_node(
+  parent : view::View,
+  placeholder? : String,
+  loc~ : String = "",
+) -> view::View {
+  let ctx_opt = parent.lent(x_select_ctx_lent)
+  parent.box(loc=loc, fn(v : view::View) -> Unit {
+    let rtl_get = fn() -> Bool {
+      match ctx_opt {
+        Some(c) => (c.rtl_get)()
+        None => aura_rtl(v)
+      }
+    }
+    let _ = v
+      .grow(view::Live::Is(1.0))
+      .shrink(view::Live::Is(1.0))
+      .min_width(view::Live::Is(Some(0.0)))
+      .row(view::Live::Is(true))
+      .lines_up(view::Live::Is(Some(view::Along::Middle)))
+      .lies_along(view::Live::By(fn() -> view::Lies {
+        if rtl_get() { view::Lies::End } else { view::Lies::Start }
+      }))
+      .points(view::Live::Is(false))
+
+    let is_empty = fn() -> Bool {
+      match ctx_opt {
+        Some(c) => c.sel.selected_keys().length() == 0
+        None => true
+      }
+    }
+    let text_get = fn() -> String {
+      match ctx_opt {
+        Some(c) => {
+          let keys = c.sel.selected_keys()
+          if keys.length() == 0 {
+            match placeholder {
+              Some(p) => p
+              None => (c.placeholder_get)()
+            }
+          } else {
+            c.idx.selection_display_text(keys)
+          }
+        }
+        None => match placeholder { Some(p) => p; None => "" }
+      }
+    }
+    let _ = v
+      .words(view::Live::By(text_get), look=x_words_look(14.0, 400, 20.0))
+      .words_look(view::Live::By(fn() -> view::WordsLook { x_words_look(14.0, 400, 20.0, rtl=rtl_get()) }))
+      .ink(view::Live::By(fn() -> Int64 {
+        let pal = aura_theme(v).palette
+        if is_empty() { pal.field_placeholder } else { pal.field_foreground }
+      }))
+  })
+}
+
+/// Pion-JSX `<aura::SelectValue>` wrapper.
+pub fn SelectValue(
+  parent : view::View,
+  placeholder? : String,
+  loc~ : String = "",
+) -> view::View {
+  select_value_node(parent, placeholder?=placeholder, loc=loc)
+}
+
+/// Aura `SelectIndicator` (Builder API): chevron indicator that rotates when open and flips side in RTL.
+pub fn select_indicator_node(
+  parent : view::View,
+  loc~ : String = "",
+) -> view::View {
+  let ctx_opt = parent.lent(x_select_ctx_lent)
+  let _ = loc
+  let open_get = fn() -> Bool {
+    match ctx_opt {
+      Some(c) => c.sel.is_open()
+      None => false
+    }
+  }
+  let rtl_get = fn() -> Bool {
+    match ctx_opt {
+      Some(c) => (c.rtl_get)()
+      None => aura_rtl(parent)
+    }
+  }
+  x_chevron_node(parent, open_get, rtl_get)
+}
+
+/// Pion-JSX `<aura::SelectIndicator>` wrapper.
+pub fn SelectIndicator(
+  parent : view::View,
+  loc~ : String = "",
+) -> view::View {
+  select_indicator_node(parent, loc=loc)
+}
+
+/// Aura `SelectClearButton` (Builder API): clears selection without opening the popover.
+pub fn select_clear_button_node(
+  parent : view::View,
+  label~ : String = "Clear selection",
+  loc~ : String = "",
+) -> view::View {
+  let ctx_opt = parent.lent(x_select_ctx_lent)
+  match ctx_opt {
+    Some(c) =>
+      x_clear_button_node(
+        parent,
+        fn() -> Bool { c.sel.selected_keys().length() > 0 },
+        c.disabled_get,
+        fn() -> Unit {
+          c.sel.clear(clear_query=false)
+          match c.on_clear {
+            Some(f) => f()
+            None => ()
+          }
+        },
+        label=label,
+        loc=loc,
+      )
+    None => parent.box(fn(_v : view::View) { () }, loc=loc)
+  }
+}
+
+/// Pion-JSX `<aura::SelectClearButton>` wrapper.
+pub fn SelectClearButton(
+  parent : view::View,
+  label~ : String = "Clear selection",
+  loc~ : String = "",
+) -> view::View {
+  select_clear_button_node(parent, label=label, loc=loc)
+}
+
+/// Aura `SelectTrigger` (Builder API): focusable field-styled button with focus-visible gap ring.
+pub fn select_trigger_node(
+  parent : view::View,
+  content? : (view::View) -> Unit,
+  clearable~ : Bool = false,
+  force_focus_visible~ : Bool = false,
+  loc~ : String = "",
+) -> view::View {
+  match parent.lent(x_select_ctx_lent) {
+    Some(c) => {
+      let rtl_get = c.rtl_get
+      let dis_get = c.disabled_get
+      let variant = c.variant
+      let invalid = c.invalid
+      let full_width = c.full_width
+      let force_trig = force_focus_visible || c.force_trigger_focus
+      let trigger_ref = c.trigger_ref
+      let trig = c.sel.trigger(
+        parent,
+        fn(tv : view::View, _s : headless::Selector[String]) -> Unit {
+          trigger_ref.v = Some(tv)
+          let _ = tv
+            .row(view::Live::Is(true))
+            .row_reverse(view::Live::By(rtl_get))
+            .lines_up(view::Live::Is(Some(view::Along::Middle)))
+            .gap(view::Live::Is(6.0))
+            .min_height(view::Live::Is(Some(36.0)))
+            .padding(view::Live::By(fn() -> (Double, Double, Double, Double) {
+              if rtl_get() { (28.0, 6.0, 12.0, 6.0) } else { (12.0, 6.0, 28.0, 6.0) }
+            }))
+            .corner_circular(view::Live::By(fn() -> Bool { aura_corner_circular(tv) }))
+            .radius(view::Live::By(fn() -> Double { aura_theme(tv).field_radius }))
+            .ground(view::Live::By(fn() -> Int64 {
+              let pal = aura_theme(tv).palette
+              let dis = dis_get()
+              let hov = !dis && !aura_is_coarse_pointer(tv) && tv.pointed()
+              x_trigger_bg(tv, pal, variant, hov, invalid.eval())
+            }))
+            .shadows(view::Live::By(fn() -> Array[view::Shadow] {
+              if aura_field_effective_variant(tv, variant) is AuraFieldVariant::Primary {
+                aura_surface_shadows(aura_theme(tv).config.dark)
+              } else {
+                []
+              }
+            }))
+            .group_alpha(view::Live::By(fn() -> Double {
+              if dis_get() { aura_theme(tv).disabled_opacity } else { 1.0 }
+            }))
+          if full_width {
+            let _ = tv.fills_across(view::Live::Is(true))
+          }
+          x_apply_trigger_ring(tv, invalid, force_focus_visible=force_trig)
+          match content {
+            Some(ch) => ch(tv)
+            None => {
+              let _ = select_value_node(tv)
+              if clearable {
+                let _ = select_clear_button_node(tv)
+              }
+              let _ = select_indicator_node(tv)
+            }
+          }
+        },
+        loc=loc,
+      )
+      trig
+    }
+    None => parent.box(fn(_v : view::View) { () }, loc=loc)
+  }
+}
+
+/// Pion-JSX `<aura::SelectTrigger>` wrapper.
+pub fn SelectTrigger(
+  parent : view::View,
+  clearable~ : Bool = false,
+  force_focus_visible~ : Bool = false,
+  children? : (view::View) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  select_trigger_node(parent, content?=children, clearable=clearable, force_focus_visible=force_focus_visible, loc=loc)
+}
+
+/// Aura `SelectPopover` (Builder API): portal-mounted overlay listbox anchored to `SelectTrigger`.
+pub fn select_popover_node(
+  parent : view::View,
+  content? : (view::View, headless::Selector[String]) -> Unit,
+  placement? : headless::Placement,
+  gap? : Double,
+  width? : Double,
+  loc~ : String = "",
+) -> view::View {
+  let _ = loc
+  match parent.lent(x_select_ctx_lent) {
+    Some(c) => {
+      let eff_placement = match placement { Some(p) => p; None => c.placement }
+      let eff_gap = match gap { Some(g) => g; None => c.gap }
+      let eff_w = match width { Some(w) => Some(w); None => c.popover_width }
+      x_mount_selector_popover(
+        parent,
+        fn() -> Bool { c.sel.is_open() },
+        c.trigger_ref,
+        eff_placement,
+        eff_gap,
+        eff_w,
+        c.rtl_get,
+        fn(panel : view::View) -> Unit {
+          x_mount_scrollable_listbox(
+            panel,
+            c.sel,
+            fn() -> Double { x_popover_list_max_height(parent, c.trigger_ref, eff_gap, 0.0) },
+            fn(lv : view::View) -> Unit {
+              match content {
+                Some(ch) => ch(lv, c.sel)
+                None =>
+                  x_render_selector_options(
+                    lv,
+                    c.sel,
+                    c.idx,
+                    fn() -> XFilterResult { c.all_res },
+                    c.rtl_get,
+                    show_active_ring=true,
+                    force_active_ring=c.force_active_ring,
+                  )
+              }
+            },
+          )
+        },
+      )
+      parent
+    }
+    None => parent
+  }
+}
+
+/// Pion-JSX `<aura::SelectPopover>` wrapper.
+pub fn SelectPopover(
+  parent : view::View,
+  placement? : headless::Placement,
+  gap? : Double,
+  width? : Double,
+  children? : (view::View, headless::Selector[String]) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  select_popover_node(parent, content?=children, placement?=placement, gap?=gap, width?=width, loc=loc)
+}
+
+/// Aura `Select` compound selector (Builder API).
+/// Separates `selected_keys` (single or multiple), `active_key`, and `open`.
+/// Supports closed-state typeahead, clearable trigger, Escape/Tab dismiss, RTL, and custom compound composition.
+pub fn select_node(
+  parent : view::View,
+  items : Array[AuraSelectOption],
+  label~ : view::Live[String] = view::Live::Is(""),
+  placeholder~ : view::Live[String] = view::Live::Is("Select an option"),
+  description~ : view::Live[String] = view::Live::Is(""),
+  error~ : view::Live[String] = view::Live::Is(""),
+  initial_selected~ : Array[String] = [],
+  selected_keys? : () -> Array[String],
+  multiple~ : Bool = false,
+  clearable~ : Bool = false,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  required~ : Bool = false,
+  invalid~ : view::Live[Bool] = view::Live::Is(false),
+  disabled~ : view::Live[Bool] = view::Live::Is(false),
+  rtl~ : Bool = false,
+  dir~ : String = "",
+  default_open~ : Bool = false,
+  open? : () -> Bool,
+  placement~ : headless::Placement = headless::Placement::BelowStart,
+  gap~ : Double = 8.0,
+  popover_width? : Double,
+  force_trigger_focus~ : Bool = false,
+  force_active_ring~ : Bool = false,
+  on_open_change? : (Bool) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_clear? : () -> Unit,
+  selector_ref? : signals::Ref[Option[headless::Selector[String]]],
+  content? : (view::View, headless::Selector[String]) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let lbl_get = label.to_getter()
+  let ph_get = placeholder.to_getter()
+  let desc_get = description.to_getter()
+  let err_get = error.to_getter()
+  let dis_get = disabled.to_getter()
+  let eff_dis = fn() -> Bool { x_effective_disabled(parent, dis_get) }
+  let trigger_ref : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let idx = XSelectIndex::new(items)
+  let all_res = idx.all_result()
+
+  let all_k = fn() -> Array[String] { idx.all_keys }
+  let eff_lbl = fn() -> String {
+    let l = lbl_get()
+    if l != "" { l } else { ph_get() }
+  }
+
+  headless::selector(
+    parent,
+    eff_lbl,
+    all_k,
+    all_k,
+    fn(k : String) -> String { idx.label_of(k) },
+    fn(root : view::View, sel : headless::Selector[String]) -> Unit {
+      match selector_ref {
+        Some(r) => r.v = Some(sel)
+        None => ()
+      }
+      let eff_rtl = fn() -> Bool { x_effective_rtl(root, rtl, dir) }
+      let eff_inv = fn() -> Bool { invalid.eval() || err_get() != "" }
+
+      let ctx = XSelectCtx::{
+        sel,
+        idx,
+        all_res,
+        variant,
+        full_width,
+        invalid: view::Live::By(eff_inv),
+        disabled_get: eff_dis,
+        rtl_get: eff_rtl,
+        placeholder_get: ph_get,
+        trigger_ref,
+        popover_width,
+        gap,
+        placement,
+        on_clear,
+        force_trigger_focus,
+        force_active_ring,
+      }
+      let _ = root.lends(x_select_ctx_lent, ctx)
+      let _ = root.gap(view::Live::Is(4.0))
+      if full_width {
+        let _ = root.fills_across(view::Live::Is(true))
+      }
+
+      match content {
+        Some(ch) => ch(root, sel)
+        None => {
+          let _ = root.show(
+            fn() -> Bool { lbl_get() != "" },
+            fn(lw : view::View) -> Unit {
+              let _ = lw
+                .fills_across(view::Live::Is(true))
+                .row(view::Live::Is(true))
+                .lies_along(view::Live::By(fn() -> view::Lies {
+                  if eff_rtl() { view::Lies::End } else { view::Lies::Start }
+                }))
+              let _ = label_node(lw, label, required=required, disabled=view::Live::By(eff_dis))
+            },
+            at_once=true,
+          )
+          let _ = select_trigger_node(root, clearable=clearable, force_focus_visible=force_trigger_focus)
+          let _ = select_popover_node(root)
+          let _ = root.show(
+            fn() -> Bool { !eff_inv() && desc_get() != "" },
+            fn(dv : view::View) -> Unit { let _ = description_node(dv, description) },
+            at_once=true,
+          )
+          let _ = root.show(
+            fn() -> Bool { eff_inv() && err_get() != "" },
+            fn(ev : view::View) -> Unit { let _ = error_message_node(ev, error) },
+            at_once=true,
+          )
+        }
+      }
+
+      if default_open && open is None {
+        sel.set_open(true)
+      }
+    },
+    initial_selected=initial_selected,
+    multiple=multiple,
+    filterable=false,
+    key_disabled=fn(k : String) -> Bool { idx.disabled_of(k) },
+    disabled=eff_dis,
+    open_by?=open,
+    selected_by?=selected_keys,
+    on_open_change?=on_open_change,
+    on_selection_change?=on_selection_change,
+    loc=loc,
+  )
+}
+
+/// Pion-JSX `<aura::Select>` wrapper.
+pub fn Select(
+  parent : view::View,
+  items~ : Array[AuraSelectOption] = [],
+  into label~ : view::Live[String] = .Is(""),
+  label_by? : () -> String,
+  into placeholder~ : view::Live[String] = .Is("Select an option"),
+  placeholder_by? : () -> String,
+  into description~ : view::Live[String] = .Is(""),
+  description_by? : () -> String,
+  into error~ : view::Live[String] = .Is(""),
+  error_by? : () -> String,
+  initial_selected~ : Array[String] = [],
+  selected_keys? : () -> Array[String],
+  multiple~ : Bool = false,
+  clearable~ : Bool = false,
+  variant~ : AuraFieldVariant = AuraFieldVariant::Primary,
+  full_width~ : Bool = true,
+  required~ : Bool = false,
+  into invalid~ : view::Live[Bool] = .Is(false),
+  invalid_by? : () -> Bool,
+  into disabled~ : view::Live[Bool] = .Is(false),
+  disabled_by? : () -> Bool,
+  rtl~ : Bool = false,
+  dir~ : String = "",
+  default_open~ : Bool = false,
+  open? : () -> Bool,
+  placement~ : headless::Placement = headless::Placement::BelowStart,
+  gap~ : Double = 8.0,
+  popover_width? : Double,
+  force_trigger_focus~ : Bool = false,
+  force_active_ring~ : Bool = false,
+  on_open_change? : (Bool) -> Unit,
+  on_selection_change? : (Array[String]) -> Unit,
+  on_clear? : () -> Unit,
+  selector_ref? : signals::Ref[Option[headless::Selector[String]]],
+  children? : (view::View, headless::Selector[String]) -> Unit,
+  loc~ : String = "",
+) -> view::View {
+  let l = match label_by { Some(f) => view::Live::By(f); None => label }
+  let ph = match placeholder_by { Some(f) => view::Live::By(f); None => placeholder }
+  let d = match description_by { Some(f) => view::Live::By(f); None => description }
+  let e = match error_by { Some(f) => view::Live::By(f); None => error }
+  let inv = match invalid_by { Some(f) => view::Live::By(f); None => invalid }
+  let dis = match disabled_by { Some(f) => view::Live::By(f); None => disabled }
+  select_node(
+    parent,
+    items,
+    label=l,
+    placeholder=ph,
+    description=d,
+    error=e,
+    initial_selected=initial_selected,
+    selected_keys?=selected_keys,
+    multiple=multiple,
+    clearable=clearable,
+    variant=variant,
+    full_width=full_width,
+    required=required,
+    invalid=inv,
+    disabled=dis,
+    rtl=rtl,
+    dir=dir,
+    default_open=default_open,
+    open?=open,
+    placement=placement,
+    gap=gap,
+    popover_width?=popover_width,
+    force_trigger_focus=force_trigger_focus,
+    force_active_ring=force_active_ring,
+    on_open_change?=on_open_change,
+    on_selection_change?=on_selection_change,
+    on_clear?=on_clear,
+    selector_ref?=selector_ref,
+    content?=children,
+    loc=loc,
+  )
+}

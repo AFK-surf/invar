@@ -42,7 +42,8 @@ pub struct TableGridState {
   pub selection_mode : TableSelectionMode
   pub mut focus_row : Option[String]
   pub mut focus_col : Option[String]
-  pub selected_rows : Array[String]
+  selected_rows_ : Array[String]
+  selected_set : Map[String, Bool]
   pub mut anchor_row : Option[String]
   pub mut sort_col : Option[String]
   pub mut sort_dir : SortDir
@@ -61,7 +62,8 @@ pub fn TableGridState::new(
     selection_mode,
     focus_row: None,
     focus_col: None,
-    selected_rows: [],
+    selected_rows_: [],
+    selected_set: Map::new(),
     anchor_row: None,
     sort_col: None,
     sort_dir: SortDir::None,
@@ -95,9 +97,54 @@ fn str_remove_key(arr : Array[String], key : String) -> Unit {
   }
 }
 
-/// Whether `row_key` is currently selected.
+/// Snapshot of currently selected row keys in selection order.
+/// Returns a fresh copy so external mutations cannot diverge from the O(1) index.
+pub fn TableGridState::selected_rows(self : TableGridState) -> Array[String] {
+  self.selected_rows_.copy()
+}
+
+/// Number of currently selected rows (O(1)).
+pub fn TableGridState::selected_count(self : TableGridState) -> Int {
+  self.selected_rows_.length()
+}
+
+/// Atomically replace the selected rows, keeping order and O(1) index synchronized.
+pub fn TableGridState::set_selected_rows(self : TableGridState, keys : Array[String]) -> Unit {
+  self.selected_rows_.clear()
+  self.selected_set.clear()
+  match self.selection_mode {
+    TableSelectionMode::None => {
+      self.anchor_row = None
+    }
+    TableSelectionMode::Single => {
+      if keys.length() > 0 {
+        let k = keys[0]
+        self.selected_rows_.push(k)
+        self.selected_set[k] = true
+        self.anchor_row = Some(k)
+      } else {
+        self.anchor_row = None
+      }
+    }
+    TableSelectionMode::Multiple => {
+      for k in keys {
+        if !self.selected_set.contains(k) {
+          self.selected_rows_.push(k)
+          self.selected_set[k] = true
+        }
+      }
+      if self.selected_rows_.length() > 0 {
+        self.anchor_row = Some(self.selected_rows_[self.selected_rows_.length() - 1])
+      } else {
+        self.anchor_row = None
+      }
+    }
+  }
+}
+
+/// Whether `row_key` is currently selected (O(1) hash lookup).
 pub fn TableGridState::is_selected(self : TableGridState, row_key : String) -> Bool {
-  str_index_of(self.selected_rows, row_key) >= 0
+  self.selected_set.contains(row_key)
 }
 
 /// Whether `(row_key, col_key)` is the currently focused 2D cell.
@@ -214,14 +261,16 @@ pub fn TableGridState::jump_focus(
 }
 
 /// Select or toggle `row_key`. When `shift_range=true` in `Multiple` mode, selects the contiguous
-/// range from `anchor_row` to `row_key` in the current `row_keys` order.
+/// range from `anchor_row` to `row_key` in the current `row_keys` order, skipping rows where
+/// `is_disabled(key)` is true.
 pub fn TableGridState::select_row(
   self : TableGridState,
   row_keys : Array[String],
   row_key : String,
   shift_range~ : Bool = false,
+  is_disabled~ : (String) -> Bool = fn(_k : String) -> Bool { false },
 ) -> Bool {
-  if self.selection_mode == TableSelectionMode::None {
+  if self.selection_mode == TableSelectionMode::None || is_disabled(row_key) {
     return false
   }
   let target_idx = str_index_of(row_keys, row_key)
@@ -231,8 +280,10 @@ pub fn TableGridState::select_row(
   match self.selection_mode {
     TableSelectionMode::None => false
     TableSelectionMode::Single => {
-      self.selected_rows.clear()
-      self.selected_rows.push(row_key)
+      self.selected_rows_.clear()
+      self.selected_set.clear()
+      self.selected_rows_.push(row_key)
+      self.selected_set[row_key] = true
       self.anchor_row = Some(row_key)
       true
     }
@@ -250,8 +301,9 @@ pub fn TableGridState::select_row(
         let mut i = lo
         while i <= hi {
           let k = row_keys[i]
-          if !self.is_selected(k) {
-            self.selected_rows.push(k)
+          if !is_disabled(k) && !self.selected_set.contains(k) {
+            self.selected_rows_.push(k)
+            self.selected_set[k] = true
           }
           i += 1
         }
@@ -261,9 +313,11 @@ pub fn TableGridState::select_row(
         true
       } else {
         if self.is_selected(row_key) {
-          str_remove_key(self.selected_rows, row_key)
+          str_remove_key(self.selected_rows_, row_key)
+          self.selected_set.remove(row_key)
         } else {
-          self.selected_rows.push(row_key)
+          self.selected_rows_.push(row_key)
+          self.selected_set[row_key] = true
         }
         self.anchor_row = Some(row_key)
         true
@@ -272,21 +326,30 @@ pub fn TableGridState::select_row(
   }
 }
 
-/// Select all `row_keys` in `Multiple` mode.
-pub fn TableGridState::select_all(self : TableGridState, row_keys : Array[String]) -> Bool {
+/// Select all non-disabled `row_keys` in `Multiple` mode.
+pub fn TableGridState::select_all(
+  self : TableGridState,
+  row_keys : Array[String],
+  is_disabled~ : (String) -> Bool = fn(_k : String) -> Bool { false },
+) -> Bool {
   if self.selection_mode != TableSelectionMode::Multiple {
     return false
   }
-  self.selected_rows.clear()
+  self.selected_rows_.clear()
+  self.selected_set.clear()
   for k in row_keys {
-    self.selected_rows.push(k)
+    if !is_disabled(k) && !self.selected_set.contains(k) {
+      self.selected_rows_.push(k)
+      self.selected_set[k] = true
+    }
   }
   true
 }
 
 /// Clear all selected rows.
 pub fn TableGridState::clear_selection(self : TableGridState) -> Unit {
-  self.selected_rows.clear()
+  self.selected_rows_.clear()
+  self.selected_set.clear()
   self.anchor_row = None
 }
 
@@ -299,15 +362,21 @@ pub fn TableGridState::reconcile(
   prune_missing_selection~ : Bool = false,
 ) -> Unit {
   if prune_missing_selection {
+    let valid_rows : Map[String, Bool] = Map::new()
+    for rk in row_keys {
+      valid_rows[rk] = true
+    }
     let kept : Array[String] = []
-    for k in self.selected_rows {
-      if str_index_of(row_keys, k) >= 0 {
+    for k in self.selected_rows_ {
+      if valid_rows.get(k) is Some(_) {
         kept.push(k)
       }
     }
-    self.selected_rows.clear()
+    self.selected_rows_.clear()
+    self.selected_set.clear()
     for k in kept {
-      self.selected_rows.push(k)
+      self.selected_rows_.push(k)
+      self.selected_set[k] = true
     }
   }
   match self.focus_row {
@@ -337,6 +406,11 @@ pub fn TableGridState::resize_column(
   let clamped = dmath::clamp(width, min_w, max_w)
   self.col_widths[col_key] = clamped
   clamped
+}
+
+/// Read stored column width if explicitly resized.
+pub fn TableGridState::column_width_opt(self : TableGridState, col_key : String) -> Option[Double] {
+  self.col_widths.get(col_key)
 }
 
 /// Read stored column width or `default_w`.

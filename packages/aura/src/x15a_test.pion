@@ -1,0 +1,1198 @@
+// Aura Wave 1.5A unit tests: Select, ComboBox, Autocomplete (Builder + Pion-JSX).
+// Verifies state separation, filter-safe selection, virtual focus + incremental a11y parity,
+// closed-state typeahead, clear button, Escape/Tab, IME composition guard, RTL mirroring, and `assert_aura_ui`.
+
+import "halt"
+import "headless"
+import "headless_core"
+import "signals"
+import "ui"
+import "view"
+
+fn x15a_assert(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    halt::saying("x15a_test", msg)
+  }
+}
+
+fn x15a_setup(root : view::View, dark~ : Bool = false, rtl~ : Bool = false) -> Unit {
+  let base = if dark { AuraConfig::dark() } else { AuraConfig::light() }
+  let cfg = signals::signal(AuraConfig::{ ..base, rtl })
+  ui::set_tree_theme(fn() -> ui::Theme { aura_ui_theme(cfg.get()) })
+  let _ = aura_provide_config(root, cfg)
+  let _ = root.ground(view::Live::Is(aura_theme_from(cfg.get()).palette.background))
+}
+
+fn x15a_click_text(t : ui::Tester, s : String) -> Bool {
+  match t.find(s) {
+    Some((x, y)) => {
+      t.click(x, y)
+      true
+    }
+    None => false
+  }
+}
+
+fn x15a_strs_eq(a : Array[String], b : Array[String]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn x15a_opt_str_is(a : Option[String], want : String) -> Bool {
+  match a {
+    Some(s) => s == want
+    None => false
+  }
+}
+
+fn x15a_opt_bool_is(a : Option[Bool], want : Bool) -> Bool {
+  match a {
+    Some(b) => b == want
+    None => false
+  }
+}
+
+fn x15a_find_said(role : view::Role, label : String) -> Option[(view::NodeId, view::Said)] {
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        match sn.said {
+          Some(sd) =>
+            if sd.role == role && sd.label == label {
+              return Some((sn.id, sd))
+            }
+          None => ()
+        }
+      }
+      None
+    }
+    None => None
+  }
+}
+
+fn x15a_said_id_is_live(id : view::NodeId) -> Bool {
+  match ui::view_tree() {
+    Some(tr) => {
+      for sn in tr.said_order() {
+        if sn.id == id {
+          return true
+        }
+      }
+      false
+    }
+    None => false
+  }
+}
+
+test "x15a_select_single_and_multi_state_separation" {
+  let single_sel : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let multi_sel : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let states = [
+    AuraSelectOption::new("ca", "California", section="West"),
+    AuraSelectOption::new("wa", "Washington", section="West"),
+    AuraSelectOption::new("ny", "New York", section="East"),
+    AuraSelectOption::new("tx", "Texas", disabled=true, section="South"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0)).gap(view::Live::Is(20.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0))).gap(view::Live::Is(16.0))
+      let _ = select_node(
+        col,
+        states,
+        label=view::Live::Is("State"),
+        initial_selected=["ca"],
+        clearable=true,
+        selector_ref=single_sel,
+      )
+      let _ = Select(
+        col,
+        items=states,
+        label=.Is("Regions"),
+        initial_selected=["ca"],
+        multiple=true,
+        selector_ref=multi_sel,
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  assert_aura_ui(t, label="x15a_select_closed")
+  let s1 = match single_sel.v { Some(s) => s; None => halt::saying("x15a", "missing s1") }
+  let s2 = match multi_sel.v { Some(s) => s; None => halt::saying("x15a", "missing s2") }
+  x15a_assert(!s1.is_open() && !s2.is_open(), "both selects start closed")
+  x15a_assert(x15a_strs_eq(s1.selected_keys(), ["ca"]), "s1 initial selected is ca")
+  x15a_assert(s1.query() == "", "select query stays empty")
+
+  // Open single select and pick New York
+  x15a_assert(x15a_click_text(t, "California"), "click single select trigger")
+  x15a_assert(s1.is_open(), "s1 opened on trigger click")
+  assert_aura_ui(t, label="x15a_select_open")
+  x15a_assert(x15a_click_text(t, "New York"), "click New York option")
+  x15a_assert(x15a_strs_eq(s1.selected_keys(), ["ny"]), "s1 selected New York")
+  x15a_assert(!s1.is_open(), "single select closes after choosing")
+
+  // Open multi-select and add Washington without losing California
+  s2.set_open(true)
+  t.frame()
+  x15a_assert(s2.is_open(), "s2 open")
+  x15a_assert(x15a_click_text(t, "Washington"), "click Washington in multi select")
+  x15a_assert(x15a_strs_eq(s2.selected_keys(), ["ca", "wa"]), "multi select retains ca and adds wa")
+  x15a_assert(s2.is_open(), "multi select stays open after choosing")
+  // Disabled option cannot be chosen
+  s2.choose("tx")
+  x15a_assert(x15a_strs_eq(s2.selected_keys(), ["ca", "wa"]), "disabled tx ignored")
+  t.dispose()
+}
+
+test "x15a_select_closed_typeahead_clear_escape_tab" {
+  let sel_ref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let cleared = view::ref_new(0)
+  let items = [
+    AuraSelectOption::new("ca", "California"),
+    AuraSelectOption::new("ny", "New York"),
+    AuraSelectOption::new("tx", "Texas"),
+    AuraSelectOption::new("wa", "Washington"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0)).gap(view::Live::Is(16.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0))).gap(view::Live::Is(16.0))
+      let _ = select_node(
+        col,
+        items,
+        label=view::Live::Is("State"),
+        initial_selected=["ca"],
+        clearable=true,
+        on_clear=fn() -> Unit { cleared.v = cleared.v + 1 },
+        selector_ref=sel_ref,
+      )
+      let _ = button_node(col, view::Live::Is("Next Control"))
+    })
+  }, width=800.0, height=600.0)
+
+  let sel = match sel_ref.v { Some(s) => s; None => halt::saying("x15a", "missing sel") }
+
+  // Focus trigger via Tab, then test closed-state typeahead ('t' -> Texas) without opening popover
+  t.key(headless_core::key_tab)
+  x15a_assert(sel.owns_focus(), "trigger owns focus after Tab")
+  t.key(headless_core::key_char_base + 116) // 't'
+  x15a_assert(!sel.is_open(), "closed-state typeahead must not open popover")
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["tx"]), "closed-state typeahead selects Texas")
+
+  // Click clear button: clears selection WITHOUT opening popover
+  let clr_drawn = match t.get("Clear selection", role=view::Role::Button) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing Clear selection button")
+  }
+  t.click(clr_drawn.x + clr_drawn.w * 0.5, clr_drawn.y + clr_drawn.h * 0.5)
+  x15a_assert(sel.selected_keys().length() == 0, "clear button empties selected_keys")
+  x15a_assert(!sel.is_open(), "clear button must never open popover")
+  x15a_assert(cleared.v == 1, "on_clear fired once")
+
+  // Re-focus trigger, open with Down, then Escape closes AND keeps trigger focus
+  let trig_drawn = match t.get("State", role=view::Role::Combobox) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing State combobox")
+  }
+  t.click(trig_drawn.x + 20.0, trig_drawn.y + trig_drawn.h * 0.5)
+  x15a_assert(sel.is_open(), "trigger click opens select")
+  t.key(headless_core::key_escape)
+  x15a_assert(!sel.is_open(), "Escape closes select popover")
+  x15a_assert(sel.owns_focus(), "Escape keeps focus on trigger")
+
+  // Re-open with Down, then Tab closes popover and moves focus away
+  t.key(headless_core::key_down)
+  x15a_assert(sel.is_open(), "ArrowDown opens select")
+  t.key(headless_core::key_tab)
+  x15a_assert(!sel.is_open(), "Tab closes select popover")
+  t.dispose()
+}
+
+test "x15a_combobox_filter_preserves_selected_keys" {
+  let sel_ref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let fld_ref : signals::Ref[Option[ui::Field]] = view::ref_new(None)
+  let items = [
+    AuraSelectOption::new("cat", "Cat"),
+    AuraSelectOption::new("dog", "Dog"),
+    AuraSelectOption::new("fox", "Fox"),
+    AuraSelectOption::new("owl", "Owl"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0)))
+      let _ = combo_box_node(
+        col,
+        items,
+        label=view::Live::Is("Favorite Animal"),
+        initial_selected=["cat"],
+        multiple=true,
+        clearable=true,
+        selector_ref=sel_ref,
+        field_ref=fld_ref,
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  let sel = match sel_ref.v { Some(s) => s; None => halt::saying("x15a", "missing sel") }
+  let fld = match fld_ref.v { Some(f) => f; None => halt::saying("x15a", "missing fld") }
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["cat"]), "initial selected is cat")
+
+  // Filter to "owl" — hides "Cat"
+  sel.set_query("owl", open_if_closed=true)
+  t.frame()
+  x15a_assert(sel.is_open(), "filtering opens combobox")
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["cat"]), "filtering out Cat must not lose selected_keys")
+
+  // Choose "owl" while "Cat" is filtered out -> both "cat" and "owl" must be selected!
+  sel.choose("owl")
+  t.frame()
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["cat", "owl"]), "multi-select keeps hidden cat + adds owl")
+
+  // Clear query -> both selected keys remain intact
+  sel.set_query("", open_if_closed=false)
+  t.frame()
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["cat", "owl"]), "clearing query preserves all selected_keys")
+
+  // Close and click Clear button -> clears without reopening
+  sel.set_open(false)
+  t.frame()
+  let clr = match t.get("Clear", role=view::Role::Button) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing ComboBox Clear button")
+  }
+  t.click(clr.x + clr.w * 0.5, clr.y + clr.h * 0.5)
+  x15a_assert(sel.selected_keys().length() == 0 && fld.text() == "", "clear empties selection and field")
+  x15a_assert(!sel.is_open(), "clear button must not reopen combobox")
+  t.dispose()
+}
+
+test "x15a_combobox_virtual_focus_and_a11y_incremental" {
+  let sel_ref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let fld_ref : signals::Ref[Option[ui::Field]] = view::ref_new(None)
+  let items = [
+    AuraSelectOption::new("alpha", "Alpha"),
+    AuraSelectOption::new("beta", "Beta"),
+    AuraSelectOption::new("gamma", "Gamma"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0)))
+      let _ = ComboBox(
+        col,
+        items=items,
+        label=.Is("Greek"),
+        selector_ref=sel_ref,
+        field_ref=fld_ref,
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  t.set_a11y(true)
+  assert_aura_ui(t, label="x15a_combobox_a11y_closed")
+  let sel = match sel_ref.v { Some(s) => s; None => halt::saying("x15a", "missing sel") }
+  let fld = match fld_ref.v { Some(f) => f; None => halt::saying("x15a", "missing fld") }
+
+  // Focus Field and open ComboBox
+  let cb = match t.get("Greek", role=view::Role::Combobox) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing Greek combobox")
+  }
+  t.click(cb.x + 20.0, cb.y + cb.h * 0.5)
+  x15a_assert(fld.focused(), "Field focused on click")
+  t.key(headless_core::key_down)
+  x15a_assert(sel.is_open(), "Down opens ComboBox")
+  x15a_assert(fld.focused(), "Field keeps focus when ComboBox opens")
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "alpha"), "initial active_key is alpha")
+
+  // ArrowDown A -> B
+  t.key(headless_core::key_down)
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "beta"), "ArrowDown moves virtual focus to beta")
+  x15a_assert(fld.focused(), "Field keeps focus after ArrowDown")
+  match x15a_find_said(view::Role::Combobox, "Greek") {
+    Some((_, sd)) => {
+      x15a_assert(x15a_opt_bool_is(sd.expanded, true), "Combobox said expanded=true")
+      match sd.controls {
+        Some(cid) => x15a_assert(x15a_said_id_is_live(cid), "Said.controls points to live listbox")
+        None => halt::saying("x15a", "Said.controls missing while open")
+      }
+      match sd.active_descendant {
+        Some(aid) => x15a_assert(x15a_said_id_is_live(aid), "Said.active_descendant points to live Beta option")
+        None => halt::saying("x15a", "Said.active_descendant missing on beta")
+      }
+    }
+    None => halt::saying("x15a", "Combobox Said missing")
+  }
+
+  // Type filter "gam" which unmounts Beta (active) -> active_descendant must reconcile to live Gamma, focus stays in Field
+  t.type_text("gam")
+  x15a_assert(fld.focused(), "Field keeps focus while typing filter")
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "gamma"), "active_key reconciled to live gamma")
+  match x15a_find_said(view::Role::Combobox, "Greek") {
+    Some((_, sd)) =>
+      match sd.active_descendant {
+        Some(aid) => x15a_assert(x15a_said_id_is_live(aid), "Said.active_descendant points to live Gamma")
+        None => halt::saying("x15a", "Said.active_descendant missing after reconcile to gamma")
+      }
+    None => halt::saying("x15a", "Combobox Said missing after filter")
+  }
+
+  // Type "zzz" so zero options match -> active_descendant must become None (never dangling)
+  t.type_text("zzz")
+  x15a_assert(fld.focused(), "Field keeps focus on empty filter")
+  x15a_assert(sel.active_key() is None, "active_key is None when no options match")
+  match x15a_find_said(view::Role::Combobox, "Greek") {
+    Some((_, sd)) => x15a_assert(sd.active_descendant is None, "Said.active_descendant cleared to None on empty filter")
+    None => halt::saying("x15a", "Combobox Said missing on empty filter")
+  }
+
+  // Clear filter and reopen -> active_descendant restores to live Alpha
+  fld.set("")
+  sel.set_query("", open_if_closed=true)
+  t.frame()
+  x15a_assert(fld.focused(), "Field keeps focus after clearing filter")
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "alpha"), "active_key restored to alpha")
+  match x15a_find_said(view::Role::Combobox, "Greek") {
+    Some((_, sd)) =>
+      match sd.active_descendant {
+        Some(aid) => x15a_assert(x15a_said_id_is_live(aid), "Said.active_descendant live after reopen")
+        None => halt::saying("x15a", "Said.active_descendant missing after reopen")
+      }
+    None => halt::saying("x15a", "Combobox Said missing after reopen")
+  }
+
+  let faults = t.a11y_faults()
+  x15a_assert(faults.length() == 0, "incremental a11y parity must have zero faults, got \{faults.length()}")
+  t.dispose()
+}
+
+test "x15a_autocomplete_virtual_focus_filter_and_a11y" {
+  let sel_ref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let fld_ref : signals::Ref[Option[ui::Field]] = view::ref_new(None)
+  let items = [
+    AuraSelectOption::new("cat", "Cat"),
+    AuraSelectOption::new("dog", "Dog"),
+    AuraSelectOption::new("lion", "Lion"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0)))
+      let _ = Autocomplete(
+        col,
+        items=items,
+        label=.Is("Animal"),
+        initial_selected=["cat"],
+        clearable=true,
+        selector_ref=sel_ref,
+        field_ref=fld_ref,
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  t.set_a11y(true)
+  assert_aura_ui(t, label="x15a_autocomplete_closed")
+  let sel = match sel_ref.v { Some(s) => s; None => halt::saying("x15a", "missing sel") }
+  let fld = match fld_ref.v { Some(f) => f; None => halt::saying("x15a", "missing fld") }
+
+  // Open Autocomplete -> focus moves to embedded Filter field
+  x15a_assert(x15a_click_text(t, "Cat"), "click Autocomplete trigger")
+  t.frame()
+  x15a_assert(sel.is_open(), "Autocomplete opened")
+  x15a_assert(fld.focused(), "Filter field takes focus on open")
+  assert_aura_ui(t, label="x15a_autocomplete_open")
+
+  // ArrowDown Cat -> Dog
+  t.key(headless_core::key_down)
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "dog"), "ArrowDown moves active to dog")
+  x15a_assert(fld.focused(), "Filter field retains focus")
+
+  // Type "li" -> unmounts Dog and Cat, reconciles active to Lion, selected_keys still retains Cat!
+  t.type_text("li")
+  x15a_assert(fld.focused(), "Filter field retains focus after typing")
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "lion"), "active reconciled to lion")
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["cat"]), "filtering must not lose selected_keys")
+  match x15a_find_said(view::Role::Combobox, "Filter...") {
+    Some((_, sd)) => {
+      match sd.controls {
+        Some(cid) => x15a_assert(x15a_said_id_is_live(cid), "Filter Said.controls live")
+        None => halt::saying("x15a", "Filter Said.controls missing")
+      }
+      match sd.active_descendant {
+        Some(aid) => x15a_assert(x15a_said_id_is_live(aid), "Filter Said.active_descendant live")
+        None => halt::saying("x15a", "Filter Said.active_descendant missing")
+      }
+    }
+    None => halt::saying("x15a", "Filter Combobox Said missing")
+  }
+
+  // Escape closes popover and returns focus to trigger
+  t.key(headless_core::key_escape)
+  x15a_assert(!sel.is_open(), "Escape closes Autocomplete")
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["cat"]), "selected_keys still cat after Escape")
+  // Pressing ArrowDown right after Escape re-opens Autocomplete, proving focus returned to trigger
+  t.key(headless_core::key_down)
+  x15a_assert(sel.is_open(), "Escape returned focus to Autocomplete trigger so ArrowDown re-opens it")
+  t.key(headless_core::key_escape)
+  x15a_assert(!sel.is_open(), "second Escape closes Autocomplete again")
+
+  let faults = t.a11y_faults()
+  x15a_assert(faults.length() == 0, "Autocomplete incremental a11y parity must have zero faults, got \{faults.length()}")
+  t.dispose()
+}
+
+test "x15a_ime_composition_guard_combobox_and_autocomplete" {
+  let cb_sel : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let cb_fld : signals::Ref[Option[ui::Field]] = view::ref_new(None)
+  let items = [
+    AuraSelectOption::new("cat", "Cat"),
+    AuraSelectOption::new("dog", "Dog"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0)))
+      let _ = combo_box_node(
+        col,
+        items,
+        label=view::Live::Is("IME Animal"),
+        default_open=true,
+        selector_ref=cb_sel,
+        field_ref=cb_fld,
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  let sel = match cb_sel.v { Some(s) => s; None => halt::saying("x15a", "missing sel") }
+  let fld = match cb_fld.v { Some(f) => f; None => halt::saying("x15a", "missing fld") }
+  let cb = match t.get("IME Animal", role=view::Role::Combobox) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing IME Animal")
+  }
+  t.click(cb.x + 20.0, cb.y + cb.h * 0.5)
+  x15a_assert(sel.is_open() && x15a_opt_str_is(sel.active_key(), "cat"), "open with cat active")
+
+  // Start IME composition -> Enter & ArrowDown must NOT commit selection or move active_key
+  fld.compose("ni")
+  t.frame()
+  x15a_assert(fld.composing(), "field is composing")
+  t.key(headless_core::key_down)
+  x15a_assert(x15a_opt_str_is(sel.active_key(), "cat"), "ArrowDown during IME must not move active_key")
+  t.key(headless_core::key_enter)
+  x15a_assert(sel.selected_keys().length() == 0 && sel.is_open(), "Enter during IME must not commit selection or close")
+  t.dispose()
+}
+
+test "x15a_rtl_mirroring_select_combobox_autocomplete" {
+  let items = [
+    AuraSelectOption::new("ca", "California"),
+    AuraSelectOption::new("ny", "New York"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root, rtl=true)
+    let _ = root.pad(view::Live::Is(24.0)).gap(view::Live::Is(16.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0))).gap(view::Live::Is(16.0))
+      let _ = select_node(
+        col,
+        items,
+        label=view::Live::Is("State"),
+        initial_selected=["ca"],
+        clearable=true,
+        dir="rtl",
+        default_open=true,
+      )
+      let _ = combo_box_node(
+        col,
+        items,
+        label=view::Live::Is("City"),
+        initial_selected=["ca"],
+        clearable=true,
+        rtl=true,
+      )
+      let _ = autocomplete_node(
+        col,
+        items,
+        label=view::Live::Is("Region"),
+        initial_selected=["ca"],
+        clearable=true,
+        dir="rtl",
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  assert_aura_ui(t, label="x15a_rtl_all")
+  // In RTL, Clear button in Select trigger is placed on the LEFT side (near trigger.x),
+  // whereas trigger text is aligned toward the RIGHT side.
+  let trig = match t.get("State", role=view::Role::Combobox) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing RTL State trigger")
+  }
+  let clr = match t.get("Clear selection", role=view::Role::Button) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing RTL Clear button")
+  }
+  let trig_mid = trig.x + trig.w * 0.5
+  x15a_assert(clr.x < trig_mid, "RTL Clear button must be flipped to the left half of trigger")
+  // In RTL ComboBox, Toggle options trigger button is on the LEFT half of the input group
+  let cb_trig = match t.get("Toggle options", role=view::Role::Button) {
+    Some(d) => d
+    None => halt::saying("x15a", "missing RTL ComboBox trigger button")
+  }
+  x15a_assert(cb_trig.x < trig_mid, "RTL ComboBox chevron button must be on the left half")
+  t.dispose()
+}
+
+test "x15a_compound_subcomponents_builder_and_jsx" {
+  let items = [
+    AuraSelectOption::new("a", "Alpha"),
+    AuraSelectOption::new("b", "Beta"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0)).gap(view::Live::Is(16.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0))).gap(view::Live::Is(16.0))
+      let _ = Select(
+        col,
+        items=items,
+        label=.Is("Custom Select"),
+        initial_selected=["a"],
+        children=fn(v : view::View, _s : headless::Selector[String]) -> Unit {
+          let _ = SelectTrigger(v, children=fn(tv : view::View) -> Unit {
+            let _ = SelectValue(tv, placeholder="Pick")
+            let _ = SelectClearButton(tv)
+            let _ = SelectIndicator(tv)
+          })
+          let _ = SelectPopover(v)
+        },
+      )
+      let _ = ComboBox(
+        col,
+        items=items,
+        label=.Is("Custom Combo"),
+        initial_selected=["a"],
+        children=fn(v : view::View, _s : headless::Selector[String]) -> Unit {
+          let _ = ComboBoxInputGroup(v, children=fn(gv : view::View) -> Unit {
+            let _ = ComboBoxInput(gv)
+            let _ = ComboBoxClearButton(gv)
+            let _ = ComboBoxTrigger(gv)
+          })
+          let _ = ComboBoxPopover(v)
+        },
+      )
+      let _ = Autocomplete(
+        col,
+        items=items,
+        label=.Is("Custom Auto"),
+        initial_selected=["a"],
+        children=fn(v : view::View, _s : headless::Selector[String]) -> Unit {
+          let _ = AutocompleteTrigger(v, children=fn(tv : view::View) -> Unit {
+            let _ = AutocompleteValue(tv)
+            let _ = AutocompleteClearButton(tv)
+            let _ = AutocompleteIndicator(tv)
+          })
+          let _ = AutocompletePopover(v)
+        },
+      )
+    })
+  }, width=800.0, height=600.0)
+
+  assert_aura_ui(t, label="x15a_compound_subcomponents")
+  t.dispose()
+}
+
+fn x15a_insts_eq(a : Array[Array[Double]], b : Array[Array[Double]]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    let x = a[i]
+    let y = b[i]
+    if x.length() != y.length() {
+      return false
+    }
+    let mut j = 0
+    while j < x.length() {
+      if x[j] != y[j] {
+        return false
+      }
+      j += 1
+    }
+    i += 1
+  }
+  true
+}
+
+fn x15a_focused_is(t : ui::Tester, label : String, role : view::Role) -> Bool {
+  match (ui::view_tree(), t.get(label, role=role)) {
+    (Some(tr), Some(d)) => {
+      let (fid, _) = tr.focused_now()
+      match fid {
+        Some(id) => id == d.id
+        None => false
+      }
+    }
+    _ => false
+  }
+}
+
+test "x15a_r2a_p0_pointer_click_option_combobox_and_autocomplete" {
+  let s1 : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let s2 : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let f2 : signals::Ref[Option[ui::Field]] = view::ref_new(None)
+  let s3 : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let s4 : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let items = [
+    AuraSelectOption::new("alpha", "Alpha"),
+    AuraSelectOption::new("beta", "Beta"),
+    AuraSelectOption::new("gamma", "Gamma"),
+  ]
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0)).row(view::Live::Is(true)).gap(view::Live::Is(20.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(200.0)))
+      let _ = select_node(col, items, label=view::Live::Is("S1"), selector_ref=s1)
+    })
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(200.0)))
+      let _ = combo_box_node(col, items, label=view::Live::Is("S2"), selector_ref=s2, field_ref=f2)
+    })
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(200.0)))
+      let _ = autocomplete_node(col, items, label=view::Live::Is("S3"), selector_ref=s3)
+    })
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(200.0)))
+      let _ = combo_box_node(col, items, label=view::Live::Is("S4"), multiple=true, selector_ref=s4)
+    })
+  }, width=1000.0, height=600.0)
+  t.set_a11y(true)
+  let a = match s1.v { Some(s) => s; None => halt::saying("x15a", "s1") }
+  let b = match s2.v { Some(s) => s; None => halt::saying("x15a", "s2") }
+  let fld2 = match f2.v { Some(f) => f; None => halt::saying("x15a", "f2") }
+  let c = match s3.v { Some(s) => s; None => halt::saying("x15a", "s3") }
+  let d_multi = match s4.v { Some(s) => s; None => halt::saying("x15a", "s4") }
+
+  let click_opt = fn(lbl : String) -> Bool {
+    match t.get(lbl, role=view::Role::Option) {
+      Some(d) => {
+        t.click(d.x + d.w * 0.5, d.y + d.h * 0.5)
+        t.frame(ms=16.0)
+        true
+      }
+      None => false
+    }
+  }
+
+  // Select pointer click
+  let tr1 = match t.get("S1", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "tr1") }
+  t.click(tr1.x + 20.0, tr1.y + tr1.h * 0.5)
+  t.frame(ms=16.0)
+  x15a_assert(click_opt("Beta") && x15a_strs_eq(a.selected_keys(), ["beta"]) && !a.is_open(), "Select click selects Beta and closes")
+
+  // ComboBox: press_at -> frame -> release verifies popup stays open across press phase and selects Beta
+  let tr2 = match t.get("S2", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "tr2") }
+  t.click(tr2.x + 20.0, tr2.y + tr2.h * 0.5)
+  t.type_text("be")
+  t.frame(ms=16.0)
+  x15a_assert(b.is_open(), "ComboBox open after typing")
+  let opt_b = match t.get("Beta", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "opt Beta") }
+  t.press_at(opt_b.x + opt_b.w * 0.5, opt_b.y + opt_b.h * 0.5)
+  t.frame(ms=16.0)
+  x15a_assert(b.is_open(), "ComboBox popup stays open during pointer-down on option")
+  t.release(opt_b.x + opt_b.w * 0.5, opt_b.y + opt_b.h * 0.5)
+  t.frame(ms=16.0)
+  x15a_assert(x15a_strs_eq(b.selected_keys(), ["beta"]), "ComboBox click selects Beta")
+  x15a_assert(!b.is_open(), "ComboBox single-select closes after option click")
+  x15a_assert(fld2.text() == "Beta" && b.query() == "", "ComboBox syncs label and clears stale query")
+
+  // Autocomplete pointer click
+  let tr3 = match t.get("S3", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "tr3") }
+  t.click(tr3.x + 20.0, tr3.y + tr3.h * 0.5)
+  t.frame(ms=16.0)
+  x15a_assert(c.is_open(), "Autocomplete open")
+  x15a_assert(click_opt("Gamma") && x15a_strs_eq(c.selected_keys(), ["gamma"]) && !c.is_open(), "Autocomplete click selects Gamma and closes")
+
+  // Multi-select ComboBox pointer click keeps open across multiple clicks
+  let tr4 = match t.get("S4", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "tr4") }
+  t.click(tr4.x + 20.0, tr4.y + tr4.h * 0.5)
+  t.key(headless_core::key_down)
+  t.frame(ms=16.0)
+  x15a_assert(click_opt("Alpha") && d_multi.is_open(), "Multi ComboBox stays open after first click")
+  x15a_assert(click_opt("Gamma") && d_multi.is_open(), "Multi ComboBox stays open after second click")
+  x15a_assert(x15a_strs_eq(d_multi.selected_keys(), ["alpha", "gamma"]), "Multi ComboBox selected both Alpha and Gamma")
+  t.dispose()
+}
+
+test "x15a_r2a_p1_keyboard_active_ring_visible_combobox_and_autocomplete" {
+  let items = [
+    AuraSelectOption::new("alpha", "Alpha"),
+    AuraSelectOption::new("beta", "Beta"),
+    AuraSelectOption::new("gamma", "Gamma"),
+  ]
+  // ComboBox active ring visible & moves across frames on ArrowDown
+  let cb_ref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let t1 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0)))
+      let _ = combo_box_node(col, items, label=view::Live::Is("Greek"), selector_ref=cb_ref)
+    })
+  }, width=800.0, height=600.0)
+  let sel1 = match cb_ref.v { Some(s) => s; None => halt::saying("x15a", "cb sel") }
+  let cb = match t1.get("Greek", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "no cb") }
+  t1.click(cb.x + 20.0, cb.y + cb.h * 0.5)
+  t1.key(headless_core::key_down)
+  t1.move_to(790.0, 590.0)
+  t1.frame(ms=16.0)
+  x15a_assert(sel1.owns_focus(), "ComboBox input focus is in selector scope")
+  let f_a1 = t1.drawn_instances()
+  t1.key(headless_core::key_down)
+  t1.frame(ms=16.0)
+  let f_b1 = t1.drawn_instances()
+  let beta1 = match t1.get("Beta", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "no Beta") }
+  x15a_assert(x15a_opt_str_is(sel1.active_key(), "beta"), "ComboBox active_key moved to beta")
+  x15a_assert(beta1.ring.0 > 0.0, "ComboBox active option draws focus ring")
+  x15a_assert(!x15a_insts_eq(f_a1, f_b1), "ComboBox drawn_instances change when ArrowDown moves active ring")
+  t1.dispose()
+
+  // Autocomplete active ring visible & moves across frames on ArrowDown
+  let ac_ref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let t2 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0)))
+      let _ = autocomplete_node(col, items, label=view::Live::Is("Greek"), selector_ref=ac_ref)
+    })
+  }, width=800.0, height=600.0)
+  let sel2 = match ac_ref.v { Some(s) => s; None => halt::saying("x15a", "ac sel") }
+  let tr = match t2.get("Greek", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "no trig") }
+  t2.click(tr.x + 20.0, tr.y + tr.h * 0.5)
+  t2.frame(ms=16.0)
+  t2.move_to(790.0, 590.0)
+  t2.frame(ms=16.0)
+  x15a_assert(sel2.owns_focus(), "Autocomplete filter focus is in selector scope")
+  let f_a2 = t2.drawn_instances()
+  t2.key(headless_core::key_down)
+  t2.frame(ms=16.0)
+  let f_b2 = t2.drawn_instances()
+  let beta2 = match t2.get("Beta", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "no ac Beta") }
+  x15a_assert(x15a_opt_str_is(sel2.active_key(), "beta"), "Autocomplete active_key moved to beta")
+  x15a_assert(beta2.ring.0 > 0.0, "Autocomplete active option draws focus ring")
+  x15a_assert(!x15a_insts_eq(f_a2, f_b2), "Autocomplete drawn_instances change when ArrowDown moves active ring")
+  t2.dispose()
+}
+
+test "x15a_r2a_p1_unfocused_siblings_never_steal_keys" {
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(16.0)).gap(view::Live::Is(12.0))
+    let _ = Select(root, items=[AuraSelectOption::new("a", "First option")], label=.Is("First select"))
+    let _ = ComboBox(root, items=[AuraSelectOption::new("b", "Second option")], label=.Is("Second combo"))
+    let _ = Autocomplete(root, items=[AuraSelectOption::new("c", "Third option")], label=.Is("Third auto"))
+  }, width=600.0, height=600.0)
+  t.frame()
+  t.press("First select")
+  t.key(headless_core::key_escape)
+  t.key(headless_core::key_down)
+  t.frame()
+  x15a_assert(t.get("First option") is Some(_), "Focused Select opens on ArrowDown")
+  x15a_assert(t.get("Second option") is None, "Unfocused ComboBox must not steal ArrowDown")
+  x15a_assert(t.get("Third option") is None, "Unfocused Autocomplete must not steal ArrowDown")
+  t.dispose()
+}
+
+test "x15a_r2a_p1_controlled_open_veto_and_delayed_accept" {
+  let req_veto : Array[Bool] = []
+  let open_delayed = signals::signal(false)
+  let req_delay : Array[Bool] = []
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(16.0)).gap(view::Live::Is(16.0))
+    let _ = Select(
+      root,
+      items=[AuraSelectOption::new("v", "Veto option")],
+      label=.Is("Veto select"),
+      open=fn() -> Bool { false },
+      on_open_change=fn(b : Bool) -> Unit { req_veto.push(b) },
+    )
+    let _ = ComboBox(
+      root,
+      items=[AuraSelectOption::new("d", "Delayed option")],
+      label=.Is("Delayed combo"),
+      open=fn() -> Bool { open_delayed.get() },
+      on_open_change=fn(b : Bool) -> Unit { req_delay.push(b) },
+    )
+  }, width=800.0, height=600.0)
+  t.frame()
+  t.press("Veto select")
+  t.frame()
+  x15a_assert(req_veto.length() == 1 && req_veto[0], "Veto select called on_open_change(true)")
+  x15a_assert(t.get("Veto option", role=view::Role::Option) is None, "Parent veto keeps Select closed")
+
+  t.press("Toggle options")
+  t.frame()
+  x15a_assert(req_delay.length() == 1 && req_delay[0], "Delayed combo called on_open_change(true)")
+  x15a_assert(t.get("Delayed option", role=view::Role::Option) is None, "Still closed before parent accepts")
+  open_delayed.set(true)
+  t.frame()
+  x15a_assert(t.get("Delayed option", role=view::Role::Option) is Some(_), "Opens once parent updates signal")
+  t.dispose()
+}
+
+test "x15a_r2a_p1_inherited_form_and_fieldset_disabled" {
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = headless::form(
+      root,
+      fn() -> String { "Form" },
+      fn(_m) -> Unit { () },
+      fn(f, _controller) -> Unit {
+        let _ = Select(f, items=[AuraSelectOption::new("a", "FormSelectOpt")], label=.Is("Form Select"))
+        let _ = ComboBox(f, items=[AuraSelectOption::new("b", "FormComboOpt")], label=.Is("Form Combo"))
+        let _ = Autocomplete(f, items=[AuraSelectOption::new("c", "FormAutoOpt")], label=.Is("Form Auto"))
+      },
+      disabled=fn() -> Bool { true },
+    )
+  }, width=600.0, height=600.0)
+  t.frame()
+  t.press("Form Select")
+  t.frame()
+  x15a_assert(t.get("FormSelectOpt") is None, "Inherited form disabled blocks Select")
+  t.press("Toggle options")
+  t.frame()
+  x15a_assert(t.get("FormComboOpt") is None, "Inherited form disabled blocks ComboBox")
+  t.press("Form Auto")
+  t.frame()
+  x15a_assert(t.get("FormAutoOpt") is None, "Inherited form disabled blocks Autocomplete")
+  t.dispose()
+}
+
+test "x15a_r2a_p1_long_menu_scroll_box_and_active_into_view" {
+  let opts : Array[AuraSelectOption] = []
+  for i in 0..<40 {
+    opts.push(AuraSelectOption::new(i.to_string(), "Option " + i.to_string()))
+  }
+  let sref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = Select(root, items=opts, label=.Is("Choice"), default_open=true, selector_ref=sref)
+  }, width=400.0, height=300.0)
+  t.frame()
+  let lb = match t.get("Choice", role=view::Role::Listbox) { Some(d) => d; None => halt::saying("x15a", "no listbox") }
+  let sc = match ui::view_tree() {
+    Some(tr) => tr.in_scroller(lb.id)
+    None => false
+  }
+  x15a_assert(sc, "Long menu listbox is mounted inside a scroll_box")
+  let sel = match sref.v { Some(s) => s; None => halt::saying("x15a", "no sel") }
+  let _ = sel.edge_active(true)
+  t.frame()
+  let last = match t.get("Option 39", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "no Option 39") }
+  x15a_assert(last.y >= 0.0 && last.y + last.h <= 300.0, "Active Option 39 scrolled within 300pt viewport, got y=\{last.y} h=\{last.h}")
+  t.dispose()
+}
+
+extern "C" fn x15a_cpu_clock() -> Int64 = "clock"
+
+test "x15a_r2a_p1_perf_linear_n800_and_n3200" {
+  let run_n = fn(n : Int) -> (Int64, Int64) {
+    let opts : Array[AuraSelectOption] = []
+    for i in 0..<n {
+      opts.push(AuraSelectOption::new("k\{i}", "Choice \{i} alpha"))
+    }
+    let sr : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+    let t = ui::Tester::tree(fn(root : view::View) -> Unit {
+      x15a_setup(root)
+      let _ = ComboBox(root, items=opts, default_open=true, selector_ref=sr)
+    }, width=600.0, height=400.0)
+    t.frame()
+    let s = match sr.v { Some(v) => v; None => halt::saying("x15a", "perf sel") }
+    let t0 = x15a_cpu_clock()
+    s.set_query("Cho", open_if_closed=false)
+    let t1 = x15a_cpu_clock()
+    let _ = s.step_active(1)
+    let t2 = x15a_cpu_clock()
+    t.frame()
+    t.dispose()
+    ((t1 - t0) / 1000L, (t2 - t1) / 1000L)
+  }
+  let (f800, k800) = run_n(800)
+  let (f3200, k3200) = run_n(3200)
+  x15a_assert(f800 < 20L && k800 < 20L, "n=800 query/key must be linear O(n), got filter=\{f800}ms key=\{k800}ms")
+  x15a_assert(f3200 < 80L && k3200 < 80L, "n=3200 query/key must be linear O(n), got filter=\{f3200}ms key=\{k3200}ms")
+}
+
+test "x15a_r2a_p2_single_init_combobox_blur_tab_controlled_sel_and_rtl_popover" {
+  // 1. Single-select initial_selected normalization
+  let t1 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = Select(
+      root,
+      items=[AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta")],
+      initial_selected=["a", "b"],
+      default_open=true,
+    )
+  }, width=600.0, height=400.0)
+  t1.frame()
+  let sd_a = match x15a_find_said(view::Role::Option, "Alpha") { Some(v) => v.1; None => halt::saying("x15a", "Alpha") }
+  let sd_b = match x15a_find_said(view::Role::Option, "Beta") { Some(v) => v.1; None => halt::saying("x15a", "Beta") }
+  x15a_assert(x15a_opt_bool_is(sd_a.selected, true) && x15a_opt_bool_is(sd_b.selected, false), "Single-select initial_selected retains only first key")
+  t1.dispose()
+
+  // 2. ComboBox query clear after Enter, reopen shows all, blur restores label, single Tab skips chevron to Next
+  let sref : signals::Ref[Option[headless::Selector[String]]] = view::ref_new(None)
+  let fref : signals::Ref[Option[ui::Field]] = view::ref_new(None)
+  let t2 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = root.pad(view::Live::Is(24.0)).gap(view::Live::Is(16.0))
+    let _ = root.box(fn(col : view::View) -> Unit {
+      let _ = col.width(view::Live::Is(Some(260.0))).gap(view::Live::Is(16.0))
+      let _ = combo_box_node(
+        col,
+        [AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta"), AuraSelectOption::new("g", "Gamma")],
+        label=view::Live::Is("Greek"),
+        selector_ref=sref,
+        field_ref=fref,
+      )
+      let _ = button_node(col, view::Live::Is("Next"))
+    })
+  }, width=800.0, height=600.0)
+  t2.set_a11y(true)
+  let sel = match sref.v { Some(s) => s; None => halt::saying("x15a", "cb sel") }
+  let fld = match fref.v { Some(f) => f; None => halt::saying("x15a", "cb fld") }
+  let cb = match t2.get("Greek", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "cb") }
+  t2.click(cb.x + 20.0, cb.y + cb.h * 0.5)
+  t2.type_text("al")
+  t2.key(headless_core::key_enter)
+  t2.frame(ms=16.0)
+  x15a_assert(x15a_strs_eq(sel.selected_keys(), ["a"]) && fld.text() == "Alpha" && sel.query() == "", "Enter selects Alpha and clears query")
+  t2.key(headless_core::key_down)
+  t2.frame(ms=16.0)
+  x15a_assert(sel.is_open() && t2.find("Beta") is Some(_), "Reopen shows all options including Beta")
+  t2.type_text("zzz")
+  t2.frame(ms=16.0)
+  t2.key(headless_core::key_tab)
+  t2.frame(ms=16.0)
+  x15a_assert(!sel.is_open(), "Single Tab closes ComboBox")
+  x15a_assert(x15a_focused_is(t2, "Next", view::Role::Button), "Single Tab skips chevron and focuses Next")
+  x15a_assert(fld.text() == "Alpha", "Blur restores committed Alpha label")
+  t2.dispose()
+
+  // 3. Controlled selected_keys + RTL BelowStart popover logical right-edge alignment
+  let ctrl_sel = signals::signal_by(["a"], x15a_strs_eq)
+  let t3 = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root, rtl=true)
+    let _ = root.box(fn(slot : view::View) -> Unit {
+      let _ = slot.over(view::Live::Is(true), edges=(Some(350.0), Some(40.0), None, None)).width(view::Live::Is(Some(180.0)))
+      let _ = Select(
+        slot,
+        items=[AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta")],
+        label=.Is("RTL State"),
+        selected_keys=fn() -> Array[String] { ctrl_sel.get() },
+        on_selection_change=fn(ks : Array[String]) -> Unit { ctrl_sel.set(ks) },
+        dir="rtl",
+        placement=headless::Placement::BelowStart,
+        popover_width=300.0,
+        default_open=true,
+      )
+    })
+  }, width=800.0, height=600.0)
+  t3.frame()
+  let trig = match t3.get("RTL State", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "rtl trig") }
+  let lb = match t3.get("RTL State", role=view::Role::Listbox) { Some(d) => d; None => halt::saying("x15a", "rtl lb") }
+  x15a_assert(lb.x < trig.x - 50.0, "RTL BelowStart popover extends leftward from trigger right edge, got lb.x=\{lb.x} trig.x=\{trig.x}")
+  ctrl_sel.set(["b"])
+  t3.frame()
+  x15a_assert(t3.find("Beta") is Some(_), "Controlled selected_keys updates displayed value")
+  t3.dispose()
+}
+
+test "w15a-r3: pointer focus restore, controlled clear, initial scroll & grouped buckets" {
+  // 1. Opus P1-1: ComboBox & Autocomplete pointer-click single-select restores keyboard focus
+  let cb_fld = ui::Field::new()
+  let t_cb = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = ComboBox(
+      root,
+      items=[AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta")],
+      label=.Is("CB Focus"),
+      field=cb_fld,
+      default_open=true,
+    )
+  }, width=600.0, height=400.0)
+  t_cb.frame()
+  x15a_assert(x15a_click_text(t_cb, "Beta"), "click Beta in ComboBox")
+  t_cb.frame(ms=16.0)
+  let cb_has_foc = match ui::view_tree() {
+    Some(tr) => tr.focused_now().0 is Some(_)
+    None => false
+  }
+  x15a_assert(cb_has_foc, "ComboBox single-select click must keep keyboard focus")
+  x15a_assert(cb_fld.focused(), "ComboBox Field must regain focus after single-select click")
+  t_cb.dispose()
+
+  let t_ac = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = Autocomplete(
+      root,
+      items=[AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta")],
+      label=.Is("AC Focus"),
+      default_open=true,
+    )
+  }, width=600.0, height=400.0)
+  t_ac.frame()
+  x15a_assert(x15a_click_text(t_ac, "Beta"), "click Beta in Autocomplete")
+  t_ac.frame(ms=16.0)
+  let ac_has_foc = match ui::view_tree() {
+    Some(tr) => tr.focused_now().0 is Some(_)
+    None => false
+  }
+  x15a_assert(ac_has_foc, "Autocomplete single-select click must keep keyboard focus")
+  x15a_assert(x15a_focused_is(t_ac, "AC Focus", view::Role::Combobox), "Autocomplete trigger must regain focus after click")
+  t_ac.dispose()
+
+  // 2. Astra P1-1: Controlled ComboBox Clear button (reject / delayed accept / immediate accept)
+  let ctrl_reject = signals::signal_by(["a"], x15a_strs_eq)
+  let reject_cb = view::ref_new(0)
+  let fld_reject = ui::Field::new()
+  let t_rej = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = ComboBox(
+      root,
+      items=[AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta")],
+      label=.Is("Ctrl Reject"),
+      field=fld_reject,
+      selected_keys=fn() -> Array[String] { ctrl_reject.get() },
+      on_selection_change=fn(_ks : Array[String]) -> Unit { reject_cb.v = reject_cb.v + 1 },
+      clearable=true,
+    )
+  }, width=600.0, height=400.0)
+  t_rej.frame()
+  x15a_assert(fld_reject.text() == "Alpha", "Controlled ComboBox initializes to Alpha")
+  let clr_btn = match t_rej.get("Clear", role=view::Role::Button) { Some(d) => d; None => halt::saying("x15a", "Clear button missing") }
+  t_rej.click(clr_btn.x + clr_btn.w * 0.5, clr_btn.y + clr_btn.h * 0.5)
+  t_rej.frame(ms=16.0)
+  x15a_assert(reject_cb.v == 1, "Controlled Clear invokes on_selection_change once")
+  x15a_assert(fld_reject.text() == "Alpha", "Parent rejecting Clear must keep Alpha in Field, got '\{fld_reject.text()}'")
+  // Delayed accept
+  ctrl_reject.set([])
+  t_rej.frame(ms=16.0)
+  x15a_assert(fld_reject.text() == "", "Delayed parent clear updates Field to empty")
+  t_rej.dispose()
+
+  let ctrl_accept = signals::signal_by(["a"], x15a_strs_eq)
+  let fld_accept = ui::Field::new()
+  let t_acc = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = ComboBox(
+      root,
+      items=[AuraSelectOption::new("a", "Alpha"), AuraSelectOption::new("b", "Beta")],
+      label=.Is("Ctrl Accept"),
+      field=fld_accept,
+      selected_keys=fn() -> Array[String] { ctrl_accept.get() },
+      on_selection_change=fn(ks : Array[String]) -> Unit { ctrl_accept.set(ks) },
+      clearable=true,
+    )
+  }, width=600.0, height=400.0)
+  t_acc.frame()
+  let clr2 = match t_acc.get("Clear", role=view::Role::Button) { Some(d) => d; None => halt::saying("x15a", "Clear2 missing") }
+  t_acc.click(clr2.x + clr2.w * 0.5, clr2.y + clr2.h * 0.5)
+  t_acc.frame(ms=16.0)
+  x15a_assert(fld_accept.text() == "", "Immediate parent clear updates Field to empty")
+  t_acc.dispose()
+
+  // 3. Astra P1-2 / R3 P1-1: First-open Select with pre-selected last item scrolls active item into real 400x300 clipped viewport and stays put after manual wheel scroll
+  let many : Array[AuraSelectOption] = []
+  let mut mi = 0
+  while mi < 40 {
+    many.push(AuraSelectOption::new("k\{mi}", "Item \{mi}"))
+    mi += 1
+  }
+  let t_scr = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = Select(
+      root,
+      items=many,
+      label=.Is("Long Select"),
+      initial_selected=["k39"],
+    )
+  }, width=400.0, height=300.0)
+  t_scr.frame()
+  let trig_scr = match t_scr.get("Long Select", role=view::Role::Combobox) { Some(d) => d; None => halt::saying("x15a", "long trig") }
+  t_scr.click(trig_scr.x + trig_scr.w * 0.5, trig_scr.y + trig_scr.h * 0.5)
+  t_scr.frame(ms=16.0)
+  t_scr.frame(ms=16.0)
+  t_scr.frame(ms=16.0)
+  t_scr.frame(ms=100.0)
+  t_scr.frame(ms=500.0)
+  let opt39 = match t_scr.get("Item 39", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "item 39") }
+  // Assert against the REAL 400x300 window & popover clipped viewport (NOT the 1608pt unclipped listbox content!)
+  x15a_assert(
+    opt39.y >= 0.0 && opt39.y + opt39.h <= 300.0 && opt39.h > 0.0,
+    "First-open pre-selected Item 39 must scroll inside real 400x300 clipped viewport: opt39.y=\{opt39.y} h=\{opt39.h}",
+  )
+  // User scrolls back upward with wheel (negative dy scrolls content down / viewport up) -> Item 39 MUST move and NOT snap back
+  let y_before_wheel = opt39.y
+  t_scr.wheel(opt39.x + opt39.w * 0.5, opt39.y + opt39.h * 0.5, -400.0)
+  t_scr.frame(ms=16.0)
+  t_scr.frame(ms=100.0)
+  let opt39_after = match t_scr.get("Item 39", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "item 39 after wheel") }
+  x15a_assert(opt39_after.y > y_before_wheel + 100.0, "Manual wheel scroll upward must move Item 39 down out of bottom viewport: before=\{y_before_wheel} after=\{opt39_after.y}")
+  let y_scrolled = opt39_after.y
+  t_scr.frame(ms=100.0)
+  t_scr.frame(ms=500.0)
+  let opt39_stay = match t_scr.get("Item 39", role=view::Role::Option) { Some(d) => d; None => halt::saying("x15a", "item 39 stay") }
+  x15a_assert(opt39_stay.y == y_scrolled, "Manual wheel scroll must not snap back: y_scrolled=\{y_scrolled} stay=\{opt39_stay.y}")
+  t_scr.dispose()
+
+  // 4. Astra P2-5: Multi-section grouped Select initial open & filter recovery
+  let grouped : Array[AuraSelectOption] = []
+  let mut gi = 0
+  while gi < 20 {
+    grouped.push(AuraSelectOption::new("g\{gi}", "Entry \{gi}", section="Group \{gi}"))
+    gi += 1
+  }
+  let g_fld = ui::Field::new()
+  let t_grp = ui::Tester::tree(fn(root : view::View) -> Unit {
+    x15a_setup(root)
+    let _ = ComboBox(
+      root,
+      items=grouped,
+      label=.Is("Grouped"),
+      field=g_fld,
+      default_open=true,
+    )
+  }, width=600.0, height=500.0)
+  t_grp.frame()
+  x15a_assert(t_grp.get("Entry 0", role=view::Role::Option) is Some(_), "Grouped mount shows Entry 0")
+  x15a_assert(t_grp.get("Entry 19", role=view::Role::Option) is Some(_), "Grouped mount shows Entry 19")
+  g_fld.set("Entry 15")
+  t_grp.frame(ms=16.0)
+  x15a_assert(t_grp.get("Entry 15", role=view::Role::Option) is Some(_), "Filtered group shows Entry 15")
+  g_fld.set("")
+  t_grp.frame(ms=16.0)
+  x15a_assert(t_grp.get("Entry 0", role=view::Role::Option) is Some(_), "Clearing filter restores Entry 0")
+  t_grp.dispose()
+}

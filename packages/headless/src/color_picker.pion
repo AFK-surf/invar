@@ -262,6 +262,15 @@ pub fn color_slider(
   }
 }
 
+struct ColorSwatchEntry {
+  hex : String
+  node : view::View
+  off : () -> Bool
+  has_alpha : Bool
+  rgba8 : Option[Int64]
+  rgb_hex : Option[String]
+}
+
 /// 2D grid roving color swatch picker controller.
 pub struct ColorSwatchPicker {
   node : view::View
@@ -269,8 +278,91 @@ pub struct ColorSwatchPicker {
   off : () -> Bool
   selected_ : () -> Option[String]
   on_select : (String) -> Unit
-  swatches : Array[(String, view::View, () -> Bool)]
+  swatches_sig : signals::Signal[Array[ColorSwatchEntry]]
+  matched_id : signals::Computed[Option[view::NodeId]]
+  mounting : signals::Signal[Bool]
+  init_buf : Array[ColorSwatchEntry]
+  mount_sel_hex : signals::Ref[Option[String]]
+  mount_sel_rgba : signals::Ref[Option[Int64]]
+  mount_sel_rgb : signals::Ref[Option[String]]
+  mount_exact_id : signals::Ref[Option[view::NodeId]]
+  mount_fallback_id : signals::Ref[Option[view::NodeId]]
   focus_idx : signals::Signal[Int]
+}
+
+fn option_str_eq(a : Option[String], b : Option[String]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+fn ColorSwatchPicker::recompute_mount_match(self : ColorSwatchPicker) -> Unit {
+  match self.mount_sel_hex.v {
+    None => {
+      self.mount_exact_id.v = None
+      self.mount_fallback_id.v = None
+    }
+    Some(s) => {
+      let sel_rgba = self.mount_sel_rgba.v
+      let sel_rgb = self.mount_sel_rgb.v
+      let mut exact_id : Option[view::NodeId] = None
+      let mut fallback_id : Option[view::NodeId] = None
+      for e in self.init_buf {
+        let exact = if e.hex == s {
+          true
+        } else {
+          match (sel_rgba, e.rgba8) {
+            (Some(a), Some(b)) => a == b
+            _ => false
+          }
+        }
+        if exact {
+          exact_id = Some(e.node.id())
+          break
+        }
+        if fallback_id is None && !e.has_alpha {
+          match (sel_rgb, e.rgb_hex) {
+            (Some(ra), Some(rb)) =>
+              if ra == rb {
+                fallback_id = Some(e.node.id())
+              }
+            _ => ()
+          }
+        }
+      }
+      self.mount_exact_id.v = exact_id
+      self.mount_fallback_id.v = fallback_id
+    }
+  }
+}
+
+fn ColorSwatchPicker::sync_mount_cache(self : ColorSwatchPicker) -> Bool {
+  let cur = signals::untracked(self.selected_)
+  if option_str_eq(cur, self.mount_sel_hex.v) {
+    return false
+  }
+  self.mount_sel_hex.v = cur
+  match cur {
+    None => {
+      self.mount_sel_rgba.v = None
+      self.mount_sel_rgb.v = None
+    }
+    Some(s) => {
+      let parsed = headless_core::color_parse_hex(s)
+      self.mount_sel_rgba.v = match parsed {
+        Some(c) => Some(c.to_rgba8())
+        None => None
+      }
+      self.mount_sel_rgb.v = match parsed {
+        Some(c) => Some(c.to_hex())
+        None => None
+      }
+    }
+  }
+  self.recompute_mount_match()
+  true
 }
 
 pub fn ColorSwatchPicker::node(self : ColorSwatchPicker) -> view::View {
@@ -292,16 +384,71 @@ pub fn color_swatch_picker(
 ) -> view::View {
   let cols = if columns < 1 { 1 } else { columns }
   let setup = fn(v : view::View) {
+    let swatches_sig : signals::Signal[Array[ColorSwatchEntry]] = signals::signal_by(
+      [],
+      fn(_a : Array[ColorSwatchEntry], _b : Array[ColorSwatchEntry]) -> Bool { false },
+    )
+    let matched_id = signals::computed_by(
+      fn(_prev : Option[Option[view::NodeId]]) -> Option[view::NodeId] {
+        let cur_swatches = swatches_sig.get()
+        match selected() {
+          Some(s) => color_swatch_matched_id(cur_swatches, s)
+          None => None
+        }
+      },
+      fn(a : Option[view::NodeId], b : Option[view::NodeId]) -> Bool {
+        match (a, b) {
+          (None, None) => true
+          (Some(x), Some(y)) => x == y
+          _ => false
+        }
+      },
+    )
+    let _ = v.owns(fn() {
+      matched_id.dispose()
+      swatches_sig.set([])
+    })
+    let mounting : signals::Signal[Bool] = signals::signal(true)
+    let init_buf : Array[ColorSwatchEntry] = []
+    let mount_sel_hex_init = signals::untracked(selected)
+    let mount_parsed = match mount_sel_hex_init {
+      Some(s) => headless_core::color_parse_hex(s)
+      None => None
+    }
+    let mount_sel_rgba_init = match mount_parsed {
+      Some(c) => Some(c.to_rgba8())
+      None => None
+    }
+    let mount_sel_rgb_init = match mount_parsed {
+      Some(c) => Some(c.to_hex())
+      None => None
+    }
     let sp = ColorSwatchPicker::{
       node: v,
       columns: cols,
       off: disabled,
       selected_: selected,
       on_select,
-      swatches: [],
+      swatches_sig,
+      matched_id,
+      mounting,
+      init_buf,
+      mount_sel_hex: view::ref_new(mount_sel_hex_init),
+      mount_sel_rgba: view::ref_new(mount_sel_rgba_init),
+      mount_sel_rgb: view::ref_new(mount_sel_rgb_init),
+      mount_exact_id: view::ref_new(None),
+      mount_fallback_id: view::ref_new(None),
       focus_idx: signals::signal(0),
     }
     look(v, sp)
+    signals::batch(fn() {
+      if init_buf.length() > 0 {
+        let committed = init_buf.copy()
+        init_buf.clear()
+        swatches_sig.set(committed)
+      }
+      mounting.set(false)
+    })
     let _ = v
     .says(view::Live::By(fn() -> Option[view::Said] {
       Some(view::said(view::Role::Listbox, label=label()))
@@ -310,14 +457,15 @@ pub fn color_swatch_picker(
       if disabled() || k.mods != 0 || !focus_in(v, false) {
         return false
       }
-      let n = sp.swatches.length()
+      let cur_swatches = sp.swatches_sig.untracked()
+      let n = cur_swatches.length()
       if n == 0 {
         return false
       }
       let mut cur = -1
       let mut i = 0
       while i < n {
-        if sp.swatches[i].1.focused() {
+        if cur_swatches[i].node.focused() {
           cur = i
           break
         }
@@ -341,9 +489,9 @@ pub fn color_swatch_picker(
       } else {
         return false
       }
-      if next != cur && !(sp.swatches[next].2)() && sp.swatches[next].1.alive() {
+      if next != cur && !(cur_swatches[next].off)() && cur_swatches[next].node.alive() {
         sp.focus_idx.set(next)
-        let _ = sp.swatches[next].1.ask_focus(visible=true)
+        let _ = cur_swatches[next].node.ask_focus(visible=true)
       }
       true
     })
@@ -354,6 +502,54 @@ pub fn color_swatch_picker(
   } else {
     parent.box(setup, made_for=resolve_made_for(made_for, loc), loc=loc)
   }
+}
+
+fn color_hex_has_alpha(raw : String) -> Bool {
+  let s = raw.trim()
+  let n = s.length()
+  let digits = if n > 0 && s.code_unit_at(0) == 35 { n - 1 } else { n }
+  digits == 4 || digits == 8
+}
+
+/// Resolve the single winning swatch `NodeId` for `selected_hex` in O(N) with a single parse:
+/// 1) exact RGBA8 match across the whole group first (so `#AABBCC` and `#AABBCC80` never double-select);
+/// 2) 6-digit RGB fallback only when no swatch in the group matched exact RGBA8.
+fn color_swatch_matched_id(
+  swatches : Array[ColorSwatchEntry],
+  selected_hex : String,
+) -> Option[view::NodeId] {
+  let parsed = headless_core::color_parse_hex(selected_hex)
+  let sel_rgba = match parsed {
+    Some(c) => Some(c.to_rgba8())
+    None => None
+  }
+  let sel_rgb = match parsed {
+    Some(c) => Some(c.to_hex())
+    None => None
+  }
+  let mut rgb_fallback : Option[view::NodeId] = None
+  for e in swatches {
+    if e.hex == selected_hex {
+      return Some(e.node.id())
+    }
+    match (sel_rgba, e.rgba8) {
+      (Some(a), Some(b)) =>
+        if a == b {
+          return Some(e.node.id())
+        }
+      _ => ()
+    }
+    if rgb_fallback is None && !e.has_alpha {
+      match (sel_rgb, e.rgb_hex) {
+        (Some(ra), Some(rb)) =>
+          if ra == rb {
+            rgb_fallback = Some(e.node.id())
+          }
+        _ => ()
+      }
+    }
+  }
+  rgb_fallback
 }
 
 /// Mount one swatch (`Role::Option`) in `ColorSwatchPicker`.
@@ -372,15 +568,75 @@ pub fn ColorSwatchPicker::swatch(
     let off = fn() -> Bool { (self.off)() || disabled() }
     let able = fn() -> Bool { !off() }
     let is_sel = fn() -> Bool {
-      match (self.selected_)() {
-        Some(s) => s == hex
+      let win = if self.mounting.get() {
+        let _ = self.matched_id.get()
+        let _ = self.sync_mount_cache()
+        match self.mount_exact_id.v {
+          Some(id) => Some(id)
+          None => self.mount_fallback_id.v
+        }
+      } else {
+        self.matched_id.get()
+      }
+      match win {
+        Some(win_id) => win_id == v.id()
         None => false
       }
     }
-    let idx = self.swatches.length()
-    self.swatches.push((hex, v, off))
+    let parsed_sw = headless_core::color_parse_hex(hex)
+    let entry = ColorSwatchEntry::{
+      hex,
+      node: v,
+      off,
+      has_alpha: color_hex_has_alpha(hex),
+      rgba8: match parsed_sw { Some(c) => Some(c.to_rgba8()); None => None },
+      rgb_hex: match parsed_sw { Some(c) => Some(c.to_hex()); None => None },
+    }
+    let idx = if self.mounting.untracked() {
+      let i = self.init_buf.length()
+      self.init_buf.push(entry)
+      if !self.sync_mount_cache() && self.mount_exact_id.v is None {
+        let exact = match self.mount_sel_hex.v {
+          Some(s) if s == entry.hex => true
+          _ =>
+            match (self.mount_sel_rgba.v, entry.rgba8) {
+              (Some(a), Some(b)) => a == b
+              _ => false
+            }
+        }
+        if exact {
+          self.mount_exact_id.v = Some(v.id())
+        } else if self.mount_fallback_id.v is None && !entry.has_alpha {
+          match (self.mount_sel_rgb.v, entry.rgb_hex) {
+            (Some(ra), Some(rb)) =>
+              if ra == rb {
+                self.mount_fallback_id.v = Some(v.id())
+              }
+            _ => ()
+          }
+        }
+      }
+      i
+    } else {
+      let prev_sw = self.swatches_sig.untracked()
+      let i = prev_sw.length()
+      let next_sw = prev_sw.copy()
+      next_sw.push(entry)
+      self.swatches_sig.set(next_sw)
+      i
+    }
     let _ = v.owns(fn() {
-      view::array_retain(self.swatches, fn(e : (String, view::View, () -> Bool)) -> Bool { e.1.id() != v.id() })
+      if self.node.letting_go() {
+        return
+      }
+      if self.mounting.untracked() {
+        view::array_retain(self.init_buf, fn(e : ColorSwatchEntry) -> Bool { e.node.id() != v.id() })
+        self.recompute_mount_match()
+        return
+      }
+      let cur_sw = self.swatches_sig.untracked().copy()
+      view::array_retain(cur_sw, fn(e : ColorSwatchEntry) -> Bool { e.node.id() != v.id() })
+      self.swatches_sig.set(cur_sw)
     })
     look(v, is_sel)
     let _ = v
