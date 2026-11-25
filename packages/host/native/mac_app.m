@@ -49,6 +49,8 @@ static int go_back(void);
 @property(nonatomic, copy) NSString *mirror;  // the field's text, for the input method
 @property(nonatomic) NSRange sel;
 @property(nonatomic) NSUInteger markedLen;
+@property(nonatomic, copy) NSString *markedText;
+@property(nonatomic) NSRange markedSel;  // selection relative to markedText
 @property(nonatomic, strong) CADisplayLink *link;
 @property(nonatomic) CFTimeInterval linkAskedAt;  // when the link was asked for a frame and has not ticked since
 @property(nonatomic) BOOL wantFrame;
@@ -1076,7 +1078,7 @@ static NSCursor *cursor_of(int kind) {
   }
   if (self.imeActive) {
     // ⌥ with an arrow and an empty field: the app's (the chat before or after)
-    if (arrow && (m & NSEventModifierFlagOption) && self.mirror.length == 0) {
+    if (arrow && (m & NSEventModifierFlagOption) && self.mirror.length == 0 && self.markedLen == 0) {
       mb_cb.key(arrow, mods);
       return;
     }
@@ -1151,35 +1153,98 @@ static int shift_down(void) {
 
 // ---- NSTextInputClient ----
 
-- (void)insertText:(id)string replacementRange:(NSRange)r {
-  NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [string string] : string;
+- (void)clearMarkedState {
   self.markedLen = 0;
+  self.markedText = nil;
+  self.markedSel = NSMakeRange(0, 0);
+}
+- (NSString *)imeText {
+  NSString *m = self.mirror ?: @"";
+  if (self.markedLen == 0 || self.markedText.length == 0) return m;
+  NSUInteger at = MIN(self.sel.location, m.length);
+  return [[[m substringToIndex:at] stringByAppendingString:self.markedText]
+      stringByAppendingString:[m substringFromIndex:at]];
+}
+- (void)insertText:(id)string replacementRange:(NSRange)r {
+  (void)r;
+  NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [string string] : (string ?: @"");
+  [self clearMarkedState];
+  NSString *m = self.mirror ?: @"";
+  NSUInteger start = MIN(self.sel.location, m.length);
+  NSUInteger end = MIN(start + self.sel.length, m.length);
+  self.mirror = [[[m substringToIndex:start] stringByAppendingString:s]
+      stringByAppendingString:[m substringFromIndex:end]];
+  self.sel = NSMakeRange(start + s.length, 0);
   send_text(0, s, 0, 0);
 }
 - (void)setMarkedText:(id)string selectedRange:(NSRange)sel replacementRange:(NSRange)r {
-  NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [string string] : string;
-  self.markedLen = s.length;
-  if (s.length == 0) send_text(1, @"", 0, 0);
-  else send_text(1, s, (int)sel.location, (int)sel.length);
+  (void)r;
+  NSString *s = [string isKindOfClass:[NSAttributedString class]] ? [string string] : (string ?: @"");
+  if (s.length == 0) {
+    [self clearMarkedState];
+    send_text(1, @"", 0, 0);
+  } else {
+    if (self.sel.length > 0) {
+      NSString *m = self.mirror ?: @"";
+      NSUInteger start = MIN(self.sel.location, m.length);
+      NSUInteger end = MIN(start + self.sel.length, m.length);
+      self.mirror = [[m substringToIndex:start] stringByAppendingString:[m substringFromIndex:end]];
+      self.sel = NSMakeRange(start, 0);
+    }
+    NSUInteger loc = sel.location == NSNotFound ? s.length : MIN(sel.location, s.length);
+    NSUInteger len = MIN(sel.length, s.length - loc);
+    self.markedText = s;
+    self.markedLen = s.length;
+    self.markedSel = NSMakeRange(loc, len);
+    send_text(1, s, (int)loc, (int)len);
+  }
 }
 - (void)unmarkText {
-  self.markedLen = 0;
+  if (self.markedLen > 0 && self.markedText.length > 0) {
+    NSString *t = self.markedText;
+    [self clearMarkedState];
+    [self insertText:t replacementRange:NSMakeRange(NSNotFound, 0)];
+    return;
+  }
+  [self clearMarkedState];
   send_text(2, @"", 0, 0);
 }
 - (BOOL)hasMarkedText { return self.markedLen > 0; }
 - (NSRange)markedRange {
-  return self.markedLen ? NSMakeRange(self.sel.location, self.markedLen) : NSMakeRange(NSNotFound, 0);
+  if (self.markedLen == 0) return NSMakeRange(NSNotFound, 0);
+  NSUInteger base = MIN(self.sel.location, (self.mirror ?: @"").length);
+  return NSMakeRange(base, self.markedLen);
 }
-- (NSRange)selectedRange { return self.sel; }
+- (NSRange)selectedRange {
+  NSUInteger mirrorLen = (self.mirror ?: @"").length;
+  NSUInteger base = MIN(self.sel.location, mirrorLen);
+  if (self.markedLen > 0) {
+    NSUInteger loc = MIN(self.markedSel.location, self.markedLen);
+    NSUInteger len = MIN(self.markedSel.length, self.markedLen - loc);
+    return NSMakeRange(base + loc, len);
+  }
+  NSUInteger len = MIN(self.sel.length, mirrorLen - base);
+  return NSMakeRange(base, len);
+}
 - (NSArray<NSAttributedStringKey> *)validAttributesForMarkedText { return @[]; }
 - (NSAttributedString *)attributedSubstringForProposedRange:(NSRange)r actualRange:(NSRangePointer)actual {
-  NSString *m = self.mirror ?: @"";
+  NSString *m = [self imeText];
+  if (r.location == NSNotFound || r.location > m.length) {
+    if (actual) *actual = NSMakeRange(NSNotFound, 0);
+    return nil;
+  }
   NSRange clipped = NSIntersectionRange(r, NSMakeRange(0, m.length));
   if (actual) *actual = clipped;
   return [[NSAttributedString alloc] initWithString:[m substringWithRange:clipped]];
 }
 - (NSUInteger)characterIndexForPoint:(NSPoint)p { return NSNotFound; }
 - (NSRect)firstRectForCharacterRange:(NSRange)r actualRange:(NSRangePointer)actual {
+  if (actual) {
+    NSString *m = [self imeText];
+    *actual = (r.location == NSNotFound || r.location > m.length)
+        ? NSMakeRange(NSNotFound, 0)
+        : NSIntersectionRange(r, NSMakeRange(0, m.length));
+  }
   NSRect inWindow = [self convertRect:self.caretRect toView:nil];
   return [self.window convertRectToScreen:inWindow];
 }
@@ -3003,7 +3068,10 @@ void mb_host_set_ime(int32_t active, double x, double y, double w, double h, moo
   v.caretRect = NSMakeRect(x, y, w, h);
   v.mirror = mb_ns_from_string(text);
   v.sel = NSMakeRange(a, b - a);
-  if (!active) [v.inputContext discardMarkedText];
+  if (!active) {
+    [v clearMarkedState];
+    [v.inputContext discardMarkedText];
+  }
   [v.inputContext invalidateCharacterCoordinates];
 }
 

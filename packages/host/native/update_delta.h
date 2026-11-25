@@ -31,6 +31,7 @@
 #define UD_FN static
 #endif
 
+#ifndef UD_INFLATE_ONLY
 // ---- SHA-256 (FIPS 180-4) ----
 
 typedef struct {
@@ -108,6 +109,7 @@ UD_FN void ud_sha256_final(ud_sha256 *s, unsigned char out[32]) {
   ud_sha256_block(s, s->buf);
   for (i = 0; i < 32; i++) out[i] = (unsigned char)(s->h[i / 4] >> (24 - 8 * (i % 4)));
 }
+#endif
 
 // ---- raw inflate (RFC 1951) ----
 // Into a buffer of its own size (a chunk's raw_len): what refers back reaches only what this stream made.
@@ -398,6 +400,7 @@ UD_FN const char *ud_inflate(const unsigned char *in, size_t n, unsigned char *o
   return NULL;
 }
 
+#ifndef UD_INFLATE_ONLY
 // ---- the delta ----
 
 // One old file by its path (relative, '/' between names, UTF-8): its bytes in a buffer of malloc's (the applier frees
@@ -643,5 +646,6 @@ UD_FN const char *ud_apply(const unsigned char *d, size_t n, ud_read_fn read, vo
   free(old);
   return why;
 }
+#endif
 
 #endif

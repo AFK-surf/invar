@@ -35,6 +35,9 @@ extern "C" size_t invar_test_array_length(const void *p);
 #include "bands.h"
 // the groups of instances the host keeps, drawn out as a frame is taken (submit)
 #include "groups.h"
+// Exposes only ud_inflate() in this TU (do not expect full ud_apply later in the same TU).
+#define UD_INFLATE_ONLY
+#include "update_delta.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -1888,10 +1891,18 @@ static ID3DBlob *compile(const char *entry, const char *target, const char *src 
       if (baked_shaders[i].key != key) continue;
       ID3DBlob *blob = KeptBlob::made(baked_shaders[i].size);
       if (blob) {
-        memcpy(blob->GetBufferPointer(), baked_shaders[i].code, baked_shaders[i].size);
-        InterlockedIncrement(&shader_baked_hits);
-        free(patched);
-        return blob;
+        size_t made = 0, took = 0;
+        const char *why = ud_inflate(
+            baked_shaders[i].code, baked_shaders[i].zsize,
+            (unsigned char *)blob->GetBufferPointer(), baked_shaders[i].size,
+            &made, &took);
+        if (!why && made == baked_shaders[i].size && took == baked_shaders[i].zsize) {
+          InterlockedIncrement(&shader_baked_hits);
+          free(patched);
+          return blob;
+        }
+        fprintf(stderr, "baked shader %016llx: %s\n", (unsigned long long)key, why ? why : "size mismatch");
+        blob->Release();
       }
     }
   }
