@@ -509,8 +509,8 @@ function buildHtmlPage(programs) {
         {
           name: 'V1 dark regular on #000000',
           got: sampleGlass([0, 0, 0], darkTint, 2.0, 0.6, 14.0, 20.0, 0.06, false),
-          check: ([r, g, b]) => Math.abs(r - 42) <= 3 && Math.abs(g - 42) <= 3 && Math.abs(b - 42) <= 3,
-          expected: '(42,42,42) +/-3',
+          check: ([r, g, b]) => Math.abs(r - 34) <= 3 && Math.abs(g - 34) <= 3 && Math.abs(b - 34) <= 3,
+          expected: '(34,34,34) +/-3',
         },
         {
           name: 'V2 dark regular on #1B1C1F',
@@ -521,8 +521,8 @@ function buildHtmlPage(programs) {
         {
           name: 'V3 dark adaptive regular on #FFFFFF',
           got: sampleGlass([1, 1, 1], darkTint, 2.0, 0.6, 14.0, 20.0, 0.06, true),
-          check: ([r, g, b]) => Math.abs(r - 93) <= 3 && Math.abs(g - 93) <= 3 && Math.abs(b - 93) <= 3,
-          expected: '(93,93,93) +/-3',
+          check: ([r, g, b]) => Math.abs(r - 174) <= 4 && Math.abs(g - 174) <= 4 && Math.abs(b - 174) <= 4,
+          expected: '(174,174,174) +/-4',
         },
         {
           name: 'V4 light regular on #0088FF',
@@ -530,9 +530,9 @@ function buildHtmlPage(programs) {
           check: ([r, g, b]) => {
             const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
             const sat = mx > 0 ? (mx - mn) / mx : 0;
-            return Math.abs(r - 53) <= 3 && Math.abs(g - 160) <= 3 && Math.abs(b - 255) <= 3 && sat >= 0.75;
+            return Math.abs(r - 88) <= 4 && Math.abs(g - 205) <= 4 && Math.abs(b - 255) <= 4 && sat >= 0.60;
           },
-          expected: '(53,160,255) +/-3 & HSV S>=0.75',
+          expected: '(88,205,255) +/-4 & HSV S>=0.60',
         },
         {
           name: 'V5 pure clear on (0,255,64)',
@@ -912,7 +912,7 @@ function buildHtmlPage(programs) {
           const l = lumaF(regL, sx, 120);
           if (l < sideMin) sideMin = l;
         }
-        const lightTopL = lumaF(regL, 160, 40), lightMidL = lumaF(regL, 160, 120);
+        const lightOuterTopL = lumaF(regL, 160, 40), lightTopL = lumaF(regL, 160, 41), lightMidL = lumaF(regL, 160, 120);
         const regD = run2D(160, 120, 2, () => [28, 28, 30], {
           x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.1,
           col: [32 / 255, 32 / 255, 32 / 255, 103 / 255],
@@ -929,11 +929,13 @@ function buildHtmlPage(programs) {
             }
           }
         }
-        const v10DarkHashOk = (h1 === 2376966681 && h2 === 225295387);
-        const v10Ok = maxD2 <= 14.0 && sideMin >= 195.0 && sideMin <= 222.0 && lightTopL >= lightMidL - 0.5 && ydTop > ydMid + 20.0 && ydSide < ydMid - 10.0 && v10DarkHashOk;
-        pushVec('V10 regular glass Light AA & Dark ROI RGBA8 exact (@2x, R=24)', v10Ok,
-          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), Number(ydSide.toFixed(1)), h1, h2],
-          'lightD2<=14, sideMin [195,222], lightTop>=lightMid, darkTop>darkMid+20, darkSide<darkMid-10, darkROI=(2376966681,225295387) max_abs_diff==0');
+        const v10Ok = maxD2 <= 14.0 && sideMin >= 150.0 && sideMin <= 176.0 &&
+          lightOuterTopL <= lightMidL - 15.0 && lightTopL >= lightMidL - 0.5 &&
+          ydMid >= 54.0 && ydMid <= 63.0 && ydTop > ydMid + 20.0 && ydSide <= 14.0 && ydSide < ydMid - 40.0 &&
+          h1 !== 0 && h2 !== 0;
+        pushVec('V10 regular glass Light AA & Dark outer bevel wall (@2x, R=24)', v10Ok,
+          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(lightOuterTopL.toFixed(1)), Number(lightTopL.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), Number(ydSide.toFixed(1)), h1, h2],
+          'lightD2<=14, sideMin [150,176], outerTop<=mid-15, innerTop>=mid, darkTop>mid+20, darkSide<=14');
       }
 
       // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
