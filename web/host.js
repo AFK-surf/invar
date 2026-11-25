@@ -1754,10 +1754,10 @@
           float regEaseOld = pow(max(1.0 - luma(result), 0.0), 0.3);
           float regEaseNew = mix(1.0, pow(max(1.0 - luma(result), 0.0), 0.25), regDark);
           float regEase = mix(regEaseOld, regEaseNew, regCtrl);
+          float regRimGain = 1.0 * clamp(v_c2.x / 0.6, 0.0, 1.5);
           float tintRimScale = mix(1.0, 0.22, smoothstep(0.08, 0.16, colChroma));
-          float regRimGain = 1.0 * clamp(v_c2.x / 0.6, 0.0, 1.5) * tintRimScale;
-          float regCoreW = mix(0.185, mix(1.15, 0.34, regDark), regCtrl);
-          float regTailW = mix(0.020, mix(0.22, 0.055, regDark), regCtrl);
+          float regCoreW = mix(0.185, mix(1.15, 0.34, regDark) * tintRimScale, regCtrl);
+          float regTailW = mix(0.020, mix(0.22, 0.055, regDark) * tintRimScale, regCtrl);
           float regRimMaskNew = mix(1.0 - regHairline, 1.0 - regHairline * regShadeMask, regDark);
           float regRimMask = mix(1.0 - regHairline * regShadeMask, regRimMaskNew, regCtrl);
           float regRim = (regRimGain * regLobe * regEase * (regCoreW * regCore + regTailW * regTail) * regRimMask + spot * 0.10 * regCoreOld) * regMix;
@@ -1772,13 +1772,14 @@
           }
         }
         if (regHairline > 0.001) {
-          vec3 oldWall = result * (1.0 - (is_dark ? 0.0 : 0.13) * regShadeMaskOld * regHairline);
+          vec3 oldRes = result * (1.0 - (is_dark ? 0.0 : 0.13) * regShadeMaskOld * regHairOld);
           vec3 envBg = backdrop(p + surfaceNormal * 1.2);
           float envY = luma(envBg);
-          vec3 physWall = pow(max(envBg, vec3(1e-6)), vec3(1.75)) * 0.695 * mix(1.0, 0.56, smoothstep(0.65, 1.0, envY) * regDark);
-          if (colChroma > 0.08 && col.a > 0.001) physWall = min(physWall, result * 0.82);
-          vec3 newWall = mix(result, physWall, regShadeMaskNew * regHairline);
-          result = mix(oldWall, newWall, regCtrl);
+          vec3 physWall = pow(max(envBg, vec3(1e-6)), vec3(1.75)) * 0.695;
+          physWall *= mix(1.0, 0.56, smoothstep(0.65, 1.0, envY) * regDark);
+          if (colChroma > 0.08) physWall = min(physWall, result * 0.82);
+          vec3 newRes = mix(result, physWall, regHairNew * regShadeMaskNew);
+          result = mix(oldRes, newRes, regCtrl);
         }
       }
       if (isModernDrop) {
@@ -2952,17 +2953,23 @@
     const rawBlur = (kind === 6 && f32[a + 7] < 0) ? 0 : Math.abs(f32[a + 7]);
     const isClearLiq = kind === 6 && f32[a + 7] >= -0.001 && f32[a + 7] <= 0.1 && f32[a + 11] < 0.12;
     const colCh = Math.max(f32[a + 8], f32[a + 9], f32[a + 10]) - Math.min(f32[a + 8], f32[a + 9], f32[a + 10]);
-    const isRegCtrl = kind === 6 && !isClearLiq &&
-      ((f32[a + 11] >= 0.12 && f32[a + 11] < 0.45) || (colCh > 0.08 && f32[a + 11] < 0.80));
     const blur = (isClearLiq && f32[a + 11] > 0.01 && rawBlur < 0.1) ? 1.2 : rawBlur;
+    let gLo = Math.min(Math.max((f32[a + 11] - 0.02) / 0.085, 0), 1);
+    gLo = gLo * gLo * (3 - 2 * gLo);
+    let gNeu = Math.min(Math.max((f32[a + 11] - 0.405) / 0.095, 0), 1);
+    gNeu = 1 - gNeu * gNeu * (3 - 2 * gNeu);
+    let gCh = Math.min(Math.max((colCh - 0.08) / 0.08, 0), 1);
+    gCh = gCh * gCh * (3 - 2 * gCh);
+    let gTa = Math.min(Math.max((f32[a + 11] - 0.72) / 0.08, 0), 1);
+    gTa = 1 - gTa * gTa * (3 - 2 * gTa);
     let dualB = Math.min(Math.max((blur - 0.2) / 0.7, 0), 1);
     dualB = dualB * dualB * (3 - 2 * dualB);
-    let dualHi = 1 - Math.min(Math.max((blur - 3.5) / 1.0, 0), 1);
-    dualHi = dualHi * dualHi * (3 - 2 * dualHi);
+    let dualHi = Math.min(Math.max((blur - 3.5) / 1.0, 0), 1);
+    dualHi = 1 - dualHi * dualHi * (3 - 2 * dualHi);
     let dualSz = Math.min(Math.max((Math.min(f32[a + 2], f32[a + 3]) - 16.0) / 12.0, 0), 1);
     dualSz = dualSz * dualSz * (3 - 2 * dualSz);
-    const dualW = isRegCtrl ? (0.78 * dualB * dualHi * dualSz) : 0;
-    const isDual = dualW > 0.005;
+    let dualW = (kind === 6 && !isClearLiq) ? (0.78 * dualB * dualHi * dualSz * gLo * Math.max(gNeu, gCh * gTa)) : 0;
+    let isDual = dualW > 0.005;
     const mergedLiquid = kind === 6 && f32[a + 23] > 0;
     const unmergedLiquid = kind === 6 && !mergedLiquid;
     let margin = isContained ? 0 : 3 * blur + (kind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
@@ -3036,6 +3043,7 @@
       if (sp >= 2.5 && k < 2) k = 2;
       else if (k === 0 && sp > 0.5) k = 1;
     }
+    if (k >= 3) { isDual = false; dualW = 0; }
     const sk = sp / (1 << k);
     const pre = k > 0 ? 0.75 * (1 - Math.pow(0.25, k)) / 3 + 1 / 6 : 0;
     const sg = Math.sqrt(Math.max(sk * sk - pre, 0));

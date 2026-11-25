@@ -869,6 +869,20 @@ static int run_warp_smoke(void) {
     ok &= check_rgb("V7 opaque light 0xFF on (0,0.4,1)", r, g, b, 253, 252, 253, 2);
   }
 
+  // Vector 13: Prominent tinted 0xD9 (#0088FF @ 0.85) top-edge rim parity across all 4 GPU backends
+  {
+    int n = 0;
+    push_inst(inst, &n, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 2.0,
+              0.0, 136.0/255.0, 1.0, 217.0/255.0,
+              0.6, 14.0, 0.0, 1.0,
+              -1.0, 20.0, 0.06, 0.0);
+    if (!render_and_sample(inst, n, 1.0, 1.0, 1.0, 160, 41, &r, &g, &b)) return 0;
+    int pass = (r >= 26 && r <= 36 && g >= 142 && g <= 156 && b >= 245);
+    printf("  [%s] V13 prominent tinted 0xD9 top-edge rim: got=(%d,%d,%d) expected R in [26..36] G in [142..156] B>=245\n",
+           pass ? "PASS" : "FAIL", r, g, b);
+    ok &= pass;
+  }
+
   // Extra pipeline coverage: rect (kind 0), shadow (kind 2), frosted (kind 5), progressive frosted, merged liquid (merge > 0)
   {
     int n = 0;

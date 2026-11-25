@@ -1006,10 +1006,10 @@ static const char *FS =
     "        float regEaseOld = pow(max(1.0 - luma(result), 0.0), 0.3);\n"
     "        float regEaseNew = mix(1.0, pow(max(1.0 - luma(result), 0.0), 0.25), regDark);\n"
     "        float regEase = mix(regEaseOld, regEaseNew, regCtrl);\n"
+    "        float regRimGain = 1.0 * clamp(v_c2.x / 0.6, 0.0, 1.5);\n"
     "        float tintRimScale = mix(1.0, 0.22, smoothstep(0.08, 0.16, colChroma));\n"
-    "        float regRimGain = 1.0 * clamp(v_c2.x / 0.6, 0.0, 1.5) * tintRimScale;\n"
-    "        float regCoreW = mix(0.185, mix(1.15, 0.34, regDark), regCtrl);\n"
-    "        float regTailW = mix(0.020, mix(0.22, 0.055, regDark), regCtrl);\n"
+    "        float regCoreW = mix(0.185, mix(1.15, 0.34, regDark) * tintRimScale, regCtrl);\n"
+    "        float regTailW = mix(0.020, mix(0.22, 0.055, regDark) * tintRimScale, regCtrl);\n"
     "        float regRimMaskNew = mix(1.0 - regHairline, 1.0 - regHairline * regShadeMask, regDark);\n"
     "        float regRimMask = mix(1.0 - regHairline * regShadeMask, regRimMaskNew, regCtrl);\n"
     "        float regRim = (regRimGain * regLobe * regEase * (regCoreW * regCore + regTailW * regTail) * regRimMask + spot * 0.10 * regCoreOld) * regMix;\n"
@@ -1024,13 +1024,14 @@ static const char *FS =
     "        }\n"
     "      }\n"
     "      if (regHairline > 0.001) {\n"
-    "        vec3 oldWall = result * (1.0 - (is_dark ? 0.0 : 0.13) * regShadeMaskOld * regHairline);\n"
+    "        vec3 oldRes = result * (1.0 - (is_dark ? 0.0 : 0.13) * regShadeMaskOld * regHairOld);\n"
     "        vec3 envBg = backdrop(p + surfaceNormal * 1.2);\n"
     "        float envY = luma(envBg);\n"
-    "        vec3 physWall = pow(max(envBg, vec3(1e-6)), vec3(1.75)) * 0.695 * mix(1.0, 0.56, smoothstep(0.65, 1.0, envY) * regDark);\n"
-    "        if (colChroma > 0.08 && col.a > 0.001) physWall = min(physWall, result * 0.82);\n"
-    "        vec3 newWall = mix(result, physWall, regShadeMaskNew * regHairline);\n"
-    "        result = mix(oldWall, newWall, regCtrl);\n"
+    "        vec3 physWall = pow(max(envBg, vec3(1e-6)), vec3(1.75)) * 0.695;\n"
+    "        physWall *= mix(1.0, 0.56, smoothstep(0.65, 1.0, envY) * regDark);\n"
+    "        if (colChroma > 0.08) physWall = min(physWall, result * 0.82);\n"
+    "        vec3 newRes = mix(result, physWall, regHairNew * regShadeMaskNew);\n"
+    "        result = mix(oldRes, newRes, regCtrl);\n"
     "      }\n"
     "    }\n"
     "    if (isModernDrop) {\n"
@@ -2117,19 +2118,22 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   float raw_blur = (kind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
   int is_clear_liq = (kind == 6 && a[7] >= -0.001f && a[7] <= 0.1f && a[11] < 0.12f);
   float col_ch = fmaxf(fmaxf(a[8], a[9]), a[10]) - fminf(fminf(a[8], a[9]), a[10]);
-  int is_reg_ctrl = (kind == 6 && !is_clear_liq &&
-                     ((a[11] >= 0.12f && a[11] < 0.45f) || (col_ch > 0.08f && a[11] < 0.80f)));
   float blur = (is_clear_liq && a[11] > 0.01f && raw_blur < 0.1f) ? 1.2f : raw_blur;
-  float dual_w = 0.0f;
-  if (is_reg_ctrl && blur > 0.2f && blur < 4.5f) {
-    float t_lo = fminf(fmaxf((blur - 0.2f) / 0.7f, 0.0f), 1.0f);
-    float t_hi = fminf(fmaxf((blur - 3.5f) / 1.0f, 0.0f), 1.0f);
-    float t_sz = fminf(fmaxf((fminf(a[2], a[3]) - 16.0f) / 12.0f, 0.0f), 1.0f);
-    t_lo = t_lo * t_lo * (3.0f - 2.0f * t_lo);
-    t_hi = t_hi * t_hi * (3.0f - 2.0f * t_hi);
-    t_sz = t_sz * t_sz * (3.0f - 2.0f * t_sz);
-    dual_w = 0.78f * t_lo * (1.0f - t_hi) * t_sz;
-  }
+  float g_lo = fminf(fmaxf((a[11] - 0.02f) / 0.085f, 0.0f), 1.0f);
+  g_lo = g_lo * g_lo * (3.0f - 2.0f * g_lo);
+  float g_neu = fminf(fmaxf((a[11] - 0.405f) / 0.095f, 0.0f), 1.0f);
+  g_neu = 1.0f - g_neu * g_neu * (3.0f - 2.0f * g_neu);
+  float g_ch = fminf(fmaxf((col_ch - 0.08f) / 0.08f, 0.0f), 1.0f);
+  g_ch = g_ch * g_ch * (3.0f - 2.0f * g_ch);
+  float g_ta = fminf(fmaxf((a[11] - 0.72f) / 0.08f, 0.0f), 1.0f);
+  g_ta = 1.0f - g_ta * g_ta * (3.0f - 2.0f * g_ta);
+  float dual_b = fminf(fmaxf((blur - 0.2f) / 0.7f, 0.0f), 1.0f);
+  dual_b = dual_b * dual_b * (3.0f - 2.0f * dual_b);
+  float dual_hi = fminf(fmaxf((blur - 3.5f) / 1.0f, 0.0f), 1.0f);
+  dual_hi = 1.0f - dual_hi * dual_hi * (3.0f - 2.0f * dual_hi);
+  float dual_sz = fminf(fmaxf((fminf(a[2], a[3]) - 16.0f) / 12.0f, 0.0f), 1.0f);
+  dual_sz = dual_sz * dual_sz * (3.0f - 2.0f * dual_sz);
+  float dual_w = (kind == 6 && !is_clear_liq) ? (0.78f * dual_b * dual_hi * dual_sz * g_lo * fmaxf(g_neu, g_ch * g_ta)) : 0.0f;
   int is_dual = (dual_w > 0.005f);
   int merged_liquid = (kind == 6 && a[23] > 0.0f);
   int unmerged_liquid = (kind == 6 && !merged_liquid);
@@ -2226,6 +2230,7 @@ static int grab_of(Grab *m, const float *f, int32_t start, int32_t end, int32_t 
   float sk = sp / (float)(1 << k);
   float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
   m->k = k;
+  if (k >= 3) { m->dual_scale = 0; m->dual_w = 0.0f; }
   m->sg = sqrtf(sk * sk - pre > 0 ? sk * sk - pre : 0);
   return 1;
 }

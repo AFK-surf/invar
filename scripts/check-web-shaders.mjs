@@ -1216,6 +1216,18 @@ function buildHtmlPage(programs) {
           '0xBF B-R>=22 dRim>=4 L72>=L60+2 0xCD L72>=L60, 0xFF |dL|<=3, darkA8 d>=8, darkCC [41..49], ctrlDiff=(0,0,0)');
       }
 
+      // V13: Prominent tinted 0xD9 (#0088FF @ 0.85) top-edge rim parity across all 4 GPU backends
+      {
+        const prom = run2D(160, 120, 2, () => [255, 255, 255], {
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.0,
+          col: [0, 136 / 255, 1, 217 / 255], rim: 0.6, bezel: 14, refract: 20, chroma: 0.06,
+        });
+        const [tr, tg, tb] = prom.at(160, 41);
+        const v13Ok = tr >= 26 && tr <= 36 && tg >= 142 && tg <= 156 && tb >= 245;
+        pushVec('V13 prominent tinted 0xD9 top-edge rim parity (@2x)', v13Ok,
+          [tr, tg, tb], 'R in [26..36], G in [142..156], B>=245');
+      }
+
       gl.deleteTexture(bdTex);
       gl.deleteProgram(bgProg);
       gl.deleteShader(bgVs);
@@ -1226,7 +1238,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 12,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 13,
       passed,
       total: programs.length,
       drawPassed,

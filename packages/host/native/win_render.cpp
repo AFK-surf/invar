@@ -3196,19 +3196,22 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   float raw_blur = (kind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
   int is_clear_liq = (kind == 6 && a[7] >= -0.001f && a[7] <= 0.1f && a[11] < 0.12f);
   float col_ch = fmaxf(fmaxf(a[8], a[9]), a[10]) - fminf(fminf(a[8], a[9]), a[10]);
-  int is_reg_ctrl = (kind == 6 && !is_clear_liq &&
-                     ((a[11] >= 0.12f && a[11] < 0.45f) || (col_ch > 0.08f && a[11] < 0.80f)));
   float blur = (is_clear_liq && a[11] > 0.01f && raw_blur < 0.1f) ? 1.2f : raw_blur;
-  float dual_w = 0.0f;
-  if (is_reg_ctrl && blur > 0.2f && blur < 4.5f) {
-    float t_lo = fminf(fmaxf((blur - 0.2f) / 0.7f, 0.0f), 1.0f);
-    float t_hi = fminf(fmaxf((blur - 3.5f) / 1.0f, 0.0f), 1.0f);
-    float t_sz = fminf(fmaxf((fminf(a[2], a[3]) - 16.0f) / 12.0f, 0.0f), 1.0f);
-    t_lo = t_lo * t_lo * (3.0f - 2.0f * t_lo);
-    t_hi = t_hi * t_hi * (3.0f - 2.0f * t_hi);
-    t_sz = t_sz * t_sz * (3.0f - 2.0f * t_sz);
-    dual_w = 0.78f * t_lo * (1.0f - t_hi) * t_sz;
-  }
+  float g_lo = fminf(fmaxf((a[11] - 0.02f) / 0.085f, 0.0f), 1.0f);
+  g_lo = g_lo * g_lo * (3.0f - 2.0f * g_lo);
+  float g_neu = fminf(fmaxf((a[11] - 0.405f) / 0.095f, 0.0f), 1.0f);
+  g_neu = 1.0f - g_neu * g_neu * (3.0f - 2.0f * g_neu);
+  float g_ch = fminf(fmaxf((col_ch - 0.08f) / 0.08f, 0.0f), 1.0f);
+  g_ch = g_ch * g_ch * (3.0f - 2.0f * g_ch);
+  float g_ta = fminf(fmaxf((a[11] - 0.72f) / 0.08f, 0.0f), 1.0f);
+  g_ta = 1.0f - g_ta * g_ta * (3.0f - 2.0f * g_ta);
+  float dual_b = fminf(fmaxf((blur - 0.2f) / 0.7f, 0.0f), 1.0f);
+  dual_b = dual_b * dual_b * (3.0f - 2.0f * dual_b);
+  float dual_hi = fminf(fmaxf((blur - 3.5f) / 1.0f, 0.0f), 1.0f);
+  dual_hi = 1.0f - dual_hi * dual_hi * (3.0f - 2.0f * dual_hi);
+  float dual_sz = fminf(fmaxf((fminf(a[2], a[3]) - 16.0f) / 12.0f, 0.0f), 1.0f);
+  dual_sz = dual_sz * dual_sz * (3.0f - 2.0f * dual_sz);
+  float dual_w = (kind == 6 && !is_clear_liq) ? (0.78f * dual_b * dual_hi * dual_sz * g_lo * fmaxf(g_neu, g_ch * g_ta)) : 0.0f;
   int is_dual = (dual_w > 0.005f && prog_ps != NULL);
   int merged_liquid = (kind == 6 && a[23] > 0.0f);
   int unmerged_liquid = (kind == 6 && !merged_liquid);
@@ -3309,6 +3312,7 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
   if (is_progressive && k == 0 && sp > 0.5f) k = 1;
   if (is_progressive && sp >= 2.5f && k < 2) k = 2;
+  if (k >= 3) { is_dual = 0; dual_w = 0.0f; }
   int lw[4] = {w}, lh[4] = {h};
   for (int j = 1; j <= 3; j++) {
     lw[j] = (lw[j - 1] + 1) / 2;
