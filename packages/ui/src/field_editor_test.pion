@@ -4,6 +4,7 @@
 // touch selection handle crossover flip, and optical loupe geometry.
 
 import "editor"
+import "text"
 import "view"
 
 test "field_editor 01: multiline wrap, Up/Down preferred_x, and real measure_text_width" {
@@ -983,5 +984,191 @@ test "r9_rtl_long_line_4096_graphemes_binary_search" {
       b += 1
     }
     t.dispose()
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// r9b: explicit O(log N) proof for `bidi_snap_grapheme_range` (the binary search behind
+// `r9_rtl_long_line_4096_graphemes_binary_search`). The probe model below mirrors the two
+// searches; poisoning every index outside the modelled probe set and still getting the exact
+// answer shows the implementation reads only those <= ceil(log2 m) indices per search, while a
+// linear scan over the same poisoned array is caught returning a different answer.
+// ---------------------------------------------------------------------------------------------
+
+fn r9b_ceil_log2(m : Int) -> Int {
+  let mut steps = 0
+  let mut span = 1
+  while span < m {
+    span = span * 2
+    steps += 1
+  }
+  steps
+}
+
+/// Indices `bidi_snap_grapheme_range` reads for `(bs, be)` and how many halving steps each search takes.
+fn r9b_probe_model(g : Array[Int], bs : Int, be : Int) -> (Array[Int], Int, Int) {
+  let m = g.length()
+  let reads : Array[Int] = []
+  let mut lo = 0
+  let mut hi = m - 1
+  let mut steps1 = 0
+  while lo < hi {
+    let mid = (lo + hi + 1) / 2
+    reads.push(mid)
+    steps1 += 1
+    if g[mid] <= bs {
+      lo = mid
+    } else {
+      hi = mid - 1
+    }
+  }
+  reads.push(lo)
+  let mut steps2 = 0
+  if lo + 1 < m {
+    reads.push(lo + 1)
+  }
+  if !(lo + 1 < m && g[lo + 1] >= be) {
+    let mut glo = lo + 1
+    let mut ghi = m - 1
+    while glo < ghi {
+      let mid = (glo + ghi) / 2
+      reads.push(mid)
+      steps2 += 1
+      if g[mid] >= be {
+        ghi = mid
+      } else {
+        glo = mid + 1
+      }
+    }
+    reads.push(if glo < m { glo } else { m - 1 })
+  }
+  (reads, steps1, steps2)
+}
+
+/// Early-exit forward linear scan with the same contract (walks boundaries from 0 until it passes `bs`,
+/// then on until the first boundary >= `be`): reads O(index) boundaries.
+fn r9b_linear_snap(g : Array[Int], bs : Int, be : Int) -> (Int, Int) {
+  let m = g.length()
+  let mut lo = 0
+  while lo + 1 < m && g[lo + 1] <= bs {
+    lo += 1
+  }
+  let mut j = lo + 1
+  while j < m {
+    if g[j] >= be {
+      return (g[lo], g[j])
+    }
+    j += 1
+  }
+  (g[lo], g[m - 1])
+}
+
+fn r9b_poisoned(g : Array[Int], keep : Array[Int], poison : Int) -> Array[Int] {
+  let out : Array[Int] = []
+  for _x in g {
+    out.push(poison)
+  }
+  for k in keep {
+    out[k] = g[k]
+  }
+  out
+}
+
+test "r9b_snap_grapheme_range_4096_graphemes_is_log_n_with_exact_boundaries" {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  while i < 1024 {
+    // 4 extended graphemes per word (base + niqqud), 14 UTF-8 bytes => 4,096 graphemes.
+    sb.write_string("שָׁלוֹם")
+    i += 1
+  }
+  let line = sb.to_string()
+  let g = text::graphemes(line)
+  let m = g.length()
+  debug_assert(m == 4097, "4,096 graphemes give 4,097 boundaries, got \{m}")
+  debug_assert(g[0] == 0 && g[1] == 6 && g[2] == 8 && g[3] == 12 && g[4] == 14, "first word boundaries 0/6/8/12/14")
+  debug_assert(g[m - 1] == line.length(), "last boundary is the byte length")
+  let max_steps = r9b_ceil_log2(m)
+  debug_assert(max_steps == 13, "ceil(log2 4097) == 13, got \{max_steps}")
+
+  // (bs, be, expected gs, expected ge, single-grapheme query?)
+  let mid = m / 2
+  let cases : Array[(Int, Int, Int, Int, Bool)] = [
+    (0, 0, 0, 6, true), // empty range at the very start
+    (0, 1, 0, 6, true), // inside the first grapheme
+    (1, 3, 0, 6, true), // inside the first grapheme's combining marks
+    (g[mid], g[mid + 1], g[mid], g[mid + 1], true), // exact middle grapheme
+    (g[mid] + 1, g[mid] + 2, g[mid], g[mid + 1], true), // byte inside the middle grapheme
+    (g[m - 2], g[m - 1], g[m - 2], g[m - 1], true), // last grapheme
+    (g[m - 2] + 1, g[m - 1], g[m - 2], g[m - 1], true), // inside the last grapheme
+    (g[m - 1], g[m - 1], g[m - 1], g[m - 1], true), // empty range at the very end
+    (g[100] + 1, g[3000] - 1, g[100], g[3000], false), // multi-grapheme span
+    (0, g[m - 1], 0, g[m - 1], false), // whole line
+  ]
+  for c in cases {
+    let (bs, be, egs, ege, single) = c
+    let probe_reads = view::ref_new(0)
+    let got_counted = bidi_snap_grapheme_range_with(
+      m,
+      fn(idx : Int) -> Int {
+        probe_reads.v = probe_reads.v + 1
+        g[idx]
+      },
+      bs,
+      be,
+    )
+    let got = bidi_snap_grapheme_range(g, bs, be)
+    let real_reads = probe_reads.v
+    debug_assert(got_counted.0 == egs && got_counted.1 == ege, "snap_with(\{bs}, \{be}) expected (\{egs}, \{ege}), got (\{got_counted.0}, \{got_counted.1})")
+    debug_assert(got.0 == egs && got.1 == ege, "snap(\{bs}, \{be}) expected (\{egs}, \{ege}), got (\{got.0}, \{got.1})")
+    if single {
+      debug_assert(real_reads <= 20, "bidi_snap_grapheme_range_with must read <= 20 boundaries on single grapheme (\{bs}, \{be}), read \{real_reads}")
+    } else {
+      debug_assert(real_reads <= 2 * max_steps + 4, "bidi_snap_grapheme_range_with must read <= 2*13+4 boundaries on span (\{bs}, \{be}), read \{real_reads}")
+    }
+    let lin = r9b_linear_snap(g, bs, be)
+    debug_assert(lin.0 == egs && lin.1 == ege, "linear reference agrees for (\{bs}, \{be})")
+    let (reads, steps1, steps2) = r9b_probe_model(g, bs, be)
+    debug_assert(steps1 <= max_steps, "first search \{steps1} steps <= \{max_steps} for (\{bs}, \{be})")
+    debug_assert(steps2 <= max_steps, "second search \{steps2} steps <= \{max_steps} for (\{bs}, \{be})")
+    if single {
+      debug_assert(steps2 == 0, "single-grapheme snap skips the second search for (\{bs}, \{be})")
+      debug_assert(reads.length() <= 20, "single-grapheme snap reads <= 20 boundaries, got \{reads.length()}")
+    } else {
+      debug_assert(reads.length() <= 2 * max_steps + 3, "span snap reads <= 2*13+3 boundaries, got \{reads.length()}")
+    }
+    // Every index outside the probe set is poisoned (coupled to current mid-rounding probe order):
+    // the real search must not notice, while a linear scan past index 32 must.
+    let mut linear_caught = false
+    for poison in [-1, 1 << 30] {
+      let pg = r9b_poisoned(g, reads, poison)
+      let pgot = bidi_snap_grapheme_range(pg, bs, be)
+      debug_assert(pgot.0 == egs && pgot.1 == ege, "snap(\{bs}, \{be}) reads only its \{reads.length()} probes (poison \{poison})")
+      let plin = r9b_linear_snap(pg, bs, be)
+      if plin.0 != egs || plin.1 != ege {
+        linear_caught = true
+      }
+    }
+    let mut target = 0
+    while target + 1 < m && g[target + 1] <= bs {
+      target += 1
+    }
+    if target > 32 {
+      debug_assert(linear_caught, "a linear scan over the poisoned boundaries is detected for (\{bs}, \{be})")
+    }
+  }
+
+  // Exhaustive: every grapheme start, every interior byte, against the linear reference, with step bound.
+  let mut k = 0
+  while k + 1 < m {
+    let mut b = g[k]
+    while b < g[k + 1] {
+      let got = bidi_snap_grapheme_range(g, b, b + 1)
+      debug_assert(got.0 == g[k] && got.1 == g[k + 1], "byte \{b} snaps to grapheme \{k} (\{g[k]}, \{g[k + 1]})")
+      let (_r, s1, s2) = r9b_probe_model(g, b, b + 1)
+      debug_assert(s1 <= max_steps && s2 == 0, "byte \{b}: \{s1} steps <= \{max_steps}, no second search")
+      b += 1
+    }
+    k += 1
   }
 }

@@ -41,10 +41,12 @@ struct SignalState[T] {
   mut current : T
   mut pending : T
   same : (T, T) -> Bool
+  mut node_id : Int
+  mut node_gen : Int
+  mut on_unwatched_cb : Option[() -> Unit]
 }
 
 pub struct Signal[T] {
-  node_id : Int
   state : SignalState[T]
 }
 
@@ -57,6 +59,8 @@ struct ComputedState[T] {
   mut untracked_read : Option[() -> Option[T]]
   made_at : String
   mut ctx_enter : Option[() -> (() -> Unit)]
+  mut node_id : Int
+  mut node_gen : Int
 }
 
 let reactive_context_hooks : Array[() -> (() -> (() -> Unit))] = []
@@ -100,7 +104,6 @@ fn capture_reactive_context() -> Option[() -> (() -> Unit)] {
 }
 
 pub struct Computed[T] {
-  node_id : Int
   state : ComputedState[T]
 }
 
@@ -174,17 +177,28 @@ fn notify_node(first : Int) -> Unit {
 
 fn unwatched_node(node_id : Int) -> Unit {
   let slot = g.nodes[node_id]
+  if !slot.alive {
+    return
+  }
   if slot.kind == kind_computed {
     if (slot.flags & flag_recursed_check) != 0 || computed_extra_reading(node_id) {
       slot.flags = slot.flags | flag_unwatch_after_update
-    } else if slot.deps >= 0 {
-      slot.flags = flag_mutable | flag_dirty
-      dispose_all_deps_in_reverse(node_id)
+    } else {
+      if slot.deps >= 0 {
+        slot.flags = flag_mutable | flag_dirty | (slot.flags & flag_dispose_when_unwatched)
+        dispose_all_deps_in_reverse(node_id)
+      }
+      if (slot.flags & flag_dispose_when_unwatched) != 0 && slot.subs < 0 {
+        free_node(node_id)
+      }
     }
   } else if slot.kind == kind_signal {
     match slot.cleanup {
       Some(f) => untracked(f)
       None => ()
+    }
+    if slot.alive && (slot.flags & flag_dispose_when_unwatched) != 0 && slot.subs < 0 {
+      free_node(node_id)
     }
   } else if slot.kind == kind_effect {
     effect_oper(node_id)
@@ -193,7 +207,7 @@ fn unwatched_node(node_id : Int) -> Unit {
   }
 }
 
-fn finish_computed_read(node_id : Int) -> Unit {
+fn finish_computed_read(node_id : Int, defer_for_active_sub~ : Bool = false) -> Unit {
   let slot = g.nodes[node_id]
   if (slot.flags & (flag_unwatch_after_update | flag_dispose_after_update)) == 0 {
     return
@@ -203,9 +217,11 @@ fn finish_computed_read(node_id : Int) -> Unit {
   }
   let unwatched_during_read = (slot.flags & flag_unwatch_after_update) != 0
   let disposed_during_read = (slot.flags & flag_dispose_after_update) != 0
+  let dispose_when_unwatched = (slot.flags & flag_dispose_when_unwatched) != 0
+  let caller_will_track = defer_for_active_sub && g.active_sub >= 0
   slot.flags = slot.flags & bit_not(flag_unwatch_after_update | flag_dispose_after_update)
-  if disposed_during_read || (unwatched_during_read && slot.subs < 0) {
-    slot.flags = flag_mutable | flag_dirty
+  if disposed_during_read || (unwatched_during_read && slot.subs < 0 && !caller_will_track) {
+    slot.flags = flag_mutable | flag_dirty | (if dispose_when_unwatched { flag_dispose_when_unwatched } else { 0 })
     dispose_all_deps_in_reverse(node_id)
   }
   if disposed_during_read {
@@ -215,6 +231,9 @@ fn finish_computed_read(node_id : Int) -> Unit {
       Some(f) => f()
       None => ()
     }
+  }
+  if slot.alive && dispose_when_unwatched && slot.subs < 0 && !caller_will_track {
+    free_node(node_id)
   }
 }
 
@@ -286,13 +305,92 @@ pub fn signal_ref[T](initial : T) -> Signal[T] {
   signal_by(initial, fn(_a : T, _b : T) -> Bool { false })
 }
 
-pub fn signal_by[T](initial : T, same : (T, T) -> Bool) -> Signal[T] {
-  let state = SignalState::{ current: initial, pending: initial, same }
-  let upd : (Int) -> Bool = fn(nid : Int) -> Bool {
-    update_signal(nid, state)
+fn attach_to_owner(node_id : Int) -> Unit {
+  let owner = if g.active_sub >= 0 && (g.nodes[g.active_sub].kind == kind_scope || g.nodes[g.active_sub].kind == kind_effect) {
+    g.active_sub
+  } else if g.owner >= 0 && (g.nodes[g.owner].kind == kind_scope || g.nodes[g.owner].kind == kind_effect) {
+    g.owner
+  } else {
+    -1
   }
-  let node_id = alloc_node(flag_mutable, kind_signal, None, -1, Some(upd))
-  Signal::{ node_id, state }
+  if owner >= 0 {
+    let o = g.nodes[owner]
+    let idx = o.owned_nodes.length()
+    o.owned_nodes.push((node_id, g.nodes[node_id].gen))
+    let s = g.nodes[node_id]
+    s.owner_id = owner
+    s.owner_gen = o.gen
+    s.owner_idx = idx
+  }
+}
+
+fn Signal::ensure_node[T](self : Signal[T]) -> Int {
+  let st = self.state
+  let nid = st.node_id
+  if nid >= 0 && g.nodes[nid].alive && g.nodes[nid].gen == st.node_gen {
+    return nid
+  }
+  let upd : (Int) -> Bool = fn(id : Int) -> Bool {
+    update_signal(id, st)
+  }
+  let new_id = alloc_node(flag_mutable, kind_signal, None, -1, Some(upd))
+  let new_gen = g.nodes[new_id].gen
+  st.node_id = new_id
+  st.node_gen = new_gen
+  g.nodes[new_id].on_free = Some(fn() -> Unit {
+    if st.node_id == new_id && st.node_gen == new_gen {
+      st.current = st.pending
+      st.node_id = -1
+      st.node_gen = 0
+    }
+  })
+  match st.on_unwatched_cb {
+    Some(f) => {
+      g.nodes[new_id].cleanup = Some(f)
+      holds_up(new_id)
+    }
+    None => ()
+  }
+  attach_to_owner(new_id)
+  new_id
+}
+
+pub fn signal_by[T](initial : T, same : (T, T) -> Bool) -> Signal[T] {
+  let state = SignalState::{
+    current: initial,
+    pending: initial,
+    same,
+    node_id: -1,
+    node_gen: 0,
+    on_unwatched_cb: None,
+  }
+  let sig = Signal::{ state }
+  let _ = sig.ensure_node()
+  sig
+}
+
+fn Computed::ensure_node[T](self : Computed[T]) -> Int {
+  let st = self.state
+  let nid = st.node_id
+  if nid >= 0 && g.nodes[nid].alive && g.nodes[nid].gen == st.node_gen {
+    return nid
+  }
+  let upd : (Int) -> Bool = fn(id : Int) -> Bool {
+    update_computed(id, st)
+  }
+  let init_flags = if st.value.is_some() { flag_mutable | flag_dirty } else { flag_none }
+  let new_id = alloc_node(init_flags, kind_computed, None, -1, Some(upd))
+  let new_gen = g.nodes[new_id].gen
+  st.node_id = new_id
+  st.node_gen = new_gen
+  g.nodes[new_id].on_free = Some(fn() -> Unit {
+    if st.node_id == new_id && st.node_gen == new_gen {
+      st.node_id = -1
+      st.node_gen = 0
+    }
+  })
+  attach_to_owner(new_id)
+  new_id
 }
 
 pub fn computed[T : Eq](getter : (Option[T]) -> T) -> Computed[T] {
@@ -318,12 +416,12 @@ pub fn computed_by_at[T](getter : (Option[T]) -> T, same : (T, T) -> Bool, loc :
     untracked_read: None,
     made_at: loc,
     ctx_enter,
+    node_id: -1,
+    node_gen: 0,
   }
-  let upd : (Int) -> Bool = fn(nid : Int) -> Bool {
-    update_computed(nid, state)
-  }
-  let node_id = alloc_node(flag_none, kind_computed, None, -1, Some(upd))
-  Computed::{ node_id, state }
+  let c = Computed::{ state }
+  let _ = c.ensure_node()
+  c
 }
 
 pub fn memo[K : Eq, V : Eq](input : () -> K, compute : (K) -> V) -> Computed[V] {
@@ -379,7 +477,7 @@ pub fn computed_scoped_by[T](
   untracked_read : Option[() -> Option[T]],
 ) -> Computed[T] {
   let c = computed_by(getter, same)
-  holds_up(c.node_id)
+  holds_up(c.ensure_node())
   c.state.untracked_dispose = true
   c.state.untracked_read = untracked_read
   c
@@ -531,7 +629,12 @@ pub fn trigger(f : () -> Unit) -> Unit {
   }
 }
 
-fn update_computed[T](c : Int, state : ComputedState[T]) -> Bool {
+fn update_computed[T](
+  c : Int,
+  state : ComputedState[T],
+  defer_for_active_sub~ : Bool = false,
+  run_afters~ : Bool = true,
+) -> Bool {
   if (g.nodes[c].flags & flag_has_child_effect) != 0 {
     let mut link_id = g.nodes[c].deps_tail
     while link_id >= 0 {
@@ -543,7 +646,7 @@ fn update_computed[T](c : Int, state : ComputedState[T]) -> Bool {
     }
   }
   g.nodes[c].deps_tail = -1
-  let deferred = g.nodes[c].flags & (flag_unwatch_after_update | flag_dispose_after_update)
+  let deferred = g.nodes[c].flags & (flag_unwatch_after_update | flag_dispose_after_update | flag_dispose_when_unwatched)
   g.nodes[c].flags = flag_mutable | flag_recursed_check | deferred
   let prev_sub = g.active_sub
   g.active_sub = c
@@ -564,8 +667,10 @@ fn update_computed[T](c : Int, state : ComputedState[T]) -> Bool {
   g.active_sub = prev_sub
   g.nodes[c].flags = g.nodes[c].flags & bit_not(flag_recursed_check)
   purge_deps(c)
-  finish_computed_read(c)
-  computed_afters_due()
+  finish_computed_read(c, defer_for_active_sub=defer_for_active_sub)
+  if run_afters {
+    computed_afters_due()
+  }
   match old_value {
     Some(old) => !(state.same)(old, value)
     None => true
@@ -573,7 +678,7 @@ fn update_computed[T](c : Int, state : ComputedState[T]) -> Bool {
 }
 
 fn update_signal[T](s : Int, state : SignalState[T]) -> Bool {
-  g.nodes[s].flags = flag_mutable
+  g.nodes[s].flags = flag_mutable | (g.nodes[s].flags & flag_dispose_when_unwatched)
   let was = state.current
   state.current = state.pending
   !(state.same)(was, state.current)
@@ -627,6 +732,7 @@ fn run_effect(e : Int) -> Unit {
         return
       }
     }
+    release_owned_nodes(e)
     g.nodes[e].deps_tail = -1
     g.nodes[e].flags = flag_watching | flag_recursed_check
     let prev_sub = g.active_sub
@@ -732,7 +838,8 @@ fn report_untracked_read(node_id : Int) -> Unit {
 }
 
 pub fn Computed::get[T](self : Computed[T]) -> T {
-  let node_id = self.node_id
+  let node_id = self.ensure_node()
+  let node_gen = g.nodes[node_id].gen
   let state = self.state
   if g.active_sub < 0 {
     match state.untracked_read {
@@ -756,66 +863,106 @@ pub fn Computed::get[T](self : Computed[T]) -> T {
   }
   if g.active_sub >= 0 {
     match state.read_dependency {
-      Some(dep) => { let _ = dep.get() }
+      Some(dep) => {
+        g.computed_extra_reads.push(node_id)
+        let _ = dep.get()
+        let _ = g.computed_extra_reads.pop()
+        finish_computed_read(node_id, defer_for_active_sub=true)
+      }
       None => ()
     }
   }
   let is_untracked = state.untracked_dispose && g.active_sub < 0
   let flags = g.nodes[node_id].flags
+  let mut should_drain_afters = false
   let stale = if (flags & flag_dirty) != 0 {
     true
   } else if (flags & flag_pending) != 0 {
-    if check_dirty(g.nodes[node_id].deps, node_id) {
+    g.computed_extra_reads.push(node_id)
+    g.computing += 1
+    let dirty = check_dirty(g.nodes[node_id].deps, node_id)
+    g.computing -= 1
+    let _ = g.computed_extra_reads.pop()
+    should_drain_afters = true
+    if dirty {
       true
     } else {
-      g.nodes[node_id].flags = flags & bit_not(flag_pending)
+      g.nodes[node_id].flags = g.nodes[node_id].flags & bit_not(flag_pending)
+      finish_computed_read(node_id, defer_for_active_sub=true)
       false
     }
   } else {
     false
   }
   if stale {
-    if update_computed(node_id, state) {
-      let subs = g.nodes[node_id].subs
-      if subs >= 0 {
-        shallow_propagate(subs)
+    should_drain_afters = true
+    if update_computed(node_id, state, defer_for_active_sub=true, run_afters=false) {
+      if g.nodes[node_id].alive && g.nodes[node_id].gen == node_gen {
+        let subs = g.nodes[node_id].subs
+        if subs >= 0 {
+          shallow_propagate(subs)
+        }
       }
     }
-  } else if flags == 0 {
-    g.nodes[node_id].flags = flag_mutable | flag_recursed_check
+  } else if (flags & flag_mutable) == 0 {
+    should_drain_afters = true
+    g.nodes[node_id].flags = flags | flag_mutable | flag_recursed_check
     let prev_sub = g.active_sub
     g.active_sub = node_id
     g.computing += 1
     let init_val = match state.ctx_enter {
       Some(enter) => {
         let leave = enter()
-        let v = (state.getter)(None)
+        let v = (state.getter)(state.value)
         leave()
         v
       }
-      None => (state.getter)(None)
+      None => (state.getter)(state.value)
     }
     state.value = Some(init_val)
     g.computing -= 1
     g.active_sub = prev_sub
     g.nodes[node_id].flags = g.nodes[node_id].flags & bit_not(flag_recursed_check)
-    finish_computed_read(node_id)
-    computed_afters_due()
+    finish_computed_read(node_id, defer_for_active_sub=true)
   }
-  track(node_id)
+  if g.nodes[node_id].alive && g.nodes[node_id].gen == node_gen {
+    track(node_id)
+  } else if g.active_sub < 0 && g.untracked_depth == 0 {
+    match g.on_untracked_read {
+      Some(tell) => tell(ReactiveNode::{ id: -1, gen: 0 })
+      None => ()
+    }
+  }
   let value = match state.value {
     Some(v) => v
     None => halt::saying("a computed read as its first value is worked out: " + state.made_at, "signals.pion")
   }
-  if is_untracked && g.nodes[node_id].subs < 0 {
+  if should_drain_afters {
+    computed_afters_due()
+  }
+  if is_untracked && g.nodes[node_id].alive && g.nodes[node_id].gen == node_gen && g.nodes[node_id].subs < 0 {
     unwatched_node(node_id)
   }
   value
 }
 
 pub fn Signal::get[T](self : Signal[T]) -> T {
-  let node_id = self.node_id
   let state = self.state
+  let mut node_id = state.node_id
+  let attached = node_id >= 0 && g.nodes[node_id].alive && g.nodes[node_id].gen == state.node_gen
+  if !attached {
+    state.current = state.pending
+    if g.active_sub >= 0 {
+      node_id = self.ensure_node()
+      track(node_id)
+    } else if g.untracked_depth == 0 {
+      match g.on_untracked_read {
+        Some(cb) => cb(ReactiveNode::{ id: -1, gen: 0 })
+        None => ()
+      }
+    }
+    return state.current
+  }
   if (g.nodes[node_id].flags & flag_dirty) != 0 {
     if update_signal(node_id, state) {
       let subs = g.nodes[node_id].subs
@@ -841,9 +988,13 @@ pub fn Signal::set_at[T](self : Signal[T], value : T, loc : String) -> Unit {
   let changed = !(state.same)(state.pending, value)
   state.pending = value
   if changed {
-    let node_id = self.node_id
-    g.nodes[node_id].flags = flag_mutable | flag_dirty
-    tell_set(node_id, loc)
+    let node_id = state.node_id
+    if node_id >= 0 && g.nodes[node_id].alive && g.nodes[node_id].gen == state.node_gen {
+      g.nodes[node_id].flags = flag_mutable | flag_dirty | (g.nodes[node_id].flags & flag_dispose_when_unwatched)
+      tell_set(node_id, loc)
+    } else {
+      state.current = value
+    }
   }
 }
 
@@ -931,6 +1082,37 @@ fn effect_oper(e : Int) -> Unit {
   }
 }
 
+fn release_owned_nodes(e : Int) -> Unit {
+  if g.nodes[e].owned_nodes.length() == 0 {
+    return
+  }
+  let owned = g.nodes[e].owned_nodes.copy()
+  g.nodes[e].owned_nodes.clear()
+  for entry in owned {
+    let (nid, gen) = entry
+    if g.nodes[nid].alive && g.nodes[nid].gen == gen {
+      let ns = g.nodes[nid]
+      ns.owner_id = -1
+      ns.owner_gen = 0
+      ns.owner_idx = -1
+      if ns.subs < 0 {
+        if ns.kind == kind_computed {
+          if (ns.flags & flag_recursed_check) != 0 || computed_extra_reading(nid) {
+            ns.flags = ns.flags | flag_unwatch_after_update | flag_dispose_when_unwatched
+          } else {
+            dispose_all_deps_in_reverse(nid)
+            free_node(nid)
+          }
+        } else {
+          free_node(nid)
+        }
+      } else {
+        ns.flags = ns.flags | flag_dispose_when_unwatched
+      }
+    }
+  }
+}
+
 fn effect_scope_oper(e : Int) -> Unit {
   if !g.nodes[e].alive {
     return
@@ -946,6 +1128,7 @@ fn effect_scope_oper(e : Int) -> Unit {
   }
   g.nodes[e].flags = flag_none
   dispose_all_deps_in_reverse(e)
+  release_owned_nodes(e)
   let subs = g.nodes[e].subs
   if subs >= 0 {
     let _ = unlink_edge(subs, g.links[subs].sub)
@@ -977,20 +1160,40 @@ pub fn Computed::peek[T](self : Computed[T]) -> Option[T] {
   self.state.value
 }
 
+pub fn Signal::dispose[T](self : Signal[T]) -> Unit {
+  let st = self.state
+  let nid = st.node_id
+  if nid < 0 || !g.nodes[nid].alive || g.nodes[nid].gen != st.node_gen {
+    return
+  }
+  if g.nodes[nid].subs >= 0 {
+    g.nodes[nid].flags = g.nodes[nid].flags | flag_dispose_when_unwatched
+  } else {
+    free_node(nid)
+  }
+}
+
 pub fn Computed::dispose[T](self : Computed[T]) -> Unit {
-  let node_id = self.node_id
+  let st = self.state
+  let node_id = st.node_id
+  if node_id < 0 || !g.nodes[node_id].alive || g.nodes[node_id].gen != st.node_gen {
+    st.ctx_enter = None
+    return
+  }
   if (g.nodes[node_id].flags & flag_recursed_check) != 0 || computed_extra_reading(node_id) {
     g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dispose_after_update
-    g.nodes[node_id].on_dispose = Some(fn() -> Unit { self.state.ctx_enter = None })
+    g.nodes[node_id].on_dispose = Some(fn() -> Unit { st.ctx_enter = None })
   } else {
-    self.state.ctx_enter = None
+    st.ctx_enter = None
     g.nodes[node_id].on_dispose = None
     unwatched_node(node_id)
   }
 }
 
 pub fn Signal::watched[T](self : Signal[T]) -> Bool {
-  g.nodes[self.node_id].subs >= 0
+  let st = self.state
+  let nid = st.node_id
+  nid >= 0 && g.nodes[nid].alive && g.nodes[nid].gen == st.node_gen && g.nodes[nid].subs >= 0
 }
 
 pub fn Signal::read[T](self : Signal[T]) -> ReadSignal[T] {
@@ -998,7 +1201,12 @@ pub fn Signal::read[T](self : Signal[T]) -> ReadSignal[T] {
 }
 
 pub fn Signal::watched_awake[T](self : Signal[T]) -> Bool {
-  has_awake_sub(self.node_id, [])
+  let st = self.state
+  let nid = st.node_id
+  if nid < 0 || !g.nodes[nid].alive || g.nodes[nid].gen != st.node_gen {
+    return false
+  }
+  has_awake_sub(nid, [])
 }
 
 fn has_awake_sub(node_id : Int, seen : Array[Int]) -> Bool {
@@ -1034,12 +1242,16 @@ fn has_awake_sub(node_id : Int, seen : Array[Int]) -> Bool {
 }
 
 pub fn Signal::on_unwatched[T](self : Signal[T], f : () -> Unit) -> Unit {
-  g.nodes[self.node_id].cleanup = Some(f)
-  holds_up(self.node_id)
+  self.state.on_unwatched_cb = Some(f)
+  let nid = self.ensure_node()
+  g.nodes[nid].cleanup = Some(f)
+  holds_up(nid)
 }
 
 pub fn Computed::watched[T](self : Computed[T]) -> Bool {
-  g.nodes[self.node_id].subs >= 0
+  let st = self.state
+  let nid = st.node_id
+  nid >= 0 && g.nodes[nid].alive && g.nodes[nid].gen == st.node_gen && g.nodes[nid].subs >= 0
 }
 
 pub fn Computed::read[T](self : Computed[T]) -> ReadSignal[T] {
@@ -1092,7 +1304,10 @@ fn release_unwatched_resource(node_id : Int) -> Unit {
 fn Computed::get_releasing[T](self : Computed[T]) -> T {
   let value = self.get()
   if g.active_sub < 0 {
-    release_unwatched_resource(self.node_id)
+    let nid = self.state.node_id
+    if nid >= 0 && g.nodes[nid].alive && g.nodes[nid].gen == self.state.node_gen {
+      release_unwatched_resource(nid)
+    }
   }
   value
 }
@@ -1105,7 +1320,11 @@ fn Computed::untracked_releasing[T](self : Computed[T]) -> T {
 }
 
 pub fn Computed::invalidate[T](self : Computed[T]) -> Unit {
-  let node_id = self.node_id
+  let st = self.state
+  let node_id = st.node_id
+  if node_id < 0 || !g.nodes[node_id].alive || g.nodes[node_id].gen != st.node_gen {
+    return
+  }
   g.nodes[node_id].flags = g.nodes[node_id].flags | flag_dirty
   let subs = g.nodes[node_id].subs
   if subs >= 0 {
@@ -1117,20 +1336,26 @@ pub fn Computed::invalidate[T](self : Computed[T]) -> Unit {
 }
 
 pub fn Computed::reading[T, U](self : Computed[T], f : () -> U) -> U {
-  g.computed_extra_reads.push(self.node_id)
+  let node_id = self.ensure_node()
+  g.computed_extra_reads.push(node_id)
   let prev = g.active_sub
-  g.active_sub = self.node_id
+  g.active_sub = node_id
   let v = f()
   g.active_sub = prev
   let _ = g.computed_extra_reads.pop()
-  finish_computed_read(self.node_id)
+  finish_computed_read(node_id)
   v
 }
 
 pub fn Computed::lend[T, U](self : Computed[T], to : Computed[U]) -> Unit {
-  let mut l = g.nodes[self.node_id].deps
+  let from_id = self.state.node_id
+  if from_id < 0 || !g.nodes[from_id].alive || g.nodes[from_id].gen != self.state.node_gen {
+    return
+  }
+  let to_id = to.ensure_node()
+  let mut l = g.nodes[from_id].deps
   while l >= 0 {
-    link_nodes(g.links[l].dep, to.node_id, g.cycle)
+    link_nodes(g.links[l].dep, to_id, g.cycle)
     l = g.links[l].next_dep
   }
 }
