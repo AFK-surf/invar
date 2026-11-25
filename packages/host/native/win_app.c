@@ -268,6 +268,10 @@ static void told_between(int kind, int id) {
   int was = ws->want_frame;
   ws->want_frame = 0;
   outside_cb(kind, id, 0);
+  if (kind == MB_OUTSIDE_POSTED && mb_post_pending()) {
+    ws->want_frame = 1;
+    outside_asked = 1;
+  }
   if (ws->want_frame) outside_asked = 1;
   ws->want_frame |= was;
 }
@@ -317,7 +321,7 @@ static void draw_frame(void) {
   int away = rc.right <= 0 || rc.bottom <= 0 || !IsWindowVisible(ws->h) || IsIconic(ws->h);
   if (away) {
     // (none drawn yet: nothing to build at)
-    if (!outside || ws->frame_w <= 0) {
+    if ((!outside && !mb_post_pending()) || ws->frame_w <= 0) {
       ws->last_begin = -1.0;
       return;
     }
@@ -1473,6 +1477,10 @@ void mb_host_run(moonbit_string_t title, mb_frame_fn frame, mb_pointer_fn pointe
     }
     // (each window's that wants one, then the display waited for: win_render.cpp mb_render_pace)
     if (frames_round()) continue;
+    if (mb_post_pending()) {
+      told_between(MB_OUTSIDE_POSTED, 0);
+      if (any_want_frame()) continue;
+    }
     DWORD timeout = wake_at < 0 ? INFINITE : (DWORD)ceil(wake_at - now);
     // (the frames stopped: the next is no later than its time for what the one before took)
     reset_all_last_begin();
