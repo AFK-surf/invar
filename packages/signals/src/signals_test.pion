@@ -305,3 +305,308 @@ test "stress create and destroy 2000 scopes/effects/watches with zero leaked lin
   // Only root signal + c1 computed remain (+2)
   debug_assert(live_node_count() == base_nodes + 2, "zero leaked nodes")
 }
+
+test "scope-owned signals and computeds recycle on scope stop while external signals stay live" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let shared = signal(10)
+  let escaped : TestBox[Signal[Int]] = TestBox::{ item: None }
+  let seen = [0]
+  for i in 0..<200 {
+    let stop = effect_scope(fn() -> Unit {
+      let local_sig = signal(i)
+      let local_comp = computed(fn(_p : Option[Int]) -> Int { local_sig.get() + shared.get() })
+      let _ = effect(fn() -> Unit {
+        seen[0] = local_comp.get()
+      })
+      if i == 0 {
+        escaped.item = Some(local_sig)
+      }
+      local_sig.set(i + 1)
+    })
+    stop()
+  }
+  debug_assert(seen[0] == 210, "effects ran")
+  debug_assert(live_link_count() == base_links, "zero leaked links after 200 scopes")
+  // Only `shared` remains live (+1); all 200 local_sig + 200 local_comp + 200 effects recycled!
+  debug_assert(live_node_count() == base_nodes + 1, "zero leaked scope-owned signals/computeds, got delta=\{live_node_count() - base_nodes}")
+  // Escaped signal from stopped scope still works reactively if subscribed again later
+  match escaped.item {
+    Some(es) => {
+      let re_seen = [0]
+      let stop2 = effect_scope(fn() -> Unit {
+        let _ = effect(fn() -> Unit { re_seen[0] = es.get() })
+      })
+      debug_assert(re_seen[0] == 1, "escaped signal kept its last value")
+      es.set(99)
+      debug_assert(re_seen[0] == 99, "escaped signal re-attaches reactively")
+      stop2()
+    }
+    None => debug_assert(false, "missing escaped signal")
+  }
+  shared.dispose()
+  debug_assert(live_node_count() == base_nodes, "manual Signal::dispose frees shared signal")
+  debug_assert(live_link_count() == base_links, "zero links after cleanup")
+}
+
+test "escaped computed preserves previous value after producer scope stops" {
+  let source = signal(10)
+  let out : Array[Computed[Int]] = []
+  let stop = effect_scope(fn() -> Unit {
+    let high = computed(fn(prev : Option[Int]) -> Int {
+      let n = source.get()
+      match prev {
+        Some(p) => if p > n { p } else { n }
+        None => n
+      }
+    })
+    out.push(high)
+    let _ = high.get()
+  })
+  stop()
+  source.set(5)
+  let result = out[0].get()
+  debug_assert(result == 10, "escaped cumulative maximum expected 10, got \{result}")
+}
+
+test "producer scope ending during first external observation keeps external subscriber" {
+  let input = signal(10)
+  let end_scope : TestBox[() -> Unit] = TestBox::{ item: None }
+  let saved : Array[Computed[Int]] = []
+  let stop = effect_scope(fn() -> Unit {
+    let c = computed(fn(_ : Option[Int]) -> Int {
+      let n = input.get()
+      match end_scope.item {
+        Some(f) => {
+          end_scope.item = None
+          f()
+        }
+        None => ()
+      }
+      n
+    })
+    saved.push(c)
+  })
+  end_scope.item = Some(stop)
+  let last = [0]
+  let end_observer = effect(fn() -> Unit { last[0] = saved[0].get() })
+  let initial = last[0]
+  input.set(20)
+  let updated = last[0]
+  end_observer()
+  debug_assert(initial == 10 && updated == 20, "external computed subscriber: initial=\{initial}, updated=\{updated}")
+}
+
+test "long lived effect bounds temporary signal allocations across 400 reruns" {
+  let ticks = signal(0)
+  let prior = live_node_count()
+  let observed = [0]
+  let stop = effect(fn() -> Unit {
+    let v = ticks.get()
+    let tmp = signal(v)
+    observed[0] = tmp.get()
+  })
+  let baseline = live_node_count()
+  for i in 1..<401 {
+    ticks.set(i)
+  }
+  let delta = live_node_count() - baseline
+  let links = live_link_count()
+  stop()
+  let residual = live_node_count() - prior
+  debug_assert(observed[0] == 400 && delta == 0 && residual == 0, "400 effect reruns: delta=\{delta}, links=\{links}, residual=\{residual}")
+}
+
+test "explicit signal dispose compacts owner ledger in O(1)" {
+  let owner_entries = [0]
+  let stop = effect_scope(fn() -> Unit {
+    for i in 0..<1000 {
+      let temporary = signal(i)
+      temporary.dispose()
+    }
+    owner_entries[0] = g.nodes[g.owner].owned_nodes.length()
+  })
+  stop()
+  debug_assert(owner_entries[0] == 0, "1,000 disposed slots should leave 0 entries, got \{owner_entries[0]}")
+}
+
+test "reading inside an unrelated effect releases the stopped producer computed" {
+  let source = signal(1)
+  let base_nodes = live_node_count()
+  let base_edges = live_link_count()
+  for i in 0..<100 {
+    let saved : Array[Computed[Int]] = []
+    let stop = effect_scope(fn() -> Unit {
+      saved.push(computed(fn(_ : Option[Int]) -> Int { i }))
+    })
+    let stop_reader = effect(fn() -> Unit {
+      saved[0].reading(fn() -> Unit {
+        let _ = source.get()
+        stop()
+      })
+    })
+    stop_reader()
+  }
+  let nodes = live_node_count() - base_nodes
+  let edges = live_link_count() - base_edges
+  let watched = source.watched()
+  debug_assert(nodes == 0 && edges == 0 && !watched, "after both scopes ended: nodes +\{nodes}, links +\{edges}, source watched=\{watched}")
+}
+
+test "deferred producer teardown via after_computing preserves first outside subscriber" {
+  let source = signal(10)
+  let base_nodes = live_node_count()
+  let base_edges = live_link_count()
+  let pending : Array[() -> Unit] = []
+  let exposed : Array[Computed[Int]] = []
+  let stop = effect_scope(fn() -> Unit {
+    exposed.push(computed(fn(_ : Option[Int]) -> Int {
+      let value = source.get()
+      match pending.pop() { Some(f) => after_computing(f); None => () }
+      value
+    }))
+  })
+  pending.push(stop)
+  let seen = [0]
+  let stop_observer = effect(fn() -> Unit { seen[0] = exposed[0].get() })
+  let first = seen[0]
+  source.set(20)
+  let next = seen[0]
+  stop_observer()
+  let nodes = live_node_count() - base_nodes
+  let edges = live_link_count() - base_edges
+  debug_assert(first == 10 && next == 20, "deferred producer stop: first=\{first}, after source.set(20)=\{next}")
+  debug_assert(nodes == 0 && edges == 0 && !source.watched(), "deferred producer stop leak: nodes +\{nodes}, links +\{edges}")
+}
+
+test "deferred producer teardown after cached read and invalidate preserves outside subscriber" {
+  let source = signal(10)
+  let base_nodes = live_node_count()
+  let base_edges = live_link_count()
+  let pending : Array[() -> Unit] = []
+  let exposed : Array[Computed[Int]] = []
+  let stop = effect_scope(fn() -> Unit {
+    exposed.push(computed(fn(_ : Option[Int]) -> Int {
+      let value = source.get()
+      match pending.pop() { Some(f) => after_computing(f); None => () }
+      value
+    }))
+  })
+  let warm = exposed[0].get()
+  debug_assert(warm == 10, "warm cache")
+  exposed[0].invalidate()
+  pending.push(stop)
+  let seen = [0]
+  let stop_observer = effect(fn() -> Unit { seen[0] = exposed[0].get() })
+  let first = seen[0]
+  source.set(20)
+  let next = seen[0]
+  stop_observer()
+  let nodes = live_node_count() - base_nodes
+  let edges = live_link_count() - base_edges
+  debug_assert(first == 10 && next == 20, "deferred producer stop after invalidate: first=\{first}, after source.set(20)=\{next}")
+  debug_assert(nodes == 0 && edges == 0 && !source.watched(), "deferred producer stop after invalidate leak: nodes +\{nodes}, links +\{edges}")
+}
+
+test "producer scope ending synchronously during pending dependency check preserves outside subscriber" {
+  let source = signal(10)
+  let base_nodes = live_node_count()
+  let base_edges = live_link_count()
+  let stops : Array[() -> Unit] = []
+  let out : Array[Computed[Int]] = []
+  let producer = effect_scope(fn() -> Unit {
+    let mid = computed(fn(_ : Option[Int]) -> Int {
+      let v = source.get()
+      match stops.pop() { Some(f) => f(); None => () }
+      v
+    })
+    out.push(computed(fn(_ : Option[Int]) -> Int { mid.get() + 1 }))
+  })
+  debug_assert(out[0].get() == 11, "warm chain")
+  source.set(20)
+  stops.push(producer)
+  let seen = [0]
+  let stop_reader = effect(fn() -> Unit { seen[0] = out[0].get() })
+  let first = seen[0]
+  source.set(30)
+  let next = seen[0]
+  stop_reader()
+  let nodes = live_node_count() - base_nodes
+  let edges = live_link_count() - base_edges
+  debug_assert(first == 21 && next == 31, "pending path: first=\{first}, next=\{next}")
+  debug_assert(nodes == 0 && edges == 0 && !source.watched(), "pending path leak: nodes +\{nodes}, links +\{edges}")
+}
+
+test "producer scope ending during untracked and unchanged pending dependency checks does not panic or leak" {
+  // 1) Untracked pending check where mid changes and stops producer
+  let source1 = signal(10)
+  let b1_n = live_node_count()
+  let b1_e = live_link_count()
+  let stops1 : Array[() -> Unit] = []
+  let out1 : Array[Computed[Int]] = []
+  let p1 = effect_scope(fn() -> Unit {
+    let mid = computed(fn(_ : Option[Int]) -> Int {
+      let v = source1.get()
+      match stops1.pop() { Some(f) => f(); None => () }
+      v
+    })
+    out1.push(computed(fn(_ : Option[Int]) -> Int { mid.get() + 1 }))
+  })
+  debug_assert(out1[0].get() == 11, "warm untracked chain")
+  source1.set(20)
+  stops1.push(p1)
+  debug_assert(out1[0].get() == 21, "untracked pending check returns updated value without panic")
+  debug_assert(live_node_count() == b1_n && live_link_count() == b1_e && !source1.watched(), "untracked pending check leaves zero leaked nodes/links")
+
+  // 2) Tracked pending check where mid returns the SAME value (not dirty) and stops producer
+  let source2 = signal(2)
+  let b2_n = live_node_count()
+  let b2_e = live_link_count()
+  let stops2 : Array[() -> Unit] = []
+  let out2 : Array[Computed[Int]] = []
+  let p2 = effect_scope(fn() -> Unit {
+    let mid = computed(fn(_ : Option[Int]) -> Int {
+      let v = source2.get() % 2
+      match stops2.pop() { Some(f) => f(); None => () }
+      v
+    })
+    out2.push(computed(fn(_ : Option[Int]) -> Int { mid.get() * 10 }))
+  })
+  debug_assert(out2[0].get() == 0, "warm clean-mid chain")
+  source2.set(4) // same parity 0 -> check_dirty returns false!
+  stops2.push(p2)
+  let seen = [-1]
+  let stop_reader = effect(fn() -> Unit { seen[0] = out2[0].get() })
+  let first = seen[0]
+  source2.set(5) // parity changes to 1 -> must still notify!
+  let next = seen[0]
+  stop_reader()
+  debug_assert(first == 0 && next == 10, "unchanged-mid pending check stays reactive: first=\{first}, next=\{next}")
+  debug_assert(live_node_count() == b2_n && live_link_count() == b2_e && !source2.watched(), "unchanged-mid pending check leaves zero leaked nodes/links")
+}
+
+test "first read of computed_following after prerequisite stops producer scope evaluates and recycles cleanly" {
+  let source = signal(10)
+  let baseline_nodes = live_node_count()
+  let baseline_links = live_link_count()
+  let to_stop : Array[() -> Unit] = []
+  let result : Array[Computed[Int]] = []
+  let producer = effect_scope(fn() -> Unit {
+    let prerequisite = held_while_read(fn() -> Unit {
+      match to_stop.pop() {
+        Some(stop) => after_computing(stop)
+        None => ()
+      }
+    })
+    result.push(computed_following(fn(_ : Option[Int]) -> Int { source.get() }, prerequisite))
+  })
+  to_stop.push(producer)
+  let seen = [0]
+  let stop_reader = effect(fn() -> Unit { seen[0] = result[0].get() })
+  let first = seen[0]
+  source.set(20)
+  let second = seen[0]
+  stop_reader()
+  debug_assert(first == 10 && second == 20, "first=\{first}, second=\{second}")
+  debug_assert(!source.watched() && live_node_count() == baseline_nodes && live_link_count() == baseline_links, "all subscriber and producer resources released")
+}

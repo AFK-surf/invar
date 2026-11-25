@@ -431,23 +431,35 @@ PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
 
 ---
 
-## 20. HeroUI v3, `@gravity-ui/icons`, and Inter (`packages/aura`)
+## 20. HeroUI v3, `@gravity-ui/icons`, and Inter (Aura Design System)
+
+The Aura Design System spans four packages: `packages/aura` (the component
+library), `packages/aura_pages` (interactive component showcase pages),
+`packages/aura_shots` (offscreen pixel-calibration scenes), and
+`packages/aura_web` (`wasm32` / WebGL2 entry for the showcase). Only
+`packages/aura` ports upstream design specifications; the other three packages
+render `packages/aura` components and carry the same attribution.
 
 - **HeroUI v3 (`v3.2.8` @ `c3373a1557c469dc823d78e56d53f0abaad89135`)**:
-  - **Files**: `packages/aura/src/*.pion`, `packages/aura_shots/src/*.pion`.
+  - **Files**: `packages/aura/src/*.pion`, `packages/aura_pages/src/*.pion`,
+    `packages/aura_shots/src/*.pion`, `packages/aura_web/src/*.pion`.
   - **Source**: <https://github.com/heroui-inc/heroui>
-  - **License**: Apache-2.0 (full text in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt))
+  - **License**: Apache-2.0 (full text in [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt);
+    attribution preserved in [`NOTICE`](NOTICE))
   - **Copyright**: `Copyright 2025 NextUI Inc.`
   - **Modifications**: Design tokens, semantic surface hierarchy, elevation
     shadows, focus ring rules, and component architecture ported to Pion.
+    No upstream source code, stylesheets, or trademarks are redistributed;
+    "Aura" is an independent name and no public API uses the upstream brand.
 - **`@gravity-ui/icons` (`2.23.1`)**:
   - **Files**: `packages/aura/src/icons.pion`.
   - **Source**: <https://github.com/gravity-ui/icons>
   - **License**: MIT (full text in [`LICENSES/MIT-gravity-ui.txt`](LICENSES/MIT-gravity-ui.txt))
   - **Copyright**: `Copyright (c) 2022 YANDEX LLC`
   - **Modifications**: 15 built-in monochrome icon vector paths ported to Pion.
-- **Inter Typeface**:
-  - **Files**: `web/inter.woff2` (loaded via `ui::face_add` in `packages/aura_shots`).
+- **Inter Typeface** (same font file as section 4):
+  - **Files**: `web/inter.woff2` (loaded via `ui::face_add` in `packages/aura_shots`
+    and by the web host for `packages/aura_web`).
   - **Source**: <https://github.com/rsms/inter>
   - **License**: SIL Open Font License 1.1 (full text in [`LICENSES/OFL-1.1.txt`](LICENSES/OFL-1.1.txt))
-  - **Copyright**: `Copyright 2016 The Inter Project Authors`
+  - **Copyright**: `Copyright (c) 2016 The Inter Project Authors (https://github.com/rsms/inter)`
