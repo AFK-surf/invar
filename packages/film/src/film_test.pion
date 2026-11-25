@@ -849,16 +849,18 @@ test "film_tiled_take_picture_preserves_shape_local_fade" {
 }
 
 test "film_magnifier_preserves_shape_local_fade" {
-  // Regression for R7 P1b: View::magnifies translates and zooms kind-11 instances.
-  // Source 40x40 red local-fade shape at (0,0), 1x translated loupe at (40,0), and 2x zoomed loupe at (80,0)
-  // must all render matching ~50% faded red at their centers (20,20), (60,20), and (100,20).
+  // Regression for R7 P1b + R8 P2: View::magnifies translates (both X and Y axes) and zooms kind-11 instances.
+  // Source 40x40 red local-fade shape at (0,0):
+  //   - 1x horizontally translated loupe at (40,0)
+  //   - 2x zoomed+translated loupe at (80,0)
+  //   - 1x vertically translated loupe at (0,48) (directly exercises Y-axis local-fade invariance across full 40x40 patch)
   let path = "/tmp/invar_film_magnifier_fade_\{process_id()}.png"
   let sq : Array[Double] = [0.0, 0.0, 40.0, 0.0, 40.0, 40.0, 0.0, 40.0]
   let ok = picture(
     fn(root : view::View) -> Unit {
       let _ = root
         .width(view::Live::Is(Some(120.0)))
-        .height(view::Live::Is(Some(40.0)))
+        .height(view::Live::Is(Some(92.0)))
         .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
       let _ = root.box(fn(src : view::View) -> Unit {
         let _ = src
@@ -883,15 +885,22 @@ test "film_magnifier_preserves_shape_local_fade" {
           .height(view::Live::Is(Some(40.0)))
           .magnifies(view::Live::Is(Some((20.0, 20.0, 2.0))))
       })
+      let _ = root.box(fn(ly : view::View) -> Unit {
+        let _ = ly
+          .over(view::Live::Is(true), edges=(Some(0.0), Some(48.0), None, None))
+          .width(view::Live::Is(Some(40.0)))
+          .height(view::Live::Is(Some(40.0)))
+          .magnifies(view::Live::Is(Some((20.0, 20.0, 1.0))))
+      })
     },
     path=path,
     w=120.0,
-    h=40.0,
+    h=92.0,
     scale=1.0,
     dark=false,
   )
   debug_assert(ok, "magnifier local-fade snapshot must succeed")
-  let px = decode_png_rgba(path, 120, 40)
+  let px = decode_png_rgba(path, 120, 92)
   let _ = remove_file(path)
   let g_src = px[(20 * 120 + 20) * 4 + 1].to_int()
   let g_1x = px[(20 * 120 + 60) * 4 + 1].to_int()
@@ -900,4 +909,121 @@ test "film_magnifier_preserves_shape_local_fade" {
   let d2 = if g_src >= g_2x { g_src - g_2x } else { g_2x - g_src }
   debug_assert(g_src >= 115 && g_src <= 145, "source center must be ~50% faded red, got g=\{g_src}")
   debug_assert(d1 <= 3 && d2 <= 3, "1x (g=\{g_1x}) and 2x (g=\{g_2x}) magnifier centers must match source (g=\{g_src})")
+  // Full 40x40 patch comparison for the vertically translated 1x loupe at (0, 48).
+  let mut max_patch_diff = 0
+  let mut py = 0
+  while py < 40 {
+    let mut px_i = 0
+    while px_i < 40 {
+      let si = (py * 120 + px_i) * 4
+      let di = ((py + 48) * 120 + px_i) * 4
+      let mut ch = 0
+      while ch < 3 {
+        let a = px[si + ch].to_int()
+        let b = px[di + ch].to_int()
+        let diff = if a >= b { a - b } else { b - a }
+        if diff > max_patch_diff {
+          max_patch_diff = diff
+        }
+        ch += 1
+      }
+      px_i += 1
+    }
+    py += 1
+  }
+  debug_assert(max_patch_diff <= 1, "vertically translated 1x magnifier 40x40 patch must match source (max_diff=\{max_patch_diff})")
+}
+
+test "r8_native_rtl_combining_marks_and_1024_line_collapse" {
+  // Astra R7 P1 + P2 native-shaper regression (real Linux Pango + real macOS CoreText):
+  // 1) Hebrew niqqud ("שָׁלוֹם") and Arabic harakat ("مَرْحَبًا") must traverse every
+  //    extended grapheme stop on Left/Right and select full graphemes on Shift+Left/Right.
+  // 2) Single-char selection collapse on line 0 of a 1,024-line RTL Field only shapes line 0.
+  let verify_native = fn(word : String, stops : Array[Int]) {
+    let fld = ui::Field::new(text=word)
+    let t = ui::Tester::tree(fn(root : view::View) {
+      let _ = root.box(fn(box : view::View) {
+        let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+        let _ = ui::field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+      })
+    }, width=320.0, height=80.0, scale=2.0)
+    attach_native_text_and_images(t, 320.0, 80.0)
+    t.frame(ms=16.0)
+
+    fld.pick(0, 0)
+    let mut i = 1
+    while i < stops.length() {
+      debug_assert(fld.handle_key(ui::key_code_left, 0), "native Left step \{i} handled")
+      let (lo, hi) = fld.selection()
+      debug_assert(lo == stops[i] && hi == stops[i], "native Left step \{i} on '\{word}' expected \{stops[i]}, got (\{lo},\{hi})")
+      i += 1
+    }
+    let end_b = stops[stops.length() - 1]
+    let _ = fld.handle_key(ui::key_code_left, 0)
+    let (elo, ehi) = fld.selection()
+    debug_assert(elo == end_b && ehi == end_b, "native extra Left stays at \{end_b}, got (\{elo},\{ehi})")
+
+    let mut j = stops.length() - 2
+    while j >= 0 {
+      debug_assert(fld.handle_key(ui::key_code_right, 0), "native Right step to \{stops[j]} handled")
+      let (lo, hi) = fld.selection()
+      debug_assert(lo == stops[j] && hi == stops[j], "native Right step on '\{word}' expected \{stops[j]}, got (\{lo},\{hi})")
+      j -= 1
+    }
+
+    fld.pick(0, 0)
+    let mut s = 1
+    while s < stops.length() {
+      debug_assert(fld.handle_key(ui::key_code_left, ui::mod_shift_key), "native Shift+Left step \{s} handled")
+      let (lo, hi) = fld.selection()
+      debug_assert(lo == 0 && hi == stops[s], "native Shift+Left step \{s} on '\{word}' expected (0,\{stops[s]}), got (\{lo},\{hi})")
+      s += 1
+    }
+
+    fld.pick_with_affinity(end_b, end_b, true)
+    let mut sr = stops.length() - 2
+    while sr >= 0 {
+      debug_assert(fld.handle_key(ui::key_code_right, ui::mod_shift_key), "native Shift+Right step to \{stops[sr]} handled")
+      let (lo, hi) = fld.selection()
+      debug_assert(lo == stops[sr] && hi == end_b, "native Shift+Right step on '\{word}' expected (\{stops[sr]},\{end_b}), got (\{lo},\{hi})")
+      sr -= 1
+    }
+    t.dispose()
+  }
+  verify_native("שָׁלוֹם", [0, 6, 8, 12, 14])
+  verify_native("مَرْحَبًا", [0, 4, 8, 12, 16, 18])
+
+  // Native 1,024-line selection collapse: adding 1,023 trailing lines must not trigger 1,024 shape calls.
+  let sb = StringBuilder::new()
+  sb.write_string("אבג abcdef")
+  let mut li = 1
+  while li < 1024 {
+    sb.write_string("\nשלום")
+    li += 1
+  }
+  let fld = ui::Field::new(text=sb.to_string())
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(120.0)))
+      let _ = ui::field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=10, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=160.0, scale=2.0)
+  attach_native_text_and_images(t, 320.0, 160.0)
+  t.frame(ms=16.0)
+  let shape_calls = signals::Ref::{ v: 0 }
+  let h = hostapi::host()
+  let orig_shape = h.shape
+  h.shape = fn(s : String, size : Double, weight : Int, style : Int, out : Array[Double]) -> Int {
+    shape_calls.v = shape_calls.v + 1
+    orig_shape(s, size, weight, style, out)
+  }
+  ui::reset_glyph_atlas()
+  fld.pick(6, 7)
+  let before = shape_calls.v
+  debug_assert(fld.handle_key(ui::key_code_left, 0), "native 1024-line Left collapse handled")
+  let used = shape_calls.v - before
+  debug_assert(used <= 8, "native 1-char collapse on 1024-line Field must only shape line 0 (<=8 calls), got \{used}")
+  let (clo, chi) = fld.selection()
+  debug_assert(clo == 7 && chi == 7, "native 1024-line collapse must stay at byte 7, got (\{clo},\{chi})")
+  t.dispose()
 }

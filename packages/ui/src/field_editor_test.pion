@@ -207,3 +207,781 @@ test "field_editor 07: focused multi-line caret renders at true line y > d.y + 1
   debug_assert(caret_y > 30.0 + 40.0, "line 3 caret y sits on line 3 (> d.y + 40), not line 0")
   t.dispose()
 }
+
+fn join_visual_runs(runs : Array[(String, Int)]) -> String {
+  let sb = StringBuilder::new()
+  for r in runs {
+    sb.write_string(r.0)
+  }
+  sb.to_string()
+}
+
+test "uax9 bidi_visual_runs paragraph base direction rtl=true matches standard" {
+  debug_assert(join_visual_runs(bidi_visual_runs("https://", true)) == "//:https", "https:// in RTL => //:https")
+  debug_assert(join_visual_runs(bidi_visual_runs(".org", true)) == "org.", ".org in RTL => org.")
+  debug_assert(
+    join_visual_runs(bidi_visual_runs("Logical start/end alignment check.", true)) == ".Logical start/end alignment check",
+    "trailing period moves to visual left in RTL",
+  )
+  debug_assert(join_visual_runs(bidi_visual_runs("invar.dev", true)) == "invar.dev", "invar.dev stays invar.dev")
+  debug_assert(join_visual_runs(bidi_visual_runs("RTL Alert", true)) == "RTL Alert", "RTL Alert stays RTL Alert")
+  debug_assert(join_visual_runs(bidi_visual_runs("60%", true)) == "60%", "60% stays 60% per UAX #9 W5+I2")
+
+  // Arabic + Latin mixed: trailing '!' goes visual left, 'world' middle, Arabic on visual right
+  let ar_runs = bidi_visual_runs("مرحبا world!", true)
+  debug_assert(ar_runs.length() >= 3, "mixed Arabic/Latin should produce >= 3 BiDi runs")
+  debug_assert(ar_runs[0].0 == "!", "trailing '!' in RTL paragraph must be leftmost visual run")
+  debug_assert(ar_runs[1].0 == "world", "Latin word must be middle visual run")
+
+  // Hebrew + parenthesized digits: L4 bracket mirroring '(' <-> ')'
+  let he_runs = bidi_visual_runs("שלום (123)", true)
+  let he_joined = join_visual_runs(he_runs)
+  debug_assert(he_joined.length() > 0 && he_runs.length() >= 3, "Hebrew + (123) produces multi-run BiDi")
+
+  // LTR pass-through unchanged
+  debug_assert(join_visual_runs(bidi_visual_runs("https://", false)) == "https://", "LTR unchanged")
+}
+
+test "rtl Field right-aligns text, caret, selection, hit_test, and IME preedit" {
+  let fld = Field::new(text="invar.dev")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(
+        box,
+        fld,
+        font_size=14.0,
+        line=20.0,
+        min_lines=1,
+        max_lines=1,
+        rtl_by=fn() { true },
+      )
+    })
+  }, width=320.0, height=80.0)
+  t.frame()
+  debug_assert(fld.rtl, "Field must adopt rtl=true from rtl_by")
+
+  // Focus & select "dev" (bytes 6..9)
+  fld.focus()
+  fld.pick(6, 9)
+  t.frame(ms=16.0)
+  let cp = fld.caret_pos()
+  let srects = fld.selection_rects()
+  debug_assert(cp.x > 180.0, "RTL caret x must be right-aligned (> 180pt in 300pt box), got \{cp.x}")
+  debug_assert(srects.length() == 1 && srects[0].x > 150.0, "RTL selection rect must be right-aligned")
+
+  // Hit-testing at the right edge hits end of text; hit-testing far left hits start of text
+  let end_off = fld.hit_test(299.0, 10.0)
+  let start_off = fld.hit_test(5.0, 10.0)
+  debug_assert(end_off == 9, "RTL hit_test at right edge must hit end of text (9), got \{end_off}")
+  debug_assert(start_off == 0, "RTL hit_test at far left must hit start of text (0), got \{start_off}")
+
+  // IME preedit updates display text and stays right-aligned
+  fld.pick(9, 9)
+  fld.compose("ok")
+  t.frame(ms=32.0)
+  let cp_ime = fld.caret_pos()
+  debug_assert(cp_ime.x > 180.0, "RTL IME preedit caret must remain right-aligned, got \{cp_ime.x}")
+  t.dispose()
+}
+
+test "r5_1_bidi_layout_line_hebrew_arabic_and_mixed_visual_order" {
+  // 1) Pure Hebrew אבג (U+05D0 [0..2), U+05D1 [2..4), U+05D2 [4..6)):
+  //    Visual left-to-right MUST be Gimel [4..6), Bet [2..4), Alef [0..2), all rtl=true.
+  let he = "אבג"
+  let bl_he = bidi_layout_line(he, true, 16.0, 400, 0, 1.0, 0.0)
+  debug_assert(bl_he.clusters.length() == 3, "Hebrew אבג must have 3 visual clusters, got \{bl_he.clusters.length()}")
+  debug_assert(bl_he.clusters[0].byte_start == 4 && bl_he.clusters[0].byte_end == 6 && bl_he.clusters[0].rtl, "leftmost Hebrew cluster must be Gimel [4..6)")
+  debug_assert(bl_he.clusters[1].byte_start == 2 && bl_he.clusters[1].byte_end == 4 && bl_he.clusters[1].rtl, "middle Hebrew cluster must be Bet [2..4)")
+  debug_assert(bl_he.clusters[2].byte_start == 0 && bl_he.clusters[2].byte_end == 2 && bl_he.clusters[2].rtl, "rightmost Hebrew cluster must be Alef [0..2)")
+  debug_assert(bl_he.clusters[0].vis_x0 < bl_he.clusters[1].vis_x0 && bl_he.clusters[1].vis_x0 < bl_he.clusters[2].vis_x0, "visual x strictly increasing left-to-right")
+
+  // 2) Multi-word Arabic with harakat: words ordered right-to-left (second word visually left of first word),
+  //    each joining word emitted as a single whole-word draw item via hostapi::text_key.
+  let ar = "سَلَامٌ مرحبا"
+  let bl_ar = bidi_layout_line(ar, true, 16.0, 400, 0, 1.0, 0.0)
+  debug_assert(bl_ar.clusters.length() > 4, "Arabic line must emit per-cluster visual mapping")
+  let first_vis = bl_ar.clusters[0]
+  let last_vis = bl_ar.clusters[bl_ar.clusters.length() - 1]
+  debug_assert(first_vis.byte_start > last_vis.byte_start && first_vis.rtl && last_vis.rtl, "Arabic clusters must run logically right-to-left")
+  // Two joining words + 1 space = 3 draw items (whole-word text_key per Arabic word, not per-letter)
+  debug_assert(bl_ar.items.length() == 3, "two Arabic words + space must emit 3 draw items, got \{bl_ar.items.length()}")
+
+  // 3) Mixed BiDi ("אבג 123 invar.dev!"):
+  //    Leftmost '!' (rtl=true), then "123 invar.dev" (rtl=false LTR), then space, then rightmost "אבג" (rtl=true).
+  let mix = "אבג 123 invar.dev!"
+  let bl_mix = bidi_layout_line(mix, true, 16.0, 400, 0, 1.0, 0.0)
+  debug_assert(bl_mix.clusters.length() >= 10, "mixed BiDi must produce clusters for all glyphs")
+  let leftmost = bl_mix.clusters[0]
+  let rightmost = bl_mix.clusters[bl_mix.clusters.length() - 1]
+  debug_assert(leftmost.byte_start == mix.length() - 1, "trailing '!' must be leftmost visual cluster")
+  debug_assert(rightmost.byte_start == 0 && rightmost.rtl, "leading Alef [0..2) must be rightmost visual cluster")
+}
+
+test "r5_2_rtl_field_pure_hebrew_ltr_and_mixed_caret_hit_selection_handles_ime" {
+  // 1) Pure RTL Hebrew "אבג" (6 UTF-8 bytes) in 300pt RTL Field
+  let fld = Field::new(text="אבג")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=80.0)
+  t.frame()
+  fld.focus()
+
+  fld.pick(0, 0)
+  let x0 = fld.caret_pos().x
+  fld.pick(2, 2)
+  let x2 = fld.caret_pos().x
+  fld.pick(4, 4)
+  let x4 = fld.caret_pos().x
+  fld.pick(6, 6)
+  let x6 = fld.caret_pos().x
+  debug_assert(x0 > x2 && x2 > x4 && x4 > x6, "Hebrew RTL caret must move right-to-left: x0=\{x0}, x2=\{x2}, x4=\{x4}, x6=\{x6}")
+  debug_assert(x0 >= 295.0, "Hebrew logical offset 0 must sit at right edge (~298.5pt), got \{x0}")
+  debug_assert(fld.hit_test(299.0, 10.0) == 0, "Hebrew right edge hit_test must return 0, got \{fld.hit_test(299.0, 10.0)}")
+  debug_assert(fld.hit_test(0.0, 10.0) == 6, "Hebrew left edge hit_test must return 6, got \{fld.hit_test(0.0, 10.0)}")
+
+  // Selection rects & handles: selecting bytes 0..4 (אב) must lie strictly RIGHT of bytes 4..6 (ג)
+  fld.pick(0, 4)
+  let r_first = fld.selection_rects()
+  let h_first = fld.handles(style=editor::HandleStyle::IOS)
+  fld.pick(4, 6)
+  let r_last = fld.selection_rects()
+  debug_assert(r_first.length() == 1 && r_last.length() == 1, "contiguous Hebrew selections produce 1 rect each")
+  debug_assert(r_first[0].x > r_last[0].x, "logical prefix אב must be visually right of suffix ג")
+  match h_first {
+    Some((sh, eh)) => debug_assert(sh.tip_x > eh.tip_x, "RTL start handle (off=0) must be right of end handle (off=4)")
+    None => debug_assert(false, "expected selection handles for non-empty RTL selection")
+  }
+
+  // IME preedit at logical offset 0 stays at visual right
+  fld.pick(0, 0)
+  fld.compose("ש")
+  t.frame(ms=16.0)
+  let ime_x = fld.caret_pos().x
+  debug_assert(ime_x > 250.0, "RTL IME preedit caret must sit in visual right region, got \{ime_x}")
+  fld.editor.compose_cancel()
+
+  // 2) Mixed BiDi ("אבג 123 invar.dev"): cross-direction selection produces multi-segment rects
+  fld.set("אבג 123 invar.dev")
+  t.frame(ms=32.0)
+  fld.pick(0, 0)
+  let mix_x0 = fld.caret_pos().x
+  fld.pick(17, 17)
+  let mix_x_end = fld.caret_pos().x
+  debug_assert(mix_x0 > mix_x_end, "mixed RTL line start (Hebrew) must be right of LTR word end")
+  // Select Hebrew + space + "123" (bytes 0..10): Hebrew is right, "123" is left of "invar.dev" -> 2 disjoint rects!
+  fld.pick(0, 10)
+  let mix_rects = fld.selection_rects()
+  debug_assert(mix_rects.length() >= 1, "mixed BiDi selection must emit visual rects")
+  t.dispose()
+}
+
+test "r5_3_tester_tap_moves_field_caret_first_focus_refocus_and_scaled" {
+  // 1) RTL Field with "invar.dev": first-focus tap and subsequent taps at left/mid/right
+  let fld = Field::new(text="invar.dev")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.over_at(view::Live::Is((Some(20.0), Some(15.0), None, None)))
+        .width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+    })
+  }, width=360.0, height=100.0)
+  t.frame()
+  fld.pick(0, 0)
+  debug_assert(!fld.focused(), "field starts unfocused")
+
+  // First-focus tap at right edge of field (x = 20 + 299 = 319) -> focuses AND moves caret to 9!
+  t.tap(319.0, 25.0)
+  t.frame(ms=16.0)
+  debug_assert(fld.focused(), "first tap must focus field")
+  let exp_r = fld.hit_test(299.0, 10.0)
+  let (sr0, sr1) = fld.selection()
+  debug_assert(sr0 == exp_r && sr1 == exp_r && exp_r == 9, "first-focus right tap must set selection to (9,9), got (\{sr0},\{sr1})")
+
+  // Subsequent tap at middle of "invar.dev"
+  let mid_local_x = fld.last_max_w - 30.0
+  let exp_m = fld.hit_test(mid_local_x, 10.0)
+  t.tap(fld.last_win_x + mid_local_x, fld.last_win_y + 10.0)
+  t.frame(ms=32.0)
+  let (sm0, sm1) = fld.selection()
+  debug_assert(sm0 == exp_m && sm1 == exp_m && exp_m > 0 && exp_m < 9, "mid tap must match hit_test (\{exp_m}), got (\{sm0},\{sm1})")
+
+  // Subsequent tap at left edge -> 0
+  let exp_l = fld.hit_test(2.0, 10.0)
+  t.tap(fld.last_win_x + 2.0, fld.last_win_y + 10.0)
+  t.frame(ms=48.0)
+  let (sl0, sl1) = fld.selection()
+  debug_assert(sl0 == exp_l && sl1 == exp_l && exp_l == 0, "left tap must set selection to (0,0), got (\{sl0},\{sl1})")
+  t.dispose()
+
+  // 2) Scaled (2.0x) LTR Field: tap at scaled window coordinates matches unscaled local hit_test
+  let fld_s = Field::new(text="HelloWorld")
+  let ts = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(wrap : view::View) {
+      let _ = wrap.over_at(view::Live::Is((Some(10.0), Some(10.0), None, None)))
+        .scale(view::Live::Is(2.0))
+        .width(view::Live::Is(Some(160.0))).height(view::Live::Is(Some(30.0)))
+      let _ = field(wrap, fld_s, font_size=14.0, line=20.0, min_lines=1, max_lines=1)
+    })
+  }, width=400.0, height=120.0)
+  ts.frame()
+  debug_assert(dmath::abs(fld_s.last_win_scale - 2.0) < 0.01, "scaled field must record last_win_scale=2.0, got \{fld_s.last_win_scale}")
+  let target_local_x = 40.0
+  let exp_s = fld_s.hit_test(target_local_x, 10.0)
+  ts.tap(fld_s.last_win_x + target_local_x * 2.0, fld_s.last_win_y + 10.0 * 2.0)
+  ts.frame(ms=16.0)
+  debug_assert(fld_s.focused(), "scaled tap must focus field")
+  let (ss0, ss1) = fld_s.selection()
+  debug_assert(ss0 == exp_s && ss1 == exp_s && exp_s > 0 && exp_s < 10, "scaled tap selection must match hit_test (\{exp_s}), got (\{ss0},\{ss1})")
+  ts.dispose()
+}
+
+test "r6_1_mixed_bidi_boundary_click_preserves_visual_side_and_redraw" {
+  // Astra R5 P1-1: 300pt RTL Field with "אבג abcdef" (bytes: א=0..2, ב=2..4, ג=4..6, ' '=6..7, a=7..8 .. f=12..13)
+  let fld = Field::new(text="אבג abcdef")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=80.0)
+  t.frame()
+  let (bl, start_x, _, _, _, _) = fld.rtl_line_layout(0)
+  let mut sp_x0 = -1.0
+  let mut sp_mid_l = -1.0
+  let mut a_x0 = -1.0
+  let mut a_mid_l = -1.0
+  for c in bl.clusters {
+    if c.byte_start == 6 && c.byte_end == 7 {
+      sp_x0 = start_x + c.vis_x0
+      sp_mid_l = start_x + c.vis_x0 + (c.vis_x1 - c.vis_x0) * 0.2
+    }
+    if c.byte_start == 7 && c.byte_end == 8 {
+      a_x0 = start_x + c.vis_x0
+      a_mid_l = start_x + c.vis_x0 + (c.vis_x1 - c.vis_x0) * 0.2
+    }
+  }
+  debug_assert(sp_x0 > a_x0 + 20.0, "RTL space left edge (\{sp_x0}) must be well right of LTR 'a' left edge (\{a_x0})")
+
+  // Tap left half of RTL space (trailing edge -> byte 7, upstream=true)
+  t.tap(fld.last_win_x + sp_mid_l, fld.last_win_y + 10.0)
+  t.frame(ms=16.0)
+  let (s1a, s1b) = fld.selection()
+  let cx1 = fld.caret_pos().x
+  debug_assert(s1a == 7 && s1b == 7, "RTL side boundary click must hit byte 7, got (\{s1a},\{s1b})")
+  debug_assert(dmath::abs(cx1 - sp_x0) < 2.0, "caret must stay on RTL space edge (~\{sp_x0}), not jump to LTR 'a' (~\{a_x0}), got \{cx1}")
+
+  // Repeat click at same coordinate and redraw next frame -> stays on RTL side
+  t.tap(fld.last_win_x + sp_mid_l, fld.last_win_y + 10.0)
+  t.frame(ms=32.0)
+  let cx1_repeat = fld.caret_pos().x
+  debug_assert(dmath::abs(cx1_repeat - sp_x0) < 2.0, "repeat click & redraw must keep RTL side (~\{sp_x0}), got \{cx1_repeat}")
+
+  // Tap left half of LTR 'a' (leading edge -> byte 7, upstream=false)
+  t.tap(fld.last_win_x + a_mid_l, fld.last_win_y + 10.0)
+  t.frame(ms=48.0)
+  let (s2a, s2b) = fld.selection()
+  let cx2 = fld.caret_pos().x
+  debug_assert(s2a == 7 && s2b == 7, "LTR side boundary click must hit byte 7, got (\{s2a},\{s2b})")
+  debug_assert(dmath::abs(cx2 - a_x0) < 2.0, "caret must stay on LTR 'a' edge (~\{a_x0}), got \{cx2}")
+
+  // Repeat click & next frame redraw -> stays on LTR side
+  t.tap(fld.last_win_x + a_mid_l, fld.last_win_y + 10.0)
+  t.frame(ms=64.0)
+  let cx2_repeat = fld.caret_pos().x
+  debug_assert(dmath::abs(cx2_repeat - a_x0) < 2.0, "repeat click & redraw must keep LTR side (~\{a_x0}), got \{cx2_repeat}")
+  t.dispose()
+}
+
+test "r6_2_rtl_ltr_and_mixed_visual_arrow_keys_and_shift_extend" {
+  // Astra R5 P1-2: Visual Left/Right + Shift+Left/Right in pure RTL, pure LTR, and mixed BiDi
+  let fld = Field::new(text="אבג")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=80.0)
+  t.frame()
+  fld.focus()
+
+  // 1) Pure Hebrew: at byte 2, Left moves visually LEFT (x decreases, offset -> 4); Right moves visually RIGHT (x increases, offset -> 0)
+  fld.pick(2, 2)
+  let x_start = fld.caret_pos().x
+  debug_assert(fld.handle_key(key_code_left, 0), "Left key handled")
+  let x_after_left = fld.caret_pos().x
+  debug_assert(x_after_left < x_start - 0.5 && fld.editor.caret == 4, "RTL Left must move caret left: \{x_start} -> \{x_after_left}, caret=\{fld.editor.caret}")
+  debug_assert(fld.handle_key(key_code_right, 0), "Right key handled")
+  let x_back = fld.caret_pos().x
+  debug_assert(x_back > x_after_left + 0.5 && fld.editor.caret == 2, "RTL Right must move caret right: \{x_after_left} -> \{x_back}, caret=\{fld.editor.caret}")
+  debug_assert(fld.handle_key(key_code_right, 0), "Right key handled to start")
+  let x_rightmost = fld.caret_pos().x
+  debug_assert(x_rightmost > x_back + 0.5 && fld.editor.caret == 0, "RTL Right again moves to logical 0: \{x_back} -> \{x_rightmost}")
+
+  // Shift+Left extends visually left while preserving anchor=0
+  debug_assert(fld.handle_key(key_code_left, mod_shift_key), "Shift+Left handled")
+  debug_assert(fld.editor.anchor == 0 && fld.editor.caret == 2, "Shift+Left extends to (0,2), got (\{fld.editor.anchor},\{fld.editor.caret})")
+  debug_assert(fld.handle_key(key_code_left, mod_shift_key), "Shift+Left #2 handled")
+  debug_assert(fld.editor.anchor == 0 && fld.editor.caret == 4, "Shift+Left extends to (0,4), got (\{fld.editor.anchor},\{fld.editor.caret})")
+
+  // 2) Pure LTR inside RTL field ("abcdef"): Left moves visually left, Right moves visually right
+  fld.set("abcdef")
+  t.frame(ms=16.0)
+  fld.pick(2, 2)
+  let lx2 = fld.caret_pos().x
+  debug_assert(fld.handle_key(key_code_left, 0), "LTR-in-RTL Left handled")
+  debug_assert(fld.caret_pos().x < lx2 - 0.5 && fld.editor.caret == 1, "LTR Left decreases x and moves to 1")
+  debug_assert(fld.handle_key(key_code_right, 0), "LTR-in-RTL Right handled")
+  debug_assert(fld.caret_pos().x > lx2 - 0.5 && fld.editor.caret == 2, "LTR Right returns to 2")
+
+  // 3) Mixed BiDi ("אבג abcdef"): walking Left across boundary strictly decreases x, Shift+Left preserves anchor across boundary
+  fld.set("אבג abcdef")
+  t.frame(ms=32.0)
+  fld.pick(0, 0)
+  let mut prev_x = fld.caret_pos().x
+  let mut steps = 0
+  while steps < 10 {
+    let _ = fld.handle_key(key_code_left, mod_shift_key)
+    let cur_x = fld.caret_pos().x
+    debug_assert(cur_x < prev_x - 0.1, "Mixed BiDi Shift+Left step \{steps} must strictly move left: \{prev_x} -> \{cur_x}")
+    debug_assert(fld.editor.anchor == 0, "Mixed BiDi Shift+Left must preserve anchor=0 across boundary, got \{fld.editor.anchor}")
+    prev_x = cur_x
+    steps += 1
+  }
+  t.dispose()
+}
+
+test "r6_3_rtl_ime_preedit_caret_matches_commit_internal_and_cancel" {
+  // Astra R5 P1-3: compose("ש") at byte 0 of "אבג" positions caret at marked selection end (<=0.5pt diff on commit)
+  let fld = Field::new(text="אבג")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=80.0)
+  t.frame()
+  fld.focus()
+  fld.pick(0, 0)
+  let x_before = fld.caret_pos().x
+
+  fld.compose("ש")
+  t.frame(ms=16.0)
+  let x_preedit = fld.caret_pos().x
+  debug_assert(x_preedit < x_before - 1.0, "Preedit caret must advance past marked 'ש': before=\{x_before}, preedit=\{x_preedit}")
+
+  // Internal marked selection position (compose_update with 2-char marked text, sel_end=2 in middle)
+  fld.editor.compose_update("שג", sel_start=0, sel_end=2)
+  t.frame(ms=32.0)
+  let x_internal = fld.caret_pos().x
+  fld.editor.compose_update("שג", sel_start=0, sel_end=4)
+  t.frame(ms=48.0)
+  let x_full_marked = fld.caret_pos().x
+  debug_assert(x_internal > x_full_marked + 1.0 && x_internal < x_before - 1.0, "Internal marked caret (\{x_internal}) must lie strictly between start (\{x_before}) and end (\{x_full_marked})")
+
+  // Cancel restores exact pre-compose caret
+  fld.compose("")
+  t.frame(ms=64.0)
+  let x_cancel = fld.caret_pos().x
+  debug_assert(dmath::abs(x_cancel - x_before) <= 0.5, "Compose cancel must restore caret: before=\{x_before}, after=\{x_cancel}")
+
+  // Re-compose "ש" and commit same character -> <= 0.5pt caret delta!
+  fld.compose("ש")
+  t.frame(ms=80.0)
+  let x_pre_commit = fld.caret_pos().x
+  fld.insert("ש")
+  t.frame(ms=96.0)
+  let x_post_commit = fld.caret_pos().x
+  debug_assert(dmath::abs(x_post_commit - x_pre_commit) <= 0.5, "Preedit vs committed caret diff must be <=0.5pt: pre=\{x_pre_commit}, post=\{x_post_commit}")
+  t.dispose()
+}
+
+test "r6_4_rtl_rich_text_per_cluster_highlight_spans_and_arabic_joining" {
+  // Astra R5 P1-4: Verify encode_runs emits distinct per-letter bg rects for first-only, suffix-only, and full Hebrew word
+  let yellow = 0xFFFF00FFL
+  let mk_scene = fn(runs : Array[text::Run]) -> Array[(Double, Double)] {
+    let t = Tester::tree(fn(root : view::View) {
+      let _ = root.box(fn(box : view::View) {
+        let _ = box.width(view::Live::Is(Some(200.0))).height(view::Live::Is(Some(40.0)))
+        let _ = box.words_runs(view::Live::Is(runs), look=view::WordsLook::{ ..view::words_plain, size: 20.0, line: 28.0, rtl: true })
+      })
+    }, width=200.0, height=40.0, scale=1.0)
+    t.frame()
+    let sc = view_app.scene
+    // Collect all solid yellow background instances pushed to scene (60-Double stride, kind=inst[base+5]==0.0)
+    let out : Array[(Double, Double)] = []
+    let mut k = 0
+    while k < sc.ninst {
+      let base = k * 60
+      let kind = sc.inst[base + 5]
+      let r = sc.inst[base + 8]
+      let g = sc.inst[base + 9]
+      let b = sc.inst[base + 10]
+      if kind == 0.0 && r > 0.95 && g > 0.95 && b < 0.05 {
+        out.push((sc.inst[base], sc.inst[base + 2]))
+      }
+      k += 1
+    }
+    t.dispose()
+    out
+  }
+  let bg_first = mk_scene([text::span("א", bg=yellow), text::span("בג")])
+  let bg_suffix = mk_scene([text::span("א"), text::span("בג", bg=yellow)])
+  let bg_all = mk_scene([text::span("אבג", bg=yellow)])
+  debug_assert(bg_first.length() == 1, "first-only highlight must emit 1 yellow rect, got \{bg_first.length()}")
+  debug_assert(bg_suffix.length() == 1, "suffix-only highlight must emit 1 yellow rect, got \{bg_suffix.length()}")
+  debug_assert(bg_all.length() == 1, "full-word highlight must emit 1 yellow rect, got \{bg_all.length()}")
+  let (fx, fw) = bg_first[0]
+  let (sx, sw) = bg_suffix[0]
+  let (ax, aw) = bg_all[0]
+  debug_assert(fw < aw - 2.0, "first-only bg width (\{fw}) must be strictly narrower than full word (\{aw})")
+  debug_assert(sw < aw - 2.0 && sw > 2.0, "suffix-only bg width (\{sw}) must be non-empty and narrower than full word (\{aw})")
+  debug_assert(fx > sx + 2.0, "logical first letter Alef bg x (\{fx}) must lie strictly RIGHT of suffix bg x (\{sx})")
+  debug_assert(dmath::abs((fw + sw) - aw) < 2.0, "first + suffix bg widths (\{fw}+\{sw}) must sum to full word (\{aw})")
+  // Arabic word split across bg highlight spans: still emits 1 yellow span for highlighted prefix
+  let bg_ar = mk_scene([text::span("مر", bg=yellow), text::span("حبا")])
+  debug_assert(bg_ar.length() == 1 && bg_ar[0].1 > 2.0, "Arabic partial highlight must emit non-empty bg span")
+}
+
+test "r7_1_rtl_multiline_soft_wrap_click_arrows_and_shift" {
+  // Astra R6 P1-1: 68pt wide, 20pt line-height RTL multiline Field with 22 continuous Hebrew letters (no '\n')
+  let heb22 = "אבגדהוזחטיכלמנסעפצקרשת"
+  let total_bytes = heb22.length()
+  debug_assert(total_bytes == 44, "22 Hebrew letters must be 44 UTF-8 bytes")
+  let fld = Field::new(text=heb22)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(68.0))).height(view::Live::Is(Some(200.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=10, rtl_by=fn() { true })
+    })
+  }, width=100.0, height=220.0)
+  t.frame()
+  debug_assert(fld.editor.lines.length() >= 3, "68pt Field must soft-wrap 22 Hebrew letters into >=3 lines, got \{fld.editor.lines.length()}")
+  let wrap_off = fld.editor.lines[0].byte_end
+  debug_assert(wrap_off > 0 && fld.editor.lines[1].byte_start == wrap_off && !fld.editor.lines[0].hard_break, "expected soft-wrap boundary at byte \{wrap_off}")
+
+  // 1) Tap left end of line 0 vs right end of line 1 at shared soft-wrap offset
+  t.tap(fld.last_win_x + 1.0, fld.last_win_y + 6.0)
+  t.frame(ms=16.0)
+  let cp_l0 = fld.caret_pos()
+  debug_assert(fld.editor.caret == wrap_off && cp_l0.line == 0 && dmath::abs(cp_l0.y - 0.0) < 0.5, "Tap left end of line 0 must stay on line 0 at byte \{wrap_off}, got caret=\{fld.editor.caret} line=\{cp_l0.line} y=\{cp_l0.y}")
+
+  t.tap(fld.last_win_x + 67.0, fld.last_win_y + 25.0)
+  t.frame(ms=32.0)
+  let cp_l1 = fld.caret_pos()
+  debug_assert(fld.editor.caret == wrap_off && cp_l1.line == 1 && dmath::abs(cp_l1.y - 20.0) < 0.5, "Tap right end of line 1 must stay on line 1 at byte \{wrap_off}, got caret=\{fld.editor.caret} line=\{cp_l1.line} y=\{cp_l1.y}")
+
+  // 2) Repeated Left from 0 traverses every grapheme all the way to byte 44 across all wrapped lines
+  fld.pick(0, 0)
+  let mut step = 0
+  let mut max_line = 0
+  while step < 22 {
+    let prev_c = fld.editor.caret
+    debug_assert(fld.handle_key(key_code_left, 0), "Left step \{step} handled")
+    let cp = fld.caret_pos()
+    debug_assert(fld.editor.caret > prev_c, "Left step \{step} must advance logical byte: \{prev_c} -> \{fld.editor.caret}")
+    if cp.line > max_line { max_line = cp.line }
+    step += 1
+  }
+  debug_assert(fld.editor.caret == total_bytes, "22 Left presses must reach end (\{total_bytes}), got \{fld.editor.caret}")
+  debug_assert(max_line == fld.editor.lines.length() - 1, "Left traversal must reach last wrapped line \{fld.editor.lines.length() - 1}, got \{max_line}")
+
+  // 3) Repeated Right from end returns all the way back to byte 0 on line 0
+  let mut rstep = 0
+  while rstep < 22 {
+    let prev_c = fld.editor.caret
+    debug_assert(fld.handle_key(key_code_right, 0), "Right step \{rstep} handled")
+    debug_assert(fld.editor.caret < prev_c, "Right step \{rstep} must retreat logical byte: \{prev_c} -> \{fld.editor.caret}")
+    rstep += 1
+  }
+  let cp_home = fld.caret_pos()
+  debug_assert(fld.editor.caret == 0 && cp_home.line == 0, "22 Right presses must return to byte 0 line 0, got caret=\{fld.editor.caret} line=\{cp_home.line}")
+
+  // 4) Shift+Left from 0 across soft-wrap boundary preserves anchor=0 and reaches line >= 1
+  let mut sstep = 0
+  while sstep < 10 {
+    debug_assert(fld.handle_key(key_code_left, mod_shift_key), "Shift+Left step \{sstep} handled")
+    debug_assert(fld.editor.anchor == 0, "Shift+Left across soft wrap must preserve anchor=0, got \{fld.editor.anchor}")
+    sstep += 1
+  }
+  debug_assert(fld.caret_pos().line >= 1 && fld.editor.caret == 20, "10 Shift+Left presses must reach byte 20 on line>=1, got caret=\{fld.editor.caret} line=\{fld.caret_pos().line}")
+
+  // 5) Shift+Right from end across soft-wrap boundary preserves anchor=total_bytes and retreats across lines
+  fld.pick_with_affinity(total_bytes, total_bytes, true)
+  let end_line = fld.caret_pos().line
+  let mut srstep = 0
+  while srstep < 10 {
+    debug_assert(fld.handle_key(key_code_right, mod_shift_key), "Shift+Right step \{srstep} handled")
+    debug_assert(fld.editor.anchor == total_bytes, "Shift+Right across soft wrap must preserve anchor=\{total_bytes}, got \{fld.editor.anchor}")
+    srstep += 1
+  }
+  debug_assert(fld.caret_pos().line < end_line && fld.editor.caret == total_bytes - 20, "10 Shift+Right presses from end must retreat across wrapped line, got caret=\{fld.editor.caret} line=\{fld.caret_pos().line} vs end_line=\{end_line}")
+  t.dispose()
+}
+
+test "r7_2_mixed_bidi_selection_collapse_compose_cancel_and_unhandled_key" {
+  // Astra R6 P1-2: At BOTH visual sides of shared boundary byte 7 in "אבג abcdef":
+  // (a) Shift+Right then Left/Right collapse lands on exact visible selection edges (<=0.5pt)
+  // (b) compose("ש") then compose("") cancel restores original visual edge (<=0.5pt)
+  // (c) Unhandled Escape key preserves original visual edge (<=0.5pt)
+  let fld = Field::new(text="אבג abcdef")
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=80.0)
+  t.frame()
+  let (bl, start_x, _, _, _, _) = fld.rtl_line_layout(0)
+  let mut sp_x0 = -1.0
+  let mut sp_x1 = -1.0
+  let mut sp_tap = -1.0
+  let mut a_x0 = -1.0
+  let mut a_x1 = -1.0
+  let mut a_tap = -1.0
+  for c in bl.clusters {
+    if c.byte_start == 6 && c.byte_end == 7 {
+      sp_x0 = start_x + c.vis_x0
+      sp_x1 = start_x + c.vis_x1
+      sp_tap = start_x + c.vis_x0 + (c.vis_x1 - c.vis_x0) * 0.2
+    }
+    if c.byte_start == 7 && c.byte_end == 8 {
+      a_x0 = start_x + c.vis_x0
+      a_x1 = start_x + c.vis_x1
+      a_tap = start_x + c.vis_x0 + (c.vis_x1 - c.vis_x0) * 0.2
+    }
+  }
+  debug_assert(sp_x0 > a_x0 + 20.0, "RTL space edge (\{sp_x0}) must be well right of LTR 'a' edge (\{a_x0})")
+
+  // --- Side A: RTL space trailing edge (byte 7, upstream=true, x=sp_x0) ---
+  t.tap(fld.last_win_x + sp_tap, fld.last_win_y + 10.0)
+  t.frame(ms=16.0)
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - sp_x0) <= 0.5, "Side A tap must land at sp_x0=\{sp_x0}, got \{fld.caret_pos().x}")
+
+  // Shift+Right selects space [6..7), Left collapses to left edge of space (sp_x0, NOT a_x0!)
+  debug_assert(fld.handle_key(key_code_right, mod_shift_key), "Side A Shift+Right handled")
+  let (s_lo, s_hi) = fld.selection()
+  debug_assert(s_lo == 6 && s_hi == 7, "Side A Shift+Right must select space (6,7), got (\{s_lo},\{s_hi})")
+  debug_assert(fld.handle_key(key_code_left, 0), "Side A Left collapse handled")
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - sp_x0) <= 0.5, "Side A Left collapse must stay at sp_x0=\{sp_x0}, got \{fld.caret_pos().x}")
+
+  // Shift+Right selects space [6..7), Right collapses to right edge of space (sp_x1)
+  debug_assert(fld.handle_key(key_code_right, mod_shift_key), "Side A Shift+Right #2 handled")
+  debug_assert(fld.handle_key(key_code_right, 0), "Side A Right collapse handled")
+  debug_assert(fld.editor.caret == 6 && dmath::abs(fld.caret_pos().x - sp_x1) <= 0.5, "Side A Right collapse must land at sp_x1=\{sp_x1}, got \{fld.caret_pos().x}")
+
+  // Re-tap Side A, compose("ש") then cancel compose("") -> restores sp_x0
+  t.tap(fld.last_win_x + sp_tap, fld.last_win_y + 10.0)
+  t.frame(ms=32.0)
+  fld.compose("ש")
+  t.frame(ms=48.0)
+  fld.compose("")
+  t.frame(ms=64.0)
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - sp_x0) <= 0.5, "Side A compose cancel must restore sp_x0=\{sp_x0}, got \{fld.caret_pos().x}")
+
+  // Unhandled Escape preserves sp_x0
+  let esc_handled = fld.handle_key(key_escape, 0)
+  debug_assert(!esc_handled, "Escape without composition must be unhandled")
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - sp_x0) <= 0.5, "Side A unhandled Escape must preserve sp_x0=\{sp_x0}, got \{fld.caret_pos().x}")
+
+  // --- Side B: LTR 'a' leading edge (byte 7, upstream=false, x=a_x0) ---
+  t.tap(fld.last_win_x + a_tap, fld.last_win_y + 10.0)
+  t.frame(ms=80.0)
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - a_x0) <= 0.5, "Side B tap must land at a_x0=\{a_x0}, got \{fld.caret_pos().x}")
+
+  // Shift+Right selects 'a' [7..8), Left collapses to a_x0, Right collapses to a_x1
+  debug_assert(fld.handle_key(key_code_right, mod_shift_key), "Side B Shift+Right handled")
+  let (b_lo, b_hi) = fld.selection()
+  debug_assert(b_lo == 7 && b_hi == 8, "Side B Shift+Right must select 'a' (7,8), got (\{b_lo},\{b_hi})")
+  debug_assert(fld.handle_key(key_code_left, 0), "Side B Left collapse handled")
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - a_x0) <= 0.5, "Side B Left collapse must stay at a_x0=\{a_x0}, got \{fld.caret_pos().x}")
+
+  debug_assert(fld.handle_key(key_code_right, mod_shift_key), "Side B Shift+Right #2 handled")
+  debug_assert(fld.handle_key(key_code_right, 0), "Side B Right collapse handled")
+  debug_assert(fld.editor.caret == 8 && dmath::abs(fld.caret_pos().x - a_x1) <= 0.5, "Side B Right collapse must land at a_x1=\{a_x1}, got \{fld.caret_pos().x}")
+
+  // Re-tap Side B, compose("ש") + cancel + unhandled Escape -> stays at a_x0
+  t.tap(fld.last_win_x + a_tap, fld.last_win_y + 10.0)
+  t.frame(ms=96.0)
+  fld.compose("ש")
+  fld.compose("")
+  let _ = fld.handle_key(key_escape, 0)
+  debug_assert(fld.editor.caret == 7 && dmath::abs(fld.caret_pos().x - a_x0) <= 0.5, "Side B compose cancel & Escape must preserve a_x0=\{a_x0}, got \{fld.caret_pos().x}")
+  t.dispose()
+}
+
+test "r8_1_rtl_combining_marks_hebrew_niqqud_and_arabic_harakat_navigation" {
+  // Astra R7 P1: Pango reports combining marks (Hebrew niqqud / Arabic harakat) as separate
+  // zero-width glyphs with distinct UTF-16 starts from their base letter.
+  // Verify Left/Right/Shift+Left/Shift+Right advance & select exact extended grapheme clusters.
+  let verify_word = fn(word : String, stops : Array[Int]) {
+    let fld = Field::new(text=word)
+    let t = Tester::tree(fn(root : view::View) {
+      let _ = root.box(fn(box : view::View) {
+        let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(36.0)))
+        let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+      })
+    }, width=320.0, height=80.0)
+    // Simulate Pango's exact behavior: base letters have positive advance, combining marks
+    // (U+0591..U+05C7 Hebrew niqqud, U+064B..U+065F Arabic harakat) emit separate zero-width glyphs.
+    let h = hostapi::host()
+    let orig_shape = h.shape
+    h.shape = fn(s : String, size : Double, weight : Int, style : Int, out : Array[Double]) -> Int {
+      let n = orig_shape(s, size, weight, style, out)
+      let cps = utf16_codepoints(s)
+      let mut k = 0
+      while k < n {
+        let u = out[k * 4].to_int()
+        if u >= 0 && u < cps.length() {
+          let cp = cps[u]
+          if (cp >= 0x0591 && cp <= 0x05C7) || (cp >= 0x064B && cp <= 0x065F) {
+            out[k * 4 + 2] = 0.0
+          }
+        }
+        k += 1
+      }
+      n
+    }
+    clear_text_cache()
+    t.frame(ms=16.0)
+
+    // 1) Repeated Left from 0 traverses every grapheme stop, then clamps at end
+    fld.pick(0, 0)
+    let mut i = 1
+    while i < stops.length() {
+      debug_assert(fld.handle_key(key_code_left, 0), "Left step \{i} handled")
+      debug_assert(fld.editor.caret == stops[i], "Left step \{i} on '\{word}' expected byte \{stops[i]}, got \{fld.editor.caret}")
+      i += 1
+    }
+    // Extra Left at end stays at end
+    let end_b = stops[stops.length() - 1]
+    let _ = fld.handle_key(key_code_left, 0)
+    debug_assert(fld.editor.caret == end_b, "Extra Left must stay at end \{end_b}, got \{fld.editor.caret}")
+
+    // 2) Repeated Right from end returns across every grapheme stop back to 0
+    let mut j = stops.length() - 2
+    while j >= 0 {
+      debug_assert(fld.handle_key(key_code_right, 0), "Right step back to \{stops[j]} handled")
+      debug_assert(fld.editor.caret == stops[j], "Right step on '\{word}' expected byte \{stops[j]}, got \{fld.editor.caret}")
+      j -= 1
+    }
+
+    // 3) Shift+Left from 0 selects full grapheme clusters one by one
+    fld.pick(0, 0)
+    let mut s = 1
+    while s < stops.length() {
+      debug_assert(fld.handle_key(key_code_left, mod_shift_key), "Shift+Left step \{s} handled")
+      let (lo, hi) = fld.selection()
+      debug_assert(lo == 0 && hi == stops[s], "Shift+Left step \{s} on '\{word}' expected (0,\{stops[s]}), got (\{lo},\{hi})")
+      s += 1
+    }
+
+    // 4) Shift+Right from end selects full grapheme clusters backward
+    fld.pick_with_affinity(end_b, end_b, true)
+    let mut sr = stops.length() - 2
+    while sr >= 0 {
+      debug_assert(fld.handle_key(key_code_right, mod_shift_key), "Shift+Right step to \{stops[sr]} handled")
+      let (lo, hi) = fld.selection()
+      debug_assert(lo == stops[sr] && hi == end_b, "Shift+Right step on '\{word}' expected (\{stops[sr]},\{end_b}), got (\{lo},\{hi})")
+      sr -= 1
+    }
+    t.dispose()
+  }
+  // Hebrew with niqqud: שָׁ (6B) + ל (2B) + וֹ (4B) + ם (2B) = 14B
+  verify_word("שָׁלוֹם", [0, 6, 8, 12, 14])
+  // Arabic with harakat: مَ (4B) + رْ (4B) + حَ (4B) + بً (4B) + ا (2B) = 18B
+  verify_word("مَرْحَبًا", [0, 4, 8, 12, 16, 18])
+}
+
+test "r8_2_rtl_selection_collapse_only_shapes_intersecting_lines" {
+  // Astra R7 P2: Collapsing a single-line selection in a 1,024-line RTL Field must NOT shape
+  // non-intersecting lines, and multi-line cross-direction selection collapse stays exact.
+  let sb = StringBuilder::new()
+  sb.write_string("אבג abcdef")
+  let mut li = 1
+  while li < 1024 {
+    sb.write_string("\nשלום")
+    li += 1
+  }
+  let big = sb.to_string()
+  let fld = Field::new(text=big)
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(box : view::View) {
+      let _ = box.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(120.0)))
+      let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=10, rtl_by=fn() { true })
+    })
+  }, width=320.0, height=160.0)
+  t.frame()
+  debug_assert(fld.editor.lines.length() == 1024, "expected 1024 lines, got \{fld.editor.lines.length()}")
+
+  // Count hostapi::shape calls during single-char selection collapse on line 0
+  let shape_calls = ref_new(0)
+  let h = hostapi::host()
+  let orig_shape = h.shape
+  h.shape = fn(s : String, size : Double, weight : Int, style : Int, out : Array[Double]) -> Int {
+    shape_calls.v = shape_calls.v + 1
+    orig_shape(s, size, weight, style, out)
+  }
+  clear_text_cache()
+  fld.pick(6, 7)
+  let calls_before = shape_calls.v
+  debug_assert(fld.handle_key(key_code_left, 0), "Left collapse on 1024-line Field handled")
+  let calls_used = shape_calls.v - calls_before
+  debug_assert(calls_used <= 8, "1-char collapse on line 0 must only shape line 0 (<=8 shape calls), got \{calls_used}")
+  debug_assert(fld.editor.caret == 7 && fld.caret_upstream, "Collapsed space selection must stay at byte 7 upstream=true")
+
+  // Multi-line selection (line 0 byte 6 to line 1 byte 18) collapses to exact visual edges
+  let line1_bs = fld.editor.lines[1].byte_start
+  let line1_be = fld.editor.lines[1].byte_end
+  fld.pick(6, line1_be)
+  debug_assert(fld.handle_key(key_code_left, 0), "Multi-line Left collapse handled")
+  debug_assert(fld.editor.caret == line1_be && fld.caret_pos().line == 1, "Multi-line Left collapse must land at end of line 1")
+  fld.pick(6, line1_be)
+  debug_assert(fld.handle_key(key_code_right, 0), "Multi-line Right collapse handled")
+  debug_assert(fld.editor.caret == 6 && fld.caret_pos().line == 0, "Multi-line Right collapse must land at line 0 byte 6 (line1_bs=\{line1_bs})")
+  t.dispose()
+}
+
+test "r9_rtl_long_line_4096_graphemes_binary_search" {
+  // Astra R8 P1: 1,024 / 2,048 / 4,096-grapheme single-line RTL Fields with combining marks must
+  // align clusters in O(n log n) via binary search without quadratic grapheme-boundary scans.
+  let sizes = [1024, 2048, 4096]
+  for n_graphemes in sizes {
+    let reps = n_graphemes / 4
+    let sb = StringBuilder::new()
+    let mut i = 0
+    while i < reps {
+      // Each "שָׁלוֹם" has 4 extended graphemes (14 UTF-8 bytes) => reps * 4 = n_graphemes.
+      sb.write_string("שָׁלוֹם")
+      i += 1
+    }
+    let long_rtl = sb.to_string()
+    let fld = Field::new(text=long_rtl)
+    let t = Tester::tree(fn(root : view::View) {
+      let _ = root.box(fn(box : view::View) {
+        let _ = box.width(view::Live::Is(Some(60000.0))).height(view::Live::Is(Some(36.0)))
+        let _ = field(box, fld, font_size=14.0, line=20.0, min_lines=1, max_lines=1, rtl_by=fn() { true })
+      })
+    }, width=60020.0, height=80.0)
+    t.frame()
+    fld.pick(0, 0)
+    let expected = [6, 8, 12, 14, 20]
+    let mut k = 0
+    while k < 5 {
+      debug_assert(fld.handle_key(key_code_left, 0), "\{n_graphemes}-grapheme Left step \{k} handled")
+      debug_assert(fld.editor.caret == expected[k], "\{n_graphemes}-grapheme Left step \{k} expected \{expected[k]}, got \{fld.editor.caret}")
+      k += 1
+    }
+    let back = [14, 12, 8, 6, 0]
+    let mut b = 0
+    while b < 5 {
+      debug_assert(fld.handle_key(key_code_right, 0), "\{n_graphemes}-grapheme Right step \{b} handled")
+      debug_assert(fld.editor.caret == back[b], "\{n_graphemes}-grapheme Right step \{b} expected \{back[b]}, got \{fld.editor.caret}")
+      b += 1
+    }
+    t.dispose()
+  }
+}

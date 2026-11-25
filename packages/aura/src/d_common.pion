@@ -1,0 +1,283 @@
+// Ported from HeroUI v3 (v3.2.8 @ c3373a1, Apache-2.0): shared Track 1D internal helpers & color utilities.
+// All package-private symbols use the `d_` prefix per the Wave 1 zero-conflict boundary.
+
+import "color"
+import "dmath"
+import "paint"
+import "view"
+
+/// Shared status/accent color token used by Alert, Badge, Chip, Avatar, ProgressBar, ProgressCircle.
+#derive(Eq)
+pub enum AuraStatusColor {
+  Default
+  Accent
+  Success
+  Warning
+  Danger
+}
+
+/// Shared 3-step control size (`Sm`, `Md`, `Lg`).
+#derive(Eq)
+pub enum AuraControlSize {
+  Sm
+  Md
+  Lg
+}
+
+fn d_words_look(size : Double, weight : Int, line : Double, wrap~ : Bool = false) -> view::WordsLook {
+  view::WordsLook::{ ..view::words_plain, size, weight, line, wrap }
+}
+
+/// Mount a dedicated child text box so `.words(...)` never overwrites a parent container's own text
+/// and centers cleanly inside flex rows/columns.
+fn d_text_box(
+  parent : view::View,
+  text : view::Live[String],
+  look : view::WordsLook,
+  ink : view::Live[Int64],
+  loc~ : String = "",
+) -> view::View {
+  parent.box(loc=loc, fn(t : view::View) -> Unit {
+    let _ = t
+      .words(text, look=look)
+      .words_look(view::Live::By(fn() -> view::WordsLook { look.with_rtl(aura_rtl(t)) }))
+      .ink(ink)
+  })
+}
+
+fn d_crc32(data : Array[Byte], start : Int, len : Int) -> Int64 {
+  let mut crc : Int64 = 0xFFFFFFFFL
+  let mut i = 0
+  while i < len {
+    crc = crc ^ (data[start + i].to_int().to_int64() & 0xFFL)
+    let mut b = 0
+    while b < 8 {
+      if (crc & 1L) != 0L {
+        crc = ((crc >> 1) & 0x7FFFFFFFL) ^ 0xEDB88320L
+      } else {
+        crc = (crc >> 1) & 0x7FFFFFFFL
+      }
+      b += 1
+    }
+    i += 1
+  }
+  (crc ^ 0xFFFFFFFFL) & 0xFFFFFFFFL
+}
+
+fn d_push_be32(out : Array[Byte], v : Int64) -> Unit {
+  out.push(((v >> 24) & 0xFFL).to_int().to_byte())
+  out.push(((v >> 16) & 0xFFL).to_int().to_byte())
+  out.push(((v >> 8) & 0xFFL).to_int().to_byte())
+  out.push((v & 0xFFL).to_int().to_byte())
+}
+
+fn d_push_png_chunk(out : Array[Byte], c0 : Int, c1 : Int, c2 : Int, c3 : Int, payload : Array[Byte]) -> Unit {
+  d_push_be32(out, payload.length().to_int64())
+  let type_start = out.length()
+  out.push(c0.to_byte())
+  out.push(c1.to_byte())
+  out.push(c2.to_byte())
+  out.push(c3.to_byte())
+  for b in payload {
+    out.push(b)
+  }
+  let crc = d_crc32(out, type_start, 4 + payload.length())
+  d_push_be32(out, crc)
+}
+
+/// Encode an opaque `w x h` RGB buffer (length `w * h * 3`, top-to-bottom RGB) into an uncompressed PNG `Bytes`.
+/// Uses standard RFC 1950 zlib stored blocks (`0x78 0x01`) so it is universally decoded on all 4 GPU hosts.
+fn d_encode_rgb_png(w : Int, h : Int, rgb : Array[Byte]) -> Bytes {
+  let out : Array[Byte] = [
+    137.to_byte(), 80.to_byte(), 78.to_byte(), 71.to_byte(),
+    13.to_byte(), 10.to_byte(), 26.to_byte(), 10.to_byte(),
+  ]
+  // IHDR: width, height, bit_depth=8, color_type=2 (RGB), compression=0, filter=0, interlace=0
+  let ihdr : Array[Byte] = []
+  d_push_be32(ihdr, w.to_int64())
+  d_push_be32(ihdr, h.to_int64())
+  ihdr.push(8.to_byte())
+  ihdr.push(2.to_byte())
+  ihdr.push(0.to_byte())
+  ihdr.push(0.to_byte())
+  ihdr.push(0.to_byte())
+  d_push_png_chunk(out, 73, 72, 68, 82, ihdr)
+
+  // Raw scanlines: each row prefixed with filter byte 0
+  let row_len = 1 + w * 3
+  let raw_len = h * row_len
+  let raw : Array[Byte] = Array::new(capacity=raw_len)
+  let mut s1 : Int64 = 1L
+  let mut s2 : Int64 = 0L
+  let mut y = 0
+  while y < h {
+    raw.push(0.to_byte())
+    s2 = (s2 + s1) % 65521L
+    let base = y * w * 3
+    let mut x = 0
+    while x < w * 3 {
+      let b = rgb[base + x]
+      raw.push(b)
+      s1 = (s1 + (b.to_int().to_int64() & 0xFFL)) % 65521L
+      s2 = (s2 + s1) % 65521L
+      x += 1
+    }
+    y += 1
+  }
+  let adler = ((s2 << 16) | s1) & 0xFFFFFFFFL
+
+  // Zlib stream with stored blocks (max 65535 bytes each)
+  let idat : Array[Byte] = [0x78.to_byte(), 0x01.to_byte()]
+  let mut off = 0
+  while off < raw_len {
+    let rem = raw_len - off
+    let blk = if rem > 65535 { 65535 } else { rem }
+    let is_last = off + blk >= raw_len
+    idat.push((if is_last { 1 } else { 0 }).to_byte())
+    idat.push((blk & 0xFF).to_byte())
+    idat.push(((blk >> 8) & 0xFF).to_byte())
+    let nblk = blk ^ 0xFFFF
+    idat.push((nblk & 0xFF).to_byte())
+    idat.push(((nblk >> 8) & 0xFF).to_byte())
+    let mut j = 0
+    while j < blk {
+      idat.push(raw[off + j])
+      j += 1
+    }
+    off += blk
+  }
+  d_push_be32(idat, adler)
+  d_push_png_chunk(out, 73, 68, 65, 84, idat)
+  d_push_png_chunk(out, 73, 69, 78, 68, [])
+
+  let sb = StringBuilder::new()
+  for b in out {
+    sb.write_byte(b)
+  }
+  sb.to_string().to_bytes()
+}
+
+fn d_clamp(v : Double, lo : Double, hi : Double) -> Double {
+  if v < lo { lo } else if v > hi { hi } else { v }
+}
+
+fn d_clamp01(v : Double) -> Double {
+  d_clamp(v, 0.0, 1.0)
+}
+
+fn d_ch(c : Int64, shift : Int) -> Double {
+  ((c >> shift) & 0xFFL).to_double()
+}
+
+fn d_pack_rgb(r : Double, g : Double, b : Double, a~ : Double = 255.0) -> Int64 {
+  let q = fn(v : Double) -> Int64 {
+    d_clamp(v, 0.0, 255.0).round().to_int64() & 0xFFL
+  }
+  (q(r) << 24) | (q(g) << 16) | (q(b) << 8) | q(a)
+}
+
+fn d_with_alpha(c : Int64, alpha01 : Double) -> Int64 {
+  let ai = d_clamp(alpha01 * 255.0, 0.0, 255.0).round().to_int64() & 0xFFL
+  (c & 0xFFFFFF00L) | ai
+}
+
+/// Porter-Duff source-over of `over` (with opacity `a`) onto opaque `under`.
+fn d_mix_over(under : Int64, over : Int64, a : Double) -> Int64 {
+  let t = d_clamp01(a)
+  d_pack_rgb(
+    d_ch(under, 24) + (d_ch(over, 24) - d_ch(under, 24)) * t,
+    d_ch(under, 16) + (d_ch(over, 16) - d_ch(under, 16)) * t,
+    d_ch(under, 8) + (d_ch(over, 8) - d_ch(under, 8)) * t,
+  )
+}
+
+/// White drawn over `under` with CSS `mix-blend-mode: overlay` at opacity `a`:
+/// B(cb, 1) = 2 * cb (when cb <= 0.5), else 1.0.
+fn d_overlay_white(under : Int64, a : Double) -> Int64 {
+  let t = d_clamp01(a)
+  let ch = fn(shift : Int) -> Double {
+    let cb = d_ch(under, shift) / 255.0
+    let bl = if cb <= 0.5 { 2.0 * cb } else { 1.0 }
+    (cb + (bl - cb) * t) * 255.0
+  }
+  d_pack_rgb(ch(24), ch(16), ch(8))
+}
+
+/// Relative luminance (WCAG) of packed `0xRRGGBBAA` color to choose white vs black contrast icon.
+fn d_is_light_color(rgba : Int64) -> Bool {
+  let c = color::unpack_rgba8(rgba)
+  let lin = fn(v : Double) -> Double {
+    if v <= 0.03928 { v / 12.92 } else { dmath::pow((v + 0.055) / 1.055, 2.4) }
+  }
+  let lum = 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+  lum > 0.55
+}
+
+/// Build HeroUI transparency checkerboard rects (`#efefef` / `#f7f7f7`, 8pt half-tile = 16pt period)
+/// centered inside a `w x h` box (matches `repeating-conic-gradient(#efefef 0% 25%, #f7f7f7 0% 50%) 50% / 16px 16px`).
+fn d_checkerboard_rects(w : Double, h : Double, tile~ : Double = 8.0) -> Array[paint::Rect] {
+  let rects : Array[paint::Rect] = []
+  if w <= 0.0 || h <= 0.0 || tile <= 0.0 {
+    return rects
+  }
+  let light_c : Int64 = 0xF7F7F7FFL
+  let dark_c : Int64 = 0xEFEFEFFFL
+  rects.push(paint::rect(0.0, 0.0, w, h, color=light_c))
+  // Align phase to center (50% 50%): cell (0,0) corner starts at (w*0.5, h*0.5)
+  let ox = w * 0.5
+  let oy = h * 0.5
+  let min_ix = ((0.0 - ox) / tile).floor().to_int()
+  let max_ix = ((w - ox) / tile).ceil().to_int()
+  let min_iy = ((0.0 - oy) / tile).floor().to_int()
+  let max_iy = ((h - oy) / tile).ceil().to_int()
+  let mut iy = min_iy
+  while iy < max_iy {
+    let mut ix = min_ix
+    while ix < max_ix {
+      // Conic 0..25% (top-right, ix>=0, iy<0 => parity 0) & 50..75% (bottom-left) are #efefef
+      let par = ((ix + iy) % 2 + 2) % 2
+      if par == 1 {
+        let rx0 = d_clamp(ox + ix.to_double() * tile, 0.0, w)
+        let ry0 = d_clamp(oy + iy.to_double() * tile, 0.0, h)
+        let rx1 = d_clamp(ox + (ix + 1).to_double() * tile, 0.0, w)
+        let ry1 = d_clamp(oy + (iy + 1).to_double() * tile, 0.0, h)
+        if rx1 > rx0 && ry1 > ry0 {
+          rects.push(paint::rect(rx0, ry0, rx1 - rx0, ry1 - ry0, color=dark_c))
+        }
+      }
+      ix += 1
+    }
+    iy += 1
+  }
+  rects
+}
+
+fn d_status_solid_pair(pal : AuraPalette, c : AuraStatusColor) -> (Int64, Int64) {
+  match c {
+    AuraStatusColor::Default => (pal.default_bg, pal.default_foreground)
+    AuraStatusColor::Accent => (pal.accent, pal.accent_foreground)
+    AuraStatusColor::Success => (pal.success, pal.success_foreground)
+    AuraStatusColor::Warning => (pal.warning, pal.warning_foreground)
+    AuraStatusColor::Danger => (pal.danger, pal.danger_foreground)
+  }
+}
+
+fn d_status_soft_pair(pal : AuraPalette, c : AuraStatusColor) -> (Int64, Int64) {
+  match c {
+    AuraStatusColor::Default => (pal.default_soft, pal.default_soft_foreground)
+    AuraStatusColor::Accent => (pal.accent_soft, pal.accent_soft_foreground)
+    AuraStatusColor::Success => (pal.success_soft, pal.success_soft_foreground)
+    AuraStatusColor::Warning => (pal.warning_soft, pal.warning_soft_foreground)
+    AuraStatusColor::Danger => (pal.danger_soft, pal.danger_soft_foreground)
+  }
+}
+
+fn d_status_soft_fg(pal : AuraPalette, c : AuraStatusColor) -> Int64 {
+  match c {
+    AuraStatusColor::Default => pal.default_foreground
+    AuraStatusColor::Accent => pal.accent_soft_foreground
+    AuraStatusColor::Success => pal.success_soft_foreground
+    AuraStatusColor::Warning => pal.warning_soft_foreground
+    AuraStatusColor::Danger => pal.danger_soft_foreground
+  }
+}
