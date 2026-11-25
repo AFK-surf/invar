@@ -488,7 +488,7 @@ static int run_v8_v9_2d_roi(void) {
         }
       }
     }
-    int v10_hash_ok = (h1 != 0u && h2 != 0u);
+    int v10_hash_ok = (h1 == 2045968625u && h2 == 831056605u);
     int v10_ok = (max_d2 <= 14.0) && (side_min >= 150.0 && side_min <= 176.0) &&
                  (light_outer_top_l <= light_mid_l - 15.0) && (light_top_l >= light_mid_l - 0.5) &&
                  (yd_mid >= 54.0 && yd_mid <= 63.0) &&

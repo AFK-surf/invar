@@ -932,7 +932,7 @@ function buildHtmlPage(programs) {
         const v10Ok = maxD2 <= 14.0 && sideMin >= 150.0 && sideMin <= 176.0 &&
           lightOuterTopL <= lightMidL - 15.0 && lightTopL >= lightMidL - 0.5 &&
           ydMid >= 54.0 && ydMid <= 63.0 && ydTop > ydMid + 20.0 && ydSide <= 14.0 && ydSide < ydMid - 40.0 &&
-          h1 !== 0 && h2 !== 0;
+          h1 === 527486360 && h2 === 2971647286;
         pushVec('V10 regular glass Light AA & Dark outer bevel wall (@2x, R=24)', v10Ok,
           [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(lightOuterTopL.toFixed(1)), Number(lightTopL.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), Number(ydSide.toFixed(1)), h1, h2],
           'lightD2<=14, sideMin [150,176], outerTop<=mid-15, innerTop>=mid, darkTop>mid+20, darkSide<=14');
