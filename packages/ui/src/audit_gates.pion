@@ -5,6 +5,8 @@
 // - Invisible interactive press targets (`unseen_press_faults`)
 // - Focused node viewport/clip visibility (`focus_visible_faults`)
 // - Frame-by-frame motion jump & jitter probe (`motion_steady_faults`, `MotionProbe`)
+// - First-line & continuation line-start alignment (`first_line_faults`, `line_start_faults`)
+// - Clipped drop-shadow halo check (`shadow_clip_faults`, `shadow_halo`)
 // - Combined `ui_craft_audit` gate
 
 import "view"
@@ -832,7 +834,162 @@ pub fn Tester::assert_line_start(self : Tester, label~ : String = "") -> Unit {
   assert_fault_list("line_start_faults", self.line_start_faults(), label)
 }
 
-/// Combined UI craft audit aggregating room, scroll, corner, unseen-press, focus-visible, text-overflow/overlap, first-line, and line-start gates.
+/// Minimum transparent shadow clearance `(left, top, right, bottom)` in points
+/// for a node with `.shadow((blur, dy, color))` so the Gaussian tail reaches zero
+/// before any window or `.clips(true)` edge (matches GPU quad spread `3*blur + 2`).
+pub fn shadow_halo(blur : Double, dy : Double) -> (Double, Double, Double, Double) {
+  if blur <= 0.0 {
+    return (0.0, 0.0, 0.0, 0.0)
+  }
+  let spread = (blur * 3.0 + 2.0).ceil()
+  (spread, dmax(0.0, spread - dy), spread, dmax(0.0, spread + dy))
+}
+
+fn round_tenth(v : Double) -> Double {
+  (v * 10.0).round() / 10.0
+}
+
+/// Gate 9: Clipped drop-shadow halo check.
+/// Flags any visible shadowed node (`blur > 0`, effective shadow alpha `> 0.01`) whose
+/// Gaussian shadow halo (`blur * sigma` around `(x, y + dy, w, h)`) is truncated by an
+/// ancestor `.clips(true)` container or (when `include_viewport=true`) the window viewport.
+/// Edges where the node's own box is already scrolled past the boundary or flush-docked across
+/// the full perpendicular span (e.g. full-width docked headers or bottom sheets) are skipped.
+pub fn Tester::shadow_clip_faults(
+  self : Tester,
+  sigma~ : Double = 2.5,
+  include_viewport~ : Bool = true,
+) -> Array[String] {
+  let tree = match view_tree() {
+    Some(tr) => tr
+    None => return []
+  }
+  let held = tree.drawn_held()
+  let n = held.length()
+  let faults : Array[String] = []
+  let vw = self.fake.width
+  let vh = self.fake.height
+  let mut i = 0
+  while i < n {
+    let d = held[i].0
+    let (sblur, sy, scol) = d.shadow
+    let sa = ((scol & 0xFFL).to_int().to_double() / 255.0) * d.alpha
+    if d.alpha > 0.01 && d.w > 0.5 && d.h > 0.5 && sblur > 0.0 && sa > 0.01 {
+      let mut cx0 = 0.0
+      let mut cy0 = 0.0
+      let mut cx1 = vw
+      let mut cy1 = vh
+      let mut has_l = include_viewport
+      let mut has_t = include_viewport
+      let mut has_r = include_viewport
+      let mut has_b = include_viewport
+      let mut src_l = "viewport"
+      let mut src_t = "viewport"
+      let mut src_r = "viewport"
+      let mut src_b = "viewport"
+      let mut p = held[i].1
+      while p >= 0 {
+        let anc = held[p].0
+        if anc.clips || anc.clips_self {
+          let aname = "clip(" + gate_label(tree, anc) + ")"
+          if anc.clips_way != 1 {
+            if (include_viewport || anc.x > 0.5) && (!has_l || anc.x > cx0) {
+              cx0 = anc.x
+              src_l = aname
+              has_l = true
+            }
+            if (include_viewport || anc.x + anc.w < vw - 0.5) && (!has_r || anc.x + anc.w < cx1) {
+              cx1 = anc.x + anc.w
+              src_r = aname
+              has_r = true
+            }
+          }
+          if anc.clips_way != 2 {
+            if (include_viewport || anc.y > 0.5) && (!has_t || anc.y > cy0) {
+              cy0 = anc.y
+              src_t = aname
+              has_t = true
+            }
+            if (include_viewport || anc.y + anc.h < vh - 0.5) && (!has_b || anc.y + anc.h < cy1) {
+              cy1 = anc.y + anc.h
+              src_b = aname
+              has_b = true
+            }
+          }
+        }
+        p = held[p].1
+      }
+      let vx0 = dmax(if has_l { cx0 } else { 0.0 }, d.x)
+      let vy0 = dmax(if has_t { cy0 } else { 0.0 }, d.y)
+      let vx1 = dmin(if has_r { cx1 } else { vw }, d.x + d.w)
+      let vy1 = dmin(if has_b { cy1 } else { vh }, d.y + d.h)
+      if vx1 - vx0 > 0.5 && vy1 - vy0 > 0.5 {
+        let spread = sblur * sigma
+        let name = gate_label(tree, d)
+        let span_w = (if has_r { cx1 } else { vw }) - (if has_l { cx0 } else { 0.0 })
+        let span_h = (if has_b { cy1 } else { vh }) - (if has_t { cy0 } else { 0.0 })
+        let full_w = d.w >= span_w - 2.0
+        let full_h = d.h >= span_h - 2.0
+        // Left side
+        if has_l && d.x >= cx0 - 0.5 && !(d.x <= cx0 + 0.5 && (full_h || full_w)) {
+          let room = dmax(0.0, d.x - cx0)
+          if room + 0.5 < spread {
+            faults.push(
+              "shadow_clip: \{name} left shadow needs \{round_tenth(spread)}pt (blur=\{sblur}), only \{round_tenth(room)}pt before \{src_l}",
+            )
+          }
+        }
+        // Right side
+        if has_r && d.x + d.w <= cx1 + 0.5 && !(d.x + d.w >= cx1 - 0.5 && (full_h || full_w)) {
+          let room = dmax(0.0, cx1 - (d.x + d.w))
+          if room + 0.5 < spread {
+            faults.push(
+              "shadow_clip: \{name} right shadow needs \{round_tenth(spread)}pt (blur=\{sblur}), only \{round_tenth(room)}pt before \{src_r}",
+            )
+          }
+        }
+        // Top side
+        let need_t = dmax(0.0, spread - sy)
+        if has_t && need_t > 0.5 && d.y >= cy0 - 0.5 && !(d.y <= cy0 + 0.5 && (full_w || full_h)) {
+          let room = dmax(0.0, d.y - cy0)
+          if room + 0.5 < need_t {
+            faults.push(
+              "shadow_clip: \{name} top shadow needs \{round_tenth(need_t)}pt (blur=\{sblur}, dy=\{sy}), only \{round_tenth(room)}pt before \{src_t}",
+            )
+          }
+        }
+        // Bottom side
+        let need_b = dmax(0.0, spread + sy)
+        if has_b && need_b > 0.5 && d.y + d.h <= cy1 + 0.5 && !(d.y + d.h >= cy1 - 0.5 && (full_w || full_h)) {
+          let room = dmax(0.0, cy1 - (d.y + d.h))
+          if room + 0.5 < need_b {
+            faults.push(
+              "shadow_clip: \{name} bottom shadow needs \{round_tenth(need_b)}pt (blur=\{sblur}, dy=\{sy}), only \{round_tenth(room)}pt before \{src_b}",
+            )
+          }
+        }
+      }
+    }
+    i += 1
+  }
+  faults
+}
+
+/// Assert zero clipped drop-shadow halos against viewport (when `include_viewport=true`) and ancestor `.clips(true)` bounds.
+pub fn Tester::assert_shadow_clip(
+  self : Tester,
+  sigma~ : Double = 2.5,
+  include_viewport~ : Bool = true,
+  label~ : String = "",
+) -> Unit {
+  assert_fault_list(
+    "shadow_clip_faults",
+    self.shadow_clip_faults(sigma=sigma, include_viewport=include_viewport),
+    label,
+  )
+}
+
+/// Combined UI craft audit aggregating room, scroll, corner, unseen-press, focus-visible, text-overflow/overlap, first-line, line-start, and clipped-ancestor shadow gates.
 pub fn Tester::ui_craft_audit(self : Tester) -> Array[String] {
   let out : Array[String] = []
   for f in self.room_faults() {
@@ -857,6 +1014,9 @@ pub fn Tester::ui_craft_audit(self : Tester) -> Array[String] {
     out.push(f)
   }
   for f in self.line_start_faults() {
+    out.push(f)
+  }
+  for f in self.shadow_clip_faults(sigma=2.0, include_viewport=false) {
     out.push(f)
   }
   out
