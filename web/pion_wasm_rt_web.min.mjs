@@ -1,5 +1,5 @@
 // Pion WebAssembly (wasm32) Minimal Browser Runtime (Zero Node.js Dependencies)
-// Synced from AFK-surf/pion@14a5a636 runtime/pion_wasm_rt.mjs (PION_WASM_RT_ABI v2, rawAlloc overflow guard, stride-4 Int/UInt/Char array sort, P71-C 128-bit wymix Map hashing, P73 iterative RC drop, P75/P77) with zero-copy host bridge helpers preserved.
+// Synced from AFK-surf/pion@932b21e2cf runtime/pion_wasm_rt_web.mjs with zero-copy host bridge helpers preserved.
 export const PION_WASM_RT_ABI = 2;
 const TAG_STRING = 1, TAG_BYTES = 2, TAG_ARRAY = 3, TAG_MAP = 7, TAG_CHANNEL = 8, TAG_MUTEX = 9, TAG_ATOMIC = 10, TAG_STRBUF = 11, TAG_SCOPE = 12, TAG_WORLD = 13;
 const FLAG_FROZEN = 1, FLAG_IMMORTAL = 2, HDR = 24, PAGE = 65536;
@@ -16,21 +16,82 @@ const ALLOC_MAGIC = 0x50494f4e, FREE_MAGIC = 0x46524545;
 const dec = new TextDecoder("utf-8", { fatal: false });
 const enc = new TextEncoder();
 
-function fmtG(v, d) {
+const _f64Buf = new ArrayBuffer(8);
+const _f64Arr = new Float64Array(_f64Buf);
+const _u64Arr = new BigUint64Array(_f64Buf);
+
+function c99Pow(x, y) {
+  if (y === 0) return 1.0;
+  if (x === 1) return 1.0;
+  if (x === -1 && (y === Infinity || y === -Infinity)) return 1.0;
+  return Math.pow(x, y);
+}
+
+function c99Round(x) {
+  if (!Number.isFinite(x) || x === 0) return x;
+  const ax = Math.abs(x);
+  const fl = Math.floor(ax);
+  const res = (ax - fl >= 0.5) ? (fl + 1) : fl;
+  return x < 0 ? -res : res;
+}
+
+export function fmtG(v, d) {
   if (Number.isNaN(v)) return "nan";
   if (v === Infinity) return "inf";
   if (v === -Infinity) return "-inf";
   if (v === 0) return Object.is(v, -0) ? "-0" : "0";
-  const e = Math.floor(Math.log10(Math.abs(v)));
-  if (e < -4 || e >= d) {
-    const s = v.toExponential(d - 1), i = s.indexOf("e");
-    let m = s.slice(0, i), x = s.slice(i + 1), dg = x.slice(1);
-    if (m.includes(".")) m = m.replace(/\.?0+$/, "");
-    return m + "e" + x[0] + (dg.length < 2 ? "0" + dg : dg);
+  _f64Arr[0] = v;
+  const bits = _u64Arr[0];
+  const sign = (bits >> 63n) !== 0n;
+  const rawExp = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & 0xfffffffffffffn;
+  const mant = rawExp === 0 ? frac : ((1n << 52n) | frac);
+  const e2 = rawExp === 0 ? -1074 : (rawExp - 1075);
+  const p = d > 0 ? d : 1;
+  let e10 = Math.floor(Math.log10(Math.abs(v)));
+  const num = e2 >= 0 ? (mant << BigInt(e2)) : mant;
+  const den = e2 >= 0 ? 1n : (1n << BigInt(-e2));
+  const shift = (p - 1) - e10;
+  let sNum = shift >= 0 ? (num * (10n ** BigInt(shift))) : num;
+  let sDen = shift >= 0 ? den : (den * (10n ** BigInt(-shift)));
+  const low = 10n ** BigInt(p - 1);
+  const high = low * 10n;
+  while (sNum < low * sDen) {
+    e10 -= 1;
+    sNum *= 10n;
   }
-  const s = v.toPrecision(d);
-  return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
+  while (sNum >= high * sDen) {
+    e10 += 1;
+    sDen *= 10n;
+  }
+  let q = sNum / sDen;
+  const rem = sNum % sDen;
+  const twiceRem = rem << 1n;
+  if (twiceRem > sDen || (twiceRem === sDen && (q & 1n) === 1n)) {
+    q += 1n;
+  }
+  if (q === high) {
+    q = low;
+    e10 += 1;
+  }
+  const digits = q.toString();
+  const pfx = sign ? "-" : "";
+  if (e10 < -4 || e10 >= p) {
+    const trimmed = digits.replace(/0+$/, "");
+    const mantStr = trimmed.length === 1 ? trimmed : (trimmed[0] + "." + trimmed.slice(1));
+    const expSign = e10 >= 0 ? "+" : "-";
+    const expAbs = Math.abs(e10).toString().padStart(2, "0");
+    return pfx + mantStr + "e" + expSign + expAbs;
+  }
+  if (e10 < 0) {
+    const trimmed = digits.replace(/0+$/, "");
+    return pfx + "0." + "0".repeat(-e10 - 1) + trimmed;
+  }
+  const intPart = digits.slice(0, e10 + 1);
+  const fracPart = digits.slice(e10 + 1).replace(/0+$/, "");
+  return fracPart.length > 0 ? (pfx + intPart + "." + fracPart) : (pfx + intPart);
 }
+export { fmtG as formatG };
 
 function splitmix64(x) {
   let z = BigInt.asUintN(64, x + 0x9e3779b97f4a7c15n);
@@ -115,7 +176,7 @@ export function createPionRuntime(opts = {}) {
     if ((slabCtl > 0 || ra !== undefined) && modAbi !== PION_WASM_RT_ABI) {
       throw new Error(
         `Pion Wasm runtime ABI mismatch: runtime expects v${PION_WASM_RT_ABI}, module exports v${modAbi}. ` +
-        `Sync web/pion_wasm_rt_web*.mjs with the pionc version that built this .wasm.`
+        `Sync runtime/pion_wasm_rt*.mjs with the pionc version that built this .wasm.`
       );
     }
     if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
@@ -151,9 +212,7 @@ export function createPionRuntime(opts = {}) {
     return need <= tq ? tq : p;
   }
   function rawAlloc(sz) {
-    if (!Number.isFinite(sz) || sz < 0 || sz > 0x7FFFFFE8) {
-      pionDie("allocation size exceeds wasm32 limit");
-    }
+    if (!Number.isFinite(sz) || sz < 0 || sz > 0x7FFFFFE8) pionDie("allocation size exceeds wasm32 limit");
     sync();
     const need = Math.ceil(sz / 8) * 8 + 8, c = clsIdx(need);
     if (c >= 0) {
@@ -331,23 +390,7 @@ export function createPionRuntime(opts = {}) {
 
   function readCStr(ptr) { const p = pNum(ptr); if (!p) return ""; sync(); let e = p; while (u8[e]) e++; return dec.decode(u8.subarray(p, e)); }
   function readStr(ptr) { const p = pNum(ptr); if (!p) return ""; sync(); return dec.decode(u8.subarray(p + 8, p + 8 + Number(g64(p)))); }
-  function readUtf8(ptr, len) { const p = pNum(ptr), n = Number(len); if (!p || n <= 0) return ""; sync(); return dec.decode(u8.subarray(p, p + n)); }
-  function mkCStr(s) {
-    const bs = enc.encode(String(s || ""));
-    const p = rawAlloc(bs.length + 1); sync();
-    u8.set(bs, p); u8[p + bs.length] = 0; return pBig(p);
-  }
-  function readBytes(ptr) {
-    const p = pNum(ptr); if (!p) return new Uint8Array(0); sync();
-    const n = Number(g64(p)), dp = Number(g64(p + 16));
-    return n > 0 && dp ? u8.slice(dp, dp + n) : new Uint8Array(0);
-  }
-  function mkBytes(src) {
-    const bs = src instanceof Uint8Array ? src : new Uint8Array(src || 0);
-    const o = pion_bytes_new(BigInt(bs.length)); sync();
-    if (bs.length) u8.set(bs, Number(g64(pNum(o) + 16)));
-    return o;
-  }
+  function readUtf8(ptr, len) { if (len === undefined) return readStr(ptr); const p = pNum(ptr), n = Number(len); if (!p || n <= 0) return ""; sync(); return dec.decode(u8.subarray(p, p + n)); }
   function mkStrBytes(bs) {
     const n = bs.length, o = pion_alloc_uninit(9 + n, TAG_STRING, 0n), p = pNum(o); sync();
     s64(p, n); u8.set(bs, p + 8); u8[p + 8 + n] = 0; return o;
@@ -629,11 +672,8 @@ export function createPionRuntime(opts = {}) {
     if (isObj) arrRcAll(dp + n * arrStride(p), l - n, isObj, st, false);
     s64(p, n);
   }
-
   function pion_arr_clear(a) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
-    arrRcAll(dp, l, isObj, st, false);
-    s64(p, 0);
+    pion_arr_truncate(a, 0);
   }
   function pion_arr_reverse(a) {
     const p = pNum(a); sync(); const l = Number(g64(p)), dp = Number(g64(p + 24)), st = arrStride(p);
@@ -660,9 +700,9 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_arr_sort_int = (a) => {
     const p = pNum(a); sync(); const l = Number(g64(p)); if (l <= 1) return;
-    const dp = Number(g64(p + 24)), st = g32(p + 20);
-    if (st === 1) { u8.subarray(dp, dp + l).sort(); return; }
-    if (st === 4) { new Int32Array(u8.buffer, dp, l).sort(); return; }
+    const st = g32(p + 20);
+    if (st === 1) { const dp = Number(g64(p + 24)); u8.subarray(dp, dp + l).sort(); return; }
+    if (st === 4) { const dp = Number(g64(p + 24)); new Int32Array(u8.buffer, dp, l).sort(); return; }
     arrSort(a, (x, y) => (x < y ? -1 : x > y ? 1 : 0));
   };
   const pion_arr_sort_str = (a) => arrSort(a, pion_str_cmp);
@@ -884,19 +924,26 @@ export function createPionRuntime(opts = {}) {
 
   const imports = {
     pion_rt: {
+      __pion_rt_abi_v2: () => {},
       pion_cur_tid: () => 1n, pion_alloc, pion_alloc_uninit,
       pion_rc_inc, pion_rc_dec, pion_rc_dec_slow, pion_rc_freeze, pion_rc_immortalize,
       pion_panic, pion_panic_oob, pion_debug_assert,
       pion_math_sqrt: Math.sqrt, pion_math_abs: Math.abs, pion_math_floor: Math.floor,
-      pion_math_ceil: Math.ceil, pion_math_sin: Math.sin, pion_math_cos: Math.cos, pion_math_pow: Math.pow,
-      sqrt: Math.sqrt, fabs: Math.abs, floor: Math.floor, ceil: Math.ceil,
-      round: (x) => (x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
-      trunc: Math.trunc, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+      pion_math_ceil: Math.ceil, pion_math_sin: Math.sin, pion_math_cos: Math.cos, pion_math_pow: c99Pow,
+      sqrt: Math.sqrt, cbrt: Math.cbrt, fabs: Math.abs, floor: Math.floor, ceil: Math.ceil,
+      round: c99Round,
+      trunc: Math.trunc, sin: Math.sin, cos: Math.cos, tan: Math.tan,
+      asin: Math.asin, acos: Math.acos, atan: Math.atan, pow: c99Pow,
       atan2: Math.atan2, log: Math.log, log1p: Math.log1p, exp: Math.exp, fmod: (a, b) => a % b,
-      roundf: (x) => Math.fround(x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
+      roundf: (x) => Math.fround(c99Round(Math.fround(x))),
       truncf: (x) => Math.fround(Math.trunc(x)), floorf: (x) => Math.fround(Math.floor(x)),
       ceilf: (x) => Math.fround(Math.ceil(x)), fabsf: (x) => Math.fround(Math.abs(x)),
-      sqrtf: (x) => Math.fround(Math.sqrt(x)),
+      sqrtf: (x) => Math.fround(Math.sqrt(x)), cbrtf: (x) => Math.fround(Math.cbrt(x)),
+      powf: (x, y) => Math.fround(c99Pow(x, y)), expf: (x) => Math.fround(Math.exp(x)),
+      logf: (x) => Math.fround(Math.log(x)), sinf: (x) => Math.fround(Math.sin(x)),
+      cosf: (x) => Math.fround(Math.cos(x)), tanf: (x) => Math.fround(Math.tan(x)),
+      atan2f: (y, x) => Math.fround(Math.atan2(y, x)), asinf: (x) => Math.fround(Math.asin(x)),
+      acosf: (x) => Math.fround(Math.acos(x)), atanf: (x) => Math.fround(Math.atan(x)),
       pion_str_from_cstr, pion_str_len, pion_str_byte_at, pion_str_concat, pion_str_concat_n,
       pion_str_eq, pion_str_cmp, pion_str_slice, pion_int_to_str, pion_uint64_to_str,
       pion_double_to_str, pion_float_to_str, pion_str_to_int, pion_str_to_double,
@@ -936,9 +983,73 @@ export function createPionRuntime(opts = {}) {
       pion_ptr_read_i64: (p, o) => (sync(), g64(pNum(p) + Number(o))),
       pion_ptr_write_i64: (p, o, v) => { sync(); s64(pNum(p) + Number(o), v); },
       pion_cstr_to_str: (c) => mkStr(readCStr(c)),
-      __pion_rt_abi_v2: () => {},
     },
   };
+  if (opts.extraImports !== undefined && opts.extraImports !== null) {
+    if (typeof opts.extraImports !== "object") {
+      throw new Error("createPionRuntime: extraImports must be an object");
+    }
+    for (const ns of Object.keys(opts.extraImports)) {
+      if (ns === "pion_rt") {
+        throw new Error("createPionRuntime: extraImports cannot override reserved 'pion_rt' namespace");
+      }
+      const mod = opts.extraImports[ns];
+      if (mod && typeof mod === "object") {
+        imports[ns] = { ...mod };
+      }
+    }
+  }
+  if (opts.hostFns !== undefined && opts.hostFns !== null) {
+    if (typeof opts.hostFns !== "object") {
+      throw new TypeError("createPionRuntime: hostFns must be an object");
+    }
+    for (const k of Object.keys(opts.hostFns)) {
+      if (Object.prototype.hasOwnProperty.call(imports.pion_rt, k)) {
+        throw new Error(`createPionRuntime: hostFns cannot override built-in pion_rt symbol '${k}'`);
+      }
+      const fn = opts.hostFns[k];
+      if (typeof fn !== "function") {
+        throw new TypeError(`createPionRuntime: hostFns['${k}'] must be a function`);
+      }
+      imports.pion_rt[k] = fn;
+    }
+  }
+
+  function mkCStr(jsStr) {
+    const bs = enc.encode(jsStr == null ? "" : String(jsStr));
+    const p = rawAlloc(bs.length + 1);
+    sync();
+    u8.set(bs, p);
+    u8[p + bs.length] = 0;
+    return pBig(p);
+  }
+  function readBytes(obj) {
+    const p = pNum(obj);
+    if (!p) return new Uint8Array(0);
+    sync();
+    const len = Number(g64(p));
+    if (len <= 0) return new Uint8Array(0);
+    const dp = Number(g64(p + 16));
+    return u8.slice(dp, dp + len);
+  }
+  function mkBytes(data) {
+    const src = data instanceof Uint8Array
+      ? data
+      : (ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : (data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data || 0)));
+    const safeSrc = (memory && src.byteLength > 0 && src.buffer === memory.buffer)
+      ? new Uint8Array(src)
+      : src;
+    const o = pion_bytes_new(BigInt(safeSrc.length));
+    if (safeSrc.length > 0) {
+      sync();
+      const dp = Number(g64(pNum(o) + 16));
+      u8.set(safeSrc, dp);
+    }
+    return o;
+  }
+
   if (exp) bindExports(exp);
   return {
     imports,
@@ -946,11 +1057,15 @@ export function createPionRuntime(opts = {}) {
     getStdout: () => out.join(""),
     getStderr: () => err.join(""),
     readStr,
-    mkStr,
     readUtf8,
+    mkStr,
     mkCStr,
     readBytes,
     mkBytes,
+    freePtr: (ptr) => rawFree(pNum(ptr)),
+    rcDec: pion_rc_dec,
+    rcInc: pion_rc_inc,
+    syncMemory: sync,
     rawFree,
     sync,
     getMemory: () => memory,
