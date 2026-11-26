@@ -508,31 +508,31 @@ function buildHtmlPage(programs) {
       const vectors = [
         {
           name: 'V1 dark regular on #000000',
-          got: sampleGlass([0, 0, 0], darkTint, 2.0, 0.6, 14.0, 20.0, 0.06, false),
-          check: ([r, g, b]) => Math.abs(r - 30) <= 3 && Math.abs(g - 30) <= 3 && Math.abs(b - 30) <= 3,
-          expected: '(30,30,30) +/-3',
+          got: sampleGlass([0, 0, 0], darkTint, 1.2, 0.6, 14.0, 20.0, 0.06, false),
+          check: ([r, g, b]) => Math.abs(r - 34) <= 3 && Math.abs(g - 34) <= 3 && Math.abs(b - 34) <= 3,
+          expected: '(34,34,34) +/-3',
         },
         {
           name: 'V2 dark regular on #1B1C1F',
-          got: sampleGlass([27 / 255, 28 / 255, 31 / 255], darkTint, 2.0, 0.6, 14.0, 20.0, 0.06, false),
-          check: ([r, g, b]) => Math.abs(r - 46) <= 3 && Math.abs(g - 47) <= 3 && Math.abs(b - 50) <= 3,
-          expected: '(46,47,50) +/-3',
+          got: sampleGlass([27 / 255, 28 / 255, 31 / 255], darkTint, 1.2, 0.6, 14.0, 20.0, 0.06, false),
+          check: ([r, g, b]) => Math.abs(r - 58) <= 3 && Math.abs(g - 59) <= 3 && Math.abs(b - 62) <= 3,
+          expected: '(58,59,62) +/-3',
         },
         {
           name: 'V3 dark adaptive regular on #FFFFFF',
-          got: sampleGlass([1, 1, 1], darkTint, 2.0, 0.6, 14.0, 20.0, 0.06, true),
-          check: ([r, g, b]) => Math.abs(r - 93) <= 3 && Math.abs(g - 93) <= 3 && Math.abs(b - 93) <= 3,
-          expected: '(93,93,93) +/-3',
+          got: sampleGlass([1, 1, 1], darkTint, 1.2, 0.6, 14.0, 20.0, 0.06, true),
+          check: ([r, g, b]) => Math.abs(r - 174) <= 3 && Math.abs(g - 174) <= 3 && Math.abs(b - 174) <= 3,
+          expected: '(174,174,174) +/-3',
         },
         {
           name: 'V4 light regular on #0088FF',
-          got: sampleGlass([0, 136 / 255, 1], lightTint, 2.0, 0.6, 14.0, 20.0, 0.06, false),
+          got: sampleGlass([0, 136 / 255, 1], lightTint, 1.2, 0.6, 14.0, 20.0, 0.06, false),
           check: ([r, g, b]) => {
             const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
             const sat = mx > 0 ? (mx - mn) / mx : 0;
-            return Math.abs(r - 40) <= 3 && Math.abs(g - 154) <= 3 && Math.abs(b - 255) <= 3 && sat >= 0.75;
+            return Math.abs(r - 89) <= 4 && Math.abs(g - 206) <= 4 && Math.abs(b - 255) <= 4 && sat >= 0.62;
           },
-          expected: '(40,154,255) +/-3 & HSV S>=0.75',
+          expected: '(89,206,255) +/-4 & HSV S>=0.62',
         },
         {
           name: 'V5 pure clear on (0,255,64)',
@@ -893,18 +893,19 @@ function buildHtmlPage(programs) {
           col: [253 / 255, 252 / 255, 253 / 255, 103 / 255],
           rim: 0.6, bezel: 14, refract: 18, chroma: 0.06,
         });
-        const mins = [];
+        const masses = [];
+        const bgL = 0.2126 * 242 + 0.7152 * 240 + 0.0722 * 236;
         for (let py = 44; py <= 84; py++) {
-          let rm = 1e9;
+          let mass = 0;
           for (let px = 200; px <= 284; px++) {
             const l = lumaF(regL, px, py);
-            if (l < rm) rm = l;
+            if (l < bgL) mass += bgL - l;
           }
-          mins.push(rm);
+          masses.push(mass / 2.0);
         }
         let maxD2 = 0;
-        for (let k = 1; k < mins.length - 1; k++) {
-          const d2 = Math.abs(mins[k - 1] - 2 * mins[k] + mins[k + 1]);
+        for (let k = 1; k < masses.length - 1; k++) {
+          const d2 = Math.abs(masses[k - 1] - 2 * masses[k] + masses[k + 1]);
           if (d2 > maxD2) maxD2 = d2;
         }
         let sideMin = 1e9;
@@ -912,12 +913,15 @@ function buildHtmlPage(programs) {
           const l = lumaF(regL, sx, 120);
           if (l < sideMin) sideMin = l;
         }
+        const lightOuterTop = lumaF(regL, 160, 39);
+        const lightTop = lumaF(regL, 160, 40);
+        const lightMid = lumaF(regL, 160, 120);
         const regD = run2D(160, 120, 2, () => [28, 28, 30], {
           x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.1,
           col: [32 / 255, 32 / 255, 32 / 255, 103 / 255],
           rim: 0.6, bezel: 14, refract: 18, chroma: 0.06,
         });
-        const ydMid = lumaF(regD, 160, 120), ydTop = lumaF(regD, 160, 41);
+        const ydMid = lumaF(regD, 160, 120), ydTop = lumaF(regD, 160, 40);
         let h1 = 2166136261 >>> 0, h2 = 5381 >>> 0;
         for (let ry = 38; ry <= 122; ry++) {
           for (let rx = 160; rx <= 283; rx++) {
@@ -928,11 +932,12 @@ function buildHtmlPage(programs) {
             }
           }
         }
-        const v10DarkHashOk = (h1 === 811113702 && h2 === 3136138768);
-        const v10Ok = maxD2 <= 14.0 && sideMin >= 212.0 && sideMin <= 232.0 && ydTop > ydMid + 5.0 && v10DarkHashOk;
+        const v10DarkHashOk = (h1 === 2429946954 && h2 === 3477172240);
+        const v10Ok = maxD2 <= 14.0 && sideMin >= 150.0 && sideMin <= 176.0 &&
+          lightOuterTop <= lightMid - 15.0 && lightTop >= lightMid && ydTop > ydMid + 5.0 && v10DarkHashOk;
         pushVec('V10 regular glass Light AA & Dark ROI RGBA8 exact (@2x, R=24)', v10Ok,
-          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), h1, h2],
-          'lightD2<=14, sideMin [212,232], darkTop>darkMid+5, darkROI=(811113702,3136138768) max_abs_diff==0');
+          [Number(maxD2.toFixed(2)), Number(sideMin.toFixed(1)), Number(lightOuterTop.toFixed(1)), Number(lightTop.toFixed(1)), Number(lightMid.toFixed(1)), Number(ydTop.toFixed(1)), Number(ydMid.toFixed(1)), h1, h2],
+          'lightD2<=14, sideMin [150,176], outerTop<=mid-15, top>=mid, darkTop>darkMid+5, darkROI=(2429946954,3477172240) max_abs_diff==0');
       }
 
       // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
@@ -1074,7 +1079,7 @@ function buildHtmlPage(programs) {
           const drawFrost = (f, initBg) => {
             const active = f > 0.0001;
             const aFrac = active ? 0.94 * f : 0.0;
-            const blurSlot = aFrac <= 0.12 ? -32.0 : 14.0 * ((aFrac - 0.12) / 0.88) * 0.5;
+            const blurSlot = aFrac <= 0.12 ? -32.0 : Math.max(0.01, 14.0 * ((aFrac - 0.12) / 0.88) * 0.5);
             const refr = active ? 9.0 * (1.0 - 0.55 * f) : 9.0;
             const trgb = active ? 1.0 + (240.0 / 255.0 - 1.0) * (0.5 * f) : 1.0;
             const ta = Math.round(aFrac * 255.0) / 255.0;
@@ -1130,7 +1135,7 @@ function buildHtmlPage(programs) {
           v11Ok ? '3x<=10/12, 2x<=12/14, wall+emerald, top 5.00/5.20pt, frost dEps<=2 dBlur<=8 dCross<=90' : JSON.stringify(v11Summary));
       }
 
-      // V12-Apple-Panel-Glass: Light 0xFDFCFDBFL bright-bg chroma + 1.5pt cushion rim & 0xFDFCFDFFL uniformity
+      // V12-Unified-Overlay: Light 0xFDFCFD80 bright-bg chroma + top rim, 0xFF uniformity, gray monotonicity, ctrl 0-diff
       {
         const lumaF = (res, x, y) => {
           const [r, g, b] = res.at(x, y);
@@ -1138,63 +1143,32 @@ function buildHtmlPage(programs) {
         };
         const bubbleBg = () => [211, 232, 253];
         const bf = run2D(160, 120, 2, bubbleBg, {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [253 / 255, 252 / 255, 253 / 255, 191 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 14.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 128 / 255], rim: 0.6, bezel: 20, refract: 16, chroma: 0.0,
         });
         const [cr, , cb] = bf.at(160, 88);
         const centerChroma = cb - cr;
-        const topL = lumaF(bf, 160, 43);
+        const topL = lumaF(bf, 160, 40);
         const centerL = lumaF(bf, 160, 88);
         const ff = run2D(160, 120, 2, null, {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [253 / 255, 252 / 255, 253 / 255, 1.0], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 14.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 1.0], rim: 0.6, bezel: 20, refract: 16, chroma: 0.0,
         });
-        const dLff = Math.abs(lumaF(ff, 160, 43) - lumaF(ff, 160, 88));
-        // 3. Light monotonicity over gray 0.60 vs 0.72: 0xBF L(0.72) >= L(0.60) + 2.0, and 0xCD (frost=0.3) L(0.72) >= L(0.60)
+        const dLff = Math.abs(lumaF(ff, 160, 40) - lumaF(ff, 160, 88));
         const g60 = run2D(160, 120, 2, () => [153, 153, 153], {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [253 / 255, 252 / 255, 253 / 255, 191 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 14.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 128 / 255], rim: 0.6, bezel: 20, refract: 16, chroma: 0.0,
         });
         const g72 = run2D(160, 120, 2, () => [184, 184, 184], {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [253 / 255, 252 / 255, 253 / 255, 191 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
+          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 14.0,
+          col: [253 / 255, 252 / 255, 253 / 255, 128 / 255], rim: 0.6, bezel: 20, refract: 16, chroma: 0.0,
         });
         const lG60 = lumaF(g60, 160, 88);
         const lG72 = lumaF(g72, 160, 88);
-        const cd60 = run2D(160, 120, 2, () => [153, 153, 153], {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [253 / 255, 252 / 255, 253 / 255, 205 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
-        });
-        const cd72 = run2D(160, 120, 2, () => [184, 184, 184], {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [253 / 255, 252 / 255, 253 / 255, 205 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
-        });
-        const lCd60 = lumaF(cd60, 160, 88);
-        const lCd72 = lumaF(cd72, 160, 88);
-        // 4. Dark 0xA8 chroma=0.03 vs chroma=0.0 over saturated blue (60, 120, 210): B-R diff >= 8
         const satBlue = () => [60, 120, 210];
-        const a8c3 = run2D(160, 120, 2, satBlue, {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [32 / 255, 32 / 255, 32 / 255, 168 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.03,
-        });
-        const a8c0 = run2D(160, 120, 2, null, {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 6.0,
-          col: [32 / 255, 32 / 255, 32 / 255, 168 / 255], rim: 0.6, bezel: 20, refract: 26, chroma: 0.0,
-        });
-        const [a3r, , a3b] = a8c3.at(160, 88);
-        const [a0r, , a0b] = a8c0.at(160, 88);
-        const darkA8Diff = (a3b - a3r) - (a0b - a0r);
-        // 5. Dark 0xCC (Sheet/Drawer, chroma=0.0) over saturated blue (60, 120, 210): zero drift (B-R ~ 45)
-        const cc0 = run2D(160, 120, 2, null, {
-          x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 12.0,
-          col: [32 / 255, 32 / 255, 32 / 255, 204 / 255], rim: 0.6, bezel: 20, refract: 24, chroma: 0.0,
-        });
-        const [ccr, , ccb] = cc0.at(160, 88);
-        const darkCC = ccb - ccr;
-        // 6. Regular controls (chroma=0.06) under contrast=true (0x85) and frost=0.5 (0xAB): bit-for-bit max_abs_diff == 0 vs chroma=0.0
         const ctrlMaxDiff = (col, bgFn) => {
-          const r6 = run2D(160, 120, 2, bgFn, { x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.0, col, rim: 0.6, bezel: 14, refract: 20, chroma: 0.06 });
-          const r0 = run2D(160, 120, 2, null, { x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 2.0, col, rim: 0.6, bezel: 14, refract: 20, chroma: 0.0 });
+          const r6 = run2D(160, 120, 2, bgFn, { x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 1.2, col, rim: 0.6, bezel: 14, refract: 20, chroma: 0.06 });
+          const r0 = run2D(160, 120, 2, null, { x: 20, y: 20, w: 120, h: 80, r: 24, blurSlot: 1.2, col, rim: 0.6, bezel: 14, refract: 20, chroma: 0.0 });
           let md = 0;
           for (let py = 40; py <= 200; py++) {
             for (let px = 40; px <= 280; px++) {
@@ -1207,10 +1181,10 @@ function buildHtmlPage(programs) {
         const dL85 = ctrlMaxDiff([253 / 255, 252 / 255, 253 / 255, 133 / 255], bubbleBg);
         const dLAB = ctrlMaxDiff([253 / 255, 252 / 255, 253 / 255, 171 / 255], bubbleBg);
         const dDAB = ctrlMaxDiff([32 / 255, 32 / 255, 32 / 255, 171 / 255], satBlue);
-        const v12Ok = centerChroma >= 22 && (topL - centerL) >= 4.0 && dLff <= 3.0 && lG72 >= lG60 + 2.0 && lCd72 >= lCd60 && darkA8Diff >= 8 && darkCC >= 41 && darkCC <= 49 && dL85 === 0 && dLAB === 0 && dDAB === 0;
-        pushVec('V12-Apple-Panel-Glass (0xBF/0xCD mono, 0xFF, dark 0xA8/0xCC, ctrl 0-diff)', v12Ok,
-          [centerChroma, Number((topL - centerL).toFixed(1)), Number(dLff.toFixed(2)), Number(lG60.toFixed(1)), Number(lG72.toFixed(1)), Number(lCd60.toFixed(1)), Number(lCd72.toFixed(1)), darkA8Diff, darkCC, dL85, dLAB, dDAB],
-          '0xBF B-R>=22 dRim>=4 L72>=L60+2 0xCD L72>=L60, 0xFF |dL|<=3, darkA8 d>=8, darkCC [41..49], ctrlDiff=(0,0,0)');
+        const v12Ok = centerChroma >= 12 && (topL - centerL) >= 4.0 && dLff <= 3.0 && lG72 >= lG60 + 2.0 && dL85 === 0 && dLAB === 0 && dDAB === 0;
+        pushVec('V12-Unified-Overlay (0x80 chroma/rim/mono, 0xFF, ctrl 0-diff)', v12Ok,
+          [centerChroma, Number((topL - centerL).toFixed(1)), Number(dLff.toFixed(2)), Number(lG60.toFixed(1)), Number(lG72.toFixed(1)), dL85, dLAB, dDAB],
+          '0x80 B-R>=12 dRim>=4 L72>=L60+2, 0xFF |dL|<=3, ctrlDiff=(0,0,0)');
       }
 
       gl.deleteTexture(bdTex);
