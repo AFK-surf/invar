@@ -1,0 +1,150 @@
+// Invar-specific host extensions kept cleanly outside mbt2pion-generated `host.pion`.
+// Covers cross-thread native wake-up, per-window back-gesture enablement, retained GPU
+// offscreen layers, and desktop window close/center/hide hooks.
+
+/// Extension callbacks installed alongside `hostapi::Host` by Invar host backends
+/// (`host`, `host_web`) and test harnesses (`ui::FakeHost`).
+pub struct HostExt {
+  pub mut wake_now : () -> Unit
+  pub mut back_enabled_for : (Int, Bool) -> Unit
+  pub mut layer_supported : () -> Bool
+  pub mut layer_render : (Int, Int, Int, Double, FixedArray[Double], Int) -> Bool
+  pub mut layer_destroy : (Int) -> Unit
+  pub mut set_window_close : (() -> Bool) -> Unit
+  pub mut window_center : () -> Unit
+  pub mut window_hide : () -> Unit
+}
+
+/// Default no-op extension callbacks.
+pub fn HostExt::noop() -> HostExt {
+  HostExt::{
+    wake_now: fn() -> Unit { () },
+    back_enabled_for: fn(_wid : Int, _on : Bool) -> Unit { () },
+    layer_supported: fn() -> Bool { false },
+    layer_render: fn(
+      _id : Int,
+      _phys_w : Int,
+      _phys_h : Int,
+      _scale : Double,
+      _inst : FixedArray[Double],
+      _count : Int,
+    ) -> Bool {
+      false
+    },
+    layer_destroy: fn(_id : Int) -> Unit { () },
+    set_window_close: fn(_f : () -> Bool) -> Unit { () },
+    window_center: fn() -> Unit { () },
+    window_hide: fn() -> Unit { () },
+  }
+}
+
+extern "C" fn pion_cur_tid() -> Int64 = "pion_cur_tid"
+extern "C" fn c_set_native_wake(fn_ptr : Ptr) -> Unit = "invar_hostapi_set_native_wake"
+extern "C" fn c_call_native_wake() -> Unit = "invar_hostapi_call_native_wake"
+
+struct HostExtBox {
+  mut ext : HostExt
+}
+
+struct WakeSlot {
+  mut f : () -> Unit
+}
+
+let current_host_ext : HostExtBox = HostExtBox::{ ext: HostExt::noop() }
+let wake_lock : Mutex[Int] = Mutex::new(0)
+let wake_slot : WakeSlot = WakeSlot::{ f: fn() -> Unit { () } }
+let wake_seq : AtomicInt = AtomicInt::new(0)
+let wake_owner_tid : AtomicInt = AtomicInt::new(0)
+
+/// Base texture id for retained physical-pixel GPU offscreen layers (`layer_tex_base + id`).
+/// `3 << 22 = 12582912` stays strictly inside IEEE-754 f32 exact integer range (`<= 2^24`).
+pub let layer_tex_base : Int = 12582912
+
+/// Installs a lock-free C function pointer `void (*)(void)` invoked by `wake_now()`
+/// from any OS thread without touching Pion closures or biased RC.
+/// Pass `ptr_null()` to clear.
+pub fn set_native_wake(fn_ptr : Ptr) -> Unit {
+  c_set_native_wake(fn_ptr)
+}
+
+/// Returns the active Invar host extension table.
+pub fn host_ext() -> HostExt {
+  current_host_ext.ext
+}
+
+/// Installs the active Invar host extension table.
+/// Clears any previously registered native wake callback and updates the owning thread's
+/// `wake_slot.f` closure under `wake_lock`.
+pub fn set_host_ext(ext : HostExt) -> Unit {
+  c_set_native_wake(ptr_null())
+  current_host_ext.ext = ext
+  let wf = ext.wake_now
+  wake_owner_tid.store(pion_cur_tid().to_int())
+  wake_lock.with_lock(fn(_v : Int) -> Unit {
+    wake_slot.f = wf
+  })
+}
+
+/// Returns the total number of `wake_now()` calls recorded across all threads.
+pub fn wake_count() -> Int {
+  wake_seq.load()
+}
+
+/// Resets the cross-thread `wake_now()` counter (for tests and stress harnesses).
+pub fn reset_wake_count() -> Unit {
+  wake_seq.store(0)
+}
+
+/// Thread-safe frame wake-up callable from any background OS thread.
+/// Atomically increments `wake_seq`, invokes the registered native C wake callback
+/// (zero Pion closures, zero RC, lock-free across all OS threads), and invokes the
+/// extension closure `wake_slot.f` only on the owning thread that called `set_host_ext`.
+pub fn wake_now() -> Unit {
+  let _ = wake_seq.fetch_add(1)
+  c_call_native_wake()
+  if pion_cur_tid().to_int() == wake_owner_tid.load() {
+    wake_lock.with_lock(fn(_v : Int) -> Unit {
+      (wake_slot.f)()
+    })
+  }
+}
+
+pub fn back_enabled_for(wid : Int, on : Bool) -> Unit {
+  (current_host_ext.ext.back_enabled_for)(wid, on)
+}
+
+pub fn layer_supported() -> Bool {
+  (current_host_ext.ext.layer_supported)()
+}
+
+pub fn layer_render(
+  id : Int,
+  phys_w : Int,
+  phys_h : Int,
+  scale : Double,
+  inst : FixedArray[Double],
+  count : Int,
+) -> Bool {
+  if id <= 0 || phys_w <= 0 || phys_h <= 0 || scale <= 0.0 || count < 0 {
+    return false
+  }
+  (current_host_ext.ext.layer_render)(id, phys_w, phys_h, scale, inst, count)
+}
+
+pub fn layer_destroy(id : Int) -> Unit {
+  if id > 0 {
+    (current_host_ext.ext.layer_destroy)(id)
+  }
+}
+
+pub fn set_window_close(f : () -> Bool) -> Unit {
+  (current_host_ext.ext.set_window_close)(f)
+}
+
+pub fn window_center() -> Unit {
+  (current_host_ext.ext.window_center)()
+}
+
+pub fn window_hide() -> Unit {
+  (current_host_ext.ext.window_hide)()
+}
