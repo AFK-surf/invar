@@ -30,6 +30,7 @@ static size_t g_test_buf_len = 0;
 
 extern "C" {
 int mb_render_init_offscreen(double w, double h, double scale);
+void mb_host_render_dirty(double x, double y, double w, double h);
 void invar_win_shader_stats(int *baked_hits, int *disk_hits, int *runtime_compiles);
 void invar_win_shader_stats_reset(void);
 
@@ -903,6 +904,70 @@ static int run_warp_smoke(void) {
   }
 
   if (!run_v8_v9_2d_roi()) ok = 0;
+
+  // Stateful adaptive test 3: Light adaptive opacity suppresses white-on-light flip on D3D11 WARP.
+  // (a) Full dark backdrop with 0x67 flips dark, raising tint_a to 0.913 on the same slot snaps immediately
+  //     to light glass + dark ink with settling == 0;
+  // (b) Fresh full dark capsule at 65% frost (0.752) stays light frosted glass + dark ink.
+  {
+    const int W = 320, H = 240;
+    static uint8_t pxbuf[320 * 240 * 4];
+    double ad_inst[4 * INST_SIZE];
+    auto build_ad = [&](double tint_a) -> int {
+      int n = 0;
+      push_inst(ad_inst, &n, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
+                0.08, 0.08, 0.08, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(ad_inst, &n, 16.0, 12.0, 128.0, 96.0, 16.0, 6.0, 1.0, 1.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, tint_a,
+                0.0, 4.0, -1.0, 1.0, -50.0, 0.0, 0.0, 0.0);
+      push_inst(ad_inst, &n, 64.0, 52.0, 32.0, 16.0, 6.0, 10.0, 0.0, 0.0,
+                0.14, 0.15, 0.17, 1.0,
+                0.1, 0.5, 0.9, 0.5, 0.0, 80.0, 60.0, 48.0);
+      return n;
+    };
+    auto present_and_read = [&](int n) -> int {
+      mb_host_render_dirty(0.0, 0.0, 160.0, 120.0);
+      mb_render_present(ad_inst, n, 0.08, 0.08, 0.08);
+      memset(pxbuf, 0, sizeof pxbuf);
+      g_test_buf_len = sizeof pxbuf;
+      return mb_render_drawn_pixels(0, 0, W, H, pxbuf);
+    };
+
+    // Reset any stale adaptive slots with an empty whole-frame present
+    mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+    mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
+
+    // 1. Baseline 0x67 over full dark flips dark (ink bright > 180, glass dark < 90)
+    int n0 = build_ad(103.0 / 255.0);
+    if (!present_and_read(n0)) return 0;
+    size_t k_ink = (120 * W + 160) * 4;
+    size_t k_gl = (64 * W + 64) * 4;
+    int ink0 = pxbuf[k_ink], gl0 = pxbuf[k_gl];
+
+    // 2. Raise tint_a to 0.913 on the same slot: snaps immediately to light glass (> 215) + dark ink (< 65), settling == 0
+    int n1 = build_ad(0.913);
+    if (!present_and_read(n1)) return 0;
+    int ink1 = pxbuf[k_ink], gl1 = pxbuf[k_gl];
+    int settling1 = mb_render_adaptive_settling(0);
+
+    // 3. Reset slots and draw fresh 0.752 capsule over full dark: stays light glass (> 180) + dark ink (< 65)
+    mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+    mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
+    int n65 = build_ad(0.752);
+    if (!present_and_read(n65)) return 0;
+    int ink65 = pxbuf[k_ink], gl65 = pxbuf[k_gl];
+
+    int ad3_ok = (ink0 > 180 && gl0 < 90) &&
+                 (ink1 < 65 && gl1 > 215 && settling1 == 0) &&
+                 (ink65 < 65 && gl65 > 180);
+    printf("  [%s] V13 light adaptive opacity: 0x67=(ink=%d,gl=%d) 0.913=(ink=%d,gl=%d,settling=%d) 0.752=(ink=%d,gl=%d)\n",
+           ad3_ok ? "PASS" : "FAIL", ink0, gl0, ink1, gl1, settling1, ink65, gl65);
+    ok &= ad3_ok;
+
+    // Clean up adaptive slots
+    mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+    mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
+  }
   return ok;
 }
 

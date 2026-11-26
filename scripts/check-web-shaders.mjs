@@ -1187,6 +1187,180 @@ function buildHtmlPage(programs) {
           '0x80 B-R>=12 dRim>=4 L72>=L60+2, 0xFF |dL|<=3, ctrlDiff=(0,0,0)');
       }
 
+      // V13: Light adaptive glass opacity (AD_FS + FS(ONE_KIND=6) + FS(ONE_KIND=10)):
+      // half-dark wide capsule at 0x67 inverts left ink bright; raising tint_a to 0.522/0.752/0.913 on the same slot
+      // keeps left ink dark on bright frosted glass; returning to 0x67 restores bright inversion;
+      // full-dark at 0.752 and 0x67->0.913 snap stays light frosted glass + dark ink.
+      {
+        const adItem = programs.find((p) => p.name === 'AD_FS');
+        const inkItem = programs.find((p) => p.name === 'FS(ONE_KIND=10)');
+        const mkProg = (item) => {
+          const vsS = gl.createShader(gl.VERTEX_SHADER);
+          gl.shaderSource(vsS, item.vs);
+          gl.compileShader(vsS);
+          const fsS = gl.createShader(gl.FRAGMENT_SHADER);
+          gl.shaderSource(fsS, item.fs);
+          gl.compileShader(fsS);
+          const p = gl.createProgram();
+          gl.attachShader(p, vsS);
+          gl.attachShader(p, fsS);
+          gl.linkProgram(p);
+          gl.deleteShader(vsS);
+          gl.deleteShader(fsS);
+          return p;
+        };
+        const adP = mkProg(adItem);
+        const inkP = mkProg(inkItem);
+        const adT = [gl.createTexture(), gl.createTexture()];
+        const adF = [gl.createFramebuffer(), gl.createFramebuffer()];
+        for (let i = 0; i < 2; i++) {
+          gl.bindTexture(gl.TEXTURE_2D, adT[i]);
+          gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 16, 1);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, adF[i]);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, adT[i], 0);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        let adC = 0;
+
+        const W3 = 800, H3 = 600, S3 = 2.0, wPt = 400.0, hPt = 300.0;
+        canvas.width = W3;
+        canvas.height = H3;
+
+        const runAdCase = (darkW, tintA, isNew) => {
+          // Upload backdrop texture (top-down matching u_map = (1/wPt, 1/hPt, 0, 0))
+          const bgBuf = new Uint8Array(W3 * H3 * 4);
+          const darkPx = Math.round(darkW * S3);
+          for (let py = 0; py < H3; py++) {
+            for (let px = 0; px < W3; px++) {
+              const i = (py * W3 + px) * 4;
+              if (px < darkPx) { bgBuf[i] = 20; bgBuf[i + 1] = 20; bgBuf[i + 2] = 24; bgBuf[i + 3] = 255; }
+              else { bgBuf[i] = 255; bgBuf[i + 1] = 255; bgBuf[i + 2] = 255; bgBuf[i + 3] = 255; }
+            }
+          }
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W3, H3, 0, gl.RGBA, gl.UNSIGNED_BYTE, bgBuf);
+
+          // Step 1: Run AD_FS into adF[nxt] slot 0 for capsule center=(200,150) half=(160,22)
+          const cur = adC, nxt = 1 - cur;
+          gl.disable(gl.BLEND);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, adF[nxt]);
+          gl.viewport(0, 0, 16, 1);
+          gl.useProgram(adP);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.uniform1i(gl.getUniformLocation(adP, 'u_bd'), 0);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, adT[cur]);
+          gl.uniform1i(gl.getUniformLocation(adP, 'u_prev'), 1);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_box'), 200.0, 150.0, 160.0, 22.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), -tintA, isNew ? 1.0 : 0.0, 1.0 / 60.0, 0.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          const adPx = new Uint8Array(4);
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, adPx);
+          const adTVal = (adPx[0] * 256 + adPx[1]) / 65535.0;
+          adC = nxt;
+
+          // Step 2: Blit backdrop to default framebuffer
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, W3, H3);
+          gl.useProgram(bgProg);
+          gl.disable(gl.BLEND);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.uniform1i(bgTexLoc, 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+          // Step 3: Draw light adaptive glass capsule (kind 6)
+          gl.useProgram(prog);
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, adT[adC]);
+          gl.uniform1i(u('u_bd'), 0);
+          gl.uniform1i(u('u_ad'), 4);
+          gl.uniform1i(u('u_ad_n'), 1);
+          gl.uniform4f(u('u_ad_box[0]'), 200.0, 150.0, 160.0, 22.0);
+          gl.uniform2f(u('u_vp'), wPt, hPt);
+          gl.uniform2f(u('u_origin'), 0.0, 0.0);
+          gl.uniform1f(u('u_scale'), S3);
+          gl.uniform1f(u('u_top'), H3);
+          gl.uniform4f(u('u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
+          gl.uniform4f(u('u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
+          gl.vertexAttrib4f(0, 40.0, 128.0, 320.0, 44.0);
+          gl.vertexAttrib4f(1, 22.0, 6.0, 1.0, 2.0);
+          gl.vertexAttrib4f(2, 253 / 255, 252 / 255, 253 / 255, tintA);
+          gl.vertexAttrib4f(3, 0.0, 14.0, -1.0, 1.0);
+          gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
+          gl.vertexAttrib4f(5, -1.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(9, 22.0, 22.0, 22.0, 22.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+          // Step 4: Draw left dark adaptive stroke (kind 10) at (60, 140, 24, 20) -> center (72, 150)
+          gl.useProgram(inkP);
+          const ui = (n) => gl.getUniformLocation(inkP, n);
+          gl.uniform1i(ui('u_bd'), 0);
+          gl.uniform1i(ui('u_ad'), 4);
+          gl.uniform1i(ui('u_ad_n'), 1);
+          gl.uniform4f(ui('u_ad_box[0]'), 200.0, 150.0, 160.0, 22.0);
+          gl.uniform2f(ui('u_vp'), wPt, hPt);
+          gl.uniform2f(ui('u_origin'), 0.0, 0.0);
+          gl.uniform1f(ui('u_scale'), S3);
+          gl.uniform1f(ui('u_top'), H3);
+          gl.uniform4f(ui('u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
+          gl.uniform4f(ui('u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
+          gl.vertexAttrib4f(0, 60.0, 140.0, 24.0, 20.0);
+          gl.vertexAttrib4f(1, 6.0, 10.0, 0.0, 0.0);
+          gl.vertexAttrib4f(2, 0.14, 0.15, 0.17, 1.0);
+          gl.vertexAttrib4f(3, 0.1, 0.5, 0.9, 0.5);
+          gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
+          gl.vertexAttrib4f(5, 0.0, 200.0, 150.0, 44.0);
+          gl.vertexAttrib4f(9, 6.0, 6.0, 6.0, 6.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+          const out = new Uint8Array(W3 * H3 * 4);
+          gl.readPixels(0, 0, W3, H3, gl.RGBA, gl.UNSIGNED_BYTE, out);
+          const lumAt = (xPt, yPt) => {
+            const fy = H3 - 1 - Math.round(yPt * S3);
+            const idx = (fy * W3 + Math.round(xPt * S3)) * 4;
+            return (0.2126 * out[idx] + 0.7152 * out[idx + 1] + 0.0722 * out[idx + 2]) / 255.0;
+          };
+          return { ink: lumAt(72, 150), glassL: lumAt(140, 150), glassR: lumAt(310, 150), adTVal };
+        };
+
+        const r0 = runAdCase(184, 103 / 255, true);
+        const frostRes = [0.522, 0.752, 0.913].map((a) => ({ a, ...runAdCase(184, a, false) }));
+        const rBack = runAdCase(184, 103 / 255, false);
+        const r65 = runAdCase(400, 0.752, true);
+        const rDark0 = runAdCase(400, 103 / 255, true);
+        const r95 = runAdCase(400, 0.913, false);
+
+        const v13Ok = r0.ink > 0.82 && rBack.ink > 0.82 &&
+          frostRes.every((r) => r.ink < 0.25 && r.glassL > 0.56) &&
+          r65.ink < 0.25 && r65.glassR > 0.72 &&
+          rDark0.ink > 0.75 && rDark0.glassR < 0.35 &&
+          r95.adTVal <= 0.02 && r95.ink < 0.25 && r95.glassR > 0.85;
+        pushVec('V13 light adaptive glass opacity (half-dark frost + full-dark snap)', v13Ok,
+          [Number(r0.ink.toFixed(3)), Number(frostRes[1].ink.toFixed(3)), Number(rBack.ink.toFixed(3)), Number(r65.ink.toFixed(3)), Number(r65.glassR.toFixed(3)), Number(r95.ink.toFixed(3)), Number(r95.glassR.toFixed(3)), Number(r95.adTVal.toFixed(3))],
+          'l0>0.82, frost ink<0.25 glass>0.56, lBack>0.82, full65 ink<0.25 glass>0.72, full95 snap t<=0.02 ink<0.25 glass>0.85');
+
+        gl.useProgram(prog);
+        gl.uniform1i(u('u_ad_n'), 0);
+        for (let i = 0; i < 2; i++) { gl.deleteFramebuffer(adF[i]); gl.deleteTexture(adT[i]); }
+        gl.deleteProgram(adP);
+        gl.deleteProgram(inkP);
+      }
+
       gl.deleteTexture(bdTex);
       gl.deleteProgram(bgProg);
       gl.deleteShader(bgVs);
@@ -1197,7 +1371,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 12,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 13,
       passed,
       total: programs.length,
       drawPassed,
@@ -1312,7 +1486,7 @@ runCheck()
     if (JSON_MODE) {
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     } else {
-      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V12) — ${report.ok ? 'PASS' : 'FAIL'}`);
+      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V13) — ${report.ok ? 'PASS' : 'FAIL'}`);
       if (report.renderer) console.log(`  renderer: ${report.renderer}`);
       if (report.version) console.log(`  version : ${report.version}`);
       for (const r of report.results || []) {

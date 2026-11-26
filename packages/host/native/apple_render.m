@@ -79,6 +79,7 @@ typedef struct {
   int active;
   float cx, cy, hx, hy;
   int is_dark;
+  float tint_a;
   double settle_left;
   uint64_t updated_serial;
   uint64_t seen_serial;
@@ -524,7 +525,7 @@ MB_CORNER_SL
 "  float lo = q - hi * 256.0;\n"
 "  return float2(hi / 255.0, lo / 255.0);\n"
 "}\n"
-"static float ad_sample(texture2d<float> bd, texture2d<float> ad_tex, constant G& g, float2 ac, float fallback_r, bool is_dark_glass) {\n"
+"static float ad_sample(texture2d<float> bd, texture2d<float> ad_tex, constant G& g, float2 ac, float fallback_r, bool is_dark_glass, float tint_a) {\n"
 "  int ad_n = int(g.ad_meta.x + 0.5);\n"
 "  if (ad_n > 0) {\n"
 "    int best = -1;\n"
@@ -550,9 +551,13 @@ MB_CORNER_SL
 "    }\n"
 "  }\n"
 "  float bgL = mb_backdrop_luma_rect(bd, g, ac, float2(max(fallback_r, 1.0)));\n"
-"  return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));\n"
+"  if (is_dark_glass) return smoothstep(0.35, 0.85, bgL);\n"
+"  float baseDens = mix(0.404, tint_a, smoothstep(0.405, 0.46, tint_a));\n"
+"  float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);\n"
+"  float c_eq = mix(sqrt(max(bgL, 0.0)), 0.992, pow(extra, 1.35));\n"
+"  return 1.0 - smoothstep(0.12, 0.21, c_eq * c_eq);\n"
 "}\n"
-"static float2 ad_sample_ink(texture2d<float> bd, texture2d<float> ad_tex, constant G& g, float2 ac, float fallback_r) {\n"
+"static float3 ad_sample_ink(texture2d<float> bd, texture2d<float> ad_tex, constant G& g, float2 ac, float fallback_r) {\n"
 "  int ad_n = int(g.ad_meta.x + 0.5);\n"
 "  if (ad_n > 0) {\n"
 "    int best = -1;\n"
@@ -575,22 +580,25 @@ MB_CORNER_SL
 "    }\n"
 "    if (best >= 0) {\n"
 "      float4 px = ad_tex.read(uint2(uint(best), 0));\n"
-"      return float2(mb_unpack16(px.rg), px.a);\n"
+"      return float3(mb_unpack16(px.rg), px.a, px.b);\n"
 "    }\n"
 "  }\n"
 "  float bgL = mb_backdrop_luma_rect(bd, g, ac, float2(max(fallback_r, 1.0)));\n"
-"  return float2(1.0 - smoothstep(0.12, 0.21, bgL), bgL);\n"
+"  return float3(1.0 - smoothstep(0.12, 0.21, bgL), bgL, 0.0);\n"
 "}\n"
 "static float3 mb_adaptive_ink_at(texture2d<float> bd, texture2d<float> ad_tex, constant G& g, float3 rgb, float2 ac, float fallback_r, float4 rect) {\n"
 "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
 "  float origL = luma(rgb);\n"
 "  if (ch > 0.08 || origL >= 0.5) return rgb;\n"
-"  float2 cap = ad_sample_ink(bd, ad_tex, g, ac, fallback_r);\n"
+"  float3 cap = ad_sample_ink(bd, ad_tex, g, ac, fallback_r);\n"
 "  float capsuleDarkT = cap.x;\n"
 "  float capsuleBgL = cap.y;\n"
+"  float capsuleLatch = cap.z;\n"
+"  int lcode = int(floor(clamp(capsuleLatch, 0.0, 1.0) * 255.0 + 0.5));\n"
+"  float capsuleExtra = (lcode < 48) ? (float(lcode) / 46.0) : ((lcode > 208) ? (float(255 - lcode) / 46.0) : 0.0);\n"
 "  float darkT = capsuleDarkT;\n"
 "  float localBoost = 0.0;\n"
-"  if (capsuleDarkT < 0.999) {\n"
+"  if (capsuleDarkT < 0.999 && capsuleExtra < 0.08) {\n"
 "    float2 gc = rect.xy + rect.zw * 0.5;\n"
 "    float2 guv = gc * g.map.xy + g.map.zw;\n"
 "    if (g.uvc.z > g.uvc.x && g.uvc.w > g.uvc.y && guv.x >= g.uvc.x && guv.x <= g.uvc.z && guv.y >= g.uvc.y && guv.y <= g.uvc.w) {\n"
@@ -933,7 +941,7 @@ MB_CORNER_SL
 "    } else if (is_adaptive) {\n"
 "      float2 ac = single_liquid ? (I.rect.xy + I.rect.zw * 0.5) : ((g.gb.xy + g.gb.zw) * 0.5);\n"
 "      float ar = (single_liquid ? max(min(I.rect.z, I.rect.w) * 0.5, 1.0) : max(min(g.gb.z - g.gb.x, g.gb.w - g.gb.y) * 0.5, 1.0)) * 0.5;\n"
-"      float val = ad_sample(bd, ad_tex, g, ac, ar, is_dark);\n"
+"      float val = ad_sample(bd, ad_tex, g, ac, ar, is_dark, col.a);\n"
 "      if (g.misc.y > 0.5) val *= bgA;\n"
 "      float baseDens = mix(0.404, col.a, smoothstep(0.405, 0.46, col.a));\n"
 "      if (is_dark) {\n"
@@ -1861,13 +1869,20 @@ MB_CORNER_SL
 "    target = smoothstep(0.35, 0.85, bgL);\n"
 "    latch = target;\n"
 "  } else {\n"
-"    if (is_new > 0.5) latch = (bgL < 0.14) ? 1.0 : 0.0;\n"
-"    else if (prev.b > 0.5) latch = (bgL > 0.21) ? 0.0 : 1.0;\n"
-"    else latch = (bgL < 0.14) ? 1.0 : 0.0;\n"
-"    target = latch;\n"
+"    float tint_a = max(-is_dark, 0.0);\n"
+"    float baseDens = mix(0.404, tint_a, smoothstep(0.405, 0.46, tint_a));\n"
+"    float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);\n"
+"    float c_eq = mix(sqrt(max(bgL, 0.0)), 0.992, pow(extra, 1.35));\n"
+"    float effBgL = c_eq * c_eq;\n"
+"    int pcode = int(floor(clamp(prev.b, 0.0, 1.0) * 255.0 + 0.5));\n"
+"    bool prev_dark = (is_new <= 0.5) && (pcode > 208);\n"
+"    bool on = prev_dark ? (effBgL <= 0.21) : (effBgL < 0.14);\n"
+"    target = on ? 1.0 : 0.0;\n"
+"    float q = floor(extra * 46.0 + 0.5);\n"
+"    latch = on ? ((255.0 - q) / 255.0) : (q / 255.0);\n"
 "  }\n"
 "  float nextT;\n"
-"  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;\n"
+"  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0 || (is_dark <= 0.5 && -is_dark >= 0.88)) nextT = target;\n"
 "  else if (dt <= 0.0) nextT = prevT;\n"
 "  else {\n"
 "    nextT = mix(prevT, target, 1.0 - exp(-dt / 0.070));\n"
@@ -2670,6 +2685,7 @@ typedef struct {
   int is_new;
   int is_dark;
   float cx, cy, hx, hy;
+  float tint_a;
 } AdPending;
 
 static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, int32_t end, int32_t count,
@@ -2681,7 +2697,7 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
   int kind = (int)(a[5] + 0.5f);
   if (kind != 6) return 0;
   int merged_liquid = a[23] > 0.0f;
-  struct { float cx, cy, hx, hy; int is_dark; } items[MB_ADAPTIVE_MAX];
+  struct { float cx, cy, hx, hy; int is_dark; float tint_a; } items[MB_ADAPTIVE_MAX];
   int ni = 0;
   if (merged_liquid) {
     int is_clear = (a[7] <= 0.1f && a[11] < 0.12f);
@@ -2693,6 +2709,7 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
       items[ni].hx = fmaxf((m->g.gb[2] - m->g.gb[0]) * 0.5f, 1.0f);
       items[ni].hy = fmaxf((m->g.gb[3] - m->g.gb[1]) * 0.5f, 1.0f);
       items[ni].is_dark = (a[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].tint_a = fminf(fmaxf(a[11], 0.0f), 1.0f);
       ni++;
     }
   } else {
@@ -2710,6 +2727,7 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
       items[ni].hx = fmaxf(b[2] * 0.5f, 1.0f);
       items[ni].hy = fmaxf(b[3] * 0.5f, 1.0f);
       items[ni].is_dark = (b[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].tint_a = fminf(fmaxf(b[11], 0.0f), 1.0f);
       ni++;
     }
   }
@@ -2717,12 +2735,17 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
   for (int k = 0; k < ni; k++) {
     int sid = -1;
     int is_new = 0;
+    int mode_changed = 0;
     // Check if already seen in an earlier dirty part of this same frame
     for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
       MBAdSlot *s = &w->ad_slots[i];
       if (s->active && s->seen_serial == serial && s->is_dark == items[k].is_dark &&
           hypotf(items[k].cx - s->cx, items[k].cy - s->cy) <= 2.0f) {
         sid = i;
+        if (fabsf(s->tint_a - items[k].tint_a) > 0.002f) {
+          s->tint_a = items[k].tint_a;
+          mode_changed = 1;
+        }
         break;
       }
     }
@@ -2752,6 +2775,10 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
         w->ad_slots[sid] = (MBAdSlot){0};
         w->ad_slots[sid].active = 1;
         w->ad_slots[sid].is_dark = items[k].is_dark;
+        w->ad_slots[sid].tint_a = items[k].tint_a;
+      } else if (fabsf(w->ad_slots[sid].tint_a - items[k].tint_a) > 0.002f) {
+        w->ad_slots[sid].tint_a = items[k].tint_a;
+        mode_changed = 1;
       }
       w->ad_slots[sid].cx = items[k].cx;
       w->ad_slots[sid].cy = items[k].cy;
@@ -2760,19 +2787,20 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
       w->ad_slots[sid].seen_serial = serial;
     }
     MBAdSlot *s = &w->ad_slots[sid];
-    if (s->updated_serial == serial) continue;
-    int need = is_new || backdrop_changed || s->settle_left > 0.0;
+    if (!is_new && !mode_changed && s->updated_serial == serial) continue;
+    int slot_changed = backdrop_changed || mode_changed;
+    int need = is_new || slot_changed || s->settle_left > 0.0;
     if (need) {
-      if (is_new || s->is_dark > 0) {
+      if (is_new || s->is_dark > 0 || s->tint_a >= 0.88f) {
         s->settle_left = 0.0;
-      } else if (backdrop_changed) {
+      } else if (slot_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;
       } else {
         s->settle_left -= dt;
         if (s->settle_left <= 0.0) s->settle_left = 0.0;
       }
       s->updated_serial = serial;
-      out[n_upd++] = (AdPending){sid, is_new, s->is_dark, s->cx, s->cy, s->hx, s->hy};
+      out[n_upd++] = (AdPending){sid, is_new, s->is_dark, s->cx, s->cy, s->hx, s->hy, s->tint_a};
     }
   }
   return n_upd;
@@ -2810,7 +2838,7 @@ static void ad_run_updates_batch(id<MTLCommandBuffer> cb, MBRenderWin *w, const 
     memcpy(u.map, items[i].map, sizeof u.map);
     memcpy(u.uvc, items[i].uvc, sizeof u.uvc);
     u.box[0] = items[i].p.cx; u.box[1] = items[i].p.cy; u.box[2] = items[i].p.hx; u.box[3] = items[i].p.hy;
-    u.param[0] = (float)items[i].p.is_dark;
+    u.param[0] = (items[i].p.is_dark > 0) ? (float)items[i].p.is_dark : -items[i].p.tint_a;
     u.param[1] = (float)items[i].p.is_new;
     u.param[2] = (float)dt;
     u.param[3] = (float)items[i].p.sid;

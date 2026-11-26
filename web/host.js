@@ -1000,7 +1000,7 @@
     float lo = floor(clamp(rg.y, 0.0, 1.0) * 255.0 + 0.5);
     return (hi * 256.0 + lo) / 65535.0;
   }
-  float ad_sample(vec2 ac, float fallback_r, bool is_dark_glass) {
+  float ad_sample(vec2 ac, float fallback_r, bool is_dark_glass, float tint_a) {
     if (u_ad_n > 0) {
       int best = -1;
       float best_d = 1e9;
@@ -1025,11 +1025,15 @@
       }
     }
     float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));
-    return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));
+    if (is_dark_glass) return smoothstep(0.35, 0.85, bgL);
+    float baseDens = mix(0.404, tint_a, smoothstep(0.405, 0.46, tint_a));
+    float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);
+    float c_eq = mix(sqrt(max(bgL, 0.0)), 0.992, pow(extra, 1.35));
+    return 1.0 - smoothstep(0.12, 0.21, c_eq * c_eq);
   }
   #endif
   #if ONE_KIND < 0 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11
-  vec2 ad_sample_ink(vec2 ac, float fallback_r) {
+  vec3 ad_sample_ink(vec2 ac, float fallback_r) {
     if (u_ad_n > 0) {
       int best = -1;
       float best_d = 1e9;
@@ -1051,22 +1055,25 @@
       }
       if (best >= 0) {
         vec4 px = texelFetch(u_ad, ivec2(best, 0), 0);
-        return vec2(mb_unpack16(px.rg), px.a);
+        return vec3(mb_unpack16(px.rg), px.a, px.b);
       }
     }
     float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));
-    return vec2(1.0 - smoothstep(0.12, 0.21, bgL), bgL);
+    return vec3(1.0 - smoothstep(0.12, 0.21, bgL), bgL, 0.0);
   }
   vec3 mb_adaptive_ink_at(vec3 rgb, vec2 ac, float fallback_r, vec4 rect) {
     float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);
     float origL = luma(rgb);
     if (ch > 0.08 || origL >= 0.5) return rgb;
-    vec2 cap = ad_sample_ink(ac, fallback_r);
+    vec3 cap = ad_sample_ink(ac, fallback_r);
     float capsuleDarkT = cap.x;
     float capsuleBgL = cap.y;
+    float capsuleLatch = cap.z;
+    int lcode = int(floor(clamp(capsuleLatch, 0.0, 1.0) * 255.0 + 0.5));
+    float capsuleExtra = (lcode < 48) ? (float(lcode) / 46.0) : ((lcode > 208) ? (float(255 - lcode) / 46.0) : 0.0);
     float darkT = capsuleDarkT;
     float localBoost = 0.0;
-    if (capsuleDarkT < 0.999) {
+    if (capsuleDarkT < 0.999 && capsuleExtra < 0.08) {
       vec2 gc = rect.xy + rect.zw * 0.5;
       vec2 guv = gc * u_map.xy + u_map.zw;
       if (u_uvc.z > u_uvc.x && u_uvc.w > u_uvc.y && guv.x >= u_uvc.x && guv.x <= u_uvc.z && guv.y >= u_uvc.y && guv.y <= u_uvc.w) {
@@ -1513,7 +1520,7 @@
         vec2 ac = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);
         float ar = ((k <= 0.0) ? max(min(v_rect.z, v_rect.w) * 0.5, 1.0) : max(min(u_gb.z - u_gb.x, u_gb.w - u_gb.y) * 0.5, 1.0)) * 0.5;
         #endif
-        float val = ad_sample(ac, ar, is_dark);
+        float val = ad_sample(ac, ar, is_dark, col.a);
         if (u_through > 0.5) val *= bgA;
         float baseDens = mix(0.404, col.a, smoothstep(0.405, 0.46, col.a));
         if (is_dark) {
@@ -2500,13 +2507,20 @@
       target = smoothstep(0.35, 0.85, bgL);
       latch = target;
     } else {
-      if (is_new > 0.5) latch = (bgL < 0.14) ? 1.0 : 0.0;
-      else if (prev.b > 0.5) latch = (bgL > 0.21) ? 0.0 : 1.0;
-      else latch = (bgL < 0.14) ? 1.0 : 0.0;
-      target = latch;
+      float tint_a = max(-is_dark, 0.0);
+      float baseDens = mix(0.404, tint_a, smoothstep(0.405, 0.46, tint_a));
+      float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);
+      float c_eq = mix(sqrt(max(bgL, 0.0)), 0.992, pow(extra, 1.35));
+      float effBgL = c_eq * c_eq;
+      int pcode = int(floor(clamp(prev.b, 0.0, 1.0) * 255.0 + 0.5));
+      bool prev_dark = (is_new <= 0.5) && (pcode > 208);
+      bool on = prev_dark ? (effBgL <= 0.21) : (effBgL < 0.14);
+      target = on ? 1.0 : 0.0;
+      float q = floor(extra * 46.0 + 0.5);
+      latch = on ? ((255.0 - q) / 255.0) : (q / 255.0);
     }
     float nextT;
-    if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;
+    if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0 || (is_dark <= 0.5 && -is_dark >= 0.88)) nextT = target;
     else if (dt <= 0.0) nextT = prevT;
     else {
       nextT = mix(prevT, target, 1.0 - exp(-dt / 0.070));
@@ -2796,7 +2810,7 @@
   const AD_MAX = 16, AD_SETTLE_SEC = 0.42, AD_MATCH_DIST = 64.0;
   function makeAdSlots() {
     const arr = [];
-    for (let i = 0; i < AD_MAX; i++) arr.push({ active: false, cx: 0, cy: 0, hx: 0, hy: 0, isDark: 0, settleLeft: 0, updatedSerial: 0, seenSerial: 0 });
+    for (let i = 0; i < AD_MAX; i++) arr.push({ active: false, cx: 0, cy: 0, hx: 0, hy: 0, isDark: 0, tintA: 0, settleLeft: 0, updatedSerial: 0, seenSerial: 0 });
     return arr;
   }
   let adProg = null, ADU = {};
@@ -2861,6 +2875,7 @@
           cx: (m.gb[0] + m.gb[2]) * 0.5, cy: (m.gb[1] + m.gb[3]) * 0.5,
           hx: Math.max((m.gb[2] - m.gb[0]) * 0.5, 1.0), hy: Math.max((m.gb[3] - m.gb[1]) * 0.5, 1.0),
           isDark: (f32[a + 11] >= 0.05 && lum < 0.35) ? 1 : 0,
+          tintA: Math.min(Math.max(f32[a + 11], 0), 1),
         });
       }
     } else {
@@ -2877,16 +2892,19 @@
           cx: f32[b] + f32[b + 2] * 0.5, cy: f32[b + 1] + f32[b + 3] * 0.5,
           hx: Math.max(f32[b + 2] * 0.5, 1.0), hy: Math.max(f32[b + 3] * 0.5, 1.0),
           isDark: (f32[b + 11] >= 0.05 && lum < 0.35) ? 1 : 0,
+          tintA: Math.min(Math.max(f32[b + 11], 0), 1),
         });
       }
     }
     const pend = [];
     for (const it of items) {
-      let sid = -1, isNew = 0;
+      let sid = -1, isNew = 0, modeChanged = false;
       for (let i = 0; i < AD_MAX; i++) {
         const s = adSlots[i];
         if (s.active && s.seenSerial === serial && s.isDark === it.isDark && Math.hypot(it.cx - s.cx, it.cy - s.cy) <= 2.0) {
-          sid = i; break;
+          sid = i;
+          if (Math.abs(s.tintA - it.tintA) > 0.002) { s.tintA = it.tintA; modeChanged = true; }
+          break;
         }
       }
       if (sid < 0) {
@@ -2910,19 +2928,23 @@
           }
           isNew = 1;
           const s = adSlots[sid];
-          s.active = true; s.isDark = it.isDark; s.settleLeft = 0; s.updatedSerial = 0;
+          s.active = true; s.isDark = it.isDark; s.tintA = it.tintA; s.settleLeft = 0; s.updatedSerial = 0;
+        } else if (Math.abs(adSlots[sid].tintA - it.tintA) > 0.002) {
+          adSlots[sid].tintA = it.tintA;
+          modeChanged = true;
         }
         const s = adSlots[sid];
         s.cx = it.cx; s.cy = it.cy; s.hx = it.hx; s.hy = it.hy; s.seenSerial = serial;
       }
       const s = adSlots[sid];
-      if (!isNew && s.updatedSerial === serial) continue;
-      if (isNew || backdropChanged || s.settleLeft > 0) {
-        if (isNew || s.isDark > 0) s.settleLeft = 0;
-        else if (backdropChanged) s.settleLeft = AD_SETTLE_SEC;
+      if (!isNew && !modeChanged && s.updatedSerial === serial) continue;
+      const slotChanged = backdropChanged || modeChanged;
+      if (isNew || slotChanged || s.settleLeft > 0) {
+        if (isNew || s.isDark > 0 || s.tintA >= 0.88) s.settleLeft = 0;
+        else if (slotChanged) s.settleLeft = AD_SETTLE_SEC;
         else s.settleLeft = Math.max(0, s.settleLeft - dt);
         s.updatedSerial = serial;
-        pend.push({ sid, isNew, isDark: s.isDark, cx: s.cx, cy: s.cy, hx: s.hx, hy: s.hy });
+        pend.push({ sid, isNew, isDark: s.isDark, tintA: s.tintA, cx: s.cx, cy: s.cy, hx: s.hx, hy: s.hy });
       }
     }
     return pend;
@@ -2951,7 +2973,7 @@
     for (const p of pend) {
       gl.scissor(p.sid, 0, 1, 1);
       gl.uniform4f(ADU.u_box, p.cx, p.cy, p.hx, p.hy);
-      gl.uniform4f(ADU.u_param, p.isDark, p.isNew, dt, p.sid);
+      gl.uniform4f(ADU.u_param, p.isDark > 0 ? p.isDark : -p.tintA, p.isNew, dt, p.sid);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     adCur = nxt;

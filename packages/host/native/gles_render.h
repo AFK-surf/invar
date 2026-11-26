@@ -257,7 +257,7 @@ static const char *FS =
     "  float lo = floor(clamp(rg.y, 0.0, 1.0) * 255.0 + 0.5);\n"
     "  return (hi * 256.0 + lo) / 65535.0;\n"
     "}\n"
-    "float ad_sample(vec2 ac, float fallback_r, bool is_dark_glass) {\n"
+    "float ad_sample(vec2 ac, float fallback_r, bool is_dark_glass, float tint_a) {\n"
     "  if (u_ad_n > 0) {\n"
     "    int best = -1;\n"
     "    float best_d = 1e9;\n"
@@ -282,9 +282,13 @@ static const char *FS =
     "    }\n"
     "  }\n"
     "  float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));\n"
-    "  return is_dark_glass ? smoothstep(0.35, 0.85, bgL) : (1.0 - smoothstep(0.12, 0.21, bgL));\n"
+    "  if (is_dark_glass) return smoothstep(0.35, 0.85, bgL);\n"
+    "  float baseDens = mix(0.404, tint_a, smoothstep(0.405, 0.46, tint_a));\n"
+    "  float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);\n"
+    "  float c_eq = mix(sqrt(max(bgL, 0.0)), 0.992, pow(extra, 1.35));\n"
+    "  return 1.0 - smoothstep(0.12, 0.21, c_eq * c_eq);\n"
     "}\n"
-    "vec2 ad_sample_ink(vec2 ac, float fallback_r) {\n"
+    "vec3 ad_sample_ink(vec2 ac, float fallback_r) {\n"
     "  if (u_ad_n > 0) {\n"
     "    int best = -1;\n"
     "    float best_d = 1e9;\n"
@@ -306,22 +310,25 @@ static const char *FS =
     "    }\n"
     "    if (best >= 0) {\n"
     "      vec4 px = texelFetch(u_ad, ivec2(best, 0), 0);\n"
-    "      return vec2(mb_unpack16(px.rg), px.a);\n"
+    "      return vec3(mb_unpack16(px.rg), px.a, px.b);\n"
     "    }\n"
     "  }\n"
     "  float bgL = mb_backdrop_luma_rect(ac, vec2(max(fallback_r, 1.0)));\n"
-    "  return vec2(1.0 - smoothstep(0.12, 0.21, bgL), bgL);\n"
+    "  return vec3(1.0 - smoothstep(0.12, 0.21, bgL), bgL, 0.0);\n"
     "}\n"
     "vec3 mb_adaptive_ink_at(vec3 rgb, vec2 ac, float fallback_r, vec4 rect) {\n"
     "  float ch = max(max(rgb.r, rgb.g), rgb.b) - min(min(rgb.r, rgb.g), rgb.b);\n"
     "  float origL = luma(rgb);\n"
     "  if (ch > 0.08 || origL >= 0.5) return rgb;\n"
-    "  vec2 cap = ad_sample_ink(ac, fallback_r);\n"
+    "  vec3 cap = ad_sample_ink(ac, fallback_r);\n"
     "  float capsuleDarkT = cap.x;\n"
     "  float capsuleBgL = cap.y;\n"
+    "  float capsuleLatch = cap.z;\n"
+    "  int lcode = int(floor(clamp(capsuleLatch, 0.0, 1.0) * 255.0 + 0.5));\n"
+    "  float capsuleExtra = (lcode < 48) ? (float(lcode) / 46.0) : ((lcode > 208) ? (float(255 - lcode) / 46.0) : 0.0);\n"
     "  float darkT = capsuleDarkT;\n"
     "  float localBoost = 0.0;\n"
-    "  if (capsuleDarkT < 0.999) {\n"
+    "  if (capsuleDarkT < 0.999 && capsuleExtra < 0.08) {\n"
     "    vec2 gc = rect.xy + rect.zw * 0.5;\n"
     "    vec2 guv = gc * u_map.xy + u_map.zw;\n"
     "    if (u_uvc.z > u_uvc.x && u_uvc.w > u_uvc.y && guv.x >= u_uvc.x && guv.x <= u_uvc.z && guv.y >= u_uvc.y && guv.y <= u_uvc.w) {\n"
@@ -765,7 +772,7 @@ static const char *FS =
     "      vec2 ac = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);\n"
     "      float ar = ((k <= 0.0) ? max(min(v_rect.z, v_rect.w) * 0.5, 1.0) : max(min(u_gb.z - u_gb.x, u_gb.w - u_gb.y) * 0.5, 1.0)) * 0.5;\n"
     "#endif\n"
-    "      float val = ad_sample(ac, ar, is_dark);\n"
+    "      float val = ad_sample(ac, ar, is_dark, col.a);\n"
     "      if (u_through > 0.5) val *= bgA;\n"
     "      float baseDens = mix(0.404, col.a, smoothstep(0.405, 0.46, col.a));\n"
     "      if (is_dark) {\n"
@@ -1747,13 +1754,20 @@ static const char *AD_FS =
     "    target = smoothstep(0.35, 0.85, bgL);\n"
     "    latch = target;\n"
     "  } else {\n"
-    "    if (is_new > 0.5) latch = (bgL < 0.14) ? 1.0 : 0.0;\n"
-    "    else if (prev.b > 0.5) latch = (bgL > 0.21) ? 0.0 : 1.0;\n"
-    "    else latch = (bgL < 0.14) ? 1.0 : 0.0;\n"
-    "    target = latch;\n"
+    "    float tint_a = max(-is_dark, 0.0);\n"
+    "    float baseDens = mix(0.404, tint_a, smoothstep(0.405, 0.46, tint_a));\n"
+    "    float extra = clamp((baseDens - 0.404) / (1.0 - 0.404), 0.0, 1.0);\n"
+    "    float c_eq = mix(sqrt(max(bgL, 0.0)), 0.992, pow(extra, 1.35));\n"
+    "    float effBgL = c_eq * c_eq;\n"
+    "    int pcode = int(floor(clamp(prev.b, 0.0, 1.0) * 255.0 + 0.5));\n"
+    "    bool prev_dark = (is_new <= 0.5) && (pcode > 208);\n"
+    "    bool on = prev_dark ? (effBgL <= 0.21) : (effBgL < 0.14);\n"
+    "    target = on ? 1.0 : 0.0;\n"
+    "    float q = floor(extra * 46.0 + 0.5);\n"
+    "    latch = on ? ((255.0 - q) / 255.0) : (q / 255.0);\n"
     "  }\n"
     "  float nextT;\n"
-    "  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;\n"
+    "  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0 || (is_dark <= 0.5 && -is_dark >= 0.88)) nextT = target;\n"
     "  else if (dt <= 0.0) nextT = prevT;\n"
     "  else {\n"
     "    nextT = mix(prevT, target, 1.0 - exp(-dt / 0.070));\n"
@@ -2692,6 +2706,7 @@ typedef struct {
   int active;
   float cx, cy, hx, hy;
   int is_dark;
+  float tint_a;
   double settle_left;
   uint64_t settle_serial;
   uint64_t updated_serial;
@@ -2821,7 +2836,7 @@ static void ad_fill_uniforms(void) {
 
 typedef struct {
   int sid, is_new, is_dark, track_rb;
-  float cx, cy, hx, hy;
+  float cx, cy, hx, hy, tint_a;
 } gl_ad_pend;
 
 static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int32_t count, const Grab *m,
@@ -2832,7 +2847,7 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
   int kind = (int)(a[5] + 0.5f);
   if (kind != 6) return 0;
   int merged_liquid = a[23] > 0.0f;
-  struct { float cx, cy, hx, hy; int is_dark; } items[MB_ADAPTIVE_MAX];
+  struct { float cx, cy, hx, hy; int is_dark; float tint_a; } items[MB_ADAPTIVE_MAX];
   int ni = 0;
   if (merged_liquid) {
     int is_clear = (a[7] <= 0.1f && a[11] < 0.12f);
@@ -2844,6 +2859,7 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       items[ni].hx = fmaxf((m->gb[2] - m->gb[0]) * 0.5f, 1.0f);
       items[ni].hy = fmaxf((m->gb[3] - m->gb[1]) * 0.5f, 1.0f);
       items[ni].is_dark = (a[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].tint_a = fminf(fmaxf(a[11], 0.0f), 1.0f);
       ni++;
     }
   } else {
@@ -2861,17 +2877,22 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       items[ni].hx = fmaxf(b[2] * 0.5f, 1.0f);
       items[ni].hy = fmaxf(b[3] * 0.5f, 1.0f);
       items[ni].is_dark = (b[11] >= 0.05f && lum < 0.35f) ? 1 : 0;
+      items[ni].tint_a = fminf(fmaxf(b[11], 0.0f), 1.0f);
       ni++;
     }
   }
   int n_upd = 0;
   for (int k = 0; k < ni; k++) {
-    int sid = -1, is_new = 0;
+    int sid = -1, is_new = 0, mode_changed = 0;
     for (int i = 0; i < MB_ADAPTIVE_MAX; i++) {
       mb_ad_slot *s = &ad_slots[i];
       if (s->active && s->seen_serial == serial && s->is_dark == items[k].is_dark &&
           hypotf(items[k].cx - s->cx, items[k].cy - s->cy) <= 2.0f) {
         sid = i;
+        if (fabsf(s->tint_a - items[k].tint_a) > 0.002f) {
+          s->tint_a = items[k].tint_a;
+          mode_changed = 1;
+        }
         break;
       }
     }
@@ -2901,6 +2922,10 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
         memset(&ad_slots[sid], 0, sizeof ad_slots[sid]);
         ad_slots[sid].active = 1;
         ad_slots[sid].is_dark = items[k].is_dark;
+        ad_slots[sid].tint_a = items[k].tint_a;
+      } else if (fabsf(ad_slots[sid].tint_a - items[k].tint_a) > 0.002f) {
+        ad_slots[sid].tint_a = items[k].tint_a;
+        mode_changed = 1;
       }
       ad_slots[sid].cx = items[k].cx;
       ad_slots[sid].cy = items[k].cy;
@@ -2909,22 +2934,23 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
       ad_slots[sid].seen_serial = serial;
     }
     mb_ad_slot *s = &ad_slots[sid];
-    if (!is_new && s->updated_serial == serial) continue;
-    if (!is_new && !backdrop_changed && s->settle_left > 0.0 && ad_conv_serial[sid] >= s->settle_serial) {
+    if (!is_new && !mode_changed && s->updated_serial == serial) continue;
+    int slot_changed = backdrop_changed || mode_changed;
+    if (!is_new && !slot_changed && s->settle_left > 0.0 && ad_conv_serial[sid] >= s->settle_serial) {
       s->settle_left = 0.0;
     }
-    int need = is_new || backdrop_changed || s->settle_left > 0.0;
+    int need = is_new || slot_changed || s->settle_left > 0.0;
     if (need) {
-      int consec_scroll = (backdrop_changed && !is_new && s->has_changed && s->last_changed_serial + 1 == serial);
-      int track_rb = (!is_new && s->is_dark == 0 && dt > 0.0 && !consec_scroll);
-      if (backdrop_changed && !is_new) {
+      int consec_scroll = (slot_changed && !is_new && s->has_changed && s->last_changed_serial + 1 == serial);
+      int track_rb = (!is_new && s->is_dark == 0 && s->tint_a < 0.88f && dt > 0.0 && !consec_scroll);
+      if (slot_changed && !is_new) {
         s->has_changed = 1;
         s->last_changed_serial = serial;
       }
-      if (is_new || s->is_dark > 0) {
+      if (is_new || s->is_dark > 0 || s->tint_a >= 0.88f) {
         s->settle_left = 0.0;
         s->settle_serial = serial;
-      } else if (backdrop_changed) {
+      } else if (slot_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;
         s->settle_serial = serial;
       } else {
@@ -2932,7 +2958,7 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
         if (s->settle_left <= 0.0) s->settle_left = 0.0;
       }
       s->updated_serial = serial;
-      out[n_upd++] = (gl_ad_pend){sid, is_new, s->is_dark, track_rb, s->cx, s->cy, s->hx, s->hy};
+      out[n_upd++] = (gl_ad_pend){sid, is_new, s->is_dark, track_rb, s->cx, s->cy, s->hx, s->hy, s->tint_a};
     }
   }
   return n_upd;
@@ -2991,7 +3017,7 @@ static void ad_run_updates_batch(const gl_ad_batch *items, int n_upd, double dt)
     glUniform4fv(adu_uvc, 1, items[i].uvc);
     glScissor(items[i].p.sid, 0, 1, 1);
     glUniform4f(adu_box, items[i].p.cx, items[i].p.cy, items[i].p.hx, items[i].p.hy);
-    glUniform4f(adu_param, (float)items[i].p.is_dark, (float)items[i].p.is_new, (float)dt, (float)items[i].p.sid);
+    glUniform4f(adu_param, (items[i].p.is_dark > 0) ? (float)items[i].p.is_dark : -items[i].p.tint_a, (float)items[i].p.is_new, (float)dt, (float)items[i].p.sid);
     glDrawArrays(GL_TRIANGLES, 0, 3);
   }
   ad_cur = nxt;
