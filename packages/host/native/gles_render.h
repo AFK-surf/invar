@@ -1493,7 +1493,7 @@ static const char *AD_FS =
     "    target = latch;\n"
     "  }\n"
     "  float nextT;\n"
-    "  if (is_new > 0.5 || dt >= 1.0) nextT = target;\n"
+    "  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;\n"
     "  else if (dt <= 0.0) nextT = prevT;\n"
     "  else {\n"
     "    nextT = mix(prevT, target, 1.0 - exp(-dt / 0.070));\n"
@@ -2345,6 +2345,8 @@ typedef struct {
   uint64_t settle_serial;
   uint64_t updated_serial;
   uint64_t seen_serial;
+  int has_changed;
+  uint64_t last_changed_serial;
 } mb_ad_slot;
 
 typedef struct {
@@ -2467,7 +2469,7 @@ static void ad_fill_uniforms(void) {
 }
 
 typedef struct {
-  int sid, is_new, is_dark;
+  int sid, is_new, is_dark, track_rb;
   float cx, cy, hx, hy;
 } gl_ad_pend;
 
@@ -2562,7 +2564,13 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
     }
     int need = is_new || backdrop_changed || s->settle_left > 0.0;
     if (need) {
-      if (is_new) {
+      int consec_scroll = (backdrop_changed && !is_new && s->has_changed && s->last_changed_serial + 1 == serial);
+      int track_rb = (!is_new && s->is_dark == 0 && dt > 0.0 && !consec_scroll);
+      if (backdrop_changed && !is_new) {
+        s->has_changed = 1;
+        s->last_changed_serial = serial;
+      }
+      if (is_new || s->is_dark > 0) {
         s->settle_left = 0.0;
         s->settle_serial = serial;
       } else if (backdrop_changed) {
@@ -2573,7 +2581,7 @@ static int ad_collect_and_match(const float *f, int32_t start, int32_t end, int3
         if (s->settle_left <= 0.0) s->settle_left = 0.0;
       }
       s->updated_serial = serial;
-      out[n_upd++] = (gl_ad_pend){sid, is_new, s->is_dark, s->cx, s->cy, s->hx, s->hy};
+      out[n_upd++] = (gl_ad_pend){sid, is_new, s->is_dark, track_rb, s->cx, s->cy, s->hx, s->hy};
     }
   }
   return n_upd;
@@ -2592,7 +2600,7 @@ static void ad_run_updates_batch(const gl_ad_batch *items, int n_upd, double dt)
   int cur = ad_cur, nxt = 1 - cur;
   uint32_t batch_mask = 0;
   for (int i = 0; i < n_upd; i++) {
-    if (!items[i].p.is_new && dt > 0.0) batch_mask |= (1u << items[i].p.sid);
+    if (items[i].p.track_rb) batch_mask |= (1u << items[i].p.sid);
   }
   glDisable(GL_BLEND);
   glDisable(GL_SCISSOR_TEST);

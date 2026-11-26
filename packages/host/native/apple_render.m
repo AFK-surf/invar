@@ -1615,7 +1615,7 @@ MB_CORNER_SL
 "    target = latch;\n"
 "  }\n"
 "  float nextT;\n"
-"  if (is_new > 0.5 || dt >= 1.0) nextT = target;\n"
+"  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;\n"
 "  else if (dt <= 0.0) nextT = prevT;\n"
 "  else {\n"
 "    nextT = mix(prevT, target, 1.0 - exp(-dt / 0.070));\n"
@@ -2392,7 +2392,7 @@ static int ad_collect_and_match(MBRenderWin *w, const float *f, int32_t start, i
     if (s->updated_serial == serial) continue;
     int need = is_new || backdrop_changed || s->settle_left > 0.0;
     if (need) {
-      if (is_new) {
+      if (is_new || s->is_dark > 0) {
         s->settle_left = 0.0;
       } else if (backdrop_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;

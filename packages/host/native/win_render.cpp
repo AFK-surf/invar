@@ -1531,7 +1531,7 @@ static const char *ad_src =
     "    target = latch;\n"
     "  }\n"
     "  float nextT;\n"
-    "  if (is_new > 0.5 || dt >= 1.0) nextT = target;\n"
+    "  if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;\n"
     "  else if (dt <= 0.0) nextT = prevT;\n"
     "  else {\n"
     "    nextT = lerp(prevT, target, 1.0 - exp(-dt / 0.070));\n"
@@ -2729,7 +2729,7 @@ static int ad_collect_and_match(RenderWin *w, const float *f, int32_t start, int
     }
     int need = is_new || item_changed || s->settle_left > 0.0;
     if (need) {
-      if (is_new) {
+      if (is_new || s->is_dark > 0) {
         s->settle_left = 0.0;
       } else if (item_changed) {
         s->settle_left = MB_AD_SETTLE_SEC;
