@@ -3,6 +3,9 @@
 import "hostapi"
 
 extern "C" fn c_test_remove_file(path : Ptr, path_len : Int64) -> Int = "pion_host_remove_file"
+extern "C" fn c_adaptive_reset() -> Unit = "mb_render_adaptive_reset"
+extern "C" fn c_adaptive_settling() -> Int = "mb_render_adaptive_settling"
+extern "C" fn c_draw_timed(inst : Ptr, count : Int, r : Double, g : Double, b : Double, out : Ptr) -> Unit = "mb_render_draw_timed"
 
 fn to_fixed_d(a : Array[Double]) -> FixedArray[Double] {
   let out = FixedArray::make(a.length(), 0.0)
@@ -1343,4 +1346,114 @@ test "liquid_glass_pixel_fit_v8_slider_and_v9_switch_segmented_2d_roi" {
       )
     }
   }
+}
+
+test "light_adaptive_glass_opacity_ink_and_flip" {
+  install()
+  let w_pt = 400.0
+  let h_pt = 300.0
+  let scale = 2.0
+  let pw = 800
+  let ph = 600
+  assert(init_offscreen(w_pt, h_pt, scale), "init_offscreen 400x300@2x must succeed")
+
+  let luma_at = fn(rgba : FixedArray[Byte], x_pt : Int, y_pt : Int) -> Double {
+    let px = x_pt * 2
+    let py = y_pt * 2
+    let idx = (py * pw + px) * 4
+    let r = rgba[idx].to_int().to_double()
+    let g = rgba[idx + 1].to_int().to_double()
+    let b = rgba[idx + 2].to_int().to_double()
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+  }
+
+  let build_scene = fn(dark_w : Double, tint_a : Double, grp : Double) -> Array[Double] {
+    let inst : Array[Double] = []
+    // White full backdrop
+    push_inst(inst, 0.0, 0.0, 400.0, 300.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    // Dark left backdrop (#141418) of width dark_w
+    push_inst(inst, 0.0, 0.0, dark_w, 300.0, 0.0, 0.0, 0.0, 0.0, 20.0 / 255.0, 20.0 / 255.0, 24.0 / 255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    // Wide 320x44pt light adaptive capsule at (40, 128), center=(200, 150)
+    push_inst(
+      inst, 40.0, 128.0, 320.0, 44.0,
+      22.0, 6.0, 1.0, 2.0,
+      253.0 / 255.0, 252.0 / 255.0, 253.0 / 255.0, tint_a,
+      0.0, 14.0, -1.0, 1.0,
+      grp, 0.0, 0.0, 0.0,
+    )
+    // Left dark adaptive stroke (kind 10) at (60, 140, 24, 20) -> center (72, 150)
+    push_inst(
+      inst, 60.0, 140.0, 24.0, 20.0,
+      6.0, 10.0, 0.0, 0.0,
+      0.14, 0.15, 0.17, 1.0,
+      0.1, 0.5, 0.9, 0.5,
+      0.0, 200.0, 150.0, 44.0,
+    )
+    // Right dark adaptive stroke (kind 10) at (240, 140, 24, 20) -> center (252, 150)
+    push_inst(
+      inst, 240.0, 140.0, 24.0, 20.0,
+      6.0, 10.0, 0.0, 0.0,
+      0.14, 0.15, 0.17, 1.0,
+      0.1, 0.5, 0.9, 0.5,
+      0.0, 200.0, 150.0, 44.0,
+    )
+    inst
+  }
+
+  let rgba = FixedArray::make(pw * ph * 4, 0 as Byte)
+  let tbuf = FixedArray::make(2, 0.0)
+  let draw_scene = fn(dark_w : Double, tint_a : Double, grp : Double) -> Unit {
+    rn_dirty(0.0, 0.0, 400.0, 300.0)
+    let fa_inst = to_fixed_d(build_scene(dark_w, tint_a, grp))
+    c_draw_timed(array_data_ptr(fa_inst), 5, 1.0, 1.0, 1.0, array_data_ptr(tbuf))
+  }
+
+  // (1) Half-dark wide capsule at baseline 0x67: left ink inverts bright (> 0.82)
+  c_adaptive_reset()
+  draw_scene(184.0, 103.0 / 255.0, -10.0)
+  assert(hostapi::drawn_pixels(0, 0, pw, ph, rgba), "half-dark 0x67 readback")
+  let l0 = luma_at(rgba, 72, 150)
+  assert(l0 > 0.82, "half-dark baseline 0x67 left ink must invert bright (> 0.82), got \{l0}")
+
+  // Raising tint_a on the same slot (0.522 / 0.752 / 0.913) keeps left ink dark (< 0.25) and glass bright (> 0.56)
+  for fa in [0.522, 0.752, 0.913] {
+    draw_scene(184.0, fa, -10.0)
+    assert(hostapi::drawn_pixels(0, 0, pw, ph, rgba), "half-dark frost readback")
+    let fl_ink = luma_at(rgba, 72, 150)
+    let fl_gl = luma_at(rgba, 140, 150)
+    assert(fl_ink < 0.25, "half-dark frost a=\{fa} left ink must stay dark (< 0.25), got \{fl_ink}")
+    assert(fl_gl > 0.56, "half-dark frost a=\{fa} glass must stay bright (> 0.56), got \{fl_gl}")
+  }
+
+  // Returning to 0x67 on the same slot restores local bright inversion
+  draw_scene(184.0, 103.0 / 255.0, -10.0)
+  assert(hostapi::drawn_pixels(0, 0, pw, ph, rgba), "half-dark return 0x67 readback")
+  let l_back = luma_at(rgba, 72, 150)
+  assert(l_back > 0.82, "half-dark return to 0x67 must restore bright left ink (> 0.82), got \{l_back}")
+
+  // (2) Full-dark backdrop: 0x67 flips dark, then raising to 0.913 snaps immediately to light glass + dark ink with settling == 0
+  c_adaptive_reset()
+  draw_scene(400.0, 103.0 / 255.0, -11.0)
+  assert(hostapi::drawn_pixels(0, 0, pw, ph, rgba), "full-dark 0x67 readback")
+  let fd0_ink = luma_at(rgba, 72, 150)
+  let fd0_gl = luma_at(rgba, 310, 150)
+  assert(fd0_ink > 0.75 && fd0_gl < 0.35, "full-dark 0x67 must flip dark (ink=\{fd0_ink} > 0.75, gl=\{fd0_gl} < 0.35)")
+
+  draw_scene(400.0, 0.913, -11.0)
+  assert(hostapi::drawn_pixels(0, 0, pw, ph, rgba), "full-dark 0.913 snap readback")
+  let fd_ink = luma_at(rgba, 72, 150)
+  let fd_gl = luma_at(rgba, 310, 150)
+  let settling = c_adaptive_settling()
+  assert(fd_ink < 0.25, "full-dark 0.913 ink must snap dark (< 0.25), got \{fd_ink}")
+  assert(fd_gl > 0.85, "full-dark 0.913 glass must snap bright (> 0.85), got \{fd_gl}")
+  assert(settling == 0, "full-dark 0.913 snap must leave adaptive_settling == 0, got \{settling}")
+
+  // Fresh full-dark capsule at 65% frost (0.752) stays light frosted glass with dark ink
+  c_adaptive_reset()
+  draw_scene(400.0, 0.752, -12.0)
+  assert(hostapi::drawn_pixels(0, 0, pw, ph, rgba), "full-dark fresh 0.752 readback")
+  let f65_ink = luma_at(rgba, 72, 150)
+  let f65_gl = luma_at(rgba, 310, 150)
+  assert(f65_ink < 0.25, "full-dark fresh 0.752 ink must stay dark (< 0.25), got \{f65_ink}")
+  assert(f65_gl > 0.72, "full-dark fresh 0.752 glass must stay bright (> 0.72), got \{f65_gl}")
 }
