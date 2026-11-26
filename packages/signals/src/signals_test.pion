@@ -557,3 +557,109 @@ test "adversarial: Watch/effect self-stop before reading unallocated Signal must
   debug_assert(live_node_count() == base_nodes, "no self-loop node leak in effect")
   debug_assert(live_link_count() == base_links, "no self-loop link leak in effect")
 }
+
+struct EqPair {
+  id : Int
+  tag : String
+}
+
+pub impl Eq for EqPair {
+  fn equal(self : EqPair, other : EqPair) -> Bool {
+    self.id == other.id && self.tag == other.tag
+  }
+}
+
+test "builtin Eq Option tuple, Option custom Eq struct, and custom same= override" {
+  // 1. Option[(String, String, String)] with built-in Eq
+  let tuple_sig : Signal[Option[(String, String, String)]] = signal(None)
+  let tuple_runs = [0]
+  let stop_t = effect(fn() -> Unit {
+    let _ = tuple_sig.get()
+    tuple_runs[0] = tuple_runs[0] + 1
+  })
+  debug_assert(tuple_runs[0] == 1, "tuple signal initial run")
+  tuple_sig.set(None)
+  debug_assert(tuple_runs[0] == 1, "tuple signal equal None does not re-run")
+  tuple_sig.set(Some(("a", "b", "c")))
+  debug_assert(tuple_runs[0] == 2, "tuple signal Some triggers run")
+  tuple_sig.set(Some(("a", "b", "c")))
+  debug_assert(tuple_runs[0] == 2, "tuple signal equal Some does not re-run")
+  tuple_sig.set(Some(("a", "b", "d")))
+  debug_assert(tuple_runs[0] == 3, "tuple signal distinct Some triggers run")
+  stop_t()
+
+  // 2. Option[EqPair] with custom pub impl Eq
+  let struct_sig : Signal[Option[EqPair]] = signal(None)
+  let struct_runs = [0]
+  let stop_s = effect(fn() -> Unit {
+    let _ = struct_sig.get()
+    struct_runs[0] = struct_runs[0] + 1
+  })
+  debug_assert(struct_runs[0] == 1, "struct signal initial run")
+  struct_sig.set(Some(EqPair::{ id: 1, tag: "ok" }))
+  debug_assert(struct_runs[0] == 2, "struct signal Some triggers run")
+  struct_sig.set(Some(EqPair::{ id: 1, tag: "ok" }))
+  debug_assert(struct_runs[0] == 2, "struct signal equal Some does not re-run")
+  struct_sig.set(Some(EqPair::{ id: 2, tag: "ok" }))
+  debug_assert(struct_runs[0] == 3, "struct signal distinct Some triggers run")
+  stop_s()
+
+  // 3. Custom same= override (always-notify even when == would be true)
+  let custom_sig = signal(false, same=fn(_a : Bool, _b : Bool) -> Bool { false })
+  let custom_runs = [0]
+  let stop_c = effect(fn() -> Unit {
+    let _ = custom_sig.get()
+    custom_runs[0] = custom_runs[0] + 1
+  })
+  debug_assert(custom_runs[0] == 1, "custom same initial run")
+  custom_sig.set(false)
+  debug_assert(custom_runs[0] == 2, "custom same=false overrides default == and re-runs")
+  stop_c()
+
+  // 4. computed(..., same=...) custom comparator suppresses downstream effect when parity unchanged
+  let num = signal(2)
+  let parity_comp = computed(
+    fn(_prev : Option[Int]) -> Int { num.get() },
+    same=fn(a : Int, b : Int) -> Bool { a % 2 == b % 2 },
+  )
+  let comp_runs = [0]
+  let stop_comp = effect(fn() -> Unit {
+    let _ = parity_comp.get()
+    comp_runs[0] = comp_runs[0] + 1
+  })
+  debug_assert(comp_runs[0] == 1, "computed same= initial run")
+  num.set(4)
+  debug_assert(comp_runs[0] == 1, "computed same= equal parity suppresses re-run")
+  num.set(5)
+  debug_assert(comp_runs[0] == 2, "computed same= changed parity triggers re-run")
+  stop_comp()
+
+  // 5. memo(..., same_in=..., same=...) verifies both input and output comparators
+  let m_in = signal(10)
+  let m_evals = [0]
+  let m_out = memo(
+    fn() -> Int { m_in.get() },
+    fn(x : Int) -> Int {
+      m_evals[0] = m_evals[0] + 1
+      x / 10
+    },
+    same_in=fn(a : Int, b : Int) -> Bool { a / 2 == b / 2 },
+    same=fn(a : Int, b : Int) -> Bool { a % 2 == b % 2 },
+  )
+  let m_runs = [0]
+  let stop_m = effect(fn() -> Unit {
+    let _ = m_out.get()
+    m_runs[0] = m_runs[0] + 1
+  })
+  debug_assert(m_evals[0] == 1 && m_runs[0] == 1, "memo initial eval & effect")
+  // 10 -> 11: same_in(10/2 == 11/2) is true -> memo does not re-evaluate
+  m_in.set(11)
+  debug_assert(m_evals[0] == 1 && m_runs[0] == 1, "memo same_in= skips re-evaluation")
+  // 11 -> 30: same_in false -> re-evaluates (30/10 = 3), same(1 % 2 == 3 % 2) is true -> suppresses downstream effect
+  m_in.set(30)
+  debug_assert(m_evals[0] == 2 && m_runs[0] == 1, "memo same= suppresses downstream effect")
+  // 30 -> 20: same_in false -> re-evaluates (20/10 = 2), same(1 % 2 == 2 % 2) is false -> triggers downstream effect
+  m_in.set(20)
+  debug_assert(m_evals[0] == 3 && m_runs[0] == 2, "memo same= triggers downstream effect when false")
+  stop_m()
+}
