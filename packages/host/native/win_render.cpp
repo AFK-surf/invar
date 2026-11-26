@@ -3140,7 +3140,7 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   float blur = (kind == 6 && a[7] < 0.0f) ? 0.0f : fabsf(a[7]);
   int merged_liquid = (kind == 6 && a[23] > 0.0f);
   int unmerged_liquid = (kind == 6 && !merged_liquid);
-  float margin = is_contained ? 0.0f : 3.0f * blur + (kind == 6 ? a[21] * (1.0f + fabsf(a[22])) + fmaxf(a[23], 0.0f) : 0.0f) + 2.0f;
+  float margin = (is_contained || is_progressive) ? 0.0f : 3.0f * blur + (kind == 6 ? a[21] * (1.0f + fabsf(a[22])) + fmaxf(a[23], 0.0f) : 0.0f) + 2.0f;
   float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
   int n = 0;
   for (int32_t i = start; i < end; i++) {
