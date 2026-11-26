@@ -298,6 +298,7 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         drawingThread();
         boolean lost = Native.surfaceCreated();
+        NativeViews.textureMostReset();
         NativeViews.textureMostRead();
         mine = ++setUp;
         glAlive = true;

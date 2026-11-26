@@ -106,6 +106,11 @@ $CC -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all 
   -Ipackages/host/native packages/host/native/groups_test.c -o "$OUT_DIR/groups_test" -lm
 "$OUT_DIR/groups_test"
 
+echo "==> MBRAWPRE (raw_premul.h) unit test"
+$CC -O2 -Wall -Wextra -Werror \
+  -Ipackages/host/native packages/host/tests/raw_premul_test.c -o "$OUT_DIR/raw_premul_test" -lm
+"$OUT_DIR/raw_premul_test"
+
 PIONC="${PIONC:-$(command -v pionc2 || true)}"
 if [ -n "$PIONC" ]; then
   echo "==> Running $PIONC test packages/damage/parity (groups.h against damage::Groups)"
