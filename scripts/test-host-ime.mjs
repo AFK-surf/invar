@@ -23,15 +23,21 @@ class FakeEvent {
 }
 
 class FakeTarget {
-  constructor() { this.listeners = new Map(); }
-  addEventListener(type, fn) {
+  constructor() { this.listeners = new Map(); this.listenerOpts = new Map(); }
+  addEventListener(type, fn, opts) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
+    if (!this.listenerOpts.has(type)) this.listenerOpts.set(type, []);
     this.listeners.get(type).push(fn);
+    this.listenerOpts.get(type).push(opts);
   }
   removeEventListener(type, fn) {
     const l = this.listeners.get(type) || [];
+    const o = this.listenerOpts.get(type) || [];
     const i = l.indexOf(fn);
-    if (i >= 0) l.splice(i, 1);
+    if (i >= 0) {
+      l.splice(i, 1);
+      o.splice(i, 1);
+    }
   }
   dispatch(type, init) {
     const ev = new FakeEvent(type, { target: this, ...init });
@@ -323,4 +329,116 @@ ev = win.dispatch("keydown", { key: "R", metaKey: true, shiftKey: true, ctrlKey:
 assert.deepEqual(keys, [], "window Cmd+Shift+R left to browser hard reload");
 assert.equal(ev.defaultPrevented, false, "window Cmd+Shift+R does not preventDefault");
 
-console.log("test-host-ime: OK (6 cases)");
+// 7. iOS WebKit: touchend listener is non-passive and prevents default while an editor is active
+//    so the synthetic click after pointerup's frameInGesture() cannot blur #ime and drop the soft keyboard.
+{
+  const iosDoc = new FakeTarget();
+  Object.assign(iosDoc, {
+    title: "",
+    visibilityState: "visible",
+    readyState: "complete",
+    currentScript: null,
+    createElement: (tag) => new FakeElement(tag, iosDoc),
+    createElementNS: (_ns, tag) => new FakeElement(tag, iosDoc),
+    getElementById(id) {
+      const walk = (n) => {
+        if (n.id === id) return n;
+        for (const c of n.children) { const f = walk(c); if (f) return f; }
+        return null;
+      };
+      return walk(iosDoc.documentElement);
+    },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  });
+  iosDoc.documentElement = new FakeElement("html", iosDoc);
+  iosDoc.head = new FakeElement("head", iosDoc);
+  iosDoc.body = new FakeElement("body", iosDoc);
+  iosDoc.documentElement.appendChild(iosDoc.head);
+  iosDoc.documentElement.appendChild(iosDoc.body);
+  iosDoc.activeElement = iosDoc.body;
+  const iosCanvas = iosDoc.createElement("canvas");
+  iosCanvas.id = "c";
+  const iosTa = iosDoc.createElement("textarea");
+  iosTa.id = "ime";
+  iosDoc.body.appendChild(iosCanvas);
+  iosDoc.body.appendChild(iosTa);
+
+  let rafCb = null;
+  const iosWin = new FakeTarget();
+  Object.assign(iosWin, {
+    document: iosDoc,
+    location: { href: "http://localhost/", search: "", hash: "", origin: "http://localhost", pathname: "/" },
+    navigator: { userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", platform: "iPhone", maxTouchPoints: 5, language: "en", languages: ["en"] },
+    devicePixelRatio: 2,
+    innerWidth: 400,
+    innerHeight: 300,
+    performance: { now: () => 0, timeOrigin: 0 },
+    requestAnimationFrame: (fn) => { rafCb = fn; return 1; },
+    cancelAnimationFrame: noop,
+    setTimeout: () => 0,
+    clearTimeout: noop,
+    setInterval: () => 0,
+    clearInterval: noop,
+    queueMicrotask,
+    matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop, addListener: noop }),
+    getComputedStyle: () => ({ backgroundColor: "", getPropertyValue: () => "" }),
+    URL, URLSearchParams, TextEncoder, TextDecoder, Promise, Map, Set, WeakMap, Math, Date, JSON, Array, Uint8Array,
+    Float32Array, Float64Array, Int32Array, Uint32Array, Uint16Array, Int16Array, Uint8ClampedArray, ArrayBuffer,
+    DataView, Error, TypeError, Object, String, Number, Boolean, Symbol, Proxy, Reflect, console,
+    ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
+    MutationObserver: class { observe() {} disconnect() {} },
+    history: { replaceState: noop, pushState: noop, state: null },
+    localStorage: { getItem: () => null, setItem: noop, removeItem: noop },
+    sessionStorage: { getItem: () => null, setItem: noop, removeItem: noop },
+    fetch: () => new Promise(noop),
+    addEventListener: FakeTarget.prototype.addEventListener,
+  });
+  iosWin.window = iosWin;
+  iosWin.self = iosWin;
+  iosWin.globalThis = iosWin;
+  iosWin.visualViewport = null;
+  vm.runInContext(hostSrc, vm.createContext(iosWin), { filename: "web/host.js" });
+  const iosH = iosWin.__mbhost;
+
+  let focused = false;
+  iosH.run(
+    "ios touchend test",
+    () => {
+      if (focused) iosH.setIme(true, 0, 100, 100, 20, "", 0, 0);
+      else iosH.setIme(false, 0, 0, 0, 0, "", 0, 0);
+    },
+    (kind, _x, y) => {
+      if (kind === 12) {
+        focused = y >= 100;
+        iosH.requestFrame();
+      }
+    },
+    noop,
+    noop,
+    noop,
+  );
+  // Wait for H.run's h264Asked microtask (known = true) and drain initial frame before the first tap.
+  await Promise.resolve();
+  if (rafCb) { const fn = rafCb; rafCb = null; fn(0); }
+
+  const touchendOpts = iosCanvas.listenerOpts.get("touchend") || [];
+  assert.ok(touchendOpts.some((o) => o && o.passive === false), "touchend listener must be non-passive");
+
+  const tapAt = (y, cancelable = true) => {
+    for (const name of ["pointerdown", "pointerup"]) {
+      iosCanvas.dispatch(name, { pointerType: "touch", pointerId: 1, button: 0, clientX: 10, clientY: y, timeStamp: 0 });
+    }
+    const te = iosCanvas.dispatch("touchend", { cancelable });
+    return te.defaultPrevented;
+  };
+
+  assert.equal(tapAt(120, true), true, "tapping a field prevents touchend default so synthetic click cannot blur #ime");
+  assert.equal(iosDoc.activeElement, iosTa, "textarea stays focused after tapping a field");
+  assert.equal(tapAt(120, false), false, "non-cancelable touchend does not call preventDefault");
+  assert.equal(tapAt(120, true), true, "tapping an already-focused field still prevents touchend default");
+  assert.equal(tapAt(10, true), false, "tapping outside blurs the field and leaves touchend un-prevented");
+  assert.equal(iosDoc.activeElement, iosDoc.body, "textarea is blurred after tapping outside");
+}
+
+console.log("test-host-ime: OK (7 cases)");
