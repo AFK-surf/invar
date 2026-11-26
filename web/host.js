@@ -2890,7 +2890,7 @@
     const blur = (kind === 6 && f32[a + 7] < 0) ? 0 : Math.abs(f32[a + 7]);
     const mergedLiquid = kind === 6 && f32[a + 23] > 0;
     const unmergedLiquid = kind === 6 && !mergedLiquid;
-    let margin = isContained ? 0 : 3 * blur + (kind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
+    let margin = (isContained || isProgressive) ? 0 : 3 * blur + (kind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
     let mN = 0;
     const mShape = new Float32Array(32), mRad = new Float32Array(32);
@@ -3207,7 +3207,7 @@
           const blurR = (gkind === 6 && f32[a + 7] < 0) ? 0 : Math.abs(f32[a + 7]);
           const mergedLiquid = gkind === 6 && f32[a + 23] > 0;
           const unmergedLiquid = gkind === 6 && !mergedLiquid;
-          let margin = isContained ? 0 : 3 * blurR + (gkind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
+          let margin = (isContained || (gkind === 5 && f32[a + 22] < -0.5)) ? 0 : 3 * blurR + (gkind === 6 ? f32[a + 21] * (1 + Math.abs(f32[a + 22])) + Math.max(f32[a + 23], 0) : 0) + 2;
           let gx0 = 1e9, gy0 = 1e9, gx1 = -1e9, gy1 = -1e9;
           for (let j = firstI; j < count; j++) {
             const b = j * INST;
