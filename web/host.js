@@ -2246,7 +2246,7 @@
       target = latch;
     }
     float nextT;
-    if (is_new > 0.5 || dt >= 1.0) nextT = target;
+    if (is_new > 0.5 || is_dark > 0.5 || dt >= 1.0) nextT = target;
     else if (dt <= 0.0) nextT = prevT;
     else {
       nextT = mix(prevT, target, 1.0 - exp(-dt / 0.070));
@@ -2657,7 +2657,7 @@
       const s = adSlots[sid];
       if (!isNew && s.updatedSerial === serial) continue;
       if (isNew || backdropChanged || s.settleLeft > 0) {
-        if (isNew) s.settleLeft = 0;
+        if (isNew || s.isDark > 0) s.settleLeft = 0;
         else if (backdropChanged) s.settleLeft = AD_SETTLE_SEC;
         else s.settleLeft = Math.max(0, s.settleLeft - dt);
         s.updatedSerial = serial;
