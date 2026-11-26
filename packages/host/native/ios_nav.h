@@ -317,6 +317,12 @@ API_AVAILABLE(ios(18.0))
 // (iOS 27: the accent the action's glass is tinted with, and its tinted UIGlassEffect view inside the platter)
 @property(nonatomic, strong) UIColor *actionInk;
 @property(nonatomic, strong) UIColor *actionWashInk;
+// (the bar's ink and accent last given to UIKit: a tint set again cascades through every view under it)
+@property(nonatomic) BOOL appliedColorsValid;
+@property(nonatomic) uint64_t appliedInkVal;
+@property(nonatomic) uint64_t appliedAccentVal;
+@property(nonatomic, strong) UIColor *appliedInk;
+@property(nonatomic, strong) UIColor *appliedAccent;
 @property(nonatomic, strong) UIView *actionWash;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, UIButton *> *floatingButtons;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *floatingKeys;
@@ -372,8 +378,7 @@ static void nav_put(UIViewController *slot) {
 static UIView *nav_platter(UIView *in, UIView *v, CGRect r) {
   if ([NSStringFromClass(in.class) hasSuffix:@"TabBarItemPlatterView"]) {
     CGRect f = [in convertRect:in.bounds toView:v];
-    if (fabs(CGRectGetMidX(f) - CGRectGetMidX(r)) < 2 && fabs(CGRectGetMidY(f) - CGRectGetMidY(r)) < 2 &&
-        fabs(f.size.width - r.size.width) < 2)
+    if (mb_ios_nav_wash_rect_matches(f, r))
       return in;
   }
   for (UIView *c in in.subviews) {
@@ -506,6 +511,16 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   }
   UITab *x = self.tabsById[self.action];
   CGRect r = x ? [x frameInView:self.view] : CGRectNull;
+  // (the wash already first in the platter still under the action, in its ink: kept, no scan of the tree for it)
+  UIView *kept = self.actionWash;
+  if (kept && kept.superview && kept.window && kept.superview.subviews.firstObject == kept &&
+      [self.actionWashInk isEqual:self.actionInk]) {
+    CGRect washInRoot = [kept.superview convertRect:kept.superview.bounds toView:self.view];
+    if (mb_ios_nav_wash_rect_matches(washInRoot, r)) {
+      if (!CGRectEqualToRect(kept.frame, kept.superview.bounds)) kept.frame = kept.superview.bounds;
+      return;
+    }
+  }
   UIView *p = CGRectIsNull(r) || CGRectIsEmpty(r) ? nil : nav_platter(self.view, self.view, r);
   if (!p) return;
 #ifdef __IPHONE_26_0
@@ -806,11 +821,19 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   return tab;
 }
 // The app reserves only the geometry. UIKit owns the glass, press feedback, title, image and popup menu.
-- (void)floatingItems:(NSArray<NSDictionary *> *)items ink:(UIColor *)ink {
+- (void)floatingItems:(NSArray<NSDictionary *> *)items ink:(UIColor *)ink inkVal:(uint64_t)inkVal bare:(BOOL)bare {
   if (!self.floatingButtons) {
     self.floatingButtons = [NSMutableDictionary dictionary];
     self.floatingKeys = [NSMutableDictionary dictionary];
   }
+  if (bare) {
+    for (UIButton *button in self.floatingButtons.allValues) {
+      [button.contextMenuInteraction dismissMenu];
+      if (!button.hidden) button.hidden = YES;
+    }
+    return;
+  }
+  if (![items isKindOfClass:NSArray.class]) items = @[];
   NSMutableSet<NSString *> *live = [NSMutableSet set];
   for (NSDictionary *f in items) {
     NSDictionary *d = f[@"item"];
@@ -831,13 +854,15 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
       self.floatingButtons[ident] = button;
     }
     if (button.superview != the_view) [the_view addSubview:button];
-    button.frame = CGRectMake([f[@"x"] doubleValue], [f[@"y"] doubleValue], [f[@"w"] doubleValue], [f[@"h"] doubleValue]);
+    if (button.hidden) button.hidden = NO;
+    CGRect targetFrame = CGRectMake([f[@"x"] doubleValue], [f[@"y"] doubleValue], [f[@"w"] doubleValue], [f[@"h"] doubleValue]);
+    if (!CGRectEqualToRect(button.frame, targetFrame)) button.frame = targetFrame;
     BOOL blocked = [f[@"blocked"] boolValue];
     ((MBFloatingButton *)button).inputBlocked = blocked;
-    button.accessibilityElementsHidden = blocked;
+    if (button.accessibilityElementsHidden != blocked) button.accessibilityElementsHidden = blocked;
     // Keep the live glass stable while a canvas presenter opens. Its backdrop already
     // changes with the presenter; an extra opacity jump makes every sibling flash.
-    NSString *key = [NSString stringWithFormat:@"%@/%@", d, ink];
+    NSString *key = mb_ios_nav_floating_item_key(d, inkVal);
     if (![self.floatingKeys[ident] isEqualToString:key]) {
       self.floatingKeys[ident] = key;
       BOOL withTitle = [d[@"prominent"] boolValue];
@@ -889,7 +914,11 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
       }
       badge.hidden = !dot;
     }
-    [button viewWithTag:71].frame = CGRectMake(button.bounds.size.width - 18, (button.bounds.size.height - 6) / 2, 6, 6);
+    UIView *badge = [button viewWithTag:71];
+    if (badge) {
+      CGRect badgeFrame = CGRectMake(button.bounds.size.width - 18, (button.bounds.size.height - 6) / 2, 6, 6);
+      if (!CGRectEqualToRect(badge.frame, badgeFrame)) badge.frame = badgeFrame;
+    }
   }
   for (NSString *ident in [self.floatingButtons.allKeys copy]) {
     if ([live containsObject:ident]) continue;
@@ -900,7 +929,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
 }
 // No tabs: one tab, the bar hidden, the app's controller in it.
 - (void)applyNone {
-  [self floatingItems:@[] ink:UIColor.labelColor];
+  [self floatingItems:@[] ink:UIColor.labelColor inkVal:0 bare:NO];
   UINavigationController *nav = [self navFor:@""];
   if (self.tabsKey.length || !self.tabs.count) {
     self.tabsKey = @"";
@@ -948,12 +977,26 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
     [self applyNone];
     return;
   }
-  UIColor *ink = [b[@"ink"] unsignedLongLongValue] ? nav_rgba(b[@"ink"]) : UIColor.labelColor;
-  UIColor *accent = [b[@"chosen_ink"] unsignedLongLongValue] ? nav_rgba(b[@"chosen_ink"]) : UIColor.tintColor;
-  self.tabBar.tintColor = accent;
-  self.view.tintColor = accent;
-  self.tabBar.unselectedItemTintColor = ink;
-  [self floatingItems:bare ? @[] : b[@"floating"] ink:ink];
+  uint64_t inkVal = [b[@"ink"] unsignedLongLongValue];
+  uint64_t accentVal = [b[@"chosen_ink"] unsignedLongLongValue];
+  BOOL inkChanged = mb_ios_nav_color_changed(self.appliedColorsValid, self.appliedInkVal, inkVal);
+  BOOL accentChanged = mb_ios_nav_color_changed(self.appliedColorsValid, self.appliedAccentVal, accentVal);
+  UIColor *ink = inkChanged ? (inkVal ? nav_rgba(b[@"ink"]) : UIColor.labelColor) : (self.appliedInk ?: UIColor.labelColor);
+  UIColor *accent =
+      accentChanged ? (accentVal ? nav_rgba(b[@"chosen_ink"]) : UIColor.tintColor) : (self.appliedAccent ?: UIColor.tintColor);
+  if (accentChanged) {
+    self.tabBar.tintColor = accent;
+    self.view.tintColor = accent;
+    self.appliedAccentVal = accentVal;
+    self.appliedAccent = accent;
+  }
+  if (inkChanged) {
+    self.tabBar.unselectedItemTintColor = ink;
+    self.appliedInkVal = inkVal;
+    self.appliedInk = ink;
+  }
+  self.appliedColorsValid = YES;
+  [self floatingItems:b[@"floating"] ink:ink inkVal:inkVal bare:bare];
   // the tabs again only as they change (their ids, words and icons)
   NSMutableString *key = [NSMutableString string];
   // (an icon that changes, the stations' at a glance, drawn again in place: below)
@@ -1007,7 +1050,8 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   for (UITab *tab in self.tabs)
     for (NSDictionary *t in places)
       if ([t[@"id"] isEqualToString:tab.identifier]) {
-        tab.badgeValue = [t[@"dot"] boolValue] ? @"" : nil;
+        NSString *wantBadge = [t[@"dot"] boolValue] ? @"" : nil;
+        if (tab.badgeValue != wantBadge && ![tab.badgeValue isEqualToString:wantBadge]) tab.badgeValue = wantBadge;
         if (![tab.title isEqualToString:t[@"title"]]) tab.title = t[@"title"];
         if (![self.icons[tab.identifier] isEqualToString:t[@"icon"]]) {
           NSString *icon = t[@"icon"];
@@ -1079,7 +1123,8 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   // (the toolbar the chosen tab's alone: shown on two, the column shows its items twice)
   for (NSString *k in self.navs) {
     UINavigationController *n = self.navs[k];
-    [n setToolbarHidden:(n != nav || !n.viewControllers.firstObject.toolbarItems.count) animated:NO];
+    BOOL hidden = (n != nav || !n.viewControllers.firstObject.toolbarItems.count);
+    if (n.toolbarHidden != hidden) [n setToolbarHidden:hidden animated:NO];
   }
   if (!self.choosing && tab.identifier.length) say_system(@{@"nav" : tab.identifier});
 }
