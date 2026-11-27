@@ -437,6 +437,7 @@ static void target_release_test(Target *t) {
   if (t->fine_rt) t->fine_rt->Release();
   if (t->fine_bitmap) t->fine_bitmap->Release();
   free(t->fine_a);
+  free(t->fine_alpha);
   *t = {};
 }
 
@@ -497,7 +498,7 @@ static void test_lazy_target_and_failure_zero(void) {
   draw_cluster(l, &cb, 2.0, 0.0, 16.0, 400, &t, &d);
   CHECK(d.px != NULL && d.pw > 0 && d.ph > 0);
   CHECK(t.rt == NULL && t.bitmap == NULL);
-  CHECK(t.fine_rt != NULL);
+  CHECK(t.fine_rt == NULL);
   CHECK(d.bounds.valid && d.bounds.box_w == cb.box_w && d.bounds.box_h == cb.box_h);
   free(d.px);
   target_release_test(&t);

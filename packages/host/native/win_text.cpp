@@ -76,6 +76,8 @@ struct Target {
   double fine_scale;
   float *fine_a;
   size_t fine_cap;
+  uint8_t *fine_alpha;
+  size_t fine_alpha_cap;
 };
 static Target main_target;
 static double text_scale = 1;
@@ -1213,8 +1215,139 @@ static bool fine_downsample_grow(const uint8_t *src, UINT stride, int pw, int ph
   return true;
 }
 
+struct DWriteFineRenderer : public IDWriteTextRenderer {
+  double sc;
+  int fine;
+  double x0, y0, dx;
+  int pw, ph;
+  Target *t;
+  uint8_t *px;
+  bool ok = true;
+
+  STDMETHOD(QueryInterface)(REFIID iid, void **o) override {
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IDWritePixelSnapping) ||
+        iid == __uuidof(IDWriteTextRenderer)) {
+      *o = this;
+      return S_OK;
+    }
+    *o = NULL;
+    return E_NOINTERFACE;
+  }
+  STDMETHOD_(ULONG, AddRef)() override { return 1; }
+  STDMETHOD_(ULONG, Release)() override { return 1; }
+  STDMETHOD(IsPixelSnappingDisabled)(void *, BOOL *d) override {
+    *d = TRUE;
+    return S_OK;
+  }
+  STDMETHOD(GetCurrentTransform)(void *, DWRITE_MATRIX *m) override {
+    *m = {1, 0, 0, 1, 0, 0};
+    return S_OK;
+  }
+  STDMETHOD(GetPixelsPerDip)(void *, FLOAT *p) override {
+    *p = 1.0f;
+    return S_OK;
+  }
+  STDMETHOD(DrawGlyphRun)(void *, FLOAT bx, FLOAT by, DWRITE_MEASURING_MODE mode, DWRITE_GLYPH_RUN const *run,
+                          DWRITE_GLYPH_RUN_DESCRIPTION const *, IUnknown *) override {
+    if (!ok || !run || run->glyphCount == 0) return S_OK;
+    IDWriteGlyphRunAnalysis *ana = NULL;
+    FLOAT fscale = (FLOAT)(sc * fine);
+    DWRITE_MATRIX mat = {fscale, 0.0f, 0.0f, fscale, 0.0f, 0.0f};
+    HRESULT hr = dw->CreateGlyphRunAnalysis(run, &mat, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, mode,
+                                            DWRITE_GRID_FIT_MODE_DISABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                                            (FLOAT)(bx - x0 + dx), (FLOAT)(by - y0), &ana);
+    if (FAILED(hr) || !ana) {
+      ok = false;
+      return S_OK;
+    }
+    RECT rc = {};
+    hr = ana->GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1, &rc);
+    if (FAILED(hr)) {
+      ana->Release();
+      ok = false;
+      return S_OK;
+    }
+    if (rc.right > rc.left && rc.bottom > rc.top) {
+      int rw = rc.right - rc.left;
+      int rh = rc.bottom - rc.top;
+      size_t need = (size_t)rw * (size_t)rh;
+      if (need > t->fine_alpha_cap) {
+        uint8_t *nb = (uint8_t *)realloc(t->fine_alpha, need);
+        if (!nb) {
+          ana->Release();
+          ok = false;
+          return S_OK;
+        }
+        t->fine_alpha = nb;
+        t->fine_alpha_cap = need;
+      }
+      hr = ana->CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &rc, t->fine_alpha, (UINT32)need);
+      if (FAILED(hr)) {
+        ana->Release();
+        ok = false;
+        return S_OK;
+      }
+      const uint8_t *alpha = t->fine_alpha;
+      int py0 = rc.top >= 0 ? rc.top / fine : 0;
+      int py1 = (rc.bottom + fine - 1) / fine;
+      if (py1 > ph) py1 = ph;
+      int px0 = rc.left >= 0 ? rc.left / fine : 0;
+      int px1 = (rc.right + fine - 1) / fine;
+      if (px1 > pw) px1 = pw;
+      int ff = fine * fine;
+      int half = ff / 2;
+      for (int py = py0; py < py1; py++) {
+        int fy0 = py * fine, fy1 = fy0 + fine;
+        int ys = fy0 > rc.top ? fy0 : rc.top;
+        int ye = fy1 < rc.bottom ? fy1 : rc.bottom;
+        for (int px_i = px0; px_i < px1; px_i++) {
+          int fx0 = px_i * fine, fx1 = fx0 + fine;
+          int xs = fx0 > rc.left ? fx0 : rc.left;
+          int xe = fx1 < rc.right ? fx1 : rc.right;
+          int sum = 0;
+          for (int fy = ys; fy < ye; fy++) {
+            const uint8_t *sr = alpha + (size_t)(fy - rc.top) * (size_t)rw;
+            for (int fx = xs; fx < xe; fx++) sum += sr[fx - rc.left];
+          }
+          int c = (sum + half) / ff;
+          uint8_t *o = px + ((size_t)py * (size_t)pw + (size_t)px_i) * 4;
+          int v = (int)o[3] + c;
+          uint8_t vc = (uint8_t)(v > 255 ? 255 : v);
+          o[0] = o[1] = o[2] = o[3] = vc;
+        }
+      }
+    }
+    ana->Release();
+    return S_OK;
+  }
+  STDMETHOD(DrawUnderline)(void *, FLOAT, FLOAT, DWRITE_UNDERLINE const *, IUnknown *) override { return S_OK; }
+  STDMETHOD(DrawStrikethrough)(void *, FLOAT, FLOAT, DWRITE_STRIKETHROUGH const *, IUnknown *) override { return S_OK; }
+  STDMETHOD(DrawInlineObject)(void *, FLOAT, FLOAT, IDWriteInlineObject *, BOOL, BOOL, IUnknown *) override {
+    return S_OK;
+  }
+};
+
+static bool draw_fine_dwrite(IDWriteTextLayout *l, double sc, double x0, double y0, double dx, int pw, int ph,
+                             Target *t, uint8_t *px) {
+  if (!dw || !t->d2d || !t->wic) return false;
+  memset(px, 0, (size_t)pw * (size_t)ph * 4);
+  DWriteFineRenderer dr;
+  dr.sc = sc;
+  dr.fine = sc >= 1.75 ? 2 : FINE;
+  dr.x0 = x0;
+  dr.y0 = y0;
+  dr.dx = dx;
+  dr.pw = pw;
+  dr.ph = ph;
+  dr.t = t;
+  dr.px = px;
+  if (FAILED(l->Draw(NULL, &dr, 0, 0))) return false;
+  return dr.ok;
+}
+
 static bool draw_fine(IDWriteTextLayout *l, double sc, double x0, double y0, double dx, int pw, int ph, double grow,
                       Target *t, uint8_t *px) {
+  if (grow <= 0.0 && draw_fine_dwrite(l, sc, x0, y0, dx, pw, ph, t, px)) return true;
   int fw = pw * FINE, fh = ph * FINE;
   if (!fine_ensure(t, sc, fw + 1, fh + 1)) return false;
   ID2D1RenderTarget *rt = t->fine_rt;
