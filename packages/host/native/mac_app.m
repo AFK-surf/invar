@@ -3118,13 +3118,28 @@ void mb_host_clipboard_secret_off(void) {
   secret_count = -1;
 }
 
-// A picture on the clipboard (@hostapi.clipboard_set_image): the image the bytes are, as other apps paste one.
+// A picture on the clipboard (@hostapi.clipboard_set_image): write raw PNG on NSPasteboardTypePNG first so modern
+// consumers (Slack, Electron, browsers, Preview) receive the exact compressed PNG with pHYs/DPI intact instead of a
+// huge uncompressed TIFF, while keeping TIFF on the same pasteboard item for legacy AppKit consumers.
 void mb_host_clipboard_image(moonbit_bytes_t data) {
-  NSImage *img = [[NSImage alloc] initWithData:[NSData dataWithBytes:data length:Moonbit_array_length(data)]];
+  size_t len = (size_t)Moonbit_array_length(data);
+  if (!len) return;
+  NSData *raw = [NSData dataWithBytes:data length:len];
+  NSImage *img = [[NSImage alloc] initWithData:raw];
   if (!img) return;
   NSPasteboard *pb = [NSPasteboard generalPasteboard];
   [pb clearContents];
-  [pb writeObjects:@[ img ]];
+  BOOL isPng = len >= 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+               data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A;
+  if (isPng) {
+    NSPasteboardItem *item = [NSPasteboardItem new];
+    [item setData:raw forType:NSPasteboardTypePNG];
+    NSData *tiff = [img TIFFRepresentation];
+    if (tiff) [item setData:tiff forType:NSPasteboardTypeTIFF];
+    [pb writeObjects:@[ item ]];
+  } else {
+    [pb writeObjects:@[ img ]];
+  }
 }
 
 

@@ -21,3 +21,107 @@ pub fn array_to_fixed(arr : Array[Byte]) -> FixedArray[Byte] {
   }
   out
 }
+
+fn png_be32_at(b : Bytes, at : Int) -> Int {
+  (b[at].to_int() << 24) | (b[at + 1].to_int() << 16) | (b[at + 2].to_int() << 8) | b[at + 3].to_int()
+}
+
+fn png_is_chunk_at(b : Bytes, at : Int, c0 : Int, c1 : Int, c2 : Int, c3 : Int) -> Bool {
+  b[at].to_int() == c0 && b[at + 1].to_int() == c1 && b[at + 2].to_int() == c2 && b[at + 3].to_int() == c3
+}
+
+/// Insert or replace the PNG `pHYs` chunk (pixels per meter, unit=1) right after `IHDR`.
+/// Returns `png` unchanged if `png` is not a valid PNG with an `IHDR` chunk or `ppm_x`/`ppm_y <= 0`.
+pub fn png_with_phys(png : Bytes, ppm_x : Int, ppm_y : Int) -> Bytes {
+  let n = png.length()
+  if ppm_x <= 0 || ppm_y <= 0 || n < 33 || !is_png(png) {
+    return png
+  }
+  let ihdr_len = png_be32_at(png, 8)
+  if ihdr_len != 13 || !png_is_chunk_at(png, 12, 0x49, 0x48, 0x44, 0x52) {
+    return png
+  }
+  let after_ihdr = 8 + 12 + ihdr_len
+  if after_ihdr > n {
+    return png
+  }
+  // Build the 9-byte pHYs payload (x_ppm, y_ppm, unit=1 meter) as a 21-byte PNG chunk.
+  let phys_out : PngOut = PngOut::{ buf: [] }
+  let phys_data : PngOut = PngOut::{ buf: [] }
+  phys_data.u32(ppm_x.reinterpret_as_uint())
+  phys_data.u32(ppm_y.reinterpret_as_uint())
+  phys_data.byte(1)
+  phys_out.chunk("pHYs", phys_data.buf)
+
+  let out : Array[Byte] = []
+  let mut i = 0
+  while i < after_ihdr {
+    out.push(png[i])
+    i = i + 1
+  }
+  for b in phys_out.buf {
+    out.push(b)
+  }
+  // Copy remaining chunks, stripping any pre-existing pHYs (at most one allowed) and Apple's private iDOT
+  // chunk (which stores absolute byte offsets into IDAT that would go stale if preceding chunks change size).
+  let mut at = after_ihdr
+  while at + 12 <= n {
+    let clen = png_be32_at(png, at)
+    if clen < 0 || clen > n - at - 12 {
+      return png
+    }
+    let is_phys = png_is_chunk_at(png, at + 4, 0x70, 0x48, 0x59, 0x73)
+    let is_idot = png_is_chunk_at(png, at + 4, 0x69, 0x44, 0x4F, 0x54)
+    if !is_phys && !is_idot {
+      let end = at + 12 + clen
+      let mut j = at
+      while j < end {
+        out.push(png[j])
+        j = j + 1
+      }
+    }
+    at = at + 12 + clen
+  }
+  if at != n {
+    return png
+  }
+  mbt_compat::bytes_from_array(out)
+}
+
+/// Insert or replace the PNG `pHYs` chunk from a dots-per-inch value (e.g. 144.0 for macOS 2x Retina).
+pub fn png_with_dpi(png : Bytes, dpi : Double) -> Bytes {
+  if dpi <= 0.0 {
+    return png
+  }
+  let ppm = (dpi / 0.0254).round().to_int()
+  if ppm <= 0 {
+    return png
+  }
+  png_with_phys(png, ppm, ppm)
+}
+
+/// Read the PNG `pHYs` chunk `(x_ppm, y_ppm, unit)` if present.
+pub fn png_phys(png : Bytes) -> Option[(Int, Int, Int)] {
+  let n = png.length()
+  if n < 33 || !is_png(png) {
+    return None
+  }
+  let mut at = 8
+  while at + 12 <= n {
+    let clen = png_be32_at(png, at)
+    if clen < 0 || clen > n - at - 12 {
+      return None
+    }
+    if clen == 9 && png_is_chunk_at(png, at + 4, 0x70, 0x48, 0x59, 0x73) {
+      let x = png_be32_at(png, at + 8)
+      let y = png_be32_at(png, at + 12)
+      let unit = png[at + 16].to_int()
+      return Some((x, y, unit))
+    }
+    if png_is_chunk_at(png, at + 4, 0x49, 0x44, 0x41, 0x54) {
+      return None
+    }
+    at = at + 12 + clen
+  }
+  None
+}
