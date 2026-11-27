@@ -1,0 +1,74 @@
+// Thin reactive projection shell (`RuntimeMachine`) connecting a pure `step` function
+// to `signals::ReadSignal[S]` for retained-tree Views.
+//
+// Views can only observe `machine.state()` (read-only) and dispatch `machine.send(msg)`.
+// Re-entrant synchronous `emit` calls from `exec` are queued iteratively to prevent
+// unbounded recursion and keep state transitions strictly FIFO.
+
+import "signals"
+
+pub struct RuntimeMachine[S, M, C] {
+  step_fn : (S, M) -> (S, Array[C])
+  state_sig : signals::Signal[S]
+  exec : (C, (M) -> Unit) -> Unit
+  inbox : Array[M]
+  mut pumping : Bool
+}
+
+pub fn RuntimeMachine::new[S : Eq, M, C](
+  init : S,
+  step_fn : (S, M) -> (S, Array[C]),
+  exec : (C, (M) -> Unit) -> Unit,
+) -> RuntimeMachine[S, M, C] {
+  RuntimeMachine::{
+    step_fn,
+    state_sig: signals::signal(init),
+    exec,
+    inbox: [],
+    pumping: false,
+  }
+}
+
+/// Read-only reactive state projection for `View` bindings (`Live::By(fn() { m.state().get() })`).
+pub fn RuntimeMachine::state[S, M, C](
+  self : RuntimeMachine[S, M, C],
+) -> signals::ReadSignal[S] {
+  self.state_sig.read()
+}
+
+/// Snapshot current state without establishing a reactive dependency.
+pub fn RuntimeMachine::snapshot[S, M, C](
+  self : RuntimeMachine[S, M, C],
+) -> S {
+  self.state_sig.untracked()
+}
+
+/// Dispatch a message into the pure `step_fn`, update the reactive projection, and execute
+/// emitted commands. Nested/re-entrant `send` calls are enqueued and drained FIFO.
+pub fn RuntimeMachine::send[S : Eq, M, C](
+  self : RuntimeMachine[S, M, C],
+  msg : M,
+) -> Unit {
+  self.inbox.push(msg)
+  if self.pumping {
+    return
+  }
+  self.pumping = true
+  signals::batch(fn() -> Unit {
+    let mut cursor = 0
+    while cursor < self.inbox.length() {
+      let cur_msg = self.inbox[cursor]
+      cursor += 1
+      let cur_state = self.state_sig.untracked()
+      let (next_state, cmds) = (self.step_fn)(cur_state, cur_msg)
+      self.state_sig.set(next_state)
+      for cmd in cmds {
+        (self.exec)(cmd, fn(reply : M) -> Unit {
+          self.send(reply)
+        })
+      }
+    }
+    self.inbox.clear()
+    self.pumping = false
+  })
+}

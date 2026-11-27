@@ -1,0 +1,205 @@
+// Bounded breadth-first state-space model checker (`explore_bfs`) for pure state machines.
+//
+// Explores all interleavings of:
+//   - User/external messages returned by `user_msgs(state)`, and
+//   - Out-of-order settlement of any in-flight command `pending[i]` via `cmd_outcomes(cmd)`.
+//
+// Because search is breadth-first, the first invariant or transition-spec failure found is
+// guaranteed to be a shortest counterexample trace.
+
+pub enum ExploreResult[S, M] {
+  /// All explored reachable states satisfied invariants.
+  /// `closed == true` means no frontier remained (exhaustive proof for all lengths within budget).
+  Ok(Int, Bool)
+  /// Shortest failing trace found: `(reason, trace, failing_state)`.
+  Failed(String, Array[M], S)
+}
+
+struct BfsNode[S, M, C] {
+  state : S
+  pending : Array[C]
+  trace : Array[M]
+  depth : Int
+}
+
+fn clone_msgs[M](src : Array[M], extra : M) -> Array[M] {
+  let out : Array[M] = []
+  for x in src {
+    out.push(x)
+  }
+  out.push(extra)
+  out
+}
+
+fn clone_cmds_with[C](base : Array[C], added : Array[C], drop_idx : Int) -> Array[C] {
+  let out : Array[C] = []
+  let mut i = 0
+  while i < base.length() {
+    if i != drop_idx {
+      out.push(base[i])
+    }
+    i += 1
+  }
+  for c in added {
+    out.push(c)
+  }
+  out
+}
+
+/// Multiset equality for pending commands so `[A, B]` and `[B, A]` deduplicate cleanly.
+fn cmds_equal[C : Eq](a : Array[C], b : Array[C]) -> Bool {
+  let n = a.length()
+  if n != b.length() {
+    return false
+  }
+  if n == 0 {
+    return true
+  }
+  let used : Array[Bool] = []
+  let mut k = 0
+  while k < n {
+    used.push(false)
+    k += 1
+  }
+  let mut i = 0
+  while i < n {
+    let mut matched = false
+    let mut j = 0
+    while j < n {
+      if !used[j] && a[i] == b[j] {
+        used[j] = true
+        matched = true
+        break
+      }
+      j += 1
+    }
+    if !matched {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+fn visited_contains[S : Eq, C : Eq](visited : Array[(S, Array[C])], st : S, pending : Array[C]) -> Bool {
+  for entry in visited {
+    if entry.0 == st && cmds_equal(entry.1, pending) {
+      return true
+    }
+  }
+  false
+}
+
+/// Explore all interleavings of `user_msgs` and pending command outcomes up to `max_depth`
+/// steps and `max_states` distinct `(state, pending)` configurations.
+///
+/// - `step(state, msg) -> (next_state, issued_cmds)` is your pure `#verify`-ready transition fn.
+/// - `invariant(state, pending)` returns `Some(reason)` on violation, `None` when valid.
+/// - `transition_spec(before, msg, after)` optionally checks a refinement relation on every step.
+pub fn explore_bfs[S : Eq, M, C : Eq](
+  init : S,
+  step : (S, M) -> (S, Array[C]),
+  user_msgs : (S) -> Array[M],
+  cmd_outcomes : (C) -> Array[M],
+  invariant : (S, Array[C]) -> Option[String],
+  transition_spec? : (S, M, S) -> Option[String],
+  max_depth~ : Int = 6,
+  max_states~ : Int = 2000,
+) -> ExploreResult[S, M] {
+  let init_pending : Array[C] = []
+  match invariant(init, init_pending) {
+    Some(reason) => return ExploreResult::Failed(reason, [], init)
+    None => ()
+  }
+
+  let visited : Array[(S, Array[C])] = [(init, init_pending)]
+  let queue : Array[BfsNode[S, M, C]] = [
+    BfsNode::{ state: init, pending: init_pending, trace: [], depth: 0 },
+  ]
+  let mut head = 0
+  let mut truncated = false
+
+  while head < queue.length() {
+    let cur = queue[head]
+    head += 1
+
+    if cur.depth >= max_depth {
+      if user_msgs(cur.state).length() > 0 || cur.pending.length() > 0 {
+        truncated = true
+      }
+      continue
+    }
+
+    // 1) Try every user/external message available in `cur.state`.
+    let umsgs = user_msgs(cur.state)
+    for m in umsgs {
+      let (next_s, issued) = step(cur.state, m)
+      let next_pending = clone_cmds_with(cur.pending, issued, -1)
+      let next_trace = clone_msgs(cur.trace, m)
+
+      match transition_spec {
+        Some(chk) => match chk(cur.state, m, next_s) {
+          Some(reason) => return ExploreResult::Failed(reason, next_trace, next_s)
+          None => ()
+        }
+        None => ()
+      }
+      match invariant(next_s, next_pending) {
+        Some(reason) => return ExploreResult::Failed(reason, next_trace, next_s)
+        None => ()
+      }
+      if !visited_contains(visited, next_s, next_pending) {
+        if visited.length() >= max_states {
+          truncated = true
+        } else {
+          visited.push((next_s, next_pending))
+          queue.push(BfsNode::{
+            state: next_s,
+            pending: next_pending,
+            trace: next_trace,
+            depth: cur.depth + 1,
+          })
+        }
+      }
+    }
+
+    // 2) Try settling ANY pending command out-of-order with each of its possible outcomes.
+    let mut ci = 0
+    while ci < cur.pending.length() {
+      let outcomes = cmd_outcomes(cur.pending[ci])
+      for m in outcomes {
+        let (next_s, issued) = step(cur.state, m)
+        let next_pending = clone_cmds_with(cur.pending, issued, ci)
+        let next_trace = clone_msgs(cur.trace, m)
+
+        match transition_spec {
+          Some(chk) => match chk(cur.state, m, next_s) {
+            Some(reason) => return ExploreResult::Failed(reason, next_trace, next_s)
+            None => ()
+          }
+          None => ()
+        }
+        match invariant(next_s, next_pending) {
+          Some(reason) => return ExploreResult::Failed(reason, next_trace, next_s)
+          None => ()
+        }
+        if !visited_contains(visited, next_s, next_pending) {
+          if visited.length() >= max_states {
+            truncated = true
+          } else {
+            visited.push((next_s, next_pending))
+            queue.push(BfsNode::{
+              state: next_s,
+              pending: next_pending,
+              trace: next_trace,
+              depth: cur.depth + 1,
+            })
+          }
+        }
+      }
+      ci += 1
+    }
+  }
+
+  ExploreResult::Ok(visited.length(), !truncated)
+}

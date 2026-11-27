@@ -1,5 +1,35 @@
 // Atomic async action lifecycle bound to `Optimistic` patches (`Action`, `ActionTicket`).
 // Pure Layer-0 signals primitive: zero IO, zero thread or UI dependencies.
+// Zero internal RC cycles: `Action` holds `Array[TicketEntry]` and `TicketEntry` holds no
+// reference back to `Action`. Callers that attach `on_cancel`/`with_optimistic` closures
+// capturing the `Action` or `ActionTicket` should bind `View::owns(fn() { act.dispose() })`
+// so unsettled entries and closures are always cleared on unmount.
+
+struct TicketEntry {
+  seq_id : Int64
+  mut settled : Bool
+  mut cancelled : Bool
+  reverts : Array[() -> Unit]
+  on_cancels : Array[() -> Unit]
+}
+
+fn TicketEntry::run_reverts(self : TicketEntry) -> Unit {
+  let mut i = self.reverts.length() - 1
+  while i >= 0 {
+    (self.reverts[i])()
+    i -= 1
+  }
+  self.reverts.clear()
+}
+
+fn TicketEntry::run_cancels(self : TicketEntry) -> Unit {
+  let mut i = self.on_cancels.length() - 1
+  while i >= 0 {
+    (self.on_cancels[i])()
+    i -= 1
+  }
+  self.on_cancels.clear()
+}
 
 pub struct Action[Res, Err] {
   in_flight_sig : Signal[Int]
@@ -7,13 +37,12 @@ pub struct Action[Res, Err] {
   error_sig : Signal[Option[Err]]
   last_ok_sig : Signal[Option[Res]]
   mut latest_seq : Int64
+  active : Array[TicketEntry]
 }
 
 pub struct ActionTicket[Res, Err] {
   action : Action[Res, Err]
-  seq_id : Int64
-  mut settled : Bool
-  reverts : Array[() -> Unit]
+  entry : TicketEntry
 }
 
 pub fn action[Res, Err]() -> Action[Res, Err] {
@@ -33,6 +62,7 @@ pub fn action[Res, Err]() -> Action[Res, Err] {
     error_sig,
     last_ok_sig,
     latest_seq: 0.to_int64(),
+    active: [],
   }
 }
 
@@ -63,52 +93,154 @@ fn Action::dec_in_flight[Res, Err](self : Action[Res, Err]) -> Unit {
   }
 }
 
+fn Action::remove_active[Res, Err](self : Action[Res, Err], seq_id : Int64) -> Unit {
+  let n = self.active.length()
+  let mut i = 0
+  while i < n {
+    if self.active[i].seq_id == seq_id {
+      let last = n - 1
+      if i != last {
+        self.active[i] = self.active[last]
+      }
+      let _ = self.active.pop()
+      return
+    }
+    i += 1
+  }
+}
+
 pub fn Action::begin[Res, Err](
   self : Action[Res, Err],
   clear_err~ : Bool = true,
 ) -> ActionTicket[Res, Err] {
   self.latest_seq += 1.to_int64()
   let seq_id = self.latest_seq
+  let entry = TicketEntry::{
+    seq_id,
+    settled: false,
+    cancelled: false,
+    reverts: [],
+    on_cancels: [],
+  }
+  self.active.push(entry)
   batch(fn() -> Unit {
     self.in_flight_sig.set(self.in_flight_sig.state.pending + 1)
     if clear_err {
       self.error_sig.set(None)
     }
   })
-  ActionTicket::{ action: self, seq_id, settled: false, reverts: [] }
+  ActionTicket::{ action: self, entry }
+}
+
+/// Exhaust concurrency mode: start a new ticket only when no run is currently in flight.
+/// Returns `None` while another ticket is active.
+pub fn Action::begin_if_idle[Res, Err](
+  self : Action[Res, Err],
+  clear_err~ : Bool = true,
+) -> Option[ActionTicket[Res, Err]] {
+  if self.in_flight_sig.state.pending > 0 {
+    return None
+  }
+  Some(self.begin(clear_err=clear_err))
+}
+
+/// Switch concurrency mode: immediately cancel all currently active tickets (firing their
+/// `on_cancel` hooks and reverting optimistic patches) and begin a fresh ticket in one batch.
+pub fn Action::begin_switching[Res, Err](
+  self : Action[Res, Err],
+  clear_err~ : Bool = true,
+) -> ActionTicket[Res, Err] {
+  let mut out : Option[ActionTicket[Res, Err]] = None
+  batch(fn() -> Unit {
+    let _ = self.cancel_all()
+    out = Some(self.begin(clear_err=clear_err))
+  })
+  match out {
+    Some(t) => t
+    None => self.begin(clear_err=clear_err)
+  }
+}
+
+/// Cancel every currently active unsettled ticket in one batch (for `View::owns` unmount cleanup).
+/// Returns the number of tickets cancelled.
+pub fn Action::cancel_all[Res, Err](self : Action[Res, Err]) -> Int {
+  let snapshot : Array[TicketEntry] = []
+  for e in self.active {
+    snapshot.push(e)
+  }
+  self.active.clear()
+  let cancelled_entries : Array[TicketEntry] = []
+  for e in snapshot {
+    if !e.settled {
+      e.settled = true
+      e.cancelled = true
+      cancelled_entries.push(e)
+    }
+  }
+  let count = cancelled_entries.length()
+  if count == 0 {
+    return 0
+  }
+  batch(fn() -> Unit {
+    let mut i = 0
+    while i < count {
+      self.dec_in_flight()
+      i += 1
+    }
+    for e in cancelled_entries {
+      e.run_cancels()
+      e.run_reverts()
+    }
+  })
+  count
+}
+
+/// Cancel all active tickets and dispose internal computed graph nodes (for `View::owns` cleanup).
+pub fn Action::dispose[Res, Err](self : Action[Res, Err]) -> Unit {
+  let _ = self.cancel_all()
+  self.pending_comp.dispose()
 }
 
 pub fn ActionTicket::with_optimistic[Res, Err](
   self : ActionTicket[Res, Err],
   revert : () -> Unit,
 ) -> ActionTicket[Res, Err] {
-  if self.settled {
+  if self.entry.settled {
     revert()
   } else {
-    self.reverts.push(revert)
+    self.entry.reverts.push(revert)
+  }
+  self
+}
+
+/// Register a cancellation callback invoked only when this ticket is cancelled (via `cancel`,
+/// `begin_switching`, or `cancel_all`). Not invoked on `succeed` or `fail`.
+pub fn ActionTicket::on_cancel[Res, Err](
+  self : ActionTicket[Res, Err],
+  cb : () -> Unit,
+) -> ActionTicket[Res, Err] {
+  if self.entry.cancelled {
+    cb()
+  } else if !self.entry.settled {
+    self.entry.on_cancels.push(cb)
   }
   self
 }
 
 pub fn ActionTicket::seq[Res, Err](self : ActionTicket[Res, Err]) -> Int64 {
-  self.seq_id
+  self.entry.seq_id
 }
 
 pub fn ActionTicket::is_latest[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
-  self.seq_id == self.action.latest_seq
+  self.entry.seq_id == self.action.latest_seq
 }
 
 pub fn ActionTicket::is_settled[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
-  self.settled
+  self.entry.settled
 }
 
-fn ActionTicket::revert_all[Res, Err](self : ActionTicket[Res, Err]) -> Unit {
-  let mut i = self.reverts.length() - 1
-  while i >= 0 {
-    (self.reverts[i])()
-    i -= 1
-  }
-  self.reverts.clear()
+pub fn ActionTicket::is_cancelled[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
+  self.entry.cancelled
 }
 
 pub fn ActionTicket::succeed[Res, Err](
@@ -116,16 +248,18 @@ pub fn ActionTicket::succeed[Res, Err](
   res : Res,
   commit : (Res) -> Unit,
 ) -> Bool {
-  if self.settled {
+  if self.entry.settled {
     return false
   }
-  self.settled = true
+  self.entry.settled = true
+  self.entry.on_cancels.clear()
+  self.action.remove_active(self.entry.seq_id)
   batch(fn() -> Unit {
-    self.revert_all()
+    self.action.dec_in_flight()
+    self.entry.run_reverts()
     commit(res)
     self.action.last_ok_sig.set(Some(res))
     self.action.error_sig.set(None)
-    self.action.dec_in_flight()
   })
   true
 }
@@ -135,14 +269,16 @@ pub fn ActionTicket::succeed_if_latest[Res, Err](
   res : Res,
   commit : (Res) -> Unit,
 ) -> Bool {
-  if self.settled {
+  if self.entry.settled {
     return false
   }
   if !self.is_latest() {
-    self.settled = true
+    self.entry.settled = true
+    self.entry.on_cancels.clear()
+    self.action.remove_active(self.entry.seq_id)
     batch(fn() -> Unit {
-      self.revert_all()
       self.action.dec_in_flight()
+      self.entry.run_reverts()
     })
     return false
   }
@@ -150,14 +286,16 @@ pub fn ActionTicket::succeed_if_latest[Res, Err](
 }
 
 pub fn ActionTicket::fail[Res, Err](self : ActionTicket[Res, Err], err : Err) -> Bool {
-  if self.settled {
+  if self.entry.settled {
     return false
   }
-  self.settled = true
+  self.entry.settled = true
+  self.entry.on_cancels.clear()
+  self.action.remove_active(self.entry.seq_id)
   batch(fn() -> Unit {
-    self.revert_all()
-    self.action.error_sig.set(Some(err))
     self.action.dec_in_flight()
+    self.entry.run_reverts()
+    self.action.error_sig.set(Some(err))
   })
   true
 }
@@ -166,14 +304,16 @@ pub fn ActionTicket::fail_if_latest[Res, Err](
   self : ActionTicket[Res, Err],
   err : Err,
 ) -> Bool {
-  if self.settled {
+  if self.entry.settled {
     return false
   }
   if !self.is_latest() {
-    self.settled = true
+    self.entry.settled = true
+    self.entry.on_cancels.clear()
+    self.action.remove_active(self.entry.seq_id)
     batch(fn() -> Unit {
-      self.revert_all()
       self.action.dec_in_flight()
+      self.entry.run_reverts()
     })
     return false
   }
@@ -181,13 +321,16 @@ pub fn ActionTicket::fail_if_latest[Res, Err](
 }
 
 pub fn ActionTicket::cancel[Res, Err](self : ActionTicket[Res, Err]) -> Bool {
-  if self.settled {
+  if self.entry.settled {
     return false
   }
-  self.settled = true
+  self.entry.settled = true
+  self.entry.cancelled = true
+  self.action.remove_active(self.entry.seq_id)
   batch(fn() -> Unit {
-    self.revert_all()
     self.action.dec_in_flight()
+    self.entry.run_cancels()
+    self.entry.run_reverts()
   })
   true
 }
