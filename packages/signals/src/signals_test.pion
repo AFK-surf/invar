@@ -181,17 +181,17 @@ test "Keyed and KeyedList per-key granularity" {
   stop_a()
   stop_b()
 
-  let kl : KeyedList[Int] = keyed_list(fn(a : Int, b : Int) -> Bool { a == b })
+  let kl : KeyedList[String, Int] = keyed_list(same=fn(a : Int, b : Int) -> Bool { a == b })
   let order_runs = [0]
   let x_runs = [0]
   let y_runs = [0]
   let stop_o = effect(fn() -> Unit { let _ = kl.keys(); order_runs[0] += 1 })
   let stop_x = effect(fn() -> Unit { let _ = kl.get("x"); x_runs[0] += 1 })
   let stop_y = effect(fn() -> Unit { let _ = kl.get("y"); y_runs[0] += 1 })
-  kl.put("x", 1, None)
-  kl.put("y", 2, None)
+  kl.put("x", 1)
+  kl.put("y", 2)
   debug_assert(order_runs[0] == 3 && x_runs[0] == 2 && y_runs[0] == 2, "put x, y")
-  kl.put("x", 10, None)
+  kl.put("x", 10)
   debug_assert(order_runs[0] == 3 && x_runs[0] == 3 && y_runs[0] == 2, "patch x only notifies x")
   kl.drop("x")
   debug_assert(order_runs[0] == 4 && x_runs[0] == 4 && y_runs[0] == 2 && kl.count() == 1, "drop x")
@@ -219,18 +219,18 @@ test "Keyed and KeyedList count reactivity in computed" {
   k.set([])
   debug_assert(k_cnt.get() == 0 && k_runs[0] == 5, "empty set clears keyed count")
 
-  let kl : KeyedList[Int] = keyed_list(fn(a : Int, b : Int) -> Bool { a == b })
+  let kl : KeyedList[String, Int] = keyed_list(same=fn(a : Int, b : Int) -> Bool { a == b })
   let kl_runs = [0]
   let kl_cnt = computed(fn(_last : Option[Int]) -> Int {
     kl_runs[0] += 1
     kl.count()
   })
   debug_assert(kl_cnt.get() == 0 && kl_runs[0] == 1, "initial keyed_list count 0")
-  kl.put("x", 1, None)
+  kl.put("x", 1)
   debug_assert(kl_cnt.get() == 1 && kl_runs[0] == 2, "put x increments keyed_list count")
-  kl.put("y", 2, None)
+  kl.put("y", 2)
   debug_assert(kl_cnt.get() == 2 && kl_runs[0] == 3, "put y increments keyed_list count")
-  kl.put("x", 99, None)
+  kl.put("x", 99)
   debug_assert(kl_cnt.get() == 2 && kl_runs[0] == 3, "update existing key does not recompute count")
   kl.drop("x")
   debug_assert(kl_cnt.get() == 1 && kl_runs[0] == 4, "drop x decrements keyed_list count")
@@ -413,7 +413,7 @@ test "edge cases: batch set then unwatch, re-subscribe, on_unwatched, computed_s
 
   // 4. computed_scoped untracked read releases slot immediately
   let ss = signal(5)
-  let sc = computed_scoped(fn(_p : Option[Int]) -> Int { ss.get() + 1 }, None)
+  let sc = computed_scoped(fn(_p : Option[Int]) -> Int { ss.get() + 1 })
   debug_assert(sc.untracked() == 6, "computed_scoped untracked read")
   debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "computed_scoped released after untracked read")
 
@@ -662,4 +662,190 @@ test "builtin Eq Option tuple, Option custom Eq struct, and custom same= overrid
   m_in.set(20)
   debug_assert(m_evals[0] == 3 && m_runs[0] == 2, "memo same= triggers downstream effect when false")
   stop_m()
+}
+
+test "signals: on_effect_in_view hook and Ref/set_* single source of truth" {
+  let seen : Array[String] = []
+  on_effect_in_view.v = Some(fn(loc : String) -> Unit { seen.push(loc) })
+  let s1 = effect(fn() -> Unit { () }, loc="view:eff1")
+  let s2 = effect_cleanup(fn() -> () -> Unit { fn() -> Unit { () } }, loc="view:eff2")
+  // effect_scope and watch must NOT trigger on_effect_in_view
+  let s3 = effect_scope(fn() -> Unit {
+    let w = watch(fn() -> Unit { () })
+    w.stop()
+  })
+  s1()
+  s2()
+  s3()
+  debug_assert(seen.length() == 2 && seen[0] == "view:eff1" && seen[1] == "view:eff2", "on_effect_in_view fires for effect/effect_cleanup only")
+  set_on_effect_in_view(None)
+  debug_assert(on_effect_in_view.v.is_none(), "set_on_effect_in_view writes the same Ref cell")
+
+  // fanout_limit / on_fanout Ref and setter share single source of truth
+  let fanout_hits : Array[(Option[String], Int)] = []
+  fanout_limit.v = 2
+  on_fanout.v = Some(fn(loc : Option[String], n : Int) -> Unit { fanout_hits.push((loc, n)) })
+  let sig = signal(0)
+  let e1 = effect(fn() -> Unit { let _ = sig.get() })
+  let e2 = effect(fn() -> Unit { let _ = sig.get() })
+  sig.set(1, loc="src:fanout")
+  debug_assert(fanout_hits.length() == 1 && fanout_hits[0].0 == Some("src:fanout") && fanout_hits[0].1 == 2, "on_fanout via Ref receives Option[String] loc and count")
+
+  // set_on_fanout wrapper forwards String loc when setting and "" when no setting is active
+  let wrapped_hits : Array[(String, Int)] = []
+  set_on_fanout(Some(fn(loc : String, n : Int) -> Unit { wrapped_hits.push((loc, n)) }))
+  sig.set(2, loc="src:wrapped")
+  debug_assert(wrapped_hits.length() == 1 && wrapped_hits[0].0 == "src:wrapped" && wrapped_hits[0].1 == 2, "set_on_fanout wrapper passes loc string")
+  trigger(fn() -> Unit { let _ = sig.get() })
+  debug_assert(wrapped_hits.length() == 2 && wrapped_hits[1].0 == "" && wrapped_hits[1].1 == 2, "set_on_fanout wrapper passes empty string without active setting")
+
+  set_fanout_limit(0)
+  debug_assert(fanout_limit.v == 0, "set_fanout_limit updates Ref")
+  set_on_fanout(None)
+  debug_assert(on_fanout.v.is_none(), "set_on_fanout clears Ref")
+  e1()
+  e2()
+}
+
+test "signals: generic Keyed[Int] and KeyedList[Int, String] move_before and reset" {
+  let ki : Keyed[Int] = keyed()
+  let h1 = [0]
+  let h2 = [0]
+  let s1 = effect(fn() -> Unit { let _ = ki.has(1); h1[0] += 1 })
+  let s2 = effect(fn() -> Unit { let _ = ki.has(2); h2[0] += 1 })
+  ki.add(1)
+  debug_assert(h1[0] == 2 && h2[0] == 1 && ki.peek(1) && !ki.peek(2), "Keyed[Int] add")
+  ki.set([2, 3])
+  debug_assert(h1[0] == 3 && h2[0] == 2 && ki.count() == 2, "Keyed[Int] set")
+  s1()
+  s2()
+
+  let kl : KeyedList[Int, String] = keyed_list(same=fn(a : String, b : String) -> Bool { a == b })
+  let order_runs = [0]
+  let k1_runs = [0]
+  let k2_runs = [0]
+  let k3_runs = [0]
+  let so = effect(fn() -> Unit { let _ = kl.keys(); order_runs[0] += 1 })
+  let sk1 = effect(fn() -> Unit { let _ = kl.get(1); k1_runs[0] += 1 })
+  let sk2 = effect(fn() -> Unit { let _ = kl.get(2); k2_runs[0] += 1 })
+  let sk3 = effect(fn() -> Unit { let _ = kl.get(3); k3_runs[0] += 1 })
+  kl.put(1, "a")
+  kl.put(2, "b")
+  kl.put(3, "c", before=Some(2))
+  let ks0 = kl.peek_keys()
+  debug_assert(ks0.length() == 3 && ks0[0] == 1 && ks0[1] == 3 && ks0[2] == 2, "put with before=")
+  let before_move = order_runs[0]
+  // No-op move_before (already right before 3, self, and missing key)
+  kl.move_before(1, before=Some(3))
+  debug_assert(order_runs[0] == before_move, "no-op move_before does not notify")
+  kl.move_before(1, before=Some(1))
+  debug_assert(order_runs[0] == before_move, "self move_before does not notify")
+  kl.move_before(999, before=Some(1))
+  debug_assert(order_runs[0] == before_move, "missing key move_before is no-op")
+  // Move 2 to front (before 1)
+  kl.move_before(2, before=Some(1))
+  let ks1 = kl.peek_keys()
+  debug_assert(order_runs[0] == before_move + 1 && ks1[0] == 2 && ks1[1] == 1 && ks1[2] == 3, "move_before reorders")
+  // Move 2 to end via missing `before` target
+  kl.move_before(2, before=Some(999))
+  let ks1b = kl.peek_keys()
+  debug_assert(order_runs[0] == before_move + 2 && ks1b[0] == 1 && ks1b[1] == 3 && ks1b[2] == 2, "move_before missing target moves to end")
+  // Move 2 to end again (before=None) is a no-op since already at end
+  kl.move_before(2)
+  let ks2 = kl.peek_keys()
+  debug_assert(order_runs[0] == before_move + 2 && ks2[0] == 1 && ks2[1] == 3 && ks2[2] == 2, "move_before None at end is no-op")
+
+  // reset: keep 1 unchanged (eq shortcircuit), update 3, drop 2, add 4
+  let order_before_reset = order_runs[0]
+  let r1_before = k1_runs[0]
+  let r2_before = k2_runs[0]
+  let r3_before = k3_runs[0]
+  let next_vals : mbt_compat::OrderedMap[Int, String] = mbt_compat::ordered_map_new()
+  next_vals.set(1, "a")
+  next_vals.set(3, "c2")
+  next_vals.set(4, "d")
+  kl.reset([1, 3, 4], next_vals)
+  let ks3 = kl.peek_keys()
+  debug_assert(order_runs[0] == order_before_reset + 1, "reset increments order_runs exactly once")
+  debug_assert(ks3.length() == 3 && ks3[0] == 1 && ks3[1] == 3 && ks3[2] == 4, "reset sets exact new order [1, 3, 4]")
+  debug_assert(k1_runs[0] == r1_before, "reset eq shortcircuit keeps k1 silent")
+  debug_assert(k2_runs[0] == r2_before + 1 && kl.peek(2).is_none(), "reset drops k2")
+  debug_assert(k3_runs[0] == r3_before + 1 && kl.peek(3) == Some("c2"), "reset updates k3")
+  debug_assert(kl.peek(4) == Some("d") && kl.count() == 3, "reset adds k4")
+
+  // reset edge cases: duplicate keys deduped, missing vals filtered, same order value-only update keeps order_runs silent
+  let order_before_val_only = order_runs[0]
+  let r3_before_val_only = k3_runs[0]
+  let vals_same_order : mbt_compat::OrderedMap[Int, String] = mbt_compat::ordered_map_new()
+  vals_same_order.set(1, "a")
+  vals_same_order.set(3, "c3")
+  vals_same_order.set(4, "d")
+  kl.reset([1, 3, 1, 999, 4, 3], vals_same_order)
+  let ks4 = kl.peek_keys()
+  debug_assert(order_runs[0] == order_before_val_only, "reset with same deduped order does not trigger order_runs")
+  debug_assert(ks4.length() == 3 && ks4[0] == 1 && ks4[1] == 3 && ks4[2] == 4, "reset dedupes keys and filters missing vals")
+  debug_assert(k3_runs[0] == r3_before_val_only + 1 && kl.peek(3) == Some("c3"), "reset updates changed value without order change")
+  so()
+  sk1()
+  sk2()
+  sk3()
+}
+
+test "signals: computed_scoped_ref, computed_following_by, and rest drop_holds=false" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let s = signal(10)
+  let sc_ref = computed_scoped_ref(
+    fn(_p : Option[Int]) -> Int { s.get() + 1 },
+    untracked_read=Some(fn() -> Option[Int] { Some(999) }),
+    loc="test:sc_ref",
+  )
+  debug_assert(sc_ref.untracked() == 999, "computed_scoped_ref uses untracked_read when unwatched")
+  debug_assert(sc_ref.made_at() == "test:sc_ref", "computed_scoped_ref preserves loc")
+  let seen_ref = [0]
+  let stop_ref = effect(fn() -> Unit { seen_ref[0] = sc_ref.get() })
+  debug_assert(seen_ref[0] == 11, "computed_scoped_ref computes when watched")
+  s.set(20)
+  debug_assert(seen_ref[0] == 21, "computed_scoped_ref updates on change")
+  stop_ref()
+
+  let dep_runs = [0]
+  let dep = held_while_read(fn() -> Unit { dep_runs[0] += 1 }, loc="test:dep")
+  let cf = computed_following_by(
+    fn(_p : Option[Int]) -> Int { s.get() * 2 },
+    dep,
+    same=fn(a : Int, b : Int) -> Bool { a == b },
+    loc="test:cf",
+  )
+  debug_assert(cf.made_at() == "test:cf", "computed_following_by preserves loc")
+  let cf_val = [0]
+  let stop_cf = effect(fn() -> Unit { cf_val[0] = cf.get() })
+  debug_assert(cf_val[0] == 40 && dep_runs[0] == 1, "computed_following_by pulls dependency")
+  stop_cf()
+
+  // rest(owner, drop_holds=false) keeps holds attached while resting
+  let hold_sig = signal(1)
+  let unwatched = [0]
+  hold_sig.on_unwatched(fn() -> Unit { unwatched[0] += 1 })
+  let scope_box : TestBox[ReactiveNode] = TestBox::{ item: None }
+  let w_box : TestBox[Watch] = TestBox::{ item: None }
+  let stop_scope = effect_scope(fn() -> Unit {
+    scope_box.item = active_sub()
+    w_box.item = Some(watch(fn() -> Unit { () }))
+  })
+  let snode = match scope_box.item {
+    Some(x) => x
+    None => panic("missing scope")
+  }
+  let w = match w_box.item {
+    Some(x) => x
+    None => panic("missing watch")
+  }
+  let _ = w.read(fn() -> Int { hold_sig.get() })
+  let wake = rest(snode, drop_holds=false)
+  debug_assert(unwatched[0] == 0, "rest drop_holds=false does not drop holds")
+  wake()
+  stop_scope()
+  debug_assert(unwatched[0] == 1, "stop_scope drops holds")
+  debug_assert(live_node_count() == base_nodes && live_link_count() == base_links, "zero leaks in scoped/rest regression test")
 }
