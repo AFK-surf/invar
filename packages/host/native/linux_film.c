@@ -302,6 +302,20 @@ int32_t mbf_snapshot_transparent(moonbit_string_t path) {
   return ok;
 }
 
+// The frame `inst` presented (the whole of it said to differ, as film's picture always presented it) and written to
+// `path` as mbf_snapshot (`transparent`: mbf_snapshot_transparent) writes the last frame. Written here at once:
+// `async_write` asks nothing more of this host. 1, or 0.
+int32_t mbf_snapshot_inst(const double *inst, int32_t count, double r, double g, double b, int32_t transparent,
+                          int32_t async_write, moonbit_string_t path) {
+  (void)async_write;
+  mb_host_render_dirty(0, 0, -1, -1);
+  mb_host_present((double *)inst, count, r, g, b);
+  return transparent ? mbf_snapshot_transparent(path) : mbf_snapshot(path);
+}
+
+// (no picture is written behind here)
+int32_t mbf_flush_snapshots(void) { return 1; }
+
 // ---- the process ----
 
 // GLib's main context turned for what is told there (a picture decoded, what was posted), then `ms` let pass.

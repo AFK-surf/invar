@@ -9,6 +9,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #include <os/lock.h>
 #include <stdatomic.h>
+#include <zlib.h>
 
 // the numbers of an instance (src/ui/scene.mbt)
 #define MB_INST 60
@@ -4360,7 +4361,9 @@ static uint8_t *read_of(const float *f, int32_t count, const double bg[3], doubl
         texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
 #if TARGET_OS_OSX
-    td.storageMode = MTLStorageModeManaged;
+    // (an Apple GPU: the CPU reads what it drew where it drew it, no copy to sync; an Intel Mac's integrated GPU
+    // shares memory too but keeps no texture shared, so it stays managed)
+    td.storageMode = [dev supportsFamily:MTLGPUFamilyApple1] ? MTLStorageModeShared : MTLStorageModeManaged;
 #else
     td.storageMode = MTLStorageModeShared;
 #endif
@@ -4373,9 +4376,11 @@ static uint8_t *read_of(const float *f, int32_t count, const double bg[3], doubl
   if (ad_mode > 0 && at_win) ad_finalize_frame(at_win, 1, ad_serial);
   at_win = NULL;
 #if TARGET_OS_OSX
-  id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-  [bl synchronizeResource:tex];
-  [bl endEncoding];
+  if (tex.storageMode == MTLStorageModeManaged) {
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl synchronizeResource:tex];
+    [bl endEncoding];
+  }
 #endif
   [cb commit];
   [cb waitUntilCompleted];
@@ -4433,6 +4438,23 @@ uint8_t *mb_render_read(const double *inst, int32_t count, double r, double g, d
     next_as_is(inst, count);
     keep_last(count, r, g, b);
     return read_of(last_inst, last_count, last_bg, 1, vw, vh, vscale, 1, pw, ph);
+  }
+}
+
+// A picture's frame (`inst` as mb_render_present takes them, its groups' headers drawn out) kept as the last frame and
+// drawn offscreen as mb_render_snapshot (or, `transparent`, mb_render_snapshot_transparent) draws the last frame: its
+// pixels as read_of gives them (the caller frees them). What a present would hand to be shown is not made: offscreen
+// there is no layer to show it, and the snapshot draws the frame again anyway.
+uint8_t *mb_render_read_snapshot_inst(const double *inst, int32_t count, double r, double g, double b, int transparent,
+                                      int *pw, int *ph) {
+  @autoreleasepool {
+    present_drain();
+    float *f = next_room(count);
+    mb_groups_floats(f, inst, count);
+    keep_last(count, r, g, b);
+    static const double clear[3] = {0, 0, 0};
+    return read_of(last_inst, last_count, transparent ? clear : last_bg, transparent ? 0 : 1, vw, vh, vscale, 0, pw,
+                   ph);
   }
 }
 
@@ -4507,9 +4529,178 @@ int32_t mb_render_pixels_of(const double *inst, int32_t count, double r, double 
   return ok;
 }
 
+static void png_be32(uint8_t *p, uint32_t v) {
+  p[0] = (uint8_t)(v >> 24);
+  p[1] = (uint8_t)(v >> 16);
+  p[2] = (uint8_t)(v >> 8);
+  p[3] = (uint8_t)v;
+}
+
+static int png_chunk(FILE *f, const char *type, const uint8_t *data, size_t len) {
+  uint8_t head[8];
+  png_be32(head, (uint32_t)len);
+  memcpy(head + 4, type, 4);
+  uLong crc = crc32(0L, (const Bytef *)type, 4);
+  if (len) crc = crc32(crc, data, (uInt)len);
+  uint8_t tail[4];
+  png_be32(tail, (uint32_t)crc);
+  return fwrite(head, 1, 8, f) == 8 && (len == 0 || fwrite(data, 1, len, f) == len) && fwrite(tail, 1, 4, f) == 4;
+}
+
+// Pixels `px` (BGRA, premultiplied, w × h, rows from the top: read_of's) written to `path` as an 8-bit RGBA PNG whose
+// pixels are those ImageIO writes of them (snapshot_of before: straight alpha, each colour (c * 255 + a / 2) / a, at most
+// 255; 0 where a is 0; its sRGB and Exif size chunks too). Each row filtered by Sub and the rows deflated in strips at
+// once (zlib, level 4), each strip ending on a byte (a sync flush) so the strips join into one stream; the strips
+// fixed by the size alone, the file is the same for the same pixels. 1, or 0 when it could not be written.
+int mb_png_write_bgra_fast(const uint8_t *px, int w, int h, const char *path) {
+  if (!px || w <= 0 || h <= 0 || !path) return 0;
+  size_t st = (size_t)w * 4, raw_row = st + 1;
+  int n = h / 48;
+  if (n < 1) n = 1;
+  if (n > 64) n = 64;
+  uint8_t **outs = calloc((size_t)n, sizeof *outs);
+  size_t *lens = calloc((size_t)n, sizeof *lens), *raws = calloc((size_t)n, sizeof *raws);
+  uLong *adlers = calloc((size_t)n, sizeof *adlers);
+  atomic_int failed_box = 0, *failed = &failed_box;
+  if (!outs || !lens || !raws || !adlers) {
+    free(outs);
+    free(lens);
+    free(raws);
+    free(adlers);
+    return 0;
+  }
+  dispatch_apply((size_t)n, DISPATCH_APPLY_AUTO, ^(size_t k) {
+    int y0 = (int)((int64_t)h * (int64_t)k / n), y1 = (int)((int64_t)h * (int64_t)(k + 1) / n);
+    size_t raw = raw_row * (size_t)(y1 - y0);
+    uint8_t *buf = malloc(raw), *rgba = malloc(st);
+    if (!buf || !rgba) {
+      free(buf);
+      free(rgba);
+      atomic_store(failed, 1);
+      return;
+    }
+    for (int y = y0; y < y1; y++) {
+      const uint8_t *s = px + (size_t)y * st;
+      for (int x = 0; x < w; x++, s += 4) {
+        uint8_t *d = rgba + (size_t)x * 4;
+        unsigned a = s[3];
+        if (a == 255) {
+          d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = 255;
+        } else if (a == 0) {
+          d[0] = d[1] = d[2] = d[3] = 0;
+        } else {
+          unsigned half = a >> 1;
+          unsigned rr = (s[2] * 255u + half) / a, gg = (s[1] * 255u + half) / a, bb = (s[0] * 255u + half) / a;
+          d[0] = (uint8_t)(rr > 255 ? 255 : rr);
+          d[1] = (uint8_t)(gg > 255 ? 255 : gg);
+          d[2] = (uint8_t)(bb > 255 ? 255 : bb);
+          d[3] = (uint8_t)a;
+        }
+      }
+      uint8_t *r = buf + raw_row * (size_t)(y - y0);
+      r[0] = 1;
+      memcpy(r + 1, rgba, 4);
+      for (size_t i = 4; i < st; i++) r[i + 1] = (uint8_t)(rgba[i] - rgba[i - 4]);
+    }
+    z_stream zs;
+    memset(&zs, 0, sizeof zs);
+    if (deflateInit2(&zs, 4, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+      free(buf);
+      free(rgba);
+      atomic_store(failed, 1);
+      return;
+    }
+    size_t cap = deflateBound(&zs, (uLong)raw) + 16;
+    uint8_t *o = malloc(cap);
+    int rc = Z_STREAM_ERROR;
+    if (o) {
+      zs.next_in = buf;
+      zs.avail_in = (uInt)raw;
+      zs.next_out = o;
+      zs.avail_out = (uInt)cap;
+      rc = deflate(&zs, k + 1 == (size_t)n ? Z_FINISH : Z_SYNC_FLUSH);
+    }
+    if (!o || (k + 1 == (size_t)n ? rc != Z_STREAM_END : rc != Z_OK) || zs.avail_in != 0 || zs.avail_out == 0) {
+      free(o);
+      atomic_store(failed, 1);
+    } else {
+      outs[k] = o;
+      lens[k] = zs.total_out;
+      raws[k] = raw;
+      adlers[k] = adler32(1L, buf, (uInt)raw);
+    }
+    deflateEnd(&zs);
+    free(buf);
+    free(rgba);
+  });
+  int ok = !atomic_load(failed);
+  FILE *f = ok ? fopen(path, "wb") : NULL;
+  ok = f != NULL;
+  if (ok) {
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    uint8_t ihdr[13];
+    png_be32(ihdr, (uint32_t)w);
+    png_be32(ihdr + 4, (uint32_t)h);
+    ihdr[8] = 8;   // bit depth
+    ihdr[9] = 6;   // RGBA
+    ihdr[10] = 0;  // deflate
+    ihdr[11] = 0;  // adaptive filtering
+    ihdr[12] = 0;  // not interlaced
+    static const uint8_t srgb[1] = {0};  // perceptual, as ImageIO writes a device RGB image
+    // (ImageIO's Exif: big-endian TIFF, an Exif IFD with PixelXDimension and PixelYDimension)
+    uint8_t exif[56] = {'M', 'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x87, 0x69, 0, 4, 0, 0, 0, 1, 0, 0, 0, 26, 0, 0, 0, 0,
+                        0, 2, 0xA0, 0x02, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0xA0, 0x03, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0,
+                        0, 0, 0, 0};
+    png_be32(exif + 36, (uint32_t)w);
+    png_be32(exif + 48, (uint32_t)h);
+    static const uint8_t zhead[2] = {0x78, 0x5E};  // deflate, 32 KB window, level 4's
+    uLong adler = adlers[0];
+    for (int k = 1; k < n; k++) adler = adler32_combine(adler, adlers[k], (z_off_t)raws[k]);
+    uint8_t ztail[4];
+    png_be32(ztail, (uint32_t)adler);
+    ok = fwrite(sig, 1, 8, f) == 8 && png_chunk(f, "IHDR", ihdr, 13) && png_chunk(f, "sRGB", srgb, 1) &&
+         png_chunk(f, "eXIf", exif, sizeof exif) && png_chunk(f, "IDAT", zhead, 2);
+    for (int k = 0; ok && k < n; k++) ok = png_chunk(f, "IDAT", outs[k], lens[k]);
+    ok = ok && png_chunk(f, "IDAT", ztail, 4) && png_chunk(f, "IEND", NULL, 0);
+    if (fclose(f) != 0) ok = 0;
+  }
+  for (int k = 0; k < n; k++) free(outs[k]);
+  free(outs);
+  free(lens);
+  free(raws);
+  free(adlers);
+  return ok;
+}
+
+// Whether a snapshot is the frame's pixels alone (no native view under them, no bands round them): what
+// mb_png_write_bgra_fast writes, off the main thread too.
+int mb_render_snapshot_plain(void) {
+  return mb_views_count() == 0 && !(band_top > 0 || band_bottom > 0);
+}
+
+// `img` written to `path` as a PNG by ImageIO: 1, or 0.
+static int png_write_cgimage(CGImageRef img, const char *path) {
+  CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+  if (!url) return 0;
+  CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+  int ok = 0;
+  if (dst) {
+    CGImageDestinationAddImage(dst, img, NULL);
+    ok = CGImageDestinationFinalize(dst);
+    CFRelease(dst);
+  }
+  CFRelease(url);
+  return ok;
+}
+
 // Pixels `px` (read_of's, w × h, freed here) into a PNG at `path`, the native views under them and the bands round
 // them as the window shows them.
 static int snapshot_of(uint8_t *px, int w, int h, const char *path) {
+  if (mb_render_snapshot_plain()) {
+    int ok = mb_png_write_bgra_fast(px, w, h, path);
+    free(px);
+    return ok;
+  }
   size_t bpr = (size_t)w * 4;
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
   CGContextRef ctx = CGBitmapContextCreate(px, w, h, 8, bpr, cs,
@@ -4541,20 +4732,48 @@ static int snapshot_of(uint8_t *px, int w, int h, const char *path) {
     img = CGBitmapContextCreateImage(whole);
     CGContextRelease(whole);
   }
-  CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
-  CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
-  int ok = 0;
-  if (dst) {
-    CGImageDestinationAddImage(dst, img, NULL);
-    ok = CGImageDestinationFinalize(dst);
-    CFRelease(dst);
-  }
-  CFRelease(url);
+  int ok = png_write_cgimage(img, path);
   CGImageRelease(img);
   CGContextRelease(ctx);
   CGColorSpaceRelease(cs);
   free(px);
   return ok;
+}
+
+// Pixels `px` (read_of's, w × h, not freed) written to `path` by ImageIO as snapshots wrote every picture before
+// mb_png_write_bgra_fast (and still write one with views or bands): what the fast writer's pixels are checked against.
+int mb_png_write_bgra_imageio(const uint8_t *px, int w, int h, const char *path) {
+  if (!px || w <= 0 || h <= 0 || !path) return 0;
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  CGContextRef ctx = CGBitmapContextCreate((void *)px, w, h, 8, (size_t)w * 4, cs,
+      kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+  CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+  int ok = img ? png_write_cgimage(img, path) : 0;
+  if (img) CGImageRelease(img);
+  if (ctx) CGContextRelease(ctx);
+  CGColorSpaceRelease(cs);
+  return ok;
+}
+
+// The last frame drawn again as mb_render_snapshot (`transparent`: mb_render_snapshot_transparent) draws it and
+// written by ImageIO (mb_png_write_bgra_imageio): the reference a test holds a snapshot's PNG to. 1, or 0.
+int mb_render_snapshot_reference(const char *path, int transparent) {
+  if (!dev || !last_inst) return 0;
+  @autoreleasepool {
+    int w, h;
+    static const double clear[3] = {0, 0, 0};
+    uint8_t *px = read_of(last_inst, last_count, transparent ? clear : last_bg, transparent ? 0 : 1, vw, vh, vscale, 0,
+                          &w, &h);
+    int ok = mb_png_write_bgra_imageio(px, w, h, path);
+    free(px);
+    return ok;
+  }
+}
+
+// Pixels `px` (read_of's, freed here) written to `path` as a snapshot writes them.
+int mb_render_snapshot_px(uint8_t *px, int w, int h, const char *path) {
+  if (!px) return 0;
+  return snapshot_of(px, w, h, path);
 }
 
 int mb_render_snapshot(const char *path) {

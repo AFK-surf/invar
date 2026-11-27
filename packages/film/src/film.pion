@@ -72,9 +72,10 @@ pub fn prepare_metal_instances(scene : ui::Scene) -> (FixedArray[Double], Int) {
   (out, n)
 }
 
-fn attach_native_text_and_images(t : ui::Tester, w : Double, h : Double) -> Unit {
+/// The native host's text and pictures put in the Tester's fake host `cur` before its tree is built
+/// (`ui::Tester::tree`'s `host_patch`), so the tree is measured, shaped and drawn by them from its first frame.
+fn patch_native_text_and_images(cur : hostapi::Host) -> Unit {
   let native = host::native_host()
-  let cur = hostapi::host()
   cur.font_metrics = native.font_metrics
   cur.shape = native.shape
   cur.text_key = native.text_key
@@ -92,35 +93,113 @@ fn attach_native_text_and_images(t : ui::Tester, w : Double, h : Double) -> Unit
   cur.image_info = native.image_info
   cur.image_free = native.image_free
   cur.image_pixels = native.image_pixels
-  ui::reset_glyph_atlas()
-  // Pictures the tree asked for while the Tester was made were the fake host's: forget them so the native host loads
-  // them (and settle_images waits for its decode).
+  // Pictures an earlier tree asked for are let go: this tree's are loaded anew by the native host (settle_images waits
+  // for their decode), as each picture always loaded its own.
   ui::images_reset()
-  match ui::view_tree() {
-    Some(tr) => tr.words_again()
-    None => ()
+}
+
+// The glyph atlas the last picture or film left (its tree disposed keeping it), what its native host's atlas generation
+// and the scale and the atlas's epoch were then: the next one at the same scale keeps the glyphs placed while nothing
+// let them go since (`ui::Tester::tree`'s `keep_glyph_atlas`).
+let film_native_atlas_ready : signals::Ref[Bool] = ui::ref_new(false)
+let film_native_atlas_gen : signals::Ref[Int] = ui::ref_new(-1)
+let film_native_atlas_scale : signals::Ref[Double] = ui::ref_new(0.0)
+let film_native_atlas_epoch : signals::Ref[Int] = ui::ref_new(-1)
+
+fn native_atlas_generation() -> Int {
+  let native = host::native_host()
+  (native.atlas_generation)()
+}
+
+fn native_atlas_kept(scale : Double) -> Bool {
+  film_native_atlas_ready.v &&
+  (film_native_atlas_scale.v - scale).abs() <= 0.001 &&
+  film_native_atlas_epoch.v == ui::glyph_atlas_epoch() &&
+  film_native_atlas_gen.v == native_atlas_generation()
+}
+
+/// A Tester whose tree is measured and drawn by the native host's text and pictures from its first frame, with no
+/// in-frame reference-scene verification (a picture's frames are not a test's).
+fn native_tester(
+  tree : (view::View) -> Unit,
+  w : Double,
+  h : Double,
+  scale : Double,
+  theme : Option[() -> ui::Theme],
+  transitions_only : Bool,
+  platform : Int,
+  dark : Bool,
+  window_corner : Double,
+) -> ui::Tester {
+  let keep = native_atlas_kept(scale)
+  let t = match theme {
+    Some(tf) =>
+      ui::Tester::tree(
+        tree,
+        width=w,
+        height=h,
+        scale=scale,
+        theme=tf,
+        transitions_only=transitions_only,
+        platform=platform,
+        dark=dark,
+        host_patch=patch_native_text_and_images,
+        keep_glyph_atlas=keep,
+        looks_on=false,
+      )
+    None =>
+      ui::Tester::tree(
+        tree,
+        width=w,
+        height=h,
+        scale=scale,
+        transitions_only=transitions_only,
+        platform=platform,
+        dark=dark,
+        host_patch=patch_native_text_and_images,
+        keep_glyph_atlas=keep,
+        looks_on=false,
+      )
   }
-  t.resize(w, h)
+  if window_corner > 0.0 {
+    t.fake.window_corner_r = window_corner
+    t.resize(w, h)
+  } else if t.fake.frame_requested {
+    // (what the first frame asked for drawn, as the frame that followed it always drew it)
+    t.resize(w, h)
+  }
+  t
+}
+
+/// The Tester disposed with its glyph atlas kept for the next picture or film at `scale`.
+fn dispose_keeping_atlas(t : ui::Tester, scale : Double) -> Unit {
+  t.dispose(keep_glyph_atlas=true)
+  film_native_atlas_ready.v = true
+  film_native_atlas_gen.v = native_atlas_generation()
+  film_native_atlas_scale.v = scale
+  film_native_atlas_epoch.v = ui::glyph_atlas_epoch()
 }
 
 /// Asks the tree's pictures of the native host and waits (up to ~2 s of real time) for their decode, which runs off
-/// the main thread on Apple, so the shot shows them rather than their stand-ins.
-fn settle_images(t : ui::Tester, w : Double, h : Double, scale : Double) -> Unit {
+/// the main thread on Apple, so the shot shows them rather than their stand-ins. Returns the scene encoded last: the
+/// tree as it is drawn once nothing is pending.
+fn settle_images(t : ui::Tester, w : Double, h : Double, scale : Double) -> ui::Scene {
   let mut tries = 0
   while tries < 200 {
-    match ui::view_tree() {
-      Some(tr) => {
-        let _ = ui::encode_tree_scene(tr, w, h, scale, t.time())
-      }
-      None => {
-        let _ = t.scene()
-      }
-    }
+    let scene = tester_scene(t, w, h, scale)
     if !ui::images_pending() {
-      return
+      return scene
     }
     host::pump_main_loop(10.0)
     tries += 1
+  }
+  tester_scene(t, w, h, scale)
+}
+
+fn tester_scene(t : ui::Tester, w : Double, h : Double, scale : Double) -> ui::Scene {
+  match ui::view_tree() {
+    Some(tr) => ui::encode_tree_scene(tr, w, h, scale, t.time())
+    None => t.scene()
   }
 }
 
@@ -161,38 +240,34 @@ fn offscreen_native_host(prev : hostapi::Host) -> hostapi::Host {
   h
 }
 
-fn render_tester_to_metal(
+/// The Tester's tree settled (`settle_images`) and written to `path` as a PNG in one step (`save_snapshot_inst`):
+/// drawn as a present of its scene then `save_snapshot` drew it, without a frame handed to be shown between.
+fn snapshot_tester(
   t : ui::Tester,
   w : Double,
   h : Double,
   scale : Double,
   dark : Bool,
-  already_init~ : Bool = false,
+  path : String,
+  transparent : Bool,
+  async_write : Bool,
 ) -> Bool {
   let (r, g, b) = clear_rgb_from_theme(dark)
   let prev = hostapi::host()
   hostapi::set_host(offscreen_native_host(prev))
-  if !already_init {
-    if !init_offscreen(w, h, scale) {
-      hostapi::set_host(prev)
-      return false
-    }
-  }
-  settle_images(t, w, h, scale)
-  let scene = match ui::view_tree() {
-    Some(tr) => ui::encode_tree_scene(tr, w, h, scale, t.time())
-    None => t.scene()
-  }
+  let scene = settle_images(t, w, h, scale)
   let (inst, count) = prepare_metal_instances(scene)
-  mark_dirty_full()
-  hostapi::present(inst, count, r, g, b)
+  let ok = save_snapshot_inst(inst, count, r, g, b, path, transparent=transparent, async_write=async_write)
   hostapi::set_host(prev)
-  true
+  ok
 }
 
 let picture_bytes_seq : signals::Ref[Int] = ui::ref_new(0)
 
 /// Render a pure-tree `view::View` scene offscreen via native GPU (Metal / EGL-GLES3) to a PNG file at `path`.
+/// `async_write=true` writes the PNG behind on Apple while the next picture is drawn: `true` then says the picture
+/// was taken, and `flush_pictures()` waits for every such PNG and tells whether all were written (the process waits
+/// for them at exit too; elsewhere the PNG is written at once). Left `false`, the PNG is written before this returns.
 pub fn picture(
   tree : (view::View) -> Unit,
   path~ : String,
@@ -216,6 +291,7 @@ pub fn picture(
   theme? : () -> ui::Theme,
   transitions_only~ : Bool = true,
   solid_glass~ : Bool = false,
+  async_write~ : Bool = false,
 ) -> Bool {
   let _ = inset
   if !is_supported() || path == "" || w <= 0.0 || h <= 0.0 || scale <= 0.0 ||
@@ -249,14 +325,7 @@ pub fn picture(
     say("picture: offscreen renderer initialization failed")
     return false
   }
-  let t = match theme {
-    Some(tf) => ui::Tester::tree(tree, width=w, height=h, scale=scale, theme=tf, transitions_only=transitions_only, platform=platform, dark=dark)
-    None => ui::Tester::tree(tree, width=w, height=h, scale=scale, transitions_only=transitions_only, platform=platform, dark=dark)
-  }
-  if window_corner > 0.0 {
-    t.fake.window_corner_r = window_corner
-  }
-  attach_native_text_and_images(t, w, h)
+  let t = native_tester(tree, w, h, scale, theme, transitions_only, platform, dark, window_corner)
   t.period_ms = 1000.0 / fps.to_double()
   let frame_idx = ui::ref_new(0)
   let noop_cb = fn(_k : Int) -> Bool { true }
@@ -316,9 +385,8 @@ pub fn picture(
       gates_ok = false
     }
   }
-  let rendered = if gates_ok { render_tester_to_metal(t, w, h, scale, dark, already_init=true) } else { false }
-  let saved = if rendered { save_snapshot(path, transparent=transparent) } else { false }
-  t.dispose()
+  let saved = if gates_ok { snapshot_tester(t, w, h, scale, dark, path, transparent, async_write) } else { false }
+  dispose_keeping_atlas(t, scale)
   if solid_glass {
     ui::set_glass_solid(None)
   }
@@ -356,6 +424,7 @@ pub fn picture_tree(
   theme? : () -> ui::Theme,
   transitions_only~ : Bool = true,
   solid_glass~ : Bool = false,
+  async_write~ : Bool = false,
 ) -> Bool {
   picture(
     tree,
@@ -380,7 +449,14 @@ pub fn picture_tree(
     theme?=theme,
     transitions_only=transitions_only,
     solid_glass=solid_glass,
+    async_write=async_write,
   )
+}
+
+/// Waits for every PNG `picture` wrote behind (`async_write`) and tells whether all of them were written since the
+/// last call. `true` at once when none is pending.
+pub fn flush_pictures() -> Bool {
+  flush_snapshots()
 }
 
 /// Render a pure-tree `view::View` scene offscreen via Apple Metal and return the encoded PNG `Bytes`.
@@ -471,24 +547,17 @@ pub fn film(
     say("film: offscreen renderer initialization failed")
     return false
   }
-  let t = match theme {
-    Some(tf) => ui::Tester::tree(tree, width=w, height=h, scale=scale, theme=tf, transitions_only=transitions_only, platform=platform, dark=dark)
-    None => ui::Tester::tree(tree, width=w, height=h, scale=scale, transitions_only=transitions_only, platform=platform, dark=dark)
-  }
-  if window_corner > 0.0 {
-    t.fake.window_corner_r = window_corner
-  }
-  attach_native_text_and_images(t, w, h)
+  let t = native_tester(tree, w, h, scale, theme, transitions_only, platform, dark, window_corner)
   t.period_ms = 1000.0 / fps.to_double()
   let prep_idx = ui::ref_new(0)
   if prepare != "" {
     if !run_drive_script(t, prepare, max, fn(_k : Int) -> Bool { true }, prep_idx) {
-      t.dispose()
+      dispose_keeping_atlas(t, scale)
       return false
     }
   }
   if !film_open(out, pw, ph, fps) {
-    t.dispose()
+    dispose_keeping_atlas(t, scale)
     return false
   }
   let written = ui::ref_new(0)
@@ -563,14 +632,13 @@ pub fn film(
   }
   let ok_last = if ok_corners && last != "" {
     // (the last frame saved only when it was drawn: never a stale or empty framebuffer)
-    let ok_render = render_tester_to_metal(t, w, h, scale, dark, already_init=true)
-    ok_render && save_snapshot(last)
+    snapshot_tester(t, w, h, scale, dark, last, false, false)
   } else {
     ok_corners
   }
   let closed = film_close(written.v)
   let published = film_finish(ok_corners && ok_last && closed)
-  t.dispose()
+  dispose_keeping_atlas(t, scale)
   ok_corners && ok_last && closed && published
 }
 
