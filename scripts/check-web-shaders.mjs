@@ -840,7 +840,7 @@ function buildHtmlPage(programs) {
           return tabBgEmpty(x, y);
         };
         const tabBgLip = (x, y) => {
-          if (x >= 112.5 && x <= 114.5 && y >= 45.0 && y <= 55.0) return [255, 149, 0];
+          if (x >= 115.2 && x <= 116.2 && y >= 45.0 && y <= 55.0) return [255, 149, 0];
           return tabBgEmpty(x, y);
         };
         const tabEmpty = run2D(160, 100, 3, tabBgEmpty,
@@ -857,11 +857,30 @@ function buildHtmlPage(programs) {
         const g1c = tabIcon.at(311, 87), g0c = tabEmpty.at(311, 87);
         const gate0InCap = Math.abs(g1c[0] - g0c[0]) + Math.abs(g1c[1] - g0c[1]) + Math.abs(g1c[2] - g0c[2]);
 
-        const tabNg = run2D(160, 100, 3, (x, y) => (x >= 41.0 && x <= 43.0 && y >= 28.0 && y <= 72.0) ? [90, 90, 90] : [246, 244, 240],
-          { x: 32, y: 18, w: 95, h: 63.5, r: 31.75, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
-        const ngBarL = tabNg.lumaAt(126, 149);
-        const ngCleanL = tabNg.lumaAt(114, 149);
-        const ngOk = ngBarL < 130 && ngCleanL > 220;
+        // Role 4 strictly monotonic: empty vs bar A/B luma diff across the outer edge (d=0..4pt, px_x=96..108)
+        const tabNgGlass = { x: 32, y: 18, w: 95, h: 63.5, r: 31.75, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 };
+        const tabNg0 = run2D(160, 100, 3, () => [246, 244, 240], tabNgGlass);
+        const ngEmptyL = [];
+        for (let gx = 96; gx <= 108; gx++) ngEmptyL.push(tabNg0.lumaAt(gx, 149));
+        const tabNg = run2D(160, 100, 3, (x, y) => (x >= 37.0 && x <= 38.5 && y >= 18.0 && y <= 81.5) ? [90, 90, 90] : [246, 244, 240], tabNgGlass);
+        const ngBarL = tabNg.lumaAt(114, 149);
+        let ngGhost = 0, ngCleanL = 255;
+        for (let gx = 96; gx <= 108; gx++) {
+          const lb = tabNg.lumaAt(gx, 149);
+          ngGhost = Math.max(ngGhost, Math.abs(lb - ngEmptyL[gx - 96]));
+          if (gx >= 99) ngCleanL = Math.min(ngCleanL, lb);
+        }
+        const ngOk = ngBarL < 130 && ngGhost <= 2 && ngCleanL > 220;
+
+        // Role 4 dark clarity: 62pt droplet over a dark 50pt bar (6pt overhang stays clear, no dead-black side ring)
+        const tabDk = run2D(160, 100, 3, (x, y) => {
+          const dx = Math.max(0, Math.abs(x - 80) - 45);
+          const dy = Math.abs(y - 50);
+          return (dx * dx + dy * dy <= 25 * 25) ? [55, 57, 60] : [25, 27, 30];
+        }, { x: 35, y: 19, w: 90, h: 62, r: 31, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
+        const dkTopL = tabDk.lumaAt(240, 66), dkBotL = tabDk.lumaAt(240, 234);
+        const dkLeftL = tabDk.lumaAt(106, 150), dkRightL = tabDk.lumaAt(373, 150);
+        const dkOk = dkTopL < 55 && dkBotL < 55 && dkLeftL >= 42 && dkRightL >= 42;
 
         const segScaleBg = (x, y) => {
           if (x >= 78 && x <= 82 && y >= 43.5 && y <= 55.5) return [0, 0, 0];
@@ -880,10 +899,10 @@ function buildHtmlPage(programs) {
         const segScaleOk = segStrokeSpan >= 35 && segStrokeSpan <= 37 && segRingL >= 225 && segTrackL <= 210 && (segRingL - segTrackL) >= 20;
 
         const v9Ok = gr0 < 15 && gr1 > 60 && gr2 < 15 && coreH >= 20 && coreH <= 22.5 && moat >= 6.5 &&
-          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && ghostDelta === 0 && lipDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && ngOk && halfOk && segScaleOk;
+          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && ghostDelta === 0 && lipDelta >= 80 && gate0SameX === 0 && gate0InCap === 0 && ngOk && dkOk && halfOk && segScaleOk;
         pushVec('V9 switch ON/OFF/half, light segmented & role4 tab 2D ROI', v9Ok,
-          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, ghostDelta, lipDelta, gate0SameX, gate0InCap, ngBarL, ngCleanL, Number(h50.toFixed(2)), segStrokeSpan, segRingL, segTrackL],
-          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, ghostDelta=0, lipDelta>=40, gate0=0, ngBar<130, ngClean>220, segSpan[35..37], ring>=225/track<=210');
+          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, ghostDelta, lipDelta, gate0SameX, gate0InCap, ngBarL, Number(ngGhost.toFixed(1)), Number(ngCleanL.toFixed(1)), Number(dkTopL.toFixed(1)), Number(dkBotL.toFixed(1)), Number(dkLeftL.toFixed(1)), Number(dkRightL.toFixed(1)), Number(h50.toFixed(2)), segStrokeSpan, segRingL, segTrackL],
+          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, ghostDelta=0, lipDelta>=80, gate0=0, ngBar<130, ngGhost<=2, ngClean>220, dkTop/Bot<55, dkSide>=42, segSpan[35..37], ring>=225/track<=210');
       }
 
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)

@@ -381,7 +381,7 @@ static int run_v8_v9_2d_roi(void) {
     ok &= v9d_ok;
   }
 
-  // V9-Tab: Role 4 Tab monotonic outer meniscus (no fake badge copy from 6.7pt inward; continuous outer lip refraction)
+  // V9-Tab: Role 4 Tab monotonic outer meniscus (no fake badge copy from 7pt inward; 1pt bar 1.8pt inward refracts into the 1.5pt outer lip)
   {
     static uint8_t rgba_empty[W3 * H3 * 4];
     static uint8_t rgba_lip[W3 * H3 * 4];
@@ -396,7 +396,7 @@ static int run_v8_v9_2d_roi(void) {
     if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba)) return 0;
     n = 0;
     push_inst(inst, &n, 10.0, 28.0, 140.0, 44.0, 22.0, 0.0, 0.0, 0.0, 42.0/255.0, 42.0/255.0, 48.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    push_inst(inst, &n, 112.5, 45.0, 2.0, 10.0, 0.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 115.2, 45.0, 1.0, 10.0, 0.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 30.0, 25.0, 88.0, 50.0, 25.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba_lip)) return 0;
     size_t k_cap = ((size_t)150 * W3 + 349) * 4;
@@ -406,22 +406,48 @@ static int run_v8_v9_2d_roi(void) {
     int gate0_same_x = abs((int)rgba[k_g0x] - (int)rgba_empty[k_g0x]) + abs((int)rgba[k_g0x+1] - (int)rgba_empty[k_g0x+1]) + abs((int)rgba[k_g0x+2] - (int)rgba_empty[k_g0x+2]);
     size_t k_g0c = ((size_t)87 * W3 + 311) * 4;
     int gate0_in_cap = abs((int)rgba[k_g0c] - (int)rgba_empty[k_g0c]) + abs((int)rgba[k_g0c+1] - (int)rgba_empty[k_g0c+1]) + abs((int)rgba[k_g0c+2] - (int)rgba_empty[k_g0c+2]);
-    int v9tab_ok = (ghost_delta == 0) && (lip_delta >= 40) && (gate0_same_x == 0) && (gate0_in_cap == 0);
-    printf("  [%s] V9-Tab Role 4 monotonic outer meniscus: ghostDelta=%d (==0) lipDelta=%d (>=40) gate0=(%d,%d) (==0)\n", v9tab_ok ? "PASS" : "FAIL", ghost_delta, lip_delta, gate0_same_x, gate0_in_cap);
+    int v9tab_ok = (ghost_delta == 0) && (lip_delta >= 80) && (gate0_same_x == 0) && (gate0_in_cap == 0);
+    printf("  [%s] V9-Tab Role 4 monotonic outer meniscus: ghostDelta=%d (==0) lipDelta=%d (>=80) gate0=(%d,%d) (==0)\n", v9tab_ok ? "PASS" : "FAIL", ghost_delta, lip_delta, gate0_same_x, gate0_in_cap);
     ok &= v9tab_ok;
   }
 
-  // V9-Tab-No-Ghost: Role 4 zero interior double-fold / ghosting at inward >= 5.5pt
+  // V9-Tab-No-Ghost: Role 4 strictly monotonic (empty vs bar A/B luma diff across the outer edge d=0..4pt, px_x=96..108)
   {
+    static uint8_t rgba_ng0[W3 * H3 * 4];
     int n = 0;
-    push_inst(inst, &n, 41.0, 28.0, 2.0, 44.0, 0.0, 0.0, 0.0, 0.0, 90.0/255.0, 90.0/255.0, 90.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 32.0, 18.0, 95.0, 63.5, 31.75, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 246.0/255.0, 244.0/255.0, 240.0/255.0, S3, W3, H3, rgba_ng0)) return 0;
+    n = 0;
+    push_inst(inst, &n, 37.0, 18.0, 1.5, 63.5, 0.0, 0.0, 0.0, 0.0, 90.0/255.0, 90.0/255.0, 90.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 32.0, 18.0, 95.0, 63.5, 31.75, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 246.0/255.0, 244.0/255.0, 240.0/255.0, S3, W3, H3, rgba)) return 0;
-    int l_bar = px_luma_of(rgba, W3, 126, 149);
-    int l_clean = px_luma_of(rgba, W3, 114, 149);
-    int ng_ok = (l_bar < 130) && (l_clean > 220);
-    printf("  [%s] V9-Tab-No-Ghost Role 4 monotonic: barL@10pt=%d (<130) cleanL@6pt=%d (>220)\n", ng_ok ? "PASS" : "FAIL", l_bar, l_clean);
+    int l_bar = px_luma_of(rgba, W3, 114, 149);
+    int ghost_diff = 0, l_clean = 255;
+    for (int gx = 96; gx <= 108; gx++) {
+      int le = px_luma_of(rgba_ng0, W3, gx, 149);
+      int lb = px_luma_of(rgba, W3, gx, 149);
+      int gd = abs(lb - le);
+      if (gd > ghost_diff) ghost_diff = gd;
+      if (gx >= 99 && lb < l_clean) l_clean = lb;
+    }
+    int ng_ok = (l_bar < 130) && (ghost_diff <= 2) && (l_clean > 220);
+    printf("  [%s] V9-Tab-No-Ghost Role 4 monotonic: barL@7pt=%d (<130) edgeGhost=%d (<=2) cleanEdgeL=%d (>220)\n", ng_ok ? "PASS" : "FAIL", l_bar, ghost_diff, l_clean);
     ok &= ng_ok;
+  }
+
+  // V9-Tab-Dark-Clarity: dark 50pt bar + 62pt Role 4 droplet (6pt overhang stays clear, no dead-black side ring)
+  {
+    int n = 0;
+    push_inst(inst, &n, 10.0, 25.0, 140.0, 50.0, 25.0, 6.0, 1.0, 0.0, 32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0, 0.6, 14.0, 0.0, 1.0, -567.0, 20.0, 0.0, 0.0);
+    push_inst(inst, &n, 35.0, 19.0, 90.0, 62.0, 31.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -568.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 25.0/255.0, 27.0/255.0, 30.0/255.0, S3, W3, H3, rgba)) return 0;
+    int top_l = px_luma_of(rgba, W3, 240, 66);
+    int bot_l = px_luma_of(rgba, W3, 240, 234);
+    int left_l = px_luma_of(rgba, W3, 106, 150);
+    int right_l = px_luma_of(rgba, W3, 373, 150);
+    int dk_ok = (top_l < 55) && (bot_l < 55) && (left_l >= 42) && (right_l >= 42);
+    printf("  [%s] V9-Tab-Dark-Clarity Role 4: overhang top/bot=(%d,%d) (<55) sideRim=(%d,%d) (>=42)\n", dk_ok ? "PASS" : "FAIL", top_l, bot_l, left_l, right_l);
+    ok &= dk_ok;
   }
 
   // V9-E: Switch half-press p = 0.5 / 0.6 / 1.0 (no pinchWeight collapse at p=0.5)
@@ -598,7 +624,7 @@ static int run_v8_v9_2d_roi(void) {
       }
       int center_ok = 1;
       if (dark) {
-        double inst_g[40];
+        double inst_g[INST_SIZE];
         int ng = 0;
         push_inst(inst_g, &ng, 31.58, 12.8, 59.2, 38.4, 19.2, 6.0, 1.0, -32.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
         if (!render_rgba(inst_g, ng, 48.0/255.0, 209.0/255.0, 88.0/255.0, 3.0, 360, 195, rgba)) return 0;
