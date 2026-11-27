@@ -449,6 +449,7 @@ struct TextRenderCache {
   mut metrics_style : Int
   mut metrics_asc : Double
   mut metrics_desc : Double
+  metrics_map : Map[String, (Double, Double)]
   mut shape_size : Double
   mut shape_weight : Int
   mut shape_style : Int
@@ -462,6 +463,7 @@ let text_cache : TextRenderCache = TextRenderCache::{
   metrics_style: 0,
   metrics_asc: 0.0,
   metrics_desc: 0.0,
+  metrics_map: Map::new(),
   shape_size: -1.0,
   shape_weight: -1,
   shape_style: -1,
@@ -470,6 +472,7 @@ let text_cache : TextRenderCache = TextRenderCache::{
 
 fn clear_text_cache() -> Unit {
   text_cache.metrics_valid = false
+  text_cache.metrics_map.clear()
   text_cache.shape_size = -1.0
   text_cache.shape_weight = -1
   text_cache.shape_style = -1
@@ -677,11 +680,28 @@ fn measure_metrics(size : Double, weight : Int, style : Int) -> (Double, Double)
   text_cache.metrics_style == style {
     return (text_cache.metrics_asc, text_cache.metrics_desc)
   }
+  let mkey = size.to_string() + ":" + weight.to_string() + ":" + style.to_string()
+  match text_cache.metrics_map.get(mkey) {
+    Some((asc, desc)) => {
+      text_cache.metrics_valid = true
+      text_cache.metrics_size = size
+      text_cache.metrics_weight = weight
+      text_cache.metrics_style = style
+      text_cache.metrics_asc = asc
+      text_cache.metrics_desc = desc
+      return (asc, desc)
+    }
+    None => ()
+  }
   shared_metrics_buf[0] = -1.0
   shared_metrics_buf[1] = -1.0
   hostapi::font_metrics(size, weight, style, shared_metrics_buf)
   let asc = if shared_metrics_buf[0] > 0.0 { shared_metrics_buf[0] } else { size * 0.8 }
   let desc = if shared_metrics_buf[1] > 0.0 { shared_metrics_buf[1] } else { size * 0.2 }
+  if text_cache.metrics_map.length() >= 256 {
+    text_cache.metrics_map.clear()
+  }
+  text_cache.metrics_map.set(mkey, (asc, desc))
   text_cache.metrics_valid = true
   text_cache.metrics_size = size
   text_cache.metrics_weight = weight
@@ -692,12 +712,14 @@ fn measure_metrics(size : Double, weight : Int, style : Int) -> (Double, Double)
 }
 
 fn shape_line_cached(raw : String, sz : Double, weight : Int, style_bits : Int) -> ShapedLine {
-  let can_cache = raw.length() <= 96
-  if can_cache &&
-  text_cache.shape_size == sz &&
-  text_cache.shape_weight == weight &&
-  text_cache.shape_style == style_bits {
-    match text_cache.shapes.get(raw) {
+  let can_cache = raw.length() <= 128
+  let skey = if can_cache {
+    sz.to_string() + ":" + weight.to_string() + ":" + style_bits.to_string() + ":" + raw
+  } else {
+    ""
+  }
+  if can_cache {
+    match text_cache.shapes.get(skey) {
       Some(sl) => return sl
       None => ()
     }
@@ -721,16 +743,13 @@ fn shape_line_cached(raw : String, sz : Double, weight : Int, style_bits : Int) 
   }
   let sl = ShapedLine::{ n, locs, advs, gkeys }
   if can_cache {
-    if text_cache.shape_size != sz ||
-    text_cache.shape_weight != weight ||
-    text_cache.shape_style != style_bits ||
-    text_cache.shapes.length() >= 2048 {
+    if text_cache.shapes.length() >= 4096 {
       text_cache.shapes.clear()
-      text_cache.shape_size = sz
-      text_cache.shape_weight = weight
-      text_cache.shape_style = style_bits
     }
-    text_cache.shapes.set(raw, sl)
+    text_cache.shape_size = sz
+    text_cache.shape_weight = weight
+    text_cache.shape_style = style_bits
+    text_cache.shapes.set(skey, sl)
   }
   sl
 }
@@ -755,7 +774,7 @@ fn emit_glyph_quad(
   // (drawn `quad_scale` times the size it was rasterized at; the atlas rectangle it reads stays the one it fills)
   let (gx, gy) = match snap_top {
     Some((top, base)) if quad_scale == 1.0 && scale > 0.0 =>
-      (on_glyph_col(pen_x, slot.ox, scale, z=1.0), on_glyph_row(top, base, slot.oy, scale))
+    (on_glyph_col(pen_x, slot.ox, scale, z=1.0), on_glyph_row(top, base, slot.oy, scale))
     _ => (pen_x + slot.ox * quad_scale, baseline_y + slot.oy * quad_scale)
   }
   let idx = scene.push_inst(
@@ -1153,13 +1172,11 @@ fn layout_runs(
       }
       let seg = sub_lines[si]
       if seg.length() > 0 {
-        let cap = (seg.length() + 4) * 4
-        let sbuf = ensure_shape_buf(cap)
-        let n = hostapi::shape(seg, rsz, rweight, rstyle, sbuf)
+        let sl = shape_line_cached(seg, rsz, rweight, rstyle)
+        let n = sl.n
         let cps = utf16_codepoints(seg)
         if n > 0 {
           shaped_any = true
-          resolve_ligatures(seg, n, sbuf, rsz, rweight, rstyle)
           let room = if run.code && (run_bg & 0xFFL) != 0L {
             ((rsz * 0.3 * 2.0).round() / 2.0) * quad_scale
           } else {
@@ -1167,11 +1184,11 @@ fn layout_runs(
           }
           let mut k = 0
           while k < n {
-            let loc = sbuf[k * 4].to_int()
+            let loc = sl.locs[k]
             let pl = if k == 0 && si == 0 { room } else { 0.0 }
             let pr = if k == n - 1 && si == sub_lines.length() - 1 { room } else { 0.0 }
-            let adv = sbuf[k * 4 + 2] * quad_scale + spacing + pl + pr
-            let gkey = sbuf[k * 4 + 3].to_int()
+            let adv = sl.advs[k] * quad_scale + spacing + pl + pr
+            let gkey = sl.gkeys[k]
             let cu = if loc >= 0 && loc < cps.length() { cps[loc] } else { 0 }
             clusters.push(RunsCluster::{ adv, pad_l: pl, gkey, cu, u16_off: para_u16_base + loc, rink, run_bg })
             k += 1
@@ -1269,6 +1286,75 @@ fn layout_runs(
   RunsLayout::{ clusters, lines, widest, shaped_any, had_text }
 }
 
+let ahead_keys_buf : FixedArray[Int] = FixedArray::make(128, -1)
+
+fn queue_runs_glyphs_ahead(
+  layout : RunsLayout,
+  d_x : Double,
+  pad : Double,
+  scale : Double,
+  qs : Double,
+) -> Unit {
+  if !hostapi::glyphs_ahead_able() {
+    return
+  }
+  let mut count = 0
+  let mut li = 0
+  while li < layout.lines.length() && count < 128 {
+    let vl = layout.lines[li]
+    let mut pen_x = d_x
+    let mut k = vl.start
+    while k < vl.end && count < 128 {
+      let cl = layout.clusters[k]
+      if (cl.rink & 0xFFL) != 0L && cl.gkey >= 0 {
+        let laid_x = pen_x + pad + cl.pad_l
+        let sub_key = glyph_sub_at(cl.gkey, laid_x, scale, qs)
+        if !glyph_state.glyphs.contains(sub_key) {
+          ahead_keys_buf[count] = sub_key
+          count += 1
+        }
+      }
+      pen_x = pen_x + cl.adv
+      k += 1
+    }
+    li += 1
+  }
+  if count >= 4 {
+    hostapi::glyphs_ahead(ahead_keys_buf, count)
+  }
+}
+
+fn prewarm_runs_node(d : view::Drawn, scale : Double, node_scale : Double) -> Unit {
+  if d.runs.length() == 0 || !hostapi::glyphs_ahead_able() {
+    return
+  }
+  ensure_glyph_atlas(scale)
+  let ns = if node_scale > 0.0 { node_scale } else { 1.0 }
+  let rs = text_raster_scale(ns)
+  let qs = ns / rs
+  let fm = font_scale_mul()
+  let base_sz_r = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * fm * rs
+  let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
+  let spacing = view_spacing(fm, d.words_look) * ns
+  let pad = spacing * 0.5
+  let lig_bit = view_words_style_bits(spacing)
+  let wrap = d.words_look.wrap && d.w > 0.0
+  let layout = layout_runs(
+    d.runs,
+    base_sz_r,
+    base_w,
+    spacing,
+    lig_bit,
+    d.ink,
+    wrap,
+    d.w,
+    d.words_look.max_lines,
+    quad_scale=qs,
+    runs_look=d.runs_look,
+  )
+  queue_runs_glyphs_ahead(layout, d.x, pad, scale, qs)
+}
+
 /// Shape and emit real glyph quads (and inline run backgrounds) for `d.runs`.
 fn encode_runs(
   scene : Scene,
@@ -1320,6 +1406,7 @@ fn encode_runs(
     quad_scale=qs,
     runs_look=d.runs_look,
   )
+  queue_runs_glyphs_ahead(layout, d.x, pad, scale, qs)
 
   let bg_pad = dmin(1.5 * ns, dmax(0.0, (line_h - base_sz_eff) * 0.35))
   let bg_h = dmax(1.0 * ns, line_h - bg_pad * 2.0)

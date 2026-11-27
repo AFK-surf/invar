@@ -307,6 +307,15 @@ static bool face_build(int f) {
 
 static void faces_changed(void);
 
+static bool slot_ever_used(int32_t f) {
+  if (f <= 3) return true;
+  for (int i = 0; i < n_formats; i++)
+    if (((formats[i].style >> 8) & 15) == f) return true;
+  for (int i = 0; i < n_entries; i++)
+    if (((entries[i].style >> 8) & 15) == f) return true;
+  return false;
+}
+
 // A file of face `f`: its path, or its bytes (path NULL); made part of it if DirectWrite reads them as a font.
 static int32_t face_take(int32_t f, WCHAR *path, void *data, UINT32 size) {
   init();
@@ -315,6 +324,7 @@ static int32_t face_take(int32_t f, WCHAR *path, void *data, UINT32 size) {
     free(data);
     return 0;
   }
+  bool was_has = face_has(f);
   int n = faces[f].n;
   faces[f].paths = (WCHAR **)realloc(faces[f].paths, sizeof(WCHAR *) * (n + 1));
   faces[f].data = (void **)realloc(faces[f].data, sizeof(void *) * (n + 1));
@@ -329,7 +339,7 @@ static int32_t face_take(int32_t f, WCHAR *path, void *data, UINT32 size) {
     free(data);
     return 0;
   }
-  faces_changed();
+  if (was_has || slot_ever_used(f)) faces_changed();
   return 1;
 }
 
@@ -378,6 +388,7 @@ extern "C" int32_t mb_host_face_add_family(int32_t f, moonbit_string_t family) {
       return 0;
     }
   }
+  bool was_has = face_has(f);
   for (int i = 0; i < faces[f].n; i++) {
     free(faces[f].paths[i]);
     free(faces[f].data[i]);
@@ -387,7 +398,7 @@ extern "C" int32_t mb_host_face_add_family(int32_t f, moonbit_string_t family) {
   faces[f].fc = NULL;
   memcpy(faces[f].family, name, sizeof(name));
   faces[f].system = true;
-  faces_changed();
+  if (was_has || slot_ever_used(f)) faces_changed();
   return 1;
 }
 

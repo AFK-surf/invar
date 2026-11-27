@@ -1514,6 +1514,8 @@ struct ViewBlock {
   edge_col : Int64
   alpha : Double
   words : String
+  runs : Array[text::Run]
+  runs_code_ground : Int64
   words_size : Double
   words_weight : Int
   words_line : Double
@@ -1739,6 +1741,64 @@ fn spacing_eq(a : view::Spacing, b : view::Spacing) -> Bool {
   }
 }
 
+fn run_opt_int_eq(a : Option[Int], b : Option[Int]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+fn opt_run_ground_eq(a : Option[text::Ground], b : Option[text::Ground]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x.room == y.room && x.height == y.height && x.corner == y.corner && x.after == y.after
+    _ => false
+  }
+}
+
+fn runs_has_drawing(runs : Array[text::Run]) -> Bool {
+  let n = runs.length()
+  let mut i = 0
+  while i < n {
+    if runs[i].drawing.is_some() {
+      return true
+    }
+    i += 1
+  }
+  false
+}
+
+fn runs_eq(a : Array[text::Run], b : Array[text::Run]) -> Bool {
+  let n = a.length()
+  if n != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    let ra = a[i]
+    let rb = b[i]
+    if ra.text != rb.text ||
+    ra.weight != rb.weight ||
+    ra.italic != rb.italic ||
+    ra.code != rb.code ||
+    ra.mono != rb.mono ||
+    ra.serif != rb.serif ||
+    !run_opt_int_eq(ra.face, rb.face) ||
+    ra.scale != rb.scale ||
+    ra.color != rb.color ||
+    ra.bg != rb.bg ||
+    !opt_run_ground_eq(ra.ground, rb.ground) ||
+    ra.strike != rb.strike ||
+    ra.underline != rb.underline ||
+    ra.link != rb.link {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
 fn rects_eq(a : Array[paint::Rect], b : Array[paint::Rect]) -> Bool {
   let n = a.length()
   if n != b.length() {
@@ -1821,6 +1881,8 @@ fn view_block_matches(
   blk.image_contain == d.image_contain &&
   opt_pair_eq(blk.image_cover_at, d.image_cover_at) &&
   ((blk.image_obs.length() == 0 && d.image is None) || blk.image_epoch == image_invalidate_epoch.v) &&
+  blk.runs_code_ground == d.runs_look.code_ground &&
+  runs_eq(blk.runs, d.runs) &&
   rects_eq(blk.rects, d.rects)
 }
 
@@ -2639,6 +2701,10 @@ fn encode_drawn_node_direct(
   (after_ground_idx - start_idx, words_start_idx - start_idx, words_end_idx - start_idx, words_square_clip, image_settled)
 }
 
+let prewarm_frame_budget : signals::Ref[Int] = ref_new(0)
+let prewarm_seen : Map[Int, Int] = Map::new()
+let prewarm_seen_epoch : signals::Ref[Int] = ref_new(-1)
+
 fn encode_drawn_node(
   scene : Scene,
   tree_id : Int,
@@ -2658,6 +2724,46 @@ fn encode_drawn_node(
 ) -> Unit {
   if d.alpha <= 0.0 || (d.w <= 0.0 && gd.dw <= 0.0) || (d.h <= 0.0 && gd.dh <= 0.0) {
     return
+  }
+  if view_cull_enabled.v &&
+  !bypass_blocks &&
+  !image_obs_recording.v &&
+  mag.is_none() &&
+  (d.shadow.2 & 0xFFL) == 0L &&
+  d.glass.is_none() &&
+  d.picture.is_none() &&
+  d.blur <= 0.0 &&
+  d.turn == 0.0 &&
+  node_scale == 1.0 &&
+  gd.dx == 0.0 &&
+  gd.dy == 0.0 &&
+  gd.dw == 0.0 &&
+  gd.dh == 0.0 &&
+  d.shapes.length() == 0 &&
+  d.lines.length() == 0 &&
+  scene.ink_r <= 0.0 &&
+  find_tree_field_in(tree_id, d.id).is_none() &&
+  find_tree_stream(d.id).is_none() &&
+  find_tree_native(d.id).is_none() &&
+  find_tree_terminal(d.id).is_none() {
+    let pad = 32.0
+    if clip.2 <= clip.0 || clip.3 <= clip.1 ||
+    d.x + d.w + pad <= clip.0 || d.x - pad >= clip.2 ||
+    d.y + d.h + pad <= clip.1 || d.y - pad >= clip.3 {
+      if d.runs.length() > 0 && prewarm_frame_budget.v > 0 && d.id.at >= 0 &&
+      d.y + d.h >= clip.1 - 1200.0 && d.y <= clip.3 + 1200.0 {
+        if prewarm_seen_epoch.v != glyph_state.epoch || prewarm_seen.length() >= 4096 {
+          prewarm_seen.clear()
+          prewarm_seen_epoch.v = glyph_state.epoch
+        }
+        if !prewarm_seen.contains(d.id.at) {
+          prewarm_seen.set(d.id.at, glyph_state.epoch)
+          prewarm_frame_budget.v = prewarm_frame_budget.v - 1
+          prewarm_runs_node(d, scale, node_scale)
+        }
+      }
+      return
+    }
   }
   if bypass_blocks {
     let _ = encode_drawn_node_direct(
@@ -2686,7 +2792,7 @@ fn encode_drawn_node(
   d.lines.length() == 0 &&
   d.shapes.length() == 0 &&
   d.picture.is_none() &&
-  d.runs.length() == 0 &&
+  !runs_has_drawing(d.runs) &&
   d.blur <= 0.0 &&
   scene.ink_r <= 0.0 &&
   find_tree_field_in(tree_id, d.id).is_none() &&
@@ -2711,7 +2817,7 @@ fn encode_drawn_node(
   // Scaled by the host's text size so a set_font_scale change misses the cached block and redraws at the new size.
   let eff_font_size = (if d.words_look.size > 0.0 { d.words_look.size } else { tree_theme().font }) * font_scale_mul()
   let atlas_gen = glyph_state.epoch
-  let (sub_x, sub_y) = if scale > 0.0 && d.words.length() > 0 {
+  let (sub_x, sub_y) = if scale > 0.0 && (d.words.length() > 0 || d.runs.length() > 0) {
     (d.x - (d.x * scale).round() / scale, d.y - (d.y * scale).round() / scale)
   } else {
     (0.0, 0.0)
@@ -2784,6 +2890,8 @@ fn encode_drawn_node(
     edge_col: d.edge.1,
     alpha: d.alpha,
     words: d.words,
+    runs: d.runs.copy(),
+    runs_code_ground: d.runs_look.code_ground,
     words_size: eff_font_size,
     words_weight: d.words_look.weight,
     words_line: d.words_look.line,
@@ -4132,6 +4240,7 @@ pub fn view_frame(w : Double, h : Double, scale : Double, now : Double) -> Bool 
   field_let_go_if_left(tree)
   let prev_in_tree_frame = in_tree_frame.v
   in_tree_frame.v = true
+  prewarm_frame_budget.v = 24
   let _ = tree.frame(w, h, now=now)
   in_tree_frame.v = prev_in_tree_frame
   view_cursor_tell()

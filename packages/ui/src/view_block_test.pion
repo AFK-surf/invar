@@ -272,3 +272,121 @@ test "view_block: 200-row 100-frame scroll CPU benchmark (blocks=false vs blocks
   debug_assert(copied_off == 0 && made_off > 0, "disabled blocks never copy")
   debug_assert(copied_on >= 19000 && made_on <= 500, "enabled blocks reuse >= 95% across 100 frames")
 }
+
+test "view_block: words_runs reuses cached ViewBlock on scroll and invalidates on run change" {
+  set_view_cull_enabled(false)
+  let scroll = view::Scroll::new()
+  let run_sig : signals::Signal[Array[text::Run]] = signals::signal([
+    text::Run::{ ..text::plain("Row-10-initial"), face: Some(4), color: 0x112233FFL },
+  ])
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.scroll_box(fn(body : view::View) {
+        let mut i = 0
+        while i < 60 {
+          let idx = i
+          let _ = body.box(fn(row : view::View) {
+            let _ = row.width(view::Live::Is(Some(360.0))).height(view::Live::Is(Some(28.0)))
+            if idx == 10 {
+              let _ = row.box(fn(lbl : view::View) {
+                let _ = lbl.words_runs(view::Live::By(fn() { run_sig.get() }))
+              })
+            } else {
+              let _ = row.box(fn(lbl : view::View) {
+                let _ = lbl.words_runs(view::Live::Is([text::Run::{ ..text::plain("Run item #\{idx}"), face: Some(4), color: 0x222222FFL }]))
+              })
+            }
+          })
+          i += 1
+        }
+      }, scroll=scroll)
+    },
+    width=400.0,
+    height=640.0,
+    scale=2.0,
+  )
+
+  view_paint_work_reset()
+  scroll.put(16.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let scroll_work = view_paint_work_now()
+  debug_assert(scroll_work.copied >= 55, "words_runs scroll copied >= 55 (got \{scroll_work.copied})")
+  debug_assert(scroll_work.made <= 5, "words_runs scroll made <= 5 (got \{scroll_work.made})")
+
+  view_paint_work_reset()
+  run_sig.set([text::Run::{ ..text::plain("Row-10-updated"), face: Some(4), color: 0xAA1122FFL }])
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let edit_work = view_paint_work_now()
+  debug_assert(edit_work.made == 1, "words_runs update rebuilds 1 node (got \{edit_work.made})")
+  debug_assert(edit_work.copied >= 55, "words_runs update reuses remaining nodes (got \{edit_work.copied})")
+  t.dispose()
+  set_view_cull_enabled(true)
+}
+
+test "text_cache: multi-style shape_line_cached retains entries across size, weight, and style switches" {
+  let shape_calls = ref_new(0)
+  let t = Tester::tree(fn(_root : view::View) { () }, width=320.0, height=200.0)
+  let h = hostapi::host()
+  let orig_shape = h.shape
+  h.shape = fn(txt : String, sz : Double, weight : Int, style : Int, out : FixedArray[Double]) -> Int {
+    shape_calls.v = shape_calls.v + 1
+    orig_shape(txt, sz, weight, style, out)
+  }
+  clear_text_cache()
+  let _ = shape_line_cached("Hello", 14.0, 400, 0)
+  let _ = shape_line_cached("World", 16.0, 700, 2)
+  let _ = shape_line_cached("Code", 12.0, 400, 4 | (4 << 8))
+  let after_cold = shape_calls.v
+  debug_assert(after_cold == 3, "expected 3 cold shape calls, got \{after_cold}")
+  let _ = shape_line_cached("Hello", 14.0, 400, 0)
+  let _ = shape_line_cached("World", 16.0, 700, 2)
+  let _ = shape_line_cached("Code", 12.0, 400, 4 | (4 << 8))
+  debug_assert(shape_calls.v == after_cold, "expected 0 shape calls on alternating warm styles, got \{shape_calls.v - after_cold}")
+  h.shape = orig_shape
+  t.dispose()
+}
+
+test "view_blocks: offscreen clipped words_runs are culled and prewarmed via glyphs_ahead" {
+  let ahead_total = ref_new(0)
+  let scroll = view::Scroll::new()
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.scrolls(scroll, fn(inner : view::View) {
+        let _ = inner.width(view::Live::Is(Some(320.0))).height(view::Live::Is(Some(800.0))).clips(view::Live::Is(true))
+        let mut i = 0
+        while i < 20 {
+          let y = i.to_double() * 40.0
+          let _ = inner.box(fn(row : view::View) {
+            let _ = row.over(view::Live::Is(true)).offset(view::Live::Is((0.0, y))).width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(40.0)))
+            let _ = row.words_runs(view::Live::Is([text::plain("PrewarmRow-" + i.to_string())]))
+          })
+          i += 1
+        }
+      })
+    },
+    width=320.0,
+    height=120.0,
+  )
+  let h = hostapi::host()
+  let orig_able = h.glyphs_ahead_able
+  let orig_ahead = h.glyphs_ahead
+  h.glyphs_ahead_able = fn() -> Bool { true }
+  h.glyphs_ahead = fn(_keys : FixedArray[Int], n : Int) -> Unit {
+    ahead_total.v = ahead_total.v + n
+  }
+  reset_glyph_atlas()
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let top_ninst = view_app.scene.ninst
+  debug_assert(ahead_total.v > 0, "expected offscreen words_runs to trigger glyphs_ahead prewarm")
+  scroll.put(400.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let bot_ninst = view_app.scene.ninst
+  debug_assert(top_ninst < 120 && bot_ninst > 0, "clipped offscreen rows should stay culled (top=\{top_ninst}, bot=\{bot_ninst})")
+  h.glyphs_ahead_able = orig_able
+  h.glyphs_ahead = orig_ahead
+  t.dispose()
+}
