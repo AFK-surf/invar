@@ -4,6 +4,7 @@
 // Metal texture the renderer draws.
 #import "apple.h"
 #include "raw_premul.h"
+#include "cr_mips.h"
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <TargetConditionals.h>
@@ -60,12 +61,46 @@ static CGContextRef rgba_context(int w, int h, void **px) {
   return ctx;
 }
 
+// Upload level 0 and its separable Catmull-Rom mip chain into a mipmapped Metal texture.
+static void upload_mips_cr(id<MTLTexture> tex, const uint8_t *base, int w, int h, int opaque) {
+  [tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
+         mipmapLevel:0
+           withBytes:base
+         bytesPerRow:(NSUInteger)w * 4];
+  NSUInteger levels = tex.mipmapLevelCount;
+  if (levels <= 1) return;
+  int mw = w, mh = h;
+  int half_w = w > 1 ? (w >> 1) : 1;
+  uint8_t *tmp = (uint8_t *)malloc((size_t)half_w * (size_t)h * 4u);
+  uint8_t *cur = NULL;
+  const uint8_t *prev = base;
+  if (tmp) {
+    for (NSUInteger lv = 1; lv < levels; lv++) {
+      int nw = mw > 1 ? (mw >> 1) : 1;
+      int nh = mh > 1 ? (mh >> 1) : 1;
+      uint8_t *dst = (uint8_t *)malloc((size_t)nw * (size_t)nh * 4u);
+      if (!dst) break;
+      mb_cr_mip_step(prev, mw, mh, dst, tmp, opaque);
+      [tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)nw, (NSUInteger)nh)
+             mipmapLevel:lv
+               withBytes:dst
+             bytesPerRow:(NSUInteger)nw * 4];
+      free(cur);
+      cur = dst;
+      prev = dst;
+      mw = nw;
+      mh = nh;
+    }
+  }
+  free(cur);
+  free(tmp);
+}
+
 // The bitmap drawn (rgba_context's pixels, freed here) as the image's
 // texture: the image ready.
 static void finish_rgba(int iid, void *px, int w, int h, int ow, int oh) {
-  size_t bpr = (size_t)w * 4;
   MTLTextureDescriptor *td = [MTLTextureDescriptor
-      texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:YES];
   td.usage = MTLTextureUsageShaderRead;
   id<MTLTexture> tex = [mb_render_device() newTextureWithDescriptor:td];
   if (!tex) {
@@ -73,7 +108,7 @@ static void finish_rgba(int iid, void *px, int w, int h, int ow, int oh) {
     finish(iid, -1, 0, 0, 0, 0, nil);
     return;
   }
-  [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:bpr];
+  upload_mips_cr(tex, (const uint8_t *)px, w, h, 0);
   free(px);
   finish(iid, 1, w, h, ow, oh, tex);
 }
@@ -93,11 +128,13 @@ static void decode(int iid, CGImageSourceRef src, int max_px) {
     if (orient >= 5 && orient <= 8) { int t = ow; ow = oh; oh = t; }
     CFRelease(props);
   }
+  int big = ow > oh ? ow : oh;
+  int req_max = (big > 0 && big <= 4096 && max_px > 0 && big <= max_px * 2) ? big : max_px;
   NSDictionary *opt = @{
     (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
     (id)kCGImageSourceCreateThumbnailWithTransform : @YES,
     (id)kCGImageSourceShouldCacheImmediately : @YES,
-    (id)kCGImageSourceThumbnailMaxPixelSize : @(max_px),
+    (id)kCGImageSourceThumbnailMaxPixelSize : @(req_max),
   };
   CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, (__bridge CFDictionaryRef)opt);
   CFRelease(src);
@@ -224,17 +261,14 @@ static BOOL decode_raw_premul(int iid, const uint8_t *d, size_t n, int max_px) {
   mb_raw_premul_target_size(w, h, max_px, device_max, &tw, &th);
   if (tw == w && th == h) {
     MTLTextureDescriptor *td = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:(NSUInteger)w height:(NSUInteger)h mipmapped:NO];
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:(NSUInteger)w height:(NSUInteger)h mipmapped:YES];
     td.usage = MTLTextureUsageShaderRead;
     id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
     if (!tex) {
       finish(iid, -1, 0, 0, 0, 0, nil);
       return YES;
     }
-    [tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
-           mipmapLevel:0
-             withBytes:d + MB_RAW_PREMUL_HEADER_BYTES
-           bytesPerRow:(NSUInteger)w * 4];
+    upload_mips_cr(tex, d + MB_RAW_PREMUL_HEADER_BYTES, w, h, 0);
     finish(iid, 1, w, h, w, h, tex);
     return YES;
   }
@@ -267,17 +301,14 @@ static BOOL decode_raw_bgra(int iid, const uint8_t *d, size_t n, int max_px) {
   if ((max_px > 0 && max_px < rbig && (rbig > 4096 || rbig > max_px * 2)) || off > n || (size_t)rw * rh * 4 > n - off)
     return NO;
   MTLTextureDescriptor *td = [MTLTextureDescriptor
-      texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:(NSUInteger)rw height:(NSUInteger)rh mipmapped:NO];
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:(NSUInteger)rw height:(NSUInteger)rh mipmapped:YES];
   td.usage = MTLTextureUsageShaderRead;
   id<MTLTexture> tex = [mb_render_device() newTextureWithDescriptor:td];
   if (!tex) {
     finish(iid, -1, 0, 0, 0, 0, nil);
     return YES;
   }
-  [tex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)rw, (NSUInteger)rh)
-         mipmapLevel:0
-           withBytes:d + off
-         bytesPerRow:(NSUInteger)rw * 4];
+  upload_mips_cr(tex, d + off, rw, rh, 1);
   finish(iid, 1, rw, rh, rw, rh, tex);
   return YES;
 }

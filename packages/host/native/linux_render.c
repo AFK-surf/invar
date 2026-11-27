@@ -46,6 +46,11 @@ static GLuint image_tex(int id) {
 
 static void view_parts_in(int tid, int32_t start, int32_t end) { (void)tid, (void)start, (void)end; }
 
+#define MB_IMAGE_MIPS_DEFINED 1
+static int image_mips(int id) {
+  return (id > 0 && id <= MB_STREAM_TEX) ? mb_image_mips(id) : 1;
+}
+
 #include "gles_render.h"
 
 // ---- the glyphs put in the atlases (linux_text.c), uploaded as the next frame is drawn ----

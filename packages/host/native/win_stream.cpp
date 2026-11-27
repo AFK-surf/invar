@@ -374,8 +374,8 @@ static HRESULT shared_nv12(int w, int h, ID3D11Texture2D **dtex, ID3D11Texture2D
 // The decoders' device on the renderer's adapter, its fences, and a texture shared from it tried (decoding, above):
 // none of it (ddev NULL) where any of that fails, or MBUI_SAME_VIDEO_DEVICE says so.
 static void decoding_device(ID3D11Device *dev, ID3D11DeviceContext *ctx) {
-  const char *same = getenv("MBUI_SAME_VIDEO_DEVICE");
-  if (same && *same && *same != '0') return;
+  const wchar_t *same = mb_win_env(L"MBUI_SAME_VIDEO_DEVICE");
+  if (same && *same && *same != L'0') return;
   IDXGIDevice *xdev = NULL;
   IDXGIAdapter *adapter = NULL;
   ID3D11Device5 *dev5 = NULL, *ddev5 = NULL;
@@ -427,8 +427,8 @@ static int video_here(void) {
   // (no device yet: asked again later)
   if (!dev || !ctx) return 0;
   video_state = -1;
-  const char *no = getenv("MBUI_NO_VIDEO_GPU");
-  if (no && *no && *no != '0') return 0;
+  const wchar_t *no = mb_win_env(L"MBUI_NO_VIDEO_GPU");
+  if (no && *no && *no != L'0') return 0;
   ID3D10Multithread *mt = NULL;
   UINT token = 0;
   if (FAILED(dev->QueryInterface(IID_PPV_ARGS(&vdev))) || FAILED(ctx->QueryInterface(IID_PPV_ARGS(&vctx))) ||
@@ -1389,8 +1389,8 @@ static int h265_decoder_here(void) {
 static int av1_decoder_here(void) {
   static int here = -1;
   if (here >= 0) return here;
-  const char *no = getenv("MBUI_NO_AV1");
-  if (no && *no && *no != '0') {
+  const wchar_t *no = mb_win_env(L"MBUI_NO_AV1");
+  if (no && *no && *no != L'0') {
     fprintf(stdout, "win: streams: AV1 not decoded here (MBUI_NO_AV1)\n");
     fflush(stdout);
     return here = 0;
@@ -2423,8 +2423,8 @@ int mb_stream_grab(int id, mb_stream_grabbed_fn done, void *arg) {
 
 // Sound plays here unless a run says not to (MBUI_STREAM_AUDIO=0, to compare).
 int32_t mb_host_stream_audio_here(void) {
-  const char *v = getenv("MBUI_STREAM_AUDIO");
-  return v && strcmp(v, "0") == 0 ? 0 : 1;
+  const wchar_t *v = mb_win_env(L"MBUI_STREAM_AUDIO");
+  return v && wcscmp(v, L"0") == 0 ? 0 : 1;
 }
 
 void mb_host_stream_audio(int32_t id, moonbit_bytes_t data) {

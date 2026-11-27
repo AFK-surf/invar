@@ -15,10 +15,11 @@
 #include <string.h>
 #include "linux.h"
 #include "raw_premul.h"
+#include "cr_mips.h"
 
 typedef struct {
   int state;  // 0 decoding, 1 ready, -1 failed or freed
-  int w, h, ow, oh;
+  int w, h, ow, oh, mips;
   GLuint tex;
   uint8_t *px;  // decoded, its texture not made yet (premultiplied RGBA, w × h)
   int untold;   // decoded (or failed), not yet told to the app (mb_images_tell)
@@ -60,7 +61,8 @@ static void size_prepared(GdkPixbufLoader *l, int w, int h, gpointer data) {
   sizing *s = data;
   s->sw = w;
   s->sh = h;
-  double k = fmin(1.0, s->max_px / (double)(w > h ? w : h));
+  int big = w > h ? w : h;
+  double k = (big <= 4096 && s->max_px > 0 && big <= s->max_px * 2) ? 1.0 : fmin(1.0, s->max_px / (double)big);
   if (k < 1) {
     int tw = (int)lround(w * k), th = (int)lround(h * k);
     gdk_pixbuf_loader_set_size(l, tw > 0 ? tw : 1, th > 0 ? th : 1);
@@ -288,12 +290,11 @@ static void tex_gone(GLuint t) {
   gone_texs[n_gone++] = t;
 }
 
-static GLuint make_tex(const uint8_t *px, int w, int h) {
+static GLuint make_tex(const uint8_t *px, int w, int h, int *out_mips) {
   for (int i = 0; i < 8 && glGetError() != GL_NO_ERROR; i++) {}
   GLuint t = 0;
   glGenTextures(1, &t);
   glBindTexture(GL_TEXTURE_2D, t);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -301,8 +302,44 @@ static GLuint make_tex(const uint8_t *px, int w, int h) {
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
   if (glGetError() != GL_NO_ERROR) {
     glDeleteTextures(1, &t);
+    if (out_mips) *out_mips = 1;
     return 0;
   }
+  int mips = mb_cr_mip_count(w, h);
+  int built = 1;
+  if (mips > 1) {
+    int mw = w, mh = h;
+    int half_w = w > 1 ? (w >> 1) : 1;
+    uint8_t *tmp = malloc((size_t)half_w * (size_t)h * 4u);
+    uint8_t *cur = NULL;
+    const uint8_t *prev = px;
+    if (tmp) {
+      for (int lv = 1; lv < mips; lv++) {
+        int nw = mw > 1 ? (mw >> 1) : 1;
+        int nh = mh > 1 ? (mh >> 1) : 1;
+        uint8_t *dst = malloc((size_t)nw * (size_t)nh * 4u);
+        if (!dst) break;
+        mb_cr_mip_step(prev, mw, mh, dst, tmp, 0);
+        glTexImage2D(GL_TEXTURE_2D, lv, GL_RGBA8, nw, nh, 0, GL_RGBA, GL_UNSIGNED_BYTE, dst);
+        if (glGetError() != GL_NO_ERROR) {
+          free(dst);
+          break;
+        }
+        free(cur);
+        cur = dst;
+        prev = dst;
+        mw = nw;
+        mh = nh;
+        built = lv + 1;
+      }
+    }
+    free(cur);
+    free(tmp);
+  }
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, built - 1);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, built > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_LINEAR);
+  if (out_mips) *out_mips = built;
   return t;
 }
 
@@ -365,7 +402,8 @@ void mb_images_upload(void) {
         px = NULL;
       }
     }
-    GLuint t = px ? make_tex(px, w, h) : 0;
+    int mips = 1;
+    GLuint t = px ? make_tex(px, w, h, &mips) : 0;
     free(px);
     g_mutex_lock(&lock);
     if (imgs[id].state == 0) {
@@ -375,6 +413,7 @@ void mb_images_upload(void) {
           imgs[id].h = h;
         }
         imgs[id].tex = t;
+        imgs[id].mips = mips;
         imgs[id].state = 1;
         imgs[id].untold = !imgs[id].told;
         t = 0;
@@ -403,6 +442,11 @@ void mb_images_tell(mb_outside_fn f) {
 unsigned mb_image_tex(int id) {
   if (id <= 0 || id >= nimgs) return 0;
   return imgs[id].state == 1 ? imgs[id].tex : 0;
+}
+
+int mb_image_mips(int id) {
+  if (id <= 0 || id >= nimgs) return 1;
+  return imgs[id].state == 1 && imgs[id].mips > 0 ? imgs[id].mips : 1;
 }
 
 // A new context: every ready one decoded again (its texture made as it comes), told the app again as it is (what draws
