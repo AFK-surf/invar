@@ -83,6 +83,7 @@ REQUIRED_SYMS=(
   _mb_host_layer_render
   _mb_host_layer_destroy
   _mb_host_wake_now
+  _mb_text_flush_ahead
   _mb_host_wake_now_ptr
   _invar_hostapi_set_native_wake
   _invar_hostapi_call_native_wake
