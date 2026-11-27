@@ -2,7 +2,10 @@
 // thread queue their other quarter-pixel phases once, as one batch at the frame's end (mb_text_flush_ahead), drawn
 // byte-identical to the frames' thread; a phase a queue is still drawing is drawn here at once rather than waited for
 // (the skip mask), its queue's picture dropped and its entry reclaimed; a scale change mid-frame forgets what was
-// pending; and frames racing the queues neither stall nor crash.
+// pending; and frames racing the queues neither stall nor crash. And shape_line's fast paths (single-unit clusters,
+// carets taken from the shaped glyphs, the nominal ASCII advances) held to the line Core Text shapes: every cluster,
+// advance (< 1e-6) and key the same as its unoptimized reference's (shape_parity), the nominal advances forgotten
+// as a face changes (ascii_nominal).
 //   cc -Wall -Werror -fobjc-arc -Ipackages/host/compat -Ipackages/host/native packages/host/tests/apple_text_test.m \
 //     -framework Foundation -framework AppKit -framework CoreText -framework CoreGraphics -framework ImageIO \
 //     -o target/apple_text_test && target/apple_text_test
@@ -59,6 +62,16 @@ static int key_of(NSString *c, double size, int style) {
   double out[4 * 8];
   int k = shape(c, size, style, out, 8);
   return k > 0 ? (int)out[3] : -1;
+}
+
+// Face `face` set in the installed family `family` (as mb_host_face_add_family is called); whether it was found.
+// (the name in a string laid out as the host's strings are: its length in the header just before its characters)
+static int face_family(int face, NSString *family) {
+  uint32_t mem[2 + 64] = {0};
+  NSUInteger n = family.length < 128 ? family.length : 128;
+  mem[0] = (uint32_t)n;
+  [family getCharacters:(unichar *)(mem + 2) range:NSMakeRange(0, n)];
+  return mb_host_face_add_family(face, (moonbit_string_t)(mem + 2));
 }
 
 static void drain_ahead_queues(void) {
@@ -270,6 +283,265 @@ static void racing(void) {
   printf("racing: ok\n");
 }
 
+// shape_line as it was before its fast paths (the reference: each cluster found by
+// rangeOfComposedCharacterSequenceAtIndex, each caret asked of CTLineGetOffsetForStringIndex, every key interned
+// from its string), which shape_line must match to within 1e-6 on every string, style and weight below.
+static double ref_offset_at(CTLineRef line, NSString *s, NSUInteger len, NSUInteger i) {
+  while (i < len && takes_no_room([s characterAtIndex:i])) i++;
+  return CTLineGetOffsetForStringIndex(line, (CFIndex)i, NULL);
+}
+
+static int32_t shape_line_ref(const unichar *text, int32_t len, double size, int32_t weight, int32_t style,
+                              double *out, int32_t cap) {
+  NSString *s = [[NSString alloc] initWithCharacters:text length:(NSUInteger)len];
+  CTFontRef f = font_for(size, weight, style);
+  CTLineRef line = make_line(s, f, style);
+  uint8_t *from = calloc((size_t)len + 1, 1);
+  int any_rtl = 0;
+  double *glyph_adv = calloc((size_t)len + 1, sizeof(double));
+  double *glyph_x = malloc(sizeof(double) * ((size_t)len + 1));
+  for (int32_t j = 0; j <= len; j++) glyph_x[j] = NAN;
+  CFArrayRef runs = CTLineGetGlyphRuns(line);
+  for (CFIndex r = 0; r < CFArrayGetCount(runs); r++) {
+    CTRunRef run = CFArrayGetValueAtIndex(runs, r);
+    CFIndex gc = CTRunGetGlyphCount(run);
+    CFIndex *idx = malloc(sizeof(CFIndex) * (size_t)(gc > 0 ? gc : 1));
+    CGPoint *pos = malloc(sizeof(CGPoint) * (size_t)(gc > 0 ? gc : 1));
+    CTRunGetStringIndices(run, CFRangeMake(0, 0), idx);
+    CTRunGetPositions(run, CFRangeMake(0, 0), pos);
+    double w = CTRunGetTypographicBounds(run, CFRangeMake(0, 0), NULL, NULL, NULL);
+    if (CTRunGetStatus(run) & kCTRunStatusRightToLeft) any_rtl = 1;
+    for (CFIndex g = 0; g < gc; g++) {
+      if (idx[g] < 0 || idx[g] >= len) continue;
+      from[idx[g]] = 1;
+      if (isnan(glyph_x[idx[g]]) || pos[g].x < glyph_x[idx[g]]) glyph_x[idx[g]] = pos[g].x;
+      double next = g + 1 < gc ? pos[g + 1].x : pos[0].x + w;
+      glyph_adv[idx[g]] += next - pos[g].x;
+    }
+    free(idx);
+    free(pos);
+  }
+  int32_t k = 0;
+  NSUInteger i = 0;
+  double x0 = ref_offset_at(line, s, (NSUInteger)len, 0);
+  while (i < (NSUInteger)len && k < cap) {
+    NSRange r = [s rangeOfComposedCharacterSequenceAtIndex:i];
+    unichar c = [s characterAtIndex:r.location];
+    if (r.location != i) x0 = ref_offset_at(line, s, (NSUInteger)len, r.location);
+    double start_x = x0;
+    double x1 = ref_offset_at(line, s, (NSUInteger)len, r.location + r.length);
+    double adv = x1 - x0;
+    x0 = x1;
+    if (any_rtl) {
+      adv = 0;
+      for (NSUInteger j = r.location; j < r.location + r.length; j++) adv += glyph_adv[j];
+    }
+    int key;
+    if (c == '\n') {
+      adv = 0;
+      key = -1;
+    } else if (c == ' ' || c == '\t') {
+      key = -1;
+    } else {
+      int drawn = 0;
+      for (NSUInteger j = r.location; j < r.location + r.length; j++) drawn |= from[j];
+      double gx = NAN;
+      for (NSUInteger j = r.location; j < r.location + r.length; j++)
+        if (!isnan(glyph_x[j]) && (isnan(gx) || glyph_x[j] < gx)) gx = glyph_x[j];
+      double dx = any_rtl || isnan(gx) ? 0 : gx - start_x;
+      if (fabs(dx) < 0.01) dx = 0;
+      BOOL after_wide = r.location > 0 && [s characterAtIndex:r.location - 1] >= 0x2E80;
+      if (!drawn && k > 0)
+        key = -2;
+      else if (r.length == 1 && c < 128 && (dx == 0 || !after_wide))
+        key = intern([s substringWithRange:r], size, weight, style);
+      else
+        key = intern_at([s substringWithRange:r], size, weight, style, dx);
+    }
+    out[k * 4] = r.location;
+    out[k * 4 + 1] = r.length;
+    out[k * 4 + 2] = adv < 0 ? 0 : adv;
+    out[k * 4 + 3] = key;
+    k++;
+    i = r.location + r.length;
+  }
+  free(from);
+  free(glyph_adv);
+  free(glyph_x);
+  CFRelease(line);
+  return k;
+}
+
+// The strings shape_line is held to its reference on: Latin with kerned pairs and ligatures, digits, code, CJK with
+// its punctuation squeezed and auto-spaced against Latin, kana, Hangul, emoji sequences, combining marks, characters
+// that take no room, right-to-left and mixed lines, tabs and newlines.
+static NSArray<NSString *> *parity_corpus(void) {
+  static NSArray<NSString *> *corpus;
+  if (!corpus) corpus = @[
+    @"",
+    @"a",
+    @" ",
+    @"\n",
+    @"\t",
+    @"Hello, world!",
+    @"AVATAR WAVE To The Office official offline difficult",
+    @"fi fl ffi ffl ff fj",
+    @"0123456789 1111 8888 0:01 40:08",
+    @"The quick brown fox jumps over the lazy dog.",
+    @"const x = foo(bar, 123); // comment: a->b != c",
+    @"https://example.com/path/to/file.m?a=1&b=2#L123",
+    @"纯中文段落测试，不包含任何英文字符与数字。",
+    @"汉字连续排版测量性能基准测试中文汉字简体繁体漢字",
+    @"你是Owner，我在macOS 27上测试中英混排自动间距！",
+    @"中文English中文123中文ABC中文",
+    @"你好World世界Hello测试Test2026年11月22日",
+    @"「（中文括号挤压测试）」，《书名号》【方括号】！？：；、。",
+    @"“引号”‘单引号’——破折号……省略号·中点",
+    @"（测试）、「测试」、『测试』、【测试】、《测试》",
+    @"ＡＢＣ１２３！＠＃￥％……＆＊（）",
+    @"日本語のひらがなとカタカナと漢字の混在テストです。",
+    @"いろはにほへとちりぬるを カタカナ・ヴ・ヵ・ヶ",
+    @"한국어 테스트입니다. 한글과 English 123 혼용.",
+    @"完成任务 ✅ 下一步 → 延迟 ≤ 16ms 🎉 汉字缓存命中测试",
+    @"👩🏽‍💻 👪 ❤️ 🏳️‍🌈 👍🏻 🧑‍🤝‍🧑",
+    @"emoji💡中间穿插中文and English🚀",
+    @"e\u0301 cafe\u0301 a\u0308 o\u0302 n\u0303",
+    @"Z\u0300\u0301\u0302\u0303 combining stack",
+    @"中文\u0301组合音标测试",
+    @"zero\u200Bwidth\u200Cjoiner\u200Dword\u2060bom\uFEFFend",
+    @"trailing zero width\u200B",
+    @"\u200Bleading zero width",
+    @"@[mention\u200B]\u200B",
+    @"العربية مرحبا بالعالم",
+    @"שלום עולם 123",
+    @"Mixed العربية and English and 中文 together",
+    @"RTL שלום + LTR hello + 数字 42",
+    @"line1\nline2\n\nline4",
+    @"col1\tcol2\tcol3\t中文\t123",
+    @"CRLF\r\nline\r\nend",
+    @"¥100 §1 20° ±0.5 · × ÷ – — ‘a’ “b” • … ‰ ′ ″ € ℃",
+    @"αβγδε ΑΒΓΔΕ π ≈ 3.14159 ∑ ∫ √ ∞ ≠ ≤ ≥",
+    @"Кириллица привет мир 12345",
+    @"Tiếng Việt có dấu phức tạp hơn",
+    @"ภาษาไทยทดสอบการตัดคำ",
+    @"हिन्दी देवनागरी परीक्षण",
+    @"fail ail hover ver AV To We",
+    @"Hello…",
+    @"中文 Hello…",
+    @"真机性能剖析显示 tree words measured 是当前双端最大的 CPU 卡顿源。",
+    @"perf(host): reduce Apple & Android text shaping hotpath overhead (500 rounds).",
+    @"# Heading\n## 二级标题\n- 列表项 1: `code_span` 与 **粗体**",
+    @"   leading and trailing spaces   ",
+    @"\t\t\n\n  "
+  ];
+  return corpus;
+}
+
+// shape_line against shape_line_ref on every string of parity_corpus in each of `styles` and `weights` at 15pt: the
+// same clusters, advances within 1e-6, the same keys (or keys of the same cluster and dx); how many strings matched.
+static int parity_over(const int *styles, int n_styles, const int *weights, int n_weights, const char *what) {
+  int checked = 0;
+  double got[4 * 512], want[4 * 512];
+  for (int si = 0; si < n_styles; si++) {
+    for (int wi = 0; wi < n_weights; wi++) {
+      int st = styles[si], wt = weights[wi];
+      for (NSString *s in parity_corpus()) {
+        unichar buf[512];
+        NSUInteger n = s.length < 512 ? s.length : 512;
+        [s getCharacters:buf range:NSMakeRange(0, n)];
+        int32_t k_ref = shape_line_ref(buf, (int32_t)n, 15.0, wt, st, want, 512);
+        int32_t k_got = shape_line((moonbit_string_t)buf, (int32_t)n, 15.0, wt, st, got, 512);
+        CHECK(k_got == k_ref, "%s: cluster count mismatch (%d != %d) style=%d weight=%d in \"%s\"", what, k_got,
+              k_ref, st, wt, s.UTF8String);
+        if (k_got != k_ref) continue;
+        BOOL ok = YES;
+        for (int32_t c = 0; c < k_ref; c++) {
+          BOOL range_ok = got[c * 4] == want[c * 4] && got[c * 4 + 1] == want[c * 4 + 1];
+          CHECK(range_ok, "%s: range mismatch at %d style=%d weight=%d in \"%s\"", what, c, st, wt, s.UTF8String);
+          double derr = fabs(got[c * 4 + 2] - want[c * 4 + 2]);
+          CHECK(derr < 1e-6, "%s: adv mismatch at %d (%.6f != %.6f, err=%.6f) style=%d weight=%d in \"%s\"", what, c,
+                got[c * 4 + 2], want[c * 4 + 2], derr, st, wt, s.UTF8String);
+          int gk = (int)got[c * 4 + 3], wk = (int)want[c * 4 + 3];
+          BOOL key_ok = gk == wk || (gk >= 0 && wk >= 0 && [texts[gk] isEqualToString:texts[wk]]
+                                     && fabs(entries[gk].dx - entries[wk].dx) < 1e-6);
+          CHECK(key_ok, "%s: key mismatch at %d (%d != %d) style=%d weight=%d in \"%s\"", what, c, gk, wk, st, wt,
+                s.UTF8String);
+          ok = ok && range_ok && derr < 1e-6 && key_ok;
+        }
+        if (ok) checked++;
+      }
+    }
+  }
+  return checked;
+}
+
+// Every string of the corpus in the system face, each style (slanted, code, serif, no ligatures, tabular, proportional)
+// at two weights: shape_line's clusters, advances and keys are its reference's.
+static void shape_parity(void) {
+  static const int styles[] = {0, 1, 2, 4, 8, 32, 64};
+  static const int weights[] = {400, 700};
+  int total = (int)(sizeof(styles) / sizeof(styles[0]) * sizeof(weights) / sizeof(weights[0])) * (int)parity_corpus().count;
+  int checked = parity_over(styles, 7, weights, 2, "system");
+  CHECK(checked == total, "%d of %d cases matched", checked, total);
+  printf("shape_parity: %d cases matched reference (< 1e-6)\n", checked);
+}
+
+static double nominal_advance(CTFontRef f, unichar c) {
+  CGGlyph g = 0;
+  CGSize adv = CGSizeZero;
+  if (!CTFontGetGlyphsForCharacters(f, &c, &g, 1) || g == 0) return NAN;
+  CTFontGetAdvancesForGlyphs(f, kCTFontOrientationHorizontal, &g, &adv, 1);
+  return adv.width;
+}
+
+// The nominal ASCII advances (bmp_ascii_nom): measured once per font where the unkerned ASCII path may be taken (not
+// in the code face, nor with tabular or proportional figures), equal to the font's own; Latin runs in the primary font
+// tagged for it; forgotten the moment a face changes (before keys_sweep), measured again in the new face, where
+// shape_line still matches its reference; and the paged keys let go at keys_sweep.
+static void ascii_nominal(void) {
+  mb_host_atlas_generation();
+  double out[4 * 64];
+  shape(@"Hello, world", 15, 0, out, 64);
+  bmp_keys *bk = bmp_for(15, 400, 0);
+  CHECK(bk->ascii_nom_ready, "nominal advances not measured");
+  CTFontRef sys = font_for(15, 400, 0);
+  for (unichar c = 0x20; c <= 0x7E; c++) {
+    double want = nominal_advance(sys, c);
+    CHECK((isnan(want) && isnan(bk->ascii_nom[c])) || bk->ascii_nom[c] == want, "nominal advance of '%c': %f != %f",
+          (char)c, bk->ascii_nom[c], want);
+  }
+  CHECK(isnan(bk->ascii_nom[0x1F]) && isnan(bk->ascii_nom[0x7F]), "nominal advance outside printable ASCII");
+  CHECK(shape_simple[0] >= 2 && shape_simple[0] == shape_simple[4], "Latin run in the primary font not tagged: %d %d",
+        shape_simple[0], shape_simple[4]);
+  shape(@"国国国", 15, 0, out, 64);
+  CHECK(shape_simple[0] == 1, "a Han run tagged for the ASCII path: %d", shape_simple[0]);
+  static const int skipped[] = {2, 32, 64};
+  for (int i = 0; i < 3; i++) {
+    shape(@"Hello, world", 15, skipped[i], out, 64);
+    CHECK(!bmp_for(15, 400, skipped[i])->ascii_nom_ready, "nominal advances measured in style %d", skipped[i]);
+  }
+  double sys_w = bmp_for(15, 400, 0)->ascii_nom['W'];
+  CHECK(face_family(1, @"Times New Roman") || face_family(1, @"Helvetica"), "no face for slot 1");
+  for (int i = 0; i < n_bmp; i++) CHECK(!bmp_cache[i].ascii_nom_ready, "nominal advances kept as the face changed");
+  shape(@"Hello, world", 15, 0, out, 64);
+  bk = bmp_for(15, 400, 0);
+  CHECK(bk->ascii_nom_ready, "nominal advances not measured in the new face");
+  CHECK(bk->ascii_nom['W'] == nominal_advance(font_for(15, 400, 0), 'W') && bk->ascii_nom['W'] != sys_w,
+        "nominal advance of W in the new face: %f (system's %f)", bk->ascii_nom['W'], sys_w);
+  static const int styles[] = {0, 8};
+  static const int weights[] = {400, 700};
+  int total = 4 * (int)parity_corpus().count;
+  int checked = parity_over(styles, 2, weights, 2, "face");
+  CHECK(checked == total, "%d of %d cases matched in the given face", checked, total);
+  printf("shape_parity (given face): %d cases matched reference (< 1e-6)\n", checked);
+  mb_host_face_clear(1);
+  for (int i = 0; i < n_bmp; i++) CHECK(!bmp_cache[i].ascii_nom_ready, "nominal advances kept as the face was cleared");
+  CHECK(n_bmp > 0, "paged keys let go before keys_sweep");
+  mb_host_atlas_generation();
+  CHECK(n_bmp == 0 && bmp_cache == NULL && last_bmp == -1, "paged keys kept past keys_sweep: %d", n_bmp);
+  printf("ascii_nominal: ok\n");
+}
+
 static void stalled(int sig) {
   (void)sig;
   static const char msg[] = "apple_text_test: stalled (deadlock?)\n";
@@ -286,6 +558,8 @@ int main(void) {
     skip_mask();
     scale_change();
     racing();
+    shape_parity();
+    ascii_nominal();
   }
   if (failed) return 1;
   printf("apple_text_test: ok\n");
