@@ -905,6 +905,42 @@ function buildHtmlPage(programs) {
           'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, ghostDelta=0, lipDelta>=80, gate0=0, ngBar<130, ngGhost<=2, ngClean>220, dkTop/Bot<55, dkSide>=42, segSpan[35..37], ring>=225/track<=210');
       }
 
+      // V9-Tab-Zoom-Edge-Visible: Role 4 tab droplet at lensZoom=1.16 keeps the centre magnified while the
+      // outer band (inward < 0.22 * halfMinor) samples the backdrop unzoomed, so the bar boundary under the
+      // overhang stays fully visible (bit-identical to lensZoom=1.0 there).
+      {
+        const zBg = (x, y) => {
+          if (x >= 72 && x <= 76 && y >= 40 && y <= 60) return [20, 20, 24];
+          if (y >= 71.0 && y <= 72.0) return [20, 20, 24];
+          return [246, 244, 240];
+        };
+        const zGlass = (zoom) => ({ x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -(64 + zoom), rim: 1, bezel: 9, refract: 9, chroma: 0 });
+        const z0 = run2D(160, 100, 3, zBg, zGlass(0));
+        const z1 = run2D(160, 100, 3, zBg, zGlass(0.16));
+        // Outer band: bottom 5pt (y 70..75pt) and left 5pt (x 30..35pt) of the droplet.
+        let edgeDiff = 0;
+        const band = (x0, x1, y0, y1) => {
+          for (let py = y0; py < y1; py++) {
+            for (let px = x0; px < x1; px++) {
+              const a = z0.at(px, py), b = z1.at(px, py);
+              edgeDiff = Math.max(edgeDiff, Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]), Math.abs(a[2] - b[2]));
+            }
+          }
+        };
+        band(150, 300, 210, 225);
+        band(90, 105, 120, 180);
+        // Bar boundary still visible in the overhang under zoom.
+        let barMin = 255;
+        for (let py = 210; py < 220; py++) barMin = Math.min(barMin, z1.lumaAt(222, py));
+        // Centre stays magnified: dark stripe span along the centre row grows by ~1.16x.
+        const span = (img) => { let n = 0; for (let px = 180; px < 264; px++) if (img.lumaAt(px, 150) < 120) n++; return n; };
+        const s0 = span(z0), s1 = span(z1);
+        const zEdgeOk = edgeDiff === 0 && barMin < 120 && s1 > s0 && s1 >= Math.round(s0 * 1.08);
+        pushVec('V9-Tab-Zoom-Edge-Visible (role4 lensZoom=1.16: centre magnified, overhang unzoomed)', zEdgeOk,
+          [edgeDiff, Number(barMin.toFixed(1)), s0, s1],
+          'edgeDiff==0, barMin<120, span1>=1.08*span0');
+      }
+
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)
       {
         gl.uniform2f(u('u_glight'), 1.0, 0.0);
@@ -1476,7 +1512,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 14,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 15,
       passed,
       total: programs.length,
       drawPassed,
