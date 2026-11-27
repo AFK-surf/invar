@@ -1359,6 +1359,87 @@ function buildHtmlPage(programs) {
           [Number(r0.ink.toFixed(3)), Number(frostRes[1].ink.toFixed(3)), Number(rBack.ink.toFixed(3)), Number(r65.ink.toFixed(3)), Number(r65.glassR.toFixed(3)), Number(r95.ink.toFixed(3)), Number(r95.glassR.toFixed(3)), Number(r95.adTVal.toFixed(3))],
           'l0<0.25, frost ink<0.25 glass>0.56, lBack<0.25, full65 ink<0.25 glass>0.72, full95 snap t<=0.02 ink<0.25 glass>0.85');
 
+        // V14: adaptive glass over kind 9 native-view holes (AD_FS through bit in u_param.y, FS u_through fallback):
+        // a fully transparent hole (a == 0) composites over white before its luma, so Light glass keeps dark ink;
+        // an opaque black stage (a == 1) and a 70% black scrim over the hole (premultiplied, Porter-Duff over) still
+        // flip to dark glass + white ink; without the through bit the hole reads as black as before.
+        const runHoleCase = (rgba, through) => {
+          const bgBuf = new Uint8Array(W3 * H3 * 4);
+          for (let i = 0; i < W3 * H3 * 4; i += 4) { bgBuf[i] = rgba[0]; bgBuf[i + 1] = rgba[1]; bgBuf[i + 2] = rgba[2]; bgBuf[i + 3] = rgba[3]; }
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W3, H3, 0, gl.RGBA, gl.UNSIGNED_BYTE, bgBuf);
+          const cur = adC, nxt = 1 - cur;
+          gl.disable(gl.BLEND);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, adF[nxt]);
+          gl.viewport(0, 0, 16, 1);
+          gl.useProgram(adP);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.uniform1i(gl.getUniformLocation(adP, 'u_bd'), 0);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, adT[cur]);
+          gl.uniform1i(gl.getUniformLocation(adP, 'u_prev'), 1);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_box'), 200.0, 150.0, 160.0, 22.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), -103 / 255, 1.0 + (through ? 2.0 : 0.0), 1.0 / 60.0, 0.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          const adPx = new Uint8Array(4);
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, adPx);
+          const adTVal = (adPx[0] * 256 + adPx[1]) / 65535.0;
+          adC = nxt;
+          const inkLuma = (adN) => {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, W3, H3);
+            gl.disable(gl.BLEND);
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.useProgram(inkP);
+            const ui = (n) => gl.getUniformLocation(inkP, n);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, bdTex);
+            gl.activeTexture(gl.TEXTURE4);
+            gl.bindTexture(gl.TEXTURE_2D, adT[adC]);
+            gl.uniform1i(ui('u_bd'), 0);
+            gl.uniform1i(ui('u_ad'), 4);
+            gl.uniform1i(ui('u_ad_n'), adN);
+            gl.uniform1f(ui('u_through'), through ? 1.0 : 0.0);
+            gl.uniform4f(ui('u_ad_box[0]'), 200.0, 150.0, 160.0, 22.0);
+            gl.uniform2f(ui('u_vp'), wPt, hPt);
+            gl.uniform2f(ui('u_origin'), 0.0, 0.0);
+            gl.uniform1f(ui('u_scale'), S3);
+            gl.uniform1f(ui('u_top'), H3);
+            gl.uniform4f(ui('u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
+            gl.uniform4f(ui('u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
+            gl.vertexAttrib4f(0, 60.0, 140.0, 24.0, 20.0);
+            gl.vertexAttrib4f(1, 6.0, 10.0, 0.0, 0.0);
+            gl.vertexAttrib4f(2, 24 / 255, 24 / 255, 27 / 255, 1.0);
+            gl.vertexAttrib4f(3, 0.1, 0.5, 0.9, 0.5);
+            gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
+            gl.vertexAttrib4f(5, 0.0, 200.0, 150.0, 44.0);
+            gl.vertexAttrib4f(9, 6.0, 6.0, 6.0, 6.0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            const o = new Uint8Array(4);
+            gl.readPixels(Math.round(72 * S3), H3 - 1 - Math.round(150 * S3), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, o);
+            gl.uniform1f(ui('u_through'), 0.0);
+            return (0.2126 * o[0] + 0.7152 * o[1] + 0.0722 * o[2]) / 255.0;
+          };
+          return { adT: adTVal, inkSlot: inkLuma(1), inkFallback: inkLuma(0) };
+        };
+        const hHole = runHoleCase([0, 0, 0, 0], true);
+        const hLegacy = runHoleCase([0, 0, 0, 0], false);
+        const hStage = runHoleCase([0, 0, 0, 255], true);
+        const hScrim = runHoleCase([0, 0, 0, 179], true);
+        const v14Ok = hHole.adT <= 0.05 && hHole.inkSlot < 0.25 && hHole.inkFallback < 0.25 &&
+          hLegacy.adT >= 0.95 &&
+          hStage.adT >= 0.95 && hStage.inkSlot > 0.75 && hStage.inkFallback > 0.75 &&
+          hScrim.adT >= 0.95 && hScrim.inkSlot > 0.75 && hScrim.inkFallback > 0.75;
+        const r3 = (v) => Number(v.toFixed(3));
+        pushVec('V14 adaptive glass over kind 9 hole (through: dark ink; opaque stage & 70% scrim: white ink)', v14Ok,
+          [r3(hHole.adT), r3(hHole.inkSlot), r3(hHole.inkFallback), r3(hLegacy.adT), r3(hStage.adT), r3(hStage.inkSlot), r3(hStage.inkFallback), r3(hScrim.adT), r3(hScrim.inkSlot), r3(hScrim.inkFallback)],
+          'hole t<=0.05 ink<0.25 (slot & fallback), no-through hole t>=0.95, stage & scrim70 t>=0.95 ink>0.75 (slot & fallback)');
+
         gl.useProgram(prog);
         gl.uniform1i(u('u_ad_n'), 0);
         for (let i = 0; i < 2; i++) { gl.deleteFramebuffer(adF[i]); gl.deleteTexture(adT[i]); }
@@ -1376,7 +1457,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 13,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 14,
       passed,
       total: programs.length,
       drawPassed,
@@ -1491,7 +1572,7 @@ runCheck()
     if (JSON_MODE) {
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     } else {
-      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V13) — ${report.ok ? 'PASS' : 'FAIL'}`);
+      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V14) — ${report.ok ? 'PASS' : 'FAIL'}`);
       if (report.renderer) console.log(`  renderer: ${report.renderer}`);
       if (report.version) console.log(`  version : ${report.version}`);
       for (const r of report.results || []) {
