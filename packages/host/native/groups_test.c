@@ -264,6 +264,40 @@ static void test_clip(void) {
   forget();
 }
 
+// A rounded clip (0, 0)-(100, 100), its corners 26, cut to (-50, -50)-(150, `foot`): the corners at its foot, -1 where
+// the two differ.
+static double cut_foot_corner(double foot) {
+  double e[N] = {0};
+  e[18] = 100.0;
+  e[19] = 100.0;
+  for (int j = 24; j < 32; j++) e[j] = 26.0;
+  mb_group_inst_moved(e, 0, 0.0, 0.0, 0.0, 1, -50.0, -50.0, 150.0, foot);
+  CHECK(e[24] == 26.0 && e[25] == 26.0 && e[28] == 26.0 && e[29] == 26.0);
+  return e[26] == e[27] && e[26] == e[30] && e[26] == e[31] ? e[26] : -1.0;
+}
+
+static void test_clip_hair(void) {
+  // a cut by a hair (MB_CLIP_HAIR) or less keeps the corners round, one by more squares them
+  CHECK(cut_foot_corner(99.7) == 26.0);
+  CHECK(cut_foot_corner(99.5) == 26.0);
+  CHECK(cut_foot_corner(99.4) == 0.0);
+  CHECK(cut_foot_corner(98.0) == 0.0);
+  // the same through a header: a top cut by 0.3 keeps the top's corners, a left cut by 2 squares the left's
+  double g[N], m[1] = {0}, f[N];
+  inst_at(g, 0, 0, 0);
+  g[16] = 0, g[17] = 0, g[18] = 100, g[19] = 100;
+  for (int j = 24; j < 32; j++) g[j] = 26;
+  mb_host_group_set(6, g, m, 1);
+  head_at(f, 0, 0, 6, 0, 1);
+  f[16] = 2, f[17] = 0.3, f[18] = 1000, f[19] = 1000;
+  float o[N];
+  mb_groups_floats(o, f, 1);
+  CHECK(o[16] == 2 && o[17] == 0.3f && o[18] == 100 && o[19] == 100);
+  CHECK(o[24] == 0 && o[25] == 26 && o[26] == 26 && o[27] == 0);
+  CHECK(o[28] == 0 && o[29] == 26 && o[30] == 26 && o[31] == 0);
+  forget();
+}
+
 static void test_nested(void) {
   double row[2 * N], m[4] = {0, 0, 0, 0};
   inst_at(row, 1, 2, 0);
@@ -387,6 +421,7 @@ int main(void) {
   test_part();
   test_moves();
   test_clip();
+  test_clip_hair();
   test_nested();
   printf("groups_test: ok, %d checks\n", checks);
   return 0;
