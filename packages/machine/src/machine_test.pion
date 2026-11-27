@@ -1,0 +1,231 @@
+import "signals"
+
+// Async save machine demonstrating how `explore_bfs` catches stale out-of-order
+// save completions when sequence tokens are missing, and proves the fixed `#verify`
+// kernel exhaustively closed.
+
+#derive(Eq)
+struct EditorState {
+  draft : Int
+  saved : Int
+  latest_req : Int
+  saving : Bool
+}
+
+#derive(Eq)
+enum EditorMsg {
+  Edit(Int)
+  RequestSave
+  SaveDone(Int, Int) // (req_id, saved_val)
+  SaveFail(Int)
+}
+
+#derive(Eq)
+struct SaveCmd {
+  req_id : Int
+  payload : Int
+}
+
+fn buggy_step(st : EditorState, msg : EditorMsg) -> (EditorState, Array[SaveCmd]) {
+  match msg {
+    EditorMsg::Edit(v) => (EditorState::{ draft: v, saved: st.saved, latest_req: st.latest_req, saving: st.saving }, [])
+    EditorMsg::RequestSave => {
+      let req = st.latest_req + 1
+      (
+        EditorState::{ draft: st.draft, saved: st.saved, latest_req: req, saving: true },
+        [SaveCmd::{ req_id: req, payload: st.draft }],
+      )
+    }
+    // BUG: ignores req_id, so a stale slow save can overwrite a newer saved value!
+    EditorMsg::SaveDone(_req, v) => (
+      EditorState::{ draft: st.draft, saved: v, latest_req: st.latest_req, saving: false },
+      [],
+    )
+    EditorMsg::SaveFail(_req) => (
+      EditorState::{ draft: st.draft, saved: st.saved, latest_req: st.latest_req, saving: false },
+      [],
+    )
+  }
+}
+
+#verify
+fn safe_step(st : EditorState, msg : EditorMsg) -> (EditorState, Array[SaveCmd]) {
+  match msg {
+    EditorMsg::Edit(v) => (EditorState::{ draft: v, saved: st.saved, latest_req: st.latest_req, saving: st.saving }, [])
+    EditorMsg::RequestSave => {
+      let req = st.latest_req + 1
+      (
+        EditorState::{ draft: st.draft, saved: st.saved, latest_req: req, saving: true },
+        [SaveCmd::{ req_id: req, payload: st.draft }],
+      )
+    }
+    // FIX: discard stale responses whose req_id != latest_req
+    EditorMsg::SaveDone(req, v) => {
+      if req != st.latest_req {
+        (EditorState::{ draft: st.draft, saved: st.saved, latest_req: st.latest_req, saving: st.saving }, [])
+      } else {
+        (EditorState::{ draft: st.draft, saved: v, latest_req: st.latest_req, saving: false }, [])
+      }
+    }
+    EditorMsg::SaveFail(req) => {
+      if req != st.latest_req {
+        (EditorState::{ draft: st.draft, saved: st.saved, latest_req: st.latest_req, saving: st.saving }, [])
+      } else {
+        (EditorState::{ draft: st.draft, saved: st.saved, latest_req: st.latest_req, saving: false }, [])
+      }
+    }
+  }
+}
+
+test "explore_bfs finds shortest out-of-order async overwrite counterexample" {
+  let init = EditorState::{ draft: 0, saved: 0, latest_req: 0, saving: false }
+  let res = explore_bfs(
+    init,
+    buggy_step,
+    fn(st : EditorState) -> Array[EditorMsg] {
+      let out : Array[EditorMsg] = []
+      if st.draft < 2 {
+        out.push(EditorMsg::Edit(st.draft + 1))
+      }
+      if st.latest_req < 2 {
+        out.push(EditorMsg::RequestSave)
+      }
+      out
+    },
+    fn(cmd : SaveCmd) -> Array[EditorMsg] {
+      [EditorMsg::SaveDone(cmd.req_id, cmd.payload), EditorMsg::SaveFail(cmd.req_id)]
+    },
+    fn(_st : EditorState, _pending : Array[SaveCmd]) -> Option[String] { None },
+    transition_spec=fn(before : EditorState, _msg : EditorMsg, after : EditorState) -> Option[String] {
+      if after.saved < before.saved {
+        Some("stale save regressed saved version")
+      } else {
+        None
+      }
+    },
+    max_depth=6,
+    max_states=1000,
+  )
+  match res {
+    ExploreResult::Failed(reason, trace, _st) => {
+      debug_assert(reason == "stale save regressed saved version", "expected regression reason")
+      debug_assert(trace.length() == 5, "shortest counterexample: Save(0), Edit(1), Save(1), Done(2,1), Done(1,0)")
+    }
+    ExploreResult::Ok(_, _) => panic("expected explore_bfs to catch stale overwrite bug")
+  }
+}
+
+test "explore_bfs proves fixed #verify editor state space closed with zero violations" {
+  let init = EditorState::{ draft: 0, saved: 0, latest_req: 0, saving: false }
+  let res = explore_bfs(
+    init,
+    safe_step,
+    fn(st : EditorState) -> Array[EditorMsg] {
+      let out : Array[EditorMsg] = []
+      if st.draft < 2 {
+        out.push(EditorMsg::Edit(st.draft + 1))
+      }
+      if st.latest_req < 2 {
+        out.push(EditorMsg::RequestSave)
+      }
+      out
+    },
+    fn(cmd : SaveCmd) -> Array[EditorMsg] {
+      [EditorMsg::SaveDone(cmd.req_id, cmd.payload), EditorMsg::SaveFail(cmd.req_id)]
+    },
+    fn(st : EditorState, _pending : Array[SaveCmd]) -> Option[String] {
+      if st.saved > st.draft {
+        Some("saved exceeded draft")
+      } else {
+        None
+      }
+    },
+    transition_spec=fn(before : EditorState, _msg : EditorMsg, after : EditorState) -> Option[String] {
+      if after.saved < before.saved {
+        Some("saved regressed")
+      } else {
+        None
+      }
+    },
+    max_depth=10,
+    max_states=2000,
+  )
+  match res {
+    ExploreResult::Ok(visited, closed) => {
+      debug_assert(visited > 10 && closed, "bounded state space exhaustively verified and closed")
+    }
+    ExploreResult::Failed(reason, _, _) => panic("unexpected failure: " + reason)
+  }
+}
+
+test "RuntimeMachine projects state to ReadSignal and drains re-entrant replies FIFO" {
+  let observed : Array[Int] = []
+  let rm = RuntimeMachine::new(
+    EditorState::{ draft: 0, saved: 0, latest_req: 0, saving: false },
+    safe_step,
+    fn(cmd : SaveCmd, emit : (EditorMsg) -> Unit) -> Unit {
+      emit(EditorMsg::SaveDone(cmd.req_id, cmd.payload))
+    },
+  )
+  let saved_slice = rm.state().map(fn(s : EditorState) -> Int { s.saved })
+  let stop = signals::effect(fn() -> Unit {
+    observed.push(saved_slice.get())
+  })
+  rm.send(EditorMsg::Edit(42))
+  rm.send(EditorMsg::RequestSave)
+  debug_assert(rm.snapshot().saved == 42 && !rm.snapshot().saving, "saved updated via sync reply")
+  debug_assert(observed.length() == 2 && observed[0] == 0 && observed[1] == 42, "fine-grained slice projection notified only on saved change")
+  stop()
+}
+
+test "RuntimeMachine allows follow-up send from downstream effect after batch flush" {
+  let rm = RuntimeMachine::new(
+    EditorState::{ draft: 0, saved: 0, latest_req: 0, saving: false },
+    safe_step,
+    fn(cmd : SaveCmd, emit : (EditorMsg) -> Unit) -> Unit {
+      emit(EditorMsg::SaveDone(cmd.req_id, cmd.payload))
+    },
+  )
+  let auto_saved = [0]
+  let draft_slice = rm.state().map(fn(s : EditorState) -> Int { s.draft })
+  let stop = signals::effect(fn() -> Unit {
+    let d = draft_slice.get()
+    if d == 7 && auto_saved[0] == 0 {
+      auto_saved[0] = 1
+      rm.send(EditorMsg::RequestSave)
+    }
+  })
+  rm.send(EditorMsg::Edit(7))
+  debug_assert(rm.snapshot().saved == 7 && auto_saved[0] == 1, "effect-triggered follow-up send executed cleanly")
+  stop()
+}
+
+test "RuntimeMachine drains multiple synchronous command replies in strict FIFO order" {
+  let order : Array[Int] = []
+  let rm = RuntimeMachine::new(
+    EditorState::{ draft: 0, saved: 0, latest_req: 0, saving: false },
+    fn(st : EditorState, msg : EditorMsg) -> (EditorState, Array[SaveCmd]) {
+      match msg {
+        EditorMsg::Edit(v) => {
+          order.push(v)
+          (EditorState::{ draft: v, saved: st.saved, latest_req: st.latest_req, saving: st.saving }, [])
+        }
+        EditorMsg::RequestSave => (
+          st,
+          [SaveCmd::{ req_id: 1, payload: 10 }, SaveCmd::{ req_id: 2, payload: 20 }],
+        )
+        _ => (st, [])
+      }
+    },
+    fn(cmd : SaveCmd, emit : (EditorMsg) -> Unit) -> Unit {
+      emit(EditorMsg::Edit(cmd.payload))
+      emit(EditorMsg::Edit(cmd.payload + 1))
+    },
+  )
+  rm.send(EditorMsg::RequestSave)
+  debug_assert(
+    order.length() == 4 && order[0] == 10 && order[1] == 11 && order[2] == 20 && order[3] == 21,
+    "multi-reply synchronous emits drained strictly FIFO",
+  )
+  debug_assert(rm.snapshot().draft == 21, "final state reflects last FIFO reply")
+}

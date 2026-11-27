@@ -1,0 +1,91 @@
+test "causal ring disabled by default records nothing" {
+  let log = CausalRing::new(16)
+  debug_assert(!log.is_enabled(), "disabled by default")
+  let cid = log.with_fact(FactKind::Input, "btn:save", "press", fn(c : CauseId) -> CauseId {
+    let _ = log.record_consequence(ConsequenceKind::CommandIssued, "worker", "save")
+    c
+  })
+  debug_assert(cid.is_none(), "no cause allocated when disabled")
+  debug_assert(log.entries().length() == 0 && log.total_recorded() == 0.to_int64(), "zero entries when disabled")
+}
+
+test "causal ring attributes nested and cross-async consequences to root fact" {
+  let log = CausalRing::new(16)
+  log.enable()
+  let captured = log.with_fact(FactKind::Input, "composer", "press_send", at_ms=100.to_int64(), fn(cid : CauseId) -> CauseId {
+    debug_assert(log.current_cause() == cid, "active cause matches")
+    let _ = log.record_consequence(ConsequenceKind::StateChange, "composer", "mark_sending", at_ms=100.to_int64())
+    let _ = log.record_consequence(ConsequenceKind::CommandIssued, "worker", "send_msg", at_ms=101.to_int64())
+    cid
+  })
+  debug_assert(log.current_cause().is_none(), "cause stack popped after with_fact")
+
+  // Later frame: async worker reply restores captured CauseId
+  log.with_cause(captured, fn() -> Unit {
+    let _ = log.record_consequence(ConsequenceKind::StateChange, "chat_list", "append_msg", at_ms=145.to_int64())
+    let _ = log.record_consequence(ConsequenceKind::RenderFlush, "root", "frame_18", at_ms=150.to_int64())
+  })
+
+  let chain = log.get_chain(captured.seq)
+  debug_assert(chain.length() == 5, "root fact + 4 consequences")
+  debug_assert(chain[0].caused_by.is_none() && chain[0].kind == "input", "root is input fact")
+  debug_assert(chain[4].caused_by == Some(captured.seq) && chain[4].label == "frame_18", "cross-async attribution")
+
+  let timeline = log.format_timeline()
+  debug_assert(timeline.contains("#1 [input] composer press_send"), "timeline root")
+  debug_assert(timeline.contains("caused_by=#1"), "timeline consequence link")
+
+  let json = log.to_json()
+  debug_assert(json.contains("\"wire\":1") && json.contains("\"caused_by\":1"), "json wire output")
+}
+
+test "causal ring json escapes quotes, backslashes, control chars and preserves UTF-8" {
+  let log = CausalRing::new(8)
+  log.enable()
+  let _ = log.with_fact(FactKind::Input, "btn/\"save\"\\1", "点击\n\t\r\u{0000}\u{001f}保存", fn(c : CauseId) -> CauseId { c })
+  let json = log.to_json()
+  debug_assert(json.contains("btn/\\\"save\\\"\\\\1"), "quotes and backslashes escaped")
+  debug_assert(json.contains("点击\\n\\t\\r\\u0000\\u001f保存"), "control chars RFC 8259 escaped and UTF-8 preserved")
+}
+
+test "causal ring excluded nested fact suppresses its consequences without misattributing to outer fact" {
+  let log = CausalRing::new(16)
+  log.enable()
+  log.exclude_label("pointer_move")
+  let outer = log.with_fact(FactKind::Input, "root", "click", fn(c : CauseId) -> CauseId {
+    let _ = log.record_consequence(ConsequenceKind::StateChange, "root", "outer_ok")
+    let inner = log.with_fact(FactKind::Input, "root", "pointer_move", fn(ic : CauseId) -> CauseId {
+      debug_assert(log.current_cause().is_none(), "excluded fact hides outer cause")
+      let seq = log.record_consequence(ConsequenceKind::StateChange, "root", "should_be_suppressed")
+      debug_assert(seq == 0.to_int64(), "consequence inside excluded fact suppressed")
+      ic
+    })
+    debug_assert(inner.is_none(), "excluded fact returns none")
+    debug_assert(log.current_cause() == c, "outer cause restored after excluded fact")
+    c
+  })
+  let chain = log.get_chain(outer.seq)
+  debug_assert(chain.length() == 2, "only outer fact and outer_ok recorded")
+}
+
+test "causal ring eviction preserves chronological order and label exclusion works" {
+  let log = CausalRing::new(3)
+  log.enable()
+  log.exclude_label("pointer_move")
+
+  let ignored = log.with_fact(FactKind::Input, "window", "pointer_move", fn(c : CauseId) -> CauseId { c })
+  debug_assert(ignored.is_none() && log.entries().length() == 0, "excluded label skipped")
+
+  let c1 = log.with_fact(FactKind::Input, "a", "click_1", fn(c : CauseId) -> CauseId {
+    let _ = log.record_consequence(ConsequenceKind::StateChange, "a", "s1")
+    let _ = log.record_consequence(ConsequenceKind::StateChange, "a", "s2")
+    let _ = log.record_consequence(ConsequenceKind::RenderFlush, "a", "f1")
+    c
+  })
+  // Capacity 3: root #1 evicted, retained #2, #3, #4 all still point to caused_by=#1
+  let retained = log.entries()
+  debug_assert(retained.length() == 3, "bounded capacity")
+  debug_assert(retained[0].seq == 2.to_int64() && retained[2].seq == 4.to_int64(), "oldest-first order")
+  let chain = log.get_chain(c1.seq)
+  debug_assert(chain.length() == 3 && chain[0].caused_by == Some(c1.seq), "evicted root still traceable via caused_by")
+}

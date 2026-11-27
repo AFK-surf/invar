@@ -1,0 +1,394 @@
+// Layer-0 zero-dependency causal event spine (`CauseId` + `CausalRing`).
+//
+// Bridges cross-frame and cross-thread/async boundaries by attributing every derived
+// `Consequence` to the root external `Fact` (`caused_by = Some(root_seq)`).
+//
+// Zero overhead when disabled (`enabled = false` by default). Stores structural
+// metadata only (`kind`, `target`, `label`) — never raw field values or plaintext secrets.
+
+#derive(Eq)
+pub struct CauseId {
+  pub seq : Int64
+}
+
+pub fn CauseId::none() -> CauseId {
+  CauseId::{ seq: 0.to_int64() }
+}
+
+pub fn CauseId::is_none(self : CauseId) -> Bool {
+  self.seq <= 0.to_int64()
+}
+
+#derive(Eq)
+pub enum FactKind {
+  Input
+  CommandResult
+  Subscription
+  External
+  Lifecycle
+}
+
+pub fn FactKind::tag(self : FactKind) -> String {
+  match self {
+    FactKind::Input => "input"
+    FactKind::CommandResult => "command_result"
+    FactKind::Subscription => "subscription"
+    FactKind::External => "external"
+    FactKind::Lifecycle => "lifecycle"
+  }
+}
+
+#derive(Eq)
+pub enum ConsequenceKind {
+  StateChange
+  CommandIssued
+  CommandInterrupted
+  RenderFlush
+  Fault
+  Custom
+}
+
+pub fn ConsequenceKind::tag(self : ConsequenceKind) -> String {
+  match self {
+    ConsequenceKind::StateChange => "state_change"
+    ConsequenceKind::CommandIssued => "command_issued"
+    ConsequenceKind::CommandInterrupted => "command_interrupted"
+    ConsequenceKind::RenderFlush => "render_flush"
+    ConsequenceKind::Fault => "fault"
+    ConsequenceKind::Custom => "custom"
+  }
+}
+
+#derive(Eq)
+pub struct CausalEntry {
+  pub seq : Int64
+  pub at_ms : Int64
+  pub caused_by : Option[Int64]
+  pub kind : String
+  pub target : String
+  pub label : String
+}
+
+pub struct CausalRing {
+  mut enabled : Bool
+  capacity : Int
+  mut next_seq : Int64
+  mut total_recorded : Int64
+  buf : Array[CausalEntry]
+  mut head : Int
+  mut count : Int
+  cause_stack : Array[Int64]
+  excluded_labels : Array[String]
+}
+
+pub fn CausalRing::new(capacity : Int) -> CausalRing {
+  let cap = if capacity < 1 { 1 } else { capacity }
+  CausalRing::{
+    enabled: false,
+    capacity: cap,
+    next_seq: 0.to_int64(),
+    total_recorded: 0.to_int64(),
+    buf: [],
+    head: 0,
+    count: 0,
+    cause_stack: [],
+    excluded_labels: [],
+  }
+}
+
+pub fn CausalRing::enable(self : CausalRing) -> Unit {
+  self.enabled = true
+}
+
+pub fn CausalRing::disable(self : CausalRing) -> Unit {
+  self.enabled = false
+}
+
+pub fn CausalRing::is_enabled(self : CausalRing) -> Bool {
+  self.enabled
+}
+
+pub fn CausalRing::clear(self : CausalRing) -> Unit {
+  self.buf.clear()
+  self.head = 0
+  self.count = 0
+}
+
+pub fn CausalRing::total_recorded(self : CausalRing) -> Int64 {
+  self.total_recorded
+}
+
+pub fn CausalRing::exclude_label(self : CausalRing, label : String) -> Unit {
+  for x in self.excluded_labels {
+    if x == label {
+      return
+    }
+  }
+  self.excluded_labels.push(label)
+}
+
+pub fn CausalRing::include_label(self : CausalRing, label : String) -> Unit {
+  let mut i = 0
+  while i < self.excluded_labels.length() {
+    if self.excluded_labels[i] == label {
+      let last = self.excluded_labels.length() - 1
+      if i != last {
+        self.excluded_labels[i] = self.excluded_labels[last]
+      }
+      let _ = self.excluded_labels.pop()
+      return
+    }
+    i += 1
+  }
+}
+
+fn CausalRing::is_excluded(self : CausalRing, label : String) -> Bool {
+  for x in self.excluded_labels {
+    if x == label {
+      return true
+    }
+  }
+  false
+}
+
+pub fn CausalRing::current_cause(self : CausalRing) -> CauseId {
+  let n = self.cause_stack.length()
+  if n == 0 {
+    CauseId::none()
+  } else {
+    let top = self.cause_stack[n - 1]
+    if top <= 0.to_int64() {
+      CauseId::none()
+    } else {
+      CauseId::{ seq: top }
+    }
+  }
+}
+
+fn CausalRing::is_in_excluded_fact(self : CausalRing) -> Bool {
+  let n = self.cause_stack.length()
+  n > 0 && self.cause_stack[n - 1] < 0.to_int64()
+}
+
+fn CausalRing::push_entry(self : CausalRing, entry : CausalEntry) -> Unit {
+  self.total_recorded += 1.to_int64()
+  if self.buf.length() < self.capacity {
+    self.buf.push(entry)
+    self.count = self.buf.length()
+  } else {
+    self.buf[self.head] = entry
+    self.head = (self.head + 1) % self.capacity
+    self.count = self.capacity
+  }
+}
+
+/// Record an external root Fact and execute `f` with that Fact's `CauseId` active.
+/// When disabled, invokes `f(CauseId::none())` with zero allocations.
+/// When enabled and `label` is excluded, pushes an exclusion sentinel so nested consequences
+/// are suppressed rather than misattributed to an enclosing outer Fact.
+pub fn CausalRing::with_fact[R](
+  self : CausalRing,
+  kind : FactKind,
+  target : String,
+  label : String,
+  at_ms~ : Int64 = 0.to_int64(),
+  f : (CauseId) -> R,
+) -> R {
+  if !self.enabled {
+    return f(CauseId::none())
+  }
+  if self.is_excluded(label) {
+    self.cause_stack.push((-1).to_int64())
+    let res = f(CauseId::none())
+    let _ = self.cause_stack.pop()
+    return res
+  }
+  self.next_seq += 1.to_int64()
+  let seq = self.next_seq
+  self.push_entry(CausalEntry::{
+    seq,
+    at_ms,
+    caused_by: None,
+    kind: kind.tag(),
+    target,
+    label,
+  })
+  self.cause_stack.push(seq)
+  let res = f(CauseId::{ seq })
+  let _ = self.cause_stack.pop()
+  res
+}
+
+/// Restore a captured `CauseId` across an async or cross-thread boundary (e.g. `Worker` reply).
+pub fn CausalRing::with_cause[R](self : CausalRing, cause : CauseId, f : () -> R) -> R {
+  if !self.enabled || cause.is_none() {
+    return f()
+  }
+  self.cause_stack.push(cause.seq)
+  let res = f()
+  let _ = self.cause_stack.pop()
+  res
+}
+
+/// Record a derived Consequence attributed to the currently active root Fact (if any).
+/// Returns the allocated `seq`, or `0` when disabled, excluded, or inside an excluded Fact.
+pub fn CausalRing::record_consequence(
+  self : CausalRing,
+  kind : ConsequenceKind,
+  target : String,
+  label : String,
+  at_ms~ : Int64 = 0.to_int64(),
+) -> Int64 {
+  if !self.enabled || self.is_in_excluded_fact() || self.is_excluded(label) {
+    return 0.to_int64()
+  }
+  self.next_seq += 1.to_int64()
+  let seq = self.next_seq
+  let root = self.current_cause()
+  let caused_by = if root.is_none() { None } else { Some(root.seq) }
+  self.push_entry(CausalEntry::{
+    seq,
+    at_ms,
+    caused_by,
+    kind: kind.tag(),
+    target,
+    label,
+  })
+  seq
+}
+
+/// Return all retained entries in chronological (oldest-first) order.
+pub fn CausalRing::entries(self : CausalRing) -> Array[CausalEntry] {
+  let out : Array[CausalEntry] = []
+  let n = self.count
+  let mut i = 0
+  while i < n {
+    let idx = if self.buf.length() < self.capacity { i } else { (self.head + i) % self.capacity }
+    out.push(self.buf[idx])
+    i += 1
+  }
+  out
+}
+
+/// Return the causal chain for `root_seq`: the Fact itself (if still in buffer) plus all retained
+/// Consequences whose `caused_by == Some(root_seq)`.
+pub fn CausalRing::get_chain(self : CausalRing, root_seq : Int64) -> Array[CausalEntry] {
+  let out : Array[CausalEntry] = []
+  for e in self.entries() {
+    let matched = if e.seq == root_seq {
+      true
+    } else {
+      match e.caused_by {
+        Some(c) => c == root_seq
+        None => false
+      }
+    }
+    if matched {
+      out.push(e)
+    }
+  }
+  out
+}
+
+/// Format retained entries as a readable timeline (`#seq` facts at top level, consequences indented).
+pub fn CausalRing::format_timeline(self : CausalRing) -> String {
+  let sb = StringBuilder::new()
+  let all = self.entries()
+  let mut first = true
+  for e in all {
+    if !first {
+      sb.write_string("\n")
+    }
+    first = false
+    match e.caused_by {
+      None => {
+        sb.write_string("#" + e.seq.to_string() + " [" + e.kind + "] " + e.target + " " + e.label)
+      }
+      Some(c) => {
+        sb.write_string("  -> #" + e.seq.to_string() + " (caused_by=#" + c.to_string() + ") [" + e.kind + "] " + e.target + " " + e.label)
+      }
+    }
+  }
+  sb.to_string()
+}
+
+fn hex_nibble(n : Int) -> Char {
+  if n < 10 {
+    (48 + n).unsafe_to_char()
+  } else {
+    (87 + n).unsafe_to_char()
+  }
+}
+
+fn write_json_escaped(sb : StringBuilder, s : String) -> Unit {
+  sb.write_char('"')
+  let mut i = 0
+  let mut seg_start = 0
+  let n = s.length()
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 34 || c == 92 || c == 10 || c == 13 || c == 9 || c < 32 {
+      if i > seg_start {
+        sb.write_substring(s, seg_start, i)
+      }
+      if c == 34 {
+        sb.write_string("\\\"")
+      } else if c == 92 {
+        sb.write_string("\\\\")
+      } else if c == 10 {
+        sb.write_string("\\n")
+      } else if c == 13 {
+        sb.write_string("\\r")
+      } else if c == 9 {
+        sb.write_string("\\t")
+      } else {
+        sb.write_string("\\u00")
+        sb.write_char(hex_nibble((c >> 4) & 15))
+        sb.write_char(hex_nibble(c & 15))
+      }
+      seg_start = i + 1
+    }
+    i += 1
+  }
+  if n > seg_start {
+    sb.write_substring(s, seg_start, n)
+  }
+  sb.write_char('"')
+}
+
+/// Serialize retained causal entries to Wire v1 JSON.
+pub fn CausalRing::to_json(self : CausalRing) -> String {
+  let sb = StringBuilder::new()
+  sb.write_string("{\"wire\":1,\"enabled\":")
+  sb.write_string(if self.enabled { "true" } else { "false" })
+  sb.write_string(",\"total\":")
+  sb.write_string(self.total_recorded.to_string())
+  sb.write_string(",\"entries\":[")
+  let all = self.entries()
+  let mut i = 0
+  while i < all.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    let e = all[i]
+    sb.write_string("{\"seq\":")
+    sb.write_string(e.seq.to_string())
+    sb.write_string(",\"at_ms\":")
+    sb.write_string(e.at_ms.to_string())
+    sb.write_string(",\"caused_by\":")
+    match e.caused_by {
+      Some(c) => sb.write_string(c.to_string())
+      None => sb.write_string("null")
+    }
+    sb.write_string(",\"kind\":")
+    write_json_escaped(sb, e.kind)
+    sb.write_string(",\"target\":")
+    write_json_escaped(sb, e.target)
+    sb.write_string(",\"label\":")
+    write_json_escaped(sb, e.label)
+    sb.write_string("}")
+    i += 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}

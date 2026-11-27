@@ -1,0 +1,403 @@
+// Conformance & parity tests ported from upstream signals test suites, plus
+// regression tests for `same_ref` (`physical_equal`), `same_value`, `DerivedSignal::made_at`,
+// and `Action` concurrency modes (`begin_if_idle`, `begin_switching`, `on_cancel`, `cancel_all`).
+
+struct RefBox {
+  num : Int
+}
+
+fn words_anew(s : String) -> String {
+  let b = StringBuilder::new()
+  b.write_string(s)
+  b.to_string()
+}
+
+test "same_value: equal freshly constructed string or array does not re-notify" {
+  let s = signal(words_anew("ab"))
+  let list = signal([1, 2, 3])
+  let runs = [0]
+  let stop = effect(fn() -> Unit {
+    let _ = s.get()
+    let _ = list.get()
+    runs[0] += 1
+  })
+  debug_assert(runs[0] == 1, "initial run")
+  s.set(words_anew("ab"))
+  list.set([1, 2, 3])
+  debug_assert(runs[0] == 1, "equal value must not re-run")
+  list.set([1, 2, 4])
+  debug_assert(runs[0] == 2, "changed value must re-run")
+  stop()
+}
+
+test "same_ref: signal_ref and computed_ref use physical_equal, not never_same" {
+  let obj1 = RefBox::{ num: 1 }
+  let obj2 = RefBox::{ num: 1 }
+  let s = signal_ref(obj1)
+  let trigger = signal(0)
+  let c = computed_ref(fn(_p : Option[RefBox]) -> RefBox {
+    let _ = trigger.get()
+    obj1
+  })
+  let s_runs = [0]
+  let c_runs = [0]
+  let stop1 = effect(fn() -> Unit {
+    let _ = s.get()
+    s_runs[0] += 1
+  })
+  let stop2 = effect(fn() -> Unit {
+    let _ = c.get()
+    c_runs[0] += 1
+  })
+  debug_assert(s_runs[0] == 1 && c_runs[0] == 1, "initial runs")
+  // Setting the exact same heap object MUST NOT trigger re-notification!
+  s.set(obj1)
+  debug_assert(s_runs[0] == 1, "signal_ref setting identical object must be a no-op")
+  // Recomputing and returning the exact same heap object MUST NOT notify downstream!
+  trigger.set(1)
+  debug_assert(c_runs[0] == 1, "computed_ref returning identical object must not notify")
+  // Setting a distinct object with equal fields MUST notify!
+  s.set(obj2)
+  debug_assert(s_runs[0] == 2, "signal_ref setting distinct object must notify")
+  debug_assert(same_ref(obj1, obj1), "same_ref true for same object")
+  debug_assert(!same_ref(obj1, obj2), "same_ref false for distinct objects")
+
+  // computed_scoped_ref also uses physical_equal (same_ref)
+  let scoped_tick = signal(0)
+  let cs = computed_scoped_ref(fn(_p : Option[RefBox]) -> RefBox {
+    let _ = scoped_tick.get()
+    obj1
+  })
+  let cs_runs = [0]
+  let stop3 = effect(fn() -> Unit {
+    let _ = cs.get()
+    cs_runs[0] += 1
+  })
+  scoped_tick.set(1)
+  debug_assert(cs_runs[0] == 1, "computed_scoped_ref returning identical object must not notify")
+
+  // same_value physical_equal fast path: identical NaN bits do not re-notify
+  let nan = 0.0 / 0.0
+  let d = signal(nan)
+  let d_runs = [0]
+  let stop4 = effect(fn() -> Unit {
+    let _ = d.get()
+    d_runs[0] += 1
+  })
+  d.set(nan)
+  debug_assert(d_runs[0] == 1, "same_value physical_equal suppresses identical NaN re-notify")
+
+  stop1()
+  stop2()
+  stop3()
+  stop4()
+}
+
+test "derived_signal_ref and optimistic_ref use physical_equal and DerivedSignal::made_at" {
+  let obj1 = RefBox::{ num: 7 }
+  let obj2 = RefBox::{ num: 7 }
+  let tick = signal(0)
+  let ds = derived_signal_ref(
+    fn(_p : Option[RefBox]) -> RefBox {
+      let _ = tick.get()
+      obj1
+    },
+    loc="conformance_parity_test.pion:66",
+  )
+  debug_assert(ds.made_at() == "conformance_parity_test.pion:66", "DerivedSignal::made_at")
+  let runs = [0]
+  let stop = effect(fn() -> Unit {
+    let _ = ds.get()
+    runs[0] += 1
+  })
+  debug_assert(runs[0] == 1, "initial")
+  ds.set(obj1)
+  debug_assert(runs[0] == 1, "derived_signal_ref same object must not notify")
+  ds.set(obj2)
+  debug_assert(runs[0] == 2, "derived_signal_ref distinct object must notify")
+  stop()
+
+  let opt_tick = signal(0)
+  let opt = optimistic_ref(fn() -> RefBox {
+    let _ = opt_tick.get()
+    obj1
+  })
+  let opt_runs = [0]
+  let stop_opt = effect(fn() -> Unit {
+    let _ = opt.get()
+    opt_runs[0] += 1
+  })
+  debug_assert(opt_runs[0] == 1, "initial optimistic_ref")
+  opt_tick.set(1)
+  debug_assert(opt_runs[0] == 1, "optimistic_ref returning same object must not notify")
+  stop_opt()
+}
+
+test "conformance computed: cached, chained, zero-deps, live after losing subscribers" {
+  // #18 cached
+  let a = signal(0)
+  let calls = [0]
+  let b = computed(fn(_p : Option[Int]) -> Int {
+    calls[0] += 1
+    a.get()
+  })
+  debug_assert(b.get() == 0 && calls[0] == 1, "first read computes once")
+  debug_assert(b.get() == 0 && calls[0] == 1, "second read cached")
+
+  // #22 chained computed avoids redundant re-compute
+  let x = signal(0)
+  let c1_calls = [0]
+  let c2_calls = [0]
+  let c3_calls = [0]
+  let c1 = computed(fn(_p : Option[Int]) -> Int { c1_calls[0] += 1; x.get() })
+  let c2 = computed(fn(_p : Option[Int]) -> Int { c2_calls[0] += 1; c1.get() })
+  let c3 = computed(fn(_p : Option[Int]) -> Int { c3_calls[0] += 1; c2.get() })
+  debug_assert(c3.get() == 0, "init chain")
+  c1_calls[0] = 0
+  c2_calls[0] = 0
+  c3_calls[0] = 0
+  x.set(1)
+  debug_assert(c3.get() == 1 && c1_calls[0] == 1 && c2_calls[0] == 1 && c3_calls[0] == 1, "each runs once")
+
+  // #25 zero dependencies
+  let z_calls = [0]
+  let z = computed(fn(_p : Option[Int]) -> Int { z_calls[0] += 1; 42 })
+  debug_assert(z.get() == 42 && z.get() == 42 && z_calls[0] == 1, "zero-dep cached")
+
+  // #26 live after losing all subscribers
+  let s = signal(0)
+  let doubled = computed(fn(_p : Option[Int]) -> Int { s.get() * 2 })
+  let stop = effect(fn() -> Unit { let _ = doubled.get() })
+  stop()
+  s.set(5)
+  debug_assert(doubled.get() == 10, "computed still updates after unsub")
+  s.set(10)
+  debug_assert(doubled.get() == 20, "computed still updates on second write")
+}
+
+test "conformance dynamic: branch switching, sibling retention, unreachable skip" {
+  // #12 & #13 branch switching deactivates old deps
+  let a = signal("a")
+  let b = signal("b")
+  let cond = signal(true)
+  let calls = [0]
+  let c = computed(fn(_p : Option[String]) -> String {
+    calls[0] += 1
+    if cond.get() { a.get() } else { b.get() }
+  })
+  debug_assert(c.get() == "a" && calls[0] == 1, "init branch a")
+  b.set("bb")
+  debug_assert(c.get() == "a" && calls[0] == 1, "inactive b ignored")
+  cond.set(false)
+  debug_assert(c.get() == "bb" && calls[0] == 2, "switched to b")
+  a.set("aa")
+  debug_assert(c.get() == "bb" && calls[0] == 2, "inactive a ignored")
+
+  // #165 computed dep cleanup doesn't delete sibling subscription
+  let toggle = signal(true)
+  let st = signal(1)
+  let p = computed(fn(_p : Option[Int]) -> Int { if toggle.get() { st.get() } else { 111 } })
+  let pp = computed(fn(_p : Option[Int]) -> Int { st.get() })
+  let stop = effect(fn() -> Unit { let _ = p.get() })
+  toggle.set(false)
+  debug_assert(p.get() == 111, "toggled off")
+  st.set(2)
+  debug_assert(pp.get() == 2, "sibling computed still receives updates")
+  stop()
+
+  // #193 sequential dirty check skips unreachable computed
+  let cc_calls = [0]
+  let src : Signal[Option[Int]] = signal(Some(1))
+  let mid = computed(fn(_p : Option[Option[Int]]) -> Option[Int] { src.get() })
+  let leaf = computed(fn(_p : Option[Option[Int]]) -> Option[Int] {
+    cc_calls[0] += 1
+    mid.get()
+  })
+  let gate = computed(fn(_p : Option[Int]) -> Int {
+    match mid.get() {
+      Some(_) => match leaf.get() {
+        Some(v) => v
+        None => 0
+      }
+      None => 0
+    }
+  })
+  debug_assert(gate.get() == 1 && cc_calls[0] == 1, "gate init")
+  src.set(None)
+  debug_assert(gate.get() == 0 && cc_calls[0] == 1, "unreachable leaf skipped")
+}
+
+test "conformance inner write and batch diamond stability" {
+  let src = signal(1)
+  let derived_even = computed(fn(_p : Option[Bool]) -> Bool { src.get() % 2 == 0 })
+  let eff_runs = [0]
+  let stop = effect(fn() -> Unit {
+    let _ = derived_even.get()
+    eff_runs[0] += 1
+  })
+  debug_assert(eff_runs[0] == 1, "initial")
+  // 1 -> 3 keeps derived_even == false: effect MUST NOT re-run
+  src.set(3)
+  debug_assert(eff_runs[0] == 1, "unchanged computed suppresses effect")
+  // 3 -> 4 flips to true: effect runs once
+  src.set(4)
+  debug_assert(eff_runs[0] == 2, "changed computed triggers effect")
+  stop()
+
+  // Conformance #50 & #54: inner write from effect A -> signal B propagates to downstream effect
+  let a = signal(0)
+  let b = signal(0)
+  let b_log : Array[Int] = []
+  let stop2 = effect(fn() -> Unit {
+    let va = a.get()
+    if va > 0 && b.get() == 0 {
+      b.set(va * 2)
+    }
+  })
+  let stop3 = effect(fn() -> Unit {
+    b_log.push(b.get())
+  })
+  a.set(5)
+  debug_assert(b.get() == 10 && b_log.length() == 2 && b_log[1] == 10, "inner write #50/#54 propagated")
+  stop2()
+  stop3()
+
+  // Self-write guard: effect writing to its own dep does not infinite-loop
+  let self_sig = signal(0)
+  let self_runs = [0]
+  let stop4 = effect(fn() -> Unit {
+    self_runs[0] += 1
+    let cur = self_sig.get()
+    if cur == 1 {
+      self_sig.set(2)
+    }
+  })
+  self_sig.set(1)
+  debug_assert(self_sig.get() == 2 && self_runs[0] == 2, "self-write does not self-retrigger infinitely")
+  stop4()
+}
+
+test "action concurrency modes: begin_if_idle, begin_switching, on_cancel, cancel_all" {
+  let act : Action[String, String] = action()
+  // Exhaust: begin_if_idle
+  let t1 = match act.begin_if_idle() {
+    Some(t) => t
+    None => panic("expected idle ticket")
+  }
+  debug_assert(act.begin_if_idle().is_none(), "second begin_if_idle rejected while in flight")
+  let ok1 = t1.succeed("done", fn(_r : String) -> Unit { () })
+  debug_assert(ok1 && !act.pending().get(), "idle again after succeed")
+
+  // Switch: begin_switching cancels prior ticket, runs on_cancel + reverts optimistic patch
+  let events : Array[String] = []
+  let s1 = act.begin_switching()
+  let _ = s1
+  .with_optimistic(fn() -> Unit { events.push("revert:1") })
+  .on_cancel(fn() -> Unit { events.push("cancel:1") })
+  let s2 = act.begin_switching()
+  let _ = s2
+  .with_optimistic(fn() -> Unit { events.push("revert:2") })
+  .on_cancel(fn() -> Unit { events.push("cancel:2") })
+  debug_assert(s1.is_settled() && s1.is_cancelled(), "s1 cancelled by switch")
+  debug_assert(act.in_flight().get() == 1, "only s2 in flight")
+  debug_assert(events.length() == 2 && events[0] == "cancel:1" && events[1] == "revert:1", "cancel then revert")
+  // Late succeed on cancelled s1 is ignored
+  debug_assert(!s1.succeed("stale", fn(_r : String) -> Unit { events.push("bad") }), "stale s1 ignored")
+  // Attaching on_cancel after cancellation fires immediately
+  let late_cancel = [0]
+  let _ = s1.on_cancel(fn() -> Unit { late_cancel[0] += 1 })
+  debug_assert(late_cancel[0] == 1, "late on_cancel runs immediately on cancelled ticket")
+
+  // cancel_all cleans up remaining active tickets (for View::owns unmount)
+  let s3 = act.begin()
+  let _ = s3.on_cancel(fn() -> Unit { events.push("cancel:3") })
+  debug_assert(act.in_flight().get() == 2, "s2 + s3 active")
+  let cancelled = act.cancel_all()
+  debug_assert(cancelled == 2 && act.in_flight().get() == 0 && !act.pending().get(), "all cancelled")
+  debug_assert(s2.is_cancelled() && s3.is_cancelled(), "both marked cancelled")
+  // Succeeding ticket never triggers on_cancel
+  let s4 = act.begin()
+  let s4_cancel = [0]
+  let _ = s4.on_cancel(fn() -> Unit { s4_cancel[0] += 1 })
+  debug_assert(s4.succeed("ok", fn(_r : String) -> Unit { () }), "s4 succeeds")
+  let _ = s4.on_cancel(fn() -> Unit { s4_cancel[0] += 1 })
+  debug_assert(s4_cancel[0] == 0 && !s4.is_cancelled(), "succeeded ticket never fires on_cancel")
+}
+
+test "action switching and cancel_all leave zero leaked signal nodes or links" {
+  let base_nodes = live_node_count()
+  let base_links = live_link_count()
+  let act : Action[Int, String] = action()
+  let seen = [0]
+  let stop = effect(fn() -> Unit {
+    if act.pending().get() {
+      seen[0] += 1
+    }
+  })
+  for i in 0..<50 {
+    let t = act.begin_switching()
+    let _ = t.with_optimistic(fn() -> Unit { () }).on_cancel(fn() -> Unit { () })
+    if i % 5 == 0 {
+      let _ = t.succeed(i, fn(_v : Int) -> Unit { () })
+    }
+  }
+  let _ = act.cancel_all()
+  stop()
+  debug_assert(seen[0] > 0 && !act.pending().get() && act.in_flight().get() == 0, "drained cleanly")
+  act.dispose()
+  debug_assert(live_link_count() == base_links, "zero leaked links after action dispose")
+  debug_assert(live_node_count() == base_nodes, "zero leaked nodes after action dispose")
+}
+
+test "action callbacks see decremented in_flight so begin_if_idle succeeds inside on_cancel and commit" {
+  let act : Action[String, String] = action()
+  let restarted = [0]
+
+  // 1) Inside single cancel()'s on_cancel callback
+  let t1 = act.begin()
+  let _ = t1.on_cancel(fn() -> Unit {
+    match act.begin_if_idle() {
+      Some(next) => {
+        restarted[0] += 1
+        let _ = next.succeed("from_cancel", fn(_v : String) -> Unit { () })
+      }
+      None => ()
+    }
+  })
+  debug_assert(t1.cancel(), "t1 cancelled")
+  debug_assert(restarted[0] == 1 && act.in_flight().get() == 0, "begin_if_idle succeeded inside cancel on_cancel")
+
+  // 2) Inside cancel_all()'s on_cancel callback when multiple tickets are active
+  let a1 = act.begin()
+  let a2 = act.begin()
+  let _ = a1.on_cancel(fn() -> Unit {
+    match act.begin_if_idle() {
+      Some(next) => {
+        restarted[0] += 1
+        let _ = next.succeed("from_cancel_all", fn(_v : String) -> Unit { () })
+      }
+      None => ()
+    }
+  })
+  let _ = a2
+  debug_assert(act.cancel_all() == 2, "both cancelled")
+  debug_assert(restarted[0] == 2 && act.in_flight().get() == 0, "begin_if_idle succeeded inside cancel_all on_cancel")
+
+  // 3) Inside succeed()'s commit callback
+  let c1 = act.begin()
+  debug_assert(
+    c1.succeed("step1", fn(_v : String) -> Unit {
+      match act.begin_if_idle() {
+        Some(next) => {
+          restarted[0] += 1
+          let _ = next.succeed("step2", fn(_v2 : String) -> Unit { () })
+        }
+        None => ()
+      }
+    }),
+    "c1 succeeded",
+  )
+  debug_assert(restarted[0] == 3 && act.in_flight().get() == 0, "begin_if_idle succeeded inside commit")
+  debug_assert(act.in_flight().get() == 0 && act.active.length() == 0, "active list matches in_flight")
+  act.dispose()
+}
