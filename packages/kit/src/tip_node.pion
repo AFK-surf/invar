@@ -1,0 +1,847 @@
+// tip_node: a control's tooltip drawn in a per-window tip layer. Style-agnostic: every colour, radius, size and
+// padding comes from a `TipLook`.
+//
+// Behaviour:
+// - shown as the mouse rests on its control `delay` (400 ms) and at once where another tip of the same layer went
+//   within headless::tooltip_skip_ms (warm skip), while the keyboard's focus shows on it (focus-visible);
+// - in ground first, words after (120 ms, eased out); out words first, ground after (motion::pop_out_ms, eased to
+//   leave); optionally drawn smaller toward its control at the far end (TipLook::scale_from, TipLook::exit_scale);
+// - between neighbouring controls of the layer on the same side, the next tip's ground and words glide from where the
+//   one before was drawn (motion::Handoff, critically damped hand_spring) instead of fading;
+// - Escape while it shows closes it, before the app's keymap is asked (View::on_key_first); a press on its control
+//   shuts it till the pointer and the focus have left;
+// - a finger: held on the control (TipHand::hold) it shows at once, let go (TipHand::lift) it stays
+//   headless::tooltip_lifted_ms or till the next press anywhere; tapped open (TipHand::open) till the next tap;
+// - `shortcut`: the keys said after the words, one cap each (key_caps), as tall as a tip of words alone;
+// - beside its control on `side`, lined up `along` it, flipped to the other side and kept `edge_pad` inside the window
+//   where it has not the room (View::beside);
+// - gone with its control: nothing of it left pending.
+
+import "headless"
+import "motion"
+import "signals"
+import "ui"
+import "view"
+
+/// How long the pointer rests on a control before its tip shows.
+pub let tip_delay_ms : Double = 400.0
+
+/// How far a tip is drawn from its control.
+pub let tip_gap : Double = 6.0
+
+/// How far inside the window a tip is kept (View::beside's padding).
+pub let tip_edge_pad : Double = 8.0
+
+/// How a tip comes in (faded in, eased out).
+pub let tip_in_ms : Double = 120.0
+
+/// How a tip looks. `radius` below zero: a full capsule (half its height on one line); `cap_radius` below
+/// zero: each cap fully round (half its height), concentric with the capsule `cap_in` in from it. `wrap`: its words
+/// broken into lines no wider than `max_width` (else one line). `cap_label_gap`: between its words and its first cap.
+/// A cap is as tall as the words' `line` and `cap_over` over and under it, so with `cap_in + cap_over == pad_y` a tip
+/// with keys is as tall as one without. `scale_from`: how big it is drawn as it starts coming in, `exit_scale` as it
+/// is all but gone (1.0: not scaled), toward its control.
+pub struct TipLook {
+  pub ground : Int64
+  pub ink : Int64
+  pub edge : (Double, Int64)
+  pub shadow : (Double, Double, Int64)
+  pub radius : Double
+  pub size : Double
+  pub line : Double
+  pub weight : Int
+  pub wrap : Bool
+  pub pad_x : Double
+  pub pad_y : Double
+  pub max_width : Double
+  pub cap_ground : Int64
+  pub cap_ink : Int64
+  pub cap_radius : Double
+  pub cap_size : Double
+  pub cap_line : Double
+  pub cap_weight : Int
+  pub cap_pad_x : Double
+  pub cap_over : Double
+  pub cap_in : Double
+  pub cap_gap : Double
+  pub cap_label_gap : Double
+  pub scale_from : Double
+  pub exit_scale : Double
+}
+
+/// A neutral look from the window's theme: in light a dark ground with the page's colour for words; in the dark the
+/// surface lifted a little toward the words with a faint edge. Not scaled as it comes and goes by default.
+pub fn tip_look_default() -> TipLook {
+  let th = ui::tree_theme()
+  let ground = if th.dark { ui::blend(th.surface, th.fg, 0.05) } else { th.fg }
+  let ink = if th.dark { th.fg } else { th.bg }
+  TipLook::{
+    ground,
+    ink,
+    edge: if th.dark { (1.0, ui::alpha(th.fg, 0.09)) } else { (0.0, 0L) },
+    shadow: (10.0, 3.0, if th.dark { 0x00000066L } else { 0x0000002EL }),
+    radius: -1.0,
+    size: 12.0,
+    line: 16.0,
+    weight: 400,
+    wrap: true,
+    pad_x: 12.0,
+    pad_y: 5.0,
+    max_width: 300.0,
+    cap_ground: ui::blend(ground, ink, 0.12),
+    cap_ink: ui::blend(ground, ink, 0.88),
+    cap_radius: -1.0,
+    cap_size: 12.0,
+    cap_line: 16.0,
+    cap_weight: 500,
+    cap_pad_x: 6.0,
+    cap_over: 1.0,
+    cap_in: 4.0,
+    cap_gap: 2.0,
+    cap_label_gap: 8.0,
+    scale_from: 1.0,
+    exit_scale: 1.0,
+  }
+}
+
+/// Where a window's tips are drawn and what they share: one tip seen at a time (its own visible slot: a tip shown in
+/// another layer, another window's, hides none of its), shown by one headless::TooltipGroup (warm for
+/// headless::tooltip_skip_ms after one went), and their ground handed on from one to the next (motion::Handoff).
+/// Drawn in the node `layer` gives (asked as a tip is shown), or, with none, the one TipLayer::mount made.
+pub struct TipLayer {
+  layer : Option[() -> Option[view::View]]
+  mounted : signals::Ref[Option[view::View]]
+  hands : motion::Handoff
+  active : signals::Signal[Option[headless::TipOwner]]
+  seen : signals::Signal[Option[headless::TipOwner]]
+  group : headless::TooltipGroup[headless::TipOwner]
+  entries : signals::Ref[Array[(headless::TipOwner, () -> Unit)]]
+}
+
+fn same_tip_owner(a : Option[headless::TipOwner], b : Option[headless::TipOwner]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => x == y
+    _ => false
+  }
+}
+
+/// A window's tips' layer, drawn in what `layer` gives (none: where TipLayer::mount puts it, mounted after the
+/// controls so it is drawn over them). A tip asked to show while there is no layer shows the next time it is asked
+/// once there is one.
+pub fn TipLayer::new(layer? : () -> Option[view::View]) -> TipLayer {
+  let active : signals::Signal[Option[headless::TipOwner]] = signals::signal_by(None, same_tip_owner)
+  let group = headless::TooltipGroup::new(
+    fn() { active.get() },
+    fn(k : Option[headless::TipOwner]) { active.set(k) },
+    open_delay_ms=tip_delay_ms,
+    warmup_ms=headless::tooltip_skip_ms,
+  )
+  TipLayer::{
+    layer,
+    mounted: view::ref_new(None),
+    hands: motion::Handoff::new(within=headless::tooltip_skip_ms),
+    active,
+    seen: signals::signal_by(None, same_tip_owner),
+    group,
+    entries: view::ref_new([]),
+  }
+}
+
+fn TipLayer::layer_now(self : TipLayer) -> Option[view::View] {
+  match self.layer {
+    Some(f) => f()
+    None =>
+    match self.mounted.v {
+      Some(l) => if l.alive() { Some(l) } else { None }
+      None => None
+    }
+  }
+}
+
+/// The layer's visible slot given to `owner`'s tip.
+fn TipLayer::claim(self : TipLayer, owner : headless::TipOwner) -> Unit {
+  if !same_tip_owner(self.seen.untracked(), Some(owner)) {
+    self.seen.set(Some(owner))
+  }
+}
+
+/// Whether `owner`'s tip is the one the layer shows (followed).
+fn TipLayer::owns(self : TipLayer, owner : headless::TipOwner) -> Bool {
+  same_tip_owner(self.seen.get(), Some(owner))
+}
+
+/// The layer's node over all of `parent` (as its child made now: mount it after what it is over), taking no pointer
+/// (presses go through to what is under it); its tips dismissed as it goes, so mounted again it starts afresh.
+pub fn TipLayer::mount(self : TipLayer, parent : view::View) -> view::View {
+  parent.box(fn(l : view::View) {
+    let _ = l.over(view::Live::Is(true)).points(view::Live::Is(false))
+    self.mounted.v = Some(l)
+    let _ = l.owns(fn() {
+      self.dismiss()
+      match self.mounted.v {
+        Some(m) => if m.id() == l.id() { self.mounted.v = None }
+        None => ()
+      }
+    })
+  })
+}
+
+/// The tip the layer shows hidden at once and any waiting to open called off, the layer cold again (the next tip waits
+/// its delay and glides from none): a menu opened over it, the app's own reason.
+pub fn TipLayer::dismiss(self : TipLayer) -> Unit {
+  let cbs : Array[() -> Unit] = []
+  for e in self.entries.v {
+    cbs.push(e.1)
+  }
+  for f in cbs {
+    f()
+  }
+  self.group.dismiss()
+  self.hands.reset()
+  if self.seen.untracked() is Some(_) {
+    self.seen.set(None)
+  }
+}
+
+/// What a tip can take over from (motion::HandPart's tag): one on the same side of its control; one by the pointer
+/// none, nor is it taken over from.
+fn tip_hand_tag(side : view::Side, at_pointer : Bool) -> Int {
+  if at_pointer {
+    return -1
+  }
+  match side {
+    Top => 0
+    Right => 1
+    Bottom => 2
+    Left => 3
+  }
+}
+
+/// How a finger holds a tip open: not at all, held down on its control, let go of it a moment ago, tapped open.
+#derive(Eq)
+enum TipHeld {
+  Free
+  Held
+  Lifted
+  Opened
+}
+
+/// What a control tells its tip of a finger (tip_node's): held on it long enough (`hold`: shown at once, as long as it
+/// stays down), let go after (`lift`: shown headless::tooltip_lifted_ms more, or till the next press anywhere), called
+/// off instead (`cancel`). `open`: shown till the next tap in the window, wherever it lands (`tapped`: the tap opening
+/// it is the one being taken now, told the window as it is let go (View::window_taps), so the one after shuts it;
+/// else, opened by a key or a screen reader, the next). `opened`: whether it is so opened now.
+pub struct TipHand {
+  pub hold : () -> Unit
+  pub lift : () -> Unit
+  pub cancel : () -> Unit
+  pub open : (Bool) -> Unit
+  pub opened : () -> Bool
+}
+
+/// One way a tip's fade goes: from `from` at `start` to `to` over `ms`, as `ease` has it.
+#derive(Eq)
+struct TipWay {
+  from : Double
+  to : Double
+  start : Double
+  ms : Double
+  ease : ui::Ease
+}
+
+fn TipWay::at(self : TipWay, t : Double) -> Double {
+  if self.ms <= 0.0 || t >= self.start + self.ms {
+    return self.to
+  }
+  let p = (t - self.start) / self.ms
+  self.from + (self.to - self.from) * self.ease.at(if p < 0.0 { 0.0 } else { p })
+}
+
+/// How far a tip is in (0 none, 1 all) as it comes and goes: one way at a time (`way`), from where the way before had
+/// it at the moment it turned; `moving` till that way ends (its end's moment, `due`, let go as another is set out).
+struct TipFade {
+  way : signals::Signal[TipWay]
+  moving : signals::Signal[Bool]
+  due : signals::Ref[() -> Unit]
+}
+
+fn TipFade::new() -> TipFade {
+  TipFade::{
+    way: signals::signal_by(TipWay::{ from: 0.0, to: 0.0, start: 0.0, ms: 0.0, ease: ui::Ease::Out }, fn(a : TipWay, b : TipWay) {
+      a == b
+    }),
+    moving: signals::signal_by(false, fn(a : Bool, b : Bool) { a == b }),
+    due: view::ref_new(fn() { () }),
+  }
+}
+
+fn TipFade::at(self : TipFade, t : Double) -> Double {
+  self.way.untracked().at(t)
+}
+
+fn TipFade::stop(self : TipFade) -> Unit {
+  let f = self.due.v
+  self.due.v = fn() { () }
+  f()
+}
+
+fn TipFade::go(self : TipFade, node : view::View, to : Double, at : Double, ms : Double, ease : ui::Ease) -> Unit {
+  let from = self.at(at)
+  self.stop()
+  self.way.set(TipWay::{ from, to, start: at, ms, ease })
+  self.moving.set(true)
+  let moving = self.moving
+  self.due.v = node.at_moment(at + ms, fn() { moving.set(false) })
+}
+
+fn TipFade::put(self : TipFade, to : Double) -> Unit {
+  self.stop()
+  self.way.set(TipWay::{ from: to, to, start: 0.0, ms: 0.0, ease: ui::Ease::Out })
+  self.moving.set(false)
+}
+
+/// How far in a tip is as drawn now (`v`'s frame): by the clock while its way goes, where it went once there.
+fn tip_fade_shown(way : signals::Signal[TipWay], moving : signals::Signal[Bool], v : view::View) -> Double {
+  let w = way.get()
+  if moving.get() {
+    w.at(v.drawn_at())
+  } else {
+    w.to
+  }
+}
+
+/// A tip saying `label` (as it changes; "" says none, so no tip) of the control `anchor`, on its `side` (lined up
+/// `along` it, `gap` from it, kept `edge_pad` inside the window), drawn in `tips` as `look` says (as that changes).
+/// `delay`: how long the mouse rests before it shows cold (warm, at once as any of the layer's); `skip`: shown at once
+/// where another of the layer went a moment before (and glided from it), else always after `delay`; `at_pointer`:
+/// beside the pointer as it moves along the control; `within`: shown by the mouse anywhere on `anchor` or what it
+/// holds (View::pointed_in), not only on `anchor` itself; `repeats`: its words are the control's own, shown only where
+/// they are cut short there (View::words_cut_now); `shortcut`: keys said after the words, a cap each (key_caps), as
+/// they change; `disabled`: while it shows none (one shown goes); `pressed`: what counts as a press on it (default:
+/// `anchor` pressed), which shuts it till the pointer and the focus leave. Only a mouse's pointer shows it by resting
+/// (a finger's goes by TipHand). Returns the control's hand on it for a finger (TipHand).
+pub fn tip_node(
+  tips : TipLayer,
+  anchor : view::View,
+  label : () -> String,
+  side~ : view::Side = view::Side::Bottom,
+  along~ : view::Along = view::Along::Middle,
+  delay~ : Double = tip_delay_ms,
+  skip~ : Bool = true,
+  gap~ : Double = tip_gap,
+  edge_pad~ : Double = tip_edge_pad,
+  at_pointer~ : Bool = false,
+  within~ : Bool = false,
+  repeats~ : Bool = false,
+  shortcut~ : () -> String = fn() { "" },
+  look~ : () -> TipLook = tip_look_default,
+  disabled~ : () -> Bool = fn() { false },
+  pressed? : () -> Bool,
+) -> TipHand {
+  if within {
+    let _ = anchor.points(view::Live::Is(true))
+  }
+  let open : signals::Signal[Bool] = signals::signal_by(false, fn(a : Bool, b : Bool) { a == b })
+  let hand : signals::Signal[TipHeld] = signals::signal_by(TipHeld::Free, fn(a : TipHeld, b : TipHeld) { a == b })
+  let lifted_end : signals::Ref[() -> Unit] = view::ref_new(fn() { () })
+  let fade = TipFade::new()
+  let anchor_id = anchor.id()
+  let owner = headless::tip_node_owner()
+  let glide = tips.hands.part(
+    fn(t : Double) {
+      if signals::untracked(fn() { tips.owns(owner) }) {
+        fade.at(t)
+      } else {
+        0.0
+      }
+    },
+    tag=tip_hand_tag(side, at_pointer),
+  )
+  // (one shared by the layer, warm with all of its; one of its own where it is never shown at once)
+  let own_active : signals::Signal[Option[headless::TipOwner]] = signals::signal_by(None, same_tip_owner)
+  let (group, group_slot) = if skip {
+    (tips.group, tips.active)
+  } else {
+    let g = headless::TooltipGroup::new(
+      fn() { own_active.get() },
+      fn(k : Option[headless::TipOwner]) { own_active.set(k) },
+      open_delay_ms=delay,
+      warmup_ms=-1.0,
+    )
+    (g, own_active)
+  }
+  let shut : signals::Signal[Bool] = signals::signal_by(false, fn(a : Bool, b : Bool) { a == b })
+  let over_now = fn() -> Bool {
+    let mouse = match ui::pointing() {
+      Mouse => true
+      _ => false
+    }
+    mouse && (if within { anchor.pointed_in() } else { anchor.pointed() })
+  }
+  let pressed_now = fn() -> Bool {
+    match pressed {
+      Some(p) => p()
+      None => anchor.pressed()
+    }
+  }
+  // (a press shuts it till the pointer and the focus have left)
+  anchor.reacts(fn() { (pressed_now(), over_now(), anchor.focus_shown()) }, at_start=false, fn(st : (Bool, Bool, Bool)) {
+    let (down, over, focused) = st
+    if down {
+      shut.set(true)
+    } else if !over && !focused {
+      shut.set(false)
+    }
+  })
+  let group_disabled = fn() -> Bool {
+    label() == "" || disabled() || hand.get() != TipHeld::Free || shut.get() || pressed_now()
+  }
+  group.trigger(
+    anchor,
+    owner,
+    disabled=group_disabled,
+    within=within,
+    repeats=repeats,
+    open_delay_ms=delay,
+    hovered=over_now,
+  )
+  // (made in its layer as it is first shown there, held there for its control, let go with it or the layer)
+  let holder_v : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let holder_live = fn() -> Bool {
+    match holder_v.v {
+      Some(h) => h.alive()
+      None => false
+    }
+  }
+  let stop_lifted = fn() {
+    let f = lifted_end.v
+    lifted_end.v = fn() { () }
+    f()
+  }
+  let close_tip : signals::Ref[() -> Unit] = view::ref_new(fn() { () })
+  // (hidden at once, nothing of it going on: the layer dismissed or let go; open cleared before group/hand so
+  // reactions do not start a fade-out transition)
+  let hide_now = fn() {
+    fade.put(0.0)
+    glide.still()
+    stop_lifted()
+    if open.untracked() {
+      open.set(false)
+    }
+    if hand.untracked() != TipHeld::Free {
+      hand.set(TipHeld::Free)
+    }
+    if same_tip_owner(group_slot.untracked(), Some(owner)) {
+      group_slot.set(None)
+    }
+    if !skip {
+      group.dismiss()
+    }
+  }
+  tips.entries.v.push((owner, hide_now))
+  let make = fn() -> Bool {
+    let l = match tips.layer_now() {
+      Some(l) => l
+      None => return false
+    }
+    let holder = l.box(fn(h : view::View) { let _ = h.transitions_only().over(view::Live::Is(true)) }).lives_with(anchor)
+    holder_v.v = Some(holder)
+    let _ = holder.owns(fn() {
+      match holder_v.v {
+        Some(m) => if m.id() == holder.id() { holder_v.v = None }
+        None => ()
+      }
+      hide_now()
+      if same_tip_owner(tips.seen.untracked(), Some(owner)) {
+        tips.seen.set(None)
+      }
+    })
+    // (Escape while it shows: its, before the app's keymap and what is under it are asked)
+    let _ = holder.on_key_first(fn(k : view::Key) -> Bool {
+      if k.code == ui::key_escape && k.mods == 0 && signals::untracked(fn() { open.get() && tips.owns(owner) }) {
+        (close_tip.v)()
+        true
+      } else {
+        false
+      }
+    })
+    holder.show(fn() { open.get() }, leave=motion::pop_out_ms, fn(t : view::View) {
+      let _ = t.over(view::Live::Is(true))
+      let _ = headless::tooltip_bubble(t, label, fn(b : view::View) {
+        tip_look_node(b, tips.seen, anchor_id, side, along, label, shortcut, fade, glide, gap, edge_pad, at_pointer, owner, look)
+      })
+    })
+    true
+  }
+  let set_shown = fn(on : Bool) {
+    match holder_v.v {
+      Some(h) if h.alive() => view::transition(within=h, fn() { open.set(on) })
+      _ => open.set(on)
+    }
+  }
+  let set_open = fn(on : Bool) {
+    if on == open.untracked() {
+      return
+    }
+    if on && repeats && !anchor.words_cut_now() {
+      return
+    }
+    let at = anchor.cause_at()
+    if on {
+      // (no layer to be shown in: nothing of it set going, shown the next time it is asked once there is one)
+      if !holder_live() && !make() {
+        return
+      }
+      // (another of the layer's showing or gone a moment ago, on the same side: taken over from where it is drawn
+      // now, before this one takes the layer's slot from it)
+      let taken = glide.came(at, motion::hand_spring, takes=skip && !at_pointer)
+      tips.claim(owner)
+      match taken {
+        Some(_) => fade.put(1.0)
+        None => fade.go(anchor, 1.0, at, tip_in_ms, ui::Ease::Out)
+      }
+    } else {
+      fade.go(anchor, 0.0, at, motion::pop_out_ms, ui::Ease::Leave)
+      glide.left(at)
+    }
+    set_shown(on)
+  }
+  // (opened on its control (TipHand::open): the window's taps then, shut by the one after it)
+  let opened_at = view::ref_new(0)
+  let hand_state = fn() -> (TipHeld, Int, Bool, Bool) {
+    let held = hand.get()
+    if held == TipHeld::Free {
+      (TipHeld::Free, 0, true, true)
+    } else {
+      (
+        held,
+        match held {
+          Lifted => anchor.window_downs()
+          Opened => anchor.window_taps()
+          _ => 0
+        },
+        anchor.takes_input(),
+        label() != "" && !disabled(),
+      )
+    }
+  }
+  let hand_before : signals::Ref[(TipHeld, Int)] = view::ref_new((TipHeld::Free, 0))
+  anchor.reacts(hand_state, at_start=false, fn(s : (TipHeld, Int, Bool, Bool)) {
+    let (held, n, takes, says) = s
+    let (was_held, was_n) = hand_before.v
+    hand_before.v = (held, n)
+    if held == TipHeld::Free {
+      return
+    }
+    if held == was_held && n != was_n {
+      if held == TipHeld::Lifted {
+        stop_lifted()
+        hand.set(TipHeld::Free)
+        return
+      }
+      if held == TipHeld::Opened && n > opened_at.v + 1 {
+        hand.set(TipHeld::Free)
+        return
+      }
+    }
+    if !says || !takes {
+      stop_lifted()
+      hand.set(TipHeld::Free)
+    }
+  })
+  anchor.reacts(
+    fn() -> Bool {
+      group.is_open(owner) ||
+      (hand.get() != TipHeld::Free && anchor.takes_input() && label() != "" && !disabled())
+    },
+    at_start=false,
+    fn(want : Bool) {
+      if want && holder_live() && open.untracked() {
+        tips.claim(owner)
+      }
+      set_open(want)
+    },
+  )
+  // (a new cause on a still-open control reclaims the layer's slot)
+  anchor.reacts(fn() { (over_now(), anchor.focus_shown()) }, at_start=false, fn(st : (Bool, Bool)) {
+    let (over, focused) = st
+    let still = fn() -> Bool {
+      anchor.takes_input() && label() != "" && !disabled() && !pressed_now() && !shut.get()
+    }
+    if (over || focused) && holder_live() && open.untracked() && signals::untracked(still) {
+      tips.claim(owner)
+    }
+  })
+  // (input taken again (a modal layer gone) while the keyboard's focus still shows on it: shown again)
+  anchor.reacts(fn() -> Bool { anchor.takes_input() }, at_start=false, fn(takes : Bool) {
+    let shows = fn() -> Bool {
+      anchor.focus_shown() &&
+      label() != "" &&
+      !disabled() &&
+      hand.get() == TipHeld::Free &&
+      !shut.get() &&
+      !pressed_now()
+    }
+    if takes && signals::untracked(shows) {
+      group_slot.set(Some(owner))
+      set_open(true)
+    }
+  })
+  // (made for a control the keyboard's focus already shows on: shown at once)
+  if signals::untracked(fn() { anchor.focus_shown() && anchor.takes_input() && label() != "" && !disabled() }) {
+    group_slot.set(Some(owner))
+    set_open(true)
+  }
+  close_tip.v = fn() {
+    if same_tip_owner(group_slot.untracked(), Some(owner)) {
+      group_slot.set(None)
+    }
+    if hand.untracked() != TipHeld::Free {
+      stop_lifted()
+      hand.set(TipHeld::Free)
+    }
+    if open.untracked() {
+      set_open(false)
+    }
+  }
+  // (its control let go: nothing of it left pending)
+  let _ = anchor.owns(fn() {
+    fade.stop()
+    glide.gone()
+    stop_lifted()
+    close_tip.v = fn() { () }
+    let kept : Array[(headless::TipOwner, () -> Unit)] = []
+    for e in tips.entries.v {
+      if e.0 != owner {
+        kept.push(e)
+      }
+    }
+    tips.entries.v = kept
+    if same_tip_owner(tips.seen.untracked(), Some(owner)) {
+      tips.seen.set(None)
+    }
+  })
+  TipHand::{
+    hold: fn() {
+      stop_lifted()
+      hand.set(TipHeld::Held)
+    },
+    cancel: fn() {
+      stop_lifted()
+      hand.set(TipHeld::Free)
+    },
+    open: fn(tapped : Bool) {
+      stop_lifted()
+      let now = signals::untracked(fn() { anchor.window_taps() })
+      opened_at.v = if tapped { now } else { now - 1 }
+      hand.set(TipHeld::Opened)
+    },
+    opened: fn() { hand.untracked() == TipHeld::Opened },
+    lift: fn() {
+      if hand.untracked() == TipHeld::Held {
+        hand.set(TipHeld::Lifted)
+        lifted_end.v = anchor.at_moment(anchor.cause_at() + headless::tooltip_lifted_ms, fn() { hand.set(TipHeld::Free) })
+      }
+    },
+  }
+}
+
+/// A tip's node `t` as `look` says, beside `anchor`, saying `label` then the caps of `shortcut`'s keys (as they
+/// change); in and out as `fade` says (its ground the first half of the way in, its words the second; going, the other
+/// way round), its ground and words handed on among the layer's tips as `glide` says.
+fn tip_look_node(
+  t : view::View,
+  seen : signals::Signal[Option[headless::TipOwner]],
+  anchor : view::NodeId,
+  side : view::Side,
+  along : view::Along,
+  label : () -> String,
+  shortcut : () -> String,
+  fade : TipFade,
+  glide : motion::HandPart,
+  gap : Double,
+  edge_pad : Double,
+  at_pointer : Bool,
+  owner : headless::TipOwner,
+  look : () -> TipLook,
+) -> Unit {
+  let way = fade.way
+  let moving = fade.moving
+  let owns_now = fn() -> Bool { same_tip_owner(seen.get(), Some(owner)) }
+  let has_keys = fn() -> Bool { !key_caps(shortcut()).is_empty() }
+  let _ = t
+  .beside(anchor, side=side, along=along, offset=gap, padding=edge_pad, at_pointer=at_pointer)
+  .points(view::Live::Is(false))
+  .padding(view::Live::By(fn() {
+    let lk = look()
+    if has_keys() {
+      (lk.pad_x, lk.cap_in, lk.cap_in, lk.cap_in)
+    } else {
+      (lk.pad_x, lk.pad_y, lk.pad_x, lk.pad_y)
+    }
+  }))
+  .max_width(view::Live::By(fn() { Some(look().max_width) }))
+  .radius(view::Live::By(fn() {
+    let lk = look()
+    if lk.radius >= 0.0 { lk.radius } else { (lk.line + 2.0 * lk.pad_y) / 2.0 }
+  }))
+  .ground(view::Live::By(fn() { look().ground }))
+  .edge(view::Live::By(fn() { if owns_now() { look().edge } else { (0.0, 0L) } }))
+  .shadow(view::Live::By(fn() { if owns_now() { look().shadow } else { (0.0, 0.0, 0L) } }))
+  .shadow_outside(view::Live::Is(true))
+  .alpha(view::Live::By(fn() {
+    let a = if owns_now() { tip_fade_shown(way, moving, t) } else { 0.0 }
+    if a * 2.0 < 1.0 { a * 2.0 } else { 1.0 }
+  }))
+  .scale(view::Live::By(fn() {
+    let lk = look()
+    let s = if way.get().to > 0.5 { lk.scale_from } else { lk.exit_scale }
+    s + (1.0 - s) * tip_fade_shown(way, moving, t)
+  }), about=view::Pivot::FromBeside)
+  .hides(view::Live::By(fn() { !owns_now() }))
+  let words_look = fn(lk : TipLook) -> view::WordsLook {
+    view::WordsLook::{ ..view::words_plain, size: lk.size, weight: lk.weight, line: lk.line, wrap: lk.wrap }
+  }
+  let _ = t.box(fn(w : view::View) {
+    // (its words alone, or its words then its keys' caps on its words' first line, the words `cap_over` from the
+    // caps' top and foot: made again as its keys change)
+    w.switch_by(fn() { shortcut() }, fn(row : view::View, keys_said : String) {
+      let keys = key_caps(keys_said)
+      if keys.is_empty() {
+        let _ = row
+        .words(view::Live::By(label))
+        .words_look(view::Live::By(fn() { words_look(look()) }))
+        .ink(view::Live::By(fn() { look().ink }))
+        return
+      }
+      let _ = row
+      .row(view::Live::Is(true))
+      .gap(view::Live::By(fn() { look().cap_label_gap }))
+      .lines_up(view::Live::Is(Some(view::Along::Start)))
+      let _ = row.box(fn(l : view::View) {
+        let _ = l
+        .margin(view::Live::By(fn() {
+          let o = look().cap_over
+          (0.0, o, 0.0, o)
+        }))
+        .shrink(view::Live::Is(1.0))
+        .words(view::Live::By(label))
+        .words_look(view::Live::By(fn() { words_look(look()) }))
+        .ink(view::Live::By(fn() { look().ink }))
+      })
+      let _ = row.box(fn(q : view::View) {
+        let _ = q.row(view::Live::Is(true)).gap(view::Live::By(fn() { look().cap_gap })).lines_up(view::Live::Is(Some(view::Along::Start)))
+        for cap in keys {
+          tip_cap_node(q, cap, look)
+        }
+      })
+    })
+    // (its ground handed on among the layer's tips, its words with it)
+    glide.draws(t, carries=w)
+    let _ = w.alpha(view::Live::By(fn() {
+      // (of its ground's: what of the words shows over as much of the ground as there is)
+      let a = tip_fade_shown(way, moving, t)
+      let ground = if a * 2.0 < 1.0 { a * 2.0 } else { 1.0 }
+      let words = if a * 2.0 - 1.0 > 0.0 { a * 2.0 - 1.0 } else { 0.0 }
+      if ground > 0.0 { words / ground } else { 0.0 }
+    }))
+  })
+}
+
+/// A key's cap in a tip's row of them: `cap` in the middle of a box as tall as the tip's words' line and `cap_over`
+/// over and under it, at least as wide, `cap_radius` round (below zero: fully).
+fn tip_cap_node(parent : view::View, cap : String, look : () -> TipLook) -> Unit {
+  let _ = parent.box(fn(k : view::View) {
+    let side = fn() -> Double {
+      let lk = look()
+      lk.line + 2.0 * lk.cap_over
+    }
+    let _ = k
+    .row(view::Live::Is(true))
+    .lines_up(view::Live::Is(Some(view::Along::Middle)))
+    .lies_along(view::Live::Is(view::Lies::Middle))
+    .padding(view::Live::By(fn() {
+      let p = look().cap_pad_x
+      (p, 0.0, p, 0.0)
+    }))
+    .height(view::Live::By(fn() { Some(side()) }))
+    .min_width(view::Live::By(fn() { Some(side()) }))
+    .radius(view::Live::By(fn() {
+      let r = look().cap_radius
+      if r >= 0.0 { r } else { side() / 2.0 }
+    }))
+    .ground(view::Live::By(fn() { look().cap_ground }))
+    let _ = k.box(fn(w : view::View) {
+      let _ = w
+      .words(view::Live::Is(cap))
+      .words_look(view::Live::By(fn() {
+        let lk = look()
+        view::WordsLook::{ ..view::words_plain, size: lk.cap_size, weight: lk.cap_weight, line: lk.cap_line, wrap: false }
+      }))
+      .ink(view::Live::By(fn() { look().cap_ink }))
+    })
+  })
+}
+
+let key_marks : Array[String] = ["⌃", "⌥", "⇧", "⌘"]
+
+fn key_mark_at(s : String, at : Int) -> Option[String] {
+  for m in key_marks {
+    let n = m.length()
+    if at + n <= s.length() && s.view(at, at + n).to_string() == m {
+      return Some(m)
+    }
+  }
+  None
+}
+
+/// The keys of a shortcut, each a cap of its own: Apple marks (⌃ ⌥ ⇧ ⌘) one cap each and the key after them one
+/// (`⌘⇧F`, `⌘ Enter`); otherwise each part between `+` (`Ctrl+Shift+F`, `Ctrl + K`), a `+` where a part would be
+/// empty the key itself (`Ctrl++`, `Ctrl + +`). None for none.
+pub fn key_caps(keys : String) -> Array[String] {
+  let caps : Array[String] = []
+  let s = keys.trim()
+  let n = s.length()
+  if n == 0 {
+    return caps
+  }
+  match key_mark_at(s, 0) {
+    Some(_) => {
+      let mut at = 0
+      let mut more = true
+      while more {
+        match key_mark_at(s, at) {
+          Some(m) => {
+            caps.push(m)
+            at = at + m.length()
+          }
+          None => more = false
+        }
+      }
+      let key = s.view(at, n).to_string().trim()
+      if key != "" {
+        caps.push(key)
+      }
+      return caps
+    }
+    None => ()
+  }
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if s.code_unit_at(i) == 43 {
+      let part = s.view(start, i).to_string().trim()
+      if part != "" {
+        caps.push(part)
+        start = i + 1
+      }
+    }
+    i += 1
+  }
+  let last = s.view(start, n).to_string().trim()
+  if last != "" {
+    caps.push(last)
+  }
+  caps
+}
