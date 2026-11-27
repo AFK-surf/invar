@@ -258,7 +258,7 @@ static const char *shader_src =
     "#ifndef ONE_KIND\n"
     "#define ONE_KIND -1\n"
     "#endif\n"
-    "cbuffer U : register(b0) { float2 vp; float scale; float pad; float2 origin; float2 _pad2; };\n"
+    "cbuffer U : register(b0) { float2 vp; float scale; float inv_atlas; float2 origin; float2 _pad2; };\n"
     "// glass (src/ui/glass.mbt): where a point is in the blurred copy under it (uv = p * gmap.xy + gmap.zw, kept in guvc),\n"
     "// a liquid group's bounds, shapes, corners (x of each), how many\n"
     "cbuffer G : register(b1) { float4 gmap; float4 guvc; float4 ggb; float4 gshape[8]; float4 grad[8]; float4 gmisc; float4 gad_box[16]; float4 gad_meta; };\n"
@@ -312,6 +312,89 @@ static const char *shader_src =
     "  return o;\n"
     "}\n"
     MB_CORNER_SL
+    "#if ONE_KIND == 4\n"
+    "float mb_cr(float x) {\n"
+    "  x = abs(x);\n"
+    "  if (x >= 2.0) return 0.0;\n"
+    "  if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;\n"
+    "  return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;\n"
+    "}\n"
+    "void mb_cr5(float tc, float inv_sz, float s, out float u[5], out float w[5]) {\n"
+    "  float c = floor(tc), f = tc - c, is = 1.0 / s;\n"
+    "  float k0 = mb_cr((-3.0 - f) * is), k1 = mb_cr((-2.0 - f) * is);\n"
+    "  float k2 = mb_cr((-1.0 - f) * is), k3 = mb_cr(( 0.0 - f) * is);\n"
+    "  float k4 = mb_cr(( 1.0 - f) * is), k5 = mb_cr(( 2.0 - f) * is);\n"
+    "  float k6 = mb_cr(( 3.0 - f) * is), k7 = mb_cr(( 4.0 - f) * is);\n"
+    "  float wA = k0 + k1, wC = k3 + k4, wE = k6 + k7;\n"
+    "  float sum = wA + k2 + wC + k5 + wE;\n"
+    "  float norm = sum > 1e-6 ? 1.0 / sum : 1.0;\n"
+    "  u[0] = (c - 2.5 + (wA < -1e-6 ? k1 / wA : 0.0)) * inv_sz;\n"
+    "  u[1] = (c - 0.5) * inv_sz;\n"
+    "  u[2] = (c + 0.5 + (wC >  1e-6 ? k4 / wC : 0.0)) * inv_sz;\n"
+    "  u[3] = (c + 2.5) * inv_sz;\n"
+    "  u[4] = (c + 3.5 + (wE < -1e-6 ? k7 / wE : 0.0)) * inv_sz;\n"
+    "  w[0] = wA * norm; w[1] = k2 * norm; w[2] = wC * norm; w[3] = k5 * norm; w[4] = wE * norm;\n"
+    "}\n"
+    "float4 mb_sample_pic(float2 uv, float2 dudx, float2 dudy) {\n"
+    "  uint tw, th, mips;\n"
+    "  img.GetDimensions(0, tw, th, mips);\n"
+    "  float2 sz = float2(tw, th);\n"
+    "  float2 rate = float2(length(dudx * sz), length(dudy * sz));\n"
+    "  if (max(abs(rate.x - 1.0), abs(rate.y - 1.0)) < 0.005)\n"
+    "    return img.SampleLevel(samp, uv, 0.0);\n"
+    "  if (max(rate.x, rate.y) <= 1.005) {\n"
+    "    float2 pos = uv * sz - 0.5;\n"
+    "    float2 tc = floor(pos), f = pos - tc;\n"
+    "    float2 f2 = f * f, f3 = f2 * f;\n"
+    "    float2 w0 = -0.5 * f3 + f2 - 0.5 * f;\n"
+    "    float2 w1 =  1.5 * f3 - 2.5 * f2 + 1.0;\n"
+    "    float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;\n"
+    "    float2 w3 =  0.5 * f3 - 0.5 * f2;\n"
+    "    float2 w12 = w1 + w2;\n"
+    "    float2 t0 = (tc - 0.5) / sz;\n"
+    "    float2 t12 = (tc + 0.5 + w2 / w12) / sz;\n"
+    "    float2 t3 = (tc + 2.5) / sz;\n"
+    "    float4 c =\n"
+    "      (img.SampleLevel(samp, float2(t0.x,  t0.y),  0.0) * w0.x  +\n"
+    "       img.SampleLevel(samp, float2(t12.x, t0.y),  0.0) * w12.x +\n"
+    "       img.SampleLevel(samp, float2(t3.x,  t0.y),  0.0) * w3.x)  * w0.y +\n"
+    "      (img.SampleLevel(samp, float2(t0.x,  t12.y), 0.0) * w0.x  +\n"
+    "       img.SampleLevel(samp, float2(t12.x, t12.y), 0.0) * w12.x +\n"
+    "       img.SampleLevel(samp, float2(t3.x,  t12.y), 0.0) * w3.x)  * w12.y +\n"
+    "      (img.SampleLevel(samp, float2(t0.x,  t3.y),  0.0) * w0.x  +\n"
+    "       img.SampleLevel(samp, float2(t12.x, t3.y),  0.0) * w12.x +\n"
+    "       img.SampleLevel(samp, float2(t3.x,  t3.y),  0.0) * w3.x)  * w3.y;\n"
+    "    c.a = saturate(c.a);\n"
+    "    c.rgb = clamp(c.rgb, 0.0, c.a);\n"
+    "    return c;\n"
+    "  }\n"
+    "  float rmin = min(rate.x, rate.y);\n"
+    "  uint L = (mips > 1 && rmin > 2.0) ? min((uint)max(0.0, ceil(log2(rmin)) - 1.0), mips - 1) : 0;\n"
+    "  uint mw, mh, nl;\n"
+    "  img.GetDimensions(L, mw, mh, nl);\n"
+    "  float2 msz = float2(mw, mh);\n"
+    "  float2 s = float2(length(dudx * msz), length(dudy * msz));\n"
+    "  if (max(s.x, s.y) > 2.05) return img.SampleGrad(samp, uv, dudx, dudy);\n"
+    "  float ux[5], wx[5], uy[5], wy[5];\n"
+    "  mb_cr5(uv.x * msz.x - 0.5, 1.0 / msz.x, max(s.x, 1.0), ux, wx);\n"
+    "  mb_cr5(uv.y * msz.y - 0.5, 1.0 / msz.y, max(s.y, 1.0), uy, wy);\n"
+    "  float4 c = float4(0.0, 0.0, 0.0, 0.0);\n"
+    "  float lv = (float)L;\n"
+    "  [unroll] for (int j = 0; j < 5; j++) {\n"
+    "    float4 row = float4(0.0, 0.0, 0.0, 0.0);\n"
+    "    [unroll] for (int i = 0; i < 5; i++)\n"
+    "      row += img.SampleLevel(samp, float2(ux[i], uy[j]), lv) * wx[i];\n"
+    "    c += row * wy[j];\n"
+    "  }\n"
+    "  c.a = saturate(c.a);\n"
+    "  c.rgb = clamp(c.rgb, 0.0, c.a);\n"
+    "  return c;\n"
+    "}\n"
+    "#else\n"
+    "float4 mb_sample_pic(float2 uv, float2 dudx, float2 dudy) {\n"
+    "  return img.SampleGrad(samp, uv, dudx, dudy);\n"
+    "}\n"
+    "#endif\n"
     "float sd_rr(float2 p, float4 r, float4 rad) {\n"
     "  float2 hs = r.zw * 0.5;\n"
     "  return mb_sd_box(p - r.xy - hs, hs, mb_corner_of(p - r.xy - hs, rad), 1e9);\n"
@@ -679,7 +762,7 @@ static const char *shader_src =
     "    float2 r0 = I.rect.xy * scale, r0i = floor(r0 + 0.5);\n"
     "    bool exact = kind == 1 && max(off.x, off.y) <= 0.5 && max(abs(r0.x - r0i.x), abs(r0.y - r0i.y)) <= 0.05 && I.prm.x == 0.0;\n"
     "    float2 tex = exact ? floor(p * scale - r0i) + 0.5 : (p - I.rect.xy) / I.rect.zw * I.c2.zw;\n"
-    "    float2 uv = clamp(I.c2.xy + tex, I.c2.xy + 0.5, I.c2.xy + I.c2.zw - 0.5) / 4096.0;\n"
+    "    float2 uv = clamp(I.c2.xy + tex, I.c2.xy + 0.5, I.c2.xy + I.c2.zw - 0.5) * inv_atlas;\n"
     "    float4 t = atlas.SampleLevel(samp, uv, 0);\n"
     "    if (kind == 1) {\n"
     "      // (a mask drawn in gray has its three the same as its alpha: as before; a glyph drawn larger or smaller than\n"
@@ -1526,7 +1609,7 @@ static const char *shader_src =
     "    float2 uv = I.c2.xy + saturate((p - I.rect.xy) / I.rect.zw) * I.c2.zw;\n"
     "    float2 dudx = ddx(p) / max(I.rect.zw, 1e-6) * I.c2.zw;\n"
     "    float2 dudy = ddy(p) / max(I.rect.zw, 1e-6) * I.c2.zw;\n"
-    "    float4 pic = img.SampleGrad(samp, saturate(uv), dudx, dudy);\n"
+    "    float4 pic = mb_sample_pic(saturate(uv), dudx, dudy);\n"
     "    float edge = saturate(0.5 - d * scale);\n"
     "    if (I.pd.z > 0.5) {\n"
     "      // Only picture edges inside the frame cut it; the frame's clip covers shared edges once.\n"
@@ -1897,7 +1980,7 @@ static const char *prog_src =
 
 // Separate HLSL source for the lossless axis-aligned rect fast path (kept outside shader_src so baked shader keys stay intact).
 static const char *rect_src =
-    "cbuffer U : register(b0) { float2 vp; float scale; float pad; float2 origin; float2 _pad2; };\n"
+    "cbuffer U : register(b0) { float2 vp; float scale; float inv_atlas; float2 origin; float2 _pad2; };\n"
     "struct VOut { float4 pos : SV_Position; nointerpolation float4 rot : ROT;\n"
     "  nointerpolation float4 rect : INST0; nointerpolation float4 prm : INST1;\n"
     "  nointerpolation float4 color : INST2; nointerpolation float4 c2 : INST3;\n"
@@ -2101,24 +2184,6 @@ extern "C" void invar_win_shader_stats_reset(void) {
 
 static ID3DBlob *compile(const char *entry, const char *target, const char *src = shader_src,
                          const D3D_SHADER_MACRO *defines = NULL) {
-  char *patched = NULL;
-  if (src == shader_src && mb_atlas_size != 4096) {
-    const char *needle = "/ 4096.0;";
-    const char *hit = strstr(src, needle);
-    if (hit) {
-      char repl[32];
-      snprintf(repl, sizeof repl, "/ %d.0;", mb_atlas_size);
-      size_t nlen = strlen(needle), rlen = strlen(repl), slen = strlen(src);
-      patched = (char *)malloc(slen - nlen + rlen + 1);
-      if (patched) {
-        size_t pre = (size_t)(hit - src);
-        memcpy(patched, src, pre);
-        memcpy(patched + pre, repl, rlen);
-        memcpy(patched + pre + rlen, hit + nlen, slen - pre - nlen + 1);
-        src = patched;
-      }
-    }
-  }
   UINT64 key = shader_fnv(src, strlen(src), shader_fnv_start);
   key = shader_fnv(entry, strlen(entry) + 1, key);
   key = shader_fnv(target, strlen(target) + 1, key);
@@ -2143,7 +2208,6 @@ static ID3DBlob *compile(const char *entry, const char *target, const char *src 
             &made, &took);
         if (!why && made == baked_shaders[i].size && took == baked_shaders[i].zsize) {
           InterlockedIncrement(&shader_baked_hits);
-          free(patched);
           return blob;
         }
         fprintf(stderr, "baked shader %016llx: %s\n", (unsigned long long)key, why ? why : "size mismatch");
@@ -2157,7 +2221,6 @@ static ID3DBlob *compile(const char *entry, const char *target, const char *src 
     ID3DBlob *was = shader_kept(path);
     if (was) {
       InterlockedIncrement(&shader_disk_hits);
-      free(patched);
       return was;
     }
   }
@@ -2170,7 +2233,6 @@ static ID3DBlob *compile(const char *entry, const char *target, const char *src 
     InterlockedIncrement(&shader_runtime_compiles);
     if (kept) shader_keep(path, code);
   }
-  free(patched);
   return code;
 }
 
@@ -2184,8 +2246,8 @@ static HRESULT make_device(D3D_DRIVER_TYPE type, UINT flags) {
 // other visual, under it, holds the native views, the composition's device made with the first; 0 (nothing made) where
 // that cannot be had. MBUI_NO_DCOMP=1: not tried.
 static int make_composed(IDXGIDevice1 *xdev, HWND hwnd) {
-  const char *no = getenv("MBUI_NO_DCOMP");
-  if (no && *no && *no != '0') return 0;
+  const wchar_t *no = mb_win_env(L"MBUI_NO_DCOMP");
+  if (no && *no && *no != L'0') return 0;
   RECT rc;
   GetClientRect(hwnd, &rc);
   DXGI_SWAP_CHAIN_DESC1 sd = {};
@@ -2292,8 +2354,8 @@ static DWORD WINAPI warm_make(LPVOID) {
 }
 static struct WarmStart {
   WarmStart() {
-    const char *no = getenv("MBUI_NO_WARM");
-    if (no && *no && *no != '0') return;
+    const wchar_t *no = mb_win_env(L"MBUI_NO_WARM");
+    if (no && *no && *no != L'0') return;
     warm_thread = CreateThread(NULL, 0, warm_make, NULL, 0, NULL);
   }
 } warm_start;
@@ -2458,14 +2520,19 @@ static volatile LONG kinds_ready;
 
 static DWORD WINAPI make_kinds(void *arg) {
   ID3D11Device *d = (ID3D11Device *)arg;
-  for (int k = 0; k < MB_KINDS; k++) {
+  // Compile kind 4 (images, Catmull-Rom resampler) first and publish each shader as soon as it is ready.
+  static const int order[] = {4, 0, 1, 2, 3, 5, 6, 7, 8, 10, 11, MB_KIND_LIQUID_SINGLE};
+  for (int i = 0; i < (int)(sizeof order / sizeof order[0]); i++) {
+    int k = order[i];
     if (!has_own_ps(k)) continue;
     char one[8];
     snprintf(one, sizeof one, "%d", k);
     D3D_SHADER_MACRO defines[2] = {{"ONE_KIND", one}, {NULL, NULL}};
     ID3DBlob *code = compile("fmain", "ps_4_0", shader_src, defines);
     if (code) {
-      d->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), NULL, &kps[k]);
+      ID3D11PixelShader *s = NULL;
+      if (SUCCEEDED(d->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), NULL, &s)))
+        InterlockedExchangePointer((PVOID *)&kps[k], s);
       code->Release();
     }
   }
@@ -2475,7 +2542,9 @@ static DWORD WINAPI make_kinds(void *arg) {
 
 // The pixel shader that draws a run of instances of `kind`.
 static ID3D11PixelShader *kind_ps(int kind) {
-  return has_own_ps(kind) && InterlockedCompareExchange(&kinds_ready, 1, 1) && kps[kind] ? kps[kind] : ps;
+  if (!has_own_ps(kind)) return ps;
+  ID3D11PixelShader *s = (ID3D11PixelShader *)InterlockedCompareExchangePointer((PVOID *)&kps[kind], NULL, NULL);
+  return s ? s : ps;
 }
 
 // The shaders, buffers, atlas and states every target is drawn with (the window's, the offscreen one).
@@ -3931,7 +4000,8 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
     ctx->ClearRenderTargetView(target, clear);
     if (count <= 0) return;
   }
-  struct { float vp[2]; float scale; float pad; float origin[2]; float pad2[2]; } u = {{(float)vw, (float)vh}, (float)vscale, 0, {0, 0}, {0, 0}};
+  struct { float vp[2]; float scale; float inv_atlas; float origin[2]; float pad2[2]; } u = {
+    {(float)vw, (float)vh}, (float)vscale, 1.0f / (float)mb_atlas_size, {0, 0}, {0, 0}};
   ctx->UpdateSubresource(ubuf, 0, NULL, &u, 0, 0);
   segs_upload(f, count);
   // (logical points to the target's pixels, as the vertex shader maps them: u.vp over pw × ph)
@@ -4206,8 +4276,8 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
         D3D11_VIEWPORT lvp = {0, 0, (float)lpw, (float)lph, 0, 1};
         ctx->RSSetViewports(1, &lvp);
         ctx->RSSetState(raster);
-        struct { float vp[2]; float scale; float pad; float origin[2]; float pad2[2]; } lu = {
-          {(float)lpw / sc_f, (float)lph / sc_f}, sc_f, 0, {ox, oy}, {0, 0}};
+        struct { float vp[2]; float scale; float inv_atlas; float origin[2]; float pad2[2]; } lu = {
+          {(float)lpw / sc_f, (float)lph / sc_f}, sc_f, 1.0f / (float)mb_atlas_size, {ox, oy}, {0, 0}};
         ctx->UpdateSubresource(ubuf, 0, NULL, &lu, 0, 0);
         ctx->PSSetShaderResources(0, 1, &atlas_srv);
         ctx->PSSetShaderResources(2, 1, &atlas_srv);
@@ -4931,6 +5001,7 @@ void mb_render_pace(void) {
 static ID3D11Texture2D *off_target;
 
 extern "C" int mb_render_init_offscreen(double w, double h, double scale) {
+  init_render_knobs();
   CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
   // (the start's device let go of: drawn here by WARP's alone; what its pipeline holds of it is left, a run's)
   if (warm_taken()) {

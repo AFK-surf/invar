@@ -857,6 +857,7 @@
   uniform vec2 u_origin;
   uniform sampler2D u_atlas;
   uniform sampler2D u_img;
+  uniform int u_img_mips;
   // glass (src/ui/glass.mbt): the blurred copy under it and where a point is in it (uv = p * u_map.xy + u_map.zw, kept
   // in u_uvc), a liquid group's shapes and corners, how many
   uniform highp sampler2D u_bd;
@@ -877,6 +878,86 @@
   uniform highp sampler2D u_segs;
   out vec4 o;
   ${CORNERS}
+  #if ONE_KIND == 4
+  float mb_cr(float x) {
+    x = abs(x);
+    if (x >= 2.0) return 0.0;
+    if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
+    return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+  }
+  void mb_cr5(float tc, float inv_sz, float s, out float u[5], out float w[5]) {
+    float c = floor(tc), f = tc - c, is = 1.0 / s;
+    float k0 = mb_cr((-3.0 - f) * is), k1 = mb_cr((-2.0 - f) * is);
+    float k2 = mb_cr((-1.0 - f) * is), k3 = mb_cr(( 0.0 - f) * is);
+    float k4 = mb_cr(( 1.0 - f) * is), k5 = mb_cr(( 2.0 - f) * is);
+    float k6 = mb_cr(( 3.0 - f) * is), k7 = mb_cr(( 4.0 - f) * is);
+    float wA = k0 + k1, wC = k3 + k4, wE = k6 + k7;
+    float sum = wA + k2 + wC + k5 + wE;
+    float norm = sum > 1e-6 ? 1.0 / sum : 1.0;
+    u[0] = (c - 2.5 + (wA < -1e-6 ? k1 / wA : 0.0)) * inv_sz;
+    u[1] = (c - 0.5) * inv_sz;
+    u[2] = (c + 0.5 + (wC >  1e-6 ? k4 / wC : 0.0)) * inv_sz;
+    u[3] = (c + 2.5) * inv_sz;
+    u[4] = (c + 3.5 + (wE < -1e-6 ? k7 / wE : 0.0)) * inv_sz;
+    w[0] = wA * norm; w[1] = k2 * norm; w[2] = wC * norm; w[3] = k5 * norm; w[4] = wE * norm;
+  }
+  vec4 mb_sample_pic(vec2 uv, vec2 dudx, vec2 dudy) {
+    vec2 sz = vec2(textureSize(u_img, 0));
+    vec2 rate = vec2(length(dudx * sz), length(dudy * sz));
+    if (max(abs(rate.x - 1.0), abs(rate.y - 1.0)) < 0.005)
+      return textureLod(u_img, uv, 0.0);
+    if (max(rate.x, rate.y) <= 1.005) {
+      vec2 pos = uv * sz - 0.5;
+      vec2 tc = floor(pos), f = pos - tc;
+      vec2 f2 = f * f, f3 = f2 * f;
+      vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+      vec2 w1 =  1.5 * f3 - 2.5 * f2 + 1.0;
+      vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+      vec2 w3 =  0.5 * f3 - 0.5 * f2;
+      vec2 w12 = w1 + w2;
+      vec2 t0 = (tc - 0.5) / sz;
+      vec2 t12 = (tc + 0.5 + w2 / w12) / sz;
+      vec2 t3 = (tc + 2.5) / sz;
+      vec4 c =
+        (textureLod(u_img, vec2(t0.x,  t0.y),  0.0) * w0.x  +
+         textureLod(u_img, vec2(t12.x, t0.y),  0.0) * w12.x +
+         textureLod(u_img, vec2(t3.x,  t0.y),  0.0) * w3.x)  * w0.y +
+        (textureLod(u_img, vec2(t0.x,  t12.y), 0.0) * w0.x  +
+         textureLod(u_img, vec2(t12.x, t12.y), 0.0) * w12.x +
+         textureLod(u_img, vec2(t3.x,  t12.y), 0.0) * w3.x)  * w12.y +
+        (textureLod(u_img, vec2(t0.x,  t3.y),  0.0) * w0.x  +
+         textureLod(u_img, vec2(t12.x, t3.y),  0.0) * w12.x +
+         textureLod(u_img, vec2(t3.x,  t3.y),  0.0) * w3.x)  * w3.y;
+      c.a = clamp(c.a, 0.0, 1.0);
+      c.rgb = clamp(c.rgb, 0.0, c.a);
+      return c;
+    }
+    float rmin = min(rate.x, rate.y);
+    int mips = max(u_img_mips, 1);
+    int L = (mips > 1 && rmin > 2.0) ? min(int(max(0.0, ceil(log2(rmin)) - 1.0)), mips - 1) : 0;
+    vec2 msz = vec2(textureSize(u_img, L));
+    vec2 s = vec2(length(dudx * msz), length(dudy * msz));
+    if (max(s.x, s.y) > 2.05) return textureGrad(u_img, uv, dudx, dudy);
+    float ux[5], wx[5], uy[5], wy[5];
+    mb_cr5(uv.x * msz.x - 0.5, 1.0 / msz.x, max(s.x, 1.0), ux, wx);
+    mb_cr5(uv.y * msz.y - 0.5, 1.0 / msz.y, max(s.y, 1.0), uy, wy);
+    vec4 c = vec4(0.0);
+    float lv = float(L);
+    for (int j = 0; j < 5; j++) {
+      vec4 row = vec4(0.0);
+      for (int i = 0; i < 5; i++)
+        row += textureLod(u_img, vec2(ux[i], uy[j]), lv) * wx[i];
+      c += row * wy[j];
+    }
+    c.a = clamp(c.a, 0.0, 1.0);
+    c.rgb = clamp(c.rgb, 0.0, c.a);
+    return c;
+  }
+  #else
+  vec4 mb_sample_pic(vec2 uv, vec2 dudx, vec2 dudy) {
+    return textureGrad(u_img, uv, dudx, dudy);
+  }
+  #endif
   #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 8 || ONE_KIND == 13
   float sd_rr(vec2 p, vec4 r, vec4 rad) {
     vec2 hs = r.zw * 0.5;
@@ -2091,7 +2172,9 @@
     #if ONE_KIND < 0 || ONE_KIND == 4
     if (kind == 4) {
       vec2 uv = v_c2.xy + clamp((p - v_rect.xy) / v_rect.zw, 0.0, 1.0) * v_c2.zw;
-      vec4 pic = texture(u_img, clamp(uv, 0.0, 1.0));
+      vec2 dudx = dFdx(p) / max(v_rect.zw, 1e-6) * v_c2.zw;
+      vec2 dudy = dFdy(p) / max(v_rect.zw, 1e-6) * v_c2.zw;
+      vec4 pic = mb_sample_pic(clamp(uv, 0.0, 1.0), dudx, dudy);
       float edge = clamp(0.5 - d * u_scale, 0.0, 1.0);
       if (v_pad.z > 0.5) {
         // Only picture edges inside the frame cut it; the frame's clip covers shared edges once.
@@ -2567,12 +2650,13 @@
       gl.deleteShader(fsShader);
     }
     const u = {};
-    for (const n of ['u_vp', 'u_origin', 'u_scale', 'u_top', 'u_atlas', 'u_img', 'u_bd', 'u_map', 'u_uvc', 'u_gb', 'u_shape', 'u_rad', 'u_n', 'u_through', 'u_glight', 'u_segs', 'u_ad', 'u_ad_box', 'u_ad_n']) {
+    for (const n of ['u_vp', 'u_origin', 'u_scale', 'u_top', 'u_atlas', 'u_img', 'u_img_mips', 'u_bd', 'u_map', 'u_uvc', 'u_gb', 'u_shape', 'u_rad', 'u_n', 'u_through', 'u_glight', 'u_segs', 'u_ad', 'u_ad_box', 'u_ad_n']) {
       u[n] = gl.getUniformLocation(p, n);
     }
     gl.useProgram(p);
     if (u.u_atlas) gl.uniform1i(u.u_atlas, 0);
     if (u.u_img) gl.uniform1i(u.u_img, 1);
+    if (u.u_img_mips) gl.uniform1i(u.u_img_mips, 1);
     if (u.u_bd) gl.uniform1i(u.u_bd, 2);
     if (u.u_segs) gl.uniform1i(u.u_segs, 3);
     if (u.u_ad) gl.uniform1i(u.u_ad, 4);
@@ -2678,9 +2762,19 @@
     return k;
   }
 
+  let progCur = null;
+  function setImgMips(m) {
+    if (progCur && progCur.u.u_img_mips) gl.uniform1i(progCur.u.u_img_mips, m > 0 ? m : 1);
+  }
+  function mipCount(w, h) {
+    let m = Math.max(w, h) | 0, c = 1;
+    while (m > 1 && c < 16) { m >>= 1; c++; }
+    return c;
+  }
   function useProg(kind) {
     const k = getProg(kind);
     if (!k) return;
+    progCur = k;
     progNow = k.p;
     gl.useProgram(k.p);
     if (k.gen === progGen) return;
@@ -4593,6 +4687,7 @@
         blComp[20] = blComp[21] = blComp[22] = blComp[23] = 0;
         blComp.fill(0, 32, 40);
         useProg(hasOwnProg(4) ? 4 : -1);
+        setImgMips(1);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, blPy[k].t);
         gl.bindVertexArray(blCompVao);
@@ -4664,19 +4759,20 @@
             if (cown ? kk !== ck : hasOwnProg(kk)) break;
             ce++;
           }
-          let ct = atlasTex;
+          let ct = atlasTex, cmips = 1;
           if (ctid > STREAM_TEX) {
             const st = streams.get(ctid - STREAM_TEX);
             if (!st || !st.tex) { cs = ce; continue; }
             ct = st.tex;
           } else if (ctid > 0) {
             const im = images.get(ctid);
-            if (im && im.tex) ct = im.tex;
+            if (im && im.tex) { ct = im.tex; cmips = im.mips || 1; }
             else drewMissing = true;
           }
           gl.activeTexture(gl.TEXTURE1);
           gl.bindTexture(gl.TEXTURE_2D, ct);
           useProg(cown ? ck : -1);
+          setImgMips(cmips);
           drawRun(cs, ce - cs);
           cs = ce;
         }
@@ -4761,6 +4857,7 @@
       if (!h && tid > 0 && tid <= STREAM_TEX && !tex) drewMissing = true;
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, tex || atlasTex);
+      if (!simple) setImgMips(tex && tid > 0 && tid <= STREAM_TEX && im && im.mips ? im.mips : 1);
       if (h) {
         gl.disable(gl.BLEND);
         drawRun(start, end - start);
@@ -5461,16 +5558,17 @@
             gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
             gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tw, th, 0, gl.RGBA, gl.UNSIGNED_BYTE, px);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.generateMipmap(gl.TEXTURE_2D);
             if (glHasError(gl) || (gl.isContextLost && gl.isContextLost())) {
               gl.deleteTexture(tex);
               im.state = -1;
             } else {
               Object.assign(im, {
-                state: 1, tex, w: tw, h: th, ow: raw.w, oh: raw.h,
+                state: 1, tex, w: tw, h: th, ow: raw.w, oh: raw.h, mips: mipCount(tw, th),
                 bytes: srcData, blob: null, maxPx,
               });
             }
@@ -5495,7 +5593,8 @@
         if (raw) {
           bmp = raw;
           ow = bmp.width; oh = bmp.height;
-          const k = maxPx > 0 ? Math.min(1, maxPx / Math.max(ow, oh)) : 1;
+          const big = Math.max(ow, oh);
+          const k = (big <= 4096 && maxPx > 0 && big <= maxPx * 2) ? 1 : (maxPx > 0 ? Math.min(1, maxPx / big) : 1);
           if (k < 1) {
             const small = await createImageBitmap(bmp, {
               resizeWidth: Math.max(1, Math.round(ow * k)),
@@ -5517,11 +5616,12 @@
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      Object.assign(im, { state: 1, tex, w: bmp.width, h: bmp.height, ow, oh, blob: storedBlob, maxPx });
+      gl.generateMipmap(gl.TEXTURE_2D);
+      Object.assign(im, { state: 1, tex, w: bmp.width, h: bmp.height, ow, oh, mips: mipCount(bmp.width, bmp.height), blob: storedBlob, maxPx });
       bmp.close();
     } catch (e) {
       if (!images.has(id)) return;
@@ -7734,6 +7834,8 @@
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, upW, upH, 0, gl.RGBA, gl.UNSIGNED_BYTE, upPx);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.generateMipmap(gl.TEXTURE_2D);
     if (glHasError(gl) || (gl.isContextLost && gl.isContextLost())) {
       gl.deleteTexture(tex);
       return null;

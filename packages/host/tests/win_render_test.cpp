@@ -19,14 +19,17 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <d3d11.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "win.h"
+#include "cr_mips.h"
 
 static size_t g_test_buf_len = 0;
+static ID3D11ShaderResourceView *g_test_pic_srv = NULL;
 
 extern "C" {
 int mb_render_init_offscreen(double w, double h, double scale);
@@ -49,7 +52,7 @@ const wchar_t *mb_win_env(const wchar_t *name) {
 }
 
 const wchar_t *mb_win_app_id(void) { return L""; }
-void *mb_image_srv(int id) { (void)id; return NULL; }
+void *mb_image_srv(int id) { return id == 1 ? g_test_pic_srv : NULL; }
 uint64_t mb_image_generation(void) { return 0; }
 uint64_t mb_image_free_generation(void) { return 0; }
 int32_t mb_atlas_gen_now(void) { return 0; }
@@ -1094,6 +1097,110 @@ static int run_warp_smoke(void) {
     mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
     mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
   }
+
+  // V14-Catmull-Rom-Picture: exercise kind == 4 mb_sample_pic on 1:1, upscale (9-tap), downscale 0.5x & 0.25x (25-tap + CR mips)
+  {
+    ID3D11Device *d = (ID3D11Device *)mb_render_device();
+    int v14_ok = 0;
+    if (d) {
+      const int TW = 64, TH = 64;
+      int mips = mb_cr_mip_count(TW, TH);
+      uint8_t *lvl[16] = {};
+      D3D11_SUBRESOURCE_DATA init[16] = {};
+      lvl[0] = (uint8_t *)malloc((size_t)TW * TH * 4);
+      if (lvl[0]) {
+        for (int y = 0; y < TH; y++) {
+          for (int x = 0; x < TW; x++) {
+            uint8_t *p = lvl[0] + ((size_t)y * TW + x) * 4;
+            if (x < 16 && y < 16) {
+              p[0] = 200; p[1] = 100; p[2] = 50; p[3] = 255;
+            } else if (x == 32) {
+              p[0] = 255; p[1] = 255; p[2] = 255; p[3] = 255;
+            } else {
+              p[0] = 16; p[1] = 16; p[2] = 16; p[3] = 255;
+            }
+          }
+        }
+        init[0].pSysMem = lvl[0];
+        init[0].SysMemPitch = (UINT)(TW * 4);
+        uint8_t *tmp = (uint8_t *)malloc((size_t)TW * TH * 4);
+        int lw = TW, lh = TH, alloc_ok = tmp != NULL;
+        for (int m = 1; m < mips && alloc_ok; m++) {
+          int nw = lw > 1 ? lw / 2 : 1, nh = lh > 1 ? lh / 2 : 1;
+          lvl[m] = (uint8_t *)malloc((size_t)nw * nh * 4);
+          if (!lvl[m]) { alloc_ok = 0; break; }
+          mb_cr_mip_step(lvl[m - 1], lw, lh, lvl[m], tmp, 1);
+          init[m].pSysMem = lvl[m];
+          init[m].SysMemPitch = (UINT)(nw * 4);
+          lw = nw; lh = nh;
+        }
+        free(tmp);
+        ID3D11Texture2D *tex = NULL;
+        ID3D11ShaderResourceView *srv = NULL;
+        if (alloc_ok) {
+          D3D11_TEXTURE2D_DESC td = {};
+          td.Width = TW; td.Height = TH; td.MipLevels = (UINT)mips; td.ArraySize = 1;
+          td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+          td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+          if (SUCCEEDED(d->CreateTexture2D(&td, init, &tex))) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sd.Format = td.Format; sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.Texture2D.MipLevels = (UINT)mips;
+            d->CreateShaderResourceView(tex, &sd, &srv);
+          }
+        }
+        for (int m = 0; m < mips; m++) free(lvl[m]);
+        if (srv) {
+          g_test_pic_srv = srv;
+          static uint8_t picbuf[320 * 240 * 4];
+          double pinst[4 * INST_SIZE];
+          auto draw_pic = [&](double w_pt, double h_pt) -> int {
+            int np = 0;
+            push_inst(pinst, &np, 10.0, 10.0, w_pt, h_pt, 0.0, 4.0, 0.0, 0.0,
+                      1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0);
+            return render_rgba(pinst, np, 0.0, 0.0, 0.0, 2.0, 320, 240, picbuf);
+          };
+          auto at_px = [&](int x, int y) -> const uint8_t * {
+            return picbuf + ((size_t)y * 320u + (size_t)x) * 4u;
+          };
+          // 1:1 (32pt @ 2x = 64px at origin 20,20): exact zero-bleed 1px line at x=20+32=52
+          int p11 = draw_pic(32.0, 32.0);
+          const uint8_t *b11 = at_px(24, 24);
+          int v11_l = at_px(51, 52)[0], v11_c = at_px(52, 52)[0], v11_r = at_px(53, 52)[0];
+          int ok11 = p11 && abs((int)b11[0] - 200) <= 1 && abs((int)b11[1] - 100) <= 1 && abs((int)b11[2] - 50) <= 1 &&
+                     v11_c == 255 && v11_l == 16 && v11_r == 16;
+          // 2x upscale (64pt @ 2x = 128px): 9-tap bicubic
+          int pup = draw_pic(64.0, 64.0);
+          const uint8_t *bup = at_px(32, 32), *lup_bg = at_px(100, 84);
+          int up_peak = 0;
+          for (int x = 80; x <= 90; x++) if (at_px(x, 84)[0] > up_peak) up_peak = at_px(x, 84)[0];
+          int okup = pup && abs((int)bup[0] - 200) <= 2 && abs((int)bup[1] - 100) <= 2 &&
+                     up_peak >= 210 && lup_bg[0] <= 20;
+          // 0.5x downscale (16pt @ 2x = 32px): 25-tap Catmull-Rom on mip 0/1
+          int pd2 = draw_pic(16.0, 16.0);
+          const uint8_t *bd2 = at_px(23, 23), *ld2_bg = at_px(46, 36);
+          int d2_peak = 0;
+          for (int x = 33; x <= 39; x++) if (at_px(x, 36)[0] > d2_peak) d2_peak = at_px(x, 36)[0];
+          int okd2 = pd2 && abs((int)bd2[0] - 200) <= 3 && abs((int)bd2[1] - 100) <= 3 &&
+                     d2_peak >= 110 && abs((int)ld2_bg[0] - 16) <= 2;
+          // 0.25x downscale (8pt @ 2x = 16px): mip level > 0
+          int pd4 = draw_pic(8.0, 8.0);
+          const uint8_t *bd4 = at_px(21, 21), *ld4_bg = at_px(33, 28);
+          int d4_peak = 0;
+          for (int x = 26; x <= 30; x++) if (at_px(x, 28)[0] > d4_peak) d4_peak = at_px(x, 28)[0];
+          int okd4 = pd4 && abs((int)bd4[0] - 200) <= 4 && d4_peak >= 45 && abs((int)ld4_bg[0] - 16) <= 3;
+
+          v14_ok = ok11 && okup && okd2 && okd4;
+          printf("  [%s] V14-Catmull-Rom-Picture: 1:1=(%d,%d,%d) upPeak=%d d0.5Peak=%d d0.25Peak=%d\n",
+                 v14_ok ? "PASS" : "FAIL", v11_l, v11_c, v11_r, up_peak, d2_peak, d4_peak);
+          g_test_pic_srv = NULL;
+          srv->Release();
+        }
+        if (tex) tex->Release();
+      }
+    }
+    ok &= v14_ok;
+  }
   return ok;
 }
 
@@ -1114,10 +1221,18 @@ int main(int argc, char **argv) {
 
   int baked = 0, disk = 0, compiled = 0;
   invar_win_shader_stats(&baked, &disk, &compiled);
-  printf("win_render_test pass=%d stats: baked_hits=%d disk_hits=%d runtime_compiles=%d (expected=%d)\n",
-         pass, baked, disk, compiled, EXPECTED_SHADER_KEYS);
+  printf("win_render_test pass=%d atlas=%d stats: baked_hits=%d disk_hits=%d runtime_compiles=%d (expected=%d)\n",
+         pass, mb_atlas_size, baked, disk, compiled, EXPECTED_SHADER_KEYS);
 
   int ok = 1;
+  const wchar_t *env_atlas = mb_win_env(L"MBUI_ATLAS_SIZE");
+  if (env_atlas && *env_atlas) {
+    int want_atlas = (int)wcstol(env_atlas, NULL, 10);
+    if (want_atlas >= 512 && want_atlas <= 4096 && (want_atlas & (want_atlas - 1)) == 0 && mb_atlas_size != want_atlas) {
+      fprintf(stderr, "FAIL: expected mb_atlas_size=%d from MBUI_ATLAS_SIZE, got %d\n", want_atlas, mb_atlas_size);
+      ok = 0;
+    }
+  }
   if (pass == 1) {
     if (baked != 0 || disk != 0 || compiled != EXPECTED_SHADER_KEYS) {
       fprintf(stderr, "FAIL: pass1 expected baked=0 disk=0 runtime_compiles=%d\n", EXPECTED_SHADER_KEYS);

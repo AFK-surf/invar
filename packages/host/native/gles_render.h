@@ -119,6 +119,7 @@ static const char *FS =
     "uniform sampler2D u_atlas;\n"
     "uniform sampler2D u_catlas;\n"
     "uniform sampler2D u_img;\n"
+    "uniform int u_img_mips;\n"
     "// glass (src/ui/glass.mbt): the blurred copy under it and where a point is in it (uv = p * u_map.xy + u_map.zw, kept\n"
     "// in u_uvc), a liquid group's shapes and corners, how many\n"
     "uniform highp sampler2D u_bd;\n"
@@ -141,6 +142,86 @@ static const char *FS =
     "#define float2 vec2\n"
     "#define float4 vec4\n"
     MB_CORNER_SL
+    "#if ONE_KIND == 4\n"
+    "float mb_cr(float x) {\n"
+    "  x = abs(x);\n"
+    "  if (x >= 2.0) return 0.0;\n"
+    "  if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;\n"
+    "  return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;\n"
+    "}\n"
+    "void mb_cr5(float tc, float inv_sz, float s, out float u[5], out float w[5]) {\n"
+    "  float c = floor(tc), f = tc - c, is = 1.0 / s;\n"
+    "  float k0 = mb_cr((-3.0 - f) * is), k1 = mb_cr((-2.0 - f) * is);\n"
+    "  float k2 = mb_cr((-1.0 - f) * is), k3 = mb_cr(( 0.0 - f) * is);\n"
+    "  float k4 = mb_cr(( 1.0 - f) * is), k5 = mb_cr(( 2.0 - f) * is);\n"
+    "  float k6 = mb_cr(( 3.0 - f) * is), k7 = mb_cr(( 4.0 - f) * is);\n"
+    "  float wA = k0 + k1, wC = k3 + k4, wE = k6 + k7;\n"
+    "  float sum = wA + k2 + wC + k5 + wE;\n"
+    "  float norm = sum > 1e-6 ? 1.0 / sum : 1.0;\n"
+    "  u[0] = (c - 2.5 + (wA < -1e-6 ? k1 / wA : 0.0)) * inv_sz;\n"
+    "  u[1] = (c - 0.5) * inv_sz;\n"
+    "  u[2] = (c + 0.5 + (wC >  1e-6 ? k4 / wC : 0.0)) * inv_sz;\n"
+    "  u[3] = (c + 2.5) * inv_sz;\n"
+    "  u[4] = (c + 3.5 + (wE < -1e-6 ? k7 / wE : 0.0)) * inv_sz;\n"
+    "  w[0] = wA * norm; w[1] = k2 * norm; w[2] = wC * norm; w[3] = k5 * norm; w[4] = wE * norm;\n"
+    "}\n"
+    "vec4 mb_sample_pic(vec2 uv, vec2 dudx, vec2 dudy) {\n"
+    "  vec2 sz = vec2(textureSize(u_img, 0));\n"
+    "  vec2 rate = vec2(length(dudx * sz), length(dudy * sz));\n"
+    "  if (max(abs(rate.x - 1.0), abs(rate.y - 1.0)) < 0.005)\n"
+    "    return textureLod(u_img, uv, 0.0);\n"
+    "  if (max(rate.x, rate.y) <= 1.005) {\n"
+    "    vec2 pos = uv * sz - 0.5;\n"
+    "    vec2 tc = floor(pos), f = pos - tc;\n"
+    "    vec2 f2 = f * f, f3 = f2 * f;\n"
+    "    vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;\n"
+    "    vec2 w1 =  1.5 * f3 - 2.5 * f2 + 1.0;\n"
+    "    vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;\n"
+    "    vec2 w3 =  0.5 * f3 - 0.5 * f2;\n"
+    "    vec2 w12 = w1 + w2;\n"
+    "    vec2 t0 = (tc - 0.5) / sz;\n"
+    "    vec2 t12 = (tc + 0.5 + w2 / w12) / sz;\n"
+    "    vec2 t3 = (tc + 2.5) / sz;\n"
+    "    vec4 c =\n"
+    "      (textureLod(u_img, vec2(t0.x,  t0.y),  0.0) * w0.x  +\n"
+    "       textureLod(u_img, vec2(t12.x, t0.y),  0.0) * w12.x +\n"
+    "       textureLod(u_img, vec2(t3.x,  t0.y),  0.0) * w3.x)  * w0.y +\n"
+    "      (textureLod(u_img, vec2(t0.x,  t12.y), 0.0) * w0.x  +\n"
+    "       textureLod(u_img, vec2(t12.x, t12.y), 0.0) * w12.x +\n"
+    "       textureLod(u_img, vec2(t3.x,  t12.y), 0.0) * w3.x)  * w12.y +\n"
+    "      (textureLod(u_img, vec2(t0.x,  t3.y),  0.0) * w0.x  +\n"
+    "       textureLod(u_img, vec2(t12.x, t3.y),  0.0) * w12.x +\n"
+    "       textureLod(u_img, vec2(t3.x,  t3.y),  0.0) * w3.x)  * w3.y;\n"
+    "    c.a = clamp(c.a, 0.0, 1.0);\n"
+    "    c.rgb = clamp(c.rgb, 0.0, c.a);\n"
+    "    return c;\n"
+    "  }\n"
+    "  float rmin = min(rate.x, rate.y);\n"
+    "  int mips = max(u_img_mips, 1);\n"
+    "  int L = (mips > 1 && rmin > 2.0) ? min(int(max(0.0, ceil(log2(rmin)) - 1.0)), mips - 1) : 0;\n"
+    "  vec2 msz = vec2(textureSize(u_img, L));\n"
+    "  vec2 s = vec2(length(dudx * msz), length(dudy * msz));\n"
+    "  if (max(s.x, s.y) > 2.05) return textureGrad(u_img, uv, dudx, dudy);\n"
+    "  float ux[5], wx[5], uy[5], wy[5];\n"
+    "  mb_cr5(uv.x * msz.x - 0.5, 1.0 / msz.x, max(s.x, 1.0), ux, wx);\n"
+    "  mb_cr5(uv.y * msz.y - 0.5, 1.0 / msz.y, max(s.y, 1.0), uy, wy);\n"
+    "  vec4 c = vec4(0.0);\n"
+    "  float lv = float(L);\n"
+    "  for (int j = 0; j < 5; j++) {\n"
+    "    vec4 row = vec4(0.0);\n"
+    "    for (int i = 0; i < 5; i++)\n"
+    "      row += textureLod(u_img, vec2(ux[i], uy[j]), lv) * wx[i];\n"
+    "    c += row * wy[j];\n"
+    "  }\n"
+    "  c.a = clamp(c.a, 0.0, 1.0);\n"
+    "  c.rgb = clamp(c.rgb, 0.0, c.a);\n"
+    "  return c;\n"
+    "}\n"
+    "#else\n"
+    "vec4 mb_sample_pic(vec2 uv, vec2 dudx, vec2 dudy) {\n"
+    "  return textureGrad(u_img, uv, dudx, dudy);\n"
+    "}\n"
+    "#endif\n"
     "float sd_rr(vec2 p, vec4 r, vec4 rad) {\n"
     "  vec2 hs = r.zw * 0.5;\n"
     "  return mb_sd_box(p - r.xy - hs, hs, mb_corner_of(p - r.xy - hs, rad), 1e9);\n"
@@ -1332,7 +1413,9 @@ static const char *FS =
     "  if ((kind == 0 && v_pad.w >= 0.0) || kind == 5) d = notch_cut(d, p, v_rect, v_pad);\n"
     "  if (kind == 4) {\n"
     "    vec2 uv = v_c2.xy + clamp((p - v_rect.xy) / v_rect.zw, 0.0, 1.0) * v_c2.zw;\n"
-    "    vec4 pic = texture(u_img, clamp(uv, 0.0, 1.0));\n"
+    "    vec2 dudx = dFdx(p) / max(v_rect.zw, 1e-6) * v_c2.zw;\n"
+    "    vec2 dudy = dFdy(p) / max(v_rect.zw, 1e-6) * v_c2.zw;\n"
+    "    vec4 pic = mb_sample_pic(clamp(uv, 0.0, 1.0), dudx, dudy);\n"
     "    float edge = clamp(0.5 - d * u_scale, 0.0, 1.0);\n"
     "    if (v_pad.z > 0.5) {\n"
     "      // Only picture edges inside the frame cut it; the frame's clip covers shared edges once.\n"
@@ -1811,14 +1894,26 @@ static int is_simple_rect(const float *f, int32_t i) {
 static int has_own_prog(int kind) {
   return (kind >= 0 && kind <= 8) || kind == 10 || kind == 11 || kind == MB_KIND_LIQUID_SINGLE;
 }
+#ifndef MB_IMAGE_MIPS_DEFINED
+static int image_mips(int id) {
+  (void)id;
+  return 1;
+}
+#endif
+
 typedef struct {
   GLuint p;
-  GLint vp, origin, scale, top, map, uvc, gb, shape, rad, n, through, glight, ad_box, ad_n;
+  GLint vp, origin, scale, top, map, uvc, gb, shape, rad, n, through, glight, ad_box, ad_n, img_mips;
   unsigned gen;
 } kprog;
 static kprog progs[MB_KINDS + 1];
+static kprog *prog_cur;
 static unsigned prog_gen;
 static GLuint prog_now;
+
+static void set_img_mips(int mips) {
+  if (prog_cur && prog_cur->img_mips >= 0) glUniform1i(prog_cur->img_mips, mips > 0 ? mips : 1);
+}
 static float *fbuf;
 // the pieces of the frame's shapes (src/ui/shape.mbt: the instances of kind 12 after every one drawn), for the shader
 // to read (u_segs): a float texture of SEGS_ROW fours a row (136 instances' 15), as many rows as they take
@@ -1894,6 +1989,7 @@ static kprog make_prog(GLuint vs, int kind) {
   k.glight = glGetUniformLocation(k.p, "u_glight");
   k.ad_box = glGetUniformLocation(k.p, "u_ad_box");
   k.ad_n = glGetUniformLocation(k.p, "u_ad_n");
+  k.img_mips = glGetUniformLocation(k.p, "u_img_mips");
   glUseProgram(k.p);
   GLint loc;
   if ((loc = glGetUniformLocation(k.p, "u_atlas")) >= 0) glUniform1i(loc, 0);
@@ -1902,6 +1998,7 @@ static kprog make_prog(GLuint vs, int kind) {
   if ((loc = glGetUniformLocation(k.p, "u_segs")) >= 0) glUniform1i(loc, 3);
   if ((loc = glGetUniformLocation(k.p, "u_catlas")) >= 0) glUniform1i(loc, 4);
   if ((loc = glGetUniformLocation(k.p, "u_ad")) >= 0) glUniform1i(loc, 5);
+  if (k.img_mips >= 0) glUniform1i(k.img_mips, 1);
   return k;
 }
 
@@ -3613,6 +3710,7 @@ static int capture(const float *f, int32_t start, int32_t end, int32_t count, in
 // The program that draws instances of `kind` (-1 any) used, its uniforms set if they changed since it was last.
 static void use_prog(int kind) {
   kprog *k = &progs[kind >= 0 && has_own_prog(kind) ? kind : MB_KINDS];
+  prog_cur = k;
   prog_now = k->p;
   glUseProgram(k->p);
   if (k->gen == prog_gen) return;
@@ -4445,6 +4543,7 @@ static void draw_into(GLuint fb, int part) {
         comp[32] = 0.0f; comp[33] = 0.0f; comp[34] = 0.0f; comp[35] = 0.0f;
         comp[36] = 0.0f; comp[37] = 0.0f; comp[38] = 0.0f; comp[39] = 0.0f;
         use_prog(4);
+        set_img_mips(1);
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, bl_py[k].t);
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -4532,6 +4631,7 @@ static void draw_into(GLuint fb, int part) {
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, ct ? ct : atlas);
         use_prog(cown ? ck : -1);
+        set_img_mips(ct ? image_mips(ctid) : 1);
         draw_run(cs, ce - cs);
         cs = ce;
       }
@@ -4634,6 +4734,7 @@ static void draw_into(GLuint fb, int part) {
       if (tid > MB_VIEW_TEX && tid <= MB_LAYER_TEX) view_parts_in(tid, start, end);
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, t);
+      if (!fast_rect) set_img_mips(tid ? image_mips(tid) : 1);
       for (int i = 0; i < MB_INST / 4; i++)
         glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, MB_INST * 4, (void *)(intptr_t)(start * MB_INST * 4 + i * 16));
 #ifdef MB_VIEWS_UNDER
