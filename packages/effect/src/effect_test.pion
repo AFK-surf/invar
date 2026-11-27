@@ -1,5 +1,5 @@
 // Comprehensive unit tests for packages/effect.
-// Ports all tests from libs/mbui/src/effect/runtime_wbtest.mbt plus RingDeque, Queue, Semaphore,
+// Covers the runtime scheduler and timers plus RingDeque, Queue, Semaphore,
 // Deferred, Scope, Race, All, Timeout, Outside, SimNet, SimFiles, and Rng tests.
 
 fn ended_str(f : Fiber[String]) -> String {
@@ -474,4 +474,60 @@ test "race, all, timeout, outside, SimNet and SimFiles" {
   rt.shutdown()
   let _ = rt.run_ready()
   assert_holding_zero(rt, "final holding zero")
+}
+
+test "aligned signatures: new(seed, start), scope_, fork/fork_k name, after later/who, outside_end wake" {
+  // Runtime::new() keeps its FIFO defaults; seed and start are optional.
+  let plain = Runtime::new()
+  debug_assert(plain.seed == 0 && !plain.shuffle && plain.now() == 0L, "new() is FIFO from 0")
+  let seeded = Runtime::new(seed=7)
+  let same = Runtime::make(7, true, 0L, None)
+  debug_assert(seeded.seed == 7 && seeded.shuffle && seeded.now() == 0L, "new(seed=) shuffles")
+  debug_assert(seeded.rng.next() == same.rng.next(), "new(seed=) draws like make(seed, true)")
+  let at = Runtime::new(seed=3, start=500L)
+  debug_assert(at.seed == 3 && at.shuffle && at.now() == 500L, "new(seed=, start=)")
+  let late = Runtime::new(start=40L)
+  debug_assert(late.seed == 0 && !late.shuffle && late.now() == 40L, "new(start=) stays FIFO")
+
+  // scope_ is new_scope; fork/fork_k take an optional name.
+  let rt = Runtime::new()
+  let s = rt.scope_()
+  let a : Fiber[Int] = rt.fork(fn(k : (Exit[Int]) -> Unit) -> Unit { k(Exit::Succeeded(1)) }, name="root-a")
+  let b : Fiber[Int] = rt.fork_k(fn(k : (Exit[Int]) -> Unit) -> Unit { k(Exit::Succeeded(2)) }, name="root-b")
+  let c : Fiber[Int] = s.fork(fn(k : (Exit[Int]) -> Unit) -> Unit { never_k(k) }, name="scoped-c")
+  let d : Fiber[Int] = s.fork(fn(k : (Exit[Int]) -> Unit) -> Unit { k(Exit::Succeeded(4)) })
+  debug_assert(a.task.name == "root-a" && b.task.name == "root-b", "root fork names")
+  debug_assert(c.task.name == "scoped-c" && d.task.name == "", "scope fork names")
+  let _ = rt.run_ready()
+  debug_assert(ended_int(a) == "ok 1" && ended_int(b) == "ok 2" && ended_int(d) == "ok 4", "forks ran")
+  debug_assert(s.running() == 1, "scope_ owns its fiber")
+  s.close_now()
+  let _ = rt.run_ready()
+  debug_assert(ended_int(c) == "interrupted" && s.is_closed(), "scope_ closes")
+
+  // after: later timers are not next_due; who names the timer.
+  let fired : Array[String] = []
+  rt.after(10, fn() { fired.push("later") }, later=true, who="bg")
+  debug_assert(rt.next_due().is_none(), "later timer not due")
+  debug_assert(rt.next_timer() == Some(10L), "later timer still set")
+  rt.after(20, fn() { fired.push("plain") }, who="fg")
+  match rt.next_due() {
+    Some((t, who)) => debug_assert(t == 20L && who == "fg", "who recorded")
+    None => debug_assert(false, "plain timer due")
+  }
+  rt.advance(25)
+  debug_assert(fired.length() == 2 && fired[0] == "later" && fired[1] == "plain", "both fired in order")
+
+  // outside_end: wake=true by default, wake=false leaves on_wake uncalled.
+  let wakes : Array[Int] = []
+  rt.on_wake(fn() { wakes.push(1) })
+  let t1 = rt.outside_start("quiet")
+  rt.outside_end(t1, wake=false)
+  debug_assert(wakes.length() == 0 && rt.awaiting() == 0, "wake=false: no on_wake")
+  let t2 = rt.outside_start("loud")
+  rt.outside_end(t2)
+  debug_assert(wakes.length() == 1 && rt.awaiting() == 0, "default wakes")
+  rt.shutdown()
+  let _ = rt.run_ready()
+  assert_holding_zero(rt, "holding zero")
 }
