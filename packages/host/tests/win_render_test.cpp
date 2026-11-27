@@ -804,6 +804,57 @@ static int run_v8_v9_2d_roi(void) {
              lr, lg, lb, la, dr, dg, db, da, over_w, (int)pbuf[kh + 3], d_l85, d_lab, d_dab);
       ok &= v12_ok;
     }
+
+    // V12-Through-Hole-Adaptive-Ink: Light adaptive glass over a kind == 9 native-view hole keeps light glass
+    // + dark icon (kind 10) + dark opaque adaptive_ink bar (kind 0, pad.w < 0): the hole's transparent backdrop
+    // (a == 0) is composited over white before its luma; the same capsule over the opaque black stage (a == 1) and
+    // one over a 70% black scrim on the hole (premultiplied, Porter-Duff over) still flip to dark glass + white ink.
+    // Dark Regular glass over the hole keeps a soft edge (its dark contour gated by the backdrop's alpha).
+    {
+      static uint8_t tbuf[400 * 330 * 2 * 2 * 4];
+      const int TW = 400, TH = 330, TPW = TW * 2, TPH = TH * 2;
+      int nt = 0;
+      push_inst(inst, &nt, 0.0, 0.0, TW, TH, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(inst, &nt, 0.0, 0.0, 200.0, TH, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8388608.0 + 7.0, 0.0, 0.0, 0.0);
+      auto capsule = [&](double x, double y, double w, double h, double tid) {
+        push_inst(inst, &nt, x, y, w, h, h * 0.5, 6.0, 1.0, 2.0, 253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
+                  0.0, 14.0, -1.0, 1.0, tid, 0.0, 0.0, 0.0);
+      };
+      auto icon = [&](double x, double y, double cx, double cy, double hr, double g) {
+        push_inst(inst, &nt, x, y, 24.0, 20.0, 6.0, 10.0, 0.0, 0.0, g, g, g + 3.0/255.0, 1.0, 0.1, 0.5, 0.9, 0.5, 0.0, cx, cy, hr);
+      };
+      auto bar = [&](double x, double y, double cx, double cy, double hr) {
+        push_inst(inst, &nt, x, y, 60.0, 16.0, 8.0, 0.0, 0.0, 0.0, 24.0/255.0, 24.0/255.0, 27.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, cx, cy, -hr);
+      };
+      // A: over the raw hole; B: over the opaque black stage; C: over a 70% black scrim on the hole
+      capsule(20.0, 36.0, 160.0, 48.0, -400.0); icon(44.0, 50.0, 100.0, 60.0, 48.0, 24.0/255.0); bar(104.0, 52.0, 100.0, 60.0, 48.0);
+      capsule(220.0, 36.0, 160.0, 48.0, -401.0); icon(244.0, 50.0, 300.0, 60.0, 48.0, 24.0/255.0); bar(304.0, 52.0, 300.0, 60.0, 48.0);
+      push_inst(inst, &nt, 10.0, 140.0, 180.0, 70.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.70, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      capsule(20.0, 150.0, 160.0, 50.0, -402.0); icon(44.0, 165.0, 100.0, 175.0, 50.0, 26.0/255.0); bar(104.0, 167.0, 100.0, 175.0, 50.0);
+      // D: dark Regular glass over the raw hole
+      push_inst(inst, &nt, 30.0, 236.0, 140.0, 72.0, 24.0, 6.0, 1.0, 2.1, 32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+                0.6, 14.0, 0.0, 1.0, -403.0, 18.0, 0.06, 0.0);
+      if (!render_rgba(inst, nt, 0.0, 0.0, 0.0, 2.0, TPW, TPH, tbuf)) return 0;
+      auto at = [&](int x, int y) -> const uint8_t * { return tbuf + ((size_t)(y * 2) * (size_t)TPW + (size_t)(x * 2)) * 4u; };
+      auto lum = [](const uint8_t *p) -> double { return (0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]) / 255.0; };
+      const uint8_t *a_gl = at(84, 60), *b_gl = at(284, 60);
+      double a_tx = lum(at(56, 60)), a_br = lum(at(134, 60)), b_gl_l = lum(b_gl), b_tx = lum(at(256, 60)), b_br = lum(at(334, 60));
+      double c_tx = lum(at(56, 175)), c_br = lum(at(134, 175));
+      // D's outer edge over a white video frame: the darkest green of (canvas + white x (1 - a)) along its left side
+      int d_min = 999;
+      for (int y = 236 * 2; y < 308 * 2; y++)
+        for (int x = 26 * 2; x < 32 * 2; x++) {
+          const uint8_t *p = tbuf + ((size_t)y * (size_t)TPW + (size_t)x) * 4u;
+          int ow = p[1] + (255 * (255 - p[3]) + 127) / 255;
+          if (ow < d_min) d_min = ow;
+        }
+      int th_ok = (a_gl[3] >= 100 && a_gl[3] <= 170 && a_gl[0] >= a_gl[3] - 12) && (a_tx < 0.25 && a_br < 0.25) &&
+                  (b_gl[3] == 255 && b_gl_l < 0.35) && (b_tx > 0.75 && b_br > 0.75) && (c_tx > 0.75 && c_br > 0.75) &&
+                  (d_min >= 90);
+      printf("  [%s] V12-Through-Hole-Adaptive-Ink: hole=(gl=%d/%d tx=%.3f br=%.3f) stage=(gl=%.3f a=%d tx=%.3f br=%.3f) scrim70=(tx=%.3f br=%.3f) darkRegEdgeOverWhite=%d (>=90)\n",
+             th_ok ? "PASS" : "FAIL", a_gl[0], a_gl[3], a_tx, a_br, b_gl_l, b_gl[3], b_tx, b_br, c_tx, c_br, d_min);
+      ok &= th_ok;
+    }
   }
 
   return ok;
