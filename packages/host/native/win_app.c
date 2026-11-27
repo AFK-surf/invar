@@ -78,10 +78,11 @@ typedef struct WinSlot {
   // the pointer's shape (@hostapi.set_cursor), whether its leaving is asked to be told (TrackMouseEvent), whether the
   // right button is down
   int cursor_kind, tracking_leave, right_down;
-  // an inset window's maximize button where the app says (window_snap, in the client's pixels) hit as the title bar's
-  // own, so Windows 11's Snap Layouts open from it; how the pointer stands on it (0 off, 1 on, 2 pressing it, its press
-  // held: snap_held), the non-client area's leaving asked to be told
-  RECT snap_px;
+  // an inset window's maximize button where the app says (window_snap, in logical points) hit as the title bar's
+  // own, so Windows 11's Snap Layouts open from it (converted to client pixels on demand at the live DPI); how the
+  // pointer stands on it (0 off, 1 on, 2 pressing it, its press held: snap_held), the non-client area's leaving asked
+  // to be told
+  double snap_pt[4];
   int snap_state, snap_held, tracking_nc_leave;
   // the fingers down that it takes (0: a free place), the first of them down while it is (what may move the window),
   // its place on the screen (pixels); a finger moving the window from the app's top row (mb_host_window_drag in its
@@ -977,11 +978,23 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   return r;
 }
 
+static int snap_rect_px(HWND h, RECT *out) {
+  if (ws->snap_pt[2] <= 0 || ws->snap_pt[3] <= 0) return 0;
+  double s = h ? win_scale(h) : ws->scale;
+  if (s <= 0) s = 1.0;
+  out->left = (LONG)lround(ws->snap_pt[0] * s);
+  out->top = (LONG)lround(ws->snap_pt[1] * s);
+  out->right = (LONG)lround((ws->snap_pt[0] + ws->snap_pt[2]) * s);
+  out->bottom = (LONG)lround((ws->snap_pt[1] + ws->snap_pt[3]) * s);
+  return out->right > out->left && out->bottom > out->top;
+}
+
 static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
   // the app's maximize button pressed (snap_held): the mouse the host's till it is let go, there or elsewhere
   if (ws->snap_held && (msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP)) {
     POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-    int on = PtInRect(&ws->snap_px, p);
+    RECT sr;
+    int on = snap_rect_px(h, &sr) && PtInRect(&sr, p);
     if (msg == WM_LBUTTONUP) {
       ws->snap_held = 0;
       ReleaseCapture();
@@ -1053,7 +1066,8 @@ static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
           GetClientRect(h, &c);
           return p.x < band ? HTTOPLEFT : p.x >= c.right - band ? HTTOPRIGHT : HTTOP;
         }
-        if (ws->snap_px.right > ws->snap_px.left && PtInRect(&ws->snap_px, p)) return HTMAXBUTTON;
+        RECT sr;
+        if (snap_rect_px(h, &sr) && PtInRect(&sr, p)) return HTMAXBUTTON;
         return HTCLIENT;
       }
       break;
@@ -1158,6 +1172,7 @@ static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       RECT *r = (RECT *)lp;
       SetWindowPos(h, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
                    SWP_NOZORDER | SWP_NOACTIVATE);
+      ws->scale = win_scale(h);
       ws->want_frame = 1;
       return 0;
     }
@@ -2273,14 +2288,17 @@ int32_t mb_host_window_zoomed(void) { return ws->h && IsZoomed(ws->h) ? 1 : 0; }
 // title bar's own (WM_NCHITTEST); w 0, none.
 void mb_host_window_snap(double x, double y, double w, double h) {
   if (w <= 0 || h <= 0) {
-    SetRectEmpty(&ws->snap_px);
+    ws->snap_pt[0] = 0;
+    ws->snap_pt[1] = 0;
+    ws->snap_pt[2] = 0;
+    ws->snap_pt[3] = 0;
     if (!ws->snap_held) snap_set(0);
     return;
   }
-  ws->snap_px.left = (LONG)lround(x * ws->scale);
-  ws->snap_px.top = (LONG)lround(y * ws->scale);
-  ws->snap_px.right = (LONG)lround((x + w) * ws->scale);
-  ws->snap_px.bottom = (LONG)lround((y + h) * ws->scale);
+  ws->snap_pt[0] = x;
+  ws->snap_pt[1] = y;
+  ws->snap_pt[2] = w;
+  ws->snap_pt[3] = h;
 }
 
 // How the pointer stands on it, which the host has (@hostapi.window_snap_state).
