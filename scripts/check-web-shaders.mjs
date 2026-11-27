@@ -836,15 +836,22 @@ function buildHtmlPage(programs) {
           return (dx * dx + dy * dy <= 22 * 22) ? [42, 42, 48] : [16, 16, 20];
         };
         const tabBgIcon = (x, y) => {
-          if (x >= 110.0 && x <= 112.6 && y >= 28.0 && y <= 72.0) return [255, 149, 0];
+          if (x >= 109.0 && x <= 111.0 && y >= 28.0 && y <= 72.0) return [255, 149, 0];
+          return tabBgEmpty(x, y);
+        };
+        const tabBgLip = (x, y) => {
+          if (x >= 112.5 && x <= 114.5 && y >= 45.0 && y <= 55.0) return [255, 149, 0];
           return tabBgEmpty(x, y);
         };
         const tabEmpty = run2D(160, 100, 3, tabBgEmpty,
           { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
         const tabIcon = run2D(160, 100, 3, tabBgIcon,
           { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
-        const c1 = tabIcon.at(349, 150), c0 = tabEmpty.at(349, 150);
-        const capDelta = Math.abs(c1[0] - c0[0]) + Math.abs(c1[1] - c0[1]) + Math.abs(c1[2] - c0[2]);
+        const tabLip = run2D(160, 100, 3, tabBgLip,
+          { x: 30, y: 25, w: 88, h: 50, r: 25, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
+        const c1 = tabIcon.at(349, 150), c0 = tabEmpty.at(349, 150), c2 = tabLip.at(349, 150);
+        const ghostDelta = Math.abs(c1[0] - c0[0]) + Math.abs(c1[1] - c0[1]) + Math.abs(c1[2] - c0[2]);
+        const lipDelta = Math.abs(c2[0] - c0[0]) + Math.abs(c2[1] - c0[1]) + Math.abs(c2[2] - c0[2]);
         const g1x = tabIcon.at(349, 87), g0x = tabEmpty.at(349, 87);
         const gate0SameX = Math.abs(g1x[0] - g0x[0]) + Math.abs(g1x[1] - g0x[1]) + Math.abs(g1x[2] - g0x[2]);
         const g1c = tabIcon.at(311, 87), g0c = tabEmpty.at(311, 87);
@@ -852,13 +859,9 @@ function buildHtmlPage(programs) {
 
         const tabNg = run2D(160, 100, 3, (x, y) => (x >= 41.0 && x <= 43.0 && y >= 28.0 && y <= 72.0) ? [90, 90, 90] : [246, 244, 240],
           { x: 32, y: 18, w: 95, h: 63.5, r: 31.75, blurSlot: -64, rim: 1, bezel: 9, refract: 9, chroma: 0 });
-        const ngOrigL = tabNg.lumaAt(126, 149);
-        let ngRefrMinL = 255;
-        for (let rx = 130; rx <= 135; rx++) {
-          const lr = tabNg.lumaAt(rx, 149);
-          if (lr < ngRefrMinL) ngRefrMinL = lr;
-        }
-        const ngOk = ngOrigL > 220 && ngRefrMinL < 170;
+        const ngBarL = tabNg.lumaAt(126, 149);
+        const ngCleanL = tabNg.lumaAt(114, 149);
+        const ngOk = ngBarL < 130 && ngCleanL > 220;
 
         const segScaleBg = (x, y) => {
           if (x >= 78 && x <= 82 && y >= 43.5 && y <= 55.5) return [0, 0, 0];
@@ -877,10 +880,10 @@ function buildHtmlPage(programs) {
         const segScaleOk = segStrokeSpan >= 35 && segStrokeSpan <= 37 && segRingL >= 225 && segTrackL <= 210 && (segRingL - segTrackL) >= 20;
 
         const v9Ok = gr0 < 15 && gr1 > 60 && gr2 < 15 && coreH >= 20 && coreH <= 22.5 && moat >= 6.5 &&
-          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && capDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && ngOk && halfOk && segScaleOk;
+          grTip < 15 && p2Ok && offOk && cyan >= 10 && cyanTop >= 10 && amber >= 20 && maxTxtDiff === 0 && ghostDelta === 0 && lipDelta >= 40 && gate0SameX === 0 && gate0InCap === 0 && ngOk && halfOk && segScaleOk;
         pushVec('V9 switch ON/OFF/half, light segmented & role4 tab 2D ROI', v9Ok,
-          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, capDelta, gate0SameX, gate0InCap, ngOrigL, ngRefrMinL, Number(h50.toFixed(2)), segStrokeSpan, segRingL, segTrackL],
-          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, capDelta>=40, gate0=0, ngOrig>220, ngRefr<170, segSpan[35..37], ring>=225/track<=210');
+          [gr0, gr1, gr2, Number(coreH.toFixed(2)), cyan, cyanTop, amber, maxTxtDiff, ghostDelta, lipDelta, gate0SameX, gate0InCap, ngBarL, ngCleanL, Number(h50.toFixed(2)), segStrokeSpan, segRingL, segTrackL],
+          'rows<15/>60/<15, core [20,22.5], moat>=6.5, cyan/top>=10, amber>=20, txtDiff=0, ghostDelta=0, lipDelta>=40, gate0=0, ngBar<130, ngClean>220, segSpan[35..37], ring>=225/track<=210');
       }
 
       // V10: Regular Glass Light AA & Dark Rim Gate (@2x, R=24pt)
@@ -1347,14 +1350,14 @@ function buildHtmlPage(programs) {
         const rDark0 = runAdCase(400, 103 / 255, true);
         const r95 = runAdCase(400, 0.913, false);
 
-        const v13Ok = r0.ink > 0.82 && rBack.ink > 0.82 &&
+        const v13Ok = r0.ink < 0.25 && rBack.ink < 0.25 &&
           frostRes.every((r) => r.ink < 0.25 && r.glassL > 0.56) &&
           r65.ink < 0.25 && r65.glassR > 0.72 &&
           rDark0.ink > 0.75 && rDark0.glassR < 0.35 &&
           r95.adTVal <= 0.02 && r95.ink < 0.25 && r95.glassR > 0.85;
-        pushVec('V13 light adaptive glass opacity (half-dark frost + full-dark snap)', v13Ok,
+        pushVec('V13 light adaptive glass opacity (half-dark uniform + full-dark snap)', v13Ok,
           [Number(r0.ink.toFixed(3)), Number(frostRes[1].ink.toFixed(3)), Number(rBack.ink.toFixed(3)), Number(r65.ink.toFixed(3)), Number(r65.glassR.toFixed(3)), Number(r95.ink.toFixed(3)), Number(r95.glassR.toFixed(3)), Number(r95.adTVal.toFixed(3))],
-          'l0>0.82, frost ink<0.25 glass>0.56, lBack>0.82, full65 ink<0.25 glass>0.72, full95 snap t<=0.02 ink<0.25 glass>0.85');
+          'l0<0.25, frost ink<0.25 glass>0.56, lBack<0.25, full65 ink<0.25 glass>0.72, full95 snap t<=0.02 ink<0.25 glass>0.85');
 
         gl.useProgram(prog);
         gl.uniform1i(u('u_ad_n'), 0);

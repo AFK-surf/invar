@@ -378,43 +378,46 @@ static int run_v8_v9_2d_roi(void) {
     ok &= v9d_ok;
   }
 
-  // V9-Tab: Role 4 Tab barIconGate isolation (fixed refract=9.0, icon at x_right-6.7pt strictly inward of readback x_right-1.5pt)
+  // V9-Tab: Role 4 Tab monotonic outer meniscus (no fake badge copy from 6.7pt inward; continuous outer lip refraction)
   {
     static uint8_t rgba_empty[W3 * H3 * 4];
+    static uint8_t rgba_lip[W3 * H3 * 4];
     int n = 0;
     push_inst(inst, &n, 10.0, 28.0, 140.0, 44.0, 22.0, 0.0, 0.0, 0.0, 42.0/255.0, 42.0/255.0, 48.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 30.0, 25.0, 88.0, 50.0, 25.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba_empty)) return 0;
     n = 0;
     push_inst(inst, &n, 10.0, 28.0, 140.0, 44.0, 22.0, 0.0, 0.0, 0.0, 42.0/255.0, 42.0/255.0, 48.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    push_inst(inst, &n, 110.0, 28.0, 2.6, 44.0, 1.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 109.0, 28.0, 2.0, 44.0, 1.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 30.0, 25.0, 88.0, 50.0, 25.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba)) return 0;
+    n = 0;
+    push_inst(inst, &n, 10.0, 28.0, 140.0, 44.0, 22.0, 0.0, 0.0, 0.0, 42.0/255.0, 42.0/255.0, 48.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 112.5, 45.0, 2.0, 10.0, 0.0, 0.0, 0.0, 0.0, 1.0, 149.0/255.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    push_inst(inst, &n, 30.0, 25.0, 88.0, 50.0, 25.0, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 16.0/255.0, 16.0/255.0, 20.0/255.0, S3, W3, H3, rgba_lip)) return 0;
     size_t k_cap = ((size_t)150 * W3 + 349) * 4;
-    int cap_delta = abs((int)rgba[k_cap] - (int)rgba_empty[k_cap]) + abs((int)rgba[k_cap+1] - (int)rgba_empty[k_cap+1]) + abs((int)rgba[k_cap+2] - (int)rgba_empty[k_cap+2]);
+    int ghost_delta = abs((int)rgba[k_cap] - (int)rgba_empty[k_cap]) + abs((int)rgba[k_cap+1] - (int)rgba_empty[k_cap+1]) + abs((int)rgba[k_cap+2] - (int)rgba_empty[k_cap+2]);
+    int lip_delta = abs((int)rgba_lip[k_cap] - (int)rgba_empty[k_cap]) + abs((int)rgba_lip[k_cap+1] - (int)rgba_empty[k_cap+1]) + abs((int)rgba_lip[k_cap+2] - (int)rgba_empty[k_cap+2]);
     size_t k_g0x = ((size_t)87 * W3 + 349) * 4;
     int gate0_same_x = abs((int)rgba[k_g0x] - (int)rgba_empty[k_g0x]) + abs((int)rgba[k_g0x+1] - (int)rgba_empty[k_g0x+1]) + abs((int)rgba[k_g0x+2] - (int)rgba_empty[k_g0x+2]);
     size_t k_g0c = ((size_t)87 * W3 + 311) * 4;
     int gate0_in_cap = abs((int)rgba[k_g0c] - (int)rgba_empty[k_g0c]) + abs((int)rgba[k_g0c+1] - (int)rgba_empty[k_g0c+1]) + abs((int)rgba[k_g0c+2] - (int)rgba_empty[k_g0c+2]);
-    int v9tab_ok = (cap_delta >= 40) && (gate0_same_x == 0) && (gate0_in_cap == 0);
-    printf("  [%s] V9-Tab Role 4 barIconGate isolation (fixed refract=9, icon@x_right-6.7pt): capDelta=%d (>=40) gate0=(%d,%d) (==0)\n", v9tab_ok ? "PASS" : "FAIL", cap_delta, gate0_same_x, gate0_in_cap);
+    int v9tab_ok = (ghost_delta == 0) && (lip_delta >= 40) && (gate0_same_x == 0) && (gate0_in_cap == 0);
+    printf("  [%s] V9-Tab Role 4 monotonic outer meniscus: ghostDelta=%d (==0) lipDelta=%d (>=40) gate0=(%d,%d) (==0)\n", v9tab_ok ? "PASS" : "FAIL", ghost_delta, lip_delta, gate0_same_x, gate0_in_cap);
     ok &= v9tab_ok;
   }
 
-  // V9-Tab-No-Ghost: Role 4 outer falloff (1 - smoothstep(2.60, 9.40, inward)) eliminates light-mode ghosting
+  // V9-Tab-No-Ghost: Role 4 zero interior double-fold / ghosting at inward >= 5.5pt
   {
     int n = 0;
     push_inst(inst, &n, 41.0, 28.0, 2.0, 44.0, 0.0, 0.0, 0.0, 0.0, 90.0/255.0, 90.0/255.0, 90.0/255.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     push_inst(inst, &n, 32.0, 18.0, 95.0, 63.5, 31.75, 6.0, 1.0, -64.0, 1.0, 1.0, 1.0, 0.0, 1.0, 9.0, 0.0, 1.0, -1.0, 9.0, 0.0, 0.0);
     if (!render_rgba(inst, n, 246.0/255.0, 244.0/255.0, 240.0/255.0, S3, W3, H3, rgba)) return 0;
-    int l_orig = px_luma_of(rgba, W3, 126, 149);
-    int min_refr_l = 255;
-    for (int rx = 130; rx <= 135; rx++) {
-      int lr = px_luma_of(rgba, W3, rx, 149);
-      if (lr < min_refr_l) min_refr_l = lr;
-    }
-    int ng_ok = (l_orig > 220) && (min_refr_l < 170);
-    printf("  [%s] V9-Tab-No-Ghost Role 4 outer falloff: origL@10pt=%d (>220) refrMinL@11.5..12.8pt=%d (<170)\n", ng_ok ? "PASS" : "FAIL", l_orig, min_refr_l);
+    int l_bar = px_luma_of(rgba, W3, 126, 149);
+    int l_clean = px_luma_of(rgba, W3, 114, 149);
+    int ng_ok = (l_bar < 130) && (l_clean > 220);
+    printf("  [%s] V9-Tab-No-Ghost Role 4 monotonic: barL@10pt=%d (<130) cleanL@6pt=%d (>220)\n", ng_ok ? "PASS" : "FAIL", l_bar, l_clean);
     ok &= ng_ok;
   }
 
@@ -502,6 +505,22 @@ static int run_v8_v9_2d_roi(void) {
     printf("  [%s] V10 regular glass AA & dark ROI RGBA8 exact: light_d2=%.2f (<=14) side_min=%.1f ([150,176]) outer_top=%.1f top=%.1f mid=%.1f dark_top=%.1f>mid=%.1f roi_hash=(%u,%u)\n",
            v10_ok ? "PASS" : "FAIL", max_d2, side_min, light_outer_top, light_top, light_mid, yd_top, yd_mid, h1, h2);
     ok &= v10_ok;
+
+    // V10-Dark-On-Bright: Dark Regular glass on #F2F3F0 bright backdrop has no dead-black contour (>= 120/255) and bright top rim.
+    n = 0;
+    push_inst(inst, &n, 20.0, 20.0, 120.0, 80.0, 24.0, 6.0, 1.0, 0.0,
+              32.0/255.0, 32.0/255.0, 32.0/255.0, 103.0/255.0,
+              0.6, 14.0, 0.0, 1.0, -72.0, 20.0, 0.0, 0.0);
+    if (!render_rgba(inst, n, 242.0/255.0, 243.0/255.0, 240.0/255.0, 2.0, 320, 240, rgba)) return 0;
+    size_t k_db_side = ((size_t)120 * 320 + 280) * 4;
+    int db_out_min = rgba[k_db_side] < rgba[k_db_side + 1] ? rgba[k_db_side] : rgba[k_db_side + 1];
+    if (rgba[k_db_side + 2] < db_out_min) db_out_min = rgba[k_db_side + 2];
+    double db_l_mid = luma_f(rgba, 320, 160, 120);
+    double db_l_top = luma_f(rgba, 320, 160, 40);
+    int v10_dob_ok = (db_out_min >= 120) && (db_l_top > db_l_mid + 20.0);
+    printf("  [%s] V10-Dark-On-Bright (#F2F3F0 @2x): out_min=%d (>=120) top=%.1f mid=%.1f\n",
+           v10_dob_ok ? "PASS" : "FAIL", db_out_min, db_l_top, db_l_mid);
+    ok &= v10_dob_ok;
   }
 
   // V11: 3D Slim Bevel Wall & Curved-Cap AA Gate (V11-AA, V11-Wall, V11-Top)
@@ -963,6 +982,62 @@ static int run_warp_smoke(void) {
     printf("  [%s] V13 light adaptive opacity: 0x67=(ink=%d,gl=%d) 0.913=(ink=%d,gl=%d,settling=%d) 0.752=(ink=%d,gl=%d)\n",
            ad3_ok ? "PASS" : "FAIL", ink0, gl0, ink1, gl1, settling1, ink65, gl65);
     ok &= ad3_ok;
+
+    // V13-B: Uniform capsule ink across mixed dark/bright backdrop (no local per-glyph inversion)
+    // and opaque adaptive kind==0 fill opacity preservation (pad.w < 0, alpha >= 0.75).
+    {
+      mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+      mb_render_present(ad_inst, 0, 1.0, 1.0, 1.0);
+      double mix_inst[8 * INST_SIZE];
+      int nm = 0;
+      push_inst(mix_inst, &nm, 0.0, 0.0, 72.0, 120.0, 0.0, 0.0, 0.0, 0.0,
+                0.05, 0.05, 0.06, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(mix_inst, &nm, 10.0, 38.0, 140.0, 44.0, 22.0, 6.0, 1.0, 1.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
+                0.0, 4.0, -1.0, 1.0, -51.0, 0.0, 0.0, 0.0);
+      push_inst(mix_inst, &nm, 24.0, 52.0, 32.0, 16.0, 6.0, 10.0, 0.0, 0.0,
+                0.14, 0.15, 0.17, 1.0,
+                0.1, 0.5, 0.9, 0.5, 0.0, 80.0, 60.0, 48.0);
+      push_inst(mix_inst, &nm, 104.0, 52.0, 32.0, 16.0, 6.0, 10.0, 0.0, 0.0,
+                0.14, 0.15, 0.17, 1.0,
+                0.1, 0.5, 0.9, 0.5, 0.0, 80.0, 60.0, 48.0);
+      mb_host_render_dirty(0.0, 0.0, 160.0, 120.0);
+      mb_render_present(mix_inst, nm, 1.0, 1.0, 1.0);
+      memset(pxbuf, 0, sizeof pxbuf);
+      g_test_buf_len = sizeof pxbuf;
+      if (!mb_render_drawn_pixels(0, 0, W, H, pxbuf)) return 0;
+      int l_left = px_luma_of(pxbuf, W, 80, 120);
+      int l_right = px_luma_of(pxbuf, W, 240, 120);
+      int uniform_ok = (l_left < 80) && (l_right < 80) && (abs(l_left - l_right) < 25);
+
+      // Opaque vs translucent adaptive kind==0 fills on flipped dark capsule
+      mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+      mb_render_present(ad_inst, 0, 0.05, 0.05, 0.06);
+      nm = 0;
+      push_inst(mix_inst, &nm, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
+                0.05, 0.05, 0.06, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(mix_inst, &nm, 10.0, 38.0, 140.0, 44.0, 22.0, 6.0, 1.0, 1.0,
+                253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
+                0.0, 4.0, -1.0, 1.0, -52.0, 0.0, 0.0, 0.0);
+      push_inst(mix_inst, &nm, 26.0, 52.0, 36.0, 16.0, 4.0, 0.0, 0.0, 0.0,
+                0.10, 0.10, 0.10, 1.0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 80.0, 60.0, -48.0);
+      push_inst(mix_inst, &nm, 98.0, 52.0, 36.0, 16.0, 4.0, 0.0, 0.0, 0.0,
+                0.10, 0.10, 0.10, 0.12,
+                0.0, 0.0, 0.0, 0.0, 0.0, 80.0, 60.0, -48.0);
+      mb_host_render_dirty(0.0, 0.0, 160.0, 120.0);
+      mb_render_present(mix_inst, nm, 0.05, 0.05, 0.06);
+      memset(pxbuf, 0, sizeof pxbuf);
+      g_test_buf_len = sizeof pxbuf;
+      if (!mb_render_drawn_pixels(0, 0, W, H, pxbuf)) return 0;
+      int opq_l = px_luma_of(pxbuf, W, 88, 120);
+      int trn_l = px_luma_of(pxbuf, W, 232, 120);
+      int fill_ok = (opq_l >= 235) && (trn_l < 150);
+      int v13b_ok = uniform_ok && fill_ok;
+      printf("  [%s] V13-B uniform capsule ink & opaque adaptive fill: mix=(%d,%d) opq=%d (>=235) trn=%d (<150)\n",
+             v13b_ok ? "PASS" : "FAIL", l_left, l_right, opq_l, trn_l);
+      ok &= v13b_ok;
+    }
 
     // Clean up adaptive slots
     mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);

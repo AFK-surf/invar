@@ -972,17 +972,16 @@
       s_cap = 1.16 * 1.847264 * u * u * exp(-u) * capCut * medialTaper;
       H_opt = 10.6 * hs * refScale;
     } else {
-      float r_lip = 2.15 * hs;
-      float L_lip = 0.42 * hs;
-      s_lip = 14.5 * exp(-d / L_lip) * (1.0 - smoothstep(0.45 * r_lip, r_lip, d)) * medialTaper;
-      float u = max(d - 1.95 * hs, 0.0) / (2.60 * hs);
-      s_cap = 0.56 * 1.847264 * u * u * exp(-u) * medialTaper;
-      H_opt = 10.6 * hs * refScale;
+      float r_lip = 4.2 * hs;
+      float L_lip = 1.05 * hs;
+      s_lip = 5.5 * exp(-d / L_lip) * (1.0 - smoothstep(0.45 * r_lip, r_lip, d)) * medialTaper;
+      s_cap = 0.0;
+      H_opt = 6.2 * hs * refScale;
     }
     return vec2(mb_snell_intersect(s_lip - s_cap, ior, H_opt), s_lip);
   }
   #endif
-  #if ONE_KIND < 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
+  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
   vec4 backdrop4(vec2 p) {
     return textureLod(u_bd, clamp(p * u_map.xy + u_map.zw, u_uvc.xy, u_uvc.zw), 0.0);
   }
@@ -992,7 +991,7 @@
   float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
   float mb_ink_luma(vec3 c) { return dot(c * c, vec3(0.2126, 0.7152, 0.0722)); }
   #endif
-  #if ONE_KIND < 0 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
+  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 6 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11 || ONE_KIND == 13
   float mb_backdrop_luma_rect(vec2 c, vec2 h) {
     float sum = 0.0;
     float mx1 = -1.0, mx2 = -1.0;
@@ -1046,7 +1045,7 @@
     return 1.0 - smoothstep(0.12, 0.21, c_eq * c_eq);
   }
   #endif
-  #if ONE_KIND < 0 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11
+  #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 7 || ONE_KIND == 10 || ONE_KIND == 11
   vec3 ad_sample_ink(vec2 ac, float fallback_r) {
     if (u_ad_n > 0) {
       int best = -1;
@@ -1081,36 +1080,8 @@
     if (ch > 0.08 || origL >= 0.5) return rgb;
     vec3 cap = ad_sample_ink(ac, fallback_r);
     float capsuleDarkT = cap.x;
-    float capsuleBgL = cap.y;
-    float capsuleLatch = cap.z;
-    int lcode = int(floor(clamp(capsuleLatch, 0.0, 1.0) * 255.0 + 0.5));
-    float capsuleExtra = (lcode < 48) ? (float(lcode) / 46.0) : ((lcode > 208) ? (float(255 - lcode) / 46.0) : 0.0);
-    float darkT = capsuleDarkT;
-    float localBoost = 0.0;
-    if (capsuleDarkT < 0.999 && capsuleExtra < 0.08) {
-      vec2 gc = rect.xy + rect.zw * 0.5;
-      vec2 guv = gc * u_map.xy + u_map.zw;
-      if (u_uvc.z > u_uvc.x && u_uvc.w > u_uvc.y && guv.x >= u_uvc.x && guv.x <= u_uvc.z && guv.y >= u_uvc.y && guv.y <= u_uvc.w) {
-        float rx = clamp(rect.z * 0.35, 6.0, 14.0);
-        float ry = clamp(rect.w * 0.35, 5.0, 10.0);
-        float localL = (mb_ink_luma(backdrop(gc)) * 2.0
-          + mb_ink_luma(backdrop(gc + vec2(-rx, -ry)))
-          + mb_ink_luma(backdrop(gc + vec2(rx, -ry)))
-          + mb_ink_luma(backdrop(gc + vec2(-rx, ry)))
-          + mb_ink_luma(backdrop(gc + vec2(rx, ry)))) / 6.0;
-        float localDarkT = 1.0 - smoothstep(0.24, 0.40, localL);
-        float localW = max(smoothstep(0.35, 0.44, capsuleBgL), smoothstep(0.08, 0.20, capsuleBgL - localL));
-        float localEff = localDarkT * localW;
-        if (localEff > darkT) {
-          localBoost = clamp(localEff - capsuleDarkT, 0.0, 1.0);
-          darkT = localEff;
-        }
-      }
-    }
-    float inkT = smoothstep(0.0, 1.0, darkT);
-    float baseLightL = clamp(1.06 - origL, 0.68, 0.98);
-    float localLightL = clamp(1.14 - origL * 0.60, 0.86, 0.99);
-    float lightL = mix(baseLightL, localLightL, localBoost);
+    float inkT = smoothstep(0.0, 1.0, capsuleDarkT);
+    float lightL = clamp(1.06 - origL, 0.68, 0.98);
     return mix(rgb, vec3(lightL), inkT);
   }
   #endif
@@ -1415,8 +1386,6 @@
       float dropHairline = 0.0;
       float pressAmt = 0.0;
       float menAA = 0.0;
-      float barIconGate = 0.0;
-      vec2 barCaDisp = vec2(0.0, 0.0);
       if (is_drop) {
         pressAmt = clamp(v_c2.x, 0.0, 1.0);
         dropHairline = (1.0 - smoothstep(0.18, 0.62, inward)) * pressAmt;
@@ -1427,21 +1396,6 @@
           vec2 dropDisp = surfaceNormal * snellDmag;
           if (isRoleSlid && snellSLip > 0.6 && pressAmt > 0.001) {
             menAA = 0.35 * smoothstep(0.6, 2.0, snellSLip) * pressAmt * droplet;
-          }
-          if (isRoleTab) {
-            float pinchWeight = smoothstep(4.5, 6.5, rawAmount);
-            vec2 lensCenter = v_rect.xy + v_rect.zw * 0.5;
-            vec2 centered = (p - lensCenter) / max(v_rect.zw, vec2(1.0));
-            vec2 absC = abs(centered) * 2.0;
-            float tipDist = (0.5 - abs(centered.x)) * v_rect.z;
-            float capAbsX = clamp(1.0 - tipDist / max(v_rect.w * 0.6514, 1.0), 0.0, 1.0);
-            float endCapX = smoothstep(0.32, 0.70, capAbsX);
-            float iconBandY = 1.0 - smoothstep(0.66, 0.79, absC.y);
-            barIconGate = iconBandY * endCapX * pressAmt * pinchWeight * droplet;
-            float iconBevelX = smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward));
-            float iconBevelY = smoothstep(0.45, 1.25, inward) * (1.0 - smoothstep(2.20, 9.00, inward));
-            float signX = (centered.x >= 0.0) ? 1.0 : -1.0;
-            barCaDisp = vec2(-signX * 5.2 * iconBevelX, -centered.y * 2.0 * 4.8 * iconBevelY) * barIconGate;
           }
           disp = mix(disp, dropDisp, droplet);
         } else {
@@ -1489,31 +1443,6 @@
         vec3 menAvg = (backdrop(mc + nOff + tOff) + backdrop(mc + nOff - tOff)
                      + backdrop(mc - nOff + tOff) + backdrop(mc - nOff - tOff)) * 0.25;
         refractColor = mix(refractColor, menAvg, menAA);
-      }
-      if (isRoleTab && barIconGate > 0.01 && dropHairline < 0.99) {
-        float bevelGate = barIconGate * smoothstep(0.45, 1.15, inward) * (1.0 - smoothstep(2.60, 9.40, inward)) * (1.0 - dropHairline);
-        if (bevelGate > 0.001) {
-          float refX = (p.x >= v_rect.x + v_rect.z * 0.5) ? 0.26 : 0.74;
-          vec3 refPlatter = backdrop(v_rect.xy + vec2(refX, 0.18) * v_rect.zw);
-          float isDarkPlatter = 1.0 - step(0.35, luma(refPlatter));
-          vec3 iconG = backdrop(p + barCaDisp);
-          float iconDiffG = length(iconG - refPlatter);
-          float iconPeakG = max(iconG.r, max(iconG.g, iconG.b));
-          float lightIconMask = smoothstep(0.24, 0.42, iconDiffG);
-          float darkIconMask = smoothstep(0.38, 0.55, iconPeakG);
-          float isInsidePlatter = mix(lightIconMask, darkIconMask * smoothstep(0.05, 0.12, luma(refractColor)), isDarkPlatter);
-          float iconCaGate = mix(smoothstep(0.22, 0.40, iconDiffG), darkIconMask, isDarkPlatter);
-          float iconDisp = 0.035 * iconCaGate;
-          vec3 iconRGB = iconG;
-          if (iconDisp > 0.002) {
-            vec3 iconR = backdrop(p + barCaDisp * (1.0 + iconDisp));
-            vec3 iconB = backdrop(p + barCaDisp * (1.0 - iconDisp));
-            float rbValid = mix(1.0, smoothstep(0.04, 0.12, min(luma(iconR), luma(iconB))), isDarkPlatter);
-            iconRGB.r = mix(iconG.r, iconR.r, rbValid);
-            iconRGB.b = mix(iconG.b, iconB.b, rbValid);
-          }
-          refractColor = mix(refractColor, iconRGB, isInsidePlatter * bevelGate);
-        }
       }
       #else
       vec3 refractColor;
@@ -1741,7 +1670,7 @@
         }
       }
       float tintDarkEnv = 1.0 - smoothstep(0.18, 0.55, luma(refractColor));
-      float regDarkContour = max(is_dark ? 1.0 : darkMixSaved, tintDarkEnv * smoothstep(0.08, 0.16, colChroma));
+      float regDarkContour = tintDarkEnv * max(is_dark ? 1.0 : darkMixSaved, smoothstep(0.08, 0.16, colChroma));
       float regExtContour = mix(0.34, 0.85, regDarkContour) * solidFade;
       contourStr = mix(contourStr, regExtContour, regMix);
       float Y = luma(refractColor);
@@ -1889,6 +1818,7 @@
       }
       if (regMix > 0.001) {
         float regDark = is_dark ? 1.0 : darkMixSaved;
+        float regDarkRim = regDark * tintDarkEnv;
         float tintChroma = smoothstep(0.08, 0.16, colChroma);
         if (v_c2.x > 0.01 && inward < 12.0 && solidFade > 0.001) {
           float along = -rn.y;
@@ -1905,19 +1835,19 @@
           float regTail = mix(regTailLight, regTailDark, regDark);
           float resY = luma(result);
           float regEaseLight = 1.0 / max(1.0 - 0.75 * resY, 0.25);
-          float regEase = mix(regEaseLight, pow(max(1.0 - resY, 0.0), 0.25), regDark);
+          float regEase = mix(regEaseLight, pow(max(1.0 - resY, 0.0), 0.25), regDarkRim);
           float regRimGain = 1.0 * clamp(v_c2.x / 0.6, 0.0, 1.5);
           float regCoreW = mix(0.21, 0.24, regDark) * (1.0 - tintChroma);
           float regTailW = mix(0.030, 0.055, regDark) * (1.0 - tintChroma);
           float lipY = resY;
-          if (inward < 3.0 && regDark < 0.999 && tintChroma < 0.999) {
+          if (inward < 3.0 && regDarkRim < 0.999 && tintChroma < 0.999) {
             vec2 tang = vec2(-surfaceNormal.y, surfaceNormal.x) * 3.0;
             vec3 lt1 = backdrop(sampleBase + disp + tang);
             vec3 lt2 = backdrop(sampleBase + disp - tang);
             float avgBgY = (Y + luma(lt1) + luma(lt2)) * (1.0 / 3.0);
             lipY = clamp(luma(emission) + clamp(avgBgY * (1.0 + lift * (1.0 - avgBgY)) * transmittance, 0.0, 1.0), 0.0, 1.0);
           }
-          float brightLip = smoothstep(0.77, 0.92, lipY) * (1.0 - regDark) * (1.0 - tintChroma);
+          float brightLip = smoothstep(0.77, 0.92, lipY) * (1.0 - regDarkRim) * (1.0 - tintChroma);
           float lipProfile = exp(-max(0.0, inward - 0.70) / 0.55);
           float regRim = (regRimGain * regLobe * (regEase * (regCoreW * regCore + regTailW * regTail) + 0.72 * brightLip * lipProfile) + spot * 0.10 * regCore) * solidFade * regMix;
           float regDarkEff = is_dark ? (1.0 - brightTSaved) : darkMixSaved;
@@ -2154,7 +2084,7 @@
     float rad = mb_corner_of(p - c, v_rr);
     float d = mb_sd_box(p - c, hs, rad, band);
     #if ONE_KIND < 0 || ONE_KIND == 0 || ONE_KIND == 5
-    if (kind == 0 || kind == 5) d = notch_cut(d, p, v_rect, v_pad);
+    if ((kind == 0 && v_pad.w >= 0.0) || kind == 5) d = notch_cut(d, p, v_rect, v_pad);
     #endif
     #if ONE_KIND < 0 || ONE_KIND == 4
     if (kind == 4) {
@@ -2226,6 +2156,17 @@
     }
     #endif
     #if ONE_KIND < 0 || ONE_KIND == 0
+    if (kind == 0 && v_pad.w < 0.0) {
+      float ch = max(max(col.r, col.g), col.b) - min(min(col.r, col.g), col.b);
+      float darkT = ad_sample_ink(v_pad.yz, -v_pad.w * 0.5).x;
+      if (ch <= 0.08 && luma(col.rgb) < 0.5) {
+        col.rgb = mix(col.rgb, vec3(1.0), darkT);
+        col.a = mix(col.a, (col.a >= 0.75) ? col.a : min(col.a * 1.45, 0.28), darkT);
+      } else if (ch > 0.08 && luma(col.rgb) < 0.35) {
+        col.rgb = mix(col.rgb, min(col.rgb * 1.65 + vec3(0.28, 0.20, 0.18), vec3(1.0)), darkT);
+        col.a = mix(col.a, (col.a >= 0.75) ? col.a : min(col.a * 1.45, 0.36), darkT);
+      }
+    }
     vec4 fill = vec4(col.rgb, 1.0) * col.a;
     if (v_p.z > 0.0) {
       float inner = clamp(0.5 - (d + v_p.z) * u_scale, 0.0, 1.0);
