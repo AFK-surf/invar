@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "raw_premul.h"
+#include "cr_mips.h"
 #include "win.h"
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -133,6 +134,34 @@ static WICBitmapTransformOptions upright(UINT16 o) {
   }
 }
 
+// Separable Catmull-Rom ([-1, 9, 9, -1] / 16) mip chain: keeps thin text and 1px UI lines sharp when scaled below 50%.
+static UINT build_mips_cr(const uint8_t *base, UINT dw, UINT dh, D3D11_SUBRESOURCE_DATA inits[16],
+                          uint8_t *mip_bufs[16], int opaque) {
+  UINT mips = (UINT)mb_cr_mip_count((int)dw, (int)dh);
+  inits[0] = {base, dw * 4, 0};
+  UINT mw = dw, mh = dh;
+  const uint8_t *prev = base;
+  uint8_t *tmp = mips > 1 ? (uint8_t *)malloc((size_t)(dw > 1 ? (dw >> 1) : 1) * dh * 4u) : NULL;
+  for (UINT level = 1; level < mips; level++) {
+    UINT nw = mw > 1 ? (mw >> 1) : 1;
+    UINT nh = mh > 1 ? (mh >> 1) : 1;
+    uint8_t *dst = (uint8_t *)malloc((size_t)nw * nh * 4u);
+    if (!dst || !tmp) {
+      free(dst);
+      mips = level;
+      break;
+    }
+    mip_bufs[level] = dst;
+    mb_cr_mip_step(prev, (int)mw, (int)mh, dst, tmp, opaque);
+    inits[level] = {dst, nw * 4, 0};
+    prev = dst;
+    mw = nw;
+    mh = nh;
+  }
+  free(tmp);
+  return mips;
+}
+
 static ID3D11ShaderResourceView *decode(IWICImagingFactory *wic, IWICBitmapDecoder *dec, int max_px,
                                         int *w, int *h, int *ow, int *oh) {
   IWICBitmapFrameDecode *frame = NULL;
@@ -149,14 +178,17 @@ static ID3D11ShaderResourceView *decode(IWICImagingFactory *wic, IWICBitmapDecod
     int turned = o >= 5;
     *ow = (int)(turned ? sh : sw);
     *oh = (int)(turned ? sw : sh);
-    double k = fmin(1.0, max_px / (double)(sw > sh ? sw : sh));
+    UINT big = sw > sh ? sw : sh;
+    // Keep native pixels across adjacent power-of-2 buckets (up to 4096) so the GPU resampler scales once directly
+    // instead of double-resampling through WIC and the GPU.
+    double k = (big <= 4096 && max_px > 0 && big <= (UINT)max_px * 2) ? 1.0 : fmin(1.0, max_px / (double)big);
     UINT tw = (UINT)lround(sw * k), th = (UINT)lround(sh * k);
     if (!tw) tw = 1;
     if (!th) th = 1;
     IWICBitmapSource *src = frame;
     if (k < 1) {
       if (FAILED(wic->CreateBitmapScaler(&scaler)) ||
-          FAILED(scaler->Initialize(frame, tw, th, WICBitmapInterpolationModeFant)))
+          FAILED(scaler->Initialize(frame, tw, th, WICBitmapInterpolationModeHighQualityCubic)))
         goto done;
       src = scaler;
     }
@@ -175,43 +207,9 @@ static ID3D11ShaderResourceView *decode(IWICImagingFactory *wic, IWICBitmapDecod
     UINT stride = dw * 4;
     px = (uint8_t *)malloc((size_t)stride * dh);
     if (!px || FAILED(src->CopyPixels(NULL, stride, stride * dh, px))) goto done;
-    UINT mips = 1;
-    for (UINT m = dw > dh ? dw : dh; m > 1; m >>= 1) mips++;
     D3D11_SUBRESOURCE_DATA inits[16] = {};
     uint8_t *mip_bufs[16] = {};
-    if (mips > 16) mips = 16;
-    inits[0] = {px, stride, 0};
-    UINT mw = dw, mh = dh;
-    const uint8_t *prev = px;
-    for (UINT level = 1; level < mips; level++) {
-      UINT nw = mw > 1 ? (mw >> 1) : 1;
-      UINT nh = mh > 1 ? (mh >> 1) : 1;
-      uint8_t *dst = (uint8_t *)malloc((size_t)nw * nh * 4);
-      if (!dst) {
-        mips = level;
-        break;
-      }
-      mip_bufs[level] = dst;
-      for (UINT y = 0; y < nh; y++) {
-        UINT y0 = y * 2, y1 = y0 + 1 < mh ? y0 + 1 : y0;
-        const uint8_t *r0 = prev + (size_t)y0 * mw * 4;
-        const uint8_t *r1 = prev + (size_t)y1 * mw * 4;
-        uint8_t *out = dst + (size_t)y * nw * 4;
-        for (UINT x = 0; x < nw; x++) {
-          UINT x0 = x * 2, x1 = x0 + 1 < mw ? x0 + 1 : x0;
-          const uint8_t *p00 = r0 + x0 * 4, *p10 = r0 + x1 * 4;
-          const uint8_t *p01 = r1 + x0 * 4, *p11 = r1 + x1 * 4;
-          out[x * 4 + 0] = (uint8_t)((p00[0] + p10[0] + p01[0] + p11[0] + 2) >> 2);
-          out[x * 4 + 1] = (uint8_t)((p00[1] + p10[1] + p01[1] + p11[1] + 2) >> 2);
-          out[x * 4 + 2] = (uint8_t)((p00[2] + p10[2] + p01[2] + p11[2] + 2) >> 2);
-          out[x * 4 + 3] = (uint8_t)((p00[3] + p10[3] + p01[3] + p11[3] + 2) >> 2);
-        }
-      }
-      inits[level] = {dst, nw * 4, 0};
-      prev = dst;
-      mw = nw;
-      mh = nh;
-    }
+    UINT mips = build_mips_cr(px, dw, dh, inits, mip_bufs, 0);
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = dw;
     td.Height = dh;
@@ -260,44 +258,9 @@ static ID3D11ShaderResourceView *raw_premul(const uint8_t *d, size_t n, int max_
     mb_raw_premul_downscale(base, rw, rh, scaled, tw, th);
     base = scaled;
   }
-  UINT mips = 1;
-  for (UINT m = (UINT)(tw > th ? tw : th); m > 1; m >>= 1) mips++;
-  if (mips > 16) mips = 16;
   D3D11_SUBRESOURCE_DATA inits[16] = {};
   uint8_t *mip_bufs[16] = {};
-  inits[0] = {base, (UINT)tw * 4u, 0};
-  UINT mw = (UINT)tw, mh = (UINT)th;
-  const uint8_t *prev = base;
-  for (UINT level = 1; level < mips; level++) {
-    UINT nw = mw > 1 ? (mw >> 1) : 1;
-    UINT nh = mh > 1 ? (mh >> 1) : 1;
-    uint8_t *dst = (uint8_t *)malloc((size_t)nw * (size_t)nh * 4u);
-    if (!dst) {
-      // Match decode(): truncate the mip chain on OOM rather than failing the whole image upload.
-      mips = level;
-      break;
-    }
-    mip_bufs[level] = dst;
-    for (UINT y = 0; y < nh; y++) {
-      UINT y0 = y * 2, y1 = y0 + 1 < mh ? y0 + 1 : y0;
-      const uint8_t *r0 = prev + (size_t)y0 * mw * 4;
-      const uint8_t *r1 = prev + (size_t)y1 * mw * 4;
-      uint8_t *out = dst + (size_t)y * nw * 4;
-      for (UINT x = 0; x < nw; x++) {
-        UINT x0 = x * 2, x1 = x0 + 1 < mw ? x0 + 1 : x0;
-        const uint8_t *p00 = r0 + x0 * 4, *p10 = r0 + x1 * 4;
-        const uint8_t *p01 = r1 + x0 * 4, *p11 = r1 + x1 * 4;
-        out[x * 4 + 0] = (uint8_t)((p00[0] + p10[0] + p01[0] + p11[0] + 2) >> 2);
-        out[x * 4 + 1] = (uint8_t)((p00[1] + p10[1] + p01[1] + p11[1] + 2) >> 2);
-        out[x * 4 + 2] = (uint8_t)((p00[2] + p10[2] + p01[2] + p11[2] + 2) >> 2);
-        out[x * 4 + 3] = (uint8_t)((p00[3] + p10[3] + p01[3] + p11[3] + 2) >> 2);
-      }
-    }
-    inits[level] = {dst, nw * 4, 0};
-    prev = dst;
-    mw = nw;
-    mh = nh;
-  }
+  UINT mips = build_mips_cr(base, (UINT)tw, (UINT)th, inits, mip_bufs, 0);
   D3D11_TEXTURE2D_DESC td = {};
   td.Width = (UINT)tw;
   td.Height = (UINT)th;
@@ -341,43 +304,9 @@ static ID3D11ShaderResourceView *raw_bmp(const uint8_t *d, size_t n, int max_px,
   int rbig = rw > rh ? rw : rh;
   if ((max_px > 0 && max_px < rbig && (rbig > 4096 || rbig > max_px * 2)) || off > n || (size_t)rw * rh * 4 > n - off)
     return NULL;
-  UINT mips = 1;
-  for (UINT m = (UINT)rbig; m > 1; m >>= 1) mips++;
-  if (mips > 16) mips = 16;
   D3D11_SUBRESOURCE_DATA inits[16] = {};
   uint8_t *mip_bufs[16] = {};
-  inits[0] = {d + off, (UINT)rw * 4, 0};
-  UINT mw = (UINT)rw, mh = (UINT)rh;
-  const uint8_t *prev = d + off;
-  for (UINT level = 1; level < mips; level++) {
-    UINT nw = mw > 1 ? (mw >> 1) : 1;
-    UINT nh = mh > 1 ? (mh >> 1) : 1;
-    uint8_t *dst = (uint8_t *)malloc((size_t)nw * nh * 4);
-    if (!dst) {
-      mips = level;
-      break;
-    }
-    mip_bufs[level] = dst;
-    for (UINT y = 0; y < nh; y++) {
-      UINT y0 = y * 2, y1 = y0 + 1 < mh ? y0 + 1 : y0;
-      const uint8_t *r0 = prev + (size_t)y0 * mw * 4;
-      const uint8_t *r1 = prev + (size_t)y1 * mw * 4;
-      uint8_t *out = dst + (size_t)y * nw * 4;
-      for (UINT x = 0; x < nw; x++) {
-        UINT x0 = x * 2, x1 = x0 + 1 < mw ? x0 + 1 : x0;
-        const uint8_t *p00 = r0 + x0 * 4, *p10 = r0 + x1 * 4;
-        const uint8_t *p01 = r1 + x0 * 4, *p11 = r1 + x1 * 4;
-        out[x * 4 + 0] = (uint8_t)((p00[0] + p10[0] + p01[0] + p11[0] + 2) >> 2);
-        out[x * 4 + 1] = (uint8_t)((p00[1] + p10[1] + p01[1] + p11[1] + 2) >> 2);
-        out[x * 4 + 2] = (uint8_t)((p00[2] + p10[2] + p01[2] + p11[2] + 2) >> 2);
-        out[x * 4 + 3] = 255;
-      }
-    }
-    inits[level] = {dst, nw * 4, 0};
-    prev = dst;
-    mw = nw;
-    mh = nh;
-  }
+  UINT mips = build_mips_cr(d + off, (UINT)rw, (UINT)rh, inits, mip_bufs, 1);
   D3D11_TEXTURE2D_DESC td = {};
   td.Width = (UINT)rw;
   td.Height = (UINT)rh;

@@ -266,6 +266,98 @@ int main(void) {
     }
   }
 
+  // 5. Catmull-Rom mip chain (cr_mips.h): premul clamp, opaque alpha=255, sharpness, odd sizes
+  {
+    CHECK(mb_cr_mip_count(1, 1) == 1);
+    CHECK(mb_cr_mip_count(64, 32) == 7);
+    // Steep alpha step: left 4 cols transparent (0,0,0,0), right 4 cols opaque white (255,255,255,255)
+    uint8_t src[8 * 4 * 4];
+    for (int y = 0; y < 4; y++) {
+      for (int x = 0; x < 8; x++) {
+        uint8_t *p = src + (y * 8 + x) * 4;
+        uint8_t v = x >= 4 ? 255 : 0;
+        p[0] = v; p[1] = v; p[2] = v; p[3] = v;
+      }
+    }
+    uint8_t tmp[8 * 4 * 4] = {};
+    uint8_t dst_premul[4 * 2 * 4] = {};
+    mb_cr_mip_step(src, 8, 4, dst_premul, tmp, 0);
+    for (int i = 0; i < 4 * 2; i++) {
+      uint8_t *p = dst_premul + i * 4;
+      CHECK(p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]);
+    }
+    uint8_t dst_opaque[4 * 2 * 4] = {};
+    mb_cr_mip_step(src, 8, 4, dst_opaque, tmp, 1);
+    for (int i = 0; i < 4 * 2; i++) CHECK(dst_opaque[i * 4 + 3] == 255);
+    // Odd dimensions (5x3 -> 2x1) preserve constant color
+    uint8_t odd_src[5 * 3 * 4];
+    for (int i = 0; i < 5 * 3; i++) {
+      odd_src[i * 4 + 0] = 60; odd_src[i * 4 + 1] = 90; odd_src[i * 4 + 2] = 120; odd_src[i * 4 + 3] = 200;
+    }
+    uint8_t odd_dst[2 * 1 * 4] = {};
+    mb_cr_mip_step(odd_src, 5, 3, odd_dst, tmp, 0);
+    for (int i = 0; i < 2; i++) {
+      CHECK(odd_dst[i * 4 + 0] == 60 && odd_dst[i * 4 + 1] == 90 &&
+            odd_dst[i * 4 + 2] == 120 && odd_dst[i * 4 + 3] == 200);
+    }
+  }
+
+  // 6. WIC decode keeps native pixels within 2x of max_px (avoids double-resampling across buckets)
+  {
+    uint8_t bgra16[16 * 16 * 4];
+    for (int i = 0; i < 16 * 16; i++) {
+      bgra16[i * 4 + 0] = 30; bgra16[i * 4 + 1] = 150; bgra16[i * 4 + 2] = 220; bgra16[i * 4 + 3] = 255;
+    }
+    IWICImagingFactory *wic = NULL;
+    IStream *stream = NULL;
+    IWICBitmapEncoder *enc = NULL;
+    IWICBitmapFrameEncode *frame = NULL;
+    uint8_t *png16 = NULL;
+    size_t len16 = 0;
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+        SUCCEEDED(CreateStreamOnHGlobal(NULL, TRUE, &stream)) &&
+        SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, NULL, &enc)) &&
+        SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(enc->CreateNewFrame(&frame, NULL)) &&
+        SUCCEEDED(frame->Initialize(NULL)) &&
+        SUCCEEDED(frame->SetSize(16, 16)) &&
+        SUCCEEDED(frame->SetPixelFormat(&fmt)) &&
+        SUCCEEDED(frame->WritePixels(16, 16 * 4, (UINT)sizeof(bgra16), bgra16)) &&
+        SUCCEEDED(frame->Commit()) &&
+        SUCCEEDED(enc->Commit())) {
+      HGLOBAL hg = NULL;
+      STATSTG st = {};
+      if (SUCCEEDED(GetHGlobalFromStream(stream, &hg)) && SUCCEEDED(stream->Stat(&st, STATFLAG_NONAME))) {
+        len16 = (size_t)st.cbSize.QuadPart;
+        const void *p = GlobalLock(hg);
+        png16 = (uint8_t *)malloc(len16 ? len16 : 1);
+        if (p && png16) memcpy(png16, p, len16);
+        if (p) GlobalUnlock(hg);
+      }
+    }
+    if (frame) frame->Release();
+    if (enc) enc->Release();
+    if (stream) stream->Release();
+    if (wic) wic->Release();
+    CHECK(png16 != NULL && len16 > 0);
+    if (png16) {
+      double info[4] = {};
+      test_mb_len = len16;
+      int id_keep = mb_host_image_load_bytes(png16, 8);
+      CHECK(wait_image(id_keep, info) == 1);
+      CHECK(info[0] == 16.0 && info[1] == 16.0 && info[2] == 16.0 && info[3] == 16.0);
+      mb_host_image_free(id_keep);
+
+      test_mb_len = len16;
+      int id_scale = mb_host_image_load_bytes(png16, 4);
+      CHECK(wait_image(id_scale, info) == 1);
+      CHECK(info[0] == 4.0 && info[1] == 4.0 && info[2] == 16.0 && info[3] == 16.0);
+      mb_host_image_free(id_scale);
+      free(png16);
+    }
+  }
+
   g_test_ctx->Release();
   g_test_dev->Release();
   if (SUCCEEDED(co)) CoUninitialize();

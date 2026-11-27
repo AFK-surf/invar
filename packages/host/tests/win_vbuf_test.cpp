@@ -63,7 +63,14 @@ static uint64_t test_image_free_gen = 0;
 
 extern "C" {
 size_t invar_test_array_length(const void *) { return test_out_bytes_len; }
-const wchar_t *mb_win_env(const wchar_t *) { return NULL; }
+const wchar_t *mb_win_env(const wchar_t *name) {
+  static wchar_t buf[8][MAX_PATH * 2];
+  static int slot = 0;
+  wchar_t *dst = buf[(slot++) & 7];
+  DWORD n = GetEnvironmentVariableW(name, dst, MAX_PATH * 2);
+  if (n == 0 || n >= MAX_PATH * 2) return NULL;
+  return dst;
+}
 const wchar_t *mb_win_app_id(void) { return L""; }
 void mb_host_request_frame(void) {}
 void *mb_image_srv(int) { return NULL; }

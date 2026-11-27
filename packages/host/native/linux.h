@@ -59,6 +59,7 @@ void mb_atlas_put(int colour, int x, int y, int w, int h, const uint8_t *px);
 // ---- images (linux_image.c): decoded off the main thread, their textures made in the GL context ----
 // a ready one's texture (0: none, decoding, failed)
 unsigned mb_image_tex(int id);
+int mb_image_mips(int id);
 // the decoded ones' textures made (GL context current), and each decode done told once to f(1, id, state)
 void mb_images_upload(void);
 void mb_images_wait_decoded(double ms);
