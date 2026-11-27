@@ -1,14 +1,16 @@
-// kit::tip_node (ported from sf-ui tip_node): delay & warm skip, glide between neighbouring controls, Escape, press
-// shut, focus-visible, finger hold/lift, shortcut caps and unmount cleanup, under ui::Tester.
+// kit::tip_node: delay & warm skip, glide between neighbouring controls, Escape vs root
+// keymap, press shut, focus-visible, finger hold/lift/cancel/open, multi-layer isolation, shortcut caps height &
+// concentricity, late/re-mount, dismiss, edge flip, disabled, reactive shortcut and unmount cleanup, under ui::Tester.
 
 import "signals"
 import "ui"
 import "view"
 
 let tip_test_ground : Int64 = 0x123456FFL
+let tip_test_cap_ground : Int64 = 0x654321FFL
 
 fn tip_test_look() -> TipLook {
-  TipLook::{ ..tip_look_default(), ground: tip_test_ground, shadow: (0.0, 0.0, 0L), scale_from: 1.0 }
+  TipLook::{ ..tip_look_default(), ground: tip_test_ground, cap_ground: tip_test_cap_ground, shadow: (0.0, 0.0, 0L) }
 }
 
 /// Two 60x30 controls 200pt apart on one row, each with a tip under it, the layer mounted after them.
@@ -29,6 +31,33 @@ fn tip_shown(t : ui::Tester, name : String) -> Bool {
   match t.get(name, role=view::Role::Tooltip) {
     Some(d) => d.alpha > 0.0
     None => false
+  }
+}
+
+/// Whether a visible drawn node has exact `words == s` (no substring match).
+fn drawn_exact_words(t : ui::Tester, s : String) -> Bool {
+  for d in t.drawn() {
+    if d.words == s && d.alpha > 0.0 {
+      return true
+    }
+  }
+  false
+}
+
+/// First drawn node matching ground colour `col` (RGB match, alpha > 0).
+fn drawn_by_ground(t : ui::Tester, col : Int64) -> Option[view::Drawn] {
+  for d in t.drawn() {
+    if d.alpha > 0.0 && d.ground >> 8 == col >> 8 {
+      return Some(d)
+    }
+  }
+  None
+}
+
+fn assert_idle(t : ui::Tester, msg : String) -> Unit {
+  match t.idle_said() {
+    None => ()
+    Some(why) => debug_assert(false, "\{msg}: not idle (\{why})")
   }
 }
 
@@ -60,8 +89,9 @@ test "tip_node_waits_400ms_then_warm_skip" {
   debug_assert(!tip_shown(t, "Alpha tip"), "the tip before gives up the window's slot")
   // (off both, long enough to cool, then back on A: waits again)
   t.move_to(200.0, 300.0)
-  t.frame(ms=1000.0)
+  t.run_shown(1000.0)
   debug_assert(!tip_shown(t, "Beta tip"), "tip gone as the pointer leaves")
+  assert_idle(t, "tree is idle after tip closes")
   t.move_to(70.0, 55.0)
   t.frame(ms=100.0)
   debug_assert(!tip_shown(t, "Alpha tip"), "cold again after the skip window: waits")
@@ -104,10 +134,44 @@ test "tip_node_escape_closes_until_pointer_leaves" {
   t.frame(ms=450.0)
   debug_assert(tip_shown(t, "Alpha tip"), "shown")
   t.key(ui::key_escape)
-  t.frame(ms=200.0)
+  t.run_shown(250.0)
   debug_assert(!tip_shown(t, "Alpha tip"), "Escape closes it")
+  assert_idle(t, "tree is idle after Escape close")
   t.frame(ms=1000.0)
   debug_assert(!tip_shown(t, "Alpha tip"), "it stays closed while the pointer rests")
+  t.dispose()
+}
+
+test "tip_node_escape_beats_root_keymap" {
+  let tips = TipLayer::new()
+  let root_escapes = view::ref_new(0)
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let km = view::Keymap::new([
+      view::Binding::{
+        keys: [view::Stroke::{ code: ui::key_escape, mods: 0 }],
+        action: "app.escape",
+        when: view::KeyWhen::Always,
+      },
+    ])
+    let _ = root
+    .keymap(view::Live::Is(km))
+    .on_action("app.escape", fn(_a : view::ActionAt) -> Bool {
+      root_escapes.v = root_escapes.v + 1
+      true
+    })
+    tip_test_pair(root, tips)
+  })
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(tip_shown(t, "Alpha tip"), "tip shown")
+  t.key(ui::key_escape)
+  t.run_shown(250.0)
+  debug_assert(!tip_shown(t, "Alpha tip"), "Escape closes the open tip first")
+  debug_assert(root_escapes.v == 0, "root keymap Escape binding did not run while tip was open")
+  assert_idle(t, "idle after tip closed by Escape")
+  t.key(ui::key_escape)
+  t.frame(ms=16.0)
+  debug_assert(root_escapes.v == 1, "root keymap Escape binding runs once no tip is open")
   t.dispose()
 }
 
@@ -142,10 +206,11 @@ test "tip_node_focus_visible_shows_at_once" {
   t.frame(ms=16.0)
   debug_assert(tip_shown(t, "Save the file"), "focus shown on its control shows the tip at once")
   t.frame(ms=200.0)
-  debug_assert(t.find("Ctrl").is_some() && t.find("S").is_some(), "the shortcut's keys drawn as caps")
+  debug_assert(drawn_exact_words(t, "Ctrl") && drawn_exact_words(t, "S"), "exact shortcut cap nodes drawn")
   t.key(ui::key_escape)
-  t.frame(ms=200.0)
+  t.run_shown(250.0)
   debug_assert(!tip_shown(t, "Save the file"), "Escape closes the focus-shown tip")
+  assert_idle(t, "idle after focus-shown tip closes")
   t.dispose()
 }
 
@@ -169,9 +234,391 @@ test "tip_node_finger_hold_and_lift" {
   (h.lift)()
   t.frame(ms=1000.0)
   debug_assert(tip_shown(t, "Held tip"), "lifted: still shown for a while")
-  t.frame(ms=700.0)
-  t.frame(ms=200.0)
+  t.run_shown(900.0)
   debug_assert(!tip_shown(t, "Held tip"), "gone tooltip_lifted_ms after the lift")
+  assert_idle(t, "idle after lifted tip closes")
+  t.dispose()
+}
+
+test "tip_node_hand_open_cancel_and_lift_interrupted" {
+  let tips = TipLayer::new()
+  let hand : signals::Ref[Option[TipHand]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() {
+        match hand.v {
+          Some(h) => (h.open)(true)
+          None => ()
+        }
+      })
+      hand.v = Some(tip_node(tips, a, fn() { "Tap tip" }))
+    })
+    let _ = tips.mount(root)
+  })
+  let h = match hand.v {
+    Some(h) => h
+    None => { debug_assert(false, "tip_node returns its hand"); return }
+  }
+  // (tapped open from on_press: stays open through the opening tap itself)
+  t.tap(70.0, 55.0)
+  t.frame(ms=200.0)
+  debug_assert((h.opened)(), "opened() true after tap-open")
+  debug_assert(tip_shown(t, "Tap tip"), "tip stays open after the opening tap")
+  // (a drag past slop is not a tap: tip remains open)
+  t.drag(200.0, 200.0, 260.0, 200.0)
+  t.frame(ms=200.0)
+  debug_assert((h.opened)() && tip_shown(t, "Tap tip"), "drag does not count as a tap to close")
+  // (next tap anywhere shuts it)
+  t.tap(200.0, 200.0)
+  t.run_shown(250.0)
+  debug_assert(!(h.opened)() && !tip_shown(t, "Tap tip"), "next tap anywhere closes tapped-open tip")
+  assert_idle(t, "idle after tap closes opened tip")
+  // (open(false): closes on the very next tap)
+  (h.open)(false)
+  t.frame(ms=200.0)
+  debug_assert((h.opened)() && tip_shown(t, "Tap tip"), "open(false) shows tip")
+  t.tap(220.0, 220.0)
+  t.run_shown(250.0)
+  debug_assert(!(h.opened)() && !tip_shown(t, "Tap tip"), "first tap closes open(false) tip")
+  // (hold -> cancel: closes immediately without waiting tooltip_lifted_ms)
+  (h.hold)()
+  t.frame(ms=200.0)
+  debug_assert(tip_shown(t, "Tap tip"), "hold shows tip")
+  (h.cancel)()
+  t.run_shown(250.0)
+  debug_assert(!tip_shown(t, "Tap tip"), "cancel closes held tip")
+  // (hold -> lift interrupted by a press anywhere before tooltip_lifted_ms)
+  (h.hold)()
+  t.frame(ms=200.0)
+  (h.lift)()
+  t.frame(ms=100.0)
+  debug_assert(tip_shown(t, "Tap tip"), "lifted tip still shown before press")
+  t.press_at(220.0, 220.0)
+  t.release(220.0, 220.0)
+  t.run_shown(250.0)
+  debug_assert(!tip_shown(t, "Tap tip"), "press anywhere interrupts lifted tip")
+  assert_idle(t, "idle after interrupted lift closes")
+  t.dispose()
+}
+
+test "tip_node_multi_layer_isolation" {
+  let tips_a = TipLayer::new()
+  let tips_b = TipLayer::new()
+  let hand_a : signals::Ref[Option[TipHand]] = view::ref_new(None)
+  let hand_b : signals::Ref[Option[TipHand]] = view::ref_new(None)
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.row(view::Live::Is(true)).gap(view::Live::Is(120.0)).padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      hand_a.v = Some(tip_node(tips_a, a, fn() { "Layer A tip" }))
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      hand_b.v = Some(tip_node(tips_b, b, fn() { "Layer B tip" }))
+    })
+    let _ = tips_a.mount(root)
+    let _ = tips_b.mount(root)
+  })
+  let ha = match hand_a.v {
+    Some(h) => h
+    None => { debug_assert(false, "hand_a"); return }
+  }
+  let hb = match hand_b.v {
+    Some(h) => h
+    None => { debug_assert(false, "hand_b"); return }
+  }
+  (ha.open)(false)
+  t.frame(ms=200.0)
+  debug_assert(tip_shown(t, "Layer A tip"), "layer A tip shown")
+  (hb.open)(false)
+  t.frame(ms=200.0)
+  debug_assert(tip_shown(t, "Layer A tip") && tip_shown(t, "Layer B tip"), "two TipLayers keep independent visible slots")
+  tips_a.dismiss()
+  t.frame(ms=16.0)
+  debug_assert(!tip_shown(t, "Layer A tip"), "dismissing layer A hides layer A tip")
+  debug_assert(tip_shown(t, "Layer B tip"), "dismissing layer A leaves layer B tip untouched")
+  tips_b.dismiss()
+  t.frame(ms=16.0)
+  debug_assert(!tip_shown(t, "Layer B tip"), "dismissing layer B hides layer B tip")
+  debug_assert(t.idle_said().is_none(), "idle after both layers dismissed")
+  t.dispose()
+}
+
+test "tip_node_caps_equal_height_and_concentric" {
+  let tips = TipLayer::new()
+  let lk = tip_test_look()
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.row(view::Live::Is(true)).gap(view::Live::Is(120.0)).padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, a, fn() { "Save" }, look=tip_test_look)
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, b, fn() { "Save" }, shortcut=fn() { "Ctrl+S" }, look=tip_test_look)
+    })
+    let _ = tips.mount(root)
+  })
+  // (plain tip without caps)
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  t.frame(ms=200.0)
+  let plain = match drawn_by_ground(t, tip_test_ground) {
+    Some(d) => d
+    None => { debug_assert(false, "plain tip ground drawn"); return }
+  }
+  // (tip with caps: equal height and concentric radius)
+  t.move_to(250.0, 55.0)
+  t.frame(ms=600.0)
+  t.frame(ms=100.0)
+  let with_caps = match drawn_by_ground(t, tip_test_ground) {
+    Some(d) => d
+    None => { debug_assert(false, "caps tip ground drawn"); return }
+  }
+  let cap_box = match drawn_by_ground(t, tip_test_cap_ground) {
+    Some(d) => d
+    None => { debug_assert(false, "cap box drawn"); return }
+  }
+  let expected_h = lk.line + 2.0 * lk.pad_y
+  let expected_cap_h = lk.line + 2.0 * lk.cap_over
+  debug_assert((plain.h - expected_h).abs() < 0.5, "plain tip height matches line + 2*pad_y (26)")
+  debug_assert((with_caps.h - plain.h).abs() < 0.5, "tip with key caps is as tall as one without")
+  debug_assert((cap_box.h - expected_cap_h).abs() < 0.5, "cap height matches line + 2*cap_over (18)")
+  debug_assert((with_caps.radius - lk.cap_in - cap_box.radius).abs() < 0.5, "cap radius concentric with outer capsule")
+  debug_assert(drawn_exact_words(t, "Ctrl") && drawn_exact_words(t, "S"), "exact cap labels rendered")
+  t.dispose()
+}
+
+test "tip_node_late_mount_and_remount" {
+  let tips = TipLayer::new()
+  let layer_on = signals::signal(false)
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.row(view::Live::Is(true)).gap(view::Live::Is(120.0)).padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, a, fn() { "Late A" }, look=tip_test_look)
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, b, fn() { "Late B" }, look=tip_test_look)
+    })
+    root.show(fn() { layer_on.get() }, fn(s : view::View) {
+      let _ = s.over(view::Live::Is(true)).points(view::Live::Is(false))
+      let _ = tips.mount(s)
+    })
+  })
+  // (hover before layer is mounted: nothing opens or stays animating)
+  t.move_to(70.0, 55.0)
+  t.run_shown(500.0)
+  debug_assert(!tip_shown(t, "Late A"), "no tip while layer is unmounted")
+  assert_idle(t, "no fade/glide left running when make() fails")
+  // (leave, mount layer, hover again: now shows)
+  t.move_to(200.0, 300.0)
+  layer_on.set(true)
+  t.frame(ms=500.0)
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(tip_shown(t, "Late A"), "tip shows once layer is mounted late")
+  // (unmount layer while open: dismissed and cooled; remount layer: cold delay and shows again)
+  layer_on.set(false)
+  t.frame(ms=16.0)
+  debug_assert(!tip_shown(t, "Late A"), "unmounting layer dismisses open tip at once")
+  layer_on.set(true)
+  t.frame(ms=16.0)
+  t.move_to(250.0, 55.0)
+  t.frame(ms=100.0)
+  debug_assert(!tip_shown(t, "Late B"), "remounted layer starts cold (warm cleared on unmount)")
+  t.frame(ms=350.0)
+  debug_assert(tip_shown(t, "Late B"), "remounted layer shows tips again after delay")
+  t.dispose()
+
+  // (custom TipLayer::new(layer=...) unmounted while open, then remounted: tip recovers and shows again)
+  let custom_host : signals::Ref[Option[view::View]] = view::ref_new(None)
+  let custom_tips = TipLayer::new(layer=fn() {
+    match custom_host.v {
+      Some(v) => if v.alive() { Some(v) } else { None }
+      None => None
+    }
+  })
+  let custom_on = signals::signal(true)
+  let t2 = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(custom_tips, a, fn() { "Custom tip" }, look=tip_test_look)
+    })
+    root.show(fn() { custom_on.get() }, fn(s : view::View) {
+      let _ = s.over(view::Live::Is(true)).points(view::Live::Is(false))
+      custom_host.v = Some(s)
+    })
+  })
+  t2.move_to(70.0, 55.0)
+  t2.frame(ms=450.0)
+  debug_assert(tip_shown(t2, "Custom tip"), "custom layer shows tip")
+  custom_on.set(false)
+  t2.frame(ms=16.0)
+  debug_assert(!tip_shown(t2, "Custom tip"), "custom layer unmount clears tip")
+  t2.move_to(200.0, 300.0)
+  custom_on.set(true)
+  t2.frame(ms=500.0)
+  t2.move_to(70.0, 55.0)
+  t2.frame(ms=450.0)
+  debug_assert(tip_shown(t2, "Custom tip"), "custom layer remount shows tip again")
+  t2.dispose()
+}
+
+test "tip_node_touch_does_not_hover_open" {
+  let tips = TipLayer::new()
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      // (non-pressable anchor that takes pointer hits: touch press sets pointed() on it)
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).points(view::Live::Is(true))
+      let _ = tip_node(tips, a, fn() { "Mouse only" })
+    })
+    let _ = tips.mount(root)
+  })
+  t.touch(0, 70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(!tip_shown(t, "Mouse only"), "touch down on non-pressable anchor does not trigger hover tip")
+  t.touch(2, 70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(!tip_shown(t, "Mouse only"), "still closed after touch release")
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(tip_shown(t, "Mouse only"), "mouse hover opens the tip normally")
+  t.dispose()
+}
+
+test "tip_node_custom_delay_shares_warm_skip" {
+  let tips = TipLayer::new()
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.row(view::Live::Is(true)).gap(view::Live::Is(120.0)).padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, a, fn() { "Fast A" }, delay=400.0, skip=true)
+    })
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, b, fn() { "Slow B" }, delay=800.0, skip=true)
+    })
+    let _ = tips.mount(root)
+  })
+  // (B cold: waits its own 800 ms delay)
+  t.move_to(250.0, 55.0)
+  t.frame(ms=500.0)
+  debug_assert(!tip_shown(t, "Slow B"), "custom 800 ms delay not open at 500 ms")
+  t.frame(ms=350.0)
+  debug_assert(tip_shown(t, "Slow B"), "custom 800 ms delay opens after 800 ms")
+  // (cool off, open A, then move straight to B: shares tips.group so B opens warm at once)
+  t.move_to(200.0, 300.0)
+  t.frame(ms=1000.0)
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(tip_shown(t, "Fast A"), "A opens after 400 ms")
+  t.move_to(250.0, 55.0)
+  t.frame(ms=16.0)
+  debug_assert(tip_shown(t, "Slow B"), "custom delay with skip=true shares layer warmup")
+  t.dispose()
+}
+
+test "tip_node_dismiss_cancels_pending_hides_at_once_and_cools" {
+  let tips = TipLayer::new()
+  let t = ui::Tester::tree(fn(root : view::View) { tip_test_pair(root, tips) })
+  // (cancel a pending open timer mid-delay)
+  t.move_to(70.0, 55.0)
+  t.frame(ms=200.0)
+  tips.dismiss()
+  t.frame(ms=400.0)
+  debug_assert(!tip_shown(t, "Alpha tip"), "dismiss() cancels pending open timer")
+  // (open A, then dismiss(): hidden immediately without pop-out fade, idle at once, and warm cleared)
+  t.move_to(200.0, 300.0)
+  t.frame(ms=16.0)
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  debug_assert(tip_shown(t, "Alpha tip"), "A shown")
+  tips.dismiss()
+  t.frame(ms=16.0)
+  debug_assert(t.get("Alpha tip", role=view::Role::Tooltip).is_none(), "dismiss() hides tip immediately")
+  debug_assert(t.idle_said().is_none(), "idle right after dismiss()")
+  // (move to B immediately after dismiss: cold, must wait 400 ms)
+  t.move_to(330.0, 55.0)
+  t.frame(ms=100.0)
+  debug_assert(!tip_shown(t, "Beta tip"), "dismiss() clears warm state")
+  t.frame(ms=350.0)
+  debug_assert(tip_shown(t, "Beta tip"), "B opens after full cold delay")
+  t.dispose()
+}
+
+test "tip_node_edge_flip_and_padding" {
+  let tips = TipLayer::new()
+  let t = ui::Tester::tree(width=300.0, height=200.0, fn(root : view::View) {
+    let _ = root.box(fn(a : view::View) {
+      let _ = a
+      .over_at(view::Live::Is((Some(240.0), Some(170.0), None, None)))
+      .width(view::Live::Is(Some(50.0)))
+      .height(view::Live::Is(Some(20.0)))
+      .on_press(fn() { () })
+      let _ = tip_node(
+        tips,
+        a,
+        fn() { "Bottom right edge tip" },
+        side=view::Side::Bottom,
+        edge_pad=12.0,
+        look=tip_test_look,
+      )
+    })
+    let _ = tips.mount(root)
+  })
+  t.move_to(265.0, 180.0)
+  t.frame(ms=450.0)
+  t.frame(ms=200.0)
+  let tip = match drawn_by_ground(t, tip_test_ground) {
+    Some(d) => d
+    None => { debug_assert(false, "edge-flipped tip ground drawn"); return }
+  }
+  debug_assert(tip.y + tip.h <= 170.0, "tip flipped above bottom-edge anchor")
+  debug_assert(tip.x >= 11.5 && tip.x + tip.w <= 288.5, "tip clamped within edge_pad=12")
+  t.dispose()
+}
+
+test "tip_node_disabled_and_reactive_shortcut" {
+  let tips = TipLayer::new()
+  let off = signals::signal(true)
+  let keys = signals::signal("Ctrl+S")
+  let custom_look = fn() -> TipLook {
+    TipLook::{ ..tip_test_look(), cap_radius: 4.0, wrap: false, cap_label_gap: 12.0, scale_from: 1.0, exit_scale: 0.95 }
+  }
+  let t = ui::Tester::tree(fn(root : view::View) {
+    let _ = root.padding(view::Live::Is((40.0, 40.0, 40.0, 40.0)))
+    let _ = root.box(fn(a : view::View) {
+      let _ = a.width(view::Live::Is(Some(60.0))).height(view::Live::Is(Some(30.0))).on_press(fn() { () })
+      let _ = tip_node(tips, a, fn() { "Export" }, shortcut=fn() { keys.get() }, disabled=fn() { off.get() }, look=custom_look)
+    })
+    let _ = tips.mount(root)
+  })
+  t.move_to(70.0, 55.0)
+  t.frame(ms=500.0)
+  debug_assert(!tip_shown(t, "Export"), "disabled=true suppresses tip")
+  off.set(false)
+  t.move_to(200.0, 300.0)
+  t.frame(ms=16.0)
+  t.move_to(70.0, 55.0)
+  t.frame(ms=450.0)
+  t.frame(ms=200.0)
+  debug_assert(tip_shown(t, "Export"), "tip shows once enabled")
+  debug_assert(drawn_exact_words(t, "Ctrl") && drawn_exact_words(t, "S"), "initial shortcut caps")
+  // (reactive shortcut change while open)
+  keys.set("⌘K")
+  t.frame(ms=16.0)
+  debug_assert(drawn_exact_words(t, "⌘") && drawn_exact_words(t, "K"), "updated shortcut caps drawn")
+  debug_assert(!drawn_exact_words(t, "Ctrl"), "old shortcut cap replaced")
+  // (disabling while open closes it)
+  off.set(true)
+  t.run_shown(250.0)
+  debug_assert(!tip_shown(t, "Export"), "disabling while open closes tip")
+  assert_idle(t, "idle after disabled close")
   t.dispose()
 }
 
@@ -195,6 +642,7 @@ test "tip_node_unmount_cleans_up" {
   t.frame(ms=300.0)
   t.frame(ms=300.0)
   debug_assert(t.get("Gone tip", role=view::Role::Tooltip).is_none(), "the tip goes with its control")
+  debug_assert(t.idle_said().is_none(), "idle after anchor unmount")
   // (back, the pointer resting; let go again before the delay ends: nothing pending shows it)
   here.set(true)
   t.frame(ms=16.0)
@@ -203,6 +651,7 @@ test "tip_node_unmount_cleans_up" {
   here.set(false)
   t.frame(ms=600.0)
   debug_assert(t.get("Gone tip", role=view::Role::Tooltip).is_none(), "no pending open survives its control")
+  debug_assert(t.idle_said().is_none(), "idle after cancelled pending unmount")
   t.dispose()
 }
 
@@ -212,5 +661,6 @@ test "tip_node_key_caps" {
   debug_assert(key_caps("⌘ Enter") == ["⌘", "Enter"], "Apple mark then key")
   debug_assert(key_caps("Ctrl+Shift+F") == ["Ctrl", "Shift", "F"], "split by +")
   debug_assert(key_caps("Ctrl++") == ["Ctrl", "+"], "a + key")
+  debug_assert(key_caps("Ctrl + +") == ["Ctrl", "+"], "spaced + key")
   debug_assert(key_caps(" Ctrl + K ") == ["Ctrl", "K"], "trimmed")
 }
