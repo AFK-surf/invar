@@ -584,6 +584,51 @@ static void fractions(void) {
   printf("fractions: ok\n");
 }
 
+// The single-unit fast path's technical, math, box-drawing, check/cross and Latin-1 symbols (is_unit_clusters): taken,
+// each unit a cluster of its own as Foundation cuts them, and shaped as shape_line_ref shapes them; ↔, ©, ®, the soft
+// hyphen and an emoji with a modifier still kept off it, and shaped as the reference too.
+static void unit_fastpath(void) {
+  NSString *fast = @"延迟 145ms → 125ms ← ↑ ↓ ≤ 16ms ≥ 0ms ≠ 1 ≈ 99% −5 ∞ ✓ ✗ ┌─┬─┐ │ └─┴─┘ café «ok» ¹²³ ½ ¿ × ÷";
+  NSArray<NSString *> *slow = @[ @"a ↔ b", @"© 2026", @"Brand®", @"soft\u00ADhyphen", @"ok 👍🏻" ];
+  unichar buf[512];
+  NSUInteger n = fast.length;
+  [fast getCharacters:buf range:NSMakeRange(0, n)];
+  CHECK(is_unit_clusters(buf, (int32_t)n), "fast path not taken for \"%s\"", fast.UTF8String);
+  for (NSUInteger i = 0; i < n; i++) {
+    NSRange r = [fast rangeOfComposedCharacterSequenceAtIndex:i];
+    CHECK(r.location == i && r.length == 1, "U+%04X not a cluster of its own", buf[i]);
+  }
+  for (NSString *s in slow) {
+    NSUInteger m = s.length;
+    [s getCharacters:buf range:NSMakeRange(0, m)];
+    CHECK(!is_unit_clusters(buf, (int32_t)m), "fast path taken for \"%s\"", s.UTF8String);
+  }
+  double got[4 * 512], want[4 * 512];
+  int cases = 0;
+  for (NSString *s in [@[ fast ] arrayByAddingObjectsFromArray:slow]) {
+    NSUInteger m = s.length;
+    [s getCharacters:buf range:NSMakeRange(0, m)];
+    for (int wt = 400; wt <= 700; wt += 300) {
+      int32_t k_ref = shape_line_ref(buf, (int32_t)m, 15.0, wt, 0, want, 512);
+      int32_t k_got = shape_line((moonbit_string_t)buf, (int32_t)m, 15.0, wt, 0, got, 512);
+      CHECK(k_got == k_ref, "cluster count %d != %d weight=%d in \"%s\"", k_got, k_ref, wt, s.UTF8String);
+      if (k_got != k_ref) continue;
+      for (int32_t c = 0; c < k_ref; c++) {
+        CHECK(got[c * 4] == want[c * 4] && got[c * 4 + 1] == want[c * 4 + 1], "range mismatch at %d in \"%s\"", c,
+              s.UTF8String);
+        CHECK(fabs(got[c * 4 + 2] - want[c * 4 + 2]) < 1e-6, "adv mismatch at %d (%.6f != %.6f) in \"%s\"", c,
+              got[c * 4 + 2], want[c * 4 + 2], s.UTF8String);
+        int gk = (int)got[c * 4 + 3], wk = (int)want[c * 4 + 3];
+        CHECK(gk == wk || (gk >= 0 && wk >= 0 && [texts[gk] isEqualToString:texts[wk]]
+                           && fabs(entries[gk].dx - entries[wk].dx) < 1e-6),
+              "key mismatch at %d (%d != %d) in \"%s\"", c, gk, wk, s.UTF8String);
+      }
+      cases++;
+    }
+  }
+  printf("unit_fastpath: %d cases matched reference\n", cases);
+}
+
 static void stalled(int sig) {
   (void)sig;
   static const char msg[] = "apple_text_test: stalled (deadlock?)\n";
@@ -601,6 +646,7 @@ int main(void) {
     scale_change();
     racing();
     shape_parity();
+    unit_fastpath();
     fractions();
     ascii_nominal();
   }
