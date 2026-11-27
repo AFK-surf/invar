@@ -8,8 +8,9 @@
 // leaving a dangling/NULL `vbuf` dereferenced by `ctx->Map` (0xC0000005), recovers cleanly on the next frame,
 // isolates per-window vertex buffers across partial redraws (such as `mb_render_adaptive_step`) and
 // `mb_render_pixels_of`, keeps shared glass caches alive while another open window still renders glass, and that
-// win_stats_step() / win_stats_on_present() count drops from PresentRefreshCount in frames of `beats` refreshes, and
-// that frame_late.h breaks a window's chain of frames as soon as it asks for no next one.
+// win_stats_step() / win_stats_on_present() count drops from PresentRefreshCount in frames of `beats` refreshes,
+// that frame_late.h breaks a window's chain of frames as soon as it asks for no next one, and that a partial redraw
+// leaves out on the CPU what cannot reach its parts yet draws exactly the pixels of a whole-frame redraw.
 #define MB_NO_MOONBIT_H 1
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -241,6 +242,253 @@ static void test_frame_late_logic(void) {
   CHECK(mb_frame_late_from_target(-1.0, 200.0) == 0.0);
   CHECK(mb_frame_late_from_target(100.0, 100.0) == 0.0);
   CHECK(mb_frame_late_from_target(100.0, 116.67) > 16.0);
+}
+
+static void fill_p0_rect(double *p, double x, double y, double w, double h, double kind, double r, double g, double b,
+                         double a, double grp) {
+  memset(p, 0, MB_INST * sizeof(double));
+  p[0] = x;
+  p[1] = y;
+  p[2] = w;
+  p[3] = h;
+  p[5] = kind;
+  p[8] = r;
+  p[9] = g;
+  p[10] = b;
+  p[11] = a;
+  p[16] = -1e9;
+  p[17] = -1e9;
+  p[18] = 1e9;
+  p[19] = 1e9;
+  p[20] = grp;
+}
+
+// `off_target` (w × h) read back whole as BGRA rows; NULL on a size mismatch or failure. Freed by the caller.
+static uint8_t *read_offscreen_bgra(int w, int h) {
+  if (!dev || !ctx || !off_target) return NULL;
+  D3D11_TEXTURE2D_DESC td = {};
+  off_target->GetDesc(&td);
+  if ((int)td.Width != w || (int)td.Height != h) return NULL;
+  td.Usage = D3D11_USAGE_STAGING;
+  td.BindFlags = 0;
+  td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  td.MiscFlags = 0;
+  ID3D11Texture2D *staging = NULL;
+  if (FAILED(dev->CreateTexture2D(&td, NULL, &staging))) return NULL;
+  ctx->CopyResource(staging, off_target);
+  D3D11_MAPPED_SUBRESOURCE m = {};
+  uint8_t *out = NULL;
+  if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+    out = (uint8_t *)malloc((size_t)w * (size_t)h * 4u);
+    if (out) {
+      for (int y = 0; y < h; y++) {
+        memcpy(out + (size_t)y * (size_t)w * 4u, (const uint8_t *)m.pData + (size_t)y * (size_t)m.RowPitch,
+               (size_t)w * 4u);
+      }
+    }
+    ctx->Unmap(staging, 0);
+  }
+  staging->Release();
+  return out;
+}
+
+static int bgra_diff_bytes(const uint8_t *a, const uint8_t *b, int w, int h) {
+  if (!a || !b) return -1;
+  int n = 0;
+  for (size_t i = 0; i < (size_t)w * (size_t)h * 4u; i++) {
+    if (a[i] != b[i]) n++;
+  }
+  return n;
+}
+
+// encode_rects(): a partial redraw leaves out, on the CPU, the instances and the lens (kind 8) that cannot reach the
+// part being drawn, uploads the path segments once for all its parts, and draws (on WARP) exactly the pixels a
+// whole-frame redraw of the same scene does.
+static void test_partial_redraw_cull(void) {
+  const int W = 128, H = 128;
+  const double saved_vw = vw, saved_vh = vh, saved_vscale = vscale;
+  const int saved_fb_w = fb_w, saved_fb_h = fb_h;
+  vw = (double)W;
+  vh = (double)H;
+  vscale = 1.0;
+  fb_w = W;
+  fb_h = H;
+  const int N_GRID = 180;
+  const int TOTAL = N_GRID + 5;  // 180 rects + 1 frosted glass + 1 lens (head + child) + 1 path + 1 segment
+  double *sc = (double *)calloc((size_t)TOTAL * MB_INST, sizeof(double));
+  CHECK(sc != NULL);
+  if (!sc) return;
+  int idx = 0;
+  // 180 small rects over the whole 128 x 128 target, most of them outside the parts drawn below.
+  for (int i = 0; i < N_GRID; i++) {
+    int col = i % 15;
+    int row = i / 15;
+    fill_p0_rect(sc + (size_t)idx * MB_INST, 4.0 + (double)col * 8.0, 4.0 + (double)row * 10.0, 6.0, 6.0, 0.0,
+                 0.15 + 0.05 * (col % 10), 0.25 + 0.04 * (row % 10), 0.70, 1.0, 0.0);
+    idx++;
+  }
+  // Frosted glass panel over x = [8, 88], y = [8, 32] (blur 1: its capture [3, 93] x [3, 37]).
+  int glass_idx = idx++;
+  fill_p0_rect(sc + (size_t)glass_idx * MB_INST, 8.0, 8.0, 80.0, 24.0, 5.0, 0.9, 0.9, 0.95, 0.35, -590.0);
+  sc[(size_t)glass_idx * MB_INST + 6] = 1.0;
+  sc[(size_t)glass_idx * MB_INST + 7] = 1.0;
+  sc[(size_t)glass_idx * MB_INST + 15] = 1.0;
+  // Lens (kind 8) at the bottom right (84, 84, 36, 36) with one child rect.
+  int lens_idx = idx++;
+  fill_p0_rect(sc + (size_t)lens_idx * MB_INST, 84.0, 84.0, 36.0, 36.0, 8.0, 1.0, 1.0, 1.0, 1.0, 0.0);
+  sc[(size_t)lens_idx * MB_INST + 7] = 2.0;
+  sc[(size_t)lens_idx * MB_INST + 12] = 1.0;
+  sc[(size_t)lens_idx * MB_INST + 15] = 1.0;
+  int lens_child = idx++;
+  fill_p0_rect(sc + (size_t)lens_child * MB_INST, 92.0, 92.0, 20.0, 20.0, 0.0, 0.95, 0.35, 0.15, 1.0, 0.0);
+  // Filled path (kind 11) at the bottom left (16, 88, 24, 24) and its segment (kind 12) at the end.
+  int path_idx = idx++;
+  fill_p0_rect(sc + (size_t)path_idx * MB_INST, 16.0, 88.0, 24.0, 24.0, 11.0, 0.90, 0.80, 0.20, 1.0, 0.0);
+  sc[(size_t)path_idx * MB_INST + 4] = 0.0;
+  sc[(size_t)path_idx * MB_INST + 12] = 0.0;
+  sc[(size_t)path_idx * MB_INST + 13] = 4.0;
+  int seg_idx = idx++;
+  double *sd = sc + (size_t)seg_idx * MB_INST;
+  sd[5] = 12.0;
+  sd[0] = 0.0; sd[1] = 0.0; sd[2] = 1.0; sd[3] = 0.0;
+  sd[8] = 1.0; sd[9] = 0.0; sd[10] = 1.0; sd[11] = 1.0;
+  sd[12] = 1.0; sd[13] = 1.0; sd[14] = 0.0; sd[15] = 1.0;
+  sd[16] = 0.0; sd[17] = 1.0; sd[18] = 0.0; sd[19] = 0.0;
+  CHECK(idx == TOTAL);
+
+  // Whole frame first: everything submitted, the lens drawn.
+  off_ok = 0;
+  dirty_told = dirty_whole = dirty_n = 0;
+  CHECK(submit(sc, TOTAL, 0.10, 0.15, 0.20) == 1);
+  int full_submitted = encode_inst_submitted;
+  CHECK(full_submitted >= N_GRID);
+  CHECK(encode_lens_drawn == 1);
+
+  // The path's color changed; two parts drawn again: the glass panel's whole capture (a part meeting glass holds
+  // it whole, @damage) and the path. The lens and the right-hand rects are outside both.
+  sc[(size_t)path_idx * MB_INST + 8] = 0.20;
+  sc[(size_t)path_idx * MB_INST + 9] = 0.90;
+  sc[(size_t)path_idx * MB_INST + 10] = 0.45;
+  int segs_before = segs_upload_calls;
+  mb_host_render_dirty(0.0, 0.0, 96.0, 40.0);
+  mb_host_render_dirty(12.0, 84.0, 32.0, 32.0);
+  int np = 0;
+  CHECK(submit(sc, TOTAL, 0.10, 0.15, 0.20, &np) == 1);
+  CHECK(np == 2);
+  int partial_submitted = encode_inst_submitted;
+  int segs_delta = segs_upload_calls - segs_before;
+  int lens_after_cull = encode_lens_drawn;
+  uint8_t *px_partial = read_offscreen_bgra(W, H);
+
+  // The same scene drawn whole, the reference.
+  off_ok = 0;
+  dirty_told = dirty_whole = dirty_n = 0;
+  CHECK(submit(sc, TOTAL, 0.10, 0.15, 0.20) == 1);
+  CHECK(encode_inst_submitted == full_submitted);
+  uint8_t *px_ref = read_offscreen_bgra(W, H);
+  CHECK(px_partial != NULL && px_ref != NULL);
+  int diff_bytes = bgra_diff_bytes(px_partial, px_ref, W, H);
+  printf("win_vbuf: partial redraw full_sub=%d part_sub=%d lens_drawn=%d segs_delta=%d diff_bytes=%d\n",
+         full_submitted, partial_submitted, lens_after_cull, segs_delta, diff_bytes);
+  CHECK(segs_delta == 1);
+  CHECK(lens_after_cull == 0);
+  // Not culled, two parts would submit about twice the whole frame's instances; culled, fewer than it once.
+  CHECK(partial_submitted < full_submitted);
+  CHECK(diff_bytes == 0);
+  free(px_partial);
+
+  // Three parts, one of them over the lens: the lens drawn (once), one segs upload, the same pixels.
+  mb_host_render_dirty(100.0, 4.0, 20.0, 20.0);
+  mb_host_render_dirty(80.0, 80.0, 44.0, 44.0);
+  mb_host_render_dirty(40.0, 50.0, 16.0, 16.0);
+  segs_before = segs_upload_calls;
+  CHECK(submit(sc, TOTAL, 0.10, 0.15, 0.20, &np) == 1);
+  CHECK(np == 3);
+  int three_segs = segs_upload_calls - segs_before;
+  int three_lens = encode_lens_drawn;
+  int three_submitted = encode_inst_submitted;
+  uint8_t *px_three = read_offscreen_bgra(W, H);
+  int diff_three = bgra_diff_bytes(px_three, px_ref, W, H);
+  printf("win_vbuf: partial redraw 3 parts part_sub=%d lens_drawn=%d segs_delta=%d diff_bytes=%d\n",
+         three_submitted, three_lens, three_segs, diff_three);
+  CHECK(three_segs == 1);
+  CHECK(three_lens == 1);
+  CHECK(three_submitted < full_submitted);
+  CHECK(diff_three == 0);
+  free(px_three);
+  free(px_ref);
+
+  free(sc);
+
+  // A lens is culled by its head, the one instance it draws onto the target: lens A's head is in a part while its
+  // child reaches far left (x = -3000, past the 2048-pixel lens target, so the target's own span ends left of x = 0),
+  // and it is still drawn. Lens B is outside every part, but the adaptive ink line after it (before any glass or lens)
+  // reads the backdrop and glass state lens B leaves bound, so lens B is drawn too. Both: the same pixels as whole.
+  {
+    const int LT = 7;
+    double *lc = (double *)calloc((size_t)LT * MB_INST, sizeof(double));
+    CHECK(lc != NULL);
+    if (lc) {
+      // 0: frosted glass at the top, outside every part (its capture [3, 43] x [-1, 21])
+      fill_p0_rect(lc, 8.0, 4.0, 30.0, 12.0, 5.0, 0.9, 0.9, 0.95, 0.35, -591.0);
+      lc[6] = 1.0;
+      lc[7] = 1.0;
+      lc[15] = 1.0;
+      // 1-2: lens A, head (40, 40, 30, 30), child (-3000, 45, 3020, 10)
+      fill_p0_rect(lc + 1 * MB_INST, 40.0, 40.0, 30.0, 30.0, 8.0, 1.0, 1.0, 1.0, 1.0, 0.0);
+      lc[1 * MB_INST + 7] = 2.0;
+      lc[1 * MB_INST + 12] = 1.0;
+      lc[1 * MB_INST + 15] = 1.0;
+      fill_p0_rect(lc + 2 * MB_INST, -3000.0, 45.0, 3020.0, 10.0, 0.0, 0.95, 0.35, 0.15, 1.0, 0.0);
+      // 3-4: lens B, head (96, 96, 24, 24), child (100, 100, 16, 16)
+      fill_p0_rect(lc + 3 * MB_INST, 96.0, 96.0, 24.0, 24.0, 8.0, 1.0, 1.0, 1.0, 1.0, 0.0);
+      lc[3 * MB_INST + 7] = 2.0;
+      lc[3 * MB_INST + 12] = 1.0;
+      lc[3 * MB_INST + 15] = 1.0;
+      fill_p0_rect(lc + 4 * MB_INST, 100.0, 100.0, 16.0, 16.0, 0.0, 0.20, 0.85, 0.30, 1.0, 0.0);
+      // 5: dark adaptive ink line (kind 10, slot 23 > 0) at (20, 104, 40, 8), drawn after lens B
+      fill_p0_rect(lc + 5 * MB_INST, 20.0, 104.0, 40.0, 8.0, 10.0, 0.10, 0.10, 0.10, 1.0, 0.0);
+      lc[5 * MB_INST + 4] = 2.0;
+      lc[5 * MB_INST + 12] = 0.0;
+      lc[5 * MB_INST + 13] = 0.5;
+      lc[5 * MB_INST + 14] = 1.0;
+      lc[5 * MB_INST + 15] = 0.5;
+      lc[5 * MB_INST + 21] = 40.0;
+      lc[5 * MB_INST + 22] = 108.0;
+      lc[5 * MB_INST + 23] = 6.0;
+      // 6: a plain rect inside the line's part
+      fill_p0_rect(lc + 6 * MB_INST, 24.0, 100.0, 8.0, 8.0, 0.0, 0.85, 0.55, 0.20, 1.0, 0.0);
+
+      off_ok = 0;
+      dirty_told = dirty_whole = dirty_n = 0;
+      CHECK(submit(lc, LT, 0.60, 0.62, 0.66) == 1);
+      CHECK(encode_lens_drawn == 2);
+      lc[6 * MB_INST + 9] = 0.75;
+      mb_host_render_dirty(30.0, 30.0, 50.0, 50.0);
+      mb_host_render_dirty(14.0, 100.0, 48.0, 16.0);
+      int lnp = 0;
+      CHECK(submit(lc, LT, 0.60, 0.62, 0.66, &lnp) == 1);
+      CHECK(lnp == 2);
+      int lens_partial = encode_lens_drawn;
+      uint8_t *lp = read_offscreen_bgra(W, H);
+      off_ok = 0;
+      dirty_told = dirty_whole = dirty_n = 0;
+      CHECK(submit(lc, LT, 0.60, 0.62, 0.66) == 1);
+      uint8_t *lr = read_offscreen_bgra(W, H);
+      int diff_lens = bgra_diff_bytes(lp, lr, W, H);
+      printf("win_vbuf: partial redraw lens head/adaptive lens_drawn=%d diff_bytes=%d\n", lens_partial, diff_lens);
+      CHECK(lens_partial == 2);
+      CHECK(diff_lens == 0);
+      free(lp);
+      free(lr);
+      free(lc);
+    }
+  }
+  vw = saved_vw;
+  vh = saved_vh;
+  vscale = saved_vscale;
+  fb_w = saved_fb_w;
+  fb_h = saved_fb_h;
 }
 
 int main(void) {
@@ -855,6 +1103,9 @@ int main(void) {
   if (w1_tex) w1_tex->Release();
   mb_render_use(0);
   chain = NULL;
+
+  // 19. Partial redraws cull on the CPU what cannot reach their parts and draw the same pixels as a whole frame.
+  test_partial_redraw_cull();
 
   if (failed) return 1;
   printf("win_vbuf: ok\n");

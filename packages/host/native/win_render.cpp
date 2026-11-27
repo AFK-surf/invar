@@ -3809,6 +3809,11 @@ static int capture(ID3D11RenderTargetView *target, int pw, int ph, const float *
   return 1;
 }
 
+// counters of the last encode_rects (and of segs uploads), read by the tests
+static int encode_inst_submitted;
+static int encode_lens_drawn;
+static int segs_upload_calls;
+
 // segs_buf / segs_srv / segs_cap declared above mb_render_trim
 
 static void segs_upload(const float *f, int32_t count) {
@@ -3860,6 +3865,7 @@ static void segs_upload(const float *f, int32_t count) {
   if (!segs_buf || !segs_srv) return;
   D3D11_MAPPED_SUBRESOURCE m;
   if (FAILED(ctx->Map(segs_buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+  segs_upload_calls++;
   memcpy(m.pData, f + (size_t)d * MB_INST, need);
   ctx->Unmap(segs_buf, 0);
 }
@@ -3916,33 +3922,66 @@ static void draw_banded(const float *f, int32_t start, int32_t end, int32_t coun
   if (end > s) ctx->DrawInstanced(6, (UINT)(end - s), 0, (UINT)s);
 }
 
-// `part`: only that part of the target drawn again, over what it holds (the frame's ground first: the instance after
-// the frame's in the vertex buffer, submit's); NULL, all of it, cleared to the ground.
-static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count, const float *bg,
-                   const float *f, const D3D11_RECT *part = NULL, int transparent = -1) {
+// Whether non-glass instance `b` can reach any pixel of the top-down pixel rect [rx0, ry0, rx1, ry1) of the target:
+// its quad as the vertex shader grows it, cut to its clip (and outer clip) with a pixel of slack for rounded clips'
+// edges and two for rasterization, or turned (rotation fields 32-35): always. Conservative: a false 1 only draws in vain.
+#define MB_CULL_SPLIT_GAP 16
+static int inst_in_px_rect(const float *b, float sx, float sy, int rx0, int ry0, int rx1, int ry1) {
+  int kind = (int)(b[5] + 0.5f);
+  if (kind == 12) return 0;
+  if (b[32] != 0.0f) return 1;
+  float grow = kind == 2 ? fabsf(b[7]) * 3.0f + 2.0f
+             : (kind == 6 && b[23] <= 0.0f) ? 2.0f
+             : ((kind == 0 || kind == 4 || kind == 5 || kind == 8) ? 1.0f : 0.0f);
+  float x0 = fminf(b[0], b[0] + b[2]) - grow;
+  float x1 = fmaxf(b[0], b[0] + b[2]) + grow;
+  float y0 = fminf(b[1], b[1] + b[3]) - grow;
+  float y1 = fmaxf(b[1], b[1] + b[3]) + grow;
+  float cpad = (b[24] > 0.0f || b[25] > 0.0f || b[26] > 0.0f || b[27] > 0.0f) ? 1.0f : 0.0f;
+  float cx0 = b[16] - cpad, cy0 = b[17] - cpad, cx1 = b[18] + cpad, cy1 = b[19] + cpad;
+  if (cx0 > x0) x0 = cx0;
+  if (cy0 > y0) y0 = cy0;
+  if (cx1 < x1) x1 = cx1;
+  if (cy1 < y1) y1 = cy1;
+  if (b[44] > 0.0f || b[45] > 0.0f || b[46] > 0.0f || b[47] > 0.0f) {
+    float ox0 = b[40] - 1.0f, oy0 = b[41] - 1.0f, ox1 = b[42] + 1.0f, oy1 = b[43] + 1.0f;
+    if (ox0 > x0) x0 = ox0;
+    if (oy0 > y0) y0 = oy0;
+    if (ox1 < x1) x1 = ox1;
+    if (oy1 < y1) y1 = oy1;
+  }
+  if (x1 <= x0 || y1 <= y0) return 0;
+  float px0 = x0 * sx - 2.0f, py0 = y0 * sy - 2.0f;
+  float px1 = x1 * sx + 2.0f, py1 = y1 * sy + 2.0f;
+  return px1 > (float)rx0 && px0 < (float)rx1 && py1 > (float)ry0 && py0 < (float)ry1;
+}
+
+// `parts` (n_parts > 0): only those parts of the target drawn again, over what it holds (the frame's ground first:
+// the instance after the frame's in the vertex buffer, submit's), one after another with one segs upload for all of
+// them, and the runs of instances that cannot reach the part being drawn (the scissor, `cut`) left out on the CPU
+// (inst_in_px_rect, a lens by its head); NULL (or n_parts < 0): all of it, cleared to the ground.
+static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t count, const float *bg,
+                         const float *f, const D3D11_RECT *parts = NULL, int n_parts = -1, int transparent = -1) {
+  int is_partial = parts != NULL && n_parts > 0;
+  if (parts != NULL && n_parts == 0) return;
   int clear_win = transparent < 0 ? rw->clear : transparent;
   float clear[4] = {clear_win ? 0.0f : bg[0], clear_win ? 0.0f : bg[1], clear_win ? 0.0f : bg[2],
                     clear_win ? 0.0f : 1.0f};
   encode_missing = 0;
+  encode_inst_submitted = 0;
+  encode_lens_drawn = 0;
   ctx->OMSetRenderTargets(1, &target, NULL);
-  cut_on = part != NULL;
-  if (part) cut = *part;
-  else ctx->ClearRenderTargetView(target, clear);
-  if (count <= 0 && !part) return;
+  if (!is_partial) {
+    cut_on = 0;
+    ctx->ClearRenderTargetView(target, clear);
+    if (count <= 0) return;
+  }
   struct { float vp[2]; float scale; float pad; float origin[2]; float pad2[2]; } u = {{(float)vw, (float)vh}, (float)vscale, 0, {0, 0}, {0, 0}};
   ctx->UpdateSubresource(ubuf, 0, NULL, &u, 0, 0);
-  memset(&gu, 0, sizeof gu);
-  ad_fill_gu(rw);
-  gsrv = NULL;
   segs_upload(f, count);
-  main_state(target, pw, ph);
-  if (part) {
-    ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
-    ctx->DrawInstanced(6, 1, 0, (UINT)count);
-    ctx->OMSetBlendState(blend, NULL, 0xffffffff);
-  }
-  // one draw per run of instances showing the same image (slot 20; 0: none, the atlas stands in) of one kind (its
-  // pixel shader: kind_ps), or sharing one capture of glass (negative)
+  // (logical points to the target's pixels, as the vertex shader maps them: u.vp over pw × ph)
+  float sx = vw > 0.0 ? (float)pw / (float)vw : (float)vscale;
+  float sy = vh > 0.0 ? (float)ph / (float)vh : (float)vscale;
   struct BlurLayer {
     int px0, py0, w, h, active;
     float sigma;
@@ -3950,304 +3989,400 @@ static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count
     int prev_cut_on;
     D3D11_RECT prev_cut;
   };
-  BlurLayer bstack[MB_BLUR_LAYERS];
-  int bdepth = 0, bover = 0;
-  ID3D11RenderTargetView *cur_rtv = target;
-  int32_t start = 0;
-  int bound = 0, shows = 0;
-  while (start < count) {
-    int tid = (int)f[start * MB_INST + 20];
-    int kind0 = (int)(f[start * MB_INST + 5] + 0.5f);
-    if (kind0 == 14) {
-      if (bdepth >= MB_BLUR_LAYERS) {
-        bover++;
-        start++;
-        continue;
-      }
-      const float *a = f + (size_t)start * MB_INST;
-      float sc = (float)vscale;
-      float sigma = fabsf(a[7]);
-      float margin = sigma > 0.0f ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
-      int px0 = (int)floorf((a[0] - margin) * sc), py0 = (int)floorf((a[1] - margin) * sc);
-      int px1 = (int)ceilf((a[0] + a[2] + margin) * sc), py1 = (int)ceilf((a[1] + a[3] + margin) * sc);
-      if (px0 < 0) px0 = 0;
-      if (py0 < 0) py0 = 0;
-      if (px1 > pw) px1 = pw;
-      if (py1 > ph) py1 = ph;
-      int bw = px1 - px0, bh = py1 - py0;
-      BlurLayer L = {px0, py0, bw, bh, 0, sigma, cur_rtv, cut_on, cut};
-      if (sigma > 0.0f && bw > 0 && bh > 0 && ensure_blur_layer(bdepth, pw, ph)) {
-        static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        L.active = 1;
-        ctx->ClearRenderTargetView(bl_lv[bdepth].rt, zero);
-        cur_rtv = bl_lv[bdepth].rt;
-        cut_on = 1;
-        cut = {px0, py0, px1, py1};
-        main_state(cur_rtv, pw, ph);
-      } else {
-        cut_on = 1;
-        cut = {0, 0, 0, 0};
-        ctx->RSSetState(raster_cut);
-        ctx->RSSetScissorRects(1, &cut);
-      }
-      bstack[bdepth++] = L;
-      start++;
-      continue;
+  int pass_n = is_partial ? n_parts : 1;
+  int missing_before = 0;  // (each part sees only its own missing pictures, as when drawn one encode at a time)
+  for (int ri = 0; ri < pass_n; ri++) {
+    missing_before |= encode_missing;
+    encode_missing = 0;
+    cut_on = is_partial;
+    if (is_partial) cut = parts[ri];
+    memset(&gu, 0, sizeof gu);
+    ad_fill_gu(rw);
+    gsrv = NULL;
+    main_state(target, pw, ph);
+    if (is_partial) {
+      ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+      ctx->DrawInstanced(6, 1, 0, (UINT)count);
+      ctx->OMSetBlendState(blend, NULL, 0xffffffff);
     }
-    if (kind0 == 15) {
-      if (bover > 0) {
-        bover--;
-        start++;
-        continue;
-      }
-      if (bdepth <= 0) {
-        start++;
-        continue;
-      }
-      BlurLayer L = bstack[--bdepth];
-      if (!L.active) {
-        cur_rtv = L.prev_rtv;
-        cut_on = L.prev_cut_on;
-        cut = L.prev_cut;
-        main_state(cur_rtv, pw, ph);
-        start++;
-        continue;
-      }
-      if (ensure_blur_py(L.w, L.h) && ensure_bl_comp_vbuf()) {
-        static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
-        ctx->PSSetShaderResources(0, 3, none);
-        ctx->ClearRenderTargetView(bl_py[0].rt, zero);
-        D3D11_BOX box = {(UINT)L.px0, (UINT)L.py0, 0, (UINT)(L.px0 + L.w), (UINT)(L.py0 + L.h), 1};
-        ctx->CopySubresourceRegion(bl_py[0].t, 0, 0, 0, 0, bl_lv[bdepth].t, 0, &box);
-        ctx->VSSetShader(pvs, NULL, 0);
-        ctx->PSSetShader(pps, NULL, 0);
-        ctx->IASetInputLayout(NULL);
-        ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
-        ctx->RSSetState(raster);
-        float sc = (float)vscale;
-        float sp = L.sigma * sc;
-        int k = 0;
-        while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
-        int lw[4] = {L.w, 0, 0, 0}, lh[4] = {L.h, 0, 0, 0};
-        for (int j = 1; j <= k; j++) {
-          lw[j] = (lw[j - 1] + 1) / 2;
-          lh[j] = (lh[j - 1] + 1) / 2;
-          ctx->ClearRenderTargetView(bl_py[j].rt, zero);
-          post_pass(&bl_py[j - 1], lw[j - 1], lh[j - 1], &bl_py[j], lw[j], lh[j], 1, 0, 0, 0);
-        }
-        float sk = sp / (float)(1 << k);
-        float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
-        float sg = sqrtf(sk * sk - pre > 0.0f ? sk * sk - pre : 0.0f);
-        if (sg > 0.3f) {
-          ctx->ClearRenderTargetView(bl_py[4].rt, zero);
-          post_pass(&bl_py[k], lw[k], lh[k], &bl_py[4], lw[k], lh[k], 2, sg, 1, 0);
-          ctx->ClearRenderTargetView(bl_py[k].rt, zero);
-          post_pass(&bl_py[4], lw[k], lh[k], &bl_py[k], lw[k], lh[k], 2, sg, 0, 1);
-        }
-        ctx->PSSetShaderResources(0, 3, none);
-        cur_rtv = L.prev_rtv;
-        cut_on = L.prev_cut_on;
-        cut = L.prev_cut;
-        main_state(cur_rtv, pw, ph);
-        float comp[MB_INST];
-        memcpy(comp, f + (size_t)start * MB_INST, MB_INST * sizeof(float));
-        float d = (float)(1 << k);
-        comp[0] = (float)L.px0 / sc;
-        comp[1] = (float)L.py0 / sc;
-        comp[2] = (float)L.w / sc;
-        comp[3] = (float)L.h / sc;
-        comp[4] = 0.0f;
-        comp[5] = 4.0f;
-        comp[6] = 0.0f;
-        comp[7] = 0.0f;
-        comp[8] = 1.0f;
-        comp[9] = 1.0f;
-        comp[10] = 1.0f;
-        comp[12] = 0.0f;
-        comp[13] = 0.0f;
-        comp[14] = (float)L.w / (d * (float)bl_py[k].w);
-        comp[15] = (float)L.h / (d * (float)bl_py[k].h);
-        comp[20] = 0.0f; comp[21] = 0.0f; comp[22] = 0.0f; comp[23] = 0.0f;
-        comp[32] = 0.0f; comp[33] = 0.0f; comp[34] = 0.0f; comp[35] = 0.0f;
-        comp[36] = 0.0f; comp[37] = 0.0f; comp[38] = 0.0f; comp[39] = 0.0f;
-        D3D11_MAPPED_SUBRESOURCE cm;
-        if (SUCCEEDED(ctx->Map(bl_comp_vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &cm))) {
-          memcpy(cm.pData, comp, MB_INST * sizeof(float));
-          ctx->Unmap(bl_comp_vbuf, 0);
-          UINT stride = MB_INST * sizeof(float), off = 0;
-          ctx->IASetVertexBuffers(0, 1, &bl_comp_vbuf, &stride, &off);
-          ctx->PSSetShaderResources(1, 1, &bl_py[k].srv);
-          ctx->PSSetShader(kind_ps(4), NULL, 0);
-          ctx->DrawInstanced(6, 1, 0, 0);
-          ctx->IASetVertexBuffers(0, 1, &vbuf, &stride, &off);
-          ctx->PSSetShaderResources(1, 1, &atlas_srv);
-        }
-      } else {
-        cur_rtv = L.prev_rtv;
-        cut_on = L.prev_cut_on;
-        cut = L.prev_cut;
-        main_state(cur_rtv, pw, ph);
-      }
-      start++;
-      continue;
-    }
-    int32_t end = start + 1;
-    while (end < count && (int)f[end * MB_INST + 20] == tid) end++;
-    if (tid < 0) {
-      glass_drawn = 1;
-      if (tid != bound) {
-        shows = capture(cur_rtv, pw, ph, f, start, end, count);
-        bound = tid;
-        main_state(cur_rtv, pw, ph);
-      }
-      // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
-      int gkind_raw = (int)(f[start * MB_INST + 5] + 0.5f);
-      int merged_liquid = gkind_raw == 6 && f[start * MB_INST + 23] > 0.0f;
-      int gkind = gkind_raw == 5 ? 5 : (gkind_raw == 6 ? (merged_liquid ? 6 : MB_KIND_LIQUID_SINGLE) : -1);
-      ctx->PSSetShader(kind_ps(gkind), NULL, 0);
-      if (shows) ctx->DrawInstanced(6, merged_liquid ? 1 : (UINT)(end - start), 0, (UINT)start);
-      start = end;
-      continue;
-    }
-    // holes for native views (kind 9) apart, written without blending: transparent there
-    int kind = kind0, hole = kind == 9, own = has_own_ps(kind);
-    if (kind == 8) {
-      int32_t child_n = (int32_t)(f[start * MB_INST + 12] + 0.5f);
-      if (child_n < 0) child_n = 0;
-      if (start + 1 + child_n > count) child_n = count - start - 1;
-      const float *hb = f + (size_t)start * MB_INST;
-      if (child_n <= 0 || hb[11] <= 0.001f || hb[2] <= 0.0f || hb[3] <= 0.0f) {
-        start += 1 + child_n;
-        continue;
-      }
-      glass_drawn = 1;
-      float sc_f = (float)vscale;
-      float blur_pt = fmaxf(hb[7], 0.0f);
-      float refr_pt = fmaxf(hb[14], 0.0f);
-      float margin = blur_pt * 3.0f + refr_pt + 4.0f;
-      float x0 = hb[0], y0 = hb[1], x1 = hb[0] + hb[2], y1 = hb[1] + hb[3];
-      for (int32_t ci = start + 1; ci < start + 1 + child_n; ci++) {
-        const float *cb_f = f + (size_t)ci * MB_INST;
-        int ck = (int)(cb_f[5] + 0.5f);
-        if (ck == 12 || cb_f[2] <= 0.0f || cb_f[3] <= 0.0f) continue;
-        if (cb_f[0] < x0) x0 = cb_f[0];
-        if (cb_f[1] < y0) y0 = cb_f[1];
-        if (cb_f[0] + cb_f[2] > x1) x1 = cb_f[0] + cb_f[2];
-        if (cb_f[1] + cb_f[3] > y1) y1 = cb_f[1] + cb_f[3];
-      }
-      float ox = floorf((x0 - margin) * sc_f) / sc_f;
-      float oy = floorf((y0 - margin) * sc_f) / sc_f;
-      int lpw = (int)ceilf(((x1 + margin) - ox) * sc_f);
-      int lph = (int)ceilf(((y1 + margin) - oy) * sc_f);
-      int max_w = pw > 2048 ? pw : 2048;
-      int max_h = ph > 2048 ? ph : 2048;
-      if (lpw < 1) lpw = 1;
-      if (lph < 1) lph = 1;
-      if (lpw > max_w) lpw = max_w;
-      if (lph > max_h) lph = max_h;
-      if (!ensure_lens_levels(lpw, lph)) {
-        start += 1 + child_n;
-        continue;
-      }
-      // Pass 1: render children into lens_lv[0]
-      ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
-      ctx->PSSetShaderResources(0, 3, none);
-      float zclear[4] = {0, 0, 0, 0};
-      ctx->OMSetRenderTargets(1, &lens_lv[0].rt, NULL);
-      ctx->ClearRenderTargetView(lens_lv[0].rt, zclear);
-      D3D11_VIEWPORT lvp = {0, 0, (float)lpw, (float)lph, 0, 1};
-      ctx->RSSetViewports(1, &lvp);
-      ctx->RSSetState(raster);
-      struct { float vp[2]; float scale; float pad; float origin[2]; float pad2[2]; } lu = {
-        {(float)lpw / sc_f, (float)lph / sc_f}, sc_f, 0, {ox, oy}, {0, 0}};
-      ctx->UpdateSubresource(ubuf, 0, NULL, &lu, 0, 0);
-      ctx->PSSetShaderResources(0, 1, &atlas_srv);
-      ctx->PSSetShaderResources(2, 1, &atlas_srv);
-      ctx->PSSetShaderResources(3, 1, &segs_srv);
-      int32_t cs = start + 1, cend_all = start + 1 + child_n;
-      while (cs < cend_all) {
-        int ctid = (int)f[cs * MB_INST + 20];
-        int ck = (int)(f[cs * MB_INST + 5] + 0.5f);
-        if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ctid < 0) {
-          cs++;
+    // one draw per run of instances showing the same image (slot 20; 0: none, the atlas stands in) of one kind (its
+    // pixel shader: kind_ps), or sharing one capture of glass (negative)
+    BlurLayer bstack[MB_BLUR_LAYERS];
+    int bdepth = 0, bover = 0;
+    ID3D11RenderTargetView *cur_rtv = target;
+    int32_t start = 0;
+    int bound = 0, shows = 0;
+    while (start < count) {
+      int tid = (int)f[start * MB_INST + 20];
+      int kind0 = (int)(f[start * MB_INST + 5] + 0.5f);
+      if (kind0 == 14) {
+        if (bdepth >= MB_BLUR_LAYERS) {
+          bover++;
+          start++;
           continue;
         }
-        int cown = has_own_ps(ck);
-        int32_t ce = cs + 1;
-        while (ce < cend_all && (int)f[ce * MB_INST + 20] == ctid) {
-          int kk = (int)(f[ce * MB_INST + 5] + 0.5f);
-          if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15) break;
-          if (cown ? kk != ck : has_own_ps(kk)) break;
-          ce++;
+        const float *a = f + (size_t)start * MB_INST;
+        float sc = (float)vscale;
+        float sigma = fabsf(a[7]);
+        float margin = sigma > 0.0f ? ceilf(3.0f * sigma) + 2.0f : 0.0f;
+        int px0 = (int)floorf((a[0] - margin) * sc), py0 = (int)floorf((a[1] - margin) * sc);
+        int px1 = (int)ceilf((a[0] + a[2] + margin) * sc), py1 = (int)ceilf((a[1] + a[3] + margin) * sc);
+        if (px0 < 0) px0 = 0;
+        if (py0 < 0) py0 = 0;
+        if (px1 > pw) px1 = pw;
+        if (py1 > ph) py1 = ph;
+        int bw = px1 - px0, bh = py1 - py0;
+        BlurLayer L = {px0, py0, bw, bh, 0, sigma, cur_rtv, cut_on, cut};
+        if (sigma > 0.0f && bw > 0 && bh > 0 && ensure_blur_layer(bdepth, pw, ph)) {
+          static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+          L.active = 1;
+          ctx->ClearRenderTargetView(bl_lv[bdepth].rt, zero);
+          cur_rtv = bl_lv[bdepth].rt;
+          cut_on = 1;
+          cut = {px0, py0, px1, py1};
+          main_state(cur_rtv, pw, ph);
+        } else {
+          cut_on = 1;
+          cut = {0, 0, 0, 0};
+          ctx->RSSetState(raster_cut);
+          ctx->RSSetScissorRects(1, &cut);
         }
-        ID3D11ShaderResourceView *ct = ctid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(ctid - MB_STREAM_TEX)
-                                      : ctid ? (ID3D11ShaderResourceView *)mb_image_srv(ctid) : atlas_srv;
-        if (ctid > MB_STREAM_TEX && !ct) { cs = ce; continue; }
-        if (ctid > 0 && ctid <= MB_STREAM_TEX && !ct) encode_missing = 1;
-        ctx->PSSetShaderResources(1, 1, ct ? &ct : &atlas_srv);
-        ctx->PSSetShader(cown ? kind_ps(ck) : ps, NULL, 0);
-        ctx->DrawInstanced(6, (UINT)(ce - cs), 0, (UINT)cs);
-        cs = ce;
+        bstack[bdepth++] = L;
+        start++;
+        continue;
       }
-      // Pass 2: separable Gaussian blur in BGRA8
-      float sp = blur_pt * sc_f;
-      if (sp > 0.25f) {
-        ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
-        ctx->IASetInputLayout(NULL);
-        ctx->VSSetShader(pvs, NULL, 0);
-        ctx->PSSetShader(pps, NULL, 0);
-        post_pass(&lens_lv[0], lpw, lph, &lens_lv[1], lpw, lph, 2, sp, 1.0f, 0.0f);
-        post_pass(&lens_lv[1], lpw, lph, &lens_lv[0], lpw, lph, 2, sp, 0.0f, 1.0f);
+      if (kind0 == 15) {
+        if (bover > 0) {
+          bover--;
+          start++;
+          continue;
+        }
+        if (bdepth <= 0) {
+          start++;
+          continue;
+        }
+        BlurLayer L = bstack[--bdepth];
+        if (!L.active) {
+          cur_rtv = L.prev_rtv;
+          cut_on = L.prev_cut_on;
+          cut = L.prev_cut;
+          main_state(cur_rtv, pw, ph);
+          start++;
+          continue;
+        }
+        if (ensure_blur_py(L.w, L.h) && ensure_bl_comp_vbuf()) {
+          static const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+          ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
+          ctx->PSSetShaderResources(0, 3, none);
+          ctx->ClearRenderTargetView(bl_py[0].rt, zero);
+          D3D11_BOX box = {(UINT)L.px0, (UINT)L.py0, 0, (UINT)(L.px0 + L.w), (UINT)(L.py0 + L.h), 1};
+          ctx->CopySubresourceRegion(bl_py[0].t, 0, 0, 0, 0, bl_lv[bdepth].t, 0, &box);
+          ctx->VSSetShader(pvs, NULL, 0);
+          ctx->PSSetShader(pps, NULL, 0);
+          ctx->IASetInputLayout(NULL);
+          ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+          ctx->RSSetState(raster);
+          float sc = (float)vscale;
+          float sp = L.sigma * sc;
+          int k = 0;
+          while (k < 3 && sp / (float)(1 << (k + 1)) >= 2.0f) k++;
+          int lw[4] = {L.w, 0, 0, 0}, lh[4] = {L.h, 0, 0, 0};
+          for (int j = 1; j <= k; j++) {
+            lw[j] = (lw[j - 1] + 1) / 2;
+            lh[j] = (lh[j - 1] + 1) / 2;
+            ctx->ClearRenderTargetView(bl_py[j].rt, zero);
+            post_pass(&bl_py[j - 1], lw[j - 1], lh[j - 1], &bl_py[j], lw[j], lh[j], 1, 0, 0, 0);
+          }
+          float sk = sp / (float)(1 << k);
+          float pre = k > 0 ? 0.75f * (1.0f - powf(0.25f, (float)k)) / 3.0f + 1.0f / 6.0f : 0.0f;
+          float sg = sqrtf(sk * sk - pre > 0.0f ? sk * sk - pre : 0.0f);
+          if (sg > 0.3f) {
+            ctx->ClearRenderTargetView(bl_py[4].rt, zero);
+            post_pass(&bl_py[k], lw[k], lh[k], &bl_py[4], lw[k], lh[k], 2, sg, 1, 0);
+            ctx->ClearRenderTargetView(bl_py[k].rt, zero);
+            post_pass(&bl_py[4], lw[k], lh[k], &bl_py[k], lw[k], lh[k], 2, sg, 0, 1);
+          }
+          ctx->PSSetShaderResources(0, 3, none);
+          cur_rtv = L.prev_rtv;
+          cut_on = L.prev_cut_on;
+          cut = L.prev_cut;
+          main_state(cur_rtv, pw, ph);
+          float comp[MB_INST];
+          memcpy(comp, f + (size_t)start * MB_INST, MB_INST * sizeof(float));
+          float d = (float)(1 << k);
+          comp[0] = (float)L.px0 / sc;
+          comp[1] = (float)L.py0 / sc;
+          comp[2] = (float)L.w / sc;
+          comp[3] = (float)L.h / sc;
+          comp[4] = 0.0f;
+          comp[5] = 4.0f;
+          comp[6] = 0.0f;
+          comp[7] = 0.0f;
+          comp[8] = 1.0f;
+          comp[9] = 1.0f;
+          comp[10] = 1.0f;
+          comp[12] = 0.0f;
+          comp[13] = 0.0f;
+          comp[14] = (float)L.w / (d * (float)bl_py[k].w);
+          comp[15] = (float)L.h / (d * (float)bl_py[k].h);
+          comp[20] = 0.0f; comp[21] = 0.0f; comp[22] = 0.0f; comp[23] = 0.0f;
+          comp[32] = 0.0f; comp[33] = 0.0f; comp[34] = 0.0f; comp[35] = 0.0f;
+          comp[36] = 0.0f; comp[37] = 0.0f; comp[38] = 0.0f; comp[39] = 0.0f;
+          D3D11_MAPPED_SUBRESOURCE cm;
+          if (SUCCEEDED(ctx->Map(bl_comp_vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &cm))) {
+            memcpy(cm.pData, comp, MB_INST * sizeof(float));
+            ctx->Unmap(bl_comp_vbuf, 0);
+            UINT stride = MB_INST * sizeof(float), off = 0;
+            ctx->IASetVertexBuffers(0, 1, &bl_comp_vbuf, &stride, &off);
+            ctx->PSSetShaderResources(1, 1, &bl_py[k].srv);
+            ctx->PSSetShader(kind_ps(4), NULL, 0);
+            ctx->DrawInstanced(6, 1, 0, 0);
+            ctx->IASetVertexBuffers(0, 1, &vbuf, &stride, &off);
+            ctx->PSSetShaderResources(1, 1, &atlas_srv);
+          }
+        } else {
+          cur_rtv = L.prev_rtv;
+          cut_on = L.prev_cut_on;
+          cut = L.prev_cut;
+          main_state(cur_rtv, pw, ph);
+        }
+        start++;
+        continue;
       }
-      // Pass 3: composite refracted & SDF-clipped foreground lens onto cur_rtv
-      ctx->UpdateSubresource(ubuf, 0, NULL, &u, 0, 0);
-      memset(&gu, 0, sizeof gu);
-      float W = (float)lens_lv[0].w, H = (float)lens_lv[0].h;
-      gu.map[0] = sc_f / W; gu.map[1] = sc_f / H;
-      gu.map[2] = -(ox * sc_f) / W; gu.map[3] = -(oy * sc_f) / H;
-      gu.uvc[0] = 0.5f / W; gu.uvc[1] = 0.5f / H;
-      gu.uvc[2] = ((float)lpw - 0.5f) / W; gu.uvc[3] = ((float)lph - 0.5f) / H;
-      gsrv = lens_lv[0].srv;
-      main_state(cur_rtv, pw, ph);
-      ctx->PSSetShader(kind_ps(8), NULL, 0);
-      ctx->DrawInstanced(6, 1, 0, (UINT)start);
-      bound = 0;
-      start += 1 + child_n;
-      continue;
-    }
-    int fast_rect = !hole && tid == 0 && kind == 0 && rect_ps && fast_rect_enabled() && is_simple_rect(f, start);
-    // (kinds without their own pixel shader one run, as before)
-    end = start + 1;
-    while (end < count && (int)f[end * MB_INST + 20] == tid) {
-      int k = (int)(f[end * MB_INST + 5] + 0.5f);
-      if (k == 8 || k == 14 || k == 15) break;
-      if ((k == 9) != hole || (own ? k != kind : has_own_ps(k))) break;
-      if (!hole && tid == 0 && kind == 0 && rect_ps && fast_rect_enabled() && is_simple_rect(f, end) != fast_rect) break;
-      end++;
-    }
-    // (a hole's image is its view's, src/hostapi/host.mbt view_tex_base + its id: the view is under the canvas here)
-    ID3D11ShaderResourceView *t = hole ? atlas_srv
-                                  : tid > MB_LAYER_TEX ? mb_layer_srv(tid - MB_LAYER_TEX)
-                                  : tid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(tid - MB_STREAM_TEX)
-                                  : tid ? (ID3D11ShaderResourceView *)mb_image_srv(tid) : atlas_srv;
-    // (a stream or offscreen layer with no texture yet: nothing, not the atlas)
-    if (!hole && tid > MB_STREAM_TEX && !t) {
+      int32_t end = start + 1;
+      while (end < count && (int)f[end * MB_INST + 20] == tid) end++;
+      if (tid < 0) {
+        glass_drawn = 1;
+        if (tid != bound) {
+          shows = capture(cur_rtv, pw, ph, f, start, end, count);
+          bound = tid;
+          main_state(cur_rtv, pw, ph);
+        }
+        // merged liquid (merge > 0): the group as one shape, drawn once; unmerged liquid and frosted: each instance
+        int gkind_raw = (int)(f[start * MB_INST + 5] + 0.5f);
+        int merged_liquid = gkind_raw == 6 && f[start * MB_INST + 23] > 0.0f;
+        int gkind = gkind_raw == 5 ? 5 : (gkind_raw == 6 ? (merged_liquid ? 6 : MB_KIND_LIQUID_SINGLE) : -1);
+        ctx->PSSetShader(kind_ps(gkind), NULL, 0);
+        if (shows) {
+          ctx->DrawInstanced(6, merged_liquid ? 1 : (UINT)(end - start), 0, (UINT)start);
+          encode_inst_submitted += merged_liquid ? 1 : (end - start);
+        }
+        start = end;
+        continue;
+      }
+      // holes for native views (kind 9) apart, written without blending: transparent there
+      int kind = kind0, hole = kind == 9, own = has_own_ps(kind);
+      if (kind == 8) {
+        int32_t child_n = (int32_t)(f[start * MB_INST + 12] + 0.5f);
+        if (child_n < 0) child_n = 0;
+        if (start + 1 + child_n > count) child_n = count - start - 1;
+        const float *hb = f + (size_t)start * MB_INST;
+        if (child_n <= 0 || hb[11] <= 0.001f || hb[2] <= 0.0f || hb[3] <= 0.0f) {
+          start += 1 + child_n;
+          continue;
+        }
+        glass_drawn = 1;
+        float sc_f = (float)vscale;
+        float blur_pt = fmaxf(hb[7], 0.0f);
+        float refr_pt = fmaxf(hb[14], 0.0f);
+        float margin = blur_pt * 3.0f + refr_pt + 4.0f;
+        float x0 = hb[0], y0 = hb[1], x1 = hb[0] + hb[2], y1 = hb[1] + hb[3];
+        for (int32_t ci = start + 1; ci < start + 1 + child_n; ci++) {
+          const float *cb_f = f + (size_t)ci * MB_INST;
+          int ck = (int)(cb_f[5] + 0.5f);
+          if (ck == 12 || cb_f[2] <= 0.0f || cb_f[3] <= 0.0f) continue;
+          if (cb_f[0] < x0) x0 = cb_f[0];
+          if (cb_f[1] < y0) y0 = cb_f[1];
+          if (cb_f[0] + cb_f[2] > x1) x1 = cb_f[0] + cb_f[2];
+          if (cb_f[1] + cb_f[3] > y1) y1 = cb_f[1] + cb_f[3];
+        }
+        float ox = floorf((x0 - margin) * sc_f) / sc_f;
+        float oy = floorf((y0 - margin) * sc_f) / sc_f;
+        int lpw = (int)ceilf(((x1 + margin) - ox) * sc_f);
+        int lph = (int)ceilf(((y1 + margin) - oy) * sc_f);
+        int max_w = pw > 2048 ? pw : 2048;
+        int max_h = ph > 2048 ? ph : 2048;
+        if (lpw < 1) lpw = 1;
+        if (lph < 1) lph = 1;
+        if (lpw > max_w) lpw = max_w;
+        if (lph > max_h) lph = max_h;
+        // (a lens whose head, the one instance it draws onto the target, misses the part being drawn: neither its
+        // children drawn nor it, unless adaptive ink after it, before the next glass or drawn lens, can reach the part
+        // and would read the backdrop and state it leaves bound; past a blur layer's bounds, whose cut differs, any)
+        int can_cull_lens = cut_on && !inst_in_px_rect(hb, sx, sy, (int)cut.left, (int)cut.top, (int)cut.right,
+                                                       (int)cut.bottom);
+        int cut_changed = 0;
+        for (int32_t j = start + 1 + child_n; can_cull_lens && j < count; j++) {
+          const float *jb = f + (size_t)j * MB_INST;
+          int jk = (int)(jb[5] + 0.5f);
+          if ((int)jb[20] < 0) break;
+          if (jk == 8) {
+            int32_t cn = (int32_t)(jb[12] + 0.5f);
+            if (cn < 0) cn = 0;
+            if (j + 1 + cn > count) cn = count - j - 1;
+            if (cn > 0 && jb[11] > 0.001f && jb[2] > 0.0f && jb[3] > 0.0f) break;
+            j += cn;
+            continue;
+          }
+          if (jk == 14 || jk == 15) {
+            cut_changed = 1;
+            continue;
+          }
+          if ((jk == 1 || jk == 3 || jk == 7 || jk == 10 || jk == 11) && jb[23] > 0.0f &&
+              (cut_changed || inst_in_px_rect(jb, sx, sy, (int)cut.left, (int)cut.top, (int)cut.right,
+                                              (int)cut.bottom)))
+            can_cull_lens = 0;
+        }
+        if (can_cull_lens) {
+          bound = 0;
+          start += 1 + child_n;
+          continue;
+        }
+        if (!ensure_lens_levels(lpw, lph)) {
+          start += 1 + child_n;
+          continue;
+        }
+        // Pass 1: render children into lens_lv[0]
+        ID3D11ShaderResourceView *none[3] = {NULL, NULL, NULL};
+        ctx->PSSetShaderResources(0, 3, none);
+        float zclear[4] = {0, 0, 0, 0};
+        ctx->OMSetRenderTargets(1, &lens_lv[0].rt, NULL);
+        ctx->ClearRenderTargetView(lens_lv[0].rt, zclear);
+        D3D11_VIEWPORT lvp = {0, 0, (float)lpw, (float)lph, 0, 1};
+        ctx->RSSetViewports(1, &lvp);
+        ctx->RSSetState(raster);
+        struct { float vp[2]; float scale; float pad; float origin[2]; float pad2[2]; } lu = {
+          {(float)lpw / sc_f, (float)lph / sc_f}, sc_f, 0, {ox, oy}, {0, 0}};
+        ctx->UpdateSubresource(ubuf, 0, NULL, &lu, 0, 0);
+        ctx->PSSetShaderResources(0, 1, &atlas_srv);
+        ctx->PSSetShaderResources(2, 1, &atlas_srv);
+        ctx->PSSetShaderResources(3, 1, &segs_srv);
+        int32_t cs = start + 1, cend_all = start + 1 + child_n;
+        while (cs < cend_all) {
+          int ctid = (int)f[cs * MB_INST + 20];
+          int ck = (int)(f[cs * MB_INST + 5] + 0.5f);
+          if (ck == 5 || ck == 6 || ck == 8 || ck == 9 || ck == 12 || ck == 14 || ck == 15 || ctid < 0) {
+            cs++;
+            continue;
+          }
+          int cown = has_own_ps(ck);
+          int32_t ce = cs + 1;
+          while (ce < cend_all && (int)f[ce * MB_INST + 20] == ctid) {
+            int kk = (int)(f[ce * MB_INST + 5] + 0.5f);
+            if (kk == 5 || kk == 6 || kk == 8 || kk == 9 || kk == 12 || kk == 14 || kk == 15) break;
+            if (cown ? kk != ck : has_own_ps(kk)) break;
+            ce++;
+          }
+          ID3D11ShaderResourceView *ct = ctid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(ctid - MB_STREAM_TEX)
+                                        : ctid ? (ID3D11ShaderResourceView *)mb_image_srv(ctid) : atlas_srv;
+          if (ctid > MB_STREAM_TEX && !ct) { cs = ce; continue; }
+          if (ctid > 0 && ctid <= MB_STREAM_TEX && !ct) encode_missing = 1;
+          ctx->PSSetShaderResources(1, 1, ct ? &ct : &atlas_srv);
+          ctx->PSSetShader(cown ? kind_ps(ck) : ps, NULL, 0);
+          ctx->DrawInstanced(6, (UINT)(ce - cs), 0, (UINT)cs);
+          cs = ce;
+        }
+        // Pass 2: separable Gaussian blur in BGRA8
+        float sp = blur_pt * sc_f;
+        if (sp > 0.25f) {
+          ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+          ctx->IASetInputLayout(NULL);
+          ctx->VSSetShader(pvs, NULL, 0);
+          ctx->PSSetShader(pps, NULL, 0);
+          post_pass(&lens_lv[0], lpw, lph, &lens_lv[1], lpw, lph, 2, sp, 1.0f, 0.0f);
+          post_pass(&lens_lv[1], lpw, lph, &lens_lv[0], lpw, lph, 2, sp, 0.0f, 1.0f);
+        }
+        // Pass 3: composite refracted & SDF-clipped foreground lens onto cur_rtv
+        ctx->UpdateSubresource(ubuf, 0, NULL, &u, 0, 0);
+        memset(&gu, 0, sizeof gu);
+        float W = (float)lens_lv[0].w, H = (float)lens_lv[0].h;
+        gu.map[0] = sc_f / W; gu.map[1] = sc_f / H;
+        gu.map[2] = -(ox * sc_f) / W; gu.map[3] = -(oy * sc_f) / H;
+        gu.uvc[0] = 0.5f / W; gu.uvc[1] = 0.5f / H;
+        gu.uvc[2] = ((float)lpw - 0.5f) / W; gu.uvc[3] = ((float)lph - 0.5f) / H;
+        gsrv = lens_lv[0].srv;
+        main_state(cur_rtv, pw, ph);
+        ctx->PSSetShader(kind_ps(8), NULL, 0);
+        ctx->DrawInstanced(6, 1, 0, (UINT)start);
+        encode_inst_submitted++;
+        encode_lens_drawn++;
+        bound = 0;
+        start += 1 + child_n;
+        continue;
+      }
+      int fast_rect = !hole && tid == 0 && kind == 0 && rect_ps && fast_rect_enabled() && is_simple_rect(f, start);
+      // (kinds without their own pixel shader one run, as before)
+      end = start + 1;
+      while (end < count && (int)f[end * MB_INST + 20] == tid) {
+        int k = (int)(f[end * MB_INST + 5] + 0.5f);
+        if (k == 8 || k == 14 || k == 15) break;
+        if ((k == 9) != hole || (own ? k != kind : has_own_ps(k))) break;
+        if (!hole && tid == 0 && kind == 0 && rect_ps && fast_rect_enabled() && is_simple_rect(f, end) != fast_rect) break;
+        end++;
+      }
+      // (a hole's image is its view's, src/hostapi/host.mbt view_tex_base + its id: the view is under the canvas here)
+      ID3D11ShaderResourceView *t = hole ? atlas_srv
+                                    : tid > MB_LAYER_TEX ? mb_layer_srv(tid - MB_LAYER_TEX)
+                                    : tid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(tid - MB_STREAM_TEX)
+                                    : tid ? (ID3D11ShaderResourceView *)mb_image_srv(tid) : atlas_srv;
+      // (a stream or offscreen layer with no texture yet: nothing, not the atlas)
+      if (!hole && tid > MB_STREAM_TEX && !t) {
+        start = end;
+        continue;
+      }
+      if (!hole && tid > 0 && tid <= MB_STREAM_TEX && !t) encode_missing = 1;
+      ID3D11PixelShader *run = fast_rect ? rect_ps : own ? kind_ps(kind) : ps;
+      if (!cut_on) {
+        ctx->PSSetShaderResources(1, 1, t ? &t : &atlas_srv);
+        ctx->PSSetShader(run, NULL, 0);
+        if (hole) ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+        if (hole) ctx->DrawInstanced(6, (UINT)(end - start), 0, (UINT)start);
+        else draw_banded(f, start, end, count, pw, ph, run);
+        encode_inst_submitted += end - start;
+        if (hole) ctx->OMSetBlendState(blend, NULL, 0xffffffff);
+      } else {
+        // only the stretches of the run that can reach the cut, a gap of fewer than MB_CULL_SPLIT_GAP left out
+        // instances kept in (one draw, not many small ones)
+        int rx0 = (int)cut.left, ry0 = (int)cut.top, rx1 = (int)cut.right, ry1 = (int)cut.bottom;
+        int bound_run = 0;
+        int32_t cur = start;
+        while (cur < end) {
+          while (cur < end && !inst_in_px_rect(f + (size_t)cur * MB_INST, sx, sy, rx0, ry0, rx1, ry1)) cur++;
+          if (cur >= end) break;
+          int32_t lo = cur, hi = cur + 1;
+          int32_t j = hi;
+          while (j < end) {
+            if (inst_in_px_rect(f + (size_t)j * MB_INST, sx, sy, rx0, ry0, rx1, ry1)) {
+              hi = j + 1;
+            } else if (j - hi + 1 >= MB_CULL_SPLIT_GAP) {
+              break;
+            }
+            j++;
+          }
+          if (!bound_run) {
+            ctx->PSSetShaderResources(1, 1, t ? &t : &atlas_srv);
+            ctx->PSSetShader(run, NULL, 0);
+            if (hole) ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
+            bound_run = 1;
+          }
+          if (hole) ctx->DrawInstanced(6, (UINT)(hi - lo), 0, (UINT)lo);
+          else draw_banded(f, lo, hi, count, pw, ph, run);
+          encode_inst_submitted += hi - lo;
+          cur = j + 1;
+        }
+        if (bound_run && hole) ctx->OMSetBlendState(blend, NULL, 0xffffffff);
+      }
       start = end;
-      continue;
     }
-    if (!hole && tid > 0 && tid <= MB_STREAM_TEX && !t) encode_missing = 1;
-    ctx->PSSetShaderResources(1, 1, t ? &t : &atlas_srv);
-    ID3D11PixelShader *run = fast_rect ? rect_ps : own ? kind_ps(kind) : ps;
-    ctx->PSSetShader(run, NULL, 0);
-    if (hole) ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
-    if (hole) ctx->DrawInstanced(6, (UINT)(end - start), 0, (UINT)start);
-    else draw_banded(f, start, end, count, pw, ph, run);
-    if (hole) ctx->OMSetBlendState(blend, NULL, 0xffffffff);
-    start = end;
   }
+  encode_missing |= missing_before;
   if (cut_on) ctx->RSSetState(raster);
   cut_on = 0;
+}
+
+static void encode(ID3D11RenderTargetView *target, int pw, int ph, int32_t count, const float *bg,
+                   const float *f, const D3D11_RECT *part = NULL, int transparent = -1) {
+  encode_rects(target, pw, ph, count, bg, f, part, part ? 1 : -1, transparent);
 }
 
 // Process-wide monotonic dropped-frame total across all windows (swapchain sampling state stays per RenderWin).
@@ -4484,13 +4619,9 @@ static int submit(const double *inst, int32_t count, double r, double g, double 
   D3D11_RECT parts[MB_PARTS];
   int np = take_parts(fb_w, fb_h, *kept, parts);
   int missing = 0;
-  if (np < 0) {
-    encode(target, fb_w, fb_h, count, last_bg, last_inst);
+  if (np != 0) {
+    encode_rects(target, fb_w, fb_h, count, last_bg, last_inst, np < 0 ? NULL : parts, np);
     missing = encode_missing;
-  }
-  for (int i = 0; i < np; i++) {
-    encode(target, fb_w, fb_h, count, last_bg, last_inst, &parts[i]);
-    missing |= encode_missing;
   }
   if (np != 0) pictures_missing = missing;
   *kept = 1;
@@ -4767,8 +4898,7 @@ int mb_render_adaptive_step(int wid) {
   ID3D11RenderTargetView *target = canvas_rtv ? canvas_rtv : rtv;
   D3D11_RECT parts[MB_PARTS];
   int np = canvas_rtv ? take_parts(fb_w, fb_h, canvas_ok, parts) : -1;
-  if (np < 0) encode(target, fb_w, fb_h, last_count, last_bg, last_inst);
-  else for (int i = 0; i < np; i++) encode(target, fb_w, fb_h, last_count, last_bg, last_inst, &parts[i]);
+  if (np != 0) encode_rects(target, fb_w, fb_h, last_count, last_bg, last_inst, np < 0 ? NULL : parts, np);
   if (canvas_rtv) {
     canvas_ok = 1;
     ID3D11Resource *back_res = NULL;
