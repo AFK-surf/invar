@@ -324,3 +324,69 @@ test "view_block: words_runs reuses cached ViewBlock on scroll and invalidates o
   t.dispose()
   set_view_cull_enabled(true)
 }
+
+test "text_cache: multi-style shape_line_cached retains entries across size, weight, and style switches" {
+  let shape_calls = ref_new(0)
+  let t = Tester::tree(fn(_root : view::View) { () }, width=320.0, height=200.0)
+  let h = hostapi::host()
+  let orig_shape = h.shape
+  h.shape = fn(txt : String, sz : Double, weight : Int, style : Int, out : FixedArray[Double]) -> Int {
+    shape_calls.v = shape_calls.v + 1
+    orig_shape(txt, sz, weight, style, out)
+  }
+  clear_text_cache()
+  let _ = shape_line_cached("Hello", 14.0, 400, 0)
+  let _ = shape_line_cached("World", 16.0, 700, 2)
+  let _ = shape_line_cached("Code", 12.0, 400, 4 | (4 << 8))
+  let after_cold = shape_calls.v
+  debug_assert(after_cold == 3, "expected 3 cold shape calls, got \{after_cold}")
+  let _ = shape_line_cached("Hello", 14.0, 400, 0)
+  let _ = shape_line_cached("World", 16.0, 700, 2)
+  let _ = shape_line_cached("Code", 12.0, 400, 4 | (4 << 8))
+  debug_assert(shape_calls.v == after_cold, "expected 0 shape calls on alternating warm styles, got \{shape_calls.v - after_cold}")
+  h.shape = orig_shape
+  t.dispose()
+}
+
+test "view_blocks: offscreen clipped words_runs are culled and prewarmed via glyphs_ahead" {
+  let ahead_total = ref_new(0)
+  let scroll = view::Scroll::new()
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.scrolls(scroll, fn(inner : view::View) {
+        let _ = inner.width(view::Live::Is(Some(320.0))).height(view::Live::Is(Some(800.0))).clips(view::Live::Is(true))
+        let mut i = 0
+        while i < 20 {
+          let y = i.to_double() * 40.0
+          let _ = inner.box(fn(row : view::View) {
+            let _ = row.over(view::Live::Is(true)).offset(view::Live::Is((0.0, y))).width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(40.0)))
+            let _ = row.words_runs(view::Live::Is([text::plain("PrewarmRow-" + i.to_string())]))
+          })
+          i += 1
+        }
+      })
+    },
+    width=320.0,
+    height=120.0,
+  )
+  let h = hostapi::host()
+  let orig_able = h.glyphs_ahead_able
+  let orig_ahead = h.glyphs_ahead
+  h.glyphs_ahead_able = fn() -> Bool { true }
+  h.glyphs_ahead = fn(_keys : FixedArray[Int], n : Int) -> Unit {
+    ahead_total.v = ahead_total.v + n
+  }
+  reset_glyph_atlas()
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let top_ninst = view_app.scene.ninst
+  debug_assert(ahead_total.v > 0, "expected offscreen words_runs to trigger glyphs_ahead prewarm")
+  scroll.put(400.0)
+  t.fake.frame_requested = true
+  t.frame(ms=16.0)
+  let bot_ninst = view_app.scene.ninst
+  debug_assert(top_ninst < 120 && bot_ninst > 0, "clipped offscreen rows should stay culled (top=\{top_ninst}, bot=\{bot_ninst})")
+  h.glyphs_ahead_able = orig_able
+  h.glyphs_ahead = orig_ahead
+  t.dispose()
+}
