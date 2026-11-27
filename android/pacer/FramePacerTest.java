@@ -1,21 +1,38 @@
 package dev.invar;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.PriorityQueue;
 
 /**
- * Pure-JDK deterministic unit tests for FramePacer: simulates display vsyncs,
- * main-thread Choreographer callbacks, drawing thread, GPU queue, and
- * SurfaceFlinger buffer presentation, including IME inset animation coalescing.
+ * MBView's pacing (FramePacer) on a clock of the test's own: the display's vsyncs on a grid, the main thread's queue
+ * and Choreographer's callbacks, the drawing thread's frames (their work), the GPU behind it and the surface's buffers
+ * as SurfaceFlinger takes them at the vsyncs (a buffer shown no sooner than the time eglPresentationTimeANDROID said).
+ * What the app asks for is said by each run: a motion (every frame asks for the next until it ends), keys struck. The
+ * same run gives the same frames on every machine: nothing reads the machine's clock or its threads.
+ *
+ * What is asserted is what a person sees: while the app asks for a frame at each vsync, each refresh shows a new one
+ * (a refresh with none is a stutter), and the surface says the display's highest rate while something moves and while
+ * the field is typed into. Run: scripts/framepacer_test.sh.
  */
 public final class FramePacerTest {
+    // ---- the simulated phone ----
+
+    /** What the app does in a frame built for {@code now} (ms): its work on the drawing thread and the GPU's (ms), and
+     * whether it asks for another. */
     interface App {
         double work(int frame, double now);
+
         double gpu(int frame, double now);
+
         boolean more(int frame, double now);
 
+        /** The rate what moves on by the clock alone needs, said by the frame (MBView.framesPaced; 0 none): its next
+         * woken for, at the vsync before the one that many frames a second on (MBView.wakeAt). */
         default float paced(int frame, double now) {
             return 0;
         }
@@ -41,8 +58,11 @@ public final class FramePacerTest {
     static final class Phone implements FramePacer.Platform {
         final double hz;
         final long period;
+        /** how many buffers SurfaceFlinger's queue holds for the surface, the one shown among them (triple buffering) */
         final int buffers;
+        /** whether eglSwapBuffers waits for the frame before's GPU work (a driver that throttles so) */
         final boolean swapWaitsGpu;
+        /** how long after requestRender the drawing thread begins the frame (ns) */
         final long wake;
         final FramePacer pacer;
         App app;
@@ -67,9 +87,12 @@ public final class FramePacerTest {
         long seq;
         final PriorityQueue<Event> events = new PriorityQueue<>();
         boolean onMain;
+        /** Choreographer's callbacks for the next vsync (posted on the main thread) */
         List<Runnable> nextVsync = new ArrayList<>();
+        /** Optional CALLBACK_INSETS_ANIMATION hook run in the same doFrame after nextVsync callbacks. */
         Runnable onInsets;
         int vsyncPosts;
+        /** the drawing thread: busy until, its queued events (queueEvent), a frame requested */
         long drawingFree;
         long blockedSince = -1;
         long swapWaitMaxNs;
@@ -79,10 +102,13 @@ public final class FramePacerTest {
         boolean drawingScheduled;
         long gpuFree;
         long gpuLastEnd;
+        /** buffers queued and not yet shown: each its ready time and the time it may be shown from */
         final ArrayDeque<long[]> queued = new ArrayDeque<>();
         int frames;
+        /** the vsyncs (their index) each showed a new frame at; the app's frames' work (ms), by frame */
         final List<Long> shownAt = new ArrayList<>();
         final List<double[]> drawn = new ArrayList<>();
+        /** the rate said, as it changed: (time ns, rate) */
         final List<double[]> rates = new ArrayList<>();
         float rate;
 
@@ -95,6 +121,7 @@ public final class FramePacerTest {
             this.pacer = new FramePacer(this);
             pacer.framePeriod = period;
             pacer.topRate = (float) hz;
+            // the display's vsyncs, from the first after 0
             at(period, this::vsync);
         }
 
@@ -173,8 +200,12 @@ public final class FramePacerTest {
             nextVsync.add(cb);
         }
 
+        // ---- FramePacer.Platform ----
+
         @Override public long nanoTime() { return now; }
+
         @Override public boolean onMain() { return onMain; }
+
         @Override public void postMain(Runnable r) { main(now, r); }
 
         @Override public void postVsync() {
@@ -244,6 +275,7 @@ public final class FramePacerTest {
                 kickDrawing();
                 return;
             }
+            // GLSurfaceView's guarded run: queued events first, then a frame where one is requested
             while (!drawingQueue.isEmpty()) drawingQueue.poll().run();
             if (renderRequested) {
                 renderRequested = false;
@@ -254,6 +286,7 @@ public final class FramePacerTest {
 
         static final long BLOCKED = Long.MAX_VALUE / 4;
 
+        /** MBView.onDrawFrame's app frame (not a picture alone, not a shot): its work, then eglSwapBuffers. */
         void drawFrame() {
             FramePacer.Taken tk = pacer.takeRender();
             if (!tk.app && !tk.pictured) return;
@@ -270,6 +303,7 @@ public final class FramePacerTest {
             boolean more = app.more(f, b.now);
             float paced = app.paced(f, b.now);
             long cpuEnd = began + Math.round(work * 1e6);
+            // (the thread busy with it till its work is done: what comes meanwhile, a vsync, comes as it works)
             drawingFree = cpuEnd;
             at(cpuEnd, () -> {
                 if (paced > 0) {
@@ -302,6 +336,7 @@ public final class FramePacerTest {
             });
         }
 
+        /** A buffer shown frees one: the drawing thread waiting on it goes on. */
         void bufferFreed() {
             if (drawingFree == BLOCKED && queued.size() < buffers - 1) {
                 if (blockedSince >= 0) {
@@ -314,6 +349,9 @@ public final class FramePacerTest {
         }
     }
 
+    // ---- runs ----
+
+    /** The refreshes from {@code from} until {@code to} (ns) that showed no new frame (their vsyncs' index). */
     static List<Long> missed(Phone ph, long from, long to) {
         List<Long> out = new ArrayList<>();
         long first = from / ph.period + 1, last = to / ph.period;
@@ -325,6 +363,7 @@ public final class FramePacerTest {
         return out;
     }
 
+    /** A motion from {@code start} for {@code ms}: each frame `work` and `gpu` (ms), asking for the next while it goes. */
     static Phone motion(Phone ph, double startMs, double ms, App app) {
         ph.app = app;
         long start = Math.round(startMs * 1e6);
@@ -336,7 +375,9 @@ public final class FramePacerTest {
     static App steady(double work, double gpu, double untilMs) {
         return new App() {
             @Override public double work(int f, double now) { return work; }
+
             @Override public double gpu(int f, double now) { return gpu; }
+
             @Override public boolean more(int f, double now) { return now < untilMs; }
         };
     }
@@ -348,15 +389,82 @@ public final class FramePacerTest {
         if (!ok) failures++;
     }
 
+    /**
+     * The known list: what is wrong now and known, run and said every run (KNOWN). Its count `now` is to be the one it
+     * was `owed` at when it was found: worse fails, and so does better (mended: bring `owed` down to it, at 0 take it
+     * off the list and assert it). The list only gets shorter.
+     */
+    static void owed(String what, int now, int owed, String said) {
+        String verdict = now > owed ? "FAIL (worse) " : now < owed ? "FAIL (better: owed " + owed + " → " + now + ") " : "KNOWN ";
+        System.out.println(verdict + what + ": " + now + (said.isEmpty() ? "" : ", " + said));
+        if (now != owed) failures++;
+    }
+
+    /** A motion of `work` and `gpu` a frame at 120 Hz for a second: the refreshes it left with no new frame. */
     static void motionCase(String what, double work, double gpu, boolean swapWaitsGpu) {
         Phone ph = new Phone(120, 3, swapWaitsGpu, 200_000);
         double start = 100, ms = 1000;
         motion(ph, start, ms, steady(work, gpu, start + ms));
+        // (from its third refresh: the first frame is asked for as the motion starts, shown two vsyncs on)
         List<Long> miss = missed(ph, Math.round((start + 4 * 8.34) * 1e6), Math.round((start + ms) * 1e6));
         check(what, miss.isEmpty(), miss.size() + " of " + Math.round(ms / 8.333) + " refreshes with no new frame"
                 + (miss.isEmpty() ? "" : ", first at vsync " + miss.get(0)) + "; frames drawn " + ph.drawn.size());
     }
 
+    /** Frames' work as a phone's PERF said it (a recorded trace: t, work, present ms a line): each run of frames drawn one
+     * after another (under 60 ms apart) replayed as a motion, its frames' work theirs, the GPU's `gpu` each. */
+    static void replay(String file, double gpu) throws IOException {
+        List<double[]> rows = new ArrayList<>();
+        try (BufferedReader r = new BufferedReader(new FileReader(file))) {
+            for (String line; (line = r.readLine()) != null; ) {
+                String[] p = line.trim().split("\\s+");
+                if (p.length >= 3) rows.add(new double[] {Double.parseDouble(p[0]), Double.parseDouble(p[1]), Double.parseDouble(p[2])});
+            }
+        }
+        // runs of frames each under 60 ms after the one before
+        int totalRefreshes = 0, totalMissed = 0, cheapMissed = 0, phoneMissed = 0, phoneCheap = 0;
+        int i = 0;
+        while (i < rows.size()) {
+            int j = i + 1;
+            while (j < rows.size() && rows.get(j)[0] - rows.get(j - 1)[0] < 60) j++;
+            if (j - i >= 10) {
+                for (int k = i + 1; k < j; k++) {
+                    double d = rows.get(k)[0] - rows.get(k - 1)[0];
+                    if (d > 12) {
+                        phoneMissed++;
+                        if (rows.get(k - 1)[1] + rows.get(k - 1)[2] < 4) phoneCheap++;
+                    }
+                }
+                double[] work = new double[j - i];
+                for (int k = i; k < j; k++) work[k - i] = rows.get(k)[1] + rows.get(k)[2];
+                double ms = rows.get(j - 1)[0] - rows.get(i)[0];
+                Phone ph = new Phone(120, 3, true, 200_000);
+                double start = 100;
+                motion(ph, start, ms, new App() {
+                    @Override public double work(int f, double now) { return work[Math.min(f, work.length - 1)]; }
+
+                    @Override public double gpu(int f, double now) { return gpu; }
+
+                    @Override public boolean more(int f, double now) { return now < start + ms; }
+                });
+                List<Long> miss = missed(ph, Math.round((start + 4 * 8.34) * 1e6), Math.round((start + ms) * 1e6));
+                totalRefreshes += (int) Math.round(ms / 8.333);
+                totalMissed += miss.size();
+                // of those, the frame drawn before it took under 4 ms
+                for (long k : miss) {
+                    double before = 0;
+                    for (double[] dr : ph.drawn) if (dr[0] * 1e6 < k * ph.period) before = dr[1];
+                    if (before < 4) cheapMissed++;
+                }
+            }
+            i = j;
+        }
+        owed("recorded frames replayed, GPU " + gpu + " ms a frame: refreshes with no new frame after a frame under 4 ms",
+                cheapMissed, gpu <= 1 ? 1 : 5, totalMissed + " of " + totalRefreshes + " with none at all (the phone: "
+                        + phoneMissed + ", " + phoneCheap + " after one under 4 ms)");
+    }
+
+    /** Keys struck into the field every `every` ms (no motion of the app's): the rate said for each key's frame. */
     static void typingCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.typing = true;
@@ -364,7 +472,7 @@ public final class FramePacerTest {
         ph.main(Math.round(50e6), ph.pacer::typingChanged);
         for (int k = 0; k < 10; k++) ph.main(Math.round((100 + 120 * k) * 1e6), ph.pacer::wantFrame);
         ph.runUntil(Math.round(1400e6));
-        check("typing holds top refresh rate", ph.rate == 120f,
+        check("typing: the display's highest rate said while the field is typed into", ph.rate == 120f,
                 "rate " + ph.rate + ", said " + ph.rates.size() + " times");
     }
 
@@ -381,23 +489,27 @@ public final class FramePacerTest {
         check("a motion's rate let go 1.3 s after it", ph.rate == 0f, "1.3 s after " + ph.rate);
     }
 
-    /** A spinner whose frames say they need 30 a second: that rate said, and as many frames drawn. */
+    /** A spinner whose frames say they need 30 a second (frame_pace.mbt): that rate said, and as many frames drawn. */
     static void pacedCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = new App() {
             @Override public double work(int f, double now) { return 1; }
+
             @Override public double gpu(int f, double now) { return 1; }
+
             @Override public boolean more(int f, double now) { return false; }
+
             @Override public float paced(int f, double now) { return now < 1100 ? 30 : 0; }
         };
         ph.main(Math.round(100e6), ph.pacer::wantFrame);
         ph.runUntil(Math.round(1050e6));
         float during = ph.rate;
         int frames = ph.drawn.size();
-        check("30 Hz paced motion sets 30 Hz rate and draws ~30 fps",
+        check("a motion paced at 30 Hz: that rate said of the display, about 30 frames a second drawn",
                 during == 30f && frames >= 28 && frames <= 30, "rate " + during + ", " + frames + " frames in 0.95 s");
     }
 
+    /** A keyboard step (frameNow) right after a picture-only frame still lays out the app rather than redrawing. */
     static void frameNowAfterPictureCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = steady(1.0, 1.0, -1);
@@ -413,10 +525,12 @@ public final class FramePacerTest {
                 "appWanted=" + wantedAfterFrameNow[0] + ", frames drawn=" + ph.drawn.size());
     }
 
+    /** Keyboard animation pre-warmed with sayRate(true) runs at topRate from before frame 1 and drops after it ends. */
     static void imeWarmupRateCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = steady(1.0, 1.0, -1);
         final float[] rateBeforeFirstFrame = {0f};
+        // Pre-warm on drawing thread (MBView.imeMovingStarted) before the first WindowInsetsAnimation.onProgress step
         ph.at(Math.round(50e6), () -> {
             ph.drawingQueue.add(() -> ph.pacer.sayRate(true));
             ph.kickDrawing();
@@ -430,18 +544,20 @@ public final class FramePacerTest {
         ph.runUntil(afterSteps);
         float rateDuring = ph.rate;
         int framesDuring = ph.drawn.size();
+        // Animation ends and keyboard is not shown (typingChanged lets the rate go after a second)
         ph.at(afterSteps + ph.period, () -> {
             ph.typing = false;
             ph.drawingQueue.add(ph.pacer::typingChanged);
             ph.kickDrawing();
         });
         ph.runUntil(afterSteps + Math.round(1300e6));
-        check("IME warmup holds topRate before frame 1 and releases after end",
+        check("IME warmup: topRate before frame 1, held across frameNow sequence, released after end",
                 rateBeforeFirstFrame[0] == 120f && rateDuring == 120f && framesDuring == 10 && ph.rate == 0f,
                 "before=" + rateBeforeFirstFrame[0] + ", during=" + rateDuring
                         + ", frames=" + framesDuring + ", after=" + ph.rate);
     }
 
+    /** IME inset animation + ongoing app animation coalesces CALLBACK_ANIMATION and CALLBACK_INSETS_ANIMATION into 1 frame/vsync. */
     static void imeMovingWithAnimationCoalescesCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         long firstV = 12;
@@ -474,6 +590,7 @@ public final class FramePacerTest {
                         + (miss.isEmpty() ? "" : " (first=" + miss.get(0) + ")") + ", totalDrawn=" + ph.drawn.size());
     }
 
+    /** When imeMoving is true but some vsyncs emit no onProgress, flushDeferredVsync falls back with 0 missed refreshes. */
     static void imeMovingWithoutProgressFallsBackCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         long firstV = 12;
@@ -499,12 +616,16 @@ public final class FramePacerTest {
                         + (miss.isEmpty() ? "" : " (first=" + miss.get(0) + ")"));
     }
 
+    /** frameNow when a postVsync is already pending does not clear wanted and does not duplicate next vsync callback. */
     static void frameNowDoesNotDuplicatePendingVsyncCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         long nextV = 12;
+        // Return more=true on frame 0 (drawn by frameNow), false on frame 1 (drawn by vsync #12)
         ph.app = new App() {
             @Override public double work(int f, double now) { return 1.0; }
+
             @Override public double gpu(int f, double now) { return 1.0; }
+
             @Override public boolean more(int f, double now) { return f == 0; }
         };
         final int[] postsBeforeNextVsync = {0};
@@ -522,6 +643,7 @@ public final class FramePacerTest {
                         + ", drawn=" + ph.drawn.size());
     }
 
+    /** Pure keyboard slide (more=false) keeps preferred timeline armed through a >8.33ms step and transition into more=true. */
     static void imeMovingPureSlideKeepsTimelineCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         long firstV = 12;
@@ -529,7 +651,9 @@ public final class FramePacerTest {
         long endV = firstV + totalSteps;
         ph.app = new App() {
             @Override public double work(int f, double now) { return f == 4 ? 5.0 : 2.0; }
+
             @Override public double gpu(int f, double now) { return f == 4 ? 4.5 : 2.0; }
+
             @Override public boolean more(int f, double now) { return f >= 10 && f < totalSteps - 1; }
         };
         ph.main(firstV * ph.period - ph.period / 2, () -> ph.pacer.setImeMoving(true));
@@ -548,7 +672,7 @@ public final class FramePacerTest {
                         + (miss.isEmpty() ? "" : " (first=" + miss.get(0) + ")"));
     }
 
-    /** Idle external frames (words coming in every 500 ms, more=false, paced=0) must say no rate. */
+    /** 0. Idle external frames (words coming in every 500 ms, more=false, paced=0) must say no rate (Opus B1). */
     static void idleExternalFramesSayNoRateCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = steady(1.0, 1.0, -1);
@@ -561,7 +685,7 @@ public final class FramePacerTest {
                 "rates=" + ph.rates.size() + ", rate=" + ph.rate + ", drawn=" + ph.drawn.size());
     }
 
-    /** Pure 20 Hz paced on a fixed 120 Hz screen: stays stably at 20 Hz with no 20<->120 ping-pong. */
+    /** 1. Pure 20 Hz paced on a fixed 120 Hz screen: stays stably at 20 Hz with no 20<->120 ping-pong. */
     static void paced20FixedScreenCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = new App() {
@@ -581,7 +705,7 @@ public final class FramePacerTest {
                 "rate=" + ph.rate + ", rateChanges=" + rateChangesAfterFirst + ", frames=" + ph.drawn.size());
     }
 
-    /** Pure 20 Hz paced on an LTPO screen whose vsync cadence switches to 50 ms: stays at 20 Hz (~20 fps, not 10 fps). */
+    /** 2. Pure 20 Hz paced on an LTPO screen whose vsync cadence switches to 50 ms: stays at 20 Hz (~20 fps, not 10 fps). */
     static void paced20LtpoScreenCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.ltpo = true;
@@ -604,7 +728,7 @@ public final class FramePacerTest {
                         + ", frames=" + ph.drawn.size());
     }
 
-    /** External 120 Hz wantFrame burst during 20 Hz paced lifts on frame 1 (both blocking & mailbox models + negative controls). */
+    /** 3. External 120 Hz wantFrame burst during 20 Hz paced lifts on frame 1 (both blocking & mailbox models + negative controls). */
     static void pacedExternalBurstLiftsCase() {
         // (a) Blocking model (mailboxDrops=false): swapWaitMaxNs <= period (control pinned at 20 Hz exceeds period).
         Phone phBlock = new Phone(120, 3, true, 200_000);
@@ -671,7 +795,7 @@ public final class FramePacerTest {
                         + " (ctrl=" + ctrlMail.swapDrops + ")");
     }
 
-    /** glSettling() lifts 20 Hz immediately before next paced frame, holds >1.5s without app frames, restores after. */
+    /** 4. glSettling() lifts 20 Hz immediately before next paced frame, holds >1.5s without app frames, restores after. */
     static void pacedNonPacedActiveLiftsCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = new App() {
@@ -716,7 +840,7 @@ public final class FramePacerTest {
                         + ", resumed=" + resumedPaced + ", held1.5s=" + heldOver1500ms + ", released=" + releasedAfterEnd);
     }
 
-    /** Normal swipe rate releases to 0 after 1s even while a native WebView/video has pictureActive=true. */
+    /** 4b. Opus B1 regression: normal swipe rate releases to 0 after 1s even while a native WebView/video has pictureActive=true. */
     static void motionRateReleasesWithNativeViewAnimatingCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = steady(1.0, 1.0, 400);
@@ -727,7 +851,7 @@ public final class FramePacerTest {
                 ph.rate == 0f, "rate at 3000ms=" + ph.rate);
     }
 
-    /** Stopping 20 Hz paced drops directly to 0 (fixed 120 Hz & LTPO) and retries if setRate(0) fails once. */
+    /** 5. Stopping 20 Hz paced drops directly to 0 (fixed 120 Hz & LTPO) and retries if setRate(0) fails once. */
     static void pacedStopExitsLowRateCase() {
         for (boolean ltpo : new boolean[] {false, true}) {
             Phone ph = new Phone(120, 3, true, 200_000);
@@ -756,7 +880,7 @@ public final class FramePacerTest {
         }
     }
 
-    /** surfaceReset() invalidates old stillFor (both with new motion and with moved unchanged). */
+    /** 6. surfaceReset() invalidates old stillFor (both with new motion and with moved unchanged). */
     static void surfaceResetInvalidatesStillForCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = new App() {
@@ -803,7 +927,7 @@ public final class FramePacerTest {
                         + ", genGuardNoMotion=" + genGuardHeldWithoutNewMotion);
     }
 
-    /** setRate failure does not clear isPacedActive early, and stillFor retries a failed setRate(0) on next vsync. */
+    /** 7. setRate failure does not clear isPacedActive early, and stillFor retries a failed setRate(0) on next vsync. */
     static void setRateFailureRetryCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = new App() {
@@ -837,7 +961,7 @@ public final class FramePacerTest {
                         + ", retriedZero=" + retriedZeroSuccess);
     }
 
-    /** WakeReq atomic merge upgrades in place in both orders (delivering on time at T with externalDemand) and rejects stale tokens. */
+    /** 8. WakeReq atomic merge upgrades in place in both orders (delivering on time at T with externalDemand) and rejects stale tokens. */
     static void wakeReqAtomicMergeCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = steady(1.0, 1.0, -1);
@@ -875,7 +999,7 @@ public final class FramePacerTest {
                         + ", superseded=" + superseded + ", cleared=" + cleared);
     }
 
-    /** wakeFrameNow + same-vsync vsyncCame in BOTH orders renders once, preserves shows, and keeps external demand. */
+    /** 9. wakeFrameNow + same-vsync vsyncCame in BOTH orders renders once, preserves shows, and keeps external demand. */
     static void wakeFrameNowSameVsyncNoDuplicateCase() {
         // Order 1: fireWake(req, v, shows) first, then queued vsyncCame(v, shows)
         Phone ph1 = new Phone(120, 3, true, 200_000);
@@ -923,7 +1047,7 @@ public final class FramePacerTest {
                 "ok1=" + ok1 + " (drawn=" + ph1.drawn.size() + "), ok2=" + ok2 + " (drawn=" + ph2.drawn.size() + ", rate=" + rateAtV[0] + ")");
     }
 
-    /** Same-vsync external fireWake arriving AFTER begin() and BEFORE ended() lifts frame T and does NOT pollute T+1. */
+    /** 10. Astra #1: same-vsync external fireWake arriving AFTER begin() and BEFORE ended() lifts frame T and does NOT pollute T+1. */
     static void sameVsyncExternalAfterBeginBeforeEndedCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         final float[] frameRate = new float[2];
@@ -956,7 +1080,7 @@ public final class FramePacerTest {
                 ok, "drawnAtT1=" + drawnAfterT1 + ", rateT=" + frameRate[0] + ", rateT1=" + frameRate[1]);
     }
 
-    /** Concurrent scheduleWake(T, false) vs fireWake(p1, T, shows) never leaves a duplicate token after external delivery. */
+    /** 11. Astra #2: concurrent scheduleWake(T, false) vs fireWake(p1, T, shows) never leaves a duplicate token after external delivery. */
     static void wakeReqConcurrentUpgradeNoDuplicateCase() {
         boolean ok = true;
         int rounds = 200;
@@ -986,7 +1110,7 @@ public final class FramePacerTest {
                 ok, "rounds=" + rounds);
     }
 
-    /** Ahead: ask(true) claiming ahead + same-vsync fireWake renders once without duplicating. */
+    /** 12. Astra #1 (ahead): ask(true) claiming ahead + same-vsync fireWake renders once without duplicating. */
     static void aheadClaimedThenSameVsyncFireWakeCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         ph.app = steady(1.0, 1.0, -1);
@@ -1009,7 +1133,7 @@ public final class FramePacerTest {
                 "renderRequests=" + ph.renderRequests + ", drawn=" + ph.drawn.size());
     }
 
-    /** Picture-only dispatch at T does NOT steal T+1's appWanted; T+1 dispatches cleanly and deduplicates same-vsync fireWake. */
+    /** 13. Astra #1: picture-only dispatch at T does NOT steal T+1's appWanted; T+1 dispatches cleanly and deduplicates same-vsync fireWake. */
     static void pictureUpgradedThenSameVsyncFireWakeCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         long t1 = 12 * ph.period;
@@ -1057,7 +1181,7 @@ public final class FramePacerTest {
                         + ", begun=" + begunVsync[0] + "/" + begunVsync[1]);
     }
 
-    /** flushDeferredVsync atomically publishes (vsyncAt, appWanted) against concurrent picture takeRender(). */
+    /** 14. Astra #2: flushDeferredVsync atomically publishes (vsyncAt, appWanted) against concurrent picture takeRender(). */
     static void imeFlushAtomicWithPendingPictureCase() {
         boolean ok = true;
         int rounds = 200;
@@ -1105,7 +1229,7 @@ public final class FramePacerTest {
                 ok, "rounds=" + rounds);
     }
 
-    /** During imeMoving, fireWake coalesces into deferredVsync (with frameNow, flush, or pending pictureFrame). */
+    /** 13. Astra #2/#3: during imeMoving, fireWake coalesces into deferredVsync (with frameNow, flush, or pending pictureFrame). */
     static void imeMovingFireWakeCoalescesCase() {
         // (a) vsyncCame(T, shows) -> fireWake(req, T, shows) -> inset update + frameNow(): 1 frame, sees new inset, keeps shows.
         Phone ph1 = new Phone(120, 3, true, 200_000);
@@ -1192,7 +1316,7 @@ public final class FramePacerTest {
                         + ", drawn=" + ph3.drawn.size() + ", inset=" + seenInset3[0] + ")");
     }
 
-    /** wantFrame() between takeRender() and begin() is NOT stolen by T; T keeps 120 Hz because appWanted is already set, and T+1 receives external=true and stays 120 Hz. */
+    /** 15. Astra #1: wantFrame() between takeRender() and begin() is NOT stolen by T; T keeps 120 Hz because appWanted is already set, and T+1 receives external=true and stays 120 Hz. */
     static void wantFrameBetweenTakeAndBeginPreservesExternalCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         long t1 = 12 * ph.period;
@@ -1220,7 +1344,7 @@ public final class FramePacerTest {
                 ok, "tk1.ext=" + tk1.external + ", rateT=" + rateT + ", tk2.ext=" + tk2.external + ", rateT1=" + rateT1);
     }
 
-    /** ONE-mode extra GL callback before T+1 does not steal T+1's appWanted or clear askedAtEnd, always redrawing validly. */
+    /** 16. Astra #2: ONE-mode extra GL callback before T+1 does not steal T+1's appWanted or clear askedAtEnd, always redrawing validly. */
     static void oneModeFlushStalePictureDoesNotDoubleDrawCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         final boolean[] systemFrameNeeded = {false};
@@ -1294,7 +1418,7 @@ public final class FramePacerTest {
                         + ", picAct=" + picActivity[0]);
     }
 
-    /** Duplicate vsyncCame(T) in either order (before or after ended(more=true)) never stalls T+1 on real Phone clock. */
+    /** 17. Astra: duplicate vsyncCame(T) in either order (before or after ended(more=true)) never stalls T+1 on real Phone clock. */
     static void duplicateVsyncAtSameTDoesNotStallNextFrameCase() {
         // Order A: vsyncCame(T) -> takeRender()+begin() -> duplicate vsyncCame(T) -> ended(more=true) -> Phone clock alone drives T+1!
         Phone phA = new Phone(120, 3, true, 200_000);
@@ -1312,7 +1436,8 @@ public final class FramePacerTest {
         phA.runUntil(t + 4 * phA.period);
         boolean okA = phA.drawn.size() >= 2 && nowA[1] > t / 1e6;
 
-        // Order B: vsyncCame(T) -> takeRender()+begin()+ended(more=true) -> duplicate vsyncCame(T) -> 0 extra postVsync & T+1 on time!
+        // Order B: vsyncCame(T) -> takeRender()+begin()+ended(more=true) -> stale-gen duplicate vsyncCame(T, shows, 1L)
+        //          -> 0 extra postVsync & T+1 on time; untagged 2-arg vsyncCame(T, shows) fails open without stalling T+1.
         Phone phB = new Phone(120, 3, true, 200_000);
         final double[] nowB = new double[4];
         final int[] postsDeltaB = {-1};
@@ -1322,17 +1447,18 @@ public final class FramePacerTest {
             @Override public boolean more(int f, double now) { return f == 0; }
         };
         phB.main(t - phB.period / 2, phB.pacer::wantFrame);
-        // Duplicate vsyncCame(t, shows) arrives after frame 0's ended(more=true) (t+0.7ms) has already queued T+1
+        // Stale-gen duplicate from T's callback (gen=1) arrives after frame 0's ended(more=true) queued T+1 (gen=2)
         phB.main(t + 1_500_000L, () -> {
             int before = phB.vsyncPosts;
-            phB.pacer.vsyncCame(t, shows);
+            phB.pacer.vsyncCame(t, shows, 1L);
             postsDeltaB[0] = phB.vsyncPosts - before;
         });
         phB.runUntil(t + 4 * phB.period);
         boolean okB = phB.drawn.size() >= 2 && postsDeltaB[0] == 0
                 && Math.abs(nowB[1] - (t + phB.period) / 1e6) < 0.01;
 
-        // Order C: frameNow() at T -> ended(more=true) queues T+1 -> duplicate vsyncCame(T) hits lastFrameNowAt fast path -> 0 extra postVsync & T+1 on time!
+        // Order C: frameNow() at T -> ended(more=true) queues T+1 (gen=1) -> stale-gen duplicate vsyncCame(T, shows, 999L)
+        //          -> 0 extra postVsync & T+1 on time; untagged 2-arg vsyncCame(T, shows) also fails open with T+1 on time.
         Phone phC = new Phone(120, 3, true, 200_000);
         final double[] nowC = new double[4];
         final int[] postsDeltaC = {-1};
@@ -1344,20 +1470,66 @@ public final class FramePacerTest {
         phC.main(t + 100_000L, phC.pacer::frameNow);
         phC.main(t + 1_500_000L, () -> {
             int before = phC.vsyncPosts;
-            phC.pacer.vsyncCame(t, shows);
+            phC.pacer.vsyncCame(t, shows, 999L);
             postsDeltaC[0] = phC.vsyncPosts - before;
         });
         phC.runUntil(t + 4 * phC.period);
         boolean okC = phC.drawn.size() >= 2 && postsDeltaC[0] == 0
                 && Math.abs(nowC[1] - (t + phC.period) / 1e6) < 0.01;
 
+        // Order D: untagged legacy 2-arg duplicate vsyncCame(T, shows) after frameNow()+ended(more=true) fails open
+        //          (zero timestamp heuristic): releases active slot, re-posts T+1 (deltaPosts == 1), and delivers T+1 on time.
+        Phone phD = new Phone(120, 3, true, 200_000);
+        final double[] nowD = new double[4];
+        final int[] postsDeltaD = {-1};
+        phD.app = new App() {
+            @Override public double work(int f, double now) { if (f < 4) nowD[f] = now; return 0.5; }
+            @Override public double gpu(int f, double now) { return 1.0; }
+            @Override public boolean more(int f, double now) { return f == 0; }
+        };
+        phD.main(t + 100_000L, phD.pacer::frameNow);
+        phD.main(t + 1_500_000L, () -> {
+            int before = phD.vsyncPosts;
+            phD.pacer.vsyncCame(t, shows);
+            postsDeltaD[0] = phD.vsyncPosts - before;
+        });
+        phD.runUntil(t + 4 * phD.period);
+        boolean okD = phD.drawn.size() == 2 && postsDeltaD[0] == 1
+                && Math.abs(nowD[1] - (t + phD.period) / 1e6) < 0.01;
+
+        // Order E: matching-gen callback hitting lastFrameNowAt fast path (frameNow at t+1ms -> ended(more=true)
+        //          posts gen=1 -> Choreographer delivers gen=1 at latched t with delta 1ms < period/2):
+        //          must release gen=1, re-post gen=2 (deltaPosts == 1), and deliver T+1 on time without deadlock.
+        Phone phE = new Phone(120, 3, true, 200_000);
+        final double[] nowE = new double[4];
+        final int[] postsDeltaE = {-1};
+        phE.app = new App() {
+            @Override public double work(int f, double now) { if (f < 4) nowE[f] = now; return 0.3; }
+            @Override public double gpu(int f, double now) { return 1.0; }
+            @Override public boolean more(int f, double now) { return f == 0; }
+        };
+        phE.main(t + 1_000_000L, phE.pacer::frameNow);
+        phE.main(t + 2_000_000L, () -> {
+            int before = phE.vsyncPosts;
+            phE.lastVsyncAt = t;
+            List<Runnable> cbs = phE.nextVsync;
+            phE.nextVsync = new ArrayList<>();
+            for (Runnable r : cbs) r.run();
+            postsDeltaE[0] = phE.vsyncPosts - before;
+        });
+        phE.runUntil(t + 4 * phE.period);
+        boolean okE = phE.drawn.size() == 2 && postsDeltaE[0] == 1
+                && Math.abs(nowE[1] - (t + phE.period) / 1e6) < 0.01;
+
         check("duplicate vsyncCame(T) before/after ended(more=true) or frameNow never stalls or double-posts T+1",
-                okA && okB && okC, "okA=" + okA + " (drawn=" + phA.drawn.size() + ", t1=" + nowA[1]
+                okA && okB && okC && okD && okE, "okA=" + okA + " (drawn=" + phA.drawn.size() + ", t1=" + nowA[1]
                         + "), okB=" + okB + " (deltaPosts=" + postsDeltaB[0] + ", t1=" + nowB[1]
-                        + "), okC=" + okC + " (deltaPosts=" + postsDeltaC[0] + ", t1=" + nowC[1] + ")");
+                        + "), okC=" + okC + " (deltaPosts=" + postsDeltaC[0] + ", t1=" + nowC[1]
+                        + "), okD=" + okD + " (deltaPosts=" + postsDeltaD[0] + ", drawn=" + phD.drawn.size() + ", t1=" + nowD[1]
+                        + "), okE=" + okE + " (deltaPosts=" + postsDeltaE[0] + ", drawn=" + phE.drawn.size() + ", t1=" + nowE[1] + ")");
     }
 
-    /** wantImmediateFrame() while ahead==true clears ahead on takeRender() so ended(more=true) drives T+1 on real clock. */
+    /** 18. Opus: wantImmediateFrame() while ahead==true clears ahead on takeRender() so ended(more=true) drives T+1 on real clock. */
     static void wantImmediateFrameClearsAheadForNextFrameCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         final double[] nows = new double[4];
@@ -1380,7 +1552,7 @@ public final class FramePacerTest {
                 ok, "drawn=" + ph.drawn.size() + ", t0=" + nows[0] + ", t1=" + nows[1]);
     }
 
-    /** Same-vsync fireWake after begin()->askAhead() does not clear wanted for T+1 or cause double postVsync. */
+    /** 19. Astra: same-vsync fireWake after begin()->askAhead() does not clear wanted for T+1 or cause double postVsync. */
     static void sameVsyncFireWakeAfterAskAheadDoesNotDoublePostCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         final double[] nows = new double[4];
@@ -1414,7 +1586,7 @@ public final class FramePacerTest {
                 ok, "postsForT1=" + postsForT1 + ", drawn=" + ph.drawn.size() + ", t2=" + nows[2]);
     }
 
-    /** Reverse order: wantFrame() then fireWake(req, T) in T's vsync callback does not clear T+1's wanted (1 postVsync total). */
+    /** 20. Astra (reverse order): wantFrame() then fireWake(req, T) in T's vsync callback does not clear T+1's wanted (1 postVsync total). */
     static void wantFrameBeforeFireWakeAtSameTDoesNotDoublePostCase() {
         Phone ph = new Phone(120, 3, true, 200_000);
         final double[] nows = new double[4];
@@ -1500,6 +1672,497 @@ public final class FramePacerTest {
                         + "), imeInsets=" + deltaInsets + " (t1=" + nowsInsets[1] + ")");
     }
 
+    /** 21. applyRate + scheduleNext matches ended() and covers pacedBefore || pacedNow on paced exit and follow-up frame. */
+    static void applyRateScheduleNextEquivalenceCase() {
+        Phone ph = new Phone(120, 3, true, 200_000);
+        long t1 = 12 * ph.period;
+        ph.pacer.wantPacedFrame();
+        ph.pacer.vsyncCame(t1, t1 + 2 * ph.period);
+        FramePacer.Taken tk1 = ph.pacer.takeRender();
+        FramePacer.Begun b1 = ph.pacer.begin(tk1.vsyncAt, t1 + 200_000L, tk1.external);
+        boolean pacedBefore1 = ph.pacer.isPacedActive();
+        boolean pacedNow1 = ph.pacer.applyRate(false, false, b1.following, 20f, b1.externalDemand);
+        ph.pacer.scheduleNext(false);
+        boolean ok1 = !pacedBefore1 && pacedNow1 && (pacedBefore1 || pacedNow1)
+                && ph.pacer.isPacedActive() && ph.rate == 20f;
+
+        // Exit frame (20 Hz -> 120 Hz): pacedBefore=true, pacedNow=false, pacedBefore || pacedNow == true.
+        long t2 = 13 * ph.period;
+        ph.pacer.wantFrame();
+        ph.pacer.vsyncCame(t2, t2 + 2 * ph.period);
+        FramePacer.Taken tk2 = ph.pacer.takeRender();
+        FramePacer.Begun b2 = ph.pacer.begin(tk2.vsyncAt, t2 + 200_000L, tk2.external);
+        boolean pacedBefore2 = ph.pacer.isPacedActive();
+        boolean pacedNow2 = ph.pacer.applyRate(true, false, b2.following, 20f, b2.externalDemand);
+        int postsBefore = ph.vsyncPosts;
+        ph.pacer.scheduleNext(true);
+        ph.runUntil(ph.now);
+        boolean ok2 = pacedBefore2 && !pacedNow2 && (pacedBefore2 || pacedNow2)
+                && !ph.pacer.isPacedActive() && ph.rate == 120f && ph.vsyncPosts > postsBefore;
+
+        // Following normal interactive frame: pacedBefore=false, pacedNow=false, pacedBefore || pacedNow == false.
+        long t3 = 14 * ph.period;
+        ph.pacer.vsyncCame(t3, t3 + 2 * ph.period);
+        FramePacer.Taken tk3 = ph.pacer.takeRender();
+        FramePacer.Begun b3 = ph.pacer.begin(tk3.vsyncAt, t3 + 200_000L, tk3.external);
+        boolean pacedBefore3 = ph.pacer.isPacedActive();
+        boolean pacedNow3 = ph.pacer.applyRate(true, false, b3.following, 0f, b3.externalDemand);
+        ph.pacer.scheduleNext(true);
+        boolean ok3 = !pacedBefore3 && !pacedNow3 && !(pacedBefore3 || pacedNow3)
+                && !ph.pacer.isPacedActive() && ph.rate == 120f;
+
+        check("applyRate + scheduleNext matches ended() and tracks pacedBefore || pacedNow across exit",
+                ok1 && ok2 && ok3, "ok1=" + ok1 + ", ok2=" + ok2 + ", ok3=" + ok3);
+    }
+
+    /** 22. cpuDeltaNanos, glWorkNanos, and measureGl separate GL work from raw wall time and measurement flags. */
+    static void cpuDeltaAndGlWorkNanosCase() {
+        // cpuDeltaNanos edge cases: both -1 (must NOT return 0!), single -1, backwards, normal.
+        boolean cpuOk = FramePacer.cpuDeltaNanos(-1L, -1L) == -1L
+                && FramePacer.cpuDeltaNanos(-1L, 1_000_000L) == -1L
+                && FramePacer.cpuDeltaNanos(1_000_000L, -1L) == -1L
+                && FramePacer.cpuDeltaNanos(5_000_000L, 4_000_000L) == -1L
+                && FramePacer.cpuDeltaNanos(1_000_000L, 3_000_000L) == 2_000_000L;
+
+        long d0 = 100_000_000L;
+        // Non-paced with 48 ms GPU backpressure in swap: must report full 50 ms wall time.
+        long nonPaced = FramePacer.glWorkNanos(d0, d0 + 2_000_000L, d0 + 50_000_000L, 2_000_000L, false);
+        // Paced with 2 ms CPU and 50 ms wall (eglSwapBuffers sleep): reports 2 ms CPU.
+        long pacedSwapSleep = FramePacer.glWorkNanos(d0, d0 + 2_000_000L, d0 + 50_000_000L, 2_000_000L, true);
+        // Paced with lazy dequeueBuffer sleep inside draw (48 ms drawWall, 2 ms CPU): reports 2 ms CPU.
+        long pacedLazyDequeue = FramePacer.glWorkNanos(d0, d0 + 48_000_000L, d0 + 50_000_000L, 2_000_000L, true);
+        // Paced with CPU time unavailable (-1): falls back to pre-swap drawWall (2 ms), not 50 ms swapWall.
+        long pacedNoCpu = FramePacer.glWorkNanos(d0, d0 + 2_000_000L, d0 + 50_000_000L, -1L, true);
+        // Fallback path (swapEnd used as swapDoneNs, swapCpuEnd used for cpuDelta): excludes lazy dequeue sleep.
+        long fallbackPaced = FramePacer.glWorkNanos(
+                d0, d0 + 48_000_000L, d0 + 48_000_000L, FramePacer.cpuDeltaNanos(10_000_000L, 12_000_000L), true);
+
+        // measureGl produces both workNs and rawWallNs from the same sample with paced/swapMeasured flags.
+        FramePacer.GlTiming mPaced = FramePacer.measureGl(0L, 2_000_000L, 50_000_000L, 2_000_000L, true, true);
+        FramePacer.GlTiming mFallback = FramePacer.measureGl(0L, 5_000_000L, 50_000_000L, 2_000_000L, true, false);
+        FramePacer.GlTiming mNonPaced = FramePacer.measureGl(0L, 2_000_000L, 50_000_000L, 2_000_000L, false, true);
+        boolean dualOk = mPaced.workNs == 2_000_000L && mPaced.rawWallNs == 50_000_000L && mPaced.paced && mPaced.swapMeasured
+                && mFallback.workNs == 2_000_000L && mFallback.rawWallNs == 5_000_000L && mFallback.paced && !mFallback.swapMeasured
+                && mNonPaced.workNs == 50_000_000L && mNonPaced.rawWallNs == 50_000_000L && !mNonPaced.paced && mNonPaced.swapMeasured;
+
+        boolean workOk = nonPaced == 50_000_000L
+                && pacedSwapSleep == 2_000_000L
+                && pacedLazyDequeue == 2_000_000L
+                && pacedNoCpu == 2_000_000L
+                && fallbackPaced == 2_000_000L;
+        check("cpuDeltaNanos, glWorkNanos & measureGl preserve backpressure, strip paced sleep, and keep raw wall",
+                cpuOk && workOk && dualOk, "cpuOk=" + cpuOk + ", workOk=" + workOk + ", dualOk=" + dualOk);
+    }
+
+    /** 23. Production FramePacer.AdpfState end-to-end: IME wake, 60 Hz cap, failed vote, gesture release, stale matrix. */
+    static void adpfTargetNanosAndTouchBoostCase() {
+        long period50ms = 50_000_000L;
+        long period33ms = 33_333_333L;
+        long period16ms = 16_666_667L;
+        long period8ms = 8_333_333L;
+        long expectedTopTarget = (long) (1e9 / 120f) * 7L / 10L;  // 5_833_333 ns
+        long expected60Target = period16ms * 7L / 10L;            // 11_666_666 ns
+        long expectedPacedTarget = period50ms * 7L / 10L;         // 35_000_000 ns
+
+        final List<Long> targets = new ArrayList<>();
+        final List<Long> actuals = new ArrayList<>();
+        FramePacer.AdpfSession sess = new FramePacer.AdpfSession() {
+            @Override public void updateTargetWorkDuration(long nanos) { targets.add(nanos); }
+            @Override public void reportActualWorkDuration(long nanos) { actuals.add(nanos); }
+        };
+
+        // 1. 20 Hz (50ms, topRate=120) touch -> wake -> IME wake (timeline still 50ms): stays 5.83ms, never 35ms.
+        FramePacer.AdpfState st = new FramePacer.AdpfState();
+        st.onSessionCreated(expectedPacedTarget, sess);
+        targets.clear();
+        actuals.clear();
+        boolean boosted = st.beginTouchBoost(true, 1_000_000_000L, period50ms, 120f);
+        st.wake(period50ms, 120f, false, true, 120f, false, sess);
+        st.wake(period50ms, 120f, false, true, 120f, false, sess); // IME wakeHints() while timeline still 50ms
+        boolean sc1 = boosted && st.boostActive
+                && targets.equals(List.of(expectedTopTarget))
+                && actuals.equals(List.of(expectedTopTarget, expectedTopTarget));
+
+        // 2. Gesture ends (touching=false) on a system-capped 60 Hz (16.67ms) 120 Hz device: clears boost -> 11.67ms.
+        targets.clear();
+        actuals.clear();
+        st.frameWorked(2_000_000L, 1_500_000L, 1_050_000_000L, period16ms, 120f, false, false, 120f, sess);
+        boolean sc2 = !st.boostActive
+                && targets.equals(List.of(expected60Target))
+                && actuals.equals(List.of(2_000_000L));
+
+        // 3. Rate lift transiently failed (pacedActive=true) while finger is still down (touching=true, 50ms):
+        //    frameWorked keeps boostActive=true (5.83ms); once finger lifts (touching=false), clears boost -> 35ms.
+        st.reset();
+        st.onSessionCreated(expectedPacedTarget, sess);
+        targets.clear();
+        actuals.clear();
+        st.beginTouchBoost(true, 2_000_000_000L, period50ms, 120f);
+        st.frameWorked(3_000_000L, 1_000_000L, 2_010_000_000L, period50ms, 120f, true, true, 20f, sess);
+        boolean keptWhileDown = st.boostActive && targets.equals(List.of(expectedTopTarget));
+        targets.clear();
+        st.frameWorked(3_000_000L, 1_000_000L, 2_020_000_000L, period50ms, 120f, true, false, 20f, sess);
+        boolean clearedOnLift = !st.boostActive && targets.equals(List.of(expectedPacedTarget));
+        boolean sc3 = keptWhileDown && clearedOnLift;
+
+        // 4. Gesture ends and high-rate vote withdrawn (touching=false, rateSaid=0) even while period stays 50ms: clears boost.
+        st.reset();
+        st.onSessionCreated(expectedPacedTarget, sess);
+        targets.clear();
+        st.beginTouchBoost(true, 3_000_000_000L, period50ms, 120f);
+        st.wake(period50ms, 120f, false, true, 120f, false, sess);
+        targets.clear();
+        st.frameWorked(2_000_000L, 1_000_000L, 3_100_000_000L, period50ms, 120f, false, false, 0f, sess);
+        boolean sc4 = !st.boostActive && targets.equals(List.of(expectedPacedTarget));
+
+        // 5. isStalePacedPeriod boundary matrix: {50ms, 33.3ms, 16.7ms, 8.3ms} x {120Hz, 90Hz, 60Hz, 0Hz}.
+        boolean sc5 = FramePacer.isStalePacedPeriod(period50ms, 120f)
+                && FramePacer.isStalePacedPeriod(period33ms, 120f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 120f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 120f)
+                && FramePacer.isStalePacedPeriod(period50ms, 90f)
+                && FramePacer.isStalePacedPeriod(period33ms, 90f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 90f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 90f)
+                && FramePacer.isStalePacedPeriod(period50ms, 60f)
+                && FramePacer.isStalePacedPeriod(period33ms, 60f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 60f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 60f)
+                && !FramePacer.isStalePacedPeriod(period50ms, 0f)
+                && !FramePacer.isStalePacedPeriod(period33ms, 0f)
+                && !FramePacer.isStalePacedPeriod(period16ms, 0f)
+                && !FramePacer.isStalePacedPeriod(period8ms, 0f);
+
+        // 6. Fixed 120 Hz screen (8.33ms, topRate=120) with lastFrameWorked 50 ms ago (< 250 ms):
+        //    beginTouchBoost(true) still returns true (bypasses 250 ms throttle) while keeping boostActive=false,
+        //    and wake() reports expectedTopTarget (5.83ms) without clamping.
+        st.reset();
+        st.onSessionCreated(expectedTopTarget, sess);
+        st.lastFrameWorkedNs = 4_000_000_000L;
+        targets.clear();
+        actuals.clear();
+        boolean fixedWakeAllowed = st.beginTouchBoost(true, 4_050_000_000L, period8ms, 120f);
+        st.wake(period8ms, 120f, false, true, 120f, false, sess);
+        boolean sc6 = fixedWakeAllowed && !st.boostActive
+                && targets.isEmpty()
+                && actuals.equals(List.of(expectedTopTarget));
+
+        check("AdpfState handles IME wake, 60 Hz cap, failed rate lift, vote release, stale matrix, and fixed-120 wake",
+                sc1 && sc2 && sc3 && sc4 && sc5 && sc6,
+                "sc1=" + sc1 + ", sc2=" + sc2 + ", sc3=" + sc3 + ", sc4=" + sc4 + ", sc5=" + sc5 + ", sc6=" + sc6);
+    }
+
+    /** 24. Picture-only redraw triggered from 20 Hz keeps picturedPaced even if posted recheckRate() lifts before takeRender(). */
+    static void picturedPacedSurvivesEarlyRecheckCase() {
+        Phone ph = new Phone(120, 3, true, 200_000);
+        // Enter 20 Hz paced mode.
+        long t1 = 12 * ph.period;
+        ph.pacer.wantPacedFrame();
+        ph.pacer.vsyncCame(t1, t1 + 2 * ph.period);
+        FramePacer.Taken tkInit = ph.pacer.takeRender();
+        FramePacer.Begun bInit = ph.pacer.begin(tkInit.vsyncAt, t1 + 200_000L, tkInit.external);
+        ph.pacer.applyRate(false, false, bInit.following, 20f, bInit.externalDemand);
+        ph.pacer.scheduleNext(false);
+        boolean inPaced = ph.pacer.isPacedActive();
+
+        // Picture arrives while paced: capture wasPaced, mark pictureActive, queue pictureFrame(wasPaced).
+        boolean wasPaced = ph.pacer.isPacedActive();
+        ph.pictureActive = true;
+        ph.pacer.pictureFrame(wasPaced);
+        // Simulate posted recheckRate() running on app thread BEFORE next vsync's frameOnApp().
+        ph.pacer.recheckRate();
+        boolean liftedEarly = !ph.pacer.isPacedActive() && ph.rate == 120f;
+
+        // Next vsync arrives -> takeRender() still carries picturedPaced=true so transition frame is attributed.
+        long t2 = 13 * ph.period;
+        ph.pacer.vsyncCame(t2, t2 + 2 * ph.period);
+        FramePacer.Taken tk1 = ph.pacer.takeRender();
+        boolean pacedBefore1 = ph.pacer.isPacedActive();
+        boolean ok1 = tk1.pictured && !tk1.app && tk1.picturedPaced && (pacedBefore1 || tk1.picturedPaced);
+
+        // Subsequent normal picture redraw after exit must NOT inherit picturedPaced.
+        ph.pacer.pictureFrame(ph.pacer.isPacedActive());
+        long t3 = 14 * ph.period;
+        ph.pacer.vsyncCame(t3, t3 + 2 * ph.period);
+        FramePacer.Taken tk2 = ph.pacer.takeRender();
+        boolean ok2 = tk2.pictured && !tk2.app && !tk2.picturedPaced;
+
+        check("pictureFrame from 20 Hz retains picturedPaced across early recheckRate() and clears on next frame",
+                inPaced && liftedEarly && ok1 && ok2,
+                "inPaced=" + inPaced + ", liftedEarly=" + liftedEarly + ", ok1=" + ok1 + ", ok2=" + ok2);
+    }
+
+    /** 25. Perf-47: fireWake exact boundary across 60/90/120 Hz, pacedOnly false/true, LTPO 60->120 & 120->20, jitter, ahead, and postDelayed truncation. */
+    static void fireWakeExactBoundaryCase() {
+        // (a) Strict boundary (at - 0.49 ms, at - 0.25 ms, at - 1 ns => return 1, 0 renders; at == vsync & > at => return 2, 1 frame, now >= at)
+        //     across 60/90/120 Hz and pacedOnly = false / true.
+        double[] freqs = {60.0, 90.0, 120.0};
+        boolean boundaryOk = true;
+        for (double hz : freqs) {
+            for (boolean pacedOnly : new boolean[] {false, true}) {
+                Phone ph = new Phone(hz, 3, true, 200_000);
+                double atMs = 200.0;
+                long atNs = 200_000_000L;
+                FramePacer.WakeReq req = ph.pacer.scheduleWake(atMs, pacedOnly);
+                int r1 = ph.pacer.fireWake(req, atNs - 490_000L, atNs + 2 * ph.period);
+                int r2 = ph.pacer.fireWake(req, atNs - 250_000L, atNs + 2 * ph.period);
+                int r3 = ph.pacer.fireWake(req, atNs - 1L, atNs + 2 * ph.period);
+                int reqsBefore = ph.renderRequests;
+                boolean stillCurrent = ph.pacer.isWakeCurrent(req);
+                int rExact = ph.pacer.fireWake(req, atNs, atNs + 2 * ph.period);
+                int reqsAfter = ph.renderRequests;
+                int rStale = ph.pacer.fireWake(req, atNs + ph.period, atNs + 3 * ph.period);
+                FramePacer.Taken tk = ph.pacer.takeRender();
+                FramePacer.Begun b = ph.pacer.begin(tk.vsyncAt, atNs + 100_000L, tk.external);
+                boolean exactOk = r1 == 1 && r2 == 1 && r3 == 1 && reqsBefore == 0 && stillCurrent
+                        && rExact == 2 && reqsAfter == 1 && rStale == 0 && b.now >= atMs;
+
+                // First vsync strictly past atMs also fires once with now >= atMs.
+                FramePacer.WakeReq req2 = ph.pacer.scheduleWake(atMs + 50.0, pacedOnly);
+                long afterNs = 250_000_000L + 1_234_567L;
+                int rPast = ph.pacer.fireWake(req2, afterNs, afterNs + 2 * ph.period);
+                FramePacer.Taken tk2 = ph.pacer.takeRender();
+                FramePacer.Begun b2 = ph.pacer.begin(tk2.vsyncAt, afterNs + 100_000L, tk2.external);
+                boolean pastOk = rPast == 2 && b2.now >= atMs + 50.0;
+                if (!exactOk || !pastOk) boundaryOk = false;
+            }
+        }
+
+        // (b) LTPO 60 -> 120 Hz counterexample: framePeriod = 16.667 ms, T = 100 ms, at = 115 ms;
+        //     actual next vsyncs at 108.333 ms (display switched to 120 Hz) and 116.667 ms.
+        //     108.333 ms must NOT render (0 renders), 116.667 ms renders exactly 1 frame.
+        Phone ltpoUp = new Phone(120, 3, true, 200_000);
+        ltpoUp.pacer.framePeriod = 16_666_667L;
+        FramePacer.WakeReq upReq = ltpoUp.pacer.scheduleWake(115.0, false);
+        int r100 = ltpoUp.pacer.fireWake(upReq, 100_000_000L, 133_333_334L);
+        int r108 = ltpoUp.pacer.fireWake(upReq, 108_333_333L, 125_000_000L);
+        int rendersBeforeDue = ltpoUp.renderRequests;
+        int r116 = ltpoUp.pacer.fireWake(upReq, 116_666_667L, 133_333_334L);
+        boolean ltpo60To120Ok = r100 == 1 && r108 == 1 && rendersBeforeDue == 0
+                && r116 == 2 && ltpoUp.renderRequests == 1 && ltpoUp.pacer.vsyncAt()[0] == 116_666_667L;
+
+        // (c) LTPO 120 <-> 20 Hz switch: framePeriod = 50 ms, T = 100 ms, at = 140 ms;
+        //     vsync at 100 ms (50 ms away) returns 1 (no pre-arming via framePeriod), 150 ms returns 2.
+        Phone ltpoDown = new Phone(120, 3, true, 200_000);
+        ltpoDown.pacer.framePeriod = 50_000_000L;
+        FramePacer.WakeReq downReq = ltpoDown.pacer.scheduleWake(140.0, true);
+        int d100 = ltpoDown.pacer.fireWake(downReq, 100_000_000L, 200_000_000L);
+        int d139 = ltpoDown.pacer.fireWake(downReq, 139_600_000L, 239_600_000L);
+        int dRendersBefore = ltpoDown.renderRequests;
+        int d150 = ltpoDown.pacer.fireWake(downReq, 150_000_000L, 250_000_000L);
+        boolean ltpo120To20Ok = d100 == 1 && d139 == 1 && dRendersBefore == 0
+                && d150 == 2 && ltpoDown.renderRequests == 1;
+
+        // (d) 120 Hz +/- 50 us jitter running 1 s steady clock (wakeAfter(100.0)): bounded 130-vsync simulation,
+        //     asserting every vsync before firstDueNs returns 1 with 0 renders, and firstDueNs returns 2 with
+        //     +1 renderRequest and begin(...).now >= targetMs.
+        Phone jitter = new Phone(120, 3, true, 200_000);
+        long[] vsyncGrid = new long[130];
+        for (int i = 0; i < vsyncGrid.length; i++) {
+            long idx = 13L + i;
+            long jitterNs = ((idx % 3) - 1) * 50_000L; // -50us, 0, +50us
+            vsyncGrid[i] = idx * jitter.period + jitterNs;
+        }
+        double baseMs = 100.0;
+        int steps = 10;
+        boolean jitterOk = true;
+        int cursor = 0;
+        for (int s = 0; s < steps; s++) {
+            double targetMs = baseMs + (s + 1) * 100.0;
+            // Independently find the first vsync in the bounded grid with vNs / 1e6 >= targetMs.
+            int firstDueIdx = -1;
+            for (int k = cursor; k < vsyncGrid.length; k++) {
+                if (vsyncGrid[k] / 1e6 >= targetMs) {
+                    firstDueIdx = k;
+                    break;
+                }
+            }
+            if (firstDueIdx < 0) {
+                jitterOk = false;
+                break;
+            }
+            FramePacer.WakeReq req = jitter.pacer.scheduleWake(targetMs, false);
+            int prevRenders = jitter.renderRequests;
+            for (int k = cursor; k < firstDueIdx; k++) {
+                long vNs = vsyncGrid[k];
+                int res = jitter.pacer.fireWake(req, vNs, vNs + 2 * jitter.period);
+                if (res != 1 || jitter.renderRequests != prevRenders) jitterOk = false;
+            }
+            long dueNs = vsyncGrid[firstDueIdx];
+            int dueRes = jitter.pacer.fireWake(req, dueNs, dueNs + 2 * jitter.period);
+            if (dueRes != 2 || jitter.renderRequests != prevRenders + 1) jitterOk = false;
+            FramePacer.Taken tk = jitter.pacer.takeRender();
+            FramePacer.Begun b = jitter.pacer.begin(tk.vsyncAt, dueNs + 100_000L, tk.external);
+            if (!tk.app || b.now < targetMs) jitterOk = false;
+            cursor = firstDueIdx + 1;
+        }
+
+        // (e) ahead == true when fireWake(req, T < at) returns 1 must NOT steal current vsync.
+        Phone aheadPh = new Phone(120, 3, true, 200_000);
+        long tAhead = 12 * aheadPh.period;
+        aheadPh.pacer.vsyncCame(tAhead, tAhead + 2 * aheadPh.period); // sets ahead = true (no appWanted)
+        FramePacer.WakeReq aheadReq = aheadPh.pacer.scheduleWake(tAhead / 1e6 + 0.3, false);
+        int rAheadEarly = aheadPh.pacer.fireWake(aheadReq, tAhead, tAhead + 2 * aheadPh.period);
+        boolean aheadNoSteal = rAheadEarly == 1 && aheadPh.renderRequests == 0 && aheadPh.pacer.isWakeCurrent(aheadReq);
+        long tNext = 13 * aheadPh.period;
+        int rAheadDue = aheadPh.pacer.fireWake(aheadReq, tNext, tNext + 2 * aheadPh.period);
+        boolean aheadOk = aheadNoSteal && rAheadDue == 2 && aheadPh.renderRequests == 1;
+
+        // (f) Token replacement, same-deadline paced -> external upgrade, same-T dual callback order,
+        //     and postDelayed integer-ms truncation boundary (lead truncated down by < 1 ms).
+        Phone edge = new Phone(120, 3, true, 200_000);
+        FramePacer.WakeReq w1 = edge.pacer.scheduleWake(300.0, true);
+        // Same-deadline upgrade paced -> external mutates w1 in place and returns null.
+        FramePacer.WakeReq wUpgrade = edge.pacer.scheduleWake(300.0, false);
+        // Earlier deadline replaces w1.
+        FramePacer.WakeReq wEarlier = edge.pacer.scheduleWake(290.0, false);
+        int staleW1 = edge.pacer.fireWake(w1, 290_000_000L, 306_666_666L);
+        // postDelayed integer-ms truncation: e.g. at = 290.8 ms, callback wakes at vsync 290.0 ms (< 290.8) -> returns 1,
+        // then next vsync 298.333 ms (>= 290.8) -> returns 2.
+        FramePacer.WakeReq truncReq = edge.pacer.scheduleWake(289.8, false);
+        int truncBefore = edge.pacer.fireWake(truncReq, 289_000_000L, 305_666_666L);
+        int truncAt = edge.pacer.fireWake(truncReq, 290_000_000L, 306_666_666L);
+        // Same-T dual callback order: second fireWake at same T returns 0 (stale).
+        int truncDup = edge.pacer.fireWake(truncReq, 290_000_000L, 306_666_666L);
+        boolean edgeOk = w1 != null && wUpgrade == null && !w1.isPacedOnly()
+                && wEarlier != null && staleW1 == 0
+                && truncBefore == 1 && truncAt == 2 && truncDup == 0;
+
+        check("fireWake exact boundary across 60/90/120 Hz, LTPO 60->120 & 120->20, jitter, ahead, and truncation",
+                boundaryOk && ltpo60To120Ok && ltpo120To20Ok && jitterOk && aheadOk && edgeOk,
+                "boundary=" + boundaryOk + ", ltpo60To120=" + ltpo60To120Ok + ", ltpo120To20=" + ltpo120To20Ok
+                        + ", jitter=" + jitterOk + ", ahead=" + aheadOk + ", edge=" + edgeOk);
+    }
+
+    static void resumeContinuityBoundaryCase() {
+        // (1a) Old vsyncAt=1000ms dispatched before 600s pause; after resume, stale/system render arrives first,
+        //      requests more=true, then new vsync arrives: both frames report late == 0, and a 3rd frame with a
+        //      real continuous drop reports late > 0.
+        Phone ph1 = new Phone(60, 3, true, 200_000);
+        long t0 = 1_000_000_000L; // 1000 ms
+        ph1.pacer.wantFrame();
+        ph1.pacer.vsyncCame(t0, t0 + ph1.period);
+        FramePacer.Taken tk0 = ph1.pacer.takeRender();
+        FramePacer.Begun b0 = ph1.pacer.begin(tk0.vsyncAt, t0 + 100_000L, tk0.external, tk0.continuityGen);
+        ph1.pacer.ended(true, false, b0.following, 0f, b0.externalDemand);
+        // Dispatch next old vsync (1016.67ms) right before pause
+        long tOld = t0 + ph1.period;
+        ph1.pacer.vsyncCame(tOld, tOld + ph1.period);
+        // Pause & resume 600s later
+        ph1.pacer.resetContinuity(0L);
+        long tResume = t0 + 600_000_000_000L;
+        ph1.pacer.resetContinuity(tResume);
+        // Simulate stale render (ONE systemFrameNeeded or pre-resume at=[tOld, tOld+period])
+        FramePacer.Taken tkStale = ph1.pacer.takeRender();
+        FramePacer.Begun b1 = ph1.pacer.begin(new long[] {tOld, tOld + ph1.period}, tResume + 100_000L,
+                tkStale.external, tkStale.continuityGen);
+        ph1.pacer.ended(true, false, b1.following, 0f, b1.externalDemand);
+        // New vsync arrives after resume
+        long tNew1 = tResume + ph1.period;
+        ph1.pacer.vsyncCame(tNew1, tNew1 + ph1.period);
+        FramePacer.Taken tkNew1 = ph1.pacer.takeRender();
+        FramePacer.Begun b2 = ph1.pacer.begin(tkNew1.vsyncAt, tNew1 + 100_000L, tkNew1.external, tkNew1.continuityGen);
+        ph1.pacer.ended(true, false, b2.following, 0f, b2.externalDemand);
+        // 3rd frame has a real 2-frame drop (3 periods after tNew1) -> late > 0
+        long tNew3 = tNew1 + 3 * ph1.period;
+        ph1.pacer.vsyncCame(tNew3, tNew3 + ph1.period);
+        FramePacer.Taken tkNew3 = ph1.pacer.takeRender();
+        FramePacer.Begun b3 = ph1.pacer.begin(tkNew3.vsyncAt, tNew3 + 100_000L, tkNew3.external, tkNew3.continuityGen);
+        boolean case1a = b1.vsync == 0L && b1.late == 0.0 && b2.late == 0.0 && b3.late > 0.0;
+
+        // (1b) New vsync arrives first after resume, then takeRender(): first frame has late == 0.
+        Phone ph2 = new Phone(60, 3, true, 200_000);
+        ph2.pacer.wantFrame();
+        ph2.pacer.vsyncCame(t0, t0 + ph2.period);
+        FramePacer.Taken p2k0 = ph2.pacer.takeRender();
+        FramePacer.Begun p2b0 = ph2.pacer.begin(p2k0.vsyncAt, t0 + 100_000L, p2k0.external, p2k0.continuityGen);
+        ph2.pacer.ended(true, false, p2b0.following, 0f, p2b0.externalDemand);
+        ph2.pacer.resetContinuity(0L);
+        ph2.pacer.resetContinuity(tResume);
+        ph2.pacer.wantFrame();
+        ph2.pacer.vsyncCame(tNew1, tNew1 + ph2.period);
+        FramePacer.Taken p2k1 = ph2.pacer.takeRender();
+        FramePacer.Begun p2b1 = ph2.pacer.begin(p2k1.vsyncAt, tNew1 + 100_000L, p2k1.external, p2k1.continuityGen);
+        boolean case1b = p2k1.app && p2b1.late == 0.0 && p2b1.vsync == tNew1;
+
+        // (2) surfaceDestroyed alone (resetContinuity(0L)) with stale vsync injected before surfaceCreated
+        //     (resetContinuity(tResume) 600s later): first two frames have late == 0, 3rd real drop reports late > 0.
+        Phone ph3 = new Phone(60, 3, true, 200_000);
+        ph3.pacer.wantFrame();
+        ph3.pacer.vsyncCame(t0, t0 + ph3.period);
+        FramePacer.Taken p3k0 = ph3.pacer.takeRender();
+        FramePacer.Begun p3b0 = ph3.pacer.begin(p3k0.vsyncAt, t0 + 100_000L, p3k0.external, p3k0.continuityGen);
+        ph3.pacer.ended(true, false, p3b0.following, 0f, p3b0.externalDemand);
+        ph3.pacer.resetContinuity(0L);
+        // Stale Choreographer callback arrives before surfaceCreated 600s later
+        ph3.pacer.vsyncCame(t0 + ph3.period, t0 + 2 * ph3.period);
+        ph3.pacer.resetContinuity(tResume);
+        FramePacer.Taken p3k1 = ph3.pacer.takeRender();
+        FramePacer.Begun p3b1 = ph3.pacer.begin(p3k1.vsyncAt, tResume, p3k1.external, p3k1.continuityGen);
+        ph3.pacer.ended(true, false, p3b1.following, 0f, p3b1.externalDemand);
+        ph3.pacer.vsyncCame(tNew1, tNew1 + ph3.period);
+        FramePacer.Taken p3k2 = ph3.pacer.takeRender();
+        FramePacer.Begun p3b2 = ph3.pacer.begin(p3k2.vsyncAt, tNew1 + 100_000L, p3k2.external, p3k2.continuityGen);
+        ph3.pacer.ended(true, false, p3b2.following, 0f, p3b2.externalDemand);
+        ph3.pacer.vsyncCame(tNew3, tNew3 + ph3.period);
+        FramePacer.Taken p3k3 = ph3.pacer.takeRender();
+        FramePacer.Begun p3b3 = ph3.pacer.begin(p3k3.vsyncAt, tNew3 + 100_000L, p3k3.external, p3k3.continuityGen);
+        boolean case2 = p3b1.vsync == 0L && p3b1.late == 0.0 && p3b2.late == 0.0 && p3b3.late > 0.0;
+
+        // (3) Fast pause -> resume does NOT drop an existing scheduled WakeReq.
+        Phone ph4 = new Phone(60, 3, true, 200_000);
+        FramePacer.WakeReq wake = ph4.pacer.scheduleWake(2000.0, false);
+        ph4.pacer.resetContinuity(0L);
+        ph4.pacer.resetContinuity(1_500_000_000L);
+        boolean stillCurrent = ph4.pacer.isWakeCurrent(wake);
+        int fired = ph4.pacer.fireWake(wake, 2_000_000_000L, 2_016_666_667L);
+        boolean case3 = wake != null && stillCurrent && fired == 2;
+
+        check("resume continuity boundary clears stale vsync/late without dropping pending wakes",
+                case1a && case1b && case2 && case3,
+                "case1a=" + case1a + ", case1b=" + case1b + ", case2=" + case2 + ", case3=" + case3);
+    }
+
+    static void imeDeferredResetContinuityNoDeadlockCase() {
+        // (a) setImeMoving(true) -> Choreographer callback arrives and defers -> inside onInsets (before flush runs),
+        //     surfaceDestroyed triggers resetContinuity(0L) + setImeMoving(false) -> next beat calls wantFrame():
+        //     must clear wanted and deliver renders (fails with renders=0 without deferredFromVsync wanted cleanup).
+        Phone ph = new Phone(60, 3, true, 200_000);
+        ph.app = steady(1.0, 1.0, -1);
+        ph.onMain = true;
+        ph.pacer.setImeMoving(true);
+        ph.onInsets = () -> {
+            ph.onInsets = null;
+            ph.pacer.resetContinuity(0L);
+            ph.pacer.setImeMoving(false);
+        };
+        ph.runUntil(ph.period);
+        int beforeRenders = ph.renderRequests;
+        ph.main(ph.period + 1, ph.pacer::wantFrame);
+        ph.runUntil(10 * ph.period);
+        boolean noDeadlockA = ph.renderRequests > beforeRenders;
+
+        // (b) deferredWakeApp=true during imeMoving -> resetContinuity(0L) + setImeMoving(false):
+        //     must preserve appWanted + externalWanted, re-post vsync, and render without deadlock.
+        Phone ph2 = new Phone(60, 3, true, 200_000);
+        ph2.app = steady(1.0, 1.0, -1);
+        ph2.pacer.setImeMoving(true);
+        long tWake = 5 * ph2.period;
+        ph2.pacer.wakeFrameNow(tWake, tWake + ph2.period, false);
+        int rendersBeforeB = ph2.renderRequests;
+        ph2.pacer.resetContinuity(0L);
+        ph2.pacer.setImeMoving(false);
+        boolean preservedWanted = ph2.pacer.appWanted.get() && ph2.pacer.externalWanted.get();
+        ph2.runUntil(12 * ph2.period);
+        boolean noDeadlockB = preservedWanted && ph2.renderRequests > rendersBeforeB;
+
+        check("resetContinuity during imeMoving clears deferred wanted lock and preserves deferredWakeApp",
+                noDeadlockA && noDeadlockB,
+                "noDeadlockA=" + noDeadlockA + " (renders=" + (ph.renderRequests - beforeRenders)
+                        + "), noDeadlockB=" + noDeadlockB + " (preserved=" + preservedWanted
+                        + ", renders=" + (ph2.renderRequests - rendersBeforeB) + ")");
+    }
+
     /**
      * Regression: frameNow() writes wall-clock nanoTime into lastAppDispatchedVsyncNs when deferredVsync==false.
      * If the sole in-flight Choreographer callback then arrives with a latched vsync timestamp t <= now (both
@@ -1579,11 +2242,145 @@ public final class FramePacerTest {
                 ph.drawn.size() == 3, "drawn=" + ph.drawn.size() + "/3");
     }
 
-    public static void main(String[] args) {
-        motionCase("1 ms CPU + 1 ms GPU at 120 Hz shows a new frame every refresh", 1, 1, true);
-        motionCase("0.5 ms CPU + 7 ms GPU at 120 Hz (swap waits GPU) shows a new frame every refresh", 0.5, 7, true);
-        motionCase("0.5 ms CPU + 7 ms GPU at 120 Hz (swap async) shows a new frame every refresh", 0.5, 7, false);
-        motionCase("6 ms CPU + 1 ms GPU at 120 Hz shows a new frame every refresh", 6, 1, true);
+    /**
+     * Regression: resetContinuity() with an in-flight non-deferred postVsync must clear wanted, re-post if demand
+     * exists, and ignore stale pre-reset callbacks so post-resume frames never deadlock.
+     */
+    static void resetContinuityClearsInFlightWantedCase() {
+        // (a) In-flight callback lost across resetContinuity: demand must still render and subsequent wantFrame works
+        Phone phA = new Phone(120, 3, true, 200_000);
+        phA.app = steady(1.0, 1.0, -1);
+        long t12 = 12 * phA.period;
+        phA.main(t12 + 1_000_000L, phA.pacer::wantFrame);
+        phA.main(t12 + 2_000_000L, () -> {
+            phA.nextVsync.clear(); // simulate pre-pause callback never delivered
+            phA.pacer.resetContinuity(0L);
+            phA.pacer.resetContinuity(13 * phA.period);
+        });
+        phA.main(16 * phA.period, phA.pacer::wantFrame);
+        phA.runUntil(20 * phA.period);
+        boolean okA = phA.drawn.size() >= 2;
+
+        // (b) Stale pre-reset callback arrives AFTER resetContinuity re-armed a new callback: must be ignored
+        //     without clearing the active callback's wanted slot or triggering a duplicate postVsync.
+        Phone phB = new Phone(120, 3, true, 200_000);
+        phB.app = steady(1.0, 1.0, -1);
+        final List<Runnable> stale = new ArrayList<>();
+        final int[] postsAfterStaleDelta = {-1};
+        phB.main(t12 + 1_000_000L, () -> {
+            phB.pacer.wantFrame();
+            stale.addAll(phB.nextVsync);
+            phB.nextVsync.clear();
+        });
+        phB.main(t12 + 2_000_000L, () -> {
+            phB.pacer.resetContinuity(0L);
+            phB.pacer.resetContinuity(13 * phB.period);
+        });
+        phB.main(t12 + 3_000_000L, () -> {
+            int before = phB.vsyncPosts;
+            phB.lastVsyncAt = t12;
+            for (Runnable r : stale) r.run();
+            phB.pacer.wantFrame(); // must see active callback still wanted -> 0 extra postVsync
+            postsAfterStaleDelta[0] = phB.vsyncPosts - before;
+        });
+        phB.main(16 * phB.period, phB.pacer::wantFrame);
+        phB.runUntil(20 * phB.period);
+        boolean okB = postsAfterStaleDelta[0] == 0 && phB.drawn.size() == 2
+                && phB.drawn.get(0)[0] >= (13 * phB.period) / 1e6 - 0.01;
+
+        check("resetContinuity clears in-flight wanted and ignores stale pre-reset vsync callbacks",
+                okA && okB, "drawnA=" + phA.drawn.size() + "/>=2, drawnB=" + phB.drawn.size()
+                        + "/2 (stalePostsDelta=" + postsAfterStaleDelta[0] + ")");
+    }
+
+    /**
+     * Regression: FrameScheduler.ask() must sample nanoTime() inside lock and reject both stale (age >= period)
+     * and negative-age (now < vsyncAt[0]) ahead slots, preserving demand and re-posting a fresh vsync.
+     */
+    static void askReadsNanoTimeInsideLockAndRejectsStaleOrNegativeAheadCase() {
+        // (a) Stale ahead (age >= period): must NOT render immediately; must re-post vsync and render on T+1.
+        Phone phStale = new Phone(120, 3, true, 200_000);
+        phStale.app = steady(0.5, 0.5, -1);
+        long t0 = 12 * phStale.period;
+        final int[] staleReqs = {-1}, stalePosts = {-1};
+        phStale.main(t0, () -> phStale.pacer.vsyncCame(t0, t0 + 2 * phStale.period));
+        phStale.main(t0 + phStale.period + 1_000_000L, () -> {
+            int req0 = phStale.renderRequests, post0 = phStale.vsyncPosts;
+            phStale.pacer.wantFrame();
+            staleReqs[0] = phStale.renderRequests - req0;
+            stalePosts[0] = phStale.vsyncPosts - post0;
+        });
+        phStale.runUntil(t0 + 4 * phStale.period);
+        boolean okStale = staleReqs[0] == 0 && stalePosts[0] == 1 && phStale.drawn.size() == 1;
+
+        // (b) Negative age (now < vsyncAt[0]): must NOT render immediately; must re-post vsync and render cleanly.
+        final long[] clock = {15 * 8_333_333L};
+        final int[] negReqs = {0}, negPosts = {0};
+        FramePacer negPacer = new FramePacer(new FramePacer.Platform() {
+            @Override public long nanoTime() { return clock[0]; }
+            @Override public boolean onMain() { return true; }
+            @Override public void postMain(Runnable r) { r.run(); }
+            @Override public void postVsync() { negPosts[0]++; }
+            @Override public void postVsync(long gen) { negPosts[0]++; }
+            @Override public void atNextVsyncOnDrawing(Runnable r) {}
+            @Override public void requestRender() { negReqs[0]++; }
+            @Override public boolean setRate(float rate) { return true; }
+            @Override public boolean typing() { return false; }
+        });
+        negPacer.framePeriod = 8_333_333L;
+        long futureVsync = clock[0] + 2_000_000L; // vsyncAt[0] > nanoTime() -> negative age
+        negPacer.vsyncCame(futureVsync, futureVsync + 2 * negPacer.framePeriod);
+        negPacer.wantFrame();
+        boolean okNeg = negReqs[0] == 0 && negPosts[0] == 1 && negPacer.appWanted.get();
+
+        // (c) Deterministic single-thread lock-holding proof: both ask() (when ahead == true) and frameNow()
+        //     must sample Platform.nanoTime() while holding FrameScheduler's lock (Thread.holdsLock(lock) == true).
+        final int[] nanoCalls = {0};
+        final boolean[] allHeldLock = {true};
+        final FramePacer[] lockPacerRef = new FramePacer[1];
+        final long[] lockClock = {100_000_000L};
+        lockPacerRef[0] = new FramePacer(new FramePacer.Platform() {
+            @Override public long nanoTime() {
+                nanoCalls[0]++;
+                if (!lockPacerRef[0].scheduler.holdsLockForTest()) {
+                    allHeldLock[0] = false;
+                }
+                return lockClock[0];
+            }
+            @Override public boolean onMain() { return true; }
+            @Override public void postMain(Runnable r) {}
+            @Override public void postVsync() {}
+            @Override public void postVsync(long gen) {}
+            @Override public void atNextVsyncOnDrawing(Runnable r) {}
+            @Override public void requestRender() {}
+            @Override public boolean setRate(float rate) { return true; }
+            @Override public boolean typing() { return false; }
+        });
+        lockPacerRef[0].framePeriod = 8_333_333L;
+        // Drive ask() with ahead == true:
+        lockPacerRef[0].vsyncCame(lockClock[0], lockClock[0] + 2 * lockPacerRef[0].framePeriod);
+        int beforeAsk = nanoCalls[0];
+        lockPacerRef[0].wantFrame();
+        int askNanoCalls = nanoCalls[0] - beforeAsk;
+        // Drive frameNow():
+        int beforeFrameNow = nanoCalls[0];
+        lockPacerRef[0].frameNow();
+        int frameNowNanoCalls = nanoCalls[0] - beforeFrameNow;
+        boolean okLockOrder = askNanoCalls >= 1 && frameNowNanoCalls >= 1 && allHeldLock[0];
+
+        check("ask() samples nanoTime() inside lock and rejects stale or negative-age ahead",
+                okStale && okNeg && okLockOrder,
+                "stale=" + okStale + " (reqs=" + staleReqs[0] + ", posts=" + stalePosts[0] + ", drawn=" + phStale.drawn.size()
+                        + "), neg=" + okNeg + " (reqs=" + negReqs[0] + ", posts=" + negPosts[0]
+                        + "), lockOrder=" + okLockOrder + " (askCalls=" + askNanoCalls
+                        + ", frameNowCalls=" + frameNowNanoCalls + ", allHeld=" + allHeldLock[0] + ")");
+    }
+
+    public static void main(String[] args) throws IOException {
+        motionCase("a motion of 1 ms CPU and 1 ms GPU a frame shows a new frame at every refresh", 1, 1, true);
+        motionCase("a motion of 0.5 ms CPU and 7 ms GPU a frame (the GPU under a refresh) shows a new frame at every refresh", 0.5, 7, true);
+        motionCase("the same, a driver whose swap does not wait for the GPU", 0.5, 7, false);
+        motionCase("a motion of 6 ms CPU and 1 ms GPU a frame shows a new frame at every refresh", 6, 1, true);
         typingCase();
         rateAfterMotion();
         pacedCase();
@@ -1616,12 +2413,24 @@ public final class FramePacerTest {
         wantImmediateFrameClearsAheadForNextFrameCase();
         sameVsyncFireWakeAfterAskAheadDoesNotDoublePostCase();
         wantFrameBeforeFireWakeAtSameTDoesNotDoublePostCase();
+        applyRateScheduleNextEquivalenceCase();
+        cpuDeltaAndGlWorkNanosCase();
+        adpfTargetNanosAndTouchBoostCase();
+        picturedPacedSurvivesEarlyRecheckCase();
+        fireWakeExactBoundaryCase();
+        resumeContinuityBoundaryCase();
+        imeDeferredResetContinuityNoDeadlockCase();
         frameNowWallClockDoesNotDeadlockWantedCase();
         sameVsyncCallbackInputDoesNotDeadlockWantedCase();
+        resetContinuityClearsInFlightWantedCase();
+        askReadsNanoTimeInsideLockAndRejectsStaleOrNegativeAheadCase();
+        if (args.length > 0) {
+            replay(args[0], 1);
+            replay(args[0], 7);
+        }
         if (failures > 0) {
             System.out.println(failures + " failed");
             System.exit(1);
         }
-        System.out.println("ALL FramePacerTest assertions PASSED");
     }
 }

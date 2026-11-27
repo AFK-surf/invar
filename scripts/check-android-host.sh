@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Verify the Android 6th-platform host layer:
-#   1. Compile & run pure-JDK unit tests (FramePacerTest, ImeRequestTest, FrameMailTest, TouchMovesTest, RawPremulTest)
+#   1. Compile & run pure-JDK unit tests (FramePacerTest, FrameSchedulerPropertyTest, ImeRequestTest, FrameMailTest, TouchMovesTest, RawPremulTest)
 #   2. Compile android_host.c (+ film_none.c + pion_mb_compat.c + wake_bridge.c) via Android NDK
 #      aarch64-linux-android26-clang (or host clang -fsyntax-only with temp stubs)
 #   3. Verify 100% 1-to-1 bidirectional JNI parity across ALL dev/invar/*.java classes <-> android_host.c
@@ -43,16 +43,21 @@ if [ -n "$JAVAC_BIN" ]; then
   TMP_DIRS+=("$TEST_OUT")
   "$JAVAC_BIN" -d "$TEST_OUT" \
     android/app/src/main/java/dev/invar/FramePacer.java \
+    android/app/src/main/java/dev/invar/FrameScheduler.java \
+    android/app/src/main/java/dev/invar/RateVoter.java \
+    android/app/src/main/java/dev/invar/FrameTelemetry.java \
     android/app/src/main/java/dev/invar/ImeRequest.java \
     android/app/src/main/java/dev/invar/FrameMail.java \
     android/app/src/main/java/dev/invar/TouchMoves.java \
     android/app/src/main/java/dev/invar/RawPremul.java \
     android/pacer/FramePacerTest.java \
+    android/pacer/FrameSchedulerPropertyTest.java \
     android/ime/ImeRequestTest.java \
     android/mail/FrameMailTest.java \
     android/touch/TouchMovesTest.java \
     android/mail/RawPremulTest.java
   "$JAVA_BIN" -cp "$TEST_OUT" dev.invar.FramePacerTest
+  "$JAVA_BIN" -cp "$TEST_OUT" dev.invar.FrameSchedulerPropertyTest
   "$JAVA_BIN" -cp "$TEST_OUT" dev.invar.ImeRequestTest
   "$JAVA_BIN" -cp "$TEST_OUT" dev.invar.FrameMailTest
   "$JAVA_BIN" -cp "$TEST_OUT" dev.invar.TouchMovesTest
