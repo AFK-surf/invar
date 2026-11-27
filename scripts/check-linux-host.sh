@@ -111,6 +111,13 @@ $CC -O2 -Wall -Wextra -Werror \
   -Ipackages/host/native packages/host/tests/raw_premul_test.c -o "$OUT_DIR/raw_premul_test" -lm
 "$OUT_DIR/raw_premul_test"
 
+echo "==> GLES3 renderer (gles_render.h) llvmpipe regression test"
+EPOXY_ZLIB_FLAGS="$(pkg-config --cflags --libs epoxy zlib)"
+$CC -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter \
+  -Ipackages/host/compat -Ipackages/host/native \
+  packages/host/tests/gles_render_test.c -o "$OUT_DIR/gles_render_test" $EPOXY_ZLIB_FLAGS -lm
+LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$OUT_DIR/gles_render_test"
+
 PIONC="${PIONC:-$(command -v pionc2 || true)}"
 if [ -n "$PIONC" ]; then
   echo "==> Running $PIONC test packages/damage/parity (groups.h against damage::Groups)"
