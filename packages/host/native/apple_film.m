@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include "moonbit.h"
 
@@ -24,6 +25,11 @@ void mb_render_adaptive_reset(void);
 int mb_render_adaptive_settling(void);
 int mb_render_snapshot(const char *path);
 int mb_render_snapshot_transparent(const char *path);
+uint8_t *mb_render_read_snapshot_inst(const double *inst, int32_t count, double r, double g, double b, int transparent,
+                                      int *pw, int *ph);
+int mb_render_snapshot_px(uint8_t *px, int w, int h, const char *path);
+int mb_render_snapshot_plain(void);
+int mb_png_write_bgra_fast(const uint8_t *px, int w, int h, const char *path);
 
 static NSString *ns(moonbit_string_t s) {
   return [NSString stringWithCharacters:(const unichar *)s length:(NSUInteger)Moonbit_array_length(s)];
@@ -301,9 +307,33 @@ int32_t mbf_write_text(moonbit_string_t path, moonbit_string_t text) {
   }
 }
 
+// ---- pictures written behind (mbf_snapshot_inst's async_write) ----
+// A picture's pixels are read on the main thread; its PNG is written on a serial queue (in the order they were taken,
+// so the last picture of a path is the one left there), at most `snap_most` waiting at once (each 16 MB at 2560 ×
+// 1600). A write that failed is told by mbf_flush_snapshots, which waits for them all; the process waits for them at
+// exit, and a picture written now (mbf_snapshot, ...) after those before it.
+static const long snap_most = 3;
+static dispatch_queue_t snap_q;
+static dispatch_group_t snap_group;
+static dispatch_semaphore_t snap_room;
+static atomic_int snap_failed;
+
+static void snap_drain(void) {
+  if (snap_group) dispatch_group_wait(snap_group, DISPATCH_TIME_FOREVER);
+}
+
+static void snap_ensure(void) {
+  if (snap_q) return;
+  snap_q = dispatch_queue_create("invar.film.png", DISPATCH_QUEUE_SERIAL);
+  snap_group = dispatch_group_create();
+  snap_room = dispatch_semaphore_create(snap_most);
+  atexit(snap_drain);
+}
+
 // Write beside the destination, then rename only a complete PNG into place. A failed render or write leaves the old
 // picture alone, including when this is used directly rather than through a shell wrapper.
 static int32_t snapshot_to(moonbit_string_t path, int transparent) {
+  snap_drain();
   NSURL *destination = [NSURL fileURLWithPath:ns(path)];
   NSString *name = [NSString stringWithFormat:@".%@.%@.tmp.png", destination.lastPathComponent, NSUUID.UUID.UUIDString];
   NSURL *temporary = [[destination URLByDeletingLastPathComponent] URLByAppendingPathComponent:name];
@@ -323,6 +353,60 @@ int32_t mbf_snapshot(moonbit_string_t path) {
 // A picture for compositing: the last frame over a transparent ground.
 int32_t mbf_snapshot_transparent(moonbit_string_t path) {
   @autoreleasepool { return snapshot_to(path, 1); }
+}
+
+// The frame `inst` (as mb_render_present takes them) drawn offscreen as a snapshot draws the last frame and written
+// to `path` as a PNG (`transparent`: over a transparent ground), with no frame handed to be shown between. With
+// `async_write` not 0 the pixels are read here and the PNG written behind (above): 1 then says it was taken,
+// mbf_flush_snapshots whether it was written. 1, or 0.
+int32_t mbf_snapshot_inst(const double *inst, int32_t count, double r, double g, double b, int32_t transparent,
+                          int32_t async_write, moonbit_string_t path) {
+  @autoreleasepool {
+    NSURL *destination = [NSURL fileURLWithPath:ns(path)];
+    NSString *name = [NSString stringWithFormat:@".%@.%@.tmp.png", destination.lastPathComponent, NSUUID.UUID.UUIDString];
+    NSURL *temporary = [[destination URLByDeletingLastPathComponent] URLByAppendingPathComponent:name];
+    int w = 0, h = 0;
+    uint8_t *px = mb_render_read_snapshot_inst(inst, count, r, g, b, transparent != 0, &w, &h);
+    if (!px) return 0;
+    if (async_write != 0 && mb_render_snapshot_plain()) {
+      snap_ensure();
+      char *temp_path = strdup(temporary.fileSystemRepresentation);
+      char *dest_path = strdup(destination.fileSystemRepresentation);
+      if (!temp_path || !dest_path) {
+        free(temp_path);
+        free(dest_path);
+        free(px);
+        return 0;
+      }
+      dispatch_semaphore_wait(snap_room, DISPATCH_TIME_FOREVER);
+      dispatch_group_async(snap_group, snap_q, ^{
+        int ok = mb_png_write_bgra_fast(px, w, h, temp_path);
+        free(px);
+        if (ok && rename(temp_path, dest_path) != 0) ok = 0;
+        if (!ok) {
+          unlink(temp_path);
+          fprintf(stderr, "film: could not write %s\n", dest_path);
+          atomic_store(&snap_failed, 1);
+        }
+        free(temp_path);
+        free(dest_path);
+        dispatch_semaphore_signal(snap_room);
+      });
+      return 1;
+    }
+    snap_drain();
+    const char *temp_path = temporary.fileSystemRepresentation;
+    int ok = mb_render_snapshot_px(px, w, h, temp_path);
+    if (ok && rename(temp_path, destination.fileSystemRepresentation) != 0) ok = 0;
+    if (!ok) [[NSFileManager defaultManager] removeItemAtURL:temporary error:nil];
+    return ok;
+  }
+}
+
+// Every picture written behind written: 1 when all were since the last call, 0 when one was not (said as it failed).
+int32_t mbf_flush_snapshots(void) {
+  snap_drain();
+  return atomic_exchange(&snap_failed, 0) ? 0 : 1;
 }
 
 // (film here: what it asks of the renderer through calls of its own, which src/host/film_none.c answers elsewhere)

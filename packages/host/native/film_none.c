@@ -37,5 +37,11 @@ moonbit_string_t mbf_read_text(moonbit_string_t path) { (void)path; return none(
 int32_t mbf_write_text(moonbit_string_t path, moonbit_string_t text) { (void)path; (void)text; return 0; }
 int32_t mbf_snapshot(moonbit_string_t path) { (void)path; return 0; }
 int32_t mbf_snapshot_transparent(moonbit_string_t path) { (void)path; return 0; }
+int32_t mbf_snapshot_inst(const double *inst, int32_t count, double r, double g, double b, int32_t transparent,
+                          int32_t async_write, moonbit_string_t path) {
+  (void)inst; (void)count; (void)r; (void)g; (void)b; (void)transparent; (void)async_write; (void)path;
+  return 0;
+}
+int32_t mbf_flush_snapshots(void) { return 1; }
 double mbf_now_ms(void) { return 0.0; }
 void mbf_exit(int32_t code) { exit(code); }
