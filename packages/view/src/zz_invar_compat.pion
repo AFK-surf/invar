@@ -1,0 +1,985 @@
+// Invar downstream compatibility bridge and pure-method extensions for `packages/view`.
+
+import "mbt_compat"
+import "signals"
+
+// ── Reactive tree room context & disposal depth ─────────────────────────────
+
+let current_tree_room_ref : signals::Ref[Option[signals::Signal[(Double, Double)]]] = signals::ref_new(None)
+let view_ctx_hook_registered : signals::Ref[Bool] = signals::ref_new(false)
+let tree_disposing_depth : signals::Ref[Int] = signals::ref_new(0)
+
+fn ensure_view_ctx_hook() -> Unit {
+  if view_ctx_hook_registered.v {
+    return
+  }
+  view_ctx_hook_registered.v = true
+  signals::register_reactive_context(fn() -> (() -> (() -> Unit)) {
+    let captured_room = current_tree_room_ref.v
+    fn() -> (() -> Unit) {
+      let prev_room = current_tree_room_ref.v
+      current_tree_room_ref.v = captured_room
+      fn() -> Unit {
+        current_tree_room_ref.v = prev_room
+      }
+    }
+  })
+}
+
+fn init_view_ctx_hook() -> Bool {
+  ensure_view_ctx_hook()
+  true
+}
+
+let view_ctx_hook_init : Bool = init_view_ctx_hook()
+
+/// Active tree's stable size signal `(width, height)` during tree construction, layout, or reactive binding evaluation.
+pub fn current_tree_room() -> Option[signals::Signal[(Double, Double)]] {
+  current_tree_room_ref.v
+}
+
+/// Temporarily clear the active tree room scope while executing `f`, restoring the prior scope on exit.
+pub fn without_tree_room[T](f : () -> T) -> T {
+  let prev = current_tree_room_ref.v
+  current_tree_room_ref.v = None
+  let out = f()
+  current_tree_room_ref.v = prev
+  out
+}
+
+fn with_tree_room[T](room : signals::Signal[(Double, Double)], body : () -> T) -> T {
+  let prev = current_tree_room_ref.v
+  current_tree_room_ref.v = Some(room)
+  let out = body()
+  current_tree_room_ref.v = prev
+  out
+}
+
+/// Whether any `Tree::dispose()` is currently running node teardown callbacks.
+pub fn tree_disposing() -> Bool {
+  tree_disposing_depth.v > 0
+}
+
+// ── Downstream-referenced compatibility helpers ─────────────────────────────
+
+/// Thin forwarder to `signals::ref_new`.
+pub fn ref_new[T](v : T) -> signals::Ref[T] {
+  signals::ref_new(v)
+}
+
+let phys_id_seq : signals::Ref[Int] = signals::Ref::{ phys_id: 0, v: 1 }
+
+/// Return a monotonically increasing physical identity integer.
+pub fn next_phys_id() -> Int {
+  let id = phys_id_seq.v
+  phys_id_seq.v = id + 1
+  id
+}
+
+/// Bitwise NOT on `Int`.
+pub fn bit_not(x : Int) -> Int {
+  (-1) ^ x
+}
+
+/// Pair equality for `(Double, Double)`.
+pub fn pair_dd_eq(a : (Double, Double), b : (Double, Double)) -> Bool {
+  a.0 == b.0 && a.1 == b.1
+}
+
+/// Optional pair equality for `Option[(Double, Double)]`.
+pub fn opt_pair_dd_eq(a : Option[(Double, Double)], b : Option[(Double, Double)]) -> Bool {
+  match (a, b) {
+    (None, None) => true
+    (Some(x), Some(y)) => pair_dd_eq(x, y)
+    _ => false
+  }
+}
+
+/// Slice `s` from `0` to `end` (clamped to `[0, s.length()]`).
+pub fn str_slice_to(s : String, end : Int) -> String {
+  let e = if end < 0 { 0 } else if end > s.length() { s.length() } else { end }
+  s.slice(0, e)
+}
+
+/// Slice `s` from `start` to `s.length()` (clamped to `[0, s.length()]`).
+pub fn str_slice_from(s : String, start : Int) -> String {
+  let st = if start < 0 { 0 } else if start > s.length() { s.length() } else { start }
+  s.slice(st, s.length())
+}
+
+/// Return `true` if any element in `arr` satisfies `pred`.
+pub fn array_any[T](arr : Array[T], pred : (T) -> Bool) -> Bool {
+  for x in arr {
+    if pred(x) {
+      return true
+    }
+  }
+  false
+}
+
+/// Return `true` if two `Array[Int]` values have identical length and elements.
+pub fn array_eq_int(a : Array[Int], b : Array[Int]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+/// Return a new array containing elements of `arr` that satisfy `pred`.
+pub fn array_filter[T](arr : Array[T], pred : (T) -> Bool) -> Array[T] {
+  let out : Array[T] = []
+  for x in arr {
+    if pred(x) {
+      out.push(x)
+    }
+  }
+  out
+}
+
+/// Return the first element in `arr` that satisfies `pred`, if any.
+pub fn array_find_first[T](arr : Array[T], pred : (T) -> Bool) -> Option[T] {
+  for x in arr {
+    if pred(x) {
+      return Some(x)
+    }
+  }
+  None
+}
+
+/// Bounds-checked element lookup on `arr`.
+pub fn array_get[T](arr : Array[T], idx : Int) -> Option[T] {
+  if idx >= 0 && idx < arr.length() {
+    Some(arr[idx])
+  } else {
+    None
+  }
+}
+
+/// Map `f` over every element in `arr`.
+pub fn array_map[T, U](arr : Array[T], f : (T) -> U) -> Array[U] {
+  let out : Array[U] = []
+  for x in arr {
+    out.push(f(x))
+  }
+  out
+}
+
+/// Remove and return the element at `idx`, preserving order.
+pub fn array_remove[T](arr : Array[T], idx : Int) -> T {
+  let v = arr[idx]
+  let last = arr.length() - 1
+  let mut i = idx
+  while i < last {
+    arr[i] = arr[i + 1]
+    i += 1
+  }
+  let _ = arr.pop()
+  v
+}
+
+/// Truncate `arr` to at most `len` elements.
+pub fn array_truncate[T](arr : Array[T], len : Int) -> Unit {
+  let target = if len < 0 { 0 } else { len }
+  while arr.length() > target {
+    let _ = arr.pop()
+  }
+}
+
+/// Retain only elements in `arr` that satisfy `pred`, in place.
+pub fn array_retain[T](arr : Array[T], pred : (T) -> Bool) -> Unit {
+  let mut w = 0
+  let mut r = 0
+  let n = arr.length()
+  while r < n {
+    if pred(arr[r]) {
+      if w != r {
+        arr[w] = arr[r]
+      }
+      w += 1
+    }
+    r += 1
+  }
+  array_truncate(arr, w)
+}
+
+/// Return the first index whose element satisfies `pred`.
+pub fn array_search_by[T](arr : Array[T], pred : (T) -> Bool) -> Option[Int] {
+  let mut i = 0
+  while i < arr.length() {
+    if pred(arr[i]) {
+      return Some(i)
+    }
+    i += 1
+  }
+  None
+}
+
+/// Return the first index equal to `target`.
+pub fn array_search_eq[T : Eq](arr : Array[T], target : T) -> Option[Int] {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == target {
+      return Some(i)
+    }
+    i += 1
+  }
+  None
+}
+
+/// Return a shallow copy of `arr[start..end]`.
+pub fn array_slice[T](arr : Array[T], start : Int, end : Int) -> Array[T] {
+  let out : Array[T] = []
+  let s = if start < 0 { 0 } else { start }
+  let e = if end > arr.length() { arr.length() } else { end }
+  let mut i = s
+  while i < e {
+    out.push(arr[i])
+    i += 1
+  }
+  out
+}
+
+/// Return a shallow copy of `arr[start..]`.
+pub fn array_slice_from[T](arr : Array[T], start : Int) -> Array[T] {
+  array_slice(arr, start, arr.length())
+}
+
+/// Return a shallow copy of `arr[..end]`.
+pub fn array_slice_to[T](arr : Array[T], end : Int) -> Array[T] {
+  array_slice(arr, 0, end)
+}
+
+// ── Live / View / Tree extensions ───────────────────────────────────────────
+
+#into
+pub fn Live::of_value[T](v : T) -> Live[T] {
+  Live::Is(v)
+}
+
+#into
+pub fn Live::of_fn[T](f : () -> T) -> Live[T] {
+  Live::By(f)
+}
+
+#into
+pub fn Live::of_read_signal[T](s : signals::ReadSignal[T]) -> Live[T] {
+  Live::By(fn() -> T { s.get() })
+}
+
+#into
+pub fn Live::of_signal[T](s : signals::Signal[T]) -> Live[T] {
+  Live::By(fn() -> T { s.get() })
+}
+
+#into
+pub fn Live::of_computed[T](c : signals::Computed[T]) -> Live[T] {
+  Live::By(fn() -> T { c.get() })
+}
+
+#into
+pub fn Live::of_derived[T](d : signals::DerivedSignal[T]) -> Live[T] {
+  Live::By(fn() -> T { d.get() })
+}
+
+#into
+pub fn Live::of_optimistic[T](o : signals::Optimistic[T]) -> Live[T] {
+  Live::By(fn() -> T { o.get() })
+}
+
+/// Evaluate a `Live[T]` once to obtain its current value.
+pub fn Live::eval[T](self : Live[T]) -> T {
+  match self {
+    Live::Is(v) => v
+    Live::By(f) => f()
+  }
+}
+
+/// Convert a `Live[T]` into a `() -> T` getter closure.
+pub fn Live::to_getter[T](self : Live[T]) -> () -> T {
+  match self {
+    Is(v) => fn() -> T { v }
+    By(f) => f
+  }
+}
+
+/// Forwarder to `Role::named_by_held`.
+pub fn role_named_by_held(self : Role) -> Bool {
+  self.named_by_held()
+}
+
+/// Write `Role::to_string` to a `StringBuilder`.
+pub fn role_output(self : Role, logger : StringBuilder) -> Unit {
+  logger.write_string(self.to_string())
+}
+
+/// Write `Check::to_string` to a `StringBuilder`.
+pub fn check_output(self : Check, logger : StringBuilder) -> Unit {
+  logger.write_string(self.to_string())
+}
+
+/// Write `BackStep::to_string` to a `StringBuilder`.
+pub fn backstep_output(self : BackStep, logger : StringBuilder) -> Unit {
+  logger.write_string(self.to_string())
+}
+
+/// Forwarder to `Cursor::code`.
+pub fn cursor_code(self : Cursor) -> Int {
+  self.code()
+}
+
+/// Set static border color and width: equivalent to `self.edge(Is((width, color)))`.
+pub fn View::border(self : View, color : Int64, width : Double, loc~ : String = "") -> View {
+  self.edge(Is((width, color)), loc=loc)
+}
+
+/// Whether a multi-key sequence is currently pending in the keymap.
+pub fn Tree::has_pending_keys(self : Tree) -> Bool {
+  self.keyed.pending.untracked().length() > 0
+}
+
+/// Detect unbounded flex-ancestor scroll containers whose size exceeds the viewport with near-zero reach.
+pub fn Tree::scroll_faults(self : Tree) -> Array[String] {
+  let out : Array[String] = []
+  let ats = self.scrolls_at.keys()
+  ats.sort()
+  for at in ats {
+    guard at >= 0 && at < self.nodes.length() else { continue }
+    let n = self.nodes[at]
+    guard n.live else { continue }
+    if n.scroll_had_siblings > 0 {
+      out.push(
+        "View::scrolls called on container node \{at} that already had \{n.scroll_had_siblings} sibling children; wrap the scrollable area in a child box or use ui::scroll_box / View::scroll_box instead",
+      )
+    }
+    guard n.scroll_held >= 0 && n.scroll_held < self.nodes.length() else { continue }
+    let held = self.nodes[n.scroll_held]
+    guard held.live else { continue }
+    if n.scroll_across {
+      if self.last_w > 0.0 && n.flex.width > self.last_w + 1.0 && held.flex.width - n.flex.width <= 0.5 {
+        out.push(
+          "unbounded horizontal scroller at node \{at}: scroller width (\{n.flex.width}) exceeds window (\{self.last_w}) with reach<=0; add .fill() or .min_width(Is(Some(0.0))) on its flex ancestors",
+        )
+      }
+    } else {
+      if self.last_h > 0.0 && n.flex.height > self.last_h + 1.0 && held.flex.height - n.flex.height <= 0.5 {
+        out.push(
+          "unbounded vertical scroller at node \{at}: scroller height (\{n.flex.height}) exceeds window (\{self.last_h}) with reach<=0; add .fill() or .min_height(Is(Some(0.0))) on its flex ancestors",
+        )
+      }
+    }
+  }
+  out
+}
+
+/// Gaussian blur standard deviation in points applied to this node and its subtree.
+pub fn View::blur(self : View, radius : Live[Double], loc~ : String = "") -> View {
+  self.bind(loc=loc, .Blur, radius, .Paint, fn(r) {
+    self.tree.nodes[self.at].look.blur = if r > 0.0 { r } else { 0.0 }
+  })
+  self
+}
+
+/// Priority key handler queried before keymap bindings, focused fields, and regular `View::on_key`.
+pub fn View::on_key_first(self : View, f : (Key) -> Bool) -> View {
+  let _ = self.on_key(f)
+  match self.live() {
+    Some(n) => n.key_first = true
+    _ => ()
+  }
+  self
+}
+
+/// Register a leaving callback and return a disposer that removes it cleanly.
+pub fn View::on_leaving_while(self : View, f : () -> Unit) -> () -> Unit {
+  let n = match self.live() {
+    Some(n) => n
+    None => return fn() { () }
+  }
+  let key = n.drop_next
+  n.drop_next = n.drop_next + 1
+  n.leavings.push((key, f))
+  let tree = self.tree
+  let at = self.at
+  let gen = self.gen
+  fn() {
+    let m = tree.nodes[at]
+    if m.gen == gen {
+      match array_search_by(m.leavings, fn(d) { d.0 == key }) {
+        Some(i) => { let _ = array_remove(m.leavings, i) }
+        None => ()
+      }
+    }
+  }
+}
+
+/// Register a come-back callback and return a disposer that removes it cleanly.
+pub fn View::on_back_while(self : View, f : () -> Unit) -> () -> Unit {
+  let n = match self.live() {
+    Some(n) => n
+    None => return fn() { () }
+  }
+  let key = n.drop_next
+  n.drop_next = n.drop_next + 1
+  n.backs.push((key, f))
+  let tree = self.tree
+  let at = self.at
+  let gen = self.gen
+  fn() {
+    let m = tree.nodes[at]
+    if m.gen == gen {
+      match array_search_by(m.backs, fn(d) { d.0 == key }) {
+        Some(i) => { let _ = array_remove(m.backs, i) }
+        None => ()
+      }
+    }
+  }
+}
+
+fn has_node_gen(xs : Array[(Int, Int)], at : Int, gen : Int) -> Bool {
+  for p in xs {
+    if p.0 == at && p.1 == gen {
+      return true
+    }
+  }
+  false
+}
+
+fn Tree::laid_left(self : Tree) -> Bool {
+  self.outs_changed ||
+  (self.sizes_due && !self.sized.is_empty()) ||
+  !self.laid_waits.is_empty() ||
+  !self.shows_due.is_empty() ||
+  mbt_compat::ordered_map_size(self.focus_holds) > 0 ||
+  self.pointer_again
+}
+
+/// Run `withins_told()` under `withins_passing`, draining any re-entrant `pointer_again` moves/scrolls,
+/// then settle layout/bars only if a pointer observer actually changed or `bars_due` was marked.
+fn Tree::withins_tell_guarded(self : Tree) -> Unit {
+  self.withins_passing = true
+  let mut changed = false
+  let mut passes = 0
+  while passes < 8 {
+    self.pointer_again = false
+    if self.withins_told() {
+      changed = true
+    }
+    passes = passes + 1
+    if !self.pointer_again {
+      break
+    }
+  }
+  self.withins_passing = false
+  if changed || self.bars_due {
+    self.withins_settled()
+  }
+}
+
+/// React to changes of `read()` using a custom equality comparator `same`, owned by `self`.
+pub fn View::reacts_by[T](
+  self : View,
+  read : () -> T,
+  same : (T, T) -> Bool,
+  f : (T) -> Unit,
+  at_start~ : Bool = true,
+) -> Unit {
+  self.owning(fn() {
+    let last : signals::Ref[Option[T]] = ref_new(None)
+    let changes = ref_new(0)
+    let stop = self.tree.structured_by(
+      fn() {
+        let v = read()
+        let eq = match last.v {
+          Some(prev) => same(prev, v)
+          None => false
+        }
+        if !eq {
+          last.v = Some(v)
+          changes.v = changes.v + 1
+        }
+        changes.v
+      },
+      fn(_) {
+        match last.v {
+          Some(v) => self.owning(fn() { f(v) })
+          None => ()
+        }
+      },
+      at_start=at_start,
+      draws=true,
+    )
+    let _ = self.owns(stop)
+  })
+}
+
+/// Like `View::show`, returning a binder that ties the shown slot's lifecycle and leaving
+/// visibility to an owner `View` once that owner is known.
+pub fn View::show_scoped(
+  self : View,
+  when : () -> Bool,
+  then : (View) -> Unit,
+  leave~ : Double = 0.0,
+  at_once~ : Bool = false,
+  along_row~ : Bool = false,
+  pop_leave~ : Bool = false,
+  loc~ : String = "",
+) -> (View) -> Unit {
+  guard self.alive() else { return fn(_owner) { () } }
+  let away = signals::signal_by(false, same=fn(a, b) { a == b })
+  let slot = self.slot(loc)
+  slot.show(
+    fn() { !away.get() && when() },
+    then,
+    leave=leave,
+    at_once=at_once,
+    along_row=along_row,
+    pop_leave=pop_leave,
+    loc=loc,
+  )
+  let host = self
+  let teardown = fn() {
+    if host.alive() && slot.alive() {
+      host.drop(slot)
+    }
+  }
+  fn(owner : View) {
+    guard slot.alive() else { return }
+    guard owner.alive() else { teardown(); return }
+    if owner.id() == host.id() {
+      return
+    }
+    if owner.leaving_now() {
+      away.set(true)
+    }
+    let disarm_leave = owner.on_leaving_while(fn() { away.set(true) })
+    let disarm_back = owner.on_back_while(fn() { away.set(false) })
+    let disarm_drop = owner.owns_while(teardown)
+    let _ = slot.owns(fn() {
+      disarm_leave()
+      disarm_back()
+      disarm_drop()
+    })
+  }
+}
+
+/// Unique physical identifier of this tree instance.
+pub fn Tree::phys_id(self : Tree) -> Int {
+  self.phys_id
+}
+
+/// Unique physical identifier of the tree owning this view.
+pub fn View::tree_id(self : View) -> Int {
+  self.tree.phys_id
+}
+
+/// The tree's stable reactive size signal `(width, height)`, updated by `Tree::frame`.
+pub fn Tree::room_signal(self : Tree) -> signals::Signal[(Double, Double)] {
+  self.room
+}
+
+/// What node `id` is drawn in as its bones (its own or nearest ancestor's `View::bones`); 0 if none or dead.
+pub fn Tree::bones_of(self : Tree, id : NodeId) -> Int64 {
+  guard self.alive_id(id) else { return 0L }
+  self.bones_of_at(id.at)
+}
+
+/// Whether node `id` is an interactive press, drag, or hold-only target that currently takes input.
+pub fn Tree::press_or_drag_of(self : Tree, id : NodeId) -> Bool {
+  guard self.alive_id(id) else { return false }
+  let n = self.nodes[id.at]
+  if n.hosted || (n.points && n.hold_only.is_none()) || n.as_ground || self.pressless_at(id.at) {
+    return false
+  }
+  n.on_press.is_some() || (n.on_drag.is_some() && n.claims.is_none()) || n.hold_only.is_some()
+}
+
+/// Whether node `id` has a step handler (`View::on_step`).
+pub fn Tree::steps_do(self : Tree, id : NodeId) -> Bool {
+  self.alive_id(id) && self.nodes[id.at].on_step.is_some()
+}
+
+fn Tree::first_focusable_walk(self : Tree, at : Int, takes : Option[(Said) -> Bool]) -> Option[NodeId] {
+  let n = self.nodes[at]
+  if !n.live || n.left_at >= 0.0 || n.inert || n.out || n.behind || n.bones != 0L {
+    return None
+  }
+  for c in self.kids_in_order(at) {
+    let cn = self.nodes[c]
+    if !cn.live || cn.left_at >= 0.0 || cn.inert || cn.out || cn.behind || cn.bones != 0L {
+      continue
+    }
+    let cid = NodeId::{ at: c, gen: cn.gen }
+    if cn.focusable && cn.focus_tab {
+      let ok = match takes {
+        Some(p) => match self.said_of(cid) {
+          Some(s) => p(s)
+          None => false
+        }
+        None => true
+      }
+      if ok {
+        return Some(cid)
+      }
+    }
+    match self.first_focusable_walk(c, takes) {
+      Some(found) => return Some(found)
+      None => ()
+    }
+  }
+  None
+}
+
+/// First tab-focusable descendant inside `layer` in `kids_in_order` DFS order.
+pub fn Tree::first_focusable_in(self : Tree, layer : NodeId, takes? : (Said) -> Bool) -> Option[NodeId] {
+  if !self.keys_own(layer) {
+    return None
+  }
+  self.first_focusable_walk(layer.at, takes)
+}
+
+// ── Composable morph_overlay channels ───────────────────────────────────────
+
+struct MorphOverlaySlot {
+  id : Int
+  mut alpha : Double
+  mut dx : Double
+  mut dy : Double
+  mut scale : Double
+  mut ground_drawn : Option[GroundShape]
+  mut ground_drawn_fn : Option[(Double, Double, Double, Double) -> GroundShape]
+}
+
+fn morph_overlay_ground_eq(a : GroundShape, b : GroundShape) -> Bool {
+  if a.dx != b.dx || a.dy != b.dy || a.dw != b.dw || a.dh != b.dh {
+    return false
+  }
+  match (a.corners, b.corners) {
+    (None, None) => true
+    (Some(ca), Some(cb)) => ca.0 == cb.0 && ca.1 == cb.1 && ca.2 == cb.2 && ca.3 == cb.3
+    _ => false
+  }
+}
+
+fn morph_overlay_bind[T](
+  tree : Tree,
+  at : Int,
+  gen : Int,
+  live : Live[T],
+  same : (T, T) -> Bool,
+  apply : (Node, T) -> Unit,
+  stops : Array[() -> Unit],
+) -> Unit {
+  match live {
+    Is(v) => {
+      let n = tree.nodes[at]
+      if n.live && n.gen == gen {
+        apply(n, v)
+        tree.place_marked_at(at)
+      }
+    }
+    By(f) => {
+      let last : signals::Ref[Option[T]] = ref_new(None)
+      let wrapped = fn() {
+        let was = tree.looks_reading
+        tree.looks_reading = true
+        let v = f()
+        tree.looks_reading = was
+        v
+      }
+      let stop = tree.queued(
+        at=at,
+        wrapped,
+        fn(v) {
+          let n = tree.nodes[at]
+          if !n.live || n.gen != gen {
+            return
+          }
+          match last.v {
+            Some(prev) if same(prev, v) => return
+            _ => ()
+          }
+          last.v = Some(v)
+          apply(n, v)
+          tree.place_marked_at(at)
+        },
+      )
+      stops.push(stop)
+    }
+  }
+}
+
+fn Node::recompute_morph_overlays(self : Node) -> Unit {
+  let mut a = 1.0
+  let mut dx = 0.0
+  let mut dy = 0.0
+  let mut s = 1.0
+  let mut gd : Option[GroundShape] = None
+  let mut gdf : Option[(Double, Double, Double, Double) -> GroundShape] = None
+  let mut i = 0
+  while i < self.overlay_slots.length() {
+    let sl = self.overlay_slots[i]
+    a = a * sl.alpha
+    dx = dx + sl.dx
+    dy = dy + sl.dy
+    s = s * sl.scale
+    match sl.ground_drawn {
+      Some(g) => gd = Some(g)
+      None => ()
+    }
+    match sl.ground_drawn_fn {
+      Some(gf) => gdf = Some(gf)
+      None => ()
+    }
+    i += 1
+  }
+  self.overlay_alpha = a
+  self.overlay_dx = dx
+  self.overlay_dy = dy
+  self.overlay_scale = s
+  self.overlay_ground_drawn = gd
+  self.overlay_ground_drawn_fn = gdf
+}
+
+/// Attaches composable temporary animation overlay channels (`alpha`, `offset`, `scale`, `ground_drawn`)
+/// on top of a node without overwriting or stopping the caller's own `Prop` bindings.
+pub fn View::morph_overlay(
+  self : View,
+  alpha? : Live[Double],
+  offset? : Live[(Double, Double)],
+  scale? : Live[Double],
+  ground_drawn? : Live[GroundShape],
+  ground_drawn_fn? : (Double, Double, Double, Double) -> GroundShape,
+) -> () -> Unit {
+  let node = match self.live() {
+    Some(n) => n
+    None => return fn() -> Unit { () }
+  }
+  let tree = self.tree
+  let at = self.at
+  let gen = self.gen
+  let slot_id = node.overlay_next
+  node.overlay_next = slot_id + 1
+  let slot = MorphOverlaySlot::{
+    id: slot_id,
+    alpha: 1.0,
+    dx: 0.0,
+    dy: 0.0,
+    scale: 1.0,
+    ground_drawn: None,
+    ground_drawn_fn: None,
+  }
+  node.overlay_slots.push(slot)
+  let stops : Array[() -> Unit] = []
+  let prev_owner = signals::set_owner(None)
+  match alpha {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      fn(a : Double, b : Double) -> Bool { a == b },
+      fn(n : Node, v : Double) -> Unit {
+        slot.alpha = v
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match offset {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      fn(a : (Double, Double), b : (Double, Double)) -> Bool { a.0 == b.0 && a.1 == b.1 },
+      fn(n : Node, v : (Double, Double)) -> Unit {
+        slot.dx = v.0
+        slot.dy = v.1
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match scale {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      fn(a : Double, b : Double) -> Bool { a == b },
+      fn(n : Node, v : Double) -> Unit {
+        slot.scale = v
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match ground_drawn {
+    Some(live) =>
+    morph_overlay_bind(
+      tree,
+      at,
+      gen,
+      live,
+      morph_overlay_ground_eq,
+      fn(n : Node, v : GroundShape) -> Unit {
+        slot.ground_drawn = Some(v)
+        n.recompute_morph_overlays()
+      },
+      stops,
+    )
+    None => ()
+  }
+  match ground_drawn_fn {
+    Some(gf) => {
+      let n = tree.nodes[at]
+      if n.live && n.gen == gen {
+        slot.ground_drawn_fn = Some(gf)
+        n.recompute_morph_overlays()
+        tree.place_marked_at(at)
+      }
+    }
+    None => ()
+  }
+  let _ = signals::set_owner(prev_owner)
+  let cleaned = ref_new(false)
+  let unown_ref : signals::Ref[Option[() -> Unit]] = ref_new(None)
+  let cleanup = fn() -> Unit {
+    if cleaned.v {
+      return
+    }
+    cleaned.v = true
+    match unown_ref.v {
+      Some(u) => {
+        unown_ref.v = None
+        u()
+      }
+      None => ()
+    }
+    let mut i = 0
+    while i < stops.length() {
+      (stops[i])()
+      i += 1
+    }
+    let n = tree.nodes[at]
+    if n.live && n.gen == gen {
+      let len = n.overlay_slots.length()
+      let mut idx = -1
+      let mut j = 0
+      while j < len {
+        if n.overlay_slots[j].id == slot_id {
+          idx = j
+          break
+        }
+        j += 1
+      }
+      if idx >= 0 {
+        let mut k = idx
+        while k + 1 < len {
+          n.overlay_slots[k] = n.overlay_slots[k + 1]
+          k += 1
+        }
+        let _ = n.overlay_slots.pop()
+      }
+      n.recompute_morph_overlays()
+      tree.place_marked_at(at)
+    }
+  }
+  unown_ref.v = Some(self.owns_while(cleanup))
+  cleanup
+}
+
+// ── Test & ergonomics compatibility helpers ─────────────────────────────────
+
+/// `View::memo` for a value without `Eq`, using an explicit comparator `same`.
+pub fn View::memo_by[T](self : View, f : () -> T, same : (T, T) -> Bool, loc~ : String = "") -> () -> T {
+  let tree = self.tree
+  let read_clock = ref_new(false)
+  let prev_read_clock = ref_new(false)
+  let c = signals::computed_by_at(
+    fn(_last : Option[T]) -> T {
+      let prev = tree.clock_read_now
+      tree.clock_read_now = false
+      let v = f()
+      let read = tree.clock_read_now
+      prev_read_clock.v = read_clock.v
+      read_clock.v = read
+      tree.clock_read_now = prev || read
+      v
+    },
+    fn(a : T, b : T) -> Bool { prev_read_clock.v == read_clock.v && same(a, b) },
+    loc,
+  )
+  let _ = self.owns(fn() -> Unit { c.dispose() })
+  fn() -> T {
+    let v = c.get()
+    if read_clock.v {
+      tree.clock_read_now = true
+    }
+    v
+  }
+}
+
+/// Create a new child scrollable column without mutating `self` or clobbering existing siblings.
+pub fn View::scroll_box(
+  self : View,
+  body : (View) -> Unit,
+  scroll? : Scroll,
+  fill~ : Bool = true,
+  bar? : ScrollBar,
+  slop? : Double,
+  loc~ : String = "",
+) -> View {
+  let s = match scroll {
+    Some(sc) => sc
+    None => Scroll::new()
+  }
+  self.box(fn(vp : View) {
+    let _ = vp.scrolls(s, body, slop?=slop, bar?=bar, fill=false)
+    if fill {
+      let _ = vp.fill(loc=loc)
+    }
+  })
+}
+
+/// Total lifecycle callbacks currently registered on this node (`drops + leavings + backs`).
+pub fn View::lifecycle_callback_count(self : View) -> Int {
+  match self.live() {
+    Some(n) => n.drops.length() + n.leavings.length() + n.backs.length()
+    None => 0
+  }
+}
+
+/// Forwarder to `KeyWhen::holds`.
+pub fn key_when_holds(self : KeyWhen, has : (String) -> Bool) -> Bool {
+  self.holds(has)
+}
+
+/// Whether `self` requires at least one context to hold (does not match in the empty context set).
+pub fn key_when_scoped(self : KeyWhen) -> Bool {
+  !self.holds(fn(_) { false })
+}
+
+/// Forwarder to `KeyWhen::parse`.
+pub fn key_when_parse(text : String) -> Option[KeyWhen] {
+  KeyWhen::parse(text)
+}
+
+/// Whether `a` and `b` share the exact same underlying storage (or are both empty), in O(1).
+fn array_is_int(a : Array[Int], b : Array[Int]) -> Bool {
+  a.length() == b.length() && (a.length() == 0 || array_data_ptr(a) == array_data_ptr(b))
+}
+
