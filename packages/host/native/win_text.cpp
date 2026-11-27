@@ -508,15 +508,17 @@ static IDWriteTextFormat *format_for(double size, int weight, int style) {
 
 // style & 8: no ligatures (words with letter spacing, each cluster spaced on its own): liga and clig off; style & 32:
 // digits all one width (style.mbt style_tabular): tnum; style & 64: a CJK face's marks narrow among Latin letters
-// (style.mbt style_proportional): pwid; the app's words and what people wrote (faces 1 and 2) with the web's
+// (style.mbt style_proportional): pwid; style & 128: fractions set diagonally (hostapi style_diagonal_fractions):
+// frac; the app's words and what people wrote (faces 1 and 2) with the web's
 // alternates, as the Apple hosts set them (apple_text.m face_font: cv11 and ss01, Inter's single-storey a and its open
 // digits; a face without them is as it is). One typography for each of the ways they go together.
-static IDWriteTypography *typographies[16];
+static IDWriteTypography *typographies[32];
 
 // the typography of a style's features (NULL: none, the font's own)
 static IDWriteTypography *typography_for(int style) {
   int face = face_id(style);
-  int k = ((style & 8) ? 1 : 0) | ((style & 32) ? 2 : 0) | ((style & 64) ? 4 : 0) | (face == 1 || face == 2 ? 8 : 0);
+  int k = ((style & 8) ? 1 : 0) | ((style & 32) ? 2 : 0) | ((style & 64) ? 4 : 0) | (face == 1 || face == 2 ? 8 : 0) |
+          ((style & 128) ? 16 : 0);
   if (!k) return NULL;
   if (!typographies[k]) {
     IDWriteTypography *t = NULL;
@@ -539,6 +541,7 @@ static IDWriteTypography *typography_for(int style) {
       t->AddFontFeature({(DWRITE_FONT_FEATURE_TAG)DWRITE_MAKE_OPENTYPE_TAG('s', 's', '0', '1'), 1});
       t->AddFontFeature({DWRITE_FONT_FEATURE_TAG_KERNING, 1});
     }
+    if (k & 16) t->AddFontFeature({DWRITE_FONT_FEATURE_TAG_FRACTIONS, 1});
     typographies[k] = t;
   }
   return typographies[k];

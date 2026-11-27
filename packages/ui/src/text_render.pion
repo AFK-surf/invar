@@ -110,10 +110,36 @@ fn on_glyph_row(top : Double, base : Double, oy : Double, sc : Double) -> Double
   (tp + (f + base * sc + 0.5 + 1.0e-6).floor() + (oy * sc + 0.5).floor()) / sc
 }
 
-/// Default text style flags from active theme (`tabular` numerals + `no_ligatures` when tracking is non-zero).
-fn view_words_style_bits(spacing : Double) -> Int {
-  (if tree_theme().tabular { hostapi::style_tabular } else { 0 }) |
+/// Numeral feature flags: tabular figures where said (`tabular`), else the active theme's, except where fractions are
+/// set diagonally (a face's tabular figures take the place of its fractions' small ones: SF's 1/2 with tnum is two
+/// full-size digits, as CSS's diagonal-fractions alone has no tnum); diagonal fractions where `fractions`.
+fn numeral_bits(tabular : Option[Bool], fractions : Bool) -> Int {
+  let use_tabular = match tabular {
+    Some(v) => v
+    None => tree_theme().tabular && !fractions
+  }
+  (if use_tabular { hostapi::style_tabular } else { 0 }) |
+  (if fractions { hostapi::style_diagonal_fractions } else { 0 })
+}
+
+/// A node's text style flags: its numerals' (numeral_bits: `look.tabular`, else the theme's; `look.diagonal_fractions`),
+/// and `no_ligatures` when tracking is non-zero.
+fn view_words_style_bits(spacing : Double, look : view::WordsLook) -> Int {
+  numeral_bits(look.tabular, look.diagonal_fractions) |
   (if spacing != 0.0 { hostapi::style_no_ligatures } else { 0 })
+}
+
+/// A run's style flags over its node's (`base`, view_words_style_bits of `look`): its numerals resolved run over look
+/// over theme (its `tabular`, else the look's, else the theme's; Some(false) clears style_tabular though the look or
+/// theme set it), its fractions diagonal where it or its look says so; the rest of `base` kept.
+fn run_feature_bits(run : text::Run, look : view::WordsLook, base : Int) -> Int {
+  let numerals = hostapi::style_tabular | hostapi::style_diagonal_fractions
+  let fractions = run.diagonal_fractions || look.diagonal_fractions
+  let tabular = match run.tabular {
+    Some(v) => Some(v)
+    None => look.tabular
+  }
+  ((base | numerals) ^ numerals) | numeral_bits(tabular, fractions)
 }
 
 /// Slice a UTF-8 String by UTF-16 code-unit range `[u16_start, u16_end)` (CoreText cluster ranges).
@@ -348,7 +374,78 @@ fn space_break_allowed_sbuf(cps : Array[Int], sbuf : FixedArray[Double], n : Int
   true
 }
 
-/// Post-process CoreText/hostapi ligature clusters (`gkey == -2`), aligned with upstream `text.mbt:1089-1119`.
+fn frac_cp(cp : Int) -> Int {
+  // 1 a digit, 2 a slash (solidus or fraction slash), 0 neither
+  if cp >= 0x30 && cp <= 0x39 {
+    1
+  } else if cp == 0x2F || cp == 0x2044 {
+    2
+  } else {
+    0
+  }
+}
+
+/// Fractions set diagonally (`style & style_diagonal_fractions`): a host draws each cluster's glyph shaped on its own,
+/// where a denominator's digit (after the slash) is a numerator's; so a run of digits and slashes with a digit after
+/// a slash (24/7, 1/2) is drawn whole at its first cluster, as a ligature is (its key the whole run's, text_key; the
+/// others drawn as nothing), each cluster keeping its own advance (the line, its carets and its width unchanged).
+fn resolve_fractions(
+  text : String,
+  n : Int,
+  sbuf : FixedArray[Double],
+  size : Double,
+  weight : Int,
+  style : Int,
+) -> Unit {
+  if (style & hostapi::style_diagonal_fractions) == 0 || n <= 1 {
+    return
+  }
+  let cps = utf16_codepoints(text)
+  let kind_at = fn(c : Int) -> Int {
+    let loc = sbuf[c * 4].to_int()
+    let ln = sbuf[c * 4 + 1].to_int()
+    if ln != 1 || loc < 0 || loc >= cps.length() || sbuf[c * 4 + 3].to_int() < 0 {
+      0
+    } else {
+      frac_cp(cps[loc])
+    }
+  }
+  let mut c = 0
+  while c < n {
+    if kind_at(c) == 0 {
+      c += 1
+      continue
+    }
+    let a = c
+    let mut slash = false
+    let mut fraction = false
+    while c < n {
+      let k = kind_at(c)
+      if k == 0 {
+        break
+      }
+      if k == 2 {
+        slash = true
+      } else if slash {
+        fraction = true
+      }
+      c += 1
+    }
+    if fraction && c - a > 1 {
+      let st = sbuf[a * 4].to_int()
+      let en = sbuf[(c - 1) * 4].to_int() + sbuf[(c - 1) * 4 + 1].to_int()
+      sbuf[a * 4 + 3] = hostapi::text_key(utf16_slice(text, st, en), size, weight, style).to_double()
+      let mut k = a + 1
+      while k < c {
+        sbuf[k * 4 + 3] = -1.0
+        k += 1
+      }
+    }
+  }
+}
+
+/// Post-process CoreText/hostapi ligature clusters (`gkey == -2`), aligned with upstream `text.mbt:1089-1119`; then
+/// diagonal fractions drawn whole (resolve_fractions).
 fn resolve_ligatures(
   text : String,
   n : Int,
@@ -400,6 +497,7 @@ fn resolve_ligatures(
     }
     c = e
   }
+  resolve_fractions(text, n, sbuf, size, weight, style)
 }
 
 struct GlyphSlot {
@@ -890,7 +988,7 @@ fn encode_words(
   let weight = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
   let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
-  let style_bits = view_words_style_bits(spacing)
+  let style_bits = view_words_style_bits(spacing, d.words_look)
   let (asc_r, desc_r) = measure_metrics(sz_r, weight, style_bits)
   let asc = asc_r * qs
   let desc = desc_r * qs
@@ -1125,6 +1223,7 @@ fn layout_runs(
   max_lines : Int,
   quad_scale~ : Double = 1.0,
   runs_look~ : view::RunsLook = view::runs_plain,
+  words_look~ : view::WordsLook = view::words_plain,
 ) -> RunsLayout {
   // (shaped at `base_sz`, every advance taken `quad_scale` times: encode_runs's node drawn scaled)
   let wrap_w = if quad_scale == 1.0 { max_w } else { max_w + 1.0e-4 }
@@ -1149,7 +1248,7 @@ fn layout_runs(
       Some(f) if f > 0 && f < 16 => (f & 15) << 8
       _ => 0
     }
-    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | lig_bit
+    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | run_feature_bits(run, words_look, lig_bit)
     let rink = if run.color != 0L {
       run.color
     } else if run.link != "" && runs_look.link != 0L {
@@ -1343,7 +1442,7 @@ fn prewarm_runs_node(d : view::Drawn, scale : Double, node_scale : Double) -> Un
   let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
   let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
-  let lig_bit = view_words_style_bits(spacing)
+  let lig_bit = view_words_style_bits(spacing, d.words_look)
   let wrap = d.words_look.wrap && d.w > 0.0
   let layout = layout_runs(
     d.runs,
@@ -1357,6 +1456,7 @@ fn prewarm_runs_node(d : view::Drawn, scale : Double, node_scale : Double) -> Un
     d.words_look.max_lines,
     quad_scale=qs,
     runs_look=d.runs_look,
+    words_look=d.words_look,
   )
   queue_runs_glyphs_ahead(layout, d.x, pad, scale, qs)
 }
@@ -1386,7 +1486,7 @@ fn encode_runs(
   let base_w = if d.words_look.weight > 0 { d.words_look.weight } else { 400 }
   let spacing = view_spacing(fm, d.words_look) * ns
   let pad = spacing * 0.5
-  let lig_bit = view_words_style_bits(spacing)
+  let lig_bit = view_words_style_bits(spacing, d.words_look)
   let (base_asc_r, base_desc_r) = measure_metrics(base_sz_r, base_w, lig_bit)
   let base_asc = base_asc_r * qs
   let base_desc = base_desc_r * qs
@@ -1411,6 +1511,7 @@ fn encode_runs(
     d.words_look.max_lines,
     quad_scale=qs,
     runs_look=d.runs_look,
+    words_look=d.words_look,
   )
   queue_runs_glyphs_ahead(layout, d.x, pad, scale, qs)
 
@@ -1510,7 +1611,7 @@ pub fn host_words_measure(
   let sz = base_sz * s
   let weight = if look.weight > 0 { look.weight } else { 400 }
   let spacing = view_spacing(s, look)
-  let style_bits = view_words_style_bits(spacing)
+  let style_bits = view_words_style_bits(spacing, look)
   let (asc, desc) = measure_metrics(sz, weight, style_bits)
   let line_h = if look.line > 0.0 {
     look.line * s
@@ -1637,7 +1738,7 @@ pub fn host_runs_measure(
   let base_sz = (if look.size > 0.0 { look.size } else { tree_theme().font }) * s
   let base_w = if look.weight > 0 { look.weight } else { 400 }
   let spacing = view_spacing(s, look)
-  let lig_bit = view_words_style_bits(spacing)
+  let lig_bit = view_words_style_bits(spacing, look)
   let (asc, desc) = measure_metrics(base_sz, base_w, lig_bit)
   let line_h = if look.line > 0.0 {
     look.line * s
@@ -1647,7 +1748,7 @@ pub fn host_runs_measure(
     asc + desc
   }
   let wrap = look.wrap && max_w > 0.0
-  let layout = layout_runs(runs, base_sz, base_w, spacing, lig_bit, 0L, wrap, max_w, look.max_lines, runs_look=set)
+  let layout = layout_runs(runs, base_sz, base_w, spacing, lig_bit, 0L, wrap, max_w, look.max_lines, runs_look=set, words_look=look)
   if layout.had_text && !layout.shaped_any {
     return view::runs_measure(runs, look, set, max_w, scale)
   }
@@ -1677,7 +1778,7 @@ pub fn host_runs_least_measure(
   let base_sz = (if look.size > 0.0 { look.size } else { tree_theme().font }) * s
   let base_w = if look.weight > 0 { look.weight } else { 400 }
   let spacing = view_spacing(s, look)
-  let lig_bit = view_words_style_bits(spacing)
+  let lig_bit = view_words_style_bits(spacing, look)
 
   let clusters : Array[RunsCluster] = []
   let para_ranges : Array[(Int, Int)] = []
@@ -1700,7 +1801,7 @@ pub fn host_runs_least_measure(
       Some(f) if f > 0 && f < 16 => (f & 15) << 8
       _ => 0
     }
-    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | lig_bit
+    let rstyle = font_style_bits(run.italic, run.mono || run.code, run.serif) | face_bits | run_feature_bits(run, look, lig_bit)
     let sub_lines = split_lines(run.text)
     let mut si = 0
     while si < sub_lines.length() {

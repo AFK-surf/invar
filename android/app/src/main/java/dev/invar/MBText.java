@@ -397,11 +397,12 @@ final class MBText {
             // ligatures as the system draws them: shape() tells MoonBit which clusters a ligature covers; none for
             // words with letter spacing (style & 8), each cluster spaced on its own; digits all one width where
             // style & 32 (style.mbt style_tabular); a CJK face's marks narrow among Latin letters where style & 64
-            // (style_proportional)
+            // (style_proportional); fractions set diagonally where style & 128 (hostapi style_diagonal_fractions)
             StringBuilder fs = new StringBuilder();
             if ((style & 8) != 0) fs.append(", 'liga' 0, 'clig' 0");
             if ((style & 32) != 0) fs.append(", 'tnum' 1");
             if ((style & 64) != 0) fs.append(", 'pwid' 1");
+            if ((style & 128) != 0) fs.append(", 'frac' 1");
             String features = fs.length() > 0 ? fs.substring(2) : "";
             if (!features.isEmpty()) p.setFontFeatureSettings(features);
             p.setColor(Color.WHITE);

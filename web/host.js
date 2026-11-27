@@ -6268,6 +6268,8 @@
 
   // digits all one width (style & 32, style.mbt style_tabular): a canvas has no font-variant-numeric, so each digit
   // advances as the widest of the ten and is drawn centred in it (rasterize)
+  // (diagonal fractions, style & 128, hostapi style_diagonal_fractions: nothing a canvas can ask for, so its digits are
+  // set as they are; its keys (textKey, with the whole style) stay apart from the same words' without it)
   const isDigit = (c) => c.length === 1 && c >= '0' && c <= '9';
   const tabWidth = (f) => Math.max(...'0123456789'.split('').map((d) => width(f, d)));
   // a cluster that is a CJK unified ideograph (its first code point: the basic block and extension A, the
