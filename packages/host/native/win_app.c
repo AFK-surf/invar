@@ -1172,7 +1172,6 @@ static LRESULT wndproc_here(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       RECT *r = (RECT *)lp;
       SetWindowPos(h, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top,
                    SWP_NOZORDER | SWP_NOACTIVATE);
-      ws->scale = win_scale(h);
       ws->want_frame = 1;
       return 0;
     }
