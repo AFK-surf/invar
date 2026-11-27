@@ -1559,6 +1559,7 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
 
         @Override
         public boolean performEditorAction(int action) {
+            finishComposingText();
             view.toApp(() -> Native.key(7, 0));
             return true;
         }
@@ -1798,6 +1799,7 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
 
         @Override
         public boolean performEditorAction(int action) {
+            finishComposingText();
             view.toApp(() -> Native.key(7, 0));
             return true;
         }
