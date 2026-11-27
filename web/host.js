@@ -39,6 +39,10 @@
   }
   let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta, pw;
   let extParallel = null, bootProgs = null, bootPvs = null, bootReady = true;
+  // (the programs of PREWARM_KINDS linking in the background, pendingProgs, adopted as a frame first asks for one;
+  // glGen: the context's generation, moved on as it is lost or made again, so a prewarm queued for one never links in
+  // the next)
+  let glGen = 0, prewarmQueued = false, pendingProgs = new Array(MB_KINDS + 1).fill(null);
   let curW = 0, curH = 0, curScale = 1;
   const rtW = () => curW || canvas.width;
   const rtH = () => curH || canvas.height;
@@ -836,6 +840,14 @@
   #ifndef ONE_KIND
   #define ONE_KIND -1
   #endif
+  // the droplet (an unmerged clear liquid lens: kind 6 with merge radius <= 0) lives only where an unmerged liquid
+  // can be drawn: the program of any kind and the single liquid's; merged liquid (ONE_KIND 6) is drawn only for a
+  // group (merge radius > 0, the draw loop's gkind), so its program carries neither the droplet nor the single shape
+  #if ONE_KIND < 0 || ONE_KIND == 13
+  #define MB_HAS_DROPLET 1
+  #else
+  #define MB_HAS_DROPLET 0
+  #endif
   flat in vec4 v_rot;
   flat in vec4 v_rect; flat in vec4 v_p; flat in vec4 v_color; flat in vec4 v_c2; flat in vec4 v_clip; flat in vec4 v_pad;
   flat in vec4 v_rc; flat in vec4 v_rs; flat in vec4 v_rr; flat in vec4 v_oclip; flat in vec4 v_orc; flat in vec4 v_ors;
@@ -918,6 +930,8 @@
     if (s1 <= s0) return 0.0;
     return max(sc * (mb_bevel_F(s1, w0_pt, L_pt) - mb_bevel_F(s0, w0_pt, L_pt)), 0.0);
   }
+  #endif
+  #if MB_HAS_DROPLET
   float mb_snell_intersect(float s, float ior, float H_opt) {
     float invLen = inversesqrt(1.0 + s * s);
     float cosI = invLen;
@@ -1248,7 +1262,9 @@
       // Copyright 2025, Tim Lehmann for whynotmake.it. Adapted from flutter_liquid_glass
       // liquid_glass_final_render_core.glsl, Apache-2.0.
       float k = v_pad.w;
+      #if ONE_KIND != 6
       vec4 s_rr = max(max(v_rr.x, v_rr.y), max(v_rr.z, v_rr.w)) > 0.0 ? v_rr : vec4(v_p.x);
+      #endif
       float d;
       float halfMinor = 1e9;
       vec2 extSpineVec = vec2(0.0, 0.0);
@@ -1260,6 +1276,7 @@
       vec2 ch = max(hs - vec2(halfMinor, halfMinor), vec2(0.0, 0.0));
       extSpineVec = p - clamp(p, ct - ch, ct + ch);
       #else
+      #if ONE_KIND != 6
       if (k <= 0.0) {
         d = sd_rr(p, v_rect, s_rr);
         vec2 hs = v_rect.zw * 0.5;
@@ -1267,7 +1284,9 @@
         vec2 ct = v_rect.xy + hs;
         vec2 ch = max(hs - vec2(halfMinor, halfMinor), vec2(0.0, 0.0));
         extSpineVec = p - clamp(p, ct - ch, ct + ch);
-      } else {
+      } else
+      #endif
+      {
         d = 1e9;
         for (int i = 0; i < 8; i++) {
           if (i >= u_n) break;
@@ -1305,11 +1324,13 @@
       float spot_raw = is_adaptive ? (-v_c2.z - 1.0) : v_c2.z;
       bool is_dark = (!is_clear && luma(col.rgb) < 0.35);
       float clearVeil = is_clear ? smoothstep(0.005, 0.102, col.a) : 0.0;
+      #if MB_HAS_DROPLET
       float droplet = is_clear ? (1.0 - clearVeil) : 0.0;
       #if ONE_KIND == 13
       bool is_drop = (droplet > 0.001);
       #else
       bool is_drop = (droplet > 0.001) && (k <= 0.0);
+      #endif
       #endif
       float inward = max(-d, 0.0);
       float rawBevel = max(v_c2.y, 0.0);
@@ -1326,13 +1347,22 @@
       vec2 surfaceNormal = vec2(0.0, 0.0);
       float shortening = 0.0;
       vec2 disp = vec2(0.0, 0.0);
+      #if MB_HAS_DROPLET
       bool need_grad = (inward < max(bevel, 23.0)) || (ext_cov > 0.0) || is_drop;
+      #else
+      bool need_grad = (inward < max(bevel, 23.0)) || (ext_cov > 0.0);
+      #endif
       if (need_grad) {
         float e = 0.5;
         #if ONE_KIND == 13
         vec2 grad = vec2(
             sd_rr(p + vec2(e, 0.0), v_rect, s_rr) - sd_rr(p - vec2(e, 0.0), v_rect, s_rr),
             sd_rr(p + vec2(0.0, e), v_rect, s_rr) - sd_rr(p - vec2(0.0, e), v_rect, s_rr)
+          ) / (2.0 * e);
+        #elif ONE_KIND == 6
+        vec2 grad = vec2(
+            sd_group(p + vec2(e, 0.0), k) - sd_group(p - vec2(e, 0.0), k),
+            sd_group(p + vec2(0.0, e), k) - sd_group(p - vec2(0.0, e), k)
           ) / (2.0 * e);
         #else
         vec2 grad = k <= 0.0
@@ -1363,6 +1393,18 @@
       int dropRole = (v_p.w <= -8.0) ? int(floor((-v_p.w + 4.0) / 16.0)) : 0;
       float rawZoomDelta = (v_p.w <= -8.0) ? ((-v_p.w) - float(dropRole) * 16.0) : ((v_p.w < 0.0) ? (-v_p.w) : 0.0);
       float lensZoom = clamp(1.0 + rawZoomDelta, 1.0, 3.0);
+      vec2 sampleBase = p;
+      if (lensZoom > 1.0001) {
+        #if ONE_KIND == 13
+        vec2 zoomC = v_rect.xy + v_rect.zw * 0.5;
+        #elif ONE_KIND == 6
+        vec2 zoomC = (u_gb.xy + u_gb.zw) * 0.5;
+        #else
+        vec2 zoomC = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);
+        #endif
+        sampleBase = zoomC + (p - zoomC) / lensZoom;
+      }
+      #if MB_HAS_DROPLET
       bool isRoleSlid = (dropRole == 1);
       bool isRoleSw = (dropRole == 2);
       bool isRoleSeg = (dropRole == 3);
@@ -1370,15 +1412,6 @@
       bool isModernDrop = is_drop && (dropRole >= 1) && (dropRole <= 4);
       float snellSLip = 0.0;
       float snellDmag = 0.0;
-      vec2 sampleBase = p;
-      if (lensZoom > 1.0001) {
-        #if ONE_KIND == 13
-        vec2 zoomC = v_rect.xy + v_rect.zw * 0.5;
-        #else
-        vec2 zoomC = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);
-        #endif
-        sampleBase = zoomC + (p - zoomC) / lensZoom;
-      }
       float dropHairline = 0.0;
       float pressAmt = 0.0;
       float menAA = 0.0;
@@ -1482,6 +1515,19 @@
           refractColor = mix(refractColor, iconRGB, isInsidePlatter * bevelGate);
         }
       }
+      #else
+      vec3 refractColor;
+      if (inward >= bevel || abs(v_pad.z) * (1.0 - regMix) * amount * u_scale <= 0.25) {
+        refractColor = backdrop(sampleBase + disp);
+      } else {
+        float ds = v_pad.z * 0.5 * (1.0 - regMix);
+        refractColor = vec3(
+          backdrop(sampleBase + disp * (1.0 + ds)).r,
+          backdrop(sampleBase + disp).g,
+          backdrop(sampleBase + disp * (1.0 - ds)).b
+        );
+      }
+      #endif
       float bgA = (u_through > 0.5) ? clamp(backdrop4(sampleBase + disp).a, 0.0, 1.0) : 1.0;
       vec3 emission;
       float transmittance;
@@ -1516,6 +1562,9 @@
         #if ONE_KIND == 13
         vec2 ac = v_rect.xy + v_rect.zw * 0.5;
         float ar = max(min(v_rect.z, v_rect.w) * 0.5, 1.0) * 0.5;
+        #elif ONE_KIND == 6
+        vec2 ac = (u_gb.xy + u_gb.zw) * 0.5;
+        float ar = max(min(u_gb.z - u_gb.x, u_gb.w - u_gb.y) * 0.5, 1.0) * 0.5;
         #else
         vec2 ac = (k <= 0.0) ? (v_rect.xy + v_rect.zw * 0.5) : ((u_gb.xy + u_gb.zw) * 0.5);
         float ar = ((k <= 0.0) ? max(min(v_rect.z, v_rect.w) * 0.5, 1.0) : max(min(u_gb.z - u_gb.x, u_gb.w - u_gb.y) * 0.5, 1.0)) * 0.5;
@@ -1922,6 +1971,7 @@
           }
         }
       }
+      #if MB_HAS_DROPLET
       if (isModernDrop) {
         float backdropLuma = clamp(Y, 0.0, 1.0);
         float brightBg = smoothstep(0.35, 0.75, backdropLuma);
@@ -2038,6 +2088,7 @@
           result = max(result - vec3(shade * dropHairline), vec3(0.0));
         }
       }
+      #endif
       result = clamp(result + mb_dither(p * u_scale) / 255.0, 0.0, 1.0);
       // (c) External dark contour (iOS 27.0: Regular controls place their bevel contour strictly outside the silhouette so circles keep full geometric width)
       float extUseCov = ext_cov;
@@ -2536,21 +2587,36 @@
     return s;
   }
 
+  // whether `p` linked; false, saying nothing, where the context is lost (every link fails then: what it is given back
+  // makes them all again); else what failed thrown, with the logs of its program and shaders
   function checkLink(p, vsShader, fsShader) {
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-      const plog = gl.getProgramInfoLog(p) || '';
-      const vlog = vsShader && !gl.getShaderParameter(vsShader, gl.COMPILE_STATUS) ? ('VS: ' + gl.getShaderInfoLog(vsShader) + '\n') : '';
-      const flog = fsShader && !gl.getShaderParameter(fsShader, gl.COMPILE_STATUS) ? ('FS: ' + gl.getShaderInfoLog(fsShader) + '\n') : '';
-      throw new Error(vlog + flog + plog);
-    }
+    if (gl.getProgramParameter(p, gl.LINK_STATUS)) return true;
+    if (gl.isContextLost && gl.isContextLost()) return false;
+    const plog = gl.getProgramInfoLog(p) || '';
+    const vlog = vsShader && !gl.getShaderParameter(vsShader, gl.COMPILE_STATUS) ? ('VS: ' + gl.getShaderInfoLog(vsShader) + '\n') : '';
+    const flog = fsShader && !gl.getShaderParameter(fsShader, gl.COMPILE_STATUS) ? ('FS: ' + gl.getShaderInfoLog(fsShader) + '\n') : '';
+    throw new Error(vlog + flog + plog);
   }
 
   const hasOwnProg = (kind) => (kind >= 0 && kind <= 8) || kind === 10 || kind === 11 || kind === MB_KIND_LIQUID_SINGLE;
   const BOOT_KINDS = [0, 1, 2, 7, 11, 13];
+  // The rest of the programs (MB_KINDS: the one of any kind), heaviest glass first: linked in the background once the
+  // first frame is presented (schedulePrewarm), so the first frame with a panel or a bar finds its program linked.
+  const PREWARM_KINDS = [6, 5, 8, MB_KINDS, 10, 4, 3];
 
+  // a kind's program, or null where its context is lost; its fragment shader let go of either way
   function finalizeKindProg(p, vsShader, fsShader) {
-    checkLink(p, vsShader, fsShader);
-    gl.deleteShader(fsShader);
+    try {
+      if (!checkLink(p, vsShader, fsShader)) {
+        gl.deleteProgram(p);
+        return null;
+      }
+    } catch (e) {
+      gl.deleteProgram(p);
+      throw e;
+    } finally {
+      gl.deleteShader(fsShader);
+    }
     const u = {};
     for (const n of ['u_vp', 'u_origin', 'u_scale', 'u_top', 'u_atlas', 'u_img', 'u_bd', 'u_map', 'u_uvc', 'u_gb', 'u_shape', 'u_rad', 'u_n', 'u_through', 'u_glight', 'u_segs', 'u_ad', 'u_ad_box', 'u_ad_n']) {
       u[n] = gl.getUniformLocation(p, n);
@@ -2564,14 +2630,54 @@
     return { p, u, gen: 0 };
   }
 
-  function makeProg(vsShader, kind) {
+  // program `idx` (MB_KINDS: of any kind) compiled and linked, not waited for: { p, fs }
+  function startProg(idx) {
+    const kind = idx === MB_KINDS ? -1 : idx;
     const src = `#version 300 es\n#define ONE_KIND ${kind}\n` + FS.slice('#version 300 es\n'.length);
     const fs = compileAsync(gl.FRAGMENT_SHADER, src);
     const p = gl.createProgram();
-    gl.attachShader(p, vsShader);
+    gl.attachShader(p, vs);
     gl.attachShader(p, fs);
     gl.linkProgram(p);
-    return finalizeKindProg(p, vsShader, fs);
+    return { p, fs };
+  }
+
+  // a program started and never adopted, let go of (in `g`: a window's context, as it closes)
+  function dropPending(pend, g = gl) {
+    if (!pend || !g) return;
+    try { if (pend.p) g.deleteProgram(pend.p); } catch (e) { /* its context gone */ }
+    try { if (pend.fs) g.deleteShader(pend.fs); } catch (e) { /* its context gone */ }
+  }
+
+  // (the context made again or lost: what was started in it is nothing now, and a prewarm queued for it never runs)
+  function resetPendingState() {
+    glGen++;
+    prewarmQueued = false;
+    pendingProgs = new Array(MB_KINDS + 1).fill(null);
+  }
+
+  // Prewarm only where the driver compiles off the page's thread (KHR_parallel_shader_compile: taken as the sign it
+  // does; COMPLETION_STATUS_KHR is not polled, a frame needing a program before it is linked waits for that one only),
+  // and never in a run to a declared moment, a rendering, or a page a test drives: what they draw or measure does not
+  // wait on programs no frame asked for.
+  function canPrewarm() {
+    return !!(extParallel && typeof extParallel.COMPLETION_STATUS_KHR === 'number' &&
+      shotAt < 0 && !globalThis.__mbrender && !(typeof navigator !== 'undefined' && navigator.webdriver));
+  }
+
+  // (after a frame presented, once per context: in a microtask, the frame's own work done first)
+  function schedulePrewarm() {
+    if (prewarmQueued || !canPrewarm()) return;
+    prewarmQueued = true;
+    const wid = winActive, gen = glGen;
+    queueMicrotask(() => {
+      inWin(wid, () => {
+        if (!gl || glGen !== gen || (gl.isContextLost && gl.isContextLost())) return;
+        for (const idx of PREWARM_KINDS) {
+          if (!progs[idx] && !pendingProgs[idx]) pendingProgs[idx] = startProg(idx);
+        }
+      });
+    });
   }
 
   function finalizeBootProgs() {
@@ -2611,15 +2717,21 @@
     progNow = null;
   }
 
+  // (one prewarmed adopted, else compiled now; null where the context is lost)
   function getProg(kind) {
     const idx = kind >= 0 && hasOwnProg(kind) ? kind : MB_KINDS;
     let k = progs[idx];
-    if (!k) k = progs[idx] = makeProg(vs, idx === MB_KINDS ? -1 : idx);
+    if (k) return k;
+    const pend = pendingProgs[idx] || startProg(idx);
+    pendingProgs[idx] = null;
+    k = finalizeKindProg(pend.p, vs, pend.fs);
+    if (k) progs[idx] = k;
     return k;
   }
 
   function useProg(kind) {
     const k = getProg(kind);
+    if (!k) return;
     progNow = k.p;
     gl.useProgram(k.p);
     if (k.gen === progGen) return;
@@ -2652,6 +2764,7 @@
       if (bootEl) bootEl.textContent = 'WebGL2 is required to run Invar.';
       throw new Error('WebGL2 context unavailable');
     }
+    resetPendingState();
     extParallel = gl.getExtension('KHR_parallel_shader_compile');
     cv = null;
     cvOk = false;
@@ -4332,6 +4445,7 @@
     if (!lastF32 || lastF32.length < need) lastF32 = new Float32Array(need);
     lastF32.set(f32.subarray(0, need), 0);
     presentCached(false);
+    schedulePrewarm();
   };
 
   // The frame's `n` instances (in f32, its ground after them) and its shapes' pieces into the GPU's buffer and texture:
@@ -4641,7 +4755,8 @@
         continue;
       }
       const h = kind === 9;
-      const own = tid >= 0 && !h && hasOwnProg(kind);
+      // (liquid outside a capture keeps the program of any kind: the merged liquid's has no single shape or droplet)
+      const own = tid >= 0 && !h && kind !== 6 && hasOwnProg(kind);
       const simple = tid === 0 && kind === 0 && progRect && isSimpleRect(start);
       let end = start + 1;
       while (end < n && (f32[end * INST + 20] | 0) === tid) {
@@ -6807,6 +6922,7 @@
   let contextLoser = null, contextAnew = false;
   const contextLost = (e) => {
     e.preventDefault();
+    inWin(0, resetPendingState);
     // (one lost by H.drive gives itself back; not within this event: allowed only once preventDefault has been seen)
     if (contextLoser) requestAnimationFrame(() => contextLoser.restoreContext());
   };
@@ -7553,7 +7669,7 @@
   function winSave(s) {
     Object.assign(s, {
       canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, pw, U, PU, ADU,
-      extParallel, bootProgs, bootPvs, bootReady,
+      extParallel, bootProgs, bootPvs, bootReady, glGen, prewarmQueued, pendingProgs,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
       cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
@@ -7564,7 +7680,7 @@
   function winLoad(s) {
     ({
       canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, pw, U, PU, ADU,
-      extParallel, bootProgs, bootPvs, bootReady,
+      extParallel, bootProgs, bootPvs, bootReady, glGen, prewarmQueued, pendingProgs,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
       cv, cvOk, target, dirty, dirtyWhole, dirtyTold, missing, drewMissing, cutOn,
@@ -7729,6 +7845,13 @@
         if (s.blCompBuf) sg.deleteBuffer(s.blCompBuf);
         if (s.blCompVao) sg.deleteVertexArray(s.blCompVao);
         for (const kp of s.progs || []) if (kp && kp.p) sg.deleteProgram(kp.p);
+        for (const pend of s.pendingProgs || []) dropPending(pend, sg);
+        // (and its first programs, where it closes before its first frame took them)
+        for (const it of s.bootProgs || []) {
+          if (it.role === 'kind') dropPending(it, sg);
+          else if (it.fs) sg.deleteShader(it.fs);
+        }
+        if (s.bootPvs) sg.deleteShader(s.bootPvs);
         if (s.progFlat) sg.deleteProgram(s.progFlat);
         if (s.progRect) sg.deleteProgram(s.progRect);
         if (s.post) sg.deleteProgram(s.post);
@@ -7741,6 +7864,7 @@
     Object.assign(s, {
       gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null,
       extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
+      glGen: (s.glGen || 0) + 1, prewarmQueued: false, pendingProgs: new Array(MB_KINDS + 1).fill(null),
       progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       adProg: null, ADU: {}, adTex: [null, null], adFb: [null, null], adCur: 0, adSlots: makeAdSlots(),
@@ -7860,6 +7984,7 @@
       texs: new Map(),
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
       extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
+      glGen: 0, prewarmQueued: false, pendingProgs: new Array(MB_KINDS + 1).fill(null),
       ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta, pw: cpw,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
@@ -7916,7 +8041,7 @@
         if (dw || dh) { try { win.resizeBy(dw, dh); } catch (e) { /* the browser's to refuse */ } }
       });
     }
-    s.canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); });
+    s.canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); inWin(wid, resetPendingState); });
     s.canvas.addEventListener('webglcontextrestored', () => inWin(wid, () => {
       setupGL();
       glassLost();

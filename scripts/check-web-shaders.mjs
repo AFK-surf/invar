@@ -349,9 +349,11 @@ function buildHtmlPage(programs) {
         gl.deleteProgram(p);
       }
 
-      // 4. FS(ONE_KIND=6) Liquid Glass over blue & red backdrop textures (proves real u_bd sampling)
+      // 4. FS(ONE_KIND=13) Liquid Glass over blue & red backdrop textures (proves real u_bd sampling). An unmerged
+      // liquid (merge radius <= 0, u_n = 0) is drawn by the single liquid's program, as the host's draw loop does;
+      // FS(ONE_KIND=6) is the merged group's only (no droplet, no single-shape branch)
       {
-        const p = linkProg('FS(ONE_KIND=6)');
+        const p = linkProg('FS(ONE_KIND=13)');
         gl.useProgram(p);
         gl.uniform2f(gl.getUniformLocation(p, 'u_vp'), W, H);
         gl.uniform2f(gl.getUniformLocation(p, 'u_origin'), 0, 0);
@@ -409,7 +411,7 @@ function buildHtmlPage(programs) {
         const redOk = redCenter[3] > 0 && redCenter[0] > redCenter[2] + 40;
         const ok = errs.length === 0 && blueOk && redOk;
         if (ok) drawPassed++;
-        drawChecks.push({ name: 'draw:FS(ONE_KIND=6)', ok, center: blueCenter, redCenter, glErrors: errs });
+        drawChecks.push({ name: 'draw:FS(ONE_KIND=13)', ok, center: blueCenter, redCenter, glErrors: errs });
         gl.deleteProgram(p);
       }
 
@@ -421,10 +423,10 @@ function buildHtmlPage(programs) {
       gl.deleteVertexArray(vao);
     }
 
-    // Real WebGL2 production-shader readback smoke (V1..V9 2D ROI) using FS(ONE_KIND=6)
+    // Real WebGL2 production-shader readback smoke (V1..V9 2D ROI) using FS(ONE_KIND=13), the unmerged liquid's program
     const vectorResults = [];
     let vectorsPassed = 0;
-    const glassItem = programs.find((p) => p.name === 'FS(ONE_KIND=6)');
+    const glassItem = programs.find((p) => p.name === 'FS(ONE_KIND=13)');
     if (glassItem && passed === programs.length) {
       const W = 320, H = 240, SCALE = 2.0;
       canvas.width = W;
@@ -1187,7 +1189,7 @@ function buildHtmlPage(programs) {
           '0x80 B-R>=12 dRim>=4 L72>=L60+2, 0xFF |dL|<=3, ctrlDiff=(0,0,0)');
       }
 
-      // V13: Light adaptive glass opacity (AD_FS + FS(ONE_KIND=6) + FS(ONE_KIND=10)):
+      // V13: Light adaptive glass opacity (AD_FS + FS(ONE_KIND=13) + FS(ONE_KIND=10)):
       // half-dark wide capsule at 0x67 inverts left ink bright; raising tint_a to 0.522/0.752/0.913 on the same slot
       // keeps left ink dark on bright frosted glass; returning to 0x67 restores bright inversion;
       // full-dark at 0.752 and 0x67->0.913 snap stays light frosted glass + dark ink.
