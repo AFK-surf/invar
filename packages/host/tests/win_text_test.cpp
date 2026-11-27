@@ -14,6 +14,8 @@
 // 5. ColorProbe tells colour and weight as an unconditional probe does.
 // 6. Target::rt is made only when draw_fine is not taken, and its failure zeroes Drawn.
 // 7. All 4 subpixel phases draw the same bytes from a reused ClusterBounds as from a fresh one.
+// 8. Diagonal fractions (style & 128): a typography of their own with frac, apart from tabular's and with it; keys apart
+//    from style 0's; "1/2" shaped with it no wider than without.
 // The threads ahead are not started (MB_WIN_AHEAD_NO_THREADS): the queues are read and drained here.
 #define MB_WIN_AHEAD_NO_THREADS 1
 #ifndef _CRT_SECURE_NO_WARNINGS
@@ -699,6 +701,55 @@ static void test_order_slot_o1_cleanup(void) {
   for (int i = 0; i < order_cap; i++) CHECK(ahead_order[i] == NULL);
 }
 
+static bool has_feature(IDWriteTypography *t, DWRITE_FONT_FEATURE_TAG tag) {
+  if (!t) return false;
+  UINT32 n = t->GetFontFeatureCount();
+  for (UINT32 i = 0; i < n; i++) {
+    DWRITE_FONT_FEATURE f;
+    if (SUCCEEDED(t->GetFontFeature(i, &f)) && f.nameTag == tag && f.parameter == 1) return true;
+  }
+  return false;
+}
+
+// `text` shaped as mb_host_shape shapes it: its clusters' advances summed, how many clusters in `clusters`
+static double shaped_width(const wchar_t *text, int32_t style, int32_t *clusters) {
+  int32_t len = (int32_t)wcslen(text);
+  moonbit_string_t s = moonbit_make_string_raw(len);
+  memcpy(s, text, sizeof(wchar_t) * (size_t)len);
+  const int32_t cap = 64;
+  uint32_t *mem = (uint32_t *)calloc(1, 8 + sizeof(double) * 4 * cap);
+  if (!mem) abort();
+  mem[0] = (uint32_t)(4 * cap);
+  double *out = (double *)(mem + 2);
+  int32_t k = mb_host_shape(s, 15.0, 400, style, out);
+  double w = 0;
+  for (int32_t i = 0; i < k; i++) w += out[i * 4 + 2];
+  *clusters = k;
+  free(mem);
+  free((uint32_t *)s - 2);
+  return w;
+}
+
+static void test_diagonal_fractions(void) {
+  int32_t n0 = 0, n1 = 0;
+  double w0 = shaped_width(L"1/2", 0, &n0);
+  double w1 = shaped_width(L"1/2", 128, &n1);
+  if (!dw) return;
+  IDWriteTypography *frac = typography_for(128);
+  IDWriteTypography *tab = typography_for(32);
+  IDWriteTypography *both = typography_for(32 | 128);
+  CHECK(frac != NULL && frac != tab && both != frac && both != tab);
+  CHECK(has_feature(frac, DWRITE_FONT_FEATURE_TAG_FRACTIONS));
+  CHECK(!has_feature(frac, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES));
+  CHECK(has_feature(both, DWRITE_FONT_FEATURE_TAG_FRACTIONS) && has_feature(both, DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES));
+  CHECK(!has_feature(tab, DWRITE_FONT_FEATURE_TAG_FRACTIONS));
+  CHECK(typography_for(0) == NULL);
+  CHECK(text_key(L"1", 15.0, 400, 128) != text_key(L"1", 15.0, 400, 0));
+  CHECK(n0 > 0 && n1 > 0);
+  CHECK(w1 <= w0 + 1e-6);
+  printf("diagonal_fractions: 1/2 %.3f unset, %.3f with frac\n", w0, w1);
+}
+
 int main(void) {
   test_fine_math_and_reuse();
   test_fine_downsample_grow_bit_exact();
@@ -707,6 +758,7 @@ int main(void) {
   test_color_probe_and_weight();
   test_lazy_target_and_failure_zero();
   test_cross_phase_bounds_reuse();
+  test_diagonal_fractions();
   if (failed) return 1;
   printf("win_text: ok\n");
   return 0;

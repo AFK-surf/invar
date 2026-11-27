@@ -100,6 +100,18 @@ static NSArray *tabular_figures(void) {
   ];
 }
 
+// A fraction set as one, diagonally (hostapi style_diagonal_fractions, style & 128): OpenType's 'frac', which a face
+// loaded from its file takes, and the AAT selector beside it, as the system's face takes it (as tabular_figures).
+static NSArray *diagonal_fractions(void) {
+  return @[
+    @{(__bridge id)kCTFontOpenTypeFeatureTag : @"frac", (__bridge id)kCTFontOpenTypeFeatureValue : @1},
+    @{
+      (__bridge id)kCTFontFeatureTypeIdentifierKey : @(kFractionsType),
+      (__bridge id)kCTFontFeatureSelectorIdentifierKey : @(kDiagonalFractionsSelector),
+    },
+  ];
+}
+
 // A CJK face's marks narrow among Latin letters (style.mbt style_proportional): its pwid, kern said with it (DirectWrite
 // sets what has pwid unkerned otherwise; said here too, to be sure of it).
 static NSArray *proportional_widths(void) {
@@ -110,8 +122,8 @@ static NSArray *proportional_widths(void) {
 }
 
 // Face `face` at this size and weight: its file for the nearest weight, a variable one at the weight itself; its digits
-// all one width where `tabular`, its marks narrow where `proportional`.
-static CTFontRef face_font(int face, double size, int weight, bool tabular, bool proportional) {
+// all one width where `tabular`, its marks narrow where `proportional`, its fractions diagonal where `fractions`.
+static CTFontRef face_font(int face, double size, int weight, bool tabular, bool proportional, bool fractions) {
   NSArray<NSNumber *> *ws = face_weights[face];
   NSUInteger best = 0;
   int bestd = INT_MAX;
@@ -139,6 +151,7 @@ static CTFontRef face_font(int face, double size, int weight, bool tabular, bool
   }
   if (tabular) [fs addObjectsFromArray:tabular_figures()];
   if (proportional) [fs addObjectsFromArray:proportional_widths()];
+  if (fractions) [fs addObjectsFromArray:diagonal_fractions()];
   if (fs.count) {
     feat = CTFontDescriptorCreateCopyWithAttributes(at ? at : d,
                                                     (__bridge CFDictionaryRef)@{(__bridge id)kCTFontFeatureSettingsAttribute : fs});
@@ -290,14 +303,17 @@ static CTFontRef font_for(double size, int weight, int style) {
   id f = fonts[k];
   if (!f) {
     int face = face_id(style);
-    CTFontRef base = face ? face_font(face, size, weight, (style & 32) != 0, (style & 64) != 0) : NULL;
+    CTFontRef base = face ? face_font(face, size, weight, (style & 32) != 0, (style & 64) != 0, (style & 128) != 0)
+                           : NULL;
     if (!base) {
       base = (style & 4) && !(style & 2) ? serif_font(size, weight) : mb_platform_font(size, weight, (style & 2) != 0);
-      if (style & (32 | 64)) {
-        // digits all one width (style.mbt style_tabular); marks narrow (style_proportional)
+      if (style & (32 | 64 | 128)) {
+        // digits all one width (style.mbt style_tabular); marks narrow (style_proportional); fractions diagonal
+        // (style_diagonal_fractions)
         NSMutableArray *fs = [NSMutableArray new];
         if (style & 32) [fs addObjectsFromArray:tabular_figures()];
         if (style & 64) [fs addObjectsFromArray:proportional_widths()];
+        if (style & 128) [fs addObjectsFromArray:diagonal_fractions()];
         CTFontDescriptorRef d = CTFontDescriptorCreateWithAttributes(
             (__bridge CFDictionaryRef)@{(__bridge id)kCTFontFeatureSettingsAttribute : fs});
         CTFontRef t = CTFontCreateCopyWithAttributes(base, 0.0, NULL, d);
@@ -665,7 +681,7 @@ static int32_t shape_line(moonbit_string_t text, int32_t len, double size, int32
   // a cluster starts where the one before it ended
   double x0 = (units && !any_rtl) ? 0.0 : offset_at(line, u, (NSUInteger)len, 0);
   int mono = (style & 2) != 0;
-  const double *nom = (units && !any_rtl && !mono && !(style & (32 | 64))) ? bmp_ascii_nom(bk, f) : NULL;
+  const double *nom = (units && !any_rtl && !mono && !(style & (32 | 64 | 128))) ? bmp_ascii_nom(bk, f) : NULL;
   while (i < (NSUInteger)len && k < cap) {
     NSRange r;
     if (units) {

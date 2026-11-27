@@ -5,7 +5,7 @@
 // pending; and frames racing the queues neither stall nor crash. And shape_line's fast paths (single-unit clusters,
 // carets taken from the shaped glyphs, the nominal ASCII advances) held to the line Core Text shapes: every cluster,
 // advance (< 1e-6) and key the same as its unoptimized reference's (shape_parity), the nominal advances forgotten
-// as a face changes (ascii_nominal).
+// as a face changes (ascii_nominal); diagonal fractions shaped whole in a font of their own (fractions).
 //   cc -Wall -Werror -fobjc-arc -Ipackages/host/compat -Ipackages/host/native packages/host/tests/apple_text_test.m \
 //     -framework Foundation -framework AppKit -framework CoreText -framework CoreGraphics -framework ImageIO \
 //     -o target/apple_text_test && target/apple_text_test
@@ -475,13 +475,15 @@ static int parity_over(const int *styles, int n_styles, const int *weights, int 
   return checked;
 }
 
-// Every string of the corpus in the system face, each style (slanted, code, serif, no ligatures, tabular, proportional)
-// at two weights: shape_line's clusters, advances and keys are its reference's.
+// Every string of the corpus in the system face, each style (slanted, code, serif, no ligatures, tabular, proportional,
+// diagonal fractions alone and with tabular digits) at two weights: shape_line's clusters, advances and keys are its
+// reference's.
 static void shape_parity(void) {
-  static const int styles[] = {0, 1, 2, 4, 8, 32, 64};
+  static const int styles[] = {0, 1, 2, 4, 8, 32, 64, 128, 32 | 128};
   static const int weights[] = {400, 700};
-  int total = (int)(sizeof(styles) / sizeof(styles[0]) * sizeof(weights) / sizeof(weights[0])) * (int)parity_corpus().count;
-  int checked = parity_over(styles, 7, weights, 2, "system");
+  int n_styles = (int)(sizeof(styles) / sizeof(styles[0]));
+  int total = n_styles * (int)(sizeof(weights) / sizeof(weights[0])) * (int)parity_corpus().count;
+  int checked = parity_over(styles, n_styles, weights, 2, "system");
   CHECK(checked == total, "%d of %d cases matched", checked, total);
   printf("shape_parity: %d cases matched reference (< 1e-6)\n", checked);
 }
@@ -495,7 +497,7 @@ static double nominal_advance(CTFontRef f, unichar c) {
 }
 
 // The nominal ASCII advances (bmp_ascii_nom): measured once per font where the unkerned ASCII path may be taken (not
-// in the code face, nor with tabular or proportional figures), equal to the font's own; Latin runs in the primary font
+// in the code face, nor with tabular or proportional figures, nor diagonal fractions), equal to the font's own; Latin runs in the primary font
 // tagged for it; forgotten the moment a face changes (before keys_sweep), measured again in the new face, where
 // shape_line still matches its reference; and the paged keys let go at keys_sweep.
 static void ascii_nominal(void) {
@@ -515,8 +517,8 @@ static void ascii_nominal(void) {
         shape_simple[0], shape_simple[4]);
   shape(@"国国国", 15, 0, out, 64);
   CHECK(shape_simple[0] == 1, "a Han run tagged for the ASCII path: %d", shape_simple[0]);
-  static const int skipped[] = {2, 32, 64};
-  for (int i = 0; i < 3; i++) {
+  static const int skipped[] = {2, 32, 64, 128};
+  for (int i = 0; i < 4; i++) {
     shape(@"Hello, world", 15, skipped[i], out, 64);
     CHECK(!bmp_for(15, 400, skipped[i])->ascii_nom_ready, "nominal advances measured in style %d", skipped[i]);
   }
@@ -542,6 +544,46 @@ static void ascii_nominal(void) {
   printf("ascii_nominal: ok\n");
 }
 
+// The width of `s` shaped as mb_host_shape shapes it (its clusters' advances summed).
+static double shaped_width(NSString *s, int style) {
+  double out[4 * 64];
+  int k = shape(s, 15, style, out, 64);
+  double w = 0;
+  for (int i = 0; i < k; i++) w += out[i * 4 + 2];
+  return w;
+}
+
+// Diagonal fractions (style & 128, hostapi style_diagonal_fractions): a font of their own, apart from the plain one's and
+// the tabular one's; "1/2" and "24/7" (printable ASCII the nominal-advance path would take) shaped whole by Core Text with
+// frac, narrower than unset and equal to the line Core Text sets; their keys and paged keys apart from style 0's.
+static void fractions(void) {
+  CTFontRef plain = font_for(15, 400, 0), tab = font_for(15, 400, 32);
+  CTFontRef frac = font_for(15, 400, 128), both = font_for(15, 400, 32 | 128);
+  CHECK(frac != plain && frac != tab && both != frac && both != tab, "fraction fonts shared with another style's");
+  NSArray *feats = CFBridgingRelease(CTFontCopyFeatureSettings(font_for(15, 400, 128)));
+  BOOL has_frac = NO;
+  for (NSDictionary *f in feats) {
+    if ([f[(__bridge id)kCTFontOpenTypeFeatureTag] isEqual:@"frac"]
+        || ([f[(__bridge id)kCTFontFeatureTypeIdentifierKey] intValue] == kFractionsType
+            && [f[(__bridge id)kCTFontFeatureSelectorIdentifierKey] intValue] == kDiagonalFractionsSelector))
+      has_frac = YES;
+  }
+  CHECK(has_frac, "style 128's font has no frac feature: %s", [feats description].UTF8String);
+  for (NSString *s in @[ @"1/2", @"24/7", @"3/4 cup" ]) {
+    double w0 = shaped_width(s, 0), w1 = shaped_width(s, 128);
+    CHECK(w1 < w0 - 1, "\"%s\" not set as a fraction: %f vs %f unset", s.UTF8String, w1, w0);
+    CTLineRef line = make_line(s, font_for(15, 400, 128), 128);
+    double want = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+    CFRelease(line);
+    CHECK(fabs(w1 - want) < 1e-6, "\"%s\" shaped %f, Core Text's line %f", s.UTF8String, w1, want);
+  }
+  CHECK(key_of(@"1", 15, 128) != key_of(@"1", 15, 0) && key_of(@"1", 15, 128) != key_of(@"1", 15, 32),
+        "a digit's key shared across fraction and plain styles");
+  CHECK(bmp_for(15, 400, 128) != bmp_for(15, 400, 0), "paged keys shared with style 0");
+  CHECK(!bmp_for(15, 400, 128)->ascii_nom_ready, "nominal advances measured with fractions");
+  printf("fractions: ok\n");
+}
+
 static void stalled(int sig) {
   (void)sig;
   static const char msg[] = "apple_text_test: stalled (deadlock?)\n";
@@ -559,6 +601,7 @@ int main(void) {
     scale_change();
     racing();
     shape_parity();
+    fractions();
     ascii_nominal();
   }
   if (failed) return 1;
