@@ -53,7 +53,7 @@ scope(world, fn(s : Scope) -> Unit {
 |---|---|---:|---|
 | **Layer 0（基础库）** | `halt`、`dmath`、`codec`、`zip`、`text`、`signals`、`headless_core`、`layer0_check` | 8 | 中止原语、确定性数学、二进制编解码、inflate/SHA-256、Unicode（Bidi/断行/字素）、细粒度响应式 Signals、无视图纯交互状态机（`headless_core`）及联合检查 |
 | **Layer 1A（布局与绘制基础）** | `flex`、`pixels`、`paint`、`damage`、`layer1a_check` | 5 | Flexbox 布局、图像解码（PNG/JPEG/WebP）、矢量/圆角/液态玻璃绘制指令、脏区与遮挡裁剪及联合检查 |
-| **Layer 1B（图形与效果引擎）** | `shape`、`svg`、`font`、`skia`、`effect`、`layer1b_check` | 6 | 文本塑形、SVG 解析、字体管理、2D 路径光栅化、后处理效果及联合检查 |
+| **Layer 1B（图形与效果引擎）** | `shape`、`svg`、`font`、`skia`、`ui_effect`、`layer1b_check` | 6 | 文本塑形、SVG 解析、字体管理、2D 路径光栅化、后处理效果及联合检查 |
 | **Layer 2（节点树、动效、导航与交互框架）** | `view`、`headless`、`ui`、`motion`、`editor`、`nav` | 6 | 保留模式纯节点树与 `ViewBlock` 快路径（`view`）、无头交互与无障碍原语（`headless`）、主题/输入法/只读选区与超链接/`ui::Worker`/6 道自动 UI 门禁/`InputTape` 回放/桌面缩放拖拽文件手柄/离屏 `Tester`（`ui`）、闭式弹簧与液态物理动效（`motion`，依赖 `view`/`ui`）、多行编辑器与光学放大镜（`editor`）、原生栈与手势导航（`nav`） |
 | **Layer 3（宿主桥接、出片与基础套件）** | `hostapi`、`host`、`host_web`、`film`、`kit`、`icons` | 6 | 统一宿主 ABI、六端原生宿主、Web 宿主、确定性离屏出图/录片引擎（`film`）、基础 UI 套件（`kit`）、纯矢量图标集（`icons`） |
 | **领域组件与系统扩展** | `code_field`、`terminal`、`player`、`media`、`figure`、`webpage`、`updater`、`textdiff`、`runfs` | 9 | 语法高亮代码编辑器、VT100/ANSI 终端、媒体播放状态机、媒体容器与转码、图表/插图组件、网页容器与桥接、SHA-512 + Ed25519 自更新验签、Myers 文本差分、沙箱文件系统 |
