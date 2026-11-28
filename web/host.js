@@ -2963,10 +2963,11 @@
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
     atlasTex = atlasMake(gl, atlasPagesN);
-    // (what stands in a sampler2D unit nothing is bound to: an instance with no picture, 1 texel, clear)
+    // (what stands in a sampler2D unit nothing is bound to: an instance with no picture, 1 texel, clear as WebGL
+    // makes a texture's storage)
     standTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, standTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 1, 1);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
