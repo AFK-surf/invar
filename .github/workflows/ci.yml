@@ -22,6 +22,11 @@ jobs:
       - name: Record job start
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
 
+      - name: Sample CPU use for the timing report
+        run: |
+          nohup bash -c 'while :; do echo "$(date +%s) $(top -l 2 -s 1 -n 0 | grep "CPU usage" | tail -n 1)"; sleep 1; done' \
+            > "$RUNNER_TEMP/cpu.log" 2>&1 < /dev/null &
+
       - name: Checkout invar
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -136,6 +141,8 @@ jobs:
 
       - name: Configure pion toolchain env
         id: pion-env
+        env:
+          CAS_HASH: ${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
         run: |
           if [ -d "$GITHUB_WORKSPACE/.pion/release" ]; then
             SEARCH_ROOT="$GITHUB_WORKSPACE/.pion/release"
@@ -164,15 +171,22 @@ jobs:
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-macos}-${CC_FP}" >> "$GITHUB_OUTPUT"
           echo "pion_id=${PION_ID}" >> "$GITHUB_OUTPUT"
+          # Saved CAS keys end in the run, so a save the timeout cuts off can never hold a key a later run needs.
+          CAS_PREFIX="pion-cas-v3-macos-arm64-${ImageOS:-macos}-${CC_FP}-${PION_ID}"
+          echo "cas_prefix=${CAS_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "cas_base=${CAS_PREFIX}-${CAS_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Restore pion CAS cache
         id: cas-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full
           restore-keys: |
-            pion-cas-v3-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-
+            ${{ steps.pion-env.outputs.cas_base }}-full-
+            ${{ steps.pion-env.outputs.cas_base }}-ws-
+            ${{ steps.pion-env.outputs.cas_base }}
+            ${{ steps.pion-env.outputs.cas_prefix }}-
 
       - name: Doctor, static audit, workspace type-check, reactive audit, web check & Web/Java/iOS/Apple native checks (parallel)
         run: |
@@ -181,6 +195,7 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "web-java ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             mkdir -p target/raw_premul_java target/frame_pacer_java
             PIDS=()
             node scripts/check-web-shaders.mjs & PIDS+=($!)
@@ -208,6 +223,7 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "apple-native ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             INVAR_IOS_CC_JOBS=2 bash scripts/check-ios-host.sh
             cc -Wall -Werror -fobjc-arc packages/host/tests/apple_grab_nav_test.m \
               -framework Foundation -framework CoreGraphics -framework CoreVideo -framework ImageIO \
@@ -225,6 +241,7 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "audit-gen ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             python3 scripts/invar doctor --json
             bash scripts/check-generated.sh
             python3 scripts/invar audit --json --require-reactive > "$CI_JSON_DIR/audit.json"
@@ -233,18 +250,21 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "ws-check ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             python3 scripts/invar check --json > "$CI_JSON_DIR/ws_check.json"
           ) > "${{ runner.temp }}/ci-logs/ws-check.log" 2>&1 &
           PID_CHECK=$!
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "reactive-audit ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             bash scripts/test-reactive-audit.sh
           ) > "${{ runner.temp }}/ci-logs/reactive-audit.log" 2>&1 &
           PID_REACTIVE=$!
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "web-check ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             python3 scripts/invar web check --out-wasm "$CI_JSON_DIR/lg_web.wasm" --json > "$CI_JSON_DIR/web_check.json"
           ) > "${{ runner.temp }}/ci-logs/web-check.log" 2>&1 &
           PID_WEB_CHECK=$!
@@ -302,6 +322,7 @@ jobs:
           set -euo pipefail
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "aux-checks ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             RUNS=3 bash examples/worker_app/scripts/verify-mt.sh
             "$PIONC" build -o /tmp/jsx_app examples/jsx_app
             rm -f /tmp/jsx_app
@@ -310,6 +331,7 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "cli-e2e ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             INVAR_CLI_TEST_AUDIT_JSON="$CI_JSON_DIR/audit.json" \
             INVAR_CLI_TEST_WS_CHECK_JSON="$CI_JSON_DIR/ws_check.json" \
             INVAR_CLI_TEST_WS_TEST_JSON="$CI_JSON_DIR/ws_test.json" \
@@ -327,11 +349,15 @@ jobs:
           exit "$FAIL"
 
       - name: Save pion CAS cache
-        if: steps.cas-cache.outputs.cache-hit != 'true'
+        if: ${{ !startsWith(steps.cas-cache.outputs.cache-matched-key, format('{0}-full-', steps.pion-env.outputs.cas_base)) }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Timing report
+        if: always()
+        run: python3 scripts/ci-timing-report.py
 
       - name: Check 60s duration target
         if: always()
@@ -356,6 +382,11 @@ jobs:
         run: |
           echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
           echo "os_fp=${ImageOS:-ubuntu}" >> "$GITHUB_OUTPUT"
+
+      - name: Sample CPU use for the timing report
+        run: |
+          nohup bash -c 'while :; do echo "$(date +%s) $(head -n 1 /proc/stat)"; sleep 2; done' \
+            > "$RUNNER_TEMP/cpu.log" 2>&1 < /dev/null &
 
       - name: Checkout invar
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -410,6 +441,7 @@ jobs:
 
           (
             set -eu
+            SECONDS=0; trap 'echo "apt ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             APT_PKGS="libgtk-4-dev libsoup-3.0-dev libepoxy-dev libpango1.0-dev libfontconfig1-dev libgdk-pixbuf-2.0-dev zlib1g-dev pkg-config mesa-utils libgl1-mesa-dri ffmpeg"
             if [ "${{ steps.apt-cache.outputs.cache-hit }}" = "true" ] && ls /tmp/apt-debs/*.deb >/dev/null 2>&1; then
               echo "Installing cached .deb packages from /tmp/apt-debs"
@@ -539,6 +571,8 @@ jobs:
 
       - name: Configure pion toolchain env
         id: pion-env
+        env:
+          CAS_HASH: ${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
         run: |
           if [ -d "$GITHUB_WORKSPACE/.pion/release" ]; then
             SEARCH_ROOT="$GITHUB_WORKSPACE/.pion/release"
@@ -567,15 +601,22 @@ jobs:
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-linux}-${CC_FP}" >> "$GITHUB_OUTPUT"
           echo "pion_id=${PION_ID}" >> "$GITHUB_OUTPUT"
+          # Saved CAS keys end in the run, so a save the timeout cuts off can never hold a key a later run needs.
+          CAS_PREFIX="pion-cas-v3-linux-x86_64-${ImageOS:-linux}-${CC_FP}-${PION_ID}"
+          echo "cas_prefix=${CAS_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "cas_base=${CAS_PREFIX}-${CAS_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Restore pion CAS cache
         id: cas-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full
           restore-keys: |
-            pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-
+            ${{ steps.pion-env.outputs.cas_base }}-full-
+            ${{ steps.pion-env.outputs.cas_base }}-ws-
+            ${{ steps.pion-env.outputs.cas_base }}
+            ${{ steps.pion-env.outputs.cas_prefix }}-
 
       - name: Doctor, static audit, workspace type-check, reactive audit, web check & Web/Java checks (parallel)
         run: |
@@ -584,6 +625,7 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "web-java ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             mkdir -p target/raw_premul_java target/frame_pacer_java
             PIDS=()
             node scripts/check-web-shaders.mjs & PIDS+=($!)
@@ -611,6 +653,7 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "audit-gen ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             python3 scripts/invar doctor --json
             bash scripts/check-generated.sh
             python3 scripts/invar audit --json --require-reactive > "$CI_JSON_DIR/audit.json"
@@ -619,18 +662,21 @@ jobs:
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "ws-check ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             python3 scripts/invar check --json > "$CI_JSON_DIR/ws_check.json"
           ) > "${{ runner.temp }}/ci-logs/ws-check.log" 2>&1 &
           PID_CHECK=$!
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "reactive-audit ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             bash scripts/test-reactive-audit.sh
           ) > "${{ runner.temp }}/ci-logs/reactive-audit.log" 2>&1 &
           PID_REACTIVE=$!
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "web-check ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             python3 scripts/invar web check --out-wasm "$CI_JSON_DIR/lg_web.wasm" --json > "$CI_JSON_DIR/web_check.json"
           ) > "${{ runner.temp }}/ci-logs/web-check.log" 2>&1 &
           PID_WEB_CHECK=$!
@@ -680,23 +726,33 @@ jobs:
           set -euo pipefail
           python3 scripts/invar test --json | tee "$CI_JSON_DIR/ws_test.json"
 
+      - name: Save pion CAS cache (workspace checkpoint)
+        if: ${{ !startsWith(steps.cas-cache.outputs.cache-matched-key, format('{0}-', steps.pion-env.outputs.cas_base)) }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/pion-cas
+          key: ${{ steps.pion-env.outputs.cas_base }}-ws-${{ github.run_id }}-${{ github.run_attempt }}
+
       - name: WebAssembly showcase, invar CLI E2E, MT stress & Linux host (parallel)
         run: |
           set -euo pipefail
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "mt-stress ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             RUNS=3 bash examples/worker_app/scripts/verify-mt.sh
           ) > "${{ runner.temp }}/ci-logs/mt-stress.log" 2>&1 &
           PID_MT=$!
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "linux-host ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             bash scripts/check-linux-host.sh --skip-workspace-pion-tests
           ) > "${{ runner.temp }}/ci-logs/linux-host.log" 2>&1 &
           PID_HOST=$!
 
           (
             set -euo pipefail
+            SECONDS=0; trap 'echo "cli-e2e ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             INVAR_CLI_TEST_AUDIT_JSON="$CI_JSON_DIR/audit.json" \
             INVAR_CLI_TEST_WS_CHECK_JSON="$CI_JSON_DIR/ws_check.json" \
             INVAR_CLI_TEST_WS_TEST_JSON="$CI_JSON_DIR/ws_test.json" \
@@ -717,11 +773,15 @@ jobs:
           exit "$FAIL"
 
       - name: Save pion CAS cache
-        if: steps.cas-cache.outputs.cache-hit != 'true'
+        if: ${{ !startsWith(steps.cas-cache.outputs.cache-matched-key, format('{0}-full-', steps.pion-env.outputs.cas_base)) }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Timing report
+        if: always()
+        run: python3 scripts/ci-timing-report.py
 
       - name: Check 60s duration target
         if: always()
