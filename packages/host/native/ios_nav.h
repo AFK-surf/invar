@@ -107,15 +107,24 @@ static UIImage *nav_icon(NSString *data, CGFloat size) {
 // on its colour, the ones after a little over the one before, in their own colours (not the bar's tint).
 static UIImage *nav_picture(NSString *url, CGFloat size, BOOL round, void (^then)(void));
 static UIImage *nav_avatars(NSString *spec, CGFloat size, void (^then)(void)) {
+  if (spec.length < 8) return nil;
+  NSString *cacheKey = mb_ios_nav_avatar_cache_key(size, nav_display_scale(), spec);
+  UIImage *cached = [nav_img_cache() objectForKey:cacheKey];
+  if (cached) return cached;
   NSArray<NSString *> *each = [[spec substringFromIndex:8] componentsSeparatedByString:@"\x1d"];
   NSUInteger n = MIN(each.count, (NSUInteger)3);
   if (!n) return nil;
   CGFloat d = size, step = size * 0.6, ring = 1.5;
   CGSize all = CGSizeMake(d + step * (n - 1), d);
   NSMutableArray *faces = [NSMutableArray array];
+  BOOL allLoaded = YES;
   for (NSUInteger i = 0; i < n; i++) {
     NSRange pic = [each[i] rangeOfString:@"\x1f"];
-    UIImage *got = pic.location == NSNotFound ? nil : nav_picture([each[i] substringFromIndex:pic.location + 1], d, YES, then);
+    UIImage *got = nil;
+    if (pic.location != NSNotFound) {
+      got = nav_picture([each[i] substringFromIndex:pic.location + 1], d, YES, then);
+      if (!got) allLoaded = NO;
+    }
     [faces addObject:got ?: NSNull.null];
   }
   UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:all];
@@ -149,7 +158,9 @@ static UIImage *nav_avatars(NSString *spec, CGFloat size, void (^then)(void)) {
       [letter drawAtPoint:CGPointMake(CGRectGetMidX(disc) - s.width / 2, CGRectGetMidY(disc) - s.height / 2) withAttributes:attrs];
     }
   }];
-  return [img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+  UIImage *out = [img imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
+  if (out && allLoaded) [nav_img_cache() setObject:out forKey:cacheKey];
+  return out;
 }
 
 // A workspace's mark as an icon (`badge:rrggbbaa,letter`): its letter (or emoji) in white on a rounded square of its
@@ -285,8 +296,6 @@ static UIImage *nav_letter(NSString *title, CGFloat size) {
 @interface MBSlot : UIViewController
 @property(nonatomic, strong) NSDictionary<NSString *, UIBarButtonItem *> *barItems;
 @property(nonatomic, strong) NSDictionary<NSString *, NSDictionary *> *barSpecs;
-@property(nonatomic, strong) UIColor *barInk;
-@property(nonatomic, strong) UIColor *barAccent;
 @property(nonatomic, copy) NSString *appliedActsKey;
 @end
 
@@ -317,6 +326,10 @@ API_AVAILABLE(ios(18.0))
 // (iOS 27: the accent the action's glass is tinted with, and its tinted UIGlassEffect view inside the platter)
 @property(nonatomic, strong) UIColor *actionInk;
 @property(nonatomic, strong) UIColor *actionWashInk;
+// (whether the displayed tabs carry the action's own tab, and the accent its glyph or glass was last tinted with)
+@property(nonatomic) BOOL hasActionTab;
+@property(nonatomic) BOOL appliedActionInkValid;
+@property(nonatomic) uint64_t appliedActionInkVal;
 // (the bar's ink and accent last given to UIKit: a tint set again cascades through every view under it)
 @property(nonatomic) BOOL appliedColorsValid;
 @property(nonatomic) uint64_t appliedInkVal;
@@ -329,8 +342,8 @@ API_AVAILABLE(ios(18.0))
 @property(nonatomic) BOOL shown;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, UINavigationController *> *navs;
 // each id's one tab over its controller, kept as tabs come and go: a tab made again over a controller the one before
-// still had stopped the app (UIKit's assertion in -[UITab viewController], an iPhone Duo back from hours away,
-// 2026-10-30..11-01), even with the tabs before let go of first
+// still had stopped the app (UIKit's assertion in -[UITab viewController], an iPhone Duo back from hours away),
+// even with the tabs before let go of first
 @property(nonatomic, strong) NSMutableDictionary<NSString *, UITab *> *tabsById;
 // (a tab chosen by the app, not the person: not said back)
 @property(nonatomic) BOOL choosing;
@@ -419,9 +432,13 @@ static UIMenu *nav_menu(NSArray<NSDictionary *> *rows, void (^chosen)(NSString *
 }
 
 static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
+  if (!title.length) {
+    if (item.title != nil) item.title = nil;
+    if (item.titleView != nil) item.titleView = nil;
+    return;
+  }
   item.title = nil;
   item.titleView = nil;
-  if (!title.length) return;
 #ifdef __IPHONE_26_0
   if (@available(iOS 26.0, *)) {
     UILabel *l = [UILabel new];
@@ -513,15 +530,19 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   CGRect r = x ? [x frameInView:self.view] : CGRectNull;
   // (the wash already first in the platter still under the action, in its ink: kept, no scan of the tree for it)
   UIView *kept = self.actionWash;
-  if (kept && kept.superview && kept.window && kept.superview.subviews.firstObject == kept &&
-      [self.actionWashInk isEqual:self.actionInk]) {
+  UIView *p = nil;
+  if (kept && kept.superview && kept.window && kept.superview.subviews.firstObject == kept) {
     CGRect washInRoot = [kept.superview convertRect:kept.superview.bounds toView:self.view];
     if (mb_ios_nav_wash_rect_matches(washInRoot, r)) {
-      if (!CGRectEqualToRect(kept.frame, kept.superview.bounds)) kept.frame = kept.superview.bounds;
-      return;
+      if ([self.actionWashInk isEqual:self.actionInk]) {
+        if (!CGRectEqualToRect(kept.frame, kept.superview.bounds)) kept.frame = kept.superview.bounds;
+        return;
+      }
+      // Platter is unchanged; reuse it in O(1) to update the tint color without walking the view hierarchy.
+      p = kept.superview;
     }
   }
-  UIView *p = CGRectIsNull(r) || CGRectIsEmpty(r) ? nil : nav_platter(self.view, self.view, r);
+  if (!p) p = CGRectIsNull(r) || CGRectIsEmpty(r) ? nil : nav_platter(self.view, self.view, r);
   if (!p) return;
 #ifdef __IPHONE_26_0
   if (@available(iOS 26.0, *)) {
@@ -563,6 +584,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   // (the glass seen through it, the page's words bent under it: not a disc of paint)
   w.backgroundColor = [self.actionInk colorWithAlphaComponent:0.6];
   w.layer.cornerRadius = MIN(p.bounds.size.width, p.bounds.size.height) / 2;
+  self.actionWashInk = self.actionInk;
   if (w.superview == p) return;
   [w removeFromSuperview];
   w.frame = p.bounds;
@@ -582,7 +604,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   NSMutableArray<UIBarButtonItem *> *made = [NSMutableArray array];
   // (`lead/` the bar's leading items: the workspace's, where the system puts back and close, the column's top)
   NSMutableArray<UIBarButtonItem *> *lead = [NSMutableArray array];
-  // (`act/` the toolbar's: down the side, at the column's foot over the tabs, 待处理's bell by them)
+  // (`act/` the toolbar's: down the side, at the column's foot over the tabs, the inbox's bell by them)
   NSMutableArray<UIBarButtonItem *> *foot = [NSMutableArray array];
   NSString *lastIdent = @"";
   // UIKit keeps an existing item's shared glass when its prominence changes; rebuild the bare viewer's group.
@@ -599,12 +621,20 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   for (NSDictionary *d in items) {
     NSString *ident = d[@"id"];
     UIBarButtonItem *b = regroup ? nil : slot.barItems[ident];
-    BOOL reuse = b && [slot.barSpecs[ident] isEqual:d] && [slot.barInk isEqual:ink] && [slot.barAccent isEqual:accent];
-    if (!reuse) {
-      // (the same action said otherwise, its icon, words, menu or dot, in the same colours: the item there changed in
-      // place, not made anew, so the system swaps what it shows on the button there and fades none of the column's
-      // buttons, as Outlook's do; a new item, even with its identifier, is faded in for the old)
-      UIBarButtonItem *was = b && [slot.barInk isEqual:ink] && [slot.barAccent isEqual:accent] ? b : nil;
+    BOOL specSame = b && [slot.barSpecs[ident] isEqual:d];
+    if (specSame) {
+#ifdef __IPHONE_26_0
+      if (@available(iOS 26.0, *)) {
+        BOOL prominent = [d[@"prominent"] boolValue];
+        UIColor *wantTint = prominent ? accent : ink;
+        if (!((b.tintColor == wantTint) || [b.tintColor isEqual:wantTint])) b.tintColor = wantTint;
+      }
+#endif
+    } else {
+      // (the same action said otherwise, its icon, words, menu or dot: the item there changed in place, not made anew,
+      // so the system swaps what it shows on the button there and fades none of the column's buttons, as Outlook's do;
+      // a new item, even with its identifier, is faded in for the old)
+      UIBarButtonItem *was = b;
       // (a picture the host loads: drawn in once it is here, on the item, while it is shown and still said so)
       __block __weak UIBarButtonItem *drawn = nil;
       __weak MBSlot *slotWeak = slot;
@@ -665,7 +695,7 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
         }
         b.title = d[@"title"];
         // (folded into the system's "…", its rows there as they are, not a submenu of them: a submenu opened there
-        // heads its rows with its own "… 更多", the system's "…" opening a "…")
+        // heads its rows with its own "… More", the system's "…" opening a "…")
         if (@available(iOS 16.0, *))
           b.menuRepresentation = [UIMenu menuWithTitle:@"" image:nil identifier:nil
                                                options:UIMenuOptionsDisplayInline children:menu.children];
@@ -688,20 +718,20 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
           b.style = UIBarButtonItemStylePlain;
           b.tintColor = ink;
         }
-        // (the app's own, 待处理's, on a glass of its own, apart from the card's)
+        // (the app's own, the inbox's, on a glass of its own, apart from the card's)
         if ((bare && prominent) || [ident hasPrefix:@"act/"] || [ident hasPrefix:@"lead/"]) b.sharesBackground = NO;
 #ifdef __IPHONE_27_0
-        // (short of room in the column, what goes first: never 待处理's bell, the user 2026-10-27, more wanted than the
+        // (short of room in the column, what goes first: never the inbox's bell, more wanted than the
         // workspace's and than any page's action; a page's first, and of a page's one that is itself a menu (a
         // chat's "…") before the rest: folded, its rows are in the system's "…" (its menuRepresentation), nothing
-        // lost, where its button left beside the system's would be two "…" in the column: the user 2026-11-03)
+        // lost, where its button left beside the system's would be two "…" in the column)
         if (@available(iOS 27.0, *)) {
           // (the bell above all: on the outer screen's short column there is room for one of the app's own)
           if ([ident hasSuffix:@"/attention"] || [ident hasSuffix:@"side/close"]) b.visibilityPriority = UIBarButtonItemVisibilityPriorityHigh;
           else if (![ident hasPrefix:@"act/"] && ![ident hasPrefix:@"lead/"])
             b.visibilityPriority = rows.count ? UIBarButtonItemVisibilityPriorityLow - 1 : UIBarButtonItemVisibilityPriorityLow;
           // (on a glass of its own: on one with the others, short of room, the system folded those and left this "…"
-          // beside its own: the user 2026-11-04)
+          // beside its own)
           if (rows.count) b.sharesBackground = NO;
         }
 #endif
@@ -726,8 +756,6 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   }
   slot.barItems = keptItems;
   slot.barSpecs = keptSpecs;
-  slot.barInk = ink;
-  slot.barAccent = accent;
   slot.appliedActsKey = self.actsKey;
   // Only the visible tab transitions; initial setup and the other tabs take their items at once.
   BOOL animate = allowAnimate && nav == self.selectedViewController && nav.isViewLoaded && nav.view.window != nil &&
@@ -746,9 +774,10 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   // (put away only when something is up over the whole window, its title alone: hidden with its items gone, the system's
   // column keeps showing the views of those it had, a page's actions on the next tab, the outer screen's workspace
   // button on the inner one. Shown with none it takes no room: there, its items are the column's.
-  // Nor with no title either (a remote screen's 全屏): put away, the column showed the chat's actions under it; shown,
-  // it is told they are gone, the user 2026-10-29)
-  [nav setNavigationBarHidden:(bare && made.count + lead.count == 0 && title.length > 0) animated:(bare && allowAnimate)];
+  // Nor with no title either (a remote screen's full screen): put away, the column showed the chat's actions under it;
+  // shown, it is told they are gone)
+  BOOL navHidden = (bare && made.count + lead.count == 0 && title.length > 0);
+  if (nav.navigationBarHidden != navHidden) [nav setNavigationBarHidden:navHidden animated:(bare && allowAnimate)];
 }
 - (void)ensureSlotBarItemsForIdent:(NSString *)ident animate:(BOOL)allowAnimate {
   if (!ident.length) return;
@@ -939,6 +968,9 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   }
   self.tabBarHidden = YES;
   self.shown = NO;
+  self.hasActionTab = NO;
+  self.appliedActionInkValid = NO;
+  self.appliedActionInkVal = 0;
   self.actsKey = nil;
   self.actsInk = nil;
   self.actsAccent = nil;
@@ -956,7 +988,8 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   NSMutableArray<NSDictionary *> *places = [NSMutableArray array];
   NSDictionary *act = nil;  // (none: what is pressed is the navigation bar's)
   NSMutableArray<NSDictionary *> *buttons = [NSMutableArray array];
-  // (the card in use's own, before the app's own actions, on one glass with 待处理's; the action most wanted apart, last)
+  // (the card in use's own, before the app's own actions, on one glass with the inbox's; the action most wanted apart,
+  // last)
   NSMutableArray<NSDictionary *> *own = [NSMutableArray array];
   // (something up over the whole window: the tabs put away, its own items alone)
   BOOL bare = [b[@"bare"] boolValue];
@@ -998,12 +1031,12 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
   self.appliedColorsValid = YES;
   [self floatingItems:b[@"floating"] ink:ink inkVal:inkVal bare:bare];
   // the tabs again only as they change (their ids, words and icons)
-  NSMutableString *key = [NSMutableString string];
   // (an icon that changes, the stations' at a glance, drawn again in place: below)
-  // (and words that change, the workspace's name on 我的: set in place too. A tab made again over its controller, while
-  // the one before still has it, is refused: UIKit's "cannot be shared between multiple UITab", the app stopped)
-  for (NSDictionary *t in places) [key appendFormat:@"%@\x1e", t[@"id"]];
-  if (act) [key appendFormat:@"!%@\x1f%@\x1f%@\x1f%@", act[@"id"], act[@"title"], act[@"icon"], b[@"chosen_ink"]];
+  // (and words that change, the workspace's name on the profile tab: set in place too. A tab made again over its
+  // controller, while the one before still has it, is refused: UIKit's "cannot be shared between multiple UITab", the
+  // app stopped)
+  // (the accent not in it: a new accent tints the action's tab in place, below, not by making the tabs again)
+  NSString *key = mb_ios_nav_tabs_key(places, NO, nil, act);
   BOOL tabsChanged = ![key isEqualToString:self.tabsKey];
   if (tabsChanged) {
     self.tabsKey = key;
@@ -1018,12 +1051,15 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
       tab.preferredPlacement = UITabPlacementDefault;
       [made addObject:tab];
     }
-    // (the action a tab of its own the system sets apart at the bar's end, as Xiaohongshu's 发布 is, on the system's
-    // glass, with an accent glyph (iOS 27: white on its glass washed with the accent, washAction): never chosen,
-    // shouldSelectTab says it)
+    // (the action a tab of its own the system sets apart at the bar's end, as a social app's post button is, on the
+    // system's glass, with an accent glyph (iOS 27: white on its glass washed with the accent, washAction): never
+    // chosen, shouldSelectTab says it)
     self.action = act[@"id"];
     self.actionInk = nil;
+    self.hasActionTab = NO;
+    self.appliedActionInkValid = NO;
     if (act && ![seen containsObject:act[@"id"]]) {
+      self.hasActionTab = YES;
       UIImage *image = [nav_icon(act[@"icon"], 26) imageWithTintColor:accent renderingMode:UIImageRenderingModeAlwaysOriginal];
 #ifdef __IPHONE_27_0
       if (@available(iOS 27.0, *)) {
@@ -1031,6 +1067,8 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
         self.actionInk = accent;
       }
 #endif
+      self.appliedActionInkVal = self.appliedAccentVal;
+      self.appliedActionInkValid = YES;
       UITab *x = [self tabFor:act[@"id"] title:act[@"title"] image:image];
       x.preferredPlacement = UITabPlacementPinned;
       [made addObject:x];
@@ -1045,6 +1083,21 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
     if (@available(iOS 27.0, *)) self.prominentTabIdentifier = act[@"id"];
 #endif
     self.choosing = NO;
+  } else if (self.hasActionTab && act &&
+             mb_ios_nav_color_changed(self.appliedActionInkValid, self.appliedActionInkVal, self.appliedAccentVal)) {
+    BOOL tintedWash = NO;
+#ifdef __IPHONE_27_0
+    if (@available(iOS 27.0, *)) {
+      tintedWash = YES;
+      self.actionInk = accent;
+    }
+#endif
+    if (!tintedWash) {
+      UITab *x = self.tabsById[act[@"id"]];
+      if (x) x.image = [nav_icon(act[@"icon"], 26) imageWithTintColor:accent renderingMode:UIImageRenderingModeAlwaysOriginal];
+    }
+    self.appliedActionInkVal = self.appliedAccentVal;
+    self.appliedActionInkValid = YES;
   }
   if (!self.icons) self.icons = [NSMutableDictionary dictionary];
   for (UITab *tab in self.tabs)
@@ -1066,9 +1119,14 @@ static void nav_title(UINavigationItem *item, NSString *title, UIColor *ink) {
       }
   BOOL hiddenChanged = self.tabBarHidden != bare;
   if (hiddenChanged) [self setTabBarHidden:bare animated:YES];
-  if (tabsChanged || hiddenChanged) {
+  BOOL washInWindow = self.actionWash.window != nil;
+  BOOL washInkMatches = (self.actionWashInk == self.actionInk) || [self.actionWashInk isEqual:self.actionInk];
+  // (a reveal with the same tabs washed at once too: no transaction here waits for the bar to come back)
+  BOOL revealWash = hiddenChanged && !bare && !tabsChanged;
+  if (revealWash ||
+      mb_ios_nav_wash_needed(tabsChanged, hiddenChanged, bare, self.actionInk != nil, washInWindow, washInkMatches)) {
     [self washAction];
-    if (self.actionInk && !bare) {
+    if (mb_ios_nav_wash_async_needed(tabsChanged, hiddenChanged, bare, self.actionInk != nil, washInWindow)) {
       __weak MBTabs *weakSelf = self;
       dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf washAction]; });
     }
