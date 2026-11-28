@@ -1426,12 +1426,45 @@ REACTIVE_SAFE_FRAMEWORK_HANDLE_EXACT = {
     "motion::Part",
     "motion::PressFeel",
     "motion::ShakeWay",
+    "motion::SpringFollow2D",
+    "glass::InteractiveHighlight",
     "lg::DampedDrag",
     "lg::LiquidMerge",
     "lg::InteractiveHighlight",
     "lg::OvlMorphHandoff",
     "code_field::CodeField",
     "terminal::TerminalModel",
+}
+
+# Method-level allowlist for framework handles that expose BOTH reactive getters (reading internal
+# signals / NodeWay timelines) and non-reactive mutable state accessors (e.g. host_node, is_bonded).
+# Capturing these types in a reactive read closure is permitted ONLY when every call to the type
+# uses an audited reactive getter and the closure never reads fields directly on the captured handle.
+REACTIVE_SAFE_PARTIAL_HANDLE_METHODS = {
+    "glass::DampedDrag": {
+        "value",
+        "progress",
+        "target",
+        "pressed",
+        "pressing",
+        "velocity",
+        "jelly",
+        "gesture_gen",
+        "lens_owned_by",
+    },
+    "glass::LiquidMerge": {
+        "is_separated",
+        "pos_on",
+        "gap_on",
+        "merge_on",
+        "recoil_on",
+    },
+}
+# Immutable Signal fields on partial-handle types that are safe to read via `.field.get()`.
+REACTIVE_SAFE_PARTIAL_HANDLE_SIGNAL_FIELDS = {
+    "glass::LiquidMerge": {
+        "dragging_sig",
+    },
 }
 
 # Invar engine-internal implementation files exempt from E008 mutable-type checks
@@ -1493,6 +1526,36 @@ def _is_safe_reactive_capture_ty(ty):
     if ty.startswith("Option[") and ty.endswith("]"):
         return _is_safe_reactive_capture_ty(ty[7:-1])
     return False
+
+
+def _is_safe_partial_handle_capture(cap_name, cap_ty, cl):
+    """Return True iff `cap_ty` is directly in REACTIVE_SAFE_PARTIAL_HANDLE_METHODS (no Option
+    stripping: fail-closed) and compiler AST `capture_uses` proves every unshadowed reference to
+    `cap_name` in this closure is strictly a safe method call or zero-arg safe signal `.get()`,
+    with no escape (including via nested closures)."""
+    if not cap_name or not cap_ty:
+        return False
+    safe_methods = REACTIVE_SAFE_PARTIAL_HANDLE_METHODS.get(cap_ty)
+    if not safe_methods:
+        return False
+    safe_sig_fields = REACTIVE_SAFE_PARTIAL_HANDLE_SIGNAL_FIELDS.get(cap_ty, set())
+    capture_uses = cl.get("capture_uses")
+    if not isinstance(capture_uses, list):
+        return False
+    cu = None
+    for item in capture_uses:
+        if isinstance(item, dict) and item.get("name") == cap_name:
+            cu = item
+            break
+    if cu is None or cu.get("escaped", True):
+        return False
+    for meth in cu.get("methods", []):
+        if meth not in safe_methods:
+            return False
+    for fld in cu.get("field_gets", []):
+        if fld not in safe_sig_fields:
+            return False
+    return True
 
 
 def _is_writable_signal_ty(ty):
@@ -1974,6 +2037,7 @@ def _run_reactive_audit(target_dir, no_reactive, add_diag):
                         not is_internal_engine_file
                         and cap.get("is_mutable_ty")
                         and not _is_safe_reactive_capture_ty(cap_ty)
+                        and not _is_safe_partial_handle_capture(cap_name, cap_ty, cl)
                     ):
                         add_diag(
                             "INVAR_E008_REACTIVE_MUT_CAPTURE",
@@ -2258,15 +2322,21 @@ def cmd_audit(args):
         if os.path.isfile(os.path.join(target_dir, "pion.toml")) and not in_invar_pkgs:
             is_external_app = True
 
-    # E001: Hand-rolled Glass::liquid outside packages/lg/
+    # E001: Hand-rolled Glass::liquid outside packages/lg/ and packages/glass/
     lg_dir = os.path.realpath(os.path.join(INVAR_ROOT, "packages", "lg"))
+    glass_dir = os.path.realpath(os.path.join(INVAR_ROOT, "packages", "glass"))
     scan_roots = [target_dir] if target_dir else [os.path.join(INVAR_ROOT, "packages"), os.path.join(INVAR_ROOT, "examples")]
     for sr in scan_roots:
         if not os.path.isdir(sr):
             continue
         for r_d, _ds, fs in os.walk(sr):
             real_rd = os.path.realpath(r_d)
-            if real_rd == lg_dir or real_rd.startswith(lg_dir + os.sep):
+            if (
+                real_rd == lg_dir
+                or real_rd.startswith(lg_dir + os.sep)
+                or real_rd == glass_dir
+                or real_rd.startswith(glass_dir + os.sep)
+            ):
                 continue
             for fn in sorted(fs):
                 if not fn.endswith(".pion"):
@@ -2295,8 +2365,8 @@ def cmd_audit(args):
                                 "error",
                                 rel,
                                 ln,
-                                "Direct `Glass::liquid` call outside `packages/lg`",
-                                "Use a component from `packages/lg` (`lg::Panel`, `lg::Button`, `lg::liquid_*_node`) instead.",
+                                "Direct `Glass::liquid` call outside `packages/lg` or `packages/glass`",
+                                "Use a component from `packages/lg` (`lg::Panel`, `lg::Button`, `lg::liquid_*_node`) or `packages/glass` instead.",
                             )
 
     # E002: 4-backend renderer lockstep + Windows manifest sources + baked shaders

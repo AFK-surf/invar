@@ -476,7 +476,318 @@ pub fn self_shadow_rhs_write() -> () -> Unit {
 }
 '
 
-python3 - "$ROOT_DIR" "$TMP_DIR" "$NEG_PKG" "$POS_PKG" "$NEG_EXPECT_FILE" "$POS_EXPECT_FILE" "$PIONC" "$FAKE_PIONC" <<'PY'
+# ── Batched `packages/glass` partial-handle E008 fixtures (3 multi-file packages) ──
+init_glass_multi_pkg() {
+  local name="$1"
+  local pdir="$TMP_DIR/$name"
+  mkdir -p "$pdir/src"
+  cat > "$pdir/pion.toml" <<EOF
+[package]
+name = "$name"
+version = "0.1.0"
+
+[dependencies]
+signals = { path = "$ROOT_DIR/packages/signals" }
+view = { path = "$ROOT_DIR/packages/view" }
+glass = { path = "$ROOT_DIR/packages/glass" }
+EOF
+  echo "$pdir"
+}
+
+GLASS_POS_PKG="$(init_glass_multi_pkg "glass_pos_all")"
+GLASS_NEG_PKG="$(init_glass_multi_pkg "glass_neg_all")"
+GLASS_POS_EXPECT_FILE="$TMP_DIR/glass_pos_expect.jsonl"
+GLASS_NEG_EXPECT_FILE="$TMP_DIR/glass_neg_expect.jsonl"
+: > "$GLASS_POS_EXPECT_FILE"
+: > "$GLASS_NEG_EXPECT_FILE"
+
+add_glass_error_case() {
+  local label="$1"
+  local expected="$2"
+  local body="$3"
+  printf '%s\n' "$body" > "$GLASS_POS_PKG/src/${label}.pion"
+  python3 - "$GLASS_POS_EXPECT_FILE" "$label" "$expected" <<'PY'
+import json, sys
+p, label, expected = sys.argv[1:4]
+with open(p, "a", encoding="utf-8") as f:
+    f.write(json.dumps({"label": label, "expected": expected}) + "\n")
+PY
+}
+
+add_glass_clean_case() {
+  local label="$1"
+  local body="$2"
+  printf '%s\n' "$body" > "$GLASS_NEG_PKG/src/${label}.pion"
+  python3 - "$GLASS_NEG_EXPECT_FILE" "$label" <<'PY'
+import json, sys
+p, label = sys.argv[1:3]
+with open(p, "a", encoding="utf-8") as f:
+    f.write(json.dumps({"label": label}) + "\n")
+PY
+}
+
+# 22. Positive E008: partial handle `glass::DampedDrag` calling non-reactive `host_node()` must fail E008
+add_glass_error_case "pos_e008_dd_host_node" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+
+pub fn bad_dd_host_node(dd : glass::DampedDrag) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    dd.host_node() is Some(_)
+  })
+}
+'
+
+# 23. Positive E008: partial handle `glass::LiquidMerge` calling non-reactive `is_bonded()` must fail E008
+add_glass_error_case "pos_e008_lm_is_bonded" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::LiquidMerge" '
+import "glass"
+import "signals"
+
+pub fn bad_lm_is_bonded(lm : glass::LiquidMerge) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    lm.is_bonded()
+  })
+}
+'
+
+# 24. Negative E008: partial handle `glass::DampedDrag` calling audited reactive `value(v)` must pass
+add_glass_clean_case "neg_e008_dd_value" '
+import "glass"
+import "signals"
+import "view"
+
+pub fn ok_dd_value(dd : glass::DampedDrag, v : view::View) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    dd.value(v)
+  })
+}
+'
+
+# 25. Negative E008: partial handle `glass::LiquidMerge` calling audited reactive `is_separated()` must pass
+add_glass_clean_case "neg_e008_lm_is_separated" '
+import "glass"
+import "signals"
+
+pub fn ok_lm_is_separated(lm : glass::LiquidMerge) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    lm.is_separated()
+  })
+}
+'
+
+# 26. Positive E008: forwarding partial handle `dd` to helper function must fail E008 (fail-closed)
+add_glass_error_case "pos_e008_dd_helper_forward" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+
+fn check_host(d : glass::DampedDrag) -> Bool {
+  d.host_node() is Some(_)
+}
+
+pub fn bad_dd_helper_forward(dd : glass::DampedDrag) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    check_host(dd)
+  })
+}
+'
+
+# 27. Positive E008: forwarding partial handle `dd` via function value `f(dd)` must fail E008 (fail-closed)
+add_glass_error_case "pos_e008_dd_fnval_forward" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+
+pub fn bad_dd_fnval_forward(dd : glass::DampedDrag) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    let f = fn(x : glass::DampedDrag) -> Bool { x.host_node() is Some(_) }
+    f(dd)
+  })
+}
+'
+
+# 28. Positive E008: Option-wrapped partial handle `Option[glass::DampedDrag]` must fail E008 (no Option stripping)
+add_glass_error_case "pos_e008_opt_dd_unwrap" "INVAR_E008_REACTIVE_MUT_CAPTURE:Option[glass::DampedDrag]" '
+import "glass"
+import "signals"
+
+fn check_host_opt(d : glass::DampedDrag) -> Bool {
+  d.host_node() is Some(_)
+}
+
+pub fn bad_opt_dd_unwrap(opt_dd : Option[glass::DampedDrag]) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    match opt_dd {
+      Some(x) => check_host_opt(x)
+      None => false
+    }
+  })
+}
+'
+
+# 29. Negative E008: reactive `dd.progress(v)` (tracked via `bounds_seq` + `value.shown`) must pass
+add_glass_clean_case "neg_e008_dd_progress" '
+import "glass"
+import "signals"
+import "view"
+
+pub fn ok_dd_progress(dd : glass::DampedDrag, v : view::View) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    dd.progress(v)
+  })
+}
+'
+
+# 30. Positive E008: non-reactive `lm.pos_at(1000.0)` must fail E008
+add_glass_error_case "pos_e008_lm_pos_at" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::LiquidMerge" '
+import "glass"
+import "signals"
+
+pub fn bad_lm_pos_at(lm : glass::LiquidMerge) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    lm.pos_at(1000.0).0
+  })
+}
+'
+
+# 31. Negative E008: inner block shadowing `let dd = [1, 2]; dd.length()` after safe `dd.value(v)` must pass
+add_glass_clean_case "neg_e008_dd_inner_shadow" '
+import "glass"
+import "signals"
+import "view"
+
+pub fn ok_dd_inner_shadow(dd : glass::DampedDrag, v : view::View) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    let x = dd.value(v)
+    {
+      let dd = [1, 2]
+      let _ = dd.length()
+    }
+    x
+  })
+}
+'
+
+# 32. Positive E008: struct field escape `Holder::{ drag: dd }` must fail E008
+add_glass_error_case "pos_e008_dd_struct_escape" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+
+struct Holder {
+  drag : glass::DampedDrag
+}
+
+pub fn bad_dd_struct_escape(dd : glass::DampedDrag) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    let h = Holder::{ drag: dd }
+    h.drag.host_node() is Some(_)
+  })
+}
+'
+
+# 33. Positive E008: string interpolation calling unsafe method `dd.host_node()` must fail E008
+add_glass_error_case "pos_e008_dd_interp_unsafe" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+
+pub fn bad_dd_interp_unsafe(dd : glass::DampedDrag) -> signals::Computed[String] {
+  signals::computed(fn(_) -> String {
+    "node=\{dd.host_node() is Some(_)}"
+  })
+}
+'
+
+# 34. Positive E008: multiline self-shadowing initializer `let dd =\n  check_host_ml(dd)` must fail E008
+add_glass_error_case "pos_e008_dd_multiline_shadow" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+
+fn check_host_ml(d : glass::DampedDrag) -> Bool {
+  d.host_node() is Some(_)
+}
+
+pub fn bad_dd_multiline_shadow(dd : glass::DampedDrag) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    let dd =
+      check_host_ml(dd)
+    dd
+  })
+}
+'
+
+# 35. Negative E008: match arm binding shadows `dd` while outer `dd` only calls `dd.value(v)` -> clean
+add_glass_clean_case "neg_e008_dd_match_shadow" '
+import "glass"
+import "signals"
+import "view"
+
+pub fn ok_dd_match_shadow(dd : glass::DampedDrag, v : view::View) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    let x = dd.value(v)
+    let opt : Option[glass::DampedDrag] = None
+    let _ = match opt {
+      Some(dd) => dd.host_node() is Some(_)
+      None => false
+    }
+    x
+  })
+}
+'
+
+# 36. Negative E008: inner local `DampedDrag` calling `local_dd.host_node()` while outer `dd` only calls `dd.value(v)` -> clean
+add_glass_clean_case "neg_e008_dd_local_new" '
+import "glass"
+import "signals"
+import "view"
+
+pub fn ok_dd_local_new(dd : glass::DampedDrag, v : view::View) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    let local_dd = glass::DampedDrag::new(0.0, lo=0.0, hi=1.0, held_scale=1.1)
+    let _ = local_dd.host_node() is Some(_)
+    dd.value(v)
+  })
+}
+'
+
+# 37. Positive E008: nested closure capturing `dd` marks outer `escaped: true` -> fail E008
+add_glass_error_case "pos_e008_dd_nested_closure" "INVAR_E008_REACTIVE_MUT_CAPTURE:glass::DampedDrag" '
+import "glass"
+import "signals"
+import "view"
+
+pub fn bad_dd_nested_closure(dd : glass::DampedDrag, v : view::View) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    let inner = fn() -> Double { dd.value(v) }
+    inner()
+  })
+}
+'
+
+# 38-39. Single whitebox package inside `packages/glass` testing `.dragging_sig.get()` (clean) and `dd.lo` (E008)
+GLASS_WB_PKG="$TMP_DIR/glass_whitebox_all/packages/glass"
+mkdir -p "$GLASS_WB_PKG/src"
+sed "s|\.\./|$ROOT_DIR/packages/|g" "$ROOT_DIR/packages/glass/pion.toml" > "$GLASS_WB_PKG/pion.toml"
+for f in "$ROOT_DIR/packages/glass/src/"*.pion; do
+  case "$(basename "$f")" in
+    *_test.pion) continue ;;
+  esac
+  ln -s "$f" "$GLASS_WB_PKG/src/$(basename "$f")"
+done
+cat > "$GLASS_WB_PKG/src/zz_probe_neg_dragging_sig.pion" <<'EOF'
+pub fn ok_lm_dragging_sig(lm : LiquidMerge) -> signals::Computed[Bool] {
+  signals::computed(fn(_) -> Bool {
+    lm.dragging_sig.get()
+  })
+}
+EOF
+cat > "$GLASS_WB_PKG/src/zz_probe_pos_field_lo.pion" <<'EOF'
+pub fn bad_dd_field_lo(dd : DampedDrag) -> signals::Computed[Double] {
+  signals::computed(fn(_) -> Double {
+    dd.lo
+  })
+}
+EOF
+
+python3 - "$ROOT_DIR" "$TMP_DIR" "$NEG_PKG" "$POS_PKG" "$NEG_EXPECT_FILE" "$POS_EXPECT_FILE" "$PIONC" "$FAKE_PIONC" \
+  "$GLASS_POS_PKG" "$GLASS_NEG_PKG" "$GLASS_POS_EXPECT_FILE" "$GLASS_NEG_EXPECT_FILE" "$GLASS_WB_PKG" <<'PY'
 import concurrent.futures
 import json
 import os
@@ -484,30 +795,42 @@ import stat
 import subprocess
 import sys
 
-root_dir, tmp_dir, neg_pkg, pos_pkg, neg_expect_file, pos_expect_file, pionc_bin, fake_pionc = sys.argv[1:9]
+(
+    root_dir,
+    tmp_dir,
+    neg_pkg,
+    pos_pkg,
+    neg_expect_file,
+    pos_expect_file,
+    pionc_bin,
+    fake_pionc,
+    glass_pos_pkg,
+    glass_neg_pkg,
+    glass_pos_expect_file,
+    glass_neg_expect_file,
+    glass_wb_pkg,
+) = sys.argv[1:14]
 invar_cli = os.path.join(root_dir, "scripts", "invar")
+REACTIVE_PREFIXES = ("INVAR_E007", "INVAR_E008", "INVAR_E009", "INVAR_E010")
 
 with open(neg_expect_file, "r", encoding="utf-8") as f:
     neg_cases = [json.loads(line) for line in f if line.strip()]
 with open(pos_expect_file, "r", encoding="utf-8") as f:
     pos_cases = [json.loads(line) for line in f if line.strip()]
+with open(glass_pos_expect_file, "r", encoding="utf-8") as f:
+    glass_pos_cases = [json.loads(line) for line in f if line.strip()]
+with open(glass_neg_expect_file, "r", encoding="utf-8") as f:
+    glass_neg_cases = [json.loads(line) for line in f if line.strip()]
 
-def run_audit(pkg_dir, extra_args, pionc_override=None):
-    env = os.environ.copy()
-    env["PIONC"] = pionc_override or pionc_bin
-    cmd = [sys.executable, invar_cli, "audit", "--json", *extra_args, pkg_dir]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-    try:
-        data = json.loads(proc.stdout)
-    except Exception as e:
-        raise AssertionError(f"invalid JSON ({e}):\n{proc.stdout}\n{proc.stderr}")
-    return proc.returncode, data
+def run_pionc_check(label, pkg_dir):
+    proc = subprocess.run([pionc_bin, "check", "--json", pkg_dir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert proc.returncode == 0, f"{label}: pionc check failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+    data = json.loads(proc.stdout)
+    assert data.get("ok") is True and not data.get("diagnostics"), f"{label}: pionc check reported diagnostics: {data}"
 
-def check_neg_all():
-    # Capture the exact `pionc query analyze` JSON payload consumed by `invar audit` itself
-    # via a transparent Python wrapper (repr-escaped literals: zero shell expansion or env pollution).
-    capture_file = os.path.join(tmp_dir, "neg_query_analyze.json")
-    wrap_bin = os.path.join(tmp_dir, "neg_pionc_wrap.py")
+def make_query_capture_wrapper(tag):
+    capture_file = os.path.join(tmp_dir, f"{tag}_query_analyze.json")
+    wrap_bin = os.path.join(tmp_dir, f"{tag}_pionc_wrap.py")
     with open(wrap_bin, "w", encoding="utf-8") as wf:
         wf.write(
             "#!/usr/bin/env python3\n"
@@ -523,7 +846,21 @@ def check_neg_all():
             "os.execv(pionc, [pionc, *sys.argv[1:]])\n"
         )
     os.chmod(wrap_bin, os.stat(wrap_bin).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return capture_file, wrap_bin
 
+def run_audit(pkg_dir, extra_args, pionc_override=None):
+    env = os.environ.copy()
+    env["PIONC"] = pionc_override or pionc_bin
+    cmd = [sys.executable, invar_cli, "audit", "--json", *extra_args, pkg_dir]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        data = json.loads(proc.stdout)
+    except Exception as e:
+        raise AssertionError(f"invalid JSON ({e}):\n{proc.stdout}\n{proc.stderr}")
+    return proc.returncode, data
+
+def check_neg_all():
+    capture_file, wrap_bin = make_query_capture_wrapper("neg")
     rc, data = run_audit(neg_pkg, [], pionc_override=wrap_bin)
     diags = data.get("diagnostics", [])
     codes = [d["code"] for d in diags if d.get("severity") == "error"]
@@ -534,7 +871,6 @@ def check_neg_all():
     assert ra.get("ran") is True, f"neg_all_clean: expected reactive_audit.ran=True, got {ra}"
     assert ra.get("closures_checked", 0) >= 10, f"neg_all_clean: expected >=10 closures_checked, got {ra}"
 
-    # Verify every clean fixture file actually produced analyzed closures in that exact payload.
     assert os.path.isfile(capture_file), "neg_all_clean: invar audit did not invoke pionc query analyze"
     with open(capture_file, "r", encoding="utf-8") as cf:
         qraw = cf.read()
@@ -593,6 +929,104 @@ def check_pos_all():
     )
     return lines
 
+def check_glass_pos_all():
+    run_pionc_check("glass_pos_all", glass_pos_pkg)
+    rc, data = run_audit(glass_pos_pkg, ["--require-reactive"])
+    err_diags = [
+        d for d in data.get("diagnostics", [])
+        if d.get("severity") == "error" and d.get("code", "").startswith(REACTIVE_PREFIXES)
+    ]
+    ra = data.get("reactive_audit", {})
+    assert rc != 0, "glass_pos_all: expected non-zero rc, got 0"
+    assert ra.get("ran") is True, f"glass_pos_all: expected reactive_audit.ran=True, got {ra}"
+    lines = []
+    matched_indices = set()
+    for case in glass_pos_cases:
+        label = case["label"]
+        exp_code, _, exp_substr = case["expected"].partition(":")
+        suffix = f"src/{label}.pion"
+        file_diags = [
+            (idx, d) for idx, d in enumerate(err_diags)
+            if str(d.get("file", "")).replace("\\", "/").endswith(suffix)
+        ]
+        matching = [
+            (idx, d) for idx, d in file_diags
+            if d.get("code") == exp_code and (not exp_substr or exp_substr in d.get("message", ""))
+        ]
+        assert len(matching) == 1, (
+            f"{label}: expected 1 {exp_code} ({exp_substr!r}) in {suffix}, got {[d for _, d in file_diags]}"
+        )
+        for idx, _ in file_diags:
+            matched_indices.add(idx)
+        lines.append(f"[PASS] {label}: code={exp_code}")
+    assert len(err_diags) == len(glass_pos_cases), (
+        f"glass_pos_all: expected exactly {len(glass_pos_cases)} reactive errors, got {len(err_diags)}: {err_diags}"
+    )
+    assert len(matched_indices) == len(err_diags), (
+        f"glass_pos_all: unmatched reactive errors: {[d for i, d in enumerate(err_diags) if i not in matched_indices]}"
+    )
+    return lines
+
+def check_glass_neg_all():
+    run_pionc_check("glass_neg_all", glass_neg_pkg)
+    capture_file, wrap_bin = make_query_capture_wrapper("glass_neg")
+    rc, data = run_audit(glass_neg_pkg, ["--require-reactive"], pionc_override=wrap_bin)
+    err_diags = [
+        d for d in data.get("diagnostics", [])
+        if d.get("severity") == "error" and d.get("code", "").startswith(REACTIVE_PREFIXES)
+    ]
+    ra = data.get("reactive_audit", {})
+    assert rc == 0 and data.get("ok") is True and len(err_diags) == 0, (
+        f"glass_neg_all: expected clean, got rc={rc} err_diags={err_diags}"
+    )
+    assert ra.get("ran") is True, f"glass_neg_all: expected reactive_audit.ran=True, got {ra}"
+    assert os.path.isfile(capture_file), "glass_neg_all: invar audit did not invoke pionc query analyze"
+    with open(capture_file, "r", encoding="utf-8") as cf:
+        qdata = json.loads(cf.read())
+    closures = qdata.get("closures", [])
+    per_file_counts = {}
+    for case in glass_neg_cases:
+        label = case["label"]
+        suffix = f"src/{label}.pion"
+        cnt = sum(1 for c in closures if str(c.get("file", "")).replace("\\", "/").endswith(suffix))
+        assert cnt >= 1, f"glass_neg_all: {suffix} had 0 analyzed closures (silently skipped?)"
+        per_file_counts[label] = cnt
+    return [f"[PASS] glass_neg_all ({len(glass_neg_cases)} files): ok=True reactive_errors=0 closures_checked={ra.get('closures_checked')} per_file={per_file_counts}"]
+
+def check_glass_whitebox():
+    run_pionc_check("glass_whitebox_all", glass_wb_pkg)
+    capture_file, wrap_bin = make_query_capture_wrapper("glass_wb")
+    rc, data = run_audit(glass_wb_pkg, ["--require-reactive"], pionc_override=wrap_bin)
+    err_diags = [
+        d for d in data.get("diagnostics", [])
+        if d.get("severity") == "error" and d.get("code", "").startswith(REACTIVE_PREFIXES)
+    ]
+    ra = data.get("reactive_audit", {})
+    assert rc != 0, "glass_whitebox_all: expected non-zero rc, got 0"
+    assert ra.get("ran") is True, f"glass_whitebox_all: expected reactive_audit.ran=True, got {ra}"
+    assert os.path.isfile(capture_file), "glass_whitebox_all: invar audit did not invoke pionc query analyze"
+    with open(capture_file, "r", encoding="utf-8") as cf:
+        qdata = json.loads(cf.read())
+    closures = qdata.get("closures", [])
+    neg_suffix = "src/zz_probe_neg_dragging_sig.pion"
+    pos_suffix = "src/zz_probe_pos_field_lo.pion"
+    neg_cnt = sum(1 for c in closures if str(c.get("file", "")).replace("\\", "/").endswith(neg_suffix))
+    assert neg_cnt >= 1, f"glass_whitebox_all: {neg_suffix} had 0 analyzed closures"
+    neg_diags = [d for d in err_diags if str(d.get("file", "")).replace("\\", "/").endswith(neg_suffix)]
+    assert len(neg_diags) == 0, f"glass_whitebox_all: {neg_suffix} had unexpected reactive errors: {neg_diags}"
+    pos_diags = [
+        d for d in err_diags
+        if str(d.get("file", "")).replace("\\", "/").endswith(pos_suffix)
+        and d.get("code") == "INVAR_E008_REACTIVE_MUT_CAPTURE"
+        and "glass::DampedDrag" in d.get("message", "")
+    ]
+    assert len(pos_diags) == 1, f"glass_whitebox_all: expected 1 E008 on {pos_suffix}, got {err_diags}"
+    assert len(err_diags) == 1, f"glass_whitebox_all: expected exactly 1 total reactive error, got {err_diags}"
+    return [
+        f"[PASS] neg_e008_lm_dragging_sig: closures={neg_cnt} reactive_errors=0",
+        f"[PASS] pos_e008_dd_field_lo: code=INVAR_E008_REACTIVE_MUT_CAPTURE total_reactive_errors=1",
+    ]
+
 def check_degraded(label, extra_args, mode, pionc_override=None):
     rc, data = run_audit(pos_pkg, extra_args, pionc_override=pionc_override)
     diags = data.get("diagnostics", [])
@@ -614,6 +1048,9 @@ def check_degraded(label, extra_args, mode, pionc_override=None):
 tasks = [
     ("pos_all", check_pos_all),
     ("neg_all", check_neg_all),
+    ("glass_pos_all", check_glass_pos_all),
+    ("glass_neg_all", check_glass_neg_all),
+    ("glass_whitebox_all", check_glass_whitebox),
     ("degrade_no_reactive_flag", lambda: check_degraded("degrade_no_reactive_flag", ["--no-reactive"], "degraded")),
     ("degrade_legacy_pionc", lambda: check_degraded("degrade_legacy_pionc", [], "degraded", pionc_override=fake_pionc)),
     ("require_reactive_no_reactive", lambda: check_degraded("require_reactive_no_reactive", ["--no-reactive", "--require-reactive"], "INVAR_E007_REACTIVE_AUDIT_SKIPPED")),
