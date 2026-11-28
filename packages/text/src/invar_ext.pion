@@ -25,6 +25,75 @@ pub fn utf16_to_utf8_offset(s : String, u16_off : Int) -> Int {
   mbt_compat::utf16_to_utf8_off(s, u16_off)
 }
 
+fn utf8_seq_len(s : String, i : Int) -> Int {
+  let n = s.length()
+  let b0 = s.code_unit_at(i)
+  if b0 < 0x80 {
+    return 1
+  }
+  let want = if b0 >= 0xC2 && b0 <= 0xDF {
+    2
+  } else if b0 >= 0xE0 && b0 <= 0xEF {
+    3
+  } else if b0 >= 0xF0 && b0 <= 0xF4 {
+    4
+  } else {
+    0
+  }
+  if want == 0 || i + want > n {
+    return 1
+  }
+  let b1 = s.code_unit_at(i + 1)
+  let lo = if b0 == 0xE0 {
+    0xA0
+  } else if b0 == 0xF0 {
+    0x90
+  } else {
+    0x80
+  }
+  let hi = if b0 == 0xED {
+    0x9F
+  } else if b0 == 0xF4 {
+    0x8F
+  } else {
+    0xBF
+  }
+  if b1 < lo || b1 > hi {
+    return 1
+  }
+  let mut k = 2
+  while k < want {
+    let bk = s.code_unit_at(i + k)
+    if bk < 0x80 || bk > 0xBF {
+      return 1
+    }
+    k += 1
+  }
+  want
+}
+
+fn utf8_scalar(s : String, i : Int, l : Int) -> Int {
+  let b0 = s.code_unit_at(i)
+  if l == 1 {
+    if b0 < 0x80 {
+      return b0
+    }
+    return 0xFFFD
+  }
+  if l == 2 {
+    return ((b0 & 0x1F) << 6) | (s.code_unit_at(i + 1) & 0x3F)
+  }
+  if l == 3 {
+    return ((b0 & 0x0F) << 12) |
+    ((s.code_unit_at(i + 1) & 0x3F) << 6) |
+    (s.code_unit_at(i + 2) & 0x3F)
+  }
+  ((b0 & 0x07) << 18) |
+  ((s.code_unit_at(i + 1) & 0x3F) << 12) |
+  ((s.code_unit_at(i + 2) & 0x3F) << 6) |
+  (s.code_unit_at(i + 3) & 0x3F)
+}
+
 fn utf8_cp_before(s : String, i : Int) -> Int {
   let mut cand = i - 1
   let floor = if i > 4 { i - 4 } else { 0 }
@@ -32,8 +101,7 @@ fn utf8_cp_before(s : String, i : Int) -> Int {
     cand -= 1
   }
   if (s.code_unit_at(cand) & 0xC0) != 0x80 {
-    let (_, next_b) = mbt_compat::str_cursor_step(s, cand)
-    if next_b >= i {
+    if cand + utf8_seq_len(s, cand) >= i {
       return cand
     }
   }
@@ -49,15 +117,24 @@ pub fn next_grapheme_utf8(s : String, byte_off : Int) -> Int {
     return n
   }
   let i = if byte_off < 0 { 0 } else { byte_off }
-  let (c0_ch, j0) = mbt_compat::str_cursor_step(s, i)
-  let mut p = grapheme_table.get(c0_ch.to_int())
-  let mut j = j0
+  let b0 = s.code_unit_at(i)
+  if b0 >= 0x20 && b0 <= 0x7E {
+    let j0 = i + 1
+    if j0 >= n || s.code_unit_at(j0) < 0x80 {
+      return j0
+    }
+  }
+  let l0 = utf8_seq_len(s, i)
+  let c0 = utf8_scalar(s, i, l0)
+  let mut p = grapheme_table.get(c0)
+  let mut j = i + l0
   let mut ri = gcb(p) == G_RI
   let mut emoji = if is_xpict(p) { 1 } else { 0 }
   let mut linker = incb(p) == INCB_LINKER
   while j < n {
-    let (c_ch, next_j) = mbt_compat::str_cursor_step(s, j)
-    let q = grapheme_table.get(c_ch.to_int())
+    let lj = utf8_seq_len(s, j)
+    let cj = utf8_scalar(s, j, lj)
+    let q = grapheme_table.get(cj)
     let a = gcb(p)
     let b = gcb(q)
     let brk = if pair_breaks(a, b) {
@@ -86,16 +163,17 @@ pub fn next_grapheme_utf8(s : String, byte_off : Int) -> Int {
     }
     linker = incb(q) == INCB_LINKER || (linker && incb(q) == INCB_EXTEND)
     p = q
-    j = next_j
+    j = j + lj
   }
   n
 }
 
 fn certain_boundary_utf8(s : String, i : Int) -> Bool {
-  let (ca, _) = mbt_compat::str_cursor_step(s, utf8_cp_before(s, i))
-  let (cb, _) = mbt_compat::str_cursor_step(s, i)
-  let a = grapheme_table.get(ca.to_int())
-  let b = grapheme_table.get(cb.to_int())
+  let prev = utf8_cp_before(s, i)
+  let ca = utf8_scalar(s, prev, utf8_seq_len(s, prev))
+  let cb = utf8_scalar(s, i, utf8_seq_len(s, i))
+  let a = grapheme_table.get(ca)
+  let b = grapheme_table.get(cb)
   if !pair_breaks(gcb(a), gcb(b)) {
     return false
   }
@@ -157,9 +235,9 @@ pub fn break_opportunities_utf8(s : String) -> Array[(Int, Bool)] {
   while i < opps.length() {
     let (target_u, mand) = opps[i]
     while b < n && u < target_u {
-      let (_, next_b) = mbt_compat::str_cursor_step(s, b)
-      let us = if next_b - b == 4 { 2 } else { 1 }
-      b = next_b
+      let l = utf8_seq_len(s, b)
+      let us = if l == 4 { 2 } else { 1 }
+      b += l
       u += us
     }
     out.push((b, mand))
