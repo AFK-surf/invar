@@ -1,0 +1,190 @@
+// Regression tests for `Tree::has_withins_work`, `Pivot::Drawn` pointer settling,
+// look-only `withins_restored` skipping, and single-span `"tree bindings"` timing.
+
+import "signals"
+
+test "look-only Paint/Alpha event bursts skip withins_laid and coalesce until frame" {
+  let tick = signals::signal(0, same=fn(a : Int, b : Int) -> Bool { a == b })
+  let within = ref_new(false)
+  let t = Tree::new(fn(root : View) {
+    let _ = root.lines_up(Is(Some(Along::Start)))
+    let _ = root.box(fn(n : View) {
+      let _ = n.width(Is(Some(40.0))).height(Is(Some(20.0)))
+      n.reacts(fn() { n.pointer_within() }, fn(v : Bool) { within.v = v })
+    })
+    let mut i = 0
+    while i < 8 {
+      let idx = i
+      let _ = root.box(fn(row : View) {
+        let _ = row
+          .width(Is(Some(80.0)))
+          .height(Is(Some(20.0)))
+          .ground(By(fn() { if (tick.get() + idx) % 2 == 0 { 0xFF112233L } else { 0xFF445566L } }))
+          .alpha(By(fn() { if (tick.get() + idx) % 2 == 0 { 0.8 } else { 1.0 } }))
+      })
+      i = i + 1
+    }
+  })
+  let _ = t.frame(300.0, 300.0, now=10.0)
+  t.point_at(10.0, 10.0)
+  let _ = t.frame(300.0, 300.0, now=12.0)
+  debug_assert(within.v, "pointer starts inside box")
+
+  // 5 consecutive look-only events between frames: zero eager withins_laid passes.
+  let passes0 = t.work().passes
+  let mut k = 1
+  while k <= 5 {
+    let cur = k
+    t.event(12.0 + cur.to_double() * 2.0, fn() { tick.set(cur) })
+    k = k + 1
+  }
+  debug_assert(
+    t.work().passes == passes0,
+    "look-only Ground/Alpha event burst must not trigger eager withins_laid passes",
+  )
+  debug_assert(!t.hits_place_due, "hits_place_due must stay false for look-only changes")
+  let _ = t.frame(300.0, 300.0, now=26.0)
+  debug_assert(
+    t.work().passes == passes0 + 1,
+    "next frame should coalesce all 5 look-only events into 1 compositing pass",
+  )
+  t.dispose()
+}
+
+test "Paint binding under Pivot::Drawn ancestor still triggers withins_laid" {
+  let fill = signals::signal(0L, same=fn(a : Int64, b : Int64) -> Bool { a == b })
+  let within = ref_new(false)
+  let t = Tree::new(fn(root : View) {
+    let _ = root.lines_up(Is(Some(Along::Start)))
+    let _ = root.box(fn(scaled : View) {
+      let _ = scaled.width(Is(Some(100.0))).height(Is(Some(40.0))).scale(Is(0.5), about=Pivot::Drawn)
+      let _ = scaled.box(fn(child : View) {
+        let _ = child.width(Is(Some(40.0))).height(Is(Some(40.0))).ground(By(fn() { fill.get() }))
+        child.reacts(fn() { child.pointer_within() }, fn(v : Bool) { within.v = v })
+      })
+    })
+  })
+  let _ = t.frame(300.0, 300.0, now=10.0)
+  t.point_at(20.0, 20.0)
+  let _ = t.frame(300.0, 300.0, now=12.0)
+
+  // Changing Ground from transparent (draws_of=false) to opaque (draws_of=true) under Pivot::Drawn
+  // shifts the ancestor's drawn pivot via drawn_stale_from, so has_withins_work must still settle eagerly.
+  let passes0 = t.work().passes
+  t.event(16.0, fn() { fill.set(0xFF112233L) })
+  debug_assert(
+    t.work().passes > passes0,
+    "Ground binding under Pivot::Drawn ancestor must still run withins_laid immediately",
+  )
+  t.dispose()
+}
+
+test "active pointer skips withins_laid and withins_restored for look-only changes but settles geometry" {
+  let now = ref_new(10.0)
+  let shade = signals::signal(0xFF112233L, same=fn(a : Int64, b : Int64) -> Bool { a == b })
+  let fade = signals::signal(1.0, same=fn(a : Double, b : Double) -> Bool { a == b })
+  let shift_y = signals::signal(0.0, same=fn(a : Double, b : Double) -> Bool { a == b })
+  let within = ref_new(false)
+  let t = Tree::new(
+    fn(root : View) {
+      let _ = root.lines_up(Is(Some(Along::Start)))
+      // Look-only animated spinner/fade reading beat/clock: must not trigger withins_restored pass.
+      let _ = root.box(fn(b : View) {
+        let _ = b
+          .width(Is(Some(20.0)))
+          .height(Is(Some(20.0)))
+          .ground(By(fn() { shade.get() }))
+          .alpha(By(fn() { fade.get() * (0.5 + 0.5 * b.cycle(1000.0)) }))
+      })
+      // Hit-moving target watched by pointer_within.
+      let _ = root.box(fn(n : View) {
+        let _ = n.width(Is(Some(60.0))).height(Is(Some(40.0))).offset(By(fn() { (0.0, shift_y.get()) }))
+        n.reacts(fn() { n.pointer_within() }, fn(v : Bool) { within.v = v })
+      })
+    },
+    time=fn() { now.v },
+  )
+  t.at(30.0)
+  t.beat_set(30.0)
+  let _ = t.frame(300.0, 300.0, now=10.0)
+  t.point_at(20.0, 35.0)
+  let _ = t.frame(300.0, 300.0, now=10.0)
+  debug_assert(within.v, "pointer starts inside target box")
+
+  // 1. Paint-only (Ground) and look-only Place (Alpha) events with active pointer: zero withins passes.
+  let passes0 = t.work().passes
+  now.v = 15.0
+  t.event(15.0, fn() {
+    shade.set(0xFF445566L)
+    fade.set(0.5)
+  })
+  debug_assert(
+    t.work().passes == passes0,
+    "Ground/Alpha-only events must not run withins_laid even with active pointer",
+  )
+  debug_assert(!t.hits_place_due, "hits_place_due must stay false for Ground/Alpha-only events")
+
+  // 2. Hit-moving event (Offset) at at=20 while drawn clock is ahead at shown=30: runs exactly 1 pass
+  // (laid_now at 20ms), then restores clock_to(30, beat=true) and skips withins_restored because the
+  // only clock/beat binding in the tree is look-only (Alpha).
+  now.v = 20.0
+  t.event(20.0, fn() { shift_y.set(100.0) })
+  debug_assert(!within.v, "moving box away from active pointer updates pointer_within immediately")
+  debug_assert(
+    t.work().passes == passes0 + 1,
+    "look-only clock binding must not trigger an extra withins_restored pass when clock restores to 30ms",
+  )
+  t.dispose()
+}
+
+test "Tree::pull and Tree::settle_bindings_at time tree bindings without double-counting" {
+  let label = signals::signal("a", same=fn(a : String, b : String) -> Bool { a == b })
+  let t = Tree::new(fn(root : View) {
+    let _ = root.transitions_only()
+    let _ = root.laid_before_moves()
+    let _ = root.box(fn(b : View) {
+      let _ = b.width(Is(Some(100.0))).height(Is(Some(30.0))).words(By(fn() { label.get() }))
+    })
+  })
+  let _ = t.frame(300.0, 300.0, now=0.0)
+
+  let clock = ref_new(0.0)
+  let calls = ref_new(0)
+  let total_ms = ref_new(0.0)
+  t.timed_by(
+    Some(
+      (
+        fn() -> Double {
+          clock.v = clock.v + 1.0
+          clock.v
+        },
+        fn(what : String, ms : Double) -> Unit {
+          if what == "tree bindings" {
+            calls.v = calls.v + 1
+            total_ms.v = total_ms.v + ms
+          }
+        },
+      ),
+    ),
+  )
+
+  // Event-end settle_bindings_at drains bindings and calls pull() internally: must report 1 outer timing.
+  t.event(10.0, fn() { label.set("b") })
+  debug_assert(calls.v == 1, "settle_bindings_at + inner pull must emit a single outer tree bindings span")
+  debug_assert(total_ms.v == 1.0, "single outer span must not double-count nested pull()")
+
+  // Standalone pull() when pulls_marked is non-empty reports tree bindings; empty pull() reports nothing.
+  calls.v = 0
+  total_ms.v = 0.0
+  signals::start_batch()
+  label.set("c")
+  t.pull()
+  signals::end_batch()
+  debug_assert(calls.v == 1, "non-empty Tree::pull must report tree bindings")
+  debug_assert(total_ms.v == 1.0, "non-empty Tree::pull span duration")
+
+  calls.v = 0
+  t.pull()
+  debug_assert(calls.v == 0, "empty Tree::pull must not emit a spurious tree bindings span")
+  t.dispose()
+}

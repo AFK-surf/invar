@@ -26,9 +26,18 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 DEBUG_BIN="$TMP_DIR/worker_mt_stress_debug"
 RELEASE_BIN="$TMP_DIR/worker_mt_stress_release"
 
-echo "=== Building worker_app/mt_stress (debug & --release) ==="
-"$PIONC" build -o "$DEBUG_BIN" "$STRESS_DIR"
-"$PIONC" build --release -o "$RELEASE_BIN" "$STRESS_DIR"
+echo "=== Building worker_app/mt_stress (debug & --release, parallel) ==="
+"$PIONC" build -o "$DEBUG_BIN" "$STRESS_DIR" &
+PID_DBG=$!
+"$PIONC" build --release -o "$RELEASE_BIN" "$STRESS_DIR" &
+PID_REL=$!
+BUILD_FAIL=0
+wait "$PID_DBG" || BUILD_FAIL=1
+wait "$PID_REL" || BUILD_FAIL=1
+if [ "$BUILD_FAIL" -ne 0 ]; then
+  echo "FAIL: building worker_app/mt_stress failed" >&2
+  exit 1
+fi
 
 run_suite() {
   mode="$1"

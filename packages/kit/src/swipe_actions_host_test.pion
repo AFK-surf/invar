@@ -1,0 +1,101 @@
+// End-to-end host-layer gesture arbitration tests for `headless::SwipeActions` inside `view::View::scrolls`.
+// Drives touch events through `ui::Tester::tree` + `ui::Tester::touch` so the full `view_claimed`
+// claim-and-handover pipeline runs between an outer vertical scroller and an inner horizontal swipe row.
+
+import "headless"
+import "signals"
+import "ui"
+import "view"
+
+test "SwipeActions inside View::scrolls: vertical claim blocks subsequent horizontal motion; horizontal claim blocks scroll" {
+  let scroll = view::Scroll::new()
+  let tree_ref : signals::Ref[Option[view::Tree]] = signals::ref_new(None)
+  let sa = headless::SwipeActions::new(
+    left_width=80.0,
+    right_width=100.0,
+    slop=8.0,
+    threshold=0.4,
+  )
+  let t = ui::Tester::tree(
+    fn(root : view::View) {
+      tree_ref.v = Some(root.tree)
+      let _ = root.box(fn(sc : view::View) {
+        let _ = sc
+          .width(view::Live::Is(Some(300.0)))
+          .height(view::Live::Is(Some(200.0)))
+          .scrolls(scroll, slop=ui::touch_slop(), fn(held : view::View) {
+            let _ = held.box(fn(row : view::View) {
+              let _ = row
+                .width(view::Live::Is(Some(300.0)))
+                .height(view::Live::Is(Some(60.0)))
+              sa.bind(row)
+            })
+            let _ = held.box(fn(spacer : view::View) {
+              let _ = spacer
+                .width(view::Live::Is(Some(300.0)))
+                .height(view::Live::Is(Some(600.0)))
+            })
+          })
+      })
+    },
+    w=300.0,
+    h=200.0,
+    pointing=ui::Pointing::Finger,
+  )
+  t.draw()
+  let tree = match tree_ref.v {
+    Some(tr) => tr
+    None => { debug_assert(false, "tree ref"); t.dispose(); return }
+  }
+
+  // 1. Vertical drag wins the scroller; subsequent horizontal motion must stay with the scroller
+  //    and never start or move SwipeActions.
+  t.touch(0, 150.0, 30.0)
+  t.advance(16.0)
+  t.touch(1, 150.0, 10.0)
+  t.advance(16.0)
+  t.touch(1, 150.0, -30.0)
+  t.advance(16.0)
+  t.draw()
+  let off_after_vert = scroll.at(tree)
+  debug_assert(off_after_vert > 0.0, "vertical touch drag must scroll outer View::scrolls container")
+  // Continue moving strongly horizontally while the scroller owns the gesture
+  t.touch(1, 270.0, -30.0)
+  t.advance(16.0)
+  t.draw()
+  debug_assert(!sa.dragging() && sa.offset() == 0.0, "horizontal motion after vertical scroll claim must not activate SwipeActions")
+  t.touch(2, 270.0, -30.0)
+  t.draw()
+  debug_assert(!sa.dragging() && sa.offset() == 0.0, "SwipeActions stays closed after vertical-then-horizontal release")
+
+  // Scroll back to top so the row is back at y=0..60
+  scroll.put(0.0)
+  t.draw()
+  debug_assert(scroll.at(tree) == 0.0, "scroll reset to 0 before horizontal swipe check")
+
+  // 2. Horizontal drag past slop (|dx| > 8 and |dx| > 2 * |dy|) wins via view_claimed:
+  //    SwipeActions expands continuously from 0 while outer scroller stays at 0, then snaps open on release.
+  t.touch(0, 50.0, 30.0)
+  t.advance(16.0)
+  t.touch(1, 65.0, 30.0)
+  t.advance(16.0)
+  t.draw()
+  debug_assert(sa.dragging(), "horizontal drag past slop must claim SwipeActions via view_claimed")
+  debug_assert(sa.offset() > 0.0 && sa.offset() < 20.0, "SwipeActions must expand continuously from 0 after slop subtraction")
+  debug_assert(scroll.at(tree) == 0.0, "outer scroller must not move while SwipeActions owns horizontal drag")
+
+  t.touch(1, 160.0, 30.0)
+  t.advance(16.0)
+  t.draw()
+  debug_assert(sa.dragging() && sa.offset() > 80.0, "continued horizontal drag past left_width applies rubber-band damping")
+  debug_assert(scroll.at(tree) == 0.0, "outer scroller stays at 0 during rubber-band horizontal drag")
+
+  t.touch(2, 160.0, 30.0)
+  t.draw()
+  debug_assert(!sa.dragging() && sa.open_side() == Some(headless::SwipeSide::Left) && sa.offset() == 80.0, "release past threshold snaps SwipeActions open to Left")
+
+  sa.close()
+  t.draw()
+  debug_assert(sa.open_side() is None && sa.offset() == 0.0, "programmatic close resets SwipeActions cleanly")
+  t.dispose()
+}
