@@ -57,6 +57,20 @@ let replacing_app : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
 let ui_ctx_depth : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
 let ui_ctx_native_base : mbt_compat::Ref[Option[InvarUiCtxSnap]] = mbt_compat::ref_new(None)
 let ui_ctx_epoch : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+let ui_ctx_slots_rev : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+let ui_ctx_enter_cache : mbt_compat::Ref[Option[(Int, Int, Int, Int, () -> (() -> Unit))]] = mbt_compat::ref_new(None)
+
+fn bump_ui_ctx_slots_rev() -> Unit {
+  ui_ctx_slots_rev.v = ui_ctx_slots_rev.v + 1
+  ui_ctx_enter_cache.v = None
+}
+
+fn run_window_restores(list : Array[() -> Unit]) -> Unit {
+  for r in list {
+    r()
+  }
+  bump_ui_ctx_slots_rev()
+}
 
 fn window_gen_is(wid : Int, gen : Int) -> Bool {
   match window_live_gen.get(wid) {
@@ -101,6 +115,7 @@ fn invar_ui_ctx_restore(snap : InvarUiCtxSnap) -> Unit {
   zoomed_said.v = snap.zoomed
   snap_said.v = snap.snap
   host_said_detached.v = snap.detached
+  bump_ui_ctx_slots_rev()
 }
 
 fn host_said_detached_clone[T](src : HostSaid[T]) -> HostSaid[T] {
@@ -134,6 +149,7 @@ fn fresh_all_window_slots() -> Unit {
   for k in windows_kept {
     (k.fresh)()
   }
+  bump_ui_ctx_slots_rev()
 }
 
 fn snapshot_all_window_slots_detached() -> Array[() -> Unit] {
@@ -170,6 +186,7 @@ fn snapshot_all_window_slots_detached() -> Array[() -> Unit] {
     zoomed_said.v = saved_zoomed
     snap_said.v = saved_snap
     view_app.v = None
+    bump_ui_ctx_slots_rev()
   })
   base
 }
@@ -194,6 +211,13 @@ fn register_invar_window_reactive_ctx() -> Unit {
       None => (window_now.now, window_active_gen.v)
     }
     let cap_epoch = ui_ctx_epoch.v
+    let cap_slots_rev = ui_ctx_slots_rev.v
+    match ui_ctx_enter_cache.v {
+      Some((cw, cg, ce, cr, cached_enter)) if cw == owner_wid && cg == owner_gen && ce == cap_epoch && cr == cap_slots_rev => {
+        return cached_enter
+      }
+      _ => ()
+    }
     let cap_size = tree_window_size_sig.v
     let cap_narrow_below = tree_narrow_below_sig.v
     let cap_narrow_enabled = tree_narrow_enabled_sig.v
@@ -207,7 +231,18 @@ fn register_invar_window_reactive_ctx() -> Unit {
     let cap_inset = inset_said.v
     let cap_zoomed = zoomed_said.v
     let cap_snap = snap_said.v
-    fn() -> (() -> Unit) {
+    let enter_fn = fn() -> (() -> Unit) {
+      if ui_ctx_depth.v == 0 &&
+      logical_window_now.v is None &&
+      !window_host_detached.v &&
+      !host_said_detached.v &&
+      disposing_primary_epoch.v is None &&
+      owner_wid == window_now.now &&
+      owner_gen == window_active_gen.v &&
+      cap_epoch == ui_ctx_epoch.v &&
+      cap_slots_rev == ui_ctx_slots_rev.v {
+        return signals::reactive_context_noop_leave
+      }
       let entered_epoch = ui_ctx_epoch.v
       let prev = invar_ui_ctx_snapshot()
       if ui_ctx_depth.v == 0 {
@@ -233,6 +268,7 @@ fn register_invar_window_reactive_ctx() -> Unit {
         inset_said.v = cap_inset
         zoomed_said.v = cap_zoomed
         snap_said.v = cap_snap
+        bump_ui_ctx_slots_rev()
       }
       let live_primary_override = !keep_detached_primary && owner_wid == 0 && owner_gen == 0 && disposing_primary_epoch.v.is_some() && disposing_primary_prev_live0.v
       host_said_detached.v = if live_primary_override {
@@ -251,6 +287,8 @@ fn register_invar_window_reactive_ctx() -> Unit {
         }
       }
     }
+    ui_ctx_enter_cache.v = Some((owner_wid, owner_gen, cap_epoch, cap_slots_rev, enter_fn))
+    enter_fn
   })
 }
 
@@ -408,9 +446,7 @@ pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
           } else {
             window_slots.remove(wid)
           }
-          for r in restore_list {
-            r()
-          }
+          run_window_restores(restore_list)
           glyphs_moved_since()
         }
         None => {
@@ -448,25 +484,19 @@ pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
           }
           None => prev_saved
         }
-        for r in restore_list {
-          r()
-        }
+        run_window_restores(restore_list)
         glyphs_moved_since()
       } else if stored_prev_slot {
         match window_slots.get(prev) {
           Some(restore_list) => {
             window_slots.remove(prev)
-            for r in restore_list {
-              r()
-            }
+            run_window_restores(restore_list)
             glyphs_moved_since()
           }
           None => ()
         }
       } else {
-        for r in prev_saved {
-          r()
-        }
+        run_window_restores(prev_saved)
         glyphs_moved_since()
       }
     })
@@ -561,9 +591,7 @@ fn dispose_detached_tree(
   host_said_detached.v = true
   match saved_target_slot {
     Some(restore_list) => {
-      for r in restore_list {
-        r()
-      }
+      run_window_restores(restore_list)
     }
     None => ()
   }
@@ -603,9 +631,7 @@ fn dispose_detached_tree(
     logical_window_now.v = prev_log
     window_host_detached.v = prev_host_det
     host_said_detached.v = prev_det
-    for r in restore_prev {
-      r()
-    }
+    run_window_restores(restore_prev)
     window_switching.v = false
     match suspended_overlay {
       Some(overlay) => {
@@ -669,9 +695,7 @@ fn dispose_primary_tree(t : view::Tree) -> Unit {
   match window_slots.get(0) {
     Some(restore0) => {
       window_slots.remove(0)
-      for r in restore0 {
-        r()
-      }
+      run_window_restores(restore0)
     }
     None => ()
   }
@@ -694,9 +718,7 @@ fn dispose_primary_tree(t : view::Tree) -> Unit {
       }
       None => prev_saved
     }
-    for r in restore_prev {
-      r()
-    }
+    run_window_restores(restore_prev)
     window_switching.v = false
     match suspended_overlay {
       Some(overlay) => {
@@ -916,6 +938,7 @@ fn windows_reset_checked() -> Bool {
   window_now.now = 0
   window_active_gen.v = 0
   ui_ctx_epoch.v = ui_ctx_epoch.v + 1
+  ui_ctx_enter_cache.v = None
   let my_epoch = ui_ctx_epoch.v
   logical_window_now.v = None
   ui_ctx_depth.v = 0
@@ -927,9 +950,7 @@ fn windows_reset_checked() -> Bool {
     view::without_tree_room(fn() -> Unit {
       match restore0 {
         Some(list) => {
-          for r in list {
-            r()
-          }
+          run_window_restores(list)
         }
         None => {
           fresh_all_window_slots()

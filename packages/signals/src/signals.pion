@@ -41,11 +41,17 @@ struct ComputedState[T] {
 
 let reactive_context_hooks : Array[() -> (() -> (() -> Unit))] = []
 
+/// Shared zero-allocation no-op leave sentinel for reactive context hooks.
+pub let reactive_context_noop_leave : () -> Unit = fn() -> Unit { () }
+
+let cached_ctx_pair : Array[(() -> (() -> Unit), () -> (() -> Unit), () -> (() -> Unit))] = []
+
 /// Register a lightweight reactive context capture hook.
 /// `capture()` runs when a `Computed`, `Effect`, or `Watch` is created and returns an `enter`
 /// closure; each re-evaluation calls `let leave = enter()`, executes, and calls `leave()`.
 pub fn register_reactive_context(capture : () -> (() -> (() -> Unit))) -> Unit {
   reactive_context_hooks.push(capture)
+  cached_ctx_pair.clear()
 }
 
 fn capture_reactive_context() -> Option[() -> (() -> Unit)] {
@@ -56,18 +62,54 @@ fn capture_reactive_context() -> Option[() -> (() -> Unit)] {
   if n == 1 {
     return Some((reactive_context_hooks[0])())
   }
-  let enters : Array[() -> (() -> Unit)] = []
+  if n == 2 {
+    let e0 = (reactive_context_hooks[0])()
+    let e1 = (reactive_context_hooks[1])()
+    if cached_ctx_pair.length() == 1 {
+      let c = cached_ctx_pair[0]
+      if physical_equal(c.0, e0) && physical_equal(c.1, e1) {
+        return Some(c.2)
+      }
+    }
+    let combined = fn() -> (() -> Unit) {
+      let l0 = e0()
+      let l1 = e1()
+      if physical_equal(l0, reactive_context_noop_leave) {
+        return l1
+      }
+      if physical_equal(l1, reactive_context_noop_leave) {
+        return l0
+      }
+      fn() -> Unit {
+        l1()
+        l0()
+      }
+    }
+    if cached_ctx_pair.length() == 1 {
+      cached_ctx_pair[0] = (e0, e1, combined)
+    } else {
+      cached_ctx_pair.push((e0, e1, combined))
+    }
+    return Some(combined)
+  }
+  let enters : Array[() -> (() -> Unit)] = Array::with_capacity(n)
   let mut i = 0
   while i < n {
     enters.push((reactive_context_hooks[i])())
     i += 1
   }
   Some(fn() -> (() -> Unit) {
-    let leaves : Array[() -> Unit] = []
+    let leaves : Array[() -> Unit] = Array::with_capacity(enters.length())
     let mut j = 0
     while j < enters.length() {
-      leaves.push((enters[j])())
+      let lv = (enters[j])()
+      if !physical_equal(lv, reactive_context_noop_leave) {
+        leaves.push(lv)
+      }
       j += 1
+    }
+    if leaves.length() == 0 {
+      return reactive_context_noop_leave
     }
     fn() -> Unit {
       let mut k = leaves.length() - 1
@@ -541,7 +583,9 @@ fn effect_of(f : () -> Option[() -> Unit], loc : String) -> () -> Unit {
     Some(enter) => fn() -> Option[() -> Unit] {
       let leave = enter()
       let res = wrap_effect_cleanup(f(), ctx_enter)
-      leave()
+      if !physical_equal(leave, reactive_context_noop_leave) {
+        leave()
+      }
       res
     }
     None => f
@@ -661,7 +705,9 @@ fn update_computed[T](c : Int, state : ComputedState[T]) -> Bool {
     Some(enter) => {
       let leave = enter()
       let v = (state.getter)(old_value)
-      leave()
+      if !physical_equal(leave, reactive_context_noop_leave) {
+        leave()
+      }
       v
     }
     None => (state.getter)(old_value)
