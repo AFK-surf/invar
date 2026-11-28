@@ -834,11 +834,8 @@ static int run_v8_v9_2d_roi(void) {
       ok &= v12_ok;
     }
 
-    // V12-Through-Hole-Adaptive-Ink: Light adaptive glass over a kind == 9 native-view hole keeps light glass
-    // + dark icon (kind 10) + dark opaque adaptive_ink bar (kind 0, pad.w < 0): the hole's transparent backdrop
-    // (a == 0) is composited over white before its luma; the same capsule over the opaque black stage (a == 1) and
-    // one over a 70% black scrim on the hole (premultiplied, Porter-Duff over) still flip to dark glass + white ink.
-    // Dark Regular glass over the hole keeps a soft edge (its dark contour gated by the backdrop's alpha).
+    // V12-Through-Hole-Adaptive-Ink: Stateless render_rgba (ad_mode = -1) verifies unslotted same-polarity fallback
+    // (light glass + dark ink over hole, stage, and 70% scrim) plus Dark Regular glass soft edge over kind == 9 hole.
     {
       static uint8_t tbuf[400 * 330 * 2 * 2 * 4];
       const int TW = 400, TH = 330, TPW = TW * 2, TPH = TH * 2;
@@ -846,7 +843,7 @@ static int run_v8_v9_2d_roi(void) {
       push_inst(inst, &nt, 0.0, 0.0, TW, TH, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
       push_inst(inst, &nt, 0.0, 0.0, 200.0, TH, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 8388608.0 + 7.0, 0.0, 0.0, 0.0);
       auto capsule = [&](double x, double y, double w, double h, double tid) {
-        push_inst(inst, &nt, x, y, w, h, h * 0.5, 6.0, 1.0, 2.0, 253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
+        push_inst(inst, &nt, x, y, w, h, h * 0.5, 6.0, -1.0, 2.0, 253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
                   0.0, 14.0, -1.0, 1.0, tid, 0.0, 0.0, 0.0);
       };
       auto icon = [&](double x, double y, double cx, double cy, double hr, double g) {
@@ -878,9 +875,9 @@ static int run_v8_v9_2d_roi(void) {
           if (ow < d_min) d_min = ow;
         }
       int th_ok = (a_gl[3] >= 100 && a_gl[3] <= 170 && a_gl[0] >= a_gl[3] - 12) && (a_tx < 0.25 && a_br < 0.25) &&
-                  (b_gl[3] == 255 && b_gl_l < 0.35) && (b_tx > 0.75 && b_br > 0.75) && (c_tx > 0.75 && c_br > 0.75) &&
+                  (b_gl[3] == 255 && b_gl_l > 0.50) && (b_tx < 0.25 && b_br < 0.25) && (c_tx < 0.25 && c_br < 0.25) &&
                   (d_min >= 90);
-      printf("  [%s] V12-Through-Hole-Adaptive-Ink: hole=(gl=%d/%d tx=%.3f br=%.3f) stage=(gl=%.3f a=%d tx=%.3f br=%.3f) scrim70=(tx=%.3f br=%.3f) darkRegEdgeOverWhite=%d (>=90)\n",
+      printf("  [%s] V12-Through-Hole-Adaptive-Ink (unslotted fallback): hole=(gl=%d/%d tx=%.3f br=%.3f) stage=(gl=%.3f a=%d tx=%.3f br=%.3f) scrim70=(tx=%.3f br=%.3f) darkRegEdgeOverWhite=%d (>=90)\n",
              th_ok ? "PASS" : "FAIL", a_gl[0], a_gl[3], a_tx, a_br, b_gl_l, b_gl[3], b_tx, b_br, c_tx, c_br, d_min);
       ok &= th_ok;
     }
@@ -920,7 +917,7 @@ static int run_warp_smoke(void) {
     ok &= check_rgb("V2 dark regular on #1B1C1F", r, g, b, 58, 59, 62, 3);
   }
 
-  // Vector 3: Dark Adaptive Regular (c2.z = -1.0) over #FFFFFF (t=1) -> (174, 174, 174)
+  // Vector 3: Dark Adaptive Regular (c2.z = -1.0) over #FFFFFF -> same-polarity densified dark glass (~90, never flipped to 174)
   {
     int n = 0;
     push_inst(inst, &n, gx, gy, gw, gh, gr, 6.0, 1.0, 1.2,
@@ -928,7 +925,7 @@ static int run_warp_smoke(void) {
               0.6, 14.0, -1.0, 1.0,
               -1.0, 20.0, 0.06, 0.0);
     if (!render_and_sample(inst, n, 1.0, 1.0, 1.0, cx, cy, &r, &g, &b)) return 0;
-    ok &= check_rgb("V3 dark adaptive regular on #FFFFFF", r, g, b, 174, 174, 174, 3);
+    ok &= check_rgb("V3 dark adaptive regular on #FFFFFF", r, g, b, 90, 90, 90, 6);
   }
 
   // Vector 4: Light Regular (#FDFCFD67) over #0088FF -> (89, 206, 255), HSV S >= 0.62
@@ -1012,11 +1009,11 @@ static int run_warp_smoke(void) {
     const int W = 320, H = 240;
     static uint8_t pxbuf[320 * 240 * 4];
     double ad_inst[4 * INST_SIZE];
-    auto build_ad = [&](double tint_a) -> int {
+    auto build_ad = [&](double tint_a, double sat_sign) -> int {
       int n = 0;
       push_inst(ad_inst, &n, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
                 0.08, 0.08, 0.08, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-      push_inst(ad_inst, &n, 16.0, 12.0, 128.0, 96.0, 16.0, 6.0, 1.0, 1.0,
+      push_inst(ad_inst, &n, 16.0, 12.0, 128.0, 96.0, 16.0, 6.0, sat_sign, 1.0,
                 253.0/255.0, 252.0/255.0, 253.0/255.0, tint_a,
                 0.0, 4.0, -1.0, 1.0, -50.0, 0.0, 0.0, 0.0);
       push_inst(ad_inst, &n, 64.0, 52.0, 32.0, 16.0, 6.0, 10.0, 0.0, 0.0,
@@ -1036,15 +1033,15 @@ static int run_warp_smoke(void) {
     mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
     mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
 
-    // 1. Baseline 0x67 over full dark flips dark (ink bright > 180, glass dark < 90)
-    int n0 = build_ad(103.0 / 255.0);
+    // 1. Clear-invert opt-in (a[6] = -1.0) 0x67 over full dark flips dark (ink bright > 180, glass dark < 90)
+    int n0 = build_ad(103.0 / 255.0, -1.0);
     if (!present_and_read(n0)) return 0;
     size_t k_ink = (120 * W + 160) * 4;
     size_t k_gl = (64 * W + 64) * 4;
     int ink0 = pxbuf[k_ink], gl0 = pxbuf[k_gl];
 
     // 2. Raise tint_a to 0.913 on the same slot: snaps immediately to light glass (> 215) + dark ink (< 65), settling == 0
-    int n1 = build_ad(0.913);
+    int n1 = build_ad(0.913, -1.0);
     if (!present_and_read(n1)) return 0;
     int ink1 = pxbuf[k_ink], gl1 = pxbuf[k_gl];
     int settling1 = mb_render_adaptive_settling(0);
@@ -1052,15 +1049,23 @@ static int run_warp_smoke(void) {
     // 3. Reset slots and draw fresh 0.752 capsule over full dark: stays light glass (> 180) + dark ink (< 65)
     mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
     mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
-    int n65 = build_ad(0.752);
+    int n65 = build_ad(0.752, -1.0);
     if (!present_and_read(n65)) return 0;
     int ink65 = pxbuf[k_ink], gl65 = pxbuf[k_gl];
 
+    // 4. Default same-polarity light adaptive (a[6] = +1.0) over full dark stays bright & densified (> 155) + dark ink (< 65)
+    mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+    mb_render_present(ad_inst, 0, 0.08, 0.08, 0.08);
+    int nsp = build_ad(103.0 / 255.0, 1.0);
+    if (!present_and_read(nsp)) return 0;
+    int ink_sp = pxbuf[k_ink], gl_sp = pxbuf[k_gl];
+
     int ad3_ok = (ink0 > 180 && gl0 < 90) &&
                  (ink1 < 65 && gl1 > 215 && settling1 == 0) &&
-                 (ink65 < 65 && gl65 > 180);
-    printf("  [%s] V13 light adaptive opacity: 0x67=(ink=%d,gl=%d) 0.913=(ink=%d,gl=%d,settling=%d) 0.752=(ink=%d,gl=%d)\n",
-           ad3_ok ? "PASS" : "FAIL", ink0, gl0, ink1, gl1, settling1, ink65, gl65);
+                 (ink65 < 65 && gl65 > 180) &&
+                 (ink_sp < 65 && gl_sp > 155);
+    printf("  [%s] V13 light adaptive opacity & same-polarity: inv0x67=(ink=%d,gl=%d) 0.913=(ink=%d,gl=%d,settling=%d) 0.752=(ink=%d,gl=%d) samePol=(ink=%d,gl=%d)\n",
+           ad3_ok ? "PASS" : "FAIL", ink0, gl0, ink1, gl1, settling1, ink65, gl65, ink_sp, gl_sp);
     ok &= ad3_ok;
 
     // V13-B: Uniform capsule ink across mixed dark/bright backdrop (no local per-glyph inversion)
@@ -1090,13 +1095,13 @@ static int run_warp_smoke(void) {
       int l_right = px_luma_of(pxbuf, W, 240, 120);
       int uniform_ok = (l_left < 80) && (l_right < 80) && (abs(l_left - l_right) < 25);
 
-      // Opaque vs translucent adaptive kind==0 fills on flipped dark capsule
+      // Opaque vs translucent adaptive kind==0 fills on clear-invert dark capsule (a[6] = -1.0)
       mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
       mb_render_present(ad_inst, 0, 0.05, 0.05, 0.06);
       nm = 0;
       push_inst(mix_inst, &nm, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
                 0.05, 0.05, 0.06, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-      push_inst(mix_inst, &nm, 10.0, 38.0, 140.0, 44.0, 22.0, 6.0, 1.0, 1.0,
+      push_inst(mix_inst, &nm, 10.0, 38.0, 140.0, 44.0, 22.0, 6.0, -1.0, 1.0,
                 253.0/255.0, 252.0/255.0, 253.0/255.0, 103.0/255.0,
                 0.0, 4.0, -1.0, 1.0, -52.0, 0.0, 0.0, 0.0);
       push_inst(mix_inst, &nm, 26.0, 52.0, 36.0, 16.0, 4.0, 0.0, 0.0, 0.0,
@@ -1113,9 +1118,27 @@ static int run_warp_smoke(void) {
       int opq_l = px_luma_of(pxbuf, W, 88, 120);
       int trn_l = px_luma_of(pxbuf, W, 232, 120);
       int fill_ok = (opq_l >= 235) && (trn_l < 150);
-      int v13b_ok = uniform_ok && fill_ok;
-      printf("  [%s] V13-B uniform capsule ink & opaque adaptive fill: mix=(%d,%d) opq=%d (>=235) trn=%d (<150)\n",
-             v13b_ok ? "PASS" : "FAIL", l_left, l_right, opq_l, trn_l);
+
+      // Dark more_contrast (tint_a = 0.52 -> is_dark == 2) over white must densify (60..112)
+      mb_host_render_dirty(0.0, 0.0, -1.0, -1.0);
+      mb_render_present(ad_inst, 0, 1.0, 1.0, 1.0);
+      nm = 0;
+      push_inst(mix_inst, &nm, 0.0, 0.0, 160.0, 120.0, 0.0, 0.0, 0.0, 0.0,
+                1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      push_inst(mix_inst, &nm, 16.0, 12.0, 128.0, 96.0, 16.0, 6.0, 1.0, 1.0,
+                32.0/255.0, 32.0/255.0, 32.0/255.0, 0.52,
+                0.0, 4.0, -1.0, 1.0, -53.0, 0.0, 0.0, 0.0);
+      mb_host_render_dirty(0.0, 0.0, 160.0, 120.0);
+      mb_render_present(mix_inst, nm, 1.0, 1.0, 1.0);
+      memset(pxbuf, 0, sizeof pxbuf);
+      g_test_buf_len = sizeof pxbuf;
+      if (!mb_render_drawn_pixels(0, 0, W, H, pxbuf)) return 0;
+      int mc_r = pxbuf[(120 * W + 160) * 4];
+      int mc_ok = (mc_r >= 60 && mc_r <= 112);
+
+      int v13b_ok = uniform_ok && fill_ok && mc_ok;
+      printf("  [%s] V13-B uniform capsule ink, opaque adaptive fill & dark more_contrast: mix=(%d,%d) opq=%d (>=235) trn=%d (<150) dark_mc=%d (60..112)\n",
+             v13b_ok ? "PASS" : "FAIL", l_left, l_right, opq_l, trn_l, mc_r);
       ok &= v13b_ok;
     }
 

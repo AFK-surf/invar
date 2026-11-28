@@ -523,8 +523,8 @@ function buildHtmlPage(programs) {
         {
           name: 'V3 dark adaptive regular on #FFFFFF',
           got: sampleGlass([1, 1, 1], darkTint, 1.2, 0.6, 14.0, 20.0, 0.06, true),
-          check: ([r, g, b]) => Math.abs(r - 174) <= 3 && Math.abs(g - 174) <= 3 && Math.abs(b - 174) <= 3,
-          expected: '(174,174,174) +/-3',
+          check: ([r, g, b]) => Math.abs(r - 90) <= 6 && Math.abs(g - 90) <= 6 && Math.abs(b - 90) <= 6,
+          expected: '(90,90,90) +/-6',
         },
         {
           name: 'V4 light regular on #0088FF',
@@ -1292,7 +1292,7 @@ function buildHtmlPage(programs) {
         canvas.width = W3;
         canvas.height = H3;
 
-        const runAdCase = (darkW, tintA, isNew) => {
+        const runAdCase = (darkW, tintA, isNew, isInverting = true) => {
           // Upload backdrop texture (top-down matching u_map = (1/wPt, 1/hPt, 0, 0))
           const bgBuf = new Uint8Array(W3 * H3 * 4);
           const darkPx = Math.round(darkW * S3);
@@ -1322,7 +1322,7 @@ function buildHtmlPage(programs) {
           gl.uniform4f(gl.getUniformLocation(adP, 'u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
           gl.uniform4f(gl.getUniformLocation(adP, 'u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
           gl.uniform4f(gl.getUniformLocation(adP, 'u_box'), 200.0, 150.0, 160.0, 22.0);
-          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), -tintA, isNew ? 1.0 : 0.0, 1.0 / 60.0, 0.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), -tintA, (isNew ? 1.0 : 0.0) + (isInverting ? 4.0 : 0.0), 1.0 / 60.0, 0.0);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           const adPx = new Uint8Array(4);
           gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, adPx);
@@ -1358,7 +1358,7 @@ function buildHtmlPage(programs) {
           gl.uniform4f(u('u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
           gl.uniform4f(u('u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
           gl.vertexAttrib4f(0, 40.0, 128.0, 320.0, 44.0);
-          gl.vertexAttrib4f(1, 22.0, 6.0, 1.0, 2.0);
+          gl.vertexAttrib4f(1, 22.0, 6.0, isInverting ? -1.0 : 1.0, 2.0);
           gl.vertexAttrib4f(2, 253 / 255, 252 / 255, 253 / 255, tintA);
           gl.vertexAttrib4f(3, 0.0, 14.0, -1.0, 1.0);
           gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
@@ -1438,7 +1438,7 @@ function buildHtmlPage(programs) {
           gl.uniform4f(gl.getUniformLocation(adP, 'u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
           gl.uniform4f(gl.getUniformLocation(adP, 'u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
           gl.uniform4f(gl.getUniformLocation(adP, 'u_box'), 200.0, 150.0, 160.0, 22.0);
-          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), -103 / 255, 1.0 + (through ? 2.0 : 0.0), 1.0 / 60.0, 0.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), -103 / 255, 1.0 + (through ? 2.0 : 0.0) + 4.0, 1.0 / 60.0, 0.0);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           const adPx = new Uint8Array(4);
           gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, adPx);
@@ -1488,12 +1488,67 @@ function buildHtmlPage(programs) {
         const hScrim = runHoleCase([0, 0, 0, 179], true);
         const v14Ok = hHole.adT <= 0.05 && hHole.inkSlot < 0.25 && hHole.inkFallback < 0.25 &&
           hLegacy.adT >= 0.95 &&
-          hStage.adT >= 0.95 && hStage.inkSlot > 0.75 && hStage.inkFallback > 0.75 &&
-          hScrim.adT >= 0.95 && hScrim.inkSlot > 0.75 && hScrim.inkFallback > 0.75;
+          hStage.adT >= 0.95 && hStage.inkSlot > 0.75 && hStage.inkFallback < 0.25 &&
+          hScrim.adT >= 0.95 && hScrim.inkSlot > 0.75 && hScrim.inkFallback < 0.25;
         const r3 = (v) => Number(v.toFixed(3));
-        pushVec('V14 adaptive glass over kind 9 hole (through: dark ink; opaque stage & 70% scrim: white ink)', v14Ok,
+        pushVec('V14 adaptive glass over kind 9 hole (through: dark ink; clear-invert stage & 70% scrim: white ink slotted, dark ink unslotted)', v14Ok,
           [r3(hHole.adT), r3(hHole.inkSlot), r3(hHole.inkFallback), r3(hLegacy.adT), r3(hStage.adT), r3(hStage.inkSlot), r3(hStage.inkFallback), r3(hScrim.adT), r3(hScrim.inkSlot), r3(hScrim.inkFallback)],
-          'hole t<=0.05 ink<0.25 (slot & fallback), no-through hole t>=0.95, stage & scrim70 t>=0.95 ink>0.75 (slot & fallback)');
+          'hole t<=0.05 ink<0.25, no-through hole t>=0.95, stage & scrim70 t>=0.95 inkSlot>0.75 inkFallback<0.25');
+
+        // V15: Same-polarity default light adaptive on black (stays bright & densified, dark ink) + dark more_contrast (is_dark==2, tint_a=0.52) over white
+        const rSamePol = runAdCase(400, 103 / 255, true, false);
+        const bgWhite = new Uint8Array(W3 * H3 * 4).fill(255);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, bdTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W3, H3, 0, gl.RGBA, gl.UNSIGNED_BYTE, bgWhite);
+        {
+          const cur = adC, nxt = 1 - cur;
+          gl.disable(gl.BLEND);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, adF[nxt]);
+          gl.viewport(0, 0, 16, 1);
+          gl.useProgram(adP);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.uniform1i(gl.getUniformLocation(adP, 'u_bd'), 0);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, adT[cur]);
+          gl.uniform1i(gl.getUniformLocation(adP, 'u_prev'), 1);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_map'), 1.0 / wPt, 1.0 / hPt, 0.0, 0.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_uvc'), 0.5 / W3, 0.5 / H3, 1.0 - 0.5 / W3, 1.0 - 0.5 / H3);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_box'), 200.0, 150.0, 160.0, 22.0);
+          gl.uniform4f(gl.getUniformLocation(adP, 'u_param'), 2.0 + 0.52, 1.0, 1.0 / 60.0, 0.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          adC = nxt;
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+          gl.viewport(0, 0, W3, H3);
+          gl.clearColor(1, 1, 1, 1);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.useProgram(prog);
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.activeTexture(gl.TEXTURE4);
+          gl.bindTexture(gl.TEXTURE_2D, adT[adC]);
+          gl.uniform1i(u('u_bd'), 0);
+          gl.uniform1i(u('u_ad'), 4);
+          gl.uniform1i(u('u_ad_n'), 1);
+          gl.uniform4f(u('u_ad_box[0]'), 200.0, 150.0, 160.0, 22.0);
+          gl.vertexAttrib4f(0, 40.0, 128.0, 320.0, 44.0);
+          gl.vertexAttrib4f(1, 22.0, 6.0, 1.0, 2.0);
+          gl.vertexAttrib4f(2, 32 / 255, 32 / 255, 32 / 255, 0.52);
+          gl.vertexAttrib4f(3, 0.0, 14.0, -1.0, 1.0);
+          gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
+          gl.vertexAttrib4f(5, -1.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(9, 22.0, 22.0, 22.0, 22.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+        const mcPx = new Uint8Array(4);
+        gl.readPixels(Math.round(200 * S3), H3 - 1 - Math.round(150 * S3), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, mcPx);
+        const v15Ok = rSamePol.glassR > 0.62 && rSamePol.ink < 0.25 && mcPx[0] >= 60 && mcPx[0] <= 112;
+        pushVec('V15 same-polarity light on black & dark more_contrast (is_dark==2) on white', v15Ok,
+          [r3(rSamePol.glassR), r3(rSamePol.ink), mcPx[0]],
+          'samePol glass>0.62 ink<0.25, dark_mc r in 60..112');
 
         gl.useProgram(prog);
         gl.uniform1i(u('u_ad_n'), 0);
@@ -1512,7 +1567,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 15,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 16,
       passed,
       total: programs.length,
       drawPassed,

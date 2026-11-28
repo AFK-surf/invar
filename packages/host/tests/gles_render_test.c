@@ -776,6 +776,92 @@ int main(void) {
     free(p_opt);
   }
 
+  // 8) Same-polarity adaptive liquid glass, opt-in clear-invert, dark more_contrast (is_dark==2) easing, & .soft curve.
+  {
+    double sp[3 * MB_INST];
+    // 8a) Default same-polarity light adaptive (a[6] = +1.0) on black: bright densified glass (> 0.62) + dark ink (< 0.25)
+    memset(sp, 0, sizeof(sp));
+    rect_at(sp, 0, 0, 150, 300, 0, 0.0, 0.0, 0.0, 0, 150.0, 300.0);
+    rect_at(sp + MB_INST, 15, 20, 120, 80, 6, 253.0/255.0, 252.0/255.0, 253.0/255.0, -70, 150.0, 300.0);
+    sp[MB_INST + 4] = 20.0; sp[MB_INST + 6] = 1.0; sp[MB_INST + 7] = 2.0;
+    sp[MB_INST + 11] = 0x67 / 255.0; sp[MB_INST + 13] = 10.0; sp[MB_INST + 14] = -1.0; sp[MB_INST + 15] = 1.0;
+    rect_at(sp + 2 * MB_INST, 55, 50, 24, 20, 10, 0.14, 0.15, 0.17, 0, 150.0, 300.0);
+    sp[2 * MB_INST + 4] = 6.0;
+    sp[2 * MB_INST + 12] = 0.1; sp[2 * MB_INST + 13] = 0.5; sp[2 * MB_INST + 14] = 0.9; sp[2 * MB_INST + 15] = 0.5;
+    sp[2 * MB_INST + 21] = 75.0; sp[2 * MB_INST + 22] = 60.0; sp[2 * MB_INST + 23] = 40.0;
+    glass_forget();
+    gl_adaptive_reset();
+    gl_present(sp, 3, 0.0, 0.0, 0.0);
+    unsigned char *px_sp = pixels_of_fb(test_fb);
+    int sp_gl = px_sp[((fb_h - 1 - 60 * 2) * fb_w + 100 * 2) * 4];
+    int sp_ink = px_sp[((fb_h - 1 - 60 * 2) * fb_w + 67 * 2) * 4];
+    free(px_sp);
+    CHECK(sp_gl > 158);
+    CHECK(sp_ink < 64);
+
+    // 8b) Opt-in clear-invert light adaptive (a[6] = -1.0) on black: dark glass (< 90) + white ink (> 190)
+    sp[MB_INST + 6] = -1.0;
+    glass_forget();
+    gl_adaptive_reset();
+    gl_present(sp, 3, 0.0, 0.0, 0.0);
+    unsigned char *px_inv = pixels_of_fb(test_fb);
+    int inv_gl = px_inv[((fb_h - 1 - 60 * 2) * fb_w + 100 * 2) * 4];
+    int inv_ink = px_inv[((fb_h - 1 - 60 * 2) * fb_w + 67 * 2) * 4];
+    free(px_inv);
+    CHECK(inv_gl < 90);
+    CHECK(inv_ink > 190);
+
+    // 8c) Dark more_contrast (tint_a = 0.52 -> is_dark == 2) over white densifies (60..112) and eases smoothly dark -> white
+    double mc[2 * MB_INST];
+    memset(mc, 0, sizeof(mc));
+    rect_at(mc, 0, 0, 150, 300, 0, 0.05, 0.05, 0.05, 0, 150.0, 300.0);
+    rect_at(mc + MB_INST, 15, 20, 120, 80, 6, 32.0/255.0, 32.0/255.0, 32.0/255.0, -71, 150.0, 300.0);
+    mc[MB_INST + 4] = 20.0; mc[MB_INST + 6] = 1.0; mc[MB_INST + 7] = 2.0;
+    mc[MB_INST + 11] = 0.52; mc[MB_INST + 13] = 10.0; mc[MB_INST + 14] = -1.0; mc[MB_INST + 15] = 1.0;
+    gl_set_fixed_dt(1.0 / 60.0);
+    glass_forget();
+    gl_adaptive_reset();
+    gl_present(mc, 2, 0.05, 0.05, 0.05);
+    rect_at(mc, 0, 0, 150, 300, 0, 1.0, 1.0, 1.0, 0, 150.0, 300.0);
+    gl_present(mc, 2, 1.0, 1.0, 1.0);
+    CHECK(gl_adaptive_settling() == 1);
+    unsigned char *px_mc1 = pixels_of_fb(test_fb);
+    int mc_f1 = px_mc1[((fb_h - 1 - 60 * 2) * fb_w + 75 * 2) * 4];
+    free(px_mc1);
+    for (int k = 0; k < 40; k++) gl_present(mc, 2, 1.0, 1.0, 1.0);
+    unsigned char *px_mc40 = pixels_of_fb(test_fb);
+    int mc_f40 = px_mc40[((fb_h - 1 - 60 * 2) * fb_w + 75 * 2) * 4];
+    free(px_mc40);
+    CHECK(mc_f40 < mc_f1 - 3);
+    CHECK(mc_f40 >= 60 && mc_f40 <= 112);
+    CHECK(gl_adaptive_settling() == 0);
+
+    // 8d) .soft progressive scroll-edge (kind == 5, a[22] = -1.0, col.a = 0.96): dark on dark matches ground; dark on white dissolves top & fades bottom
+    double ap[2 * MB_INST];
+    memset(ap, 0, sizeof(ap));
+    rect_at(ap, 0, 0, 150, 300, 0, 0.08, 0.08, 0.08, 0, 150.0, 300.0);
+    rect_at(ap + MB_INST, 0, 0, 150, 68.0, 5, 0.08, 0.08, 0.08, -72, 150.0, 300.0);
+    ap[MB_INST + 6] = 1.0; ap[MB_INST + 7] = 12.0; ap[MB_INST + 11] = 0.96; ap[MB_INST + 15] = 1.0;
+    ap[MB_INST + 22] = -1.0; ap[MB_INST + 54] = 68.0; ap[MB_INST + 55] = 20.0;
+    glass_forget();
+    gl_adaptive_reset();
+    gl_present(ap, 2, 0.08, 0.08, 0.08);
+    unsigned char *px_same = pixels_of_fb(test_fb);
+    int same_r = px_same[((fb_h - 1 - 16 * 2) * fb_w + 75 * 2) * 4];
+    free(px_same);
+    rect_at(ap, 0, 0, 150, 300, 0, 1.0, 1.0, 1.0, 0, 150.0, 300.0);
+    glass_forget();
+    gl_adaptive_reset();
+    gl_present(ap, 2, 1.0, 1.0, 1.0);
+    unsigned char *px_opp = pixels_of_fb(test_fb);
+    int opp_top_r = px_opp[((fb_h - 1 - 10 * 2) * fb_w + 75 * 2) * 4];
+    int opp_bot_r = px_opp[((fb_h - 1 - 65 * 2) * fb_w + 75 * 2) * 4];
+    free(px_opp);
+    CHECK(abs(same_r - 20) <= 3);
+    CHECK(opp_top_r <= 45);
+    CHECK(opp_bot_r >= 225);
+  }
+
   CHECK(feedback_loops == 0);
   CHECK(glGetError() == GL_NO_ERROR);
 
