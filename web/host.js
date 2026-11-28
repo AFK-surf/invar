@@ -4389,6 +4389,16 @@
   const layers = new Map();
   let layerF32 = new Float32Array(INST * 256);
 
+  function texSourceOf(tid) {
+    return tid > LAYER_TEX
+      ? layers.get(tid - LAYER_TEX)
+      : tid > STREAM_TEX
+        ? streams.get(tid - STREAM_TEX)
+        : tid
+          ? images.get(tid)
+          : null;
+  }
+
   function flipLayerUVs(arr, count) {
     for (let i = 0; i < count; i++) {
       const b = i * INST;
@@ -4932,7 +4942,7 @@
       // a stream's picture (STREAM_TEX + its id): nothing until a frame of its own shows; a hole's image is its
       // view's (src/hostapi/host.mbt view_tex_base + its id), the element under the canvas here
       // (in a window beside the page, its own texture of each: slotTex)
-      const im = h ? null : tid > LAYER_TEX ? layers.get(tid - LAYER_TEX) : tid > STREAM_TEX ? streams.get(tid - STREAM_TEX) : tid ? images.get(tid) : null;
+      const im = h ? null : texSourceOf(tid);
       const tex = !im || !im.tex ? null : winActive === 0 ? im.tex : slotTex(wins[winActive], tid, im);
       if (!h && tid > STREAM_TEX && !tex) {
         start = end;
@@ -5493,8 +5503,82 @@
     }
     return { ok: true, w, h, pixels: new Uint8Array(u8.buffer, u8.byteOffset + 16, w * h * 4) };
   }
+  function downscaleRawPremulRows(src, sw, sh, out, dw, dh, yStart, yEnd) {
+    // Exact integer-weight box / area averaging (Fant filter) matching native raw_premul.h.
+    const totalW = sw * sh;
+    const den = totalW * 2;
+    for (let y = yStart; y < yEnd; y++) {
+      const sy0 = y * sh;
+      const sy1 = (y + 1) * sh;
+      const iy0 = Math.floor(sy0 / dh);
+      const iy1 = Math.floor((sy1 - 1) / dh);
+      const dstRow = y * dw * 4;
+      for (let x = 0; x < dw; x++) {
+        const sx0 = x * sw;
+        const sx1 = (x + 1) * sw;
+        const ix0 = Math.floor(sx0 / dw);
+        const ix1 = Math.floor((sx1 - 1) / dw);
+        const wx0 = ix0 === ix1 ? sw : ((ix0 + 1) * dw - sx0);
+        const wx1 = ix0 === ix1 ? 0 : (sx1 - ix1 * dw);
+        let sr = 0, sg = 0, sb = 0, sa = 0;
+        for (let iy = iy0; iy <= iy1; iy++) {
+          const yLo = iy * dh > sy0 ? iy * dh : sy0;
+          const yHi = (iy + 1) * dh < sy1 ? (iy + 1) * dh : sy1;
+          const wy = yHi - yLo;
+          const row = iy * sw * 4;
+          const p0 = row + ix0 * 4;
+          let rr = src[p0] * wx0;
+          let rg = src[p0 + 1] * wx0;
+          let rb = src[p0 + 2] * wx0;
+          let ra = src[p0 + 3] * wx0;
+          if (ix0 + 1 < ix1) {
+            let ir = 0, ig = 0, ib = 0, ia = 0;
+            for (let ix = ix0 + 1; ix < ix1; ix++) {
+              const p = row + ix * 4;
+              ir += src[p];
+              ig += src[p + 1];
+              ib += src[p + 2];
+              ia += src[p + 3];
+            }
+            rr += ir * dw;
+            rg += ig * dw;
+            rb += ib * dw;
+            ra += ia * dw;
+          }
+          if (ix1 > ix0) {
+            const p1 = row + ix1 * 4;
+            rr += src[p1] * wx1;
+            rg += src[p1 + 1] * wx1;
+            rb += src[p1 + 2] * wx1;
+            ra += src[p1 + 3] * wx1;
+          }
+          sr += rr * wy;
+          sg += rg * wy;
+          sb += rb * wy;
+          sa += ra * wy;
+        }
+        let a = Math.floor((sa * 2 + totalW) / den);
+        if (a > 255) a = 255;
+        let r = Math.floor((sr * 2 + totalW) / den);
+        let g = Math.floor((sg * 2 + totalW) / den);
+        let bl = Math.floor((sb * 2 + totalW) / den);
+        if (r > a) r = a;
+        if (g > a) g = a;
+        if (bl > a) bl = a;
+        const dst = dstRow + x * 4;
+        out[dst] = r;
+        out[dst + 1] = g;
+        out[dst + 2] = bl;
+        out[dst + 3] = a;
+      }
+    }
+  }
   function downscaleRawPremul(src, sw, sh, dw, dh) {
     const out = new Uint8Array(dw * dh * 4);
+    if (dw <= sw && dh <= sh) {
+      downscaleRawPremulRows(src, sw, sh, out, dw, dh, 0, dh);
+      return out;
+    }
     const sxScale = sw / dw;
     const syScale = sh / dh;
     for (let y = 0; y < dh; y++) {
@@ -5530,6 +5614,102 @@
           else if (v > a) v = a;
           out[dst + c] = v;
         }
+        out[dst + 3] = a;
+      }
+    }
+    return out;
+  }
+  async function downscaleRawPremulAsync(src, sw, sh, dw, dh, isAlive) {
+    const out = new Uint8Array(dw * dh * 4);
+    const SLICE_SRC_PX = 262144;
+    const srcRowsPerDstRow = Math.max(1, Math.ceil(sh / dh));
+    const srcPxPerDstRow = Math.max(1, sw * srcRowsPerDstRow);
+    if (srcPxPerDstRow <= SLICE_SRC_PX) {
+      const rowsPerChunk = Math.max(1, Math.min(dh, Math.floor(SLICE_SRC_PX / srcPxPerDstRow)));
+      for (let y = 0; y < dh; y += rowsPerChunk) {
+        await new Promise((r) => setTimeout(r, 0));
+        if (!isAlive()) return null;
+        downscaleRawPremulRows(src, sw, sh, out, dw, dh, y, Math.min(dh, y + rowsPerChunk));
+      }
+      return out;
+    }
+    // Extreme vertical compression (single dst row > SLICE_SRC_PX src pixels, e.g. 2048x16384 -> 1x1):
+    // slice each dst row into source-row strips and accumulate exact integer weights per column.
+    const totalW = sw * sh;
+    const den = totalW * 2;
+    const srcRowsStep = Math.max(1, Math.floor(SLICE_SRC_PX / Math.max(1, sw)));
+    const acc = new Float64Array(dw * 4);
+    for (let y = 0; y < dh; y++) {
+      const sy0 = y * sh;
+      const sy1 = (y + 1) * sh;
+      const iy0 = Math.floor(sy0 / dh);
+      const iy1 = Math.floor((sy1 - 1) / dh);
+      acc.fill(0);
+      for (let strip = iy0; strip <= iy1; strip += srcRowsStep) {
+        await new Promise((r) => setTimeout(r, 0));
+        if (!isAlive()) return null;
+        const stripEnd = Math.min(iy1, strip + srcRowsStep - 1);
+        for (let iy = strip; iy <= stripEnd; iy++) {
+          const yLo = iy * dh > sy0 ? iy * dh : sy0;
+          const yHi = (iy + 1) * dh < sy1 ? (iy + 1) * dh : sy1;
+          const wy = yHi - yLo;
+          const row = iy * sw * 4;
+          for (let x = 0; x < dw; x++) {
+            const sx0 = x * sw;
+            const sx1 = (x + 1) * sw;
+            const ix0 = Math.floor(sx0 / dw);
+            const ix1 = Math.floor((sx1 - 1) / dw);
+            const wx0 = ix0 === ix1 ? sw : ((ix0 + 1) * dw - sx0);
+            const wx1 = ix0 === ix1 ? 0 : (sx1 - ix1 * dw);
+            const p0 = row + ix0 * 4;
+            let rr = src[p0] * wx0;
+            let rg = src[p0 + 1] * wx0;
+            let rb = src[p0 + 2] * wx0;
+            let ra = src[p0 + 3] * wx0;
+            if (ix0 + 1 < ix1) {
+              let ir = 0, ig = 0, ib = 0, ia = 0;
+              for (let ix = ix0 + 1; ix < ix1; ix++) {
+                const p = row + ix * 4;
+                ir += src[p];
+                ig += src[p + 1];
+                ib += src[p + 2];
+                ia += src[p + 3];
+              }
+              rr += ir * dw;
+              rg += ig * dw;
+              rb += ib * dw;
+              ra += ia * dw;
+            }
+            if (ix1 > ix0) {
+              const p1 = row + ix1 * 4;
+              rr += src[p1] * wx1;
+              rg += src[p1 + 1] * wx1;
+              rb += src[p1 + 2] * wx1;
+              ra += src[p1 + 3] * wx1;
+            }
+            const ao = x * 4;
+            acc[ao] += rr * wy;
+            acc[ao + 1] += rg * wy;
+            acc[ao + 2] += rb * wy;
+            acc[ao + 3] += ra * wy;
+          }
+        }
+      }
+      const dstRow = y * dw * 4;
+      for (let x = 0; x < dw; x++) {
+        const ao = x * 4;
+        let a = Math.floor((acc[ao + 3] * 2 + totalW) / den);
+        if (a > 255) a = 255;
+        let r = Math.floor((acc[ao] * 2 + totalW) / den);
+        let g = Math.floor((acc[ao + 1] * 2 + totalW) / den);
+        let bl = Math.floor((acc[ao + 2] * 2 + totalW) / den);
+        if (r > a) r = a;
+        if (g > a) g = a;
+        if (bl > a) bl = a;
+        const dst = dstRow + x * 4;
+        out[dst] = r;
+        out[dst + 1] = g;
+        out[dst + 2] = bl;
         out[dst + 3] = a;
       }
     }
@@ -5608,18 +5788,25 @@
     if (isBytes) {
       const raw = parseRawPremul(srcData);
       if (raw !== null) {
+        const gen = (im.gen = (im.gen || 0) + 1);
+        const isAlive = () => images.get(id) === im && im.gen === gen;
         await Promise.resolve();
-        if (!images.has(id)) return;
+        if (!isAlive()) return;
         if (!raw.ok) {
           im.state = -1;
           tell(OUTSIDE_IMAGE, id, -1);
           H.requestFrame();
           return;
         }
+        im.bytes = srcData;
+        im.blob = null;
+        im.maxPx = maxPx;
+        im.lostRecoverable = false;
         try {
-          const gl = mainGl();
+          let gl = mainGl();
           if (!gl || (gl.isContextLost && gl.isContextLost())) {
             im.state = -1;
+            im.lostRecoverable = true;
             tell(OUTSIDE_IMAGE, id, -1);
             H.requestFrame();
             return;
@@ -5631,11 +5818,23 @@
             const k = effMax / Math.max(tw, th);
             tw = Math.max(1, Math.min(effMax, Math.round(raw.w * k)));
             th = Math.max(1, Math.min(effMax, Math.round(raw.h * k)));
-            px = downscaleRawPremul(raw.pixels, raw.w, raw.h, tw, th);
+            px = await downscaleRawPremulAsync(raw.pixels, raw.w, raw.h, tw, th, isAlive);
+            if (px === null || !isAlive()) return;
+            gl = mainGl();
+            if (!gl || (gl.isContextLost && gl.isContextLost())) {
+              im.state = 0;
+              im.lostRecoverable = true;
+              return;
+            }
           }
           glDrainError(gl);
           const tex = gl.createTexture();
           if (!tex) {
+            if (gl.isContextLost && gl.isContextLost()) {
+              im.state = 0;
+              im.lostRecoverable = true;
+              return;
+            }
             im.state = -1;
           } else {
             gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -5647,20 +5846,34 @@
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.generateMipmap(gl.TEXTURE_2D);
-            if (glHasError(gl) || (gl.isContextLost && gl.isContextLost())) {
+            const lost = !!(gl.isContextLost && gl.isContextLost());
+            if (lost) {
+              gl.deleteTexture(tex);
+              im.state = 0;
+              im.lostRecoverable = true;
+              return;
+            }
+            if (glHasError(gl)) {
               gl.deleteTexture(tex);
               im.state = -1;
             } else {
               Object.assign(im, {
                 state: 1, tex, w: tw, h: th, ow: raw.w, oh: raw.h, mips: mipCount(tw, th),
-                bytes: srcData, blob: null, maxPx,
+                bytes: srcData, blob: null, maxPx, lostRecoverable: false,
               });
             }
           }
         } catch (e) {
-          if (!images.has(id)) return;
+          if (!isAlive()) return;
+          const glNow = mainGl();
+          if (!glNow || (glNow.isContextLost && glNow.isContextLost())) {
+            im.state = 0;
+            im.lostRecoverable = true;
+            return;
+          }
           im.state = -1;
         }
+        if (!isAlive()) return;
         tell(OUTSIDE_IMAGE, id, im.state);
         H.requestFrame();
         return;
@@ -7162,8 +7375,9 @@
     textChanged();
     for (const s of streams.values()) { s.tex = null; uploadStream(s); }
     for (const [id, im] of images) {
-      if (im.state !== 1) continue;
-      Object.assign(im, { state: 0, tex: null });
+      if (im.state !== 1 && !im.lostRecoverable && !(im.state === 0 && (im.bytes || im.blob))) continue;
+      im.gen = (im.gen || 0) + 1;
+      Object.assign(im, { state: 0, tex: null, lostRecoverable: false });
       told.delete(OUTSIDE_IMAGE + ':' + id);
       decodeImage(id, im.bytes || im.blob, im.maxPx);
     }
@@ -7990,7 +8204,7 @@
       e.gen = gen;
       return e.tex;
     }
-    if (e) return e.tex;
+    if (e) return e.tex || null;
     if (gl.isContextLost && gl.isContextLost()) return null;
     const px = texPixels(wins[0].gl, im.tex, im.w, im.h);
     if (!px) return null;
@@ -8000,7 +8214,53 @@
       const k = sMax / Math.max(upW, upH);
       upW = Math.max(1, Math.min(sMax, Math.round(im.w * k)));
       upH = Math.max(1, Math.min(sMax, Math.round(im.h * k)));
-      upPx = downscaleRawPremul(px, im.w, im.h, upW, upH);
+      const targetGl = gl;
+      const srcTex = im.tex;
+      const myEntry = { tex: null, pending: true, gen: (s.texGen = (s.texGen || 0) + 1) };
+      s.texs.set(tid, myEntry);
+      const isAlive = () => !s.closed && s.texs.get(tid) === myEntry && texSourceOf(tid) === im && im.tex === srcTex;
+      downscaleRawPremulAsync(px, im.w, im.h, upW, upH, isAlive).then((scaled) => {
+        if (!scaled || !isAlive()) {
+          if (s.texs.get(tid) === myEntry) s.texs.delete(tid);
+          return;
+        }
+        const g = s.gl || targetGl;
+        if (!g || (g.isContextLost && g.isContextLost())) {
+          if (s.texs.get(tid) === myEntry) s.texs.delete(tid);
+          return;
+        }
+        try {
+          g.activeTexture(g.TEXTURE1);
+          glDrainError(g);
+          const t = g.createTexture();
+          if (!t) {
+            if (s.texs.get(tid) === myEntry) s.texs.delete(tid);
+            return;
+          }
+          g.bindTexture(g.TEXTURE_2D, t);
+          g.pixelStorei(g.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+          g.pixelStorei(g.UNPACK_ALIGNMENT, 4);
+          g.texImage2D(g.TEXTURE_2D, 0, g.RGBA, upW, upH, 0, g.RGBA, g.UNSIGNED_BYTE, scaled);
+          g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.LINEAR_MIPMAP_LINEAR);
+          g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
+          g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
+          g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
+          g.generateMipmap(g.TEXTURE_2D);
+          if (glHasError(g) || (g.isContextLost && g.isContextLost())) {
+            g.deleteTexture(t);
+            if (s.texs.get(tid) === myEntry) s.texs.delete(tid);
+            return;
+          }
+          myEntry.tex = t;
+          myEntry.pending = false;
+          H.requestFrame();
+        } catch (err) {
+          if (s.texs.get(tid) === myEntry) s.texs.delete(tid);
+        }
+      }).catch(() => {
+        if (s.texs.get(tid) === myEntry) s.texs.delete(tid);
+      });
+      return null;
     }
     gl.activeTexture(gl.TEXTURE1);
     glDrainError(gl);
@@ -8025,7 +8285,9 @@
       const s = wins[i], e = s && s.texs.get(tid);
       if (!e) continue;
       s.texs.delete(tid);
-      try { (i === winActive ? gl : s.gl).deleteTexture(e.tex); } catch (err) { /* its context gone */ }
+      if (e.tex) {
+        try { (i === winActive ? gl : s.gl).deleteTexture(e.tex); } catch (err) { /* its context gone */ }
+      }
     }
   }
   // The atlas of the window in place (just made, or given back after its context was lost) made what the page's
@@ -8057,7 +8319,7 @@
     try { if (s.raf) s.win.cancelAnimationFrame(s.raf); } catch (e) { /* gone already */ }
     s.raf = 0;
     try { if (s.sizeObserver) s.sizeObserver.disconnect(); } catch (e) { /* gone already */ }
-    for (const e of s.texs.values()) { try { s.gl.deleteTexture(e.tex); } catch (err) { /* its context gone */ } }
+    for (const e of s.texs.values()) { if (e.tex) { try { s.gl.deleteTexture(e.tex); } catch (err) { /* its context gone */ } } }
     s.texs.clear();
     // (all else its context holds, then the context itself: a closed popup's is not let go of while the page holds it)
     const sg = s.gl;

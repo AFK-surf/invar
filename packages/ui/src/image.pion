@@ -261,7 +261,7 @@ pub fn raw_premul_of(w : Int, h : Int, premul_rgba : FixedArray[Byte]) -> Option
     return Option::None
   }
   let n = n64.to_int()
-  let out = FixedArray::make(16 + n, 0.to_byte())
+  let out = Bytes::new(16 + n)
   out[0] = 77.to_byte()
   out[1] = 66.to_byte()
   out[2] = 82.to_byte()
@@ -278,8 +278,10 @@ pub fn raw_premul_of(w : Int, h : Int, premul_rgba : FixedArray[Byte]) -> Option
   out[13] = ((h >> 8) & 0xFF).to_byte()
   out[14] = ((h >> 16) & 0xFF).to_byte()
   out[15] = ((h >> 24) & 0xFF).to_byte()
-  premul_rgba.blit_to(out, len=n, dst_offset=16)
-  Some(mbt_compat::bytes_from_array(mbt_compat::fixed_array_slice_clamp(out, 0, out.length())))
+  for i in 0..<n {
+    out[16 + i] = premul_rgba[i]
+  }
+  Some(out)
 }
 
 ///|
@@ -340,6 +342,37 @@ fn vector_parsed_touch(key : String) -> Unit {
     }
   }
   vector_parsed_order.v.push(key)
+}
+
+///|
+fn vector_parsed_lookup(src : String, data : Bytes) -> Option[(Int) -> Option[(Int, Int, FixedArray[Byte])]] {
+  match vector_parsed_cache.get(src) {
+    Some((cached_bytes, draw)) if physical_equal(cached_bytes, data) => {
+      vector_parsed_touch(src)
+      return Some(draw)
+    }
+    _ => ()
+  }
+  // Reuse parsed SVG documents across distinct `mem:` keys holding identical bytes (e.g. Chat tile -> Viewer).
+  // Cache has at most `vector_parsed_max_entries` (4) entries and is cleared on `redraw_vector_pictures()`.
+  let mut hit : Option[(Int) -> Option[(Int, Int, FixedArray[Byte])]] = Option::None
+  { let __mbt_mit_vpl = mbt_compat::ordered_map_iter_lazy(vector_parsed_cache); while true { match (__mbt_mit_vpl.next)() { Some((k, v)) => {
+    let (cached_bytes, draw) = v
+    if physical_equal(cached_bytes, data) || (cached_bytes.length() == data.length() && mbt_compat::bytes_eq(cached_bytes, data)) {
+      vector_parsed_touch(k)
+      hit = Some(draw)
+      break
+    }
+  }, None => break } } }
+  match hit {
+    Some(draw) => {
+      // Register `src -> (data, draw)` so subsequent bucket upgrades on `src` hit O(1) physical_equal instead of
+      // re-scanning up to 4 x 512 KB entries, and any stale entry previously under `src` is replaced immediately.
+      vector_parsed_insert(src, data, draw)
+      Some(draw)
+    }
+    Option::None => Option::None
+  }
 }
 
 ///|
@@ -406,12 +439,9 @@ fn host_bytes(src : String, data : Bytes, px : Int) -> Bytes {
     match vector_pictures.v {
       .VecParsedPremul(parse) => {
         let t0 = hostapi::work_began()
-        let draw_opt = match vector_parsed_cache.get(src) {
-          Some((cached_bytes, draw)) if physical_equal(cached_bytes, data) => {
-            vector_parsed_touch(src)
-            Some(draw)
-          }
-          _ =>
+        let draw_opt = match vector_parsed_lookup(src, data) {
+          Some(draw) => Some(draw)
+          Option::None =>
           match parse(data) {
             Some(draw) => {
               vector_parsed_insert(src, data, draw)
@@ -918,16 +948,17 @@ fn Ctx::moving_key(self : Ctx, src : String, bw : Double, bh : Double, fit : Fit
         m.frame_used[want] = self.frame_no
         m.frame_used[next] = self.frame_no
       }
-      let ready = mbt_compat::arr_makei(m.keys.length(), fn(i) { m.made[i] && self.image_ready(m.keys[i], px) })
-      let mut k = want
-      while k > 0 && !ready[k] {
-        k = k - 1
-      }
-      if ready[k] {
-        if m.streaming {
-          m.frame_used[k] = self.frame_no
+      let mut best = -1
+      for i in 0..<m.keys.length() {
+        if m.made[i] && self.image_ready(m.keys[i], px) && i <= want {
+          best = i
         }
-        m.keys[k]
+      }
+      if best >= 0 {
+        if m.streaming {
+          m.frame_used[best] = self.frame_no
+        }
+        m.keys[best]
       } else {
         src
       }
@@ -1215,6 +1246,20 @@ fn image_done(src : String, e : ImageEntry, at : Double) -> Unit {
       image_bytes.v = image_bytes.v + e.w * e.h * 4.0
       return
     }
+  } else if e.state < 0 {
+    // Host recovered a previously failed decode (e.g. WebGL context lost at request time and later restored).
+    let st = h_image_info(e.id, image_info_out)
+    if st != 1 {
+      return
+    }
+    e.state = 1
+    e.w = image_info_out[0]
+    e.h = image_info_out[1]
+    e.ow = image_info_out[2]
+    e.oh = image_info_out[3]
+    e.ready_at = at
+    image_bytes.v = image_bytes.v + e.w * e.h * 4.0
+    pixels_forget(src)
   }
   if e.state == 0 {
     return

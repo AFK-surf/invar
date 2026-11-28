@@ -1,0 +1,671 @@
+// Regression tests for animated GIF MBRAWPRE encoding, LZW hot-loop parity/4096 full-table clear,
+// cross-key parsed SVG caching, and Fant box-filter area-averaging downscale.
+
+import "mbt_compat"
+
+///|
+fn str_to_ascii_bytes(s : String) -> Bytes {
+  let out : Array[Byte] = []
+  for i in 0..<s.length() {
+    out.push(s[i].to_int().to_byte())
+  }
+  mbt_compat::bytes_from_array(out)
+}
+
+///|
+fn copy_bytes(src : Bytes) -> Bytes {
+  let out = Bytes::new(src.length())
+  for i in 0..<src.length() {
+    out[i] = src[i]
+  }
+  out
+}
+
+///|
+/// Builds a multi-frame GIF with 256-colour global table (min_code=8), full-frame & clipped sub-rects,
+/// disposal 0/2/3, transparent and opaque frames, and interlaced/non-interlaced frames to exercise run-based LZW.
+fn rich_lzw_gif(w : Int, h : Int) -> Bytes {
+  let out : Array[Byte] = [
+    71.to_byte(), 73.to_byte(), 70.to_byte(), 56.to_byte(), 57.to_byte(), 97.to_byte(),
+    (w & 0xFF).to_byte(), ((w >> 8) & 0xFF).to_byte(),
+    (h & 0xFF).to_byte(), ((h >> 8) & 0xFF).to_byte(),
+    0xF7.to_byte(), 0.to_byte(), 0.to_byte(), // global colour table, 256 entries
+  ]
+  for k in 0..<256 {
+    out.push(((k * 37) & 0xFF).to_byte())
+    out.push(((k * 73 + 17) & 0xFF).to_byte())
+    out.push(((k * 109 + 53) & 0xFF).to_byte())
+  }
+  let emit_frame = fn(
+    fx : Int,
+    fy : Int,
+    fw : Int,
+    fh : Int,
+    disposal : Int,
+    transparent : Int,
+    interlaced : Bool,
+    seed : Int,
+  ) {
+    let gce_flags = ((disposal & 7) << 2) | (if transparent >= 0 { 1 } else { 0 })
+    let hdr : Array[Byte] = [
+      0x21.to_byte(), 0xF9.to_byte(), 0x04.to_byte(), gce_flags.to_byte(), 0x05.to_byte(), 0x00.to_byte(),
+      (if transparent >= 0 { transparent } else { 0 }).to_byte(), 0x00.to_byte(),
+      0x2C.to_byte(),
+      (fx & 0xFF).to_byte(), ((fx >> 8) & 0xFF).to_byte(),
+      (fy & 0xFF).to_byte(), ((fy >> 8) & 0xFF).to_byte(),
+      (fw & 0xFF).to_byte(), ((fw >> 8) & 0xFF).to_byte(),
+      (fh & 0xFF).to_byte(), ((fh >> 8) & 0xFF).to_byte(),
+      (if interlaced { 0x40.to_byte() } else { 0x00.to_byte() }),
+      0x08.to_byte(), // min_code = 8 (clear=256, end=257)
+    ]
+    for b in hdr {
+      out.push(b)
+    }
+    // Simple valid LZW encoder (9..12-bit codes; emits deferred clear after staying full at 4096 for 256 codes so both
+    // the full-table stop-inserting path and post-full-table clear reset are exercised).
+    let block : Array[Byte] = []
+    let mut acc = 0
+    let mut bits = 0
+    let push_code = fn(code : Int, size : Int) {
+      acc = acc | (code << bits)
+      bits = bits + size
+      while bits >= 8 {
+        block.push((acc & 0xFF).to_byte())
+        acc = acc >> 8
+        bits = bits - 8
+        if block.length() == 255 {
+          out.push(0xFF.to_byte())
+          for b in block {
+            out.push(b)
+          }
+          block.clear()
+        }
+      }
+    }
+    let clear = 256
+    let end = 257
+    let mut size = 9
+    let mut next = 258
+    let mut full_codes = 0
+    let dict : mbt_compat::OrderedMap[Int, Int] = mbt_compat::ordered_map_new()
+    push_code(clear, size)
+    let total = fw * fh
+    let mut prev = -1
+    for i in 0..<total {
+      // High-entropy transitions mixed with short runs so 192x128 hits next == 4096 (full table + clear reset)
+      let px = if seed == 6 {
+        ((i * 73 + (i / 19) * 37 + (i % 13) * 19) ^ (i >> 3)) & 0xFF
+      } else {
+        let run_band = (i / 13) + seed
+        if i % 17 < 10 { (run_band * 7) & 0xFF } else { ((i * 29 + seed * 13) & 0xFF) }
+      }
+      if prev < 0 {
+        prev = px
+      } else {
+        let key = (prev << 8) | px
+        match dict.get(key) {
+          Some(c) => prev = c
+          Option::None => {
+            push_code(prev, size)
+            if next < 4096 {
+              dict.set(key, next)
+              next = next + 1
+              if next > (1 << size) && size < 12 {
+                size = size + 1
+              }
+            } else {
+              full_codes = full_codes + 1
+              if full_codes >= 256 {
+                push_code(clear, size)
+                dict.clear()
+                size = 9
+                next = 258
+                full_codes = 0
+              }
+            }
+            prev = px
+          }
+        }
+      }
+    }
+    if prev >= 0 {
+      push_code(prev, size)
+    }
+    push_code(end, size)
+    if bits > 0 {
+      block.push((acc & 0xFF).to_byte())
+    }
+    if !block.is_empty() {
+      out.push(block.length().to_byte())
+      for b in block {
+        out.push(b)
+      }
+    }
+    out.push(0x00.to_byte())
+  }
+  // Frame 0: full opaque frame (disposal 1)
+  emit_frame(0, 0, w, h, 1, -1, false, 1)
+  // Frame 1: transparent sub-rect extending past right & bottom edges (clipped, disposal 2)
+  emit_frame(w / 2, h / 2, w, h, 2, 0, false, 2)
+  // Frame 2: interlaced transparent full frame (disposal 3)
+  emit_frame(0, 0, w, h, 3, 7, true, 3)
+  // Frame 3: opaque full frame after disposal 3 restore (disposal 2 full clear)
+  emit_frame(0, 0, w, h, 2, -1, false, 4)
+  // Frame 4: sub-rect starting completely right of canvas (fx >= w)
+  emit_frame(w + 4, 0, 8, 8, 1, -1, false, 5)
+  // Frame 5: full high-entropy opaque frame (disposal 1) exercising 4096 full LZW table + deferred clear
+  emit_frame(0, 0, w, h, 1, -1, false, 6)
+  out.push(0x3B.to_byte())
+  mbt_compat::bytes_from_array(out)
+}
+
+///|
+fn assert_binary_alpha_premul(f : FixedArray[Byte], label : String) -> Unit {
+  let mut p = 0
+  while p < f.length() {
+    let a = f[p + 3]
+    debug_assert(a == 0.to_byte() || a == 255.to_byte(), "\{label}: non-binary alpha at \{p}")
+    if a == 0.to_byte() {
+      debug_assert(
+        f[p] == 0.to_byte() && f[p + 1] == 0.to_byte() && f[p + 2] == 0.to_byte(),
+        "\{label}: non-zero rgb with alpha 0 at \{p}",
+      )
+    }
+    p = p + 4
+  }
+}
+
+///|
+test "downscale_raw_premul 4x and 3.2x area-averaging preserves 1px vertical white lines" {
+  let px = FixedArray::make(16 * 4 * 4, 0.to_byte())
+  for y in 0..<4 {
+    let mut x = 0
+    while x < 16 {
+      let o = (y * 16 + x) * 4
+      px[o] = 255.to_byte()
+      px[o + 1] = 255.to_byte()
+      px[o + 2] = 255.to_byte()
+      px[o + 3] = 255.to_byte()
+      x = x + 4
+    }
+  }
+  guard raw_premul_of(16, 4, px) is Some(raw) else {
+    debug_assert(false, "expected raw_premul")
+    return
+  }
+  // 4x downscale: 16x4 -> 4x1 yields exact 64 across all channels
+  let scaled = downscale_raw_premul(raw, 16, 4, 4, 1)
+  debug_assert(scaled.length() == 4 * 1 * 4, "4x output length")
+  for x in 0..<4 {
+    let o = x * 4
+    debug_assert(
+      scaled[o] == 64.to_byte() &&
+      scaled[o + 1] == 64.to_byte() &&
+      scaled[o + 2] == 64.to_byte() &&
+      scaled[o + 3] == 64.to_byte(),
+      "4x 1px line preserved at x=\{x}",
+    )
+  }
+  // Non-integer 3.2x downscale: 16x4 -> 5x1 conserves energy and keeps rgb <= a
+  let scaled5 = downscale_raw_premul(raw, 16, 4, 5, 1)
+  debug_assert(scaled5.length() == 5 * 1 * 4, "3.2x output length")
+  let mut sum_r = 0
+  for x in 0..<5 {
+    let o = x * 4
+    let r = scaled5[o].to_int()
+    let g = scaled5[o + 1].to_int()
+    let b = scaled5[o + 2].to_int()
+    let a = scaled5[o + 3].to_int()
+    debug_assert(r <= a && g <= a && b <= a, "3.2x premul invariant rgb <= a at x=\{x}")
+    sum_r = sum_r + r
+  }
+  debug_assert(sum_r >= 314 && sum_r <= 324, "3.2x energy conserved: sum_r=\{sum_r}")
+
+  // Exact integer half-up midpoint rounding: 98x1 -> 1x1 (49 of r=1 + 49 of r=2 => exact 1.5 => 2)
+  let px98 = FixedArray::make(98 * 4, 0.to_byte())
+  for x in 0..<98 {
+    px98[x * 4] = (if x < 49 { 1 } else { 2 }).to_byte()
+    px98[x * 4 + 3] = 255.to_byte()
+  }
+  guard raw_premul_of(98, 1, px98) is Some(raw98) else {
+    debug_assert(false, "expected raw98")
+    return
+  }
+  let dst98 = downscale_raw_premul(raw98, 98, 1, 1, 1)
+  debug_assert(
+    dst98[0] == 2.to_byte() && dst98[1] == 0.to_byte() && dst98[2] == 0.to_byte() && dst98[3] == 255.to_byte(),
+    "98x1->1x1 exact half-up",
+  )
+
+  // Exact integer midpoint overlap: 18x1 -> 11x1 (only x=8 has r=1 => dst x=5 overlap 9/18=0.5 => r=1, others 0)
+  let px18 = FixedArray::make(18 * 4, 0.to_byte())
+  for x in 0..<18 {
+    px18[x * 4] = (if x == 8 { 1 } else { 0 }).to_byte()
+    px18[x * 4 + 3] = 255.to_byte()
+  }
+  guard raw_premul_of(18, 1, px18) is Some(raw18) else {
+    debug_assert(false, "expected raw18")
+    return
+  }
+  let dst11 = downscale_raw_premul(raw18, 18, 1, 11, 1)
+  for x in 0..<11 {
+    let o = x * 4
+    let expect_r = (if x == 5 { 1 } else { 0 }).to_byte()
+    debug_assert(
+      dst11[o] == expect_r && dst11[o + 1] == 0.to_byte() && dst11[o + 2] == 0.to_byte() && dst11[o + 3] == 255.to_byte(),
+      "18x1->11x1 exact midpoint at x=\{x}",
+    )
+  }
+}
+
+///|
+test "vector_parsed_lookup shares parsed SVG across distinct mem: keys and registers src for O(1) hits" {
+  let parse_calls : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+  let draw_calls : Array[Int] = []
+  set_vector_pictures_parsed(fn(data) {
+    ignore(data)
+    parse_calls.v = parse_calls.v + 1
+    Some(fn(px) {
+      draw_calls.push(px)
+      Some((2, 1, FixedArray::from_array([
+        0x80.to_byte(), 0x00.to_byte(), 0x00.to_byte(), 0x80.to_byte(),
+        0x00.to_byte(), 0x40.to_byte(), 0x80.to_byte(), 0x80.to_byte(),
+      ])))
+    })
+  })
+  let t = Tester::new(fn(_) { () }, w=200.0, h=200.0)
+  let svg1 = str_to_ascii_bytes("<svg xmlns='http://www.w3.org/2000/svg' width='2' height='1' id='shared'/>")
+  let svg2 = str_to_ascii_bytes("<svg xmlns='http://www.w3.org/2000/svg' width='2' height='1' id='second'/>")
+  ignore(host_bytes("mem:chat-file/1", svg1, 256))
+  debug_assert(parse_calls.v == 1, "first parse count")
+  // Distinct Bytes instance with identical content under a different key reuses parsed tree AND registers new key.
+  let svg1_copy = copy_bytes(svg1)
+  let b1024 = host_bytes("mem:preview/1", svg1_copy, 1024)
+  debug_assert(is_raw_premul(b1024), "expected MBRAWPRE output")
+  debug_assert(parse_calls.v == 1, "cross-key cache hit should not re-parse")
+  debug_assert(vector_parsed_cache.contains("mem:preview/1"), "mem:preview/1 registered")
+  // Subsequent upgrade on mem:preview/1 hits physical_equal directly.
+  ignore(host_bytes("mem:preview/1", svg1_copy, 2048))
+  debug_assert(parse_calls.v == 1, "O(1) physical_equal hit")
+  // Overwriting an existing key with bytes already cached under another key updates its entry in place.
+  ignore(host_bytes("mem:other", svg2, 64))
+  debug_assert(parse_calls.v == 2, "second svg parsed")
+  let svg2_copy = copy_bytes(svg2)
+  ignore(host_bytes("mem:chat-file/1", svg2_copy, 128))
+  debug_assert(parse_calls.v == 2, "overwrite reuses svg2 parse")
+  match vector_parsed_cache.get("mem:chat-file/1") {
+    Some((b, _)) => debug_assert(physical_equal(b, svg2_copy), "mem:chat-file/1 updated in place")
+    Option::None => debug_assert(false, "expected mem:chat-file/1 in cache")
+  }
+  debug_assert(
+    draw_calls.length() == 5 &&
+    draw_calls[0] == 256 &&
+    draw_calls[1] == 1024 &&
+    draw_calls[2] == 2048 &&
+    draw_calls[3] == 64 &&
+    draw_calls[4] == 128,
+    "draw_calls sequence",
+  )
+  t.draw()
+  set_vector_pictures(fn(_, _) { Option::None })
+  t.dispose()
+}
+
+///|
+test "GIF fast LZW + MBRAWPRE frame encoding, 4096 full table clear, clipped rects, interlaced, disposal 0..3, and edge cases" {
+  let (w, h) = (192, 128)
+  let data = rich_lzw_gif(w, h)
+  guard gif_frames(data) is Some(decoded) else {
+    debug_assert(false, "expected gif_frames Some")
+    return
+  }
+  debug_assert(decoded.w == w && decoded.h == h && decoded.frames.length() == 6, "6 frames decoded")
+  for k in 0..<decoded.frames.length() {
+    assert_binary_alpha_premul(decoded.frames[k], "frame \{k}")
+  }
+  // Verify Frame 5 (full 4096-entry LZW table + deferred clear reset) decoded to exact source pixels
+  let f5 = decoded.frames[5]
+  for i in 0..<(w * h) {
+    let px = ((i * 73 + (i / 19) * 37 + (i % 13) * 19) ^ (i >> 3)) & 0xFF
+    let r = ((px * 37) & 0xFF).to_byte()
+    let g = ((px * 73 + 17) & 0xFF).to_byte()
+    let b = ((px * 109 + 53) & 0xFF).to_byte()
+    let o = i * 4
+    debug_assert(
+      f5[o] == r && f5[o + 1] == g && f5[o + 2] == b && f5[o + 3] == 255.to_byte(),
+      "frame 5 pixel mismatch at \{i}",
+    )
+  }
+
+  // Verify add_image / GifCycle::make produces MBRAWPRE bytes matching eager decoded frames
+  let t = Tester::new(fn(_) { () }, w=200.0, h=200.0)
+  add_image("mem:rich-gif", data)
+  guard moving_images.get("mem:rich-gif") is Some(m) else {
+    debug_assert(false, "expected moving_images entry")
+    t.dispose()
+    return
+  }
+  debug_assert(m.made[0] && !m.made[1], "only frame 0 made initially")
+  guard raw_premul_of(w, h, decoded.frames[0]) is Some(expected0) else {
+    debug_assert(false, "expected raw_premul_of frame 0")
+    t.dispose()
+    return
+  }
+  guard image_data.get("mem:rich-gif") is Some(stored0) else {
+    debug_assert(false, "expected image_data frame 0")
+    t.dispose()
+    return
+  }
+  debug_assert(is_raw_premul(stored0) && mbt_compat::bytes_eq(stored0, expected0), "frame 0 stored as exact MBRAWPRE")
+  m.make(5)
+  guard raw_premul_of(w, h, decoded.frames[5]) is Some(expected5) else {
+    debug_assert(false, "expected raw_premul_of frame 5")
+    t.dispose()
+    return
+  }
+  guard image_data.get(m.keys[5]) is Some(stored5) else {
+    debug_assert(false, "expected image_data frame 5")
+    t.dispose()
+    return
+  }
+  debug_assert(is_raw_premul(stored5) && mbt_compat::bytes_eq(stored5, expected5), "frame 5 stored as exact MBRAWPRE")
+  t.dispose()
+
+  // Prefix truncation & deterministic byte mutations on smaller rich GIF must never panic and keep premul invariant
+  let small_rich = rich_lzw_gif(32, 24)
+  for cut in 0..<(small_rich.length() + 1) {
+    let prefix = mbt_compat::bytes_slice(small_rich, 0, cut)
+    match gif_frames(prefix) {
+      Some(g) => {
+        for k in 0..<g.frames.length() {
+          assert_binary_alpha_premul(g.frames[k], "trunc \{cut} frame \{k}")
+        }
+      }
+      Option::None => ()
+    }
+  }
+  let mut rng = 0x1234567
+  for trial in 0..<48 {
+    let mut_buf : Array[Byte] = []
+    for i in 0..<small_rich.length() {
+      mut_buf.push(small_rich[i])
+    }
+    for _ in 0..<4 {
+      rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF
+      let idx = 13 + (rng % (small_rich.length() - 13))
+      rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF
+      mut_buf[idx] = ((rng >> 16) & 0xFF).to_byte()
+    }
+    let mutated = mbt_compat::bytes_from_array(mut_buf)
+    match gif_frames(mutated) {
+      Some(g) => {
+        for k in 0..<g.frames.length() {
+          assert_binary_alpha_premul(g.frames[k], "mut \{trial} frame \{k}")
+        }
+      }
+      Option::None => ()
+    }
+  }
+
+  // Adversarial / boundary cases: min_code=2, min_code=11 (ci >= colours), global_len=0 no LCT, fy >= h, invalid code > next
+  let edge_gifs : Array[(String, Array[Int])] = [
+    (
+      "min_code=2",
+      [
+        71, 73, 70, 56, 57, 97, 2, 0, 2, 0, 0x81, 0, 0,
+        255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0,
+        0x2C, 0, 0, 0, 0, 2, 0, 2, 0, 0,
+        2, 3, 0x44, 0x8C, 0x51, 0, 0x3B,
+      ],
+    ),
+    (
+      "min_code=11_and_ci_ge_colours",
+      [
+        71, 73, 70, 56, 57, 97, 2, 0, 2, 0, 0x80, 0, 0,
+        10, 20, 30, 40, 50, 60,
+        0x2C, 0, 0, 0, 0, 2, 0, 2, 0, 0,
+        11, 8, 0x00, 0x08, 0x00, 0x01, 0x00, 0x02, 0x01, 0x80, 0, 0x3B,
+      ],
+    ),
+    (
+      "global_len=0_no_lct",
+      [
+        71, 73, 70, 56, 57, 97, 2, 0, 2, 0, 0x00, 0, 0,
+        0x2C, 0, 0, 0, 0, 2, 0, 2, 0, 0,
+        2, 2, 0x44, 0x01, 0, 0x3B,
+      ],
+    ),
+    (
+      "fy_ge_h",
+      [
+        71, 73, 70, 56, 57, 97, 4, 0, 4, 0, 0x80, 0, 0,
+        255, 0, 0, 0, 255, 0,
+        0x2C, 0, 0, 8, 0, 2, 0, 2, 0, 0,
+        2, 2, 0x44, 0x01, 0, 0x3B,
+      ],
+    ),
+    (
+      "invalid_code_gt_next",
+      [
+        71, 73, 70, 56, 57, 97, 2, 0, 2, 0, 0x80, 0, 0,
+        255, 0, 0, 0, 255, 0,
+        0x2C, 0, 0, 0, 0, 2, 0, 2, 0, 0,
+        2, 2, 0x3C, 0x00, 0, 0x3B,
+      ],
+    ),
+  ]
+  for pair in edge_gifs {
+    let (label, ints) = pair
+    let bs : Array[Byte] = []
+    for v in ints {
+      bs.push(v.to_byte())
+    }
+    match gif_frames(mbt_compat::bytes_from_array(bs)) {
+      Some(g) => {
+        for k in 0..<g.frames.length() {
+          assert_binary_alpha_premul(g.frames[k], "edge \{label} frame \{k}")
+        }
+      }
+      Option::None => ()
+    }
+  }
+}
+
+///|
+/// Encodes a single uncompressed-style LZW frame (emits clear before table grows) with exact colour indices.
+fn push_exact_gif_frame(
+  out : Array[Byte],
+  fx : Int,
+  fy : Int,
+  fw : Int,
+  fh : Int,
+  disposal : Int,
+  transparent : Int,
+  interlaced : Bool,
+  indices : Array[Int],
+) -> Unit {
+  let gce_flags = ((disposal & 7) << 2) | (if transparent >= 0 { 1 } else { 0 })
+  let hdr : Array[Byte] = [
+    0x21.to_byte(), 0xF9.to_byte(), 0x04.to_byte(), gce_flags.to_byte(), 0x05.to_byte(), 0x00.to_byte(),
+    (if transparent >= 0 { transparent } else { 0 }).to_byte(), 0x00.to_byte(),
+    0x2C.to_byte(),
+    (fx & 0xFF).to_byte(), ((fx >> 8) & 0xFF).to_byte(),
+    (fy & 0xFF).to_byte(), ((fy >> 8) & 0xFF).to_byte(),
+    (fw & 0xFF).to_byte(), ((fw >> 8) & 0xFF).to_byte(),
+    (fh & 0xFF).to_byte(), ((fh >> 8) & 0xFF).to_byte(),
+    (if interlaced { 0x40.to_byte() } else { 0x00.to_byte() }),
+    0x03.to_byte(), // min_code = 3 (clear=8, end=9, 4-bit codes while next < 16)
+  ]
+  for b in hdr {
+    out.push(b)
+  }
+  let block : Array[Byte] = []
+  let mut acc = 0
+  let mut bits = 0
+  let push_code = fn(code : Int) {
+    acc = acc | (code << bits)
+    bits = bits + 4
+    while bits >= 8 {
+      block.push((acc & 0xFF).to_byte())
+      acc = acc >> 8
+      bits = bits - 8
+      if block.length() == 255 {
+        out.push(0xFF.to_byte())
+        for b in block {
+          out.push(b)
+        }
+        block.clear()
+      }
+    }
+  }
+  push_code(8) // clear
+  let mut emitted = 0
+  for ci in indices {
+    if emitted == 5 {
+      // Clear before next reaches 16 so code width stays 4 bits
+      push_code(8)
+      emitted = 0
+    }
+    push_code(ci & 7)
+    emitted = emitted + 1
+  }
+  push_code(9) // end
+  if bits > 0 {
+    block.push((acc & 0xFF).to_byte())
+  }
+  if !block.is_empty() {
+    out.push(block.length().to_byte())
+    for b in block {
+      out.push(b)
+    }
+  }
+  out.push(0x00.to_byte())
+}
+
+///|
+test "GIF interlaced row mapping and disposal=2 sub-rect clear produce exact pixels" {
+  // 8-colour global palette: index k => (k*30, k*20, k*10)
+  let build_gif = fn(w : Int, h : Int) -> Array[Byte] {
+    let out : Array[Byte] = [
+      71.to_byte(), 73.to_byte(), 70.to_byte(), 56.to_byte(), 57.to_byte(), 97.to_byte(),
+      (w & 0xFF).to_byte(), ((w >> 8) & 0xFF).to_byte(),
+      (h & 0xFF).to_byte(), ((h >> 8) & 0xFF).to_byte(),
+      0x82.to_byte(), 0.to_byte(), 0.to_byte(), // global colour table, 8 entries
+    ]
+    for k in 0..<8 {
+      out.push((k * 30).to_byte())
+      out.push((k * 20).to_byte())
+      out.push((k * 10).to_byte())
+    }
+    out
+  }
+
+  // 1. Interlaced 2x8 frame: stream lines 0..7 map to canvas rows [0, 4, 2, 6, 1, 3, 5, 7]
+  let g_inter = build_gif(2, 8)
+  let inter_order : Array[Int] = [0, 4, 2, 6, 1, 3, 5, 7]
+  let inter_idx : Array[Int] = []
+  for line in 0..<8 {
+    let target_row = inter_order[line]
+    inter_idx.push(target_row)
+    inter_idx.push(target_row)
+  }
+  push_exact_gif_frame(g_inter, 0, 0, 2, 8, 1, -1, true, inter_idx)
+  g_inter.push(0x3B.to_byte())
+  guard gif_frames(mbt_compat::bytes_from_array(g_inter)) is Some(dec_inter) else {
+    debug_assert(false, "expected interlaced gif_frames")
+    return
+  }
+  debug_assert(dec_inter.frames.length() == 1, "1 interlaced frame")
+  let fi = dec_inter.frames[0]
+  for y in 0..<8 {
+    for x in 0..<2 {
+      let o = (y * 2 + x) * 4
+      debug_assert(
+        fi[o] == (y * 30).to_byte() &&
+        fi[o + 1] == (y * 20).to_byte() &&
+        fi[o + 2] == (y * 10).to_byte() &&
+        fi[o + 3] == 255.to_byte(),
+        "interlaced pixel mismatch at (\{x}, \{y})",
+      )
+    }
+  }
+
+  // 2. Disposal=2 sub-rect clear:
+  //    Frame 0 fills 4x4 with colour 1 (disposal 1: keep).
+  //    Frame 1 draws sub-rect (1, 1, 2, 2) with colour 2 (disposal 2: clear sub-rect before next frame).
+  //    Frame 2 draws 1x1 at (0, 0) with colour 3: sub-rect (1,1,2,2) must be (0,0,0,0), (0,0) colour 3, rest colour 1.
+  let g_disp = build_gif(4, 4)
+  let f0_idx : Array[Int] = []
+  for _ in 0..<16 {
+    f0_idx.push(1)
+  }
+  push_exact_gif_frame(g_disp, 0, 0, 4, 4, 1, -1, false, f0_idx)
+  push_exact_gif_frame(g_disp, 1, 1, 2, 2, 2, -1, false, [2, 2, 2, 2])
+  push_exact_gif_frame(g_disp, 0, 0, 1, 1, 1, -1, false, [3])
+  g_disp.push(0x3B.to_byte())
+  guard gif_frames(mbt_compat::bytes_from_array(g_disp)) is Some(dec_disp) else {
+    debug_assert(false, "expected disposal gif_frames")
+    return
+  }
+  debug_assert(dec_disp.frames.length() == 3, "3 disposal frames")
+  let f2 = dec_disp.frames[2]
+  for y in 0..<4 {
+    for x in 0..<4 {
+      let o = (y * 4 + x) * 4
+      if x >= 1 && x < 3 && y >= 1 && y < 3 {
+        debug_assert(
+          f2[o] == 0.to_byte() && f2[o + 1] == 0.to_byte() && f2[o + 2] == 0.to_byte() && f2[o + 3] == 0.to_byte(),
+          "disposal=2 cleared sub-rect at (\{x}, \{y})",
+        )
+      } else if x == 0 && y == 0 {
+        debug_assert(
+          f2[o] == 90.to_byte() && f2[o + 1] == 60.to_byte() && f2[o + 2] == 30.to_byte() && f2[o + 3] == 255.to_byte(),
+          "frame 2 pixel at (0, 0)",
+        )
+      } else {
+        debug_assert(
+          f2[o] == 30.to_byte() && f2[o + 1] == 20.to_byte() && f2[o + 2] == 10.to_byte() && f2[o + 3] == 255.to_byte(),
+          "preserved frame 0 pixel at (\{x}, \{y})",
+        )
+      }
+    }
+  }
+}
+
+///|
+test "image_done recovers Failed (-1) ImageEntry when host restores decode to Ready (1)" {
+  let t = Tester::new(fn(c) {
+    ignore(c.image("mem:ctx-recover", w=Size::Px(64.0), h=Size::Px(64.0), fit=Fit::FitFill))
+  }, w=200.0, h=200.0)
+  let px = FixedArray::make(8 * 4 * 4, 128.to_byte())
+  guard raw_premul_of(8, 4, px) is Some(raw) else {
+    debug_assert(false, "expected raw_premul")
+    t.dispose()
+    return
+  }
+  add_image("mem:ctx-recover", raw)
+  t.draw()
+  guard image_cache.get("mem:ctx-recover") is Some(list) else {
+    debug_assert(false, "expected image_cache entry")
+    t.dispose()
+    return
+  }
+  debug_assert(list.length() == 1, "one decode entry: got \{list.length()}")
+  let e = list[0]
+  let want_px = e.px.to_double()
+  // Simulate host reporting failure (e.g. WebGL context lost: state = -1)
+  t.fake.images.set(e.id, FakeImage::{ state: -1, w: 0.0, h: 0.0, ow: 0.0, oh: 0.0 })
+  image_decoded(e.id, t.time())
+  debug_assert(e.state == -1, "entry transitioned to Failed (-1)")
+  debug_assert(!g().image_ready("mem:ctx-recover", want_px), "image_ready false while Failed")
+  let bytes_while_failed = image_bytes.v
+  // Simulate host recovering after context restore (state = 1, valid dimensions)
+  t.fake.images.set(e.id, FakeImage::{ state: 1, w: 8.0, h: 4.0, ow: 8.0, oh: 4.0 })
+  image_decoded(e.id, t.time() + 16.0)
+  debug_assert(e.state == 1, "entry recovered to Ready (1)")
+  debug_assert(e.w == 8.0 && e.h == 4.0 && e.ow == 8.0 && e.oh == 4.0, "recovered dimensions")
+  debug_assert(g().image_ready("mem:ctx-recover", want_px), "image_ready true after recovery")
+  debug_assert(image_bytes.v == bytes_while_failed + 8.0 * 4.0 * 4.0, "image_bytes accounted on recovery")
+  t.draw()
+  t.dispose()
+}
