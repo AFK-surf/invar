@@ -1147,6 +1147,14 @@ static GtkWidget *area_with_context(int but) {
       return win_slots[k].area;
   return NULL;
 }
+// The run's GL context made current, where a window has one (what is done in it between frames: an atlas's pages
+// given back as the app rests): whether it is.
+int mb_app_gl_current(void) {
+  GtkWidget *a = area_with_context(-1);
+  if (!a) return 0;
+  gtk_gl_area_make_current(GTK_GL_AREA(a));
+  return gtk_gl_area_get_error(GTK_GL_AREA(a)) == NULL;
+}
 // The context a canvas is made with: the run's one, any realized canvas's (the first's, or, the first hidden and
 // realized again, that of a window beside it: what drawing made in it stands, context_kept); none, GTK's own made.
 static GdkGLContext *canvas_context(GtkGLArea *a, gpointer data) {

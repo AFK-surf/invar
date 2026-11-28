@@ -22,6 +22,7 @@
 #include "bands.h"
 // the groups of instances the host keeps, drawn out as gl_present takes a frame
 #include "groups.h"
+#include "atlas_pages.h"
 
 // the numbers of an instance (src/ui/scene.mbt)
 #define MB_INST 60
@@ -116,8 +117,9 @@ static const char *FS =
     "uniform float u_scale;\n"
     "uniform float u_top;\n"
     "uniform vec2 u_origin;\n"
-    "uniform sampler2D u_atlas;\n"
-    "uniform sampler2D u_catlas;\n"
+    "// the glyphs' atlases: arrays of square pages (atlas_pages.h)\n"
+    "uniform highp sampler2DArray u_atlas;\n"
+    "uniform highp sampler2DArray u_catlas;\n"
     "uniform sampler2D u_img;\n"
     "uniform int u_img_mips;\n"
     "// glass (src/ui/glass.mbt): the blurred copy under it and where a point is in it (uv = p * u_map.xy + u_map.zw, kept\n"
@@ -565,6 +567,10 @@ static const char *FS =
     "    // the colour one would have it\n"
     "    bool colour = v_c2.x >= 16384.0;\n"
     "    vec2 at = vec2(v_c2.x - (colour ? 16384.0 : 0.0), v_c2.y);\n"
+    "    // (its page, a page's side of its atlas down for each)\n"
+    "    float side = colour ? float(textureSize(u_catlas, 0).y) : float(textureSize(u_atlas, 0).y);\n"
+    "    float layer = max(floor(at.y / side), 0.0);\n"
+    "    at.y -= layer * side;\n"
     "    // One drawn as big as its picture, not turned, its corner on a pixel: each pixel its texel's centre, as\n"
     "    // win_render.cpp takes it (worked out of where it is across the rect, a float's division took a texel's\n"
     "    // neighbour in where its rounding fell, at 3, 2.625 and 1.5 pixels a point and far across)\n"
@@ -573,8 +579,8 @@ static const char *FS =
     "    bool exact = v_p.x == 0.0 && max(off.x, off.y) <= 0.05 && max(abs(r0.x - r0i.x), abs(r0.y - r0i.y)) <= 0.05;\n"
     "    vec2 tex = exact ? floor(p * u_scale - r0i) + 0.5 : (p - v_rect.xy) / v_rect.zw * v_c2.zw;\n"
     "    vec2 uv = clamp(at + tex, at + 0.5, at + v_c2.zw - 0.5);\n"
-    "    vec4 t = colour ? textureLod(u_catlas, uv / vec2(textureSize(u_catlas, 0)), 0.0)\n"
-    "                    : vec4(textureLod(u_atlas, uv / vec2(textureSize(u_atlas, 0)), 0.0).r);\n"
+    "    vec4 t = colour ? textureLod(u_catlas, vec3(uv / side, layer), 0.0)\n"
+    "                    : vec4(textureLod(u_atlas, vec3(uv / side, layer), 0.0).r);\n"
     "    if (kind == 7) {\n"
     "      // inked by how light what is under its glass is, looked at round the glass's middle and locally\n"
     "      vec3 ink = mb_adaptive_ink_at(col.rgb, v_pad.yz, v_pad.w * 0.5, v_rect);\n"
@@ -1916,6 +1922,11 @@ static const char *AD_FS =
     "}\n";
 
 static GLuint vao, vbo, atlas, catlas, post, ad_prog;
+// how many pages each atlas has (the GL thread's: what its texture has), what stands in a sampler2D unit nothing is
+// bound to (an instance with no picture: 1 texel, clear), and where pages fail to be made (the most there are then)
+static int gl_atlas_have[2] = {1, 1};
+static GLuint stand_tex;
+static volatile int gl_atlas_fail_most[2];
 // a ground's flat middle (bands.h mb_pieces), and where its window's size goes
 static GLuint prog_flat;
 static GLint uf_vp;
@@ -2062,6 +2073,82 @@ static kprog make_prog(GLuint vs, int kind) {
   return k;
 }
 
+// An atlas of `pages` pages (`colour`: colour glyphs', RGBA, MB_ATLAS_COLOR square; else the words', a byte a texel,
+// MB_ATLAS square): a texture array however many, as the shader takes it.
+static GLuint gl_atlas_make(int colour, int pages) {
+  GLuint t = 0;
+  glGenTextures(1, &t);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, t);
+  int side = colour ? MB_ATLAS_COLOR : MB_ATLAS;
+  glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, colour ? GL_RGBA8 : GL_R8, side, side, pages > 0 ? pages : 1);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  return t;
+}
+
+// The most pages an atlas may have: atlas_pages.h's, as many as the context's arrays take, as many as were made where
+// one more failed to be.
+static int gl_atlas_most(int colour, int device_most) {
+  int n = colour ? mb_atlas_pages_cap(MB_ATLAS_COLOR, 4, device_most) : mb_atlas_pages_cap(MB_ATLAS, 1, device_most);
+  int fail = gl_atlas_fail_most[colour ? 1 : 0];
+  return fail > 0 && fail < n ? fail : n;
+}
+
+// The atlas `colour` made `n` pages (the GL thread's, its context current): an array of n made, the pages both have
+// copied into it on the GPU (each read through a framebuffer, glCopyTexSubImage3D: OpenGL ES 3.0's own), put in the
+// old one's place. 0 where it cannot be made: the atlas as it was, and no more pages than it has from now on.
+static int gl_atlas_pages(int colour, int n) {
+  int c = colour ? 1 : 0;
+  GLuint *tex = c ? &catlas : &atlas;
+  if (n == gl_atlas_have[c]) return 1;
+  if (n < 1) return 0;
+  while (glGetError() != GL_NO_ERROR) {
+  }
+  GLuint t = gl_atlas_make(c, n);
+  if (glGetError() != GL_NO_ERROR) {
+    glDeleteTextures(1, &t);
+    gl_atlas_fail_most[c] = gl_atlas_have[c];
+    return 0;
+  }
+  int keep = n < gl_atlas_have[c] ? n : gl_atlas_have[c];
+  int side = c ? MB_ATLAS_COLOR : MB_ATLAS;
+  if (keep > 0 && *tex) {
+    GLint read_was = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_was);
+    GLuint fb = 0;
+    glGenFramebuffers(1, &fb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, t);
+    for (int i = 0; i < keep; i++) {
+      glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, *tex, 0, i);
+      glCopyTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, i, 0, 0, side, side);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read_was);
+    glDeleteFramebuffers(1, &fb);
+  }
+  if (glGetError() != GL_NO_ERROR) {
+    glDeleteTextures(1, &t);
+    gl_atlas_fail_most[c] = gl_atlas_have[c];
+    return 0;
+  }
+  if (*tex) glDeleteTextures(1, tex);
+  *tex = t;
+  gl_atlas_have[c] = n;
+  return 1;
+}
+
+// A glyph's pixels into its atlas's page (y: page * side + where on it), the texture bound to GL_TEXTURE_2D_ARRAY on
+// the unit active; none past the pages the atlas has.
+static void gl_atlas_sub(int colour, int x, int y, int w, int h, const void *px) {
+  int c = colour ? 1 : 0, side = c ? MB_ATLAS_COLOR : MB_ATLAS;
+  int page = y >= 0 ? y / side : -1, ly = y - page * side;
+  if (page < 0 || page >= gl_atlas_have[c] || x < 0 || x + w > side || ly + h > side) return;
+  glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, ly, page, w, h, 1, c ? GL_RGBA : GL_RED, GL_UNSIGNED_BYTE, px);
+}
+
 // The programs, the instances' buffer and the glyphs' atlases made in the context now current (a new one has none of
 // the old: the host makes again what else it had in it).
 static void gl_setup(void) {
@@ -2129,18 +2216,17 @@ static void gl_setup(void) {
     glVertexAttribPointer(i, 4, GL_FLOAT, GL_FALSE, MB_INST * 4, (void *)(intptr_t)(i * 16));
     glVertexAttribDivisor(i, 1);
   }
-  // the words' atlas a byte a texel, colour glyphs' four (MB_ATLAS above)
-  GLuint *texs[2] = {&atlas, &catlas};
-  for (int k = 0; k < 2; k++) {
-    glGenTextures(1, texs[k]);
-    glBindTexture(GL_TEXTURE_2D, *texs[k]);
-    if (k == 0) glTexStorage2D(GL_TEXTURE_2D, 1, GL_R8, MB_ATLAS, MB_ATLAS);
-    else glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, MB_ATLAS_COLOR, MB_ATLAS_COLOR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  }
+  // the words' atlas a byte a texel, colour glyphs' four (MB_ATLAS above): a context made anew has them of one page
+  atlas = gl_atlas_make(0, 1);
+  catlas = gl_atlas_make(1, 1);
+  gl_atlas_have[0] = gl_atlas_have[1] = 1;
+  gl_atlas_fail_most[0] = gl_atlas_fail_most[1] = 0;
+  static const uint32_t clear_texel = 0;
+  glGenTextures(1, &stand_tex);
+  glBindTexture(GL_TEXTURE_2D, stand_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, &clear_texel);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 }
@@ -4157,9 +4243,9 @@ static int capture(const float *f, int32_t start, int32_t end, int32_t count, in
     main_state();
   } else if (shows) {
     glActiveTexture(GL_TEXTURE5);
-    glBindTexture(GL_TEXTURE_2D, ad_tex[ad_cur] ? ad_tex[ad_cur] : atlas);
+    glBindTexture(GL_TEXTURE_2D, ad_tex[ad_cur] ? ad_tex[ad_cur] : stand_tex);
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : atlas);
+    glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : stand_tex);
     prog_gen++;
   }
   return shows;
@@ -4206,17 +4292,17 @@ static void main_state(void) {
   glBindVertexArray(vao);
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
   glActiveTexture(GL_TEXTURE5);
-  glBindTexture(GL_TEXTURE_2D, ad_tex[ad_cur] ? ad_tex[ad_cur] : atlas);
+  glBindTexture(GL_TEXTURE_2D, ad_tex[ad_cur] ? ad_tex[ad_cur] : stand_tex);
   glActiveTexture(GL_TEXTURE4);
-  glBindTexture(GL_TEXTURE_2D, catlas);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, catlas);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, atlas);
+  glBindTexture(GL_TEXTURE_2D_ARRAY, atlas);
   // (the shapes' pieces before the backdrop: the unit left active as it was, 2, which a stream's SurfaceTexture is
   // latched on as its picture is asked for: Streams.show)
   glActiveTexture(GL_TEXTURE3);
-  glBindTexture(GL_TEXTURE_2D, segs_tex ? segs_tex : atlas);
+  glBindTexture(GL_TEXTURE_2D, segs_tex ? segs_tex : stand_tex);
   glActiveTexture(GL_TEXTURE2);
-  glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : atlas);
+  glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : stand_tex);
   // (the programs' uniforms as they are now: each set again as it is next used)
   prog_gen++;
   use_prog(-1);
@@ -5032,7 +5118,7 @@ static void draw_into(GLuint fb, int part) {
                         MB_INST * sizeof(float), comp);
         draw_run(pieces + 1, 1);
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, atlas);
+        glBindTexture(GL_TEXTURE_2D, stand_tex);
       } else {
         target_fb = L.prev_fb;
         cut_on = L.prev_cut_on;
@@ -5082,7 +5168,7 @@ static void draw_into(GLuint fb, int part) {
       glBindFramebuffer(GL_FRAMEBUFFER, lens_lv[0].fb);
       // (u_bd off any lens level: one bound there by a lens before is drawn into now)
       glActiveTexture(GL_TEXTURE2);
-      glBindTexture(GL_TEXTURE_2D, atlas);
+      glBindTexture(GL_TEXTURE_2D, stand_tex);
       glViewport(0, 0, pw, ph);
       glDisable(GL_SCISSOR_TEST);
       glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -5106,11 +5192,11 @@ static void draw_into(GLuint fb, int part) {
           if (cown ? kk != ck : has_own_prog(kk)) break;
           ce++;
         }
-        GLuint ct = ctid ? image_tex(ctid) : atlas;
+        GLuint ct = ctid ? image_tex(ctid) : stand_tex;
         if (ctid > MB_STREAM_TEX && !ct) { cs = ce; continue; }
         if (ctid > 0 && ctid <= MB_STREAM_TEX && !ct) encode_missing = 1;
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, ct ? ct : atlas);
+        glBindTexture(GL_TEXTURE_2D, ct ? ct : stand_tex);
         use_prog(cown ? ck : -1);
         set_img_mips(ct ? image_mips(ctid) : 1);
         draw_run(cs, ce - cs);
@@ -5138,7 +5224,7 @@ static void draw_into(GLuint fb, int part) {
       draw_run(start, 1);
       bd_tex = prev_bd;
       glActiveTexture(GL_TEXTURE2);
-      glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : atlas);
+      glBindTexture(GL_TEXTURE_2D, bd_tex ? bd_tex : stand_tex);
       bound = 0;
       start += 1 + child_n;
       continue;
@@ -5244,7 +5330,7 @@ static void draw_into(GLuint fb, int part) {
     } else {
       use_prog(own ? kind : -1);
     }
-    GLuint t = tid ? image_tex(tid) : atlas;
+    GLuint t = tid ? image_tex(tid) : stand_tex;
     if (!t && tid > 0 && tid <= MB_STREAM_TEX) encode_missing = 1;
     if (t) {  // 0: lost with the context, decoding again; a stream's or a view's with no picture yet
       if (tid > MB_VIEW_TEX && tid <= MB_LAYER_TEX) view_parts_in(tid, start, end);

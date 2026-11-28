@@ -11,7 +11,6 @@ import android.graphics.Typeface;
 import android.icu.text.Bidi;
 import android.icu.text.BreakIterator;
 import android.opengl.GLES30;
-import android.opengl.GLUtils;
 import android.os.Build;
 import android.text.Layout;
 import android.text.StaticLayout;
@@ -130,12 +129,16 @@ final class MBText {
         return sub < SUB_COUNT ? sub : 0;
     }
 
-    /** A glyph put in an atlas this frame (colour glyphs' or the words'), its picture to be uploaded there (flush). */
+    /**
+     * A glyph put in an atlas this frame (colour glyphs' or the words'), its picture to be uploaded there (flush); or
+     * (pages > 0) the atlas made that many pages, between the glyphs put before and after (atlasPages).
+     */
     static final class Placed {
         final Bitmap bmp;
         byte[] bytes;
         final int w, h, x, y;
         final boolean colour;
+        int pages;
 
         Placed(byte[] bytes, Bitmap bmp, int w, int h, int x, int y, boolean colour) {
             this.bytes = bytes;
@@ -155,6 +158,12 @@ final class MBText {
 
     /** A colour glyph's place across is this far past its place in colour glyphs' atlas (android_host.c MB_ATLAS_COLOR_U). */
     static final int COLOUR_U = 16384;
+
+    /**
+     * A page's side of the words' atlas and of colour glyphs' (gles_render.h MB_ATLAS, MB_ATLAS_COLOR): a glyph on page
+     * p is p sides down past its place on it.
+     */
+    static final int ATLAS_SIDE = 4096, COLOUR_ATLAS_SIDE = 1024;
 
     /**
      * A font's clusters and their keys: by the cluster, and a cluster of one UTF-16 unit (a letter, a Han ideograph, a
@@ -853,6 +862,24 @@ final class MBText {
         heldKey = -1;
     }
 
+    /**
+     * The atlas (colour glyphs' or the words') made {@code n} pages for what is put after this (android_host.c
+     * mb_host_atlas_pages, the app's thread): among the glyphs put, in order. Pages given back ({@code fewer}) are
+     * handed to the GL thread at once with what was put before them, so their memory goes though no frame comes.
+     */
+    static void atlasPages(boolean colour, int n, boolean fewer) {
+        Placed op = new Placed(null, null, 0, 0, 0, 0, colour);
+        op.pages = n;
+        if (!fewer) {
+            placed.add(op);
+            return;
+        }
+        ArrayList<Placed> now = new ArrayList<>(placed);
+        placed.clear();
+        now.add(op);
+        MBView.toRender(() -> upload(now));
+    }
+
     /** The glyph drawn last, not put in the atlas, let go. */
     static void dropHeld() {
         if (held != null) held.recycle();
@@ -968,9 +995,18 @@ final class MBText {
         int i = 0;
         while (i < n) {
             Placed first = placed.get(i);
+            if (first.pages > 0) {
+                // (the atlas's texture made anew: bound again for the glyphs after)
+                Native.atlasPages(first.colour, first.pages);
+                bound = -1;
+                i++;
+                continue;
+            }
+            int side = first.colour ? COLOUR_ATLAS_SIDE : ATLAS_SIDE;
+            int page = first.y / side, ly = first.y - page * side;
             int j = i, right = first.x - 1, h = 0;
-            while (j < n && placed.get(j).colour == first.colour && placed.get(j).y == first.y
-                    && placed.get(j).x == right + 1) {
+            while (j < n && placed.get(j).pages == 0 && placed.get(j).colour == first.colour
+                    && placed.get(j).y == first.y && placed.get(j).x == right + 1) {
                 Placed g = placed.get(j);
                 right = g.x + g.w;
                 h = Math.max(h, g.h);
@@ -978,13 +1014,13 @@ final class MBText {
             }
             int tex = first.colour ? Native.colourAtlasTexture() : Native.atlasTexture();
             if (tex != bound) {
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex);
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D_ARRAY, tex);
                 bound = tex;
             }
             int w = right - first.x;
             if (first.colour) {
                 if (j - i == 1) {
-                    GLUtils.texSubImage2D(GLES30.GL_TEXTURE_2D, 0, first.x, first.y, first.bmp);
+                    colourPut(first.x, ly, page, first.bmp);
                 } else {
                     Bitmap row = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
                     Canvas c = new Canvas(row);
@@ -992,7 +1028,7 @@ final class MBText {
                         Placed g = placed.get(k);
                         c.drawBitmap(g.bmp, g.x - first.x, 0, null);
                     }
-                    GLUtils.texSubImage2D(GLES30.GL_TEXTURE_2D, 0, first.x, first.y, row);
+                    colourPut(first.x, ly, page, row);
                     row.recycle();
                 }
             } else {
@@ -1001,13 +1037,13 @@ final class MBText {
                     ByteBuffer one = glyphBuffer(first.bytes.length);
                     one.put(first.bytes);
                     one.flip();
-                    GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, first.x, first.y, first.w, first.h,
+                    GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_2D_ARRAY, 0, first.x, ly, page, first.w, first.h, 1,
                             GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, one);
                 } else if (j - i == 1 && first.bmp.getConfig() == Bitmap.Config.ALPHA_8
                         && first.bmp.getRowBytes() == first.w) {
                     // one glyph drawn as its cover alone: its bytes as they are
                     ByteBuffer one = coverOf(first.bmp);
-                    GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, first.x, first.y, first.w, first.h,
+                    GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_2D_ARRAY, 0, first.x, ly, page, first.w, first.h, 1,
                             GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, one);
                 } else {
                     // each glyph's alpha where it lies in the row, nothing (0) round it
@@ -1046,7 +1082,7 @@ final class MBText {
                         }
                     }
                     cover.position(0);
-                    GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, first.x, first.y, w, h, GLES30.GL_RED,
+                    GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_2D_ARRAY, 0, first.x, ly, page, w, h, 1, GLES30.GL_RED,
                             GLES30.GL_UNSIGNED_BYTE, cover);
                 }
                 GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 4);
@@ -1055,6 +1091,23 @@ final class MBText {
             i = j;
         }
         placed.clear();
+    }
+
+    /**
+     * Colour glyphs' pixels ({@code bmp}, ARGB_8888: premultiplied, RGBA in memory, as GLUtils.texSubImage2D gave
+     * them) into page {@code page} of their atlas, their top left at x, y on it.
+     */
+    static void colourPut(int x, int y, int page, Bitmap bmp) {
+        int bw = bmp.getWidth(), bh = bmp.getHeight();
+        Bitmap b = bmp.getConfig() == Bitmap.Config.ARGB_8888 && bmp.getRowBytes() == bw * 4
+                ? bmp : bmp.copy(Bitmap.Config.ARGB_8888, false);
+        ByteBuffer px = glyphBuffer(bw * bh * 4);
+        b.copyPixelsToBuffer(px);
+        px.flip();
+        GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 4);
+        GLES30.glTexSubImage3D(GLES30.GL_TEXTURE_2D_ARRAY, 0, x, y, page, bw, bh, 1, GLES30.GL_RGBA,
+                GLES30.GL_UNSIGNED_BYTE, px);
+        if (b != bmp) b.recycle();
     }
 
     /**

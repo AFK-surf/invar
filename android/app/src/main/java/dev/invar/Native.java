@@ -62,6 +62,9 @@ final class Native {
     static native int atlasTexture();
 
     static native int colourAtlasTexture();
+
+    /** (GL thread) The atlas (colour glyphs' or the words') made {@code n} pages: false where there was no memory. */
+    static native boolean atlasPages(boolean colour, int n);
     static native boolean snapshot(String path);
     /** Image `id` uploaded as `tex` (0: not decoded), GL thread: whether the app is to be told (imageTold). */
     static native boolean imageDone(int id, int tex);

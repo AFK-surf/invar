@@ -58,6 +58,8 @@ static int image_mips(int id) {
 typedef struct {
   int colour, x, y, w, h;
   uint8_t *px;
+  // (a PAGES op, px NULL: the atlas `pages` pages from here on)
+  int pages;
 } atlas_put;
 static atlas_put *puts_;
 static int n_puts, cap_puts;
@@ -72,19 +74,37 @@ void mb_atlas_put(int colour, int x, int y, int w, int h, const uint8_t *px) {
   size_t n = (size_t)w * h * (colour ? 4 : 1);
   uint8_t *copy = malloc(n);
   memcpy(copy, px, n);
-  puts_[n_puts++] = (atlas_put){colour, x, y, w, h, copy};
+  puts_[n_puts++] = (atlas_put){colour, x, y, w, h, copy, 0};
 }
+
+// the pages each atlas has for what is put and drawn from now on (the ops kept say it to the context)
+static int atlas_told[2] = {1, 1};
+// (linux_text.c) what the atlases held is gone: the generation moves on, every glyph drawn again
+void mb_text_atlas_lost(void);
+// (linux_app.c) the run's GL context made current where a window has one: whether it is
+int mb_app_gl_current(void);
 
 static void atlas_upload(void) {
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  int lost = 0;
   for (int i = 0; i < n_puts; i++) {
     atlas_put *p = &puts_[i];
-    glBindTexture(GL_TEXTURE_2D, p->colour ? catlas : atlas);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, p->x, p->y, p->w, p->h, p->colour ? GL_RGBA : GL_RED, GL_UNSIGNED_BYTE, p->px);
+    if (p->pages > 0) {
+      // (pages there was no memory for: the most the atlas has from now on, and every glyph drawn again in them)
+      if (!gl_atlas_pages(p->colour, p->pages)) lost = 1;
+      continue;
+    }
+    glBindTexture(GL_TEXTURE_2D_ARRAY, p->colour ? catlas : atlas);
+    gl_atlas_sub(p->colour, p->x, p->y, p->w, p->h, p->px);
     free(p->px);
   }
   n_puts = 0;
   glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+  if (lost) {
+    atlas_told[0] = gl_atlas_have[0];
+    atlas_told[1] = gl_atlas_have[1];
+    mb_text_atlas_lost();
+  }
 }
 
 // ---- the windows of one run (linux_app.c): what gles_render.h keeps of the frame, each window's ----
@@ -189,9 +209,14 @@ void mb_render_setup(void) {
   }
   gl_setup();
   ready = 1;
-  // what the atlases held is gone with the old context (MoonBit draws its glyphs again: linux_text.c's generation)
+  // what the atlases held is gone with the old context (MoonBit draws its glyphs again: linux_text.c's generation),
+  // their pages one again
   for (int i = 0; i < n_puts; i++) free(puts_[i].px);
   n_puts = 0;
+  if (atlas_told[0] > 1 || atlas_told[1] > 1) {
+    atlas_told[0] = atlas_told[1] = 1;
+    mb_text_atlas_lost();
+  }
   mb_images_lost();
   mb_streams_lost();
   mb_players_lost();
@@ -525,22 +550,35 @@ void mb_render_spin(double ms) {
   nanosleep(&t, NULL);
 }
 
-// ---- the glyph atlases' pages (atlas_pages.h): one page here as yet ----
+// ---- the glyph atlases' pages (atlas_pages.h) ----
 int mb_atlas_pages_said;
 void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
+
 int32_t mb_host_atlas_pages_most(int32_t colour) {
-  (void)colour;
-  return 1;
+  GLint layers = 0;
+  if (ready) glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &layers);
+  return gl_atlas_most(colour, layers > 0 ? layers : 256);
 }
-int32_t mb_host_atlas_pages_now(int32_t colour) {
-  (void)colour;
-  return 1;
-}
+
+int32_t mb_host_atlas_pages_now(int32_t colour) { return atlas_told[colour ? 1 : 0]; }
+
+// The atlas `colour` made `n` pages for what is put and drawn after this: an op kept in order with the glyphs put
+// (atlas_upload, in the context). Given back, done at once where the context can be made current, so the memory goes
+// though no frame is drawn after.
 int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
-  (void)colour;
-  return n == 1;
-}
-int32_t mb_render_atlas_pages_held(int32_t colour) {
-  (void)colour;
+  int c = colour ? 1 : 0;
+  if (n == atlas_told[c]) return 1;
+  if (n < 1 || n > mb_host_atlas_pages_most(colour)) return 0;
+  if (n_puts == cap_puts) {
+    cap_puts = cap_puts ? cap_puts * 2 : 256;
+    puts_ = realloc(puts_, sizeof *puts_ * (size_t)cap_puts);
+  }
+  puts_[n_puts++] = (atlas_put){c, 0, 0, 0, 0, NULL, n};
+  int fewer = n < atlas_told[c];
+  atlas_told[c] = n;
+  if (fewer && ready && (eglGetCurrentContext() != EGL_NO_CONTEXT || mb_app_gl_current())) atlas_upload();
   return 1;
 }
+
+// How many pages each atlas's texture has (for tests: what the context's ops left).
+int32_t mb_render_atlas_pages_held(int32_t colour) { return gl_atlas_have[colour ? 1 : 0]; }

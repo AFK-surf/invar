@@ -130,6 +130,8 @@ static void checked_draw_arrays_instanced(GLenum mode, GLint first, GLsizei coun
 
 #include "gles_render.h"
 
+int mb_atlas_pages_said;
+
 static int failed;
 
 #define CHECK(c)                                                      \
@@ -871,6 +873,52 @@ int main(void) {
     glDeleteTextures(1, &canvas_tex);
     canvas_lost();
   }
+  // Atlas pages: a page added keeps page 0's texels, a glyph whose v is a page down is drawn from page 1, and a page
+  // given back leaves page 0 as it was.
+  {
+    const int side = MB_ATLAS;
+    uint8_t c0[16 * 16], c1[16 * 16];
+    memset(c0, 200, sizeof c0);
+    memset(c1, 90, sizeof c1);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, atlas);
+    gl_atlas_sub(0, 0, 0, 16, 16, c0);
+    CHECK(gl_atlas_have[0] == 1);
+    CHECK(gl_atlas_pages(0, 2) == 1 && gl_atlas_have[0] == 2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, atlas);
+    gl_atlas_sub(0, 0, side, 16, 16, c1);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    double scene[2 * MB_INST];
+    rect_at(scene, 10, 10, 40, 40, 1, 1.0, 1.0, 1.0, 0, 150.0, 300.0);
+    scene[12] = 0.0;
+    scene[13] = 0.0;
+    scene[14] = 16.0;
+    scene[15] = 16.0;
+    rect_at(scene + MB_INST, 60, 10, 40, 40, 1, 1.0, 1.0, 1.0, 0, 150.0, 300.0);
+    scene[MB_INST + 12] = 0.0;
+    scene[MB_INST + 13] = (double)side;
+    scene[MB_INST + 14] = 16.0;
+    scene[MB_INST + 15] = 16.0;
+    glass_forget();
+    reset_counters(test_fb);
+    gl_present(scene, 2, 0.0, 0.0, 0.0);
+    unsigned char *px = pixels_of_fb(test_fb);
+    // (rows from the bottom: the quads' middles, 30 points down, 30 and 80 across, at 2 pixels a point)
+    size_t row = (size_t)(fb_h - 1 - 60) * (size_t)fb_w * 4;
+    int r0 = px[row + 60 * 4], r1 = px[row + 160 * 4];
+    CHECK(abs(r0 - 200) <= 2);
+    CHECK(abs(r1 - 90) <= 2);
+    free(px);
+    CHECK(gl_atlas_pages(0, 1) == 1 && gl_atlas_have[0] == 1);
+    glass_forget();
+    reset_counters(test_fb);
+    gl_present(scene, 1, 0.0, 0.0, 0.0);
+    px = pixels_of_fb(test_fb);
+    CHECK(abs((int)px[row + 60 * 4] - 200) <= 2);
+    free(px);
+    if (failed) fprintf(stderr, "gles_render_test: atlas pages r0=%d r1=%d\n", r0, r1);
+  }
+
   glass_free();
   glDeleteFramebuffers(1, &test_fb);
   glDeleteTextures(1, &test_tex);
