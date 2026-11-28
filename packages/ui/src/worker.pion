@@ -2,74 +2,153 @@
 // Keeps blocking IO and heavy computation off the render thread while providing
 // a synchronous inline mode for `wasm32` and deterministic `Tester` suites.
 
+import "causal"
 import "hostapi"
+import "signals"
+import "view"
 
 /// Thread-safe event queue bridging background worker threads to the render thread.
 /// Contains no `mut` or closure fields so `EventQueue[Ev]` is statically `Send` whenever `Ev : Send`.
+/// Coalesces back-to-back `hostapi::wake_now()` syscalls under the mutex until drained.
 pub struct EventQueue[Ev] {
-  buf : Mutex[Array[Ev]]
+  buf : Mutex[Array[(causal::CauseId, Ev)]]
+  wake_pending : AtomicInt
 }
 
 pub fn EventQueue::new[Ev]() -> EventQueue[Ev] {
-  let empty : Array[Ev] = []
-  EventQueue::{ buf: Mutex::new(empty) }
+  let empty : Array[(causal::CauseId, Ev)] = []
+  EventQueue::{ buf: Mutex::new(empty), wake_pending: AtomicInt::new(0) }
 }
 
-/// Push an event onto the queue from any thread and wake the render loop immediately.
-pub fn EventQueue::emit[Ev](self : EventQueue[Ev], ev : Ev) -> Unit {
-  self.buf.with_lock(fn(q : Array[Ev]) -> Unit {
-    q.push(ev)
+/// Push an event with an explicit causal `CauseId` from any thread and wake the render loop
+/// (coalesced to at most one `hostapi::wake_now()` call per undrained burst).
+pub fn EventQueue::emit_with_cause[Ev](
+  self : EventQueue[Ev],
+  cause : causal::CauseId,
+  ev : Ev,
+) -> Unit {
+  let mut should_wake = false
+  self.buf.with_lock(fn(q : Array[(causal::CauseId, Ev)]) -> Unit {
+    q.push((cause, ev))
+    if self.wake_pending.load() == 0 {
+      self.wake_pending.store(1)
+      should_wake = true
+    }
   })
-  hostapi::wake_now()
+  if should_wake {
+    hostapi::wake_now()
+  }
 }
 
-/// Drain all queued events on the render thread and apply them after releasing the lock.
-pub fn EventQueue::drain[Ev](self : EventQueue[Ev], apply : (Ev) -> Unit) -> Int {
-  let batch : Array[Ev] = []
-  self.buf.with_lock(fn(q : Array[Ev]) -> Unit {
+/// Push an event onto the queue from any thread and wake the render loop (coalesced).
+pub fn EventQueue::emit[Ev](self : EventQueue[Ev], ev : Ev) -> Unit {
+  self.emit_with_cause(causal::CauseId::none(), ev)
+}
+
+fn EventQueue::take_all[Ev](self : EventQueue[Ev]) -> Array[(causal::CauseId, Ev)] {
+  let items : Array[(causal::CauseId, Ev)] = []
+  self.buf.with_lock(fn(q : Array[(causal::CauseId, Ev)]) -> Unit {
     let mut i = 0
     while i < q.length() {
-      batch.push(q[i])
+      items.push(q[i])
       i += 1
     }
     q.clear()
+    self.wake_pending.store(0)
   })
-  let n = batch.length()
-  let mut i = 0
-  while i < n {
-    apply(batch[i])
-    i += 1
+  items
+}
+
+fn apply_drained_items[Ev](
+  items : Array[(causal::CauseId, Ev)],
+  apply : (Ev) -> Unit,
+) -> Unit {
+  signals::batch(fn() -> Unit {
+    let mut i = 0
+    let n = items.length()
+    while i < n {
+      let item = items[i]
+      let cid = item.0
+      if cid.is_none() {
+        apply(item.1)
+      } else {
+        ui_causal_ring_inst.with_cause(cid, fn() -> Unit {
+          apply(item.1)
+        })
+      }
+      i += 1
+    }
+  })
+}
+
+/// Drain all queued events on the render thread and apply them inside a single `signals::batch`
+/// after releasing the lock, restoring each event's `CauseId` when `ui::causal_ring()` is enabled.
+pub fn EventQueue::drain[Ev](self : EventQueue[Ev], apply : (Ev) -> Unit) -> Int {
+  let items = self.take_all()
+  let n = items.length()
+  if n == 0 {
+    return 0
   }
+  apply_drained_items(items, apply)
   n
 }
 
 /// Background-thread endpoint of a `Worker` pair (`Send` whenever `Cmd : Send, Ev : Send`).
 pub struct WorkerCtx[Cmd, Ev] {
-  cmds : Channel[Cmd]
+  cmds : Channel[(causal::CauseId, Cmd)]
   events : EventQueue[Ev]
 }
 
 /// Block until the next command arrives, or return `None` when the worker is closed.
 pub fn WorkerCtx::recv[Cmd, Ev](self : WorkerCtx[Cmd, Ev]) -> Option[Cmd] {
+  match self.cmds.recv() {
+    Some(pair) => Some(pair.1)
+    None => None
+  }
+}
+
+/// Block until the next `(CauseId, Cmd)` arrives, or return `None` when the worker is closed.
+pub fn WorkerCtx::recv_with_cause[Cmd, Ev](
+  self : WorkerCtx[Cmd, Ev],
+) -> Option[(causal::CauseId, Cmd)] {
   self.cmds.recv()
 }
 
-/// Emit an event back to the render thread and wake the host frame loop.
+/// Emit an event back to the render thread and wake the host frame loop (coalesced).
 pub fn WorkerCtx::emit[Cmd, Ev](self : WorkerCtx[Cmd, Ev], ev : Ev) -> Unit {
   self.events.emit(ev)
 }
 
+/// Emit an event with explicit `CauseId` back to the render thread.
+pub fn WorkerCtx::emit_with_cause[Cmd, Ev](
+  self : WorkerCtx[Cmd, Ev],
+  cause : causal::CauseId,
+  ev : Ev,
+) -> Unit {
+  self.events.emit_with_cause(cause, ev)
+}
+
 /// Run the command loop until the render-thread `Worker` is closed.
+/// Automatically propagates each command's captured `CauseId` to every event emitted for it.
 pub fn WorkerCtx::run_loop[Cmd, Ev](
   self : WorkerCtx[Cmd, Ev],
   handle : (Cmd, (Ev) -> Unit) -> Unit,
 ) -> Unit {
-  let emit_fn = fn(ev : Ev) -> Unit {
+  let plain_emit = fn(ev : Ev) -> Unit {
     self.events.emit(ev)
   }
   while true {
     match self.cmds.recv() {
-      Some(cmd) => handle(cmd, emit_fn)
+      Some(pair) => {
+        let cid = pair.0
+        if cid.is_none() {
+          handle(pair.1, plain_emit)
+        } else {
+          handle(pair.1, fn(ev : Ev) -> Unit {
+            self.events.emit_with_cause(cid, ev)
+          })
+        }
+      }
       None => break
     }
   }
@@ -77,17 +156,18 @@ pub fn WorkerCtx::run_loop[Cmd, Ev](
 
 /// Render-thread endpoint of a dual-thread (or synchronous inline) worker.
 pub struct Worker[Cmd, Ev] {
-  cmds : Channel[Cmd]
+  cmds : Channel[(causal::CauseId, Cmd)]
   events : EventQueue[Ev]
   inline_handler : Option[(Cmd, (Ev) -> Unit) -> Unit]
   mut closed : Bool
   mut hook_id : Int
+  mut bind_gen : Int
 }
 
 /// Create a paired render-thread `Worker` and background-thread `WorkerCtx`.
 /// Uses an unbounded channel (`Channel::new(0)`) so `send` never blocks the render thread.
 pub fn Worker::pair[Cmd, Ev]() -> (Worker[Cmd, Ev], WorkerCtx[Cmd, Ev]) {
-  let cmds : Channel[Cmd] = Channel::new(0)
+  let cmds : Channel[(causal::CauseId, Cmd)] = Channel::new(0)
   let events : EventQueue[Ev] = EventQueue::new()
   let worker = Worker::{
     cmds,
@@ -95,6 +175,7 @@ pub fn Worker::pair[Cmd, Ev]() -> (Worker[Cmd, Ev], WorkerCtx[Cmd, Ev]) {
     inline_handler: None,
     closed: false,
     hook_id: 0,
+    bind_gen: 0,
   }
   let ctx = WorkerCtx::{ cmds, events }
   (worker, ctx)
@@ -102,7 +183,7 @@ pub fn Worker::pair[Cmd, Ev]() -> (Worker[Cmd, Ev], WorkerCtx[Cmd, Ev]) {
 
 /// Create an inline synchronous worker for `wasm32` and deterministic `Tester` suites.
 pub fn Worker::inline[Cmd, Ev](handle : (Cmd, (Ev) -> Unit) -> Unit) -> Worker[Cmd, Ev] {
-  let cmds : Channel[Cmd] = Channel::new(0)
+  let cmds : Channel[(causal::CauseId, Cmd)] = Channel::new(0)
   let events : EventQueue[Ev] = EventQueue::new()
   Worker::{
     cmds,
@@ -110,46 +191,98 @@ pub fn Worker::inline[Cmd, Ev](handle : (Cmd, (Ev) -> Unit) -> Unit) -> Worker[C
     inline_handler: Some(handle),
     closed: false,
     hook_id: 0,
+    bind_gen: 0,
   }
 }
 
 /// Send a command to the worker. Returns `false` if the worker has already been closed.
+/// Captures `ui::causal_ring().current_cause()` when causal tracing is enabled (zero overhead when disabled).
 pub fn Worker::send[Cmd, Ev](self : Worker[Cmd, Ev], cmd : Cmd) -> Bool {
   if self.closed {
     return false
   }
+  let cid = if ui_causal_ring_inst.is_enabled() {
+    ui_causal_ring_inst.current_cause()
+  } else {
+    causal::CauseId::none()
+  }
   match self.inline_handler {
     Some(handle) => {
-      handle(cmd, fn(ev : Ev) -> Unit { self.events.emit(ev) })
+      handle(cmd, fn(ev : Ev) -> Unit { self.events.emit_with_cause(cid, ev) })
       true
     }
-    None => self.cmds.send(move cmd)
+    None => {
+      let pkg = (cid, cmd)
+      self.cmds.send(move pkg)
+    }
   }
 }
 
-/// Drain queued worker events and apply each to render-thread signals.
+/// Drain queued worker events and apply each to render-thread signals in one `signals::batch`.
 pub fn Worker::drain[Cmd, Ev](self : Worker[Cmd, Ev], apply : (Ev) -> Unit) -> Int {
   self.events.drain(apply)
 }
 
-/// Automatically drain queued events before every frame via `on_before_frame`.
-/// Calling `bind` again replaces any previously bound hook for this worker.
-pub fn Worker::bind[Cmd, Ev](self : Worker[Cmd, Ev], apply : (Ev) -> Unit) -> Unit {
+/// Unbind any active `on_before_frame` hook without closing the command channel.
+/// Advances `bind_gen` so any prior `bind_in(..., close_on_unmount=true)` owner unmount
+/// will not subsequently close this worker after an explicit `unbind()`.
+pub fn Worker::unbind[Cmd, Ev](self : Worker[Cmd, Ev]) -> Unit {
+  self.bind_gen += 1
   if self.hook_id > 0 {
     remove_before_frame(self.hook_id)
     self.hook_id = 0
   }
+}
+
+/// Automatically drain queued events before every frame via `on_before_frame`
+/// (batched in a single `signals::batch` per frame; callers settling initial-load answers
+/// may opt into `answered_from_outside(...)` inside `apply`).
+/// Calling `bind` again replaces any previously bound hook for this worker.
+pub fn Worker::bind[Cmd, Ev](self : Worker[Cmd, Ev], apply : (Ev) -> Unit) -> Unit {
+  self.unbind()
   self.hook_id = on_before_frame(fn() -> Unit {
     let _ = self.drain(apply)
   })
 }
 
+/// Bind this worker to `owner`'s lifecycle via `owner.owns(...)`.
+/// Automatically unbinds the `on_before_frame` hook when `owner` unmounts (or closes the worker
+/// when `close_on_unmount=true`), unless a newer `bind` / `bind_in` or explicit `unbind()`
+/// has already advanced `bind_gen`.
+/// If `owner` is already dead, any active binding is immediately unbound (or closed when
+/// `close_on_unmount=true`), matching `bind`'s replacement semantics.
+/// Prefer calling `bind_in` once per mounted view (repeated calls on the same long-lived
+/// `owner` register one `owns` cleanup closure per call until `owner` unmounts).
+pub fn Worker::bind_in[Cmd, Ev](
+  self : Worker[Cmd, Ev],
+  owner : view::View,
+  apply : (Ev) -> Unit,
+  close_on_unmount~ : Bool = false,
+) -> Unit {
+  if !owner.alive() {
+    if close_on_unmount {
+      self.close()
+    } else {
+      self.unbind()
+    }
+    return
+  }
+  self.bind(apply)
+  let my_gen = self.bind_gen
+  let _ = owner.owns(fn() -> Unit {
+    if self.bind_gen == my_gen {
+      if close_on_unmount {
+        self.close()
+      } else {
+        self.unbind()
+      }
+    }
+  })
+}
+
 /// Unbind any `on_before_frame` hook and close the command channel so `WorkerCtx::run_loop` exits.
 pub fn Worker::close[Cmd, Ev](self : Worker[Cmd, Ev]) -> Unit {
-  if self.hook_id > 0 {
-    remove_before_frame(self.hook_id)
-    self.hook_id = 0
-  }
+  self.unbind()
   if !self.closed {
     self.closed = true
     self.cmds.close()

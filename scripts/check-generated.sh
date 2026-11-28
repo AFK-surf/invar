@@ -58,10 +58,55 @@ json_out = sys.argv[5] == "1"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_HAND_EXACT = {"00_init_order.pion", "invar_ext.pion"}
 
-# Ratcheting baseline of pre-existing legacy violations (may only shrink; never grow).
-# Remove each entry as soon as its package is republished / renamed.
-BASELINE_BAD_HEADER_PACKAGES = {
-    "headless": 92,  # 46 files x (mbt2pion_commit=dev, source_commit=working-tree)
+# Ratcheting baseline of pre-existing legacy violations (exact file paths; may only shrink, never grow).
+# Remove each entry as soon as its file is republished with valid 40-char hex headers or renamed.
+BASELINE_BAD_HEADER_FILES = {
+    "packages/headless/src/00_init_order.pion",
+    "packages/headless/src/accordion.pion",
+    "packages/headless/src/anchor.pion",
+    "packages/headless/src/button.pion",
+    "packages/headless/src/choice.pion",
+    "packages/headless/src/cmdk.pion",
+    "packages/headless/src/combobox.pion",
+    "packages/headless/src/context_menu.pion",
+    "packages/headless/src/dialog.pion",
+    "packages/headless/src/disclosure.pion",
+    "packages/headless/src/drawer.pion",
+    "packages/headless/src/focus_recovery.pion",
+    "packages/headless/src/headless.pion",
+    "packages/headless/src/hover_reveal.pion",
+    "packages/headless/src/inline_edit.pion",
+    "packages/headless/src/input_history.pion",
+    "packages/headless/src/listbox.pion",
+    "packages/headless/src/menu.pion",
+    "packages/headless/src/menubar.pion",
+    "packages/headless/src/number_input.pion",
+    "packages/headless/src/overlay.pion",
+    "packages/headless/src/popover.pion",
+    "packages/headless/src/progress.pion",
+    "packages/headless/src/radio_group.pion",
+    "packages/headless/src/range_slider.pion",
+    "packages/headless/src/reorder.pion",
+    "packages/headless/src/repeat.pion",
+    "packages/headless/src/rove.pion",
+    "packages/headless/src/selection.pion",
+    "packages/headless/src/shortcut.pion",
+    "packages/headless/src/slider.pion",
+    "packages/headless/src/split.pion",
+    "packages/headless/src/state_set.pion",
+    "packages/headless/src/submenu.pion",
+    "packages/headless/src/swipe_actions.pion",
+    "packages/headless/src/table.pion",
+    "packages/headless/src/tabs.pion",
+    "packages/headless/src/text_field.pion",
+    "packages/headless/src/toaster.pion",
+    "packages/headless/src/toggle.pion",
+    "packages/headless/src/toggle_group.pion",
+    "packages/headless/src/toolbar.pion",
+    "packages/headless/src/tooltip.pion",
+    "packages/headless/src/tree.pion",
+    "packages/headless/src/trigger_menu.pion",
+    "packages/headless/src/typeahead.pion",
 }
 BASELINE_ROGUE_FILES = {
     "packages/hostapi/src/json.pion",
@@ -76,7 +121,6 @@ def is_allowed_overlay(fname: str) -> bool:
 
 packages_dir = os.path.join(root, "packages")
 bad_headers = []
-bad_headers_by_pkg = {}
 rogue_files = []
 pkg_commits = {}
 gen_packages = 0
@@ -118,7 +162,6 @@ for pkg in sorted(os.listdir(packages_dir)):
                     "field": "mbt2pion_commit",
                     "value": mbt2pion_c or "<missing>",
                 })
-                bad_headers_by_pkg[pkg] = bad_headers_by_pkg.get(pkg, 0) + 1
             if not source_c or not HEX40.match(source_c):
                 bad_headers.append({
                     "pkg": pkg,
@@ -126,7 +169,6 @@ for pkg in sorted(os.listdir(packages_dir)):
                     "field": "source_commit",
                     "value": source_c or "<missing>",
                 })
-                bad_headers_by_pkg[pkg] = bad_headers_by_pkg.get(pkg, 0) + 1
             if source_c:
                 commits.add(source_c)
         else:
@@ -151,21 +193,13 @@ if strict:
     new_bad_headers = bad_headers
     new_rogue_files = rogue_files
 else:
+    bad_header_files = {h["file"] for h in bad_headers}
     for h in bad_headers:
-        pkg = h["pkg"]
-        if pkg not in BASELINE_BAD_HEADER_PACKAGES:
+        if h["file"] not in BASELINE_BAD_HEADER_FILES:
             new_bad_headers.append(h)
-    for pkg, limit in BASELINE_BAD_HEADER_PACKAGES.items():
-        actual = bad_headers_by_pkg.get(pkg, 0)
-        if actual > limit:
-            new_bad_headers.append({
-                "pkg": pkg,
-                "file": f"packages/{pkg}/src/*",
-                "field": "baseline_exceeded",
-                "value": f"{actual} > {limit}",
-            })
-        elif actual < limit:
-            stale_baseline.append(f"BASELINE_BAD_HEADER_PACKAGES['{pkg}']: actual {actual} < baseline {limit} (lower it!)")
+    for bf in sorted(BASELINE_BAD_HEADER_FILES):
+        if bf not in bad_header_files:
+            stale_baseline.append(f"BASELINE_BAD_HEADER_FILES: '{bf}' resolved (remove it!)")
 
     rogue_set = set(rogue_files)
     for rf in rogue_files:

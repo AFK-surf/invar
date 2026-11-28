@@ -2,6 +2,7 @@
 // `hostapi::wake_now`, `FakeHost.wake_count`, and `on_before_frame`.
 // Note: Pion `test "..."` blocks do not receive a `World` capability (needed for `scope`/`spawn`).
 
+import "causal"
 import "hostapi"
 import "signals"
 import "view"
@@ -46,12 +47,18 @@ test "worker inline mode dispatches synchronously and drains on Tester::frame" {
   debug_assert(worker.send(TestCmd::Add(3)), "inline send Add(3)")
   debug_assert(worker.send(TestCmd::Add(4)), "inline send Add(4)")
   debug_assert(worker.send(TestCmd::Tag("ok")), "inline send Tag(ok)")
-  debug_assert(hostapi::wake_count() == before_wakes + 3, "each emit triggers hostapi::wake_now")
+  debug_assert(hostapi::wake_count() == before_wakes + 1, "burst of 3 emits coalesces to 1 hostapi::wake_now")
 
   t.frame(ms=16.0)
   debug_assert(sum.get() == 70, "drained both Added events (30 + 40 = 70)")
   debug_assert(label.get() == "tag:ok", "drained Tagged event")
   debug_assert(t.find("sum=70 label=tag:ok").is_some(), "UI re-rendered with drained signal values")
+
+  // After drain clears wake_pending, the next emit triggers a fresh host wake.
+  debug_assert(worker.send(TestCmd::Add(1)), "inline send after drain")
+  debug_assert(hostapi::wake_count() == before_wakes + 2, "post-drain emit wakes host again")
+  t.frame(ms=16.0)
+  debug_assert(sum.get() == 80, "post-drain event applied")
 
   worker.close()
   debug_assert(!worker.send(TestCmd::Add(1)), "send returns false after close")
@@ -94,7 +101,7 @@ test "worker pair channel, EventQueue emit/drain, wake_now and re-bind lifecycle
     }
   })
 
-  debug_assert(hostapi::wake_count() == wakes_before + 3, "ctx.run_loop emit called wake_now 3 times")
+  debug_assert(hostapi::wake_count() == wakes_before + 1, "ctx.run_loop burst coalesced to 1 wake_now")
   debug_assert(t.frame_requested(), "FakeHost.frame_requested set by wake_now")
 
   // Re-bind after close to verify drain on Tester::frame
@@ -109,4 +116,169 @@ test "worker pair channel, EventQueue emit/drain, wake_now and re-bind lifecycle
   debug_assert(tag.get() == "bg:ok", "tag updated to bg:ok")
   debug_assert(t.find("pair=24 tag=bg:ok").is_some(), "UI re-rendered with drained WorkerCtx events")
   t.dispose()
+}
+
+test "worker drain coalesces burst updates in one signals::batch" {
+  let sum = signals::signal(0)
+  let eff_runs = [0]
+  let stop = signals::effect(fn() -> Unit {
+    let _ = sum.get()
+    eff_runs[0] += 1
+  })
+  debug_assert(eff_runs[0] == 1, "initial effect run")
+
+  let worker : Worker[TestCmd, TestEv] = Worker::inline(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n))
+      TestCmd::Tag(s) => emit(TestEv::Tagged(s))
+    }
+  })
+  let _ = worker.send(TestCmd::Add(1))
+  let _ = worker.send(TestCmd::Add(2))
+  let _ = worker.send(TestCmd::Add(3))
+  let drained = worker.drain(fn(ev : TestEv) -> Unit {
+    match ev {
+      TestEv::Added(v) => sum.set(sum.untracked() + v)
+      TestEv::Tagged(_) => ()
+    }
+  })
+  debug_assert(drained == 3 && sum.get() == 6, "all 3 events drained")
+  debug_assert(eff_runs[0] == 2, "3 events in one drain flushed downstream effect exactly once")
+  stop()
+  worker.close()
+}
+
+test "worker bind_in auto-unbinds on unmount, respects rebind, and supports close_on_unmount" {
+  let show_a = signals::signal(true)
+  let show_b = signals::signal(false)
+  let hits_a = [0]
+  let hits_b = [0]
+  let worker : Worker[TestCmd, TestEv] = Worker::inline(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n))
+      TestCmd::Tag(s) => emit(TestEv::Tagged(s))
+    }
+  })
+
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    root.show(fn() -> Bool { show_a.get() }, fn(v : view::View) -> Unit {
+      worker.bind_in(v, fn(_ev : TestEv) -> Unit { hits_a[0] += 1 })
+      let _ = v.words(view::Live::Is("A"), look=view::words_plain)
+    })
+    root.show(fn() -> Bool { show_b.get() }, fn(v : view::View) -> Unit {
+      worker.bind_in(v, fn(_ev : TestEv) -> Unit { hits_b[0] += 1 }, close_on_unmount=true)
+      let _ = v.words(view::Live::Is("B"), look=view::words_plain)
+    })
+  })
+
+  debug_assert(worker.send(TestCmd::Add(1)), "send while A mounted")
+  t.frame(ms=16.0)
+  debug_assert(hits_a[0] == 1, "A received event")
+
+  // Mount B (rebinds worker to B), then unmount A: A's unmount must NOT unbind B!
+  show_b.set(true)
+  t.frame(ms=16.0)
+  show_a.set(false)
+  t.frame(ms=16.0)
+
+  debug_assert(worker.send(TestCmd::Add(2)), "send after A unmounted while B owns worker")
+  t.frame(ms=16.0)
+  debug_assert(hits_a[0] == 1 && hits_b[0] == 1, "B still bound and received event after A unmounted")
+
+  // Unmount B (close_on_unmount=true): worker is closed and unbound
+  show_b.set(false)
+  t.frame(ms=16.0)
+  debug_assert(!worker.send(TestCmd::Add(3)), "worker closed when B unmounted")
+  t.dispose()
+
+  // Explicit unbind() detaches close_on_unmount ownership so subsequent unmount does NOT close worker.
+  let show_c = signals::signal(true)
+  let worker2 : Worker[TestCmd, TestEv] = Worker::inline(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n))
+      TestCmd::Tag(s) => emit(TestEv::Tagged(s))
+    }
+  })
+  let t2 = Tester::tree(fn(root : view::View) -> Unit {
+    root.show(fn() -> Bool { show_c.get() }, fn(v : view::View) -> Unit {
+      worker2.bind_in(v, fn(_ev : TestEv) -> Unit { () }, close_on_unmount=true)
+      let _ = v.words(view::Live::Is("C"), look=view::words_plain)
+    })
+  })
+  worker2.unbind()
+  show_c.set(false)
+  t2.frame(ms=16.0)
+  debug_assert(worker2.send(TestCmd::Add(42)), "unmount after explicit unbind() must not close worker")
+  worker2.close()
+  t2.dispose()
+
+  // Dead owner branch in bind_in: immediately unbinds (close_on_unmount=false) or closes (close_on_unmount=true).
+  let show_d = signals::signal(true)
+  let dead_view : signals::Ref[Option[view::View]] = ref_new(None)
+  let hits_d = [0]
+  let worker3 : Worker[TestCmd, TestEv] = Worker::inline(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n))
+      TestCmd::Tag(s) => emit(TestEv::Tagged(s))
+    }
+  })
+  let t3 = Tester::tree(fn(root : view::View) -> Unit {
+    worker3.bind(fn(_ev : TestEv) -> Unit { hits_d[0] += 1 })
+    root.show(fn() -> Bool { show_d.get() }, fn(v : view::View) -> Unit {
+      dead_view.v = Some(v)
+      let _ = v.words(view::Live::Is("D"), look=view::words_plain)
+    })
+  })
+  show_d.set(false)
+  t3.frame(ms=16.0)
+  match dead_view.v {
+    Some(dv) => {
+      debug_assert(!dv.alive(), "captured view is dead after unmount")
+      worker3.bind_in(dv, fn(_ev : TestEv) -> Unit { hits_d[0] += 100 })
+      debug_assert(worker3.send(TestCmd::Add(1)), "dead owner with close_on_unmount=false keeps worker open")
+      t3.frame(ms=16.0)
+      debug_assert(hits_d[0] == 0, "dead owner bind_in unbound prior hook")
+      worker3.bind_in(dv, fn(_ev : TestEv) -> Unit { () }, close_on_unmount=true)
+      debug_assert(!worker3.send(TestCmd::Add(2)), "dead owner with close_on_unmount=true immediately closes worker")
+    }
+    None => panic("expected captured view")
+  }
+  t3.dispose()
+}
+
+test "worker propagates causal CauseId from send through run_loop to drain" {
+  let t = Tester::tree(fn(root : view::View) -> Unit {
+    let _ = root.words(view::Live::Is("causal"), look=view::words_plain)
+  })
+  let ring = causal_ring()
+  ring.enable()
+
+  let (worker, ctx) : (Worker[TestCmd, TestEv], WorkerCtx[TestCmd, TestEv]) = Worker::pair()
+  let root_seq : Array[Int64] = [0.to_int64()]
+  let _ = ring.with_fact(causal::FactKind::Input, "btn:sync", "click", fn(cid : causal::CauseId) -> Unit {
+    root_seq[0] = cid.seq
+    debug_assert(worker.send(TestCmd::Add(9)), "send inside causal fact")
+  })
+  worker.close()
+
+  ctx.run_loop(fn(cmd : TestCmd, emit : (TestEv) -> Unit) -> Unit {
+    match cmd {
+      TestCmd::Add(n) => emit(TestEv::Added(n * 3))
+      TestCmd::Tag(s) => emit(TestEv::Tagged(s))
+    }
+  })
+
+  let seen_cause : Array[Int64] = [0.to_int64()]
+  let n = worker.drain(fn(_ev : TestEv) -> Unit {
+    seen_cause[0] = ring.current_cause().seq
+    let _ = ring.record_consequence(causal::ConsequenceKind::StateChange, "sig:sum", "updated")
+  })
+  debug_assert(n == 1 && root_seq[0] > 0.to_int64(), "fact recorded and event drained")
+  debug_assert(seen_cause[0] == root_seq[0], "drain restored original send CauseId")
+  let chain = ring.get_chain(root_seq[0])
+  debug_assert(chain.length() == 2, "chain has root fact + worker-drained consequence")
+  debug_assert(chain[1].caused_by == Some(root_seq[0]), "consequence attributed to root fact")
+
+  t.dispose()
+  debug_assert(!ring.is_enabled() && ring.entries().length() == 0, "Tester::dispose resets causal ring")
 }

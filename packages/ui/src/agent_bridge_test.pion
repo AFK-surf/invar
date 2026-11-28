@@ -1,6 +1,8 @@
 // Unit tests for AgentBridge: redaction & side-channel defense, hidden subtree shielding,
 // modal underlying blocking, confirm gate, ambiguity defense, full actions, JSON & Tester helpers.
 
+import "causal"
+import "redacted"
 import "signals"
 import "view"
 
@@ -280,5 +282,66 @@ test "agent_bridge 04 ui::field secret=true auto-redaction and side-channel defe
   let json = agent_snapshot_json(t.agent_snapshot())
   ab_assert(str_contains(json, "\"value\":\"[redacted]\""), "JSON has redacted placeholder")
   ab_assert(!str_contains(json, "s3cr3t-token-42"), "JSON never leaks ui::field secret text")
+  t.dispose()
+}
+
+test "agent_bridge redacted value writer auto-marks secret and causal tracing never leaks payloads" {
+  let stored : signals::Ref[redacted::Redacted[String]] = ref_new(redacted::Redacted::new("sk-initial-000"))
+  let worker : Worker[String, String] = Worker::inline(fn(cmd : String, emit : (String) -> Unit) -> Unit {
+    emit("done:" + cmd)
+  })
+  let t = Tester::tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      agent_value_writer_redacted(v, fn(secret : redacted::Redacted[String]) -> Unit {
+        stored.v = secret
+        let _ = worker.send("save_token")
+      })
+      let _ = v.says(view::Live::By(fn() {
+        Some(view::said(
+          view::Role::TextField,
+          label="Vault Key",
+          description="Top secret key",
+          value=stored.v.expose(),
+        ))
+      }))
+    })
+  })
+
+  let ring = causal_ring()
+  ring.enable()
+
+  // Auto-marked secret: snapshot and JSON redact value, query blocks side-channel probing.
+  let snap = t.agent_snapshot()
+  ab_assert(snap.length() == 1 && snap[0].redacted, "agent_value_writer_redacted auto-marks secret")
+  ab_assert(snap[0].value == redacted::redacted_placeholder, "snapshot uses redacted placeholder")
+  ab_assert(t.agent_query(text="sk-initial").length() == 0, "side-channel probe blocked")
+
+  // SetValue delivers typed Redacted[String] and attributes a causal fact WITHOUT logging the secret.
+  let res = t.agent_act(AgentStep::{
+    target: "Vault Key",
+    action: AgentAction::SetValue("sk-super-secret-42"),
+  })
+  ab_assert(ab_is_ok(res), "SetValue succeeded on redacted writer")
+  ab_assert(
+    redacted::ct_eq_str(stored.v, redacted::Redacted::new("sk-super-secret-42")),
+    "redacted writer received exact secret value",
+  )
+
+  let drained = worker.drain(fn(_ev : String) -> Unit {
+    let _ = ring.record_consequence(causal::ConsequenceKind::StateChange, "vault", "saved")
+  })
+  ab_assert(drained == 1, "worker event drained")
+
+  let entries = ring.entries()
+  ab_assert(entries.length() == 2, "agent_act fact + worker consequence recorded")
+  ab_assert(entries[0].label == "agent_act:set_value", "root fact label records action name only")
+  ab_assert(entries[1].caused_by == Some(entries[0].seq), "worker consequence attributed to agent_act fact")
+
+  let causal_json = ring.to_json()
+  ab_assert(!str_contains(causal_json, "sk-super-secret-42"), "causal JSON never leaks SetValue secret")
+  let snap_json = agent_snapshot_json(t.agent_snapshot())
+  ab_assert(!str_contains(snap_json, "sk-super-secret-42"), "snapshot JSON never leaks secret")
+
+  worker.close()
   t.dispose()
 }
