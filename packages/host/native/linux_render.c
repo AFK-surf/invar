@@ -51,6 +51,9 @@ static int image_mips(int id) {
   return (id > 0 && id <= MB_STREAM_TEX) ? mb_image_mips(id) : 1;
 }
 
+// (what pictures drawn apart from the frames draw from: the glyphs kept put in the atlases first, gles_pixels_of)
+static void atlas_upload(void);
+#define GL_ATLAS_FLUSH() atlas_upload()
 #include "gles_render.h"
 
 // ---- the glyphs put in the atlases (linux_text.c), uploaded as the next frame is drawn ----

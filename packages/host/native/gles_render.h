@@ -4688,6 +4688,9 @@ static int32_t gles_drawn_pixels(int32_t x, int32_t y, int32_t w, int32_t h, moo
 static int32_t gles_pixels_of(const double *inst, int32_t count, double r, double g, double b, double scale,
                               int32_t w, int32_t h, moonbit_bytes_t out) {
   if (count <= 0 || !(scale > 0) || w <= 0 || h <= 0) return 0;
+#ifdef GL_ATLAS_FLUSH
+  GL_ATLAS_FLUSH();
+#endif
   float *kf = fbuf;
   size_t kc = fcap;
   int32_t kn = kept_count;

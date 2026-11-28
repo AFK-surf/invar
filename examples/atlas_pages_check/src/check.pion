@@ -1,0 +1,169 @@
+// A screen of ideographs more than one glyph atlas page holds, drawn by the platform's own renderer offscreen (Metal,
+// Direct3D 11, OpenGL ES 3) through ui::Tester on the native host (Live): how many of its cells come out empty. Before
+// the atlas had pages, a frame drawing more glyphs than the atlas held left some out (12% on Metal, 18% on llvmpipe at
+// 2000 glyphs of 48 points at 2 pixels a point). Only what main has is used, so the same check runs on main.
+
+import "host"
+import "hostapi"
+import "ui"
+import "view"
+
+///|
+/// What is drawn: `cols` × `rows` ideographs from `first`, each in a cell of its own `size` points wide and 1.25 times
+/// as tall, `pad` points from the picture's edges, at `scale` pixels a point.
+pub struct Grid {
+  cols : Int
+  rows : Int
+  size : Double
+  scale : Double
+  first : Int
+}
+
+///|
+let pad : Double = 16.0
+
+///|
+/// The grid the environment says (ATLAS_CHECK_COLS, _ROWS, _SIZE, _SCALE, _FIRST), else 50 × 40 of 48 points at 2.
+pub fn Grid::from_env() -> Grid {
+  Grid::{
+    cols: env_int("ATLAS_CHECK_COLS", 50),
+    rows: env_int("ATLAS_CHECK_ROWS", 40),
+    size: env_int("ATLAS_CHECK_SIZE", 48).to_double(),
+    scale: env_int("ATLAS_CHECK_SCALE", 2).to_double(),
+    first: env_int("ATLAS_CHECK_FIRST", 0x4E00),
+  }
+}
+
+///|
+fn env_int(name : String, fallback : Int) -> Int {
+  let s = ui::env(name)
+  if s == "" {
+    return fallback
+  }
+  let mut acc = 0
+  for i in 0..<s.length() {
+    let ch = s.code_unit_at(i)
+    if ch < 48 || ch > 57 {
+      return fallback
+    }
+    acc = acc * 10 + (ch - 48)
+  }
+  acc
+}
+
+///|
+fn Grid::line(self : Grid) -> Double {
+  self.size * 1.25
+}
+
+///|
+/// The picture's size in points.
+pub fn Grid::points(self : Grid) -> (Double, Double) {
+  (pad * 2.0 + self.cols.to_double() * self.size + self.size, pad * 2.0 + self.rows.to_double() * self.line() + self.size)
+}
+
+///|
+/// The picture's size in pixels.
+pub fn Grid::pixels(self : Grid) -> (Int, Int) {
+  let (w, h) = self.points()
+  ((w * self.scale).ceil().to_int(), (h * self.scale).ceil().to_int())
+}
+
+///|
+fn Grid::view(self : Grid) -> (view::View) -> Unit {
+  fn(root : view::View) -> Unit {
+    let look = view::WordsLook::{ ..view::words_plain, size: self.size, line: self.line(), wrap: false, max_lines: 1 }
+    let _ = root.box(fn(grid : view::View) -> Unit {
+      let _ = grid
+        .padding(view::Live::Is((pad, pad, pad, pad)))
+        .ground(view::Live::Is(ui::rgba(255, 255, 255, 255)))
+      for r in 0..<self.rows {
+        let _ = grid.box(fn(row : view::View) -> Unit {
+          let _ = row.row(view::Live::Is(true))
+          for c in 0..<self.cols {
+            let ch = (self.first + r * self.cols + c).unsafe_to_char().to_string()
+            let _ = row.box(fn(cell : view::View) -> Unit {
+              let _ = cell
+                .width(view::Live::Is(Some(self.size)))
+                .height(view::Live::Is(Some(self.line())))
+                .words(view::Live::Is(ch), look=look)
+                .ink(view::Live::Is(ui::rgba(0, 0, 0, 255)))
+            })
+          }
+        })
+      }
+    })
+  }
+}
+
+///|
+/// The grid drawn by the native renderer offscreen: its pixels (RGBA, rows from the top), or None where the platform
+/// has no offscreen renderer here. host::install first.
+pub fn Grid::draw(self : Grid) -> Option[FixedArray[Byte]] {
+  let (w, h) = self.points()
+  let (pw, ph) = self.pixels()
+  if !host::init_offscreen(w, h, self.scale) {
+    return None
+  }
+  let native = host::native_host()
+  let t = ui::Tester::tree(self.view(), w=w, h=h, scale=self.scale, corners_held=false, live=ui::Live::{
+    host: native,
+    turn: fn() { () },
+  })
+  // (a frame short of room starts the atlas over in the next: drawn a few times, as an app's frames come)
+  for _i in 0..<3 {
+    t.frame()
+  }
+  let sc = t.scene()
+  let n = sc.ninst
+  let inst = FixedArray::make(n * ui::inst_size, 0.0)
+  for k in 0..<(n * ui::inst_size) {
+    inst[k] = sc.inst[k]
+  }
+  // (what has no clip of its own drawn as unclipped: the renderer's, as film::prepare_metal_instances says)
+  for i in 0..<n {
+    let b = i * ui::inst_size
+    if (inst[b + 5] + 0.5).to_int() != 12 && inst[b + 18] <= 0.0 && inst[b + 19] <= 0.0 {
+      inst[b + 16] = 0.0
+      inst[b + 17] = 0.0
+      inst[b + 18] = 1.0e9
+      inst[b + 19] = 1.0e9
+    }
+  }
+  let out = FixedArray::make(pw * ph * 4, 0.to_byte())
+  let ok = (native.drawn_pixels_of)(inst, n, 1.0, 1.0, 1.0, self.scale, pw, ph, out)
+  t.dispose()
+  if ok { Some(out) } else { None }
+}
+
+///|
+/// How many of the grid's cells have no ink in `rgba` (its pixels as Grid::draw gives them), of how many.
+pub fn Grid::empty_cells(self : Grid, rgba : FixedArray[Byte]) -> (Int, Int) {
+  let (pw, ph) = self.pixels()
+  let mut empty = 0
+  for r in 0..<self.rows {
+    for c in 0..<self.cols {
+      let x0 = ((pad + c.to_double() * self.size) * self.scale).to_int() + 2
+      let x1 = ((pad + (c + 1).to_double() * self.size) * self.scale).to_int() - 2
+      let y0 = ((pad + r.to_double() * self.line()) * self.scale).to_int() + 2
+      let y1 = ((pad + (r + 1).to_double() * self.line()) * self.scale).to_int() - 2
+      let mut ink = false
+      let mut y = y0
+      while y < y1 && y < ph && !ink {
+        let mut x = x0
+        while x < x1 && x < pw && !ink {
+          let i = (y * pw + x) * 4
+          if rgba[i].to_int() + rgba[i + 1].to_int() + rgba[i + 2].to_int() < 384 {
+            ink = true
+          }
+          x += 2
+        }
+        y += 2
+      }
+      if !ink {
+        empty += 1
+      }
+    }
+  }
+  (empty, self.rows * self.cols)
+}
