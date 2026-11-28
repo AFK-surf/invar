@@ -50,13 +50,27 @@ OBJC_SOURCES=(
 )
 
 OBJS=()
+CC_PIDS=()
+MAX_JOBS="${INVAR_IOS_CC_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 3)}"
+if [ "$MAX_JOBS" -lt 1 ]; then MAX_JOBS=1; fi
 
-echo "==> iOS SDK: $SDK ($(xcrun --sdk "$SDK" --show-sdk-version))"
+wait_ios_slot() {
+  while [ "${#CC_PIDS[@]}" -ge "$MAX_JOBS" ]; do
+    local first="${CC_PIDS[0]}"
+    CC_PIDS=("${CC_PIDS[@]:1}")
+    wait "$first" || CC_FAIL=1
+  done
+}
+
+CC_FAIL=0
+echo "==> iOS SDK: $SDK ($(xcrun --sdk "$SDK" --show-sdk-version)) (parallel -j$MAX_JOBS)"
 for src in "${C_SOURCES[@]}"; do
   base="$(basename "$src" .c)"
   obj="$OBJ_DIR/${base}.o"
   echo "  CC   $src"
-  xcrun --sdk "$SDK" clang "${COMMON_FLAGS[@]}" -Wall -Wextra -Wno-unused-parameter -c "$src" -o "$obj"
+  wait_ios_slot
+  xcrun --sdk "$SDK" clang "${COMMON_FLAGS[@]}" -Wall -Wextra -Wno-unused-parameter -c "$src" -o "$obj" &
+  CC_PIDS+=($!)
   OBJS+=("$obj")
 done
 
@@ -64,9 +78,21 @@ for src in "${OBJC_SOURCES[@]}"; do
   base="$(basename "$src" .m)"
   obj="$OBJ_DIR/${base}.o"
   echo "  OBJC $src"
-  xcrun --sdk "$SDK" clang "${COMMON_FLAGS[@]}" -fobjc-arc -c "$src" -o "$obj"
+  wait_ios_slot
+  xcrun --sdk "$SDK" clang "${COMMON_FLAGS[@]}" -fobjc-arc -c "$src" -o "$obj" &
+  CC_PIDS+=($!)
   OBJS+=("$obj")
 done
+
+for pid in "${CC_PIDS[@]}"; do
+  if ! wait "$pid"; then
+    CC_FAIL=1
+  fi
+done
+if [ "$CC_FAIL" -ne 0 ]; then
+  echo "ERROR: One or more iOS host compilations failed!" >&2
+  exit 1
+fi
 
 echo "==> Archiving ${#OBJS[@]} objects into $LIB"
 xcrun --sdk "$SDK" ar rcs "$LIB" "${OBJS[@]}"

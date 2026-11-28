@@ -7,6 +7,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+SKIP_WS_PION_TESTS="${INVAR_SKIP_WORKSPACE_PION_TESTS:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --skip-workspace-pion-tests) SKIP_WS_PION_TESTS=1 ;;
+    *)
+      echo "Unknown argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
 CC="${CC:-cc}"
 OUT_DIR="${INVAR_LINUX_OUT:-$ROOT/target/linux-host}"
 OBJ_DIR="$OUT_DIR/obj"
@@ -40,18 +51,31 @@ C_SOURCES=(
 )
 
 OBJS=()
-echo "==> Linux host CC=$CC ($(uname -m))"
+CC_PIDS=()
+echo "==> Linux host CC=$CC ($(uname -m)) (parallel)"
 for src in "${C_SOURCES[@]}"; do
   base="$(basename "$src" .c)"
   obj="$OBJ_DIR/${base}.o"
   echo "  CC   $src"
   if [ "$base" = "pion_mb_compat" ] || [ "$base" = "wake_bridge" ]; then
-    $CC -O2 -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native -c "$src" -o "$obj"
+    $CC -O2 -Wall -Wextra -Wno-unused-parameter -Ipackages/host/compat -Ipackages/host/native -c "$src" -o "$obj" &
   else
-    $CC -O2 -Ipackages/host/compat -Ipackages/host/native $PKG_CFLAGS -c "$src" -o "$obj"
+    $CC -O2 -Ipackages/host/compat -Ipackages/host/native $PKG_CFLAGS -c "$src" -o "$obj" &
   fi
+  CC_PIDS+=($!)
   OBJS+=("$obj")
 done
+
+CC_FAIL=0
+for pid in "${CC_PIDS[@]}"; do
+  if ! wait "$pid"; then
+    CC_FAIL=1
+  fi
+done
+if [ "$CC_FAIL" -ne 0 ]; then
+  echo "ERROR: One or more Linux host C compilations failed!" >&2
+  exit 1
+fi
 
 echo "==> Archiving ${#OBJS[@]} objects into $LIB"
 ar rcs "$LIB" "${OBJS[@]}"
@@ -101,33 +125,63 @@ fi
 ls -lh "$LIB"
 echo "==> Linux EGL/GLES3 host archive check PASSED (${#OBJS[@]} objects)"
 
-echo "==> Kept groups (groups.h) unit test"
-$CC -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all \
-  -Ipackages/host/native packages/host/native/groups_test.c -o "$OUT_DIR/groups_test" -lm
-"$OUT_DIR/groups_test"
-
-echo "==> MBRAWPRE (raw_premul.h) unit test"
-$CC -O2 -Wall -Wextra -Werror \
-  -Ipackages/host/native packages/host/tests/raw_premul_test.c -o "$OUT_DIR/raw_premul_test" -lm
-"$OUT_DIR/raw_premul_test"
-
-echo "==> GLES3 renderer (gles_render.h) llvmpipe regression test"
+echo "==> Building & running Linux native C tests in parallel"
 EPOXY_ZLIB_FLAGS="$(pkg-config --cflags --libs epoxy zlib)"
-$CC -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter \
-  -Ipackages/host/compat -Ipackages/host/native \
-  packages/host/tests/gles_render_test.c -o "$OUT_DIR/gles_render_test" $EPOXY_ZLIB_FLAGS -lm
-LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$OUT_DIR/gles_render_test"
+TEST_LOG_DIR="$OUT_DIR/test-logs"
+mkdir -p "$TEST_LOG_DIR"
+
+(
+  set -euo pipefail
+  echo "==> Kept groups (groups.h) unit test"
+  $CC -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -Ipackages/host/native packages/host/native/groups_test.c -o "$OUT_DIR/groups_test" -lm
+  "$OUT_DIR/groups_test"
+) > "$TEST_LOG_DIR/groups_test.log" 2>&1 &
+PID_GROUPS=$!
+
+(
+  set -euo pipefail
+  echo "==> MBRAWPRE (raw_premul.h) unit test"
+  $CC -O2 -Wall -Wextra -Werror \
+    -Ipackages/host/native packages/host/tests/raw_premul_test.c -o "$OUT_DIR/raw_premul_test" -lm
+  "$OUT_DIR/raw_premul_test"
+) > "$TEST_LOG_DIR/raw_premul_test.log" 2>&1 &
+PID_PREMUL=$!
+
+(
+  set -euo pipefail
+  echo "==> GLES3 renderer (gles_render.h) llvmpipe regression test"
+  $CC -O2 -Wall -Wextra -Wno-unused-function -Wno-unused-parameter \
+    -Ipackages/host/compat -Ipackages/host/native \
+    packages/host/tests/gles_render_test.c -o "$OUT_DIR/gles_render_test" $EPOXY_ZLIB_FLAGS -lm
+  LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$OUT_DIR/gles_render_test"
+) > "$TEST_LOG_DIR/gles_render_test.log" 2>&1 &
+PID_GLES=$!
+
+C_TEST_FAIL=0
+wait "$PID_GROUPS" || C_TEST_FAIL=1
+wait "$PID_PREMUL" || C_TEST_FAIL=1
+wait "$PID_GLES" || C_TEST_FAIL=1
+cat "$TEST_LOG_DIR/groups_test.log" "$TEST_LOG_DIR/raw_premul_test.log" "$TEST_LOG_DIR/gles_render_test.log"
+if [ "$C_TEST_FAIL" -ne 0 ]; then
+  echo "ERROR: One or more Linux native C unit tests failed!" >&2
+  exit 1
+fi
 
 PIONC="${PIONC:-$(command -v pionc2 || true)}"
 if [ -n "$PIONC" ]; then
   echo "==> Running $PIONC test packages/damage/parity (groups.h against damage::Groups)"
   "$PIONC" test packages/damage/parity
-  echo "==> Running $PIONC check packages/host"
-  "$PIONC" check packages/host
-  echo "==> Running $PIONC test --package host packages/host (Mesa llvmpipe)"
-  LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$PIONC" test --package host packages/host
-  echo "==> Running $PIONC check packages/film"
-  "$PIONC" check packages/film
-  echo "==> Running $PIONC test --package film packages/film (Mesa llvmpipe)"
-  LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$PIONC" test --package film packages/film
+  if [ "$SKIP_WS_PION_TESTS" != "1" ]; then
+    echo "==> Running $PIONC check packages/host"
+    "$PIONC" check packages/host
+    echo "==> Running $PIONC test --package host packages/host (Mesa llvmpipe)"
+    LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$PIONC" test --package host packages/host
+    echo "==> Running $PIONC check packages/film"
+    "$PIONC" check packages/film
+    echo "==> Running $PIONC test --package film packages/film (Mesa llvmpipe)"
+    LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe "$PIONC" test --package film packages/film
+  else
+    echo "==> Skipping workspace host/film pion check+test (covered by workspace invar check/test under llvmpipe)"
+  fi
 fi

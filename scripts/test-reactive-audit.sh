@@ -16,9 +16,8 @@ if [ -z "$PIONC_BIN" ] || [ ! -x "$PIONC_BIN" ]; then
 fi
 export PIONC="$PIONC_BIN"
 
-make_pkg() {
+init_multi_pkg() {
   local name="$1"
-  local body="$2"
   local pdir="$TMP_DIR/$name"
   mkdir -p "$pdir/src"
   cat > "$pdir/pion.toml" <<EOF
@@ -29,77 +28,46 @@ version = "0.1.0"
 [dependencies]
 signals = { path = "$ROOT_DIR/packages/signals" }
 view = { path = "$ROOT_DIR/packages/view" }
-ui = { path = "$ROOT_DIR/packages/ui" }
 EOF
-  printf '%s\n' "$body" > "$pdir/src/lib.pion"
   echo "$pdir"
 }
 
-run_case() {
+NEG_PKG="$(init_multi_pkg "neg_all_clean")"
+POS_PKG="$(init_multi_pkg "pos_all_errors")"
+NEG_EXPECT_FILE="$TMP_DIR/neg_expect.jsonl"
+POS_EXPECT_FILE="$TMP_DIR/pos_expect.jsonl"
+: > "$NEG_EXPECT_FILE"
+: > "$POS_EXPECT_FILE"
+
+add_clean_case() {
   local label="$1"
-  local pkg_dir="$2"
-  local expected_json_check="$3"
-  shift 3
-  local out_file="$TMP_DIR/${label}.json"
-  set +e
-  python3 "$ROOT_DIR/scripts/invar" audit --json "$@" "$pkg_dir" > "$out_file"
-  local rc=$?
-  set -e
-  python3 - "$label" "$out_file" "$rc" "$expected_json_check" <<'PY'
+  local body="$2"
+  printf '%s\n' "$body" > "$NEG_PKG/src/${label}.pion"
+  python3 - "$NEG_EXPECT_FILE" "$label" <<'PY'
 import json, sys
+p, label = sys.argv[1:3]
+with open(p, "a", encoding="utf-8") as f:
+    f.write(json.dumps({"label": label}) + "\n")
+PY
+}
 
-label, out_file, rc_s, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-rc = int(rc_s)
-with open(out_file, "r", encoding="utf-8") as f:
-    raw = f.read()
-try:
-    data = json.loads(raw)
-except Exception as e:
-    print(f"[FAIL] {label}: invalid JSON ({e})\n{raw}", file=sys.stderr)
-    sys.exit(1)
-
-diags = data.get("diagnostics", [])
-codes = [d["code"] for d in diags if d.get("severity") == "error"]
-ra = data.get("reactive_audit", {})
-
-if mode == "clean":
-    assert rc == 0, f"{label}: expected rc=0, got {rc}: {diags}"
-    assert data.get("ok") is True, f"{label}: expected ok=True"
-    assert data.get("error_count") == 0, f"{label}: expected 0 errors, got {codes}: {diags}"
-    assert ra.get("ran") is True, f"{label}: expected reactive_audit.ran=True, got {ra}"
-    assert ra.get("closures_checked", 0) > 0, f"{label}: expected closures_checked > 0, got {ra}"
-elif mode == "degraded":
-    assert rc == 0, f"{label}: expected rc=0 in degraded mode, got {rc}: {diags}"
-    assert data.get("ok") is True, f"{label}: expected ok=True in degraded mode"
-    assert data.get("error_count") == 0, f"{label}: expected 0 errors in degraded mode, got {codes}"
-    assert ra.get("ran") is False, f"{label}: expected reactive_audit.ran=False, got {ra}"
-    assert isinstance(ra.get("reason"), str) and len(ra["reason"]) > 0, f"{label}: missing reason in {ra}"
-else:
-    # mode is expected error code, optionally with ":substring"
-    if ":" in mode:
-        exp_code, exp_substr = mode.split(":", 1)
-    else:
-        exp_code, exp_substr = mode, ""
-    assert rc != 0, f"{label}: expected non-zero exit code for {exp_code}"
-    assert data.get("ok") is False, f"{label}: expected ok=False"
-    if exp_code == "INVAR_E007_REACTIVE_AUDIT_SKIPPED":
-        assert ra.get("ran") is False, f"{label}: expected reactive_audit.ran=False, got {ra}"
-    else:
-        assert ra.get("ran") is True, f"{label}: expected reactive_audit.ran=True, got {ra}"
-    matching = [d for d in diags if d.get("code") == exp_code and d.get("severity") == "error"]
-    assert len(matching) >= 1, f"{label}: expected {exp_code}, got codes={codes}, diags={diags}"
-    if exp_substr:
-        assert any(exp_substr in d.get("message", "") for d in matching), (
-            f"{label}: expected message containing {exp_substr!r}, got {[d.get('message') for d in matching]}"
-        )
-print(f"[PASS] {label}: ok={data.get('ok')} errors={data.get('error_count')} codes={codes} reactive={ra}")
+add_error_case() {
+  local label="$1"
+  local expected="$2"
+  local body="$3"
+  printf '%s\n' "$body" > "$POS_PKG/src/${label}.pion"
+  python3 - "$POS_EXPECT_FILE" "$label" "$expected" <<'PY'
+import json, sys
+p, label, expected = sys.argv[1:4]
+with open(p, "a", encoding="utf-8") as f:
+    f.write(json.dumps({"label": label, "expected": expected}) + "\n")
 PY
 }
 
 echo "=== Track I2 Typed Reactive Static Audit Test Suite ==="
 
 # 1a. Positive E007: direct signal write inside Live::By
-PKG_E007_DIRECT="$(make_pkg "pos_e007_direct" '
+add_error_case "e007_direct" "INVAR_E007_REACTIVE_WRITE:signals::Signal::set" '
 import "signals"
 import "view"
 
@@ -110,11 +78,10 @@ pub fn bad_direct(root : view::View) -> Unit {
     "bad"
   }), look=view::words_plain)
 }
-')"
-run_case "e007_direct" "$PKG_E007_DIRECT" "INVAR_E007_REACTIVE_WRITE:signals::Signal::set"
+'
 
 # 1b. Positive E007: transitive signal write through helper function
-PKG_E007_TRANS="$(make_pkg "pos_e007_trans" '
+add_error_case "e007_transitive" "INVAR_E007_REACTIVE_WRITE:helper_mutate -> signals::Signal::update" '
 import "signals"
 import "view"
 
@@ -130,11 +97,10 @@ pub fn bad_transitive(root : view::View) -> Unit {
     "bad"
   }), look=view::words_plain)
 }
-')"
-run_case "e007_transitive" "$PKG_E007_TRANS" "INVAR_E007_REACTIVE_WRITE:helper_mutate -> signals::Signal::update"
+'
 
 # 2a. Positive E008: capturing let mut variable
-PKG_E008_MUT="$(make_pkg "pos_e008_let_mut" '
+add_error_case "e008_let_mut" "INVAR_E008_REACTIVE_MUT_CAPTURE:let mut count" '
 import "signals"
 
 pub fn bad_let_mut() -> signals::Computed[Int] {
@@ -144,11 +110,10 @@ pub fn bad_let_mut() -> signals::Computed[Int] {
     count
   })
 }
-')"
-run_case "e008_let_mut" "$PKG_E008_MUT" "INVAR_E008_REACTIVE_MUT_CAPTURE:let mut count"
+'
 
 # 2b. Positive E008: capturing immutable binding to mutable struct
-PKG_E008_STRUCT="$(make_pkg "pos_e008_mut_struct" '
+add_error_case "e008_mut_struct" "INVAR_E008_REACTIVE_MUT_CAPTURE:MutBox" '
 import "signals"
 
 pub struct MutBox {
@@ -161,11 +126,10 @@ pub fn bad_mut_struct() -> signals::Computed[Int] {
     st.n
   })
 }
-')"
-run_case "e008_mut_struct" "$PKG_E008_STRUCT" "INVAR_E008_REACTIVE_MUT_CAPTURE:MutBox"
+'
 
 # 2c. Positive E008: capturing mutable Array
-PKG_E008_ARRAY="$(make_pkg "pos_e008_array" '
+add_error_case "e008_array" "INVAR_E008_REACTIVE_MUT_CAPTURE:Array[Int]" '
 import "signals"
 
 pub fn bad_array() -> signals::Computed[Int] {
@@ -174,11 +138,10 @@ pub fn bad_array() -> signals::Computed[Int] {
     xs.length()
   })
 }
-')"
-run_case "e008_array" "$PKG_E008_ARRAY" "INVAR_E008_REACTIVE_MUT_CAPTURE:Array[Int]"
+'
 
 # 3. Positive E009: signals::effect both reading and writing captured signal
-PKG_E009="$(make_pkg "pos_e009_effect" '
+add_error_case "e009_effect_self_write" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn bad_effect() -> () -> Unit {
@@ -190,11 +153,10 @@ pub fn bad_effect() -> () -> Unit {
     }
   })
 }
-')"
-run_case "e009_effect_self_write" "$PKG_E009" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 4. Positive E010: transitive blocking IO / scope inside reactive binding
-PKG_E010="$(make_pkg "pos_e010_io" '
+add_error_case "e010_reactive_io" "INVAR_E010_REACTIVE_IO:helper_io -> builtin::" '
 import "signals"
 
 fn helper_io(world : World) -> Int {
@@ -208,11 +170,10 @@ pub fn bad_io(world : World) -> signals::Computed[Int] {
     helper_io(world)
   })
 }
-')"
-run_case "e010_reactive_io" "$PKG_E010" "INVAR_E010_REACTIVE_IO:helper_io -> builtin::"
+'
 
 # 5. Negative (clean): valid ReadSignal, Signal, Computed, val struct, scalar, String, untracked, on_press write
-PKG_CLEAN="$(make_pkg "neg_clean" '
+add_clean_case "neg_clean" '
 import "signals"
 import "view"
 
@@ -240,11 +201,10 @@ pub fn good_view(root : view::View) -> Unit {
       })
   })
 }
-')"
-run_case "neg_clean" "$PKG_CLEAN" "clean"
+'
 
 # 6. Inline allow comment test
-PKG_ALLOW="$(make_pkg "neg_inline_allow" '
+add_clean_case "neg_inline_allow" '
 import "signals"
 
 pub fn allowed_mut() -> signals::Computed[Int] {
@@ -254,13 +214,9 @@ pub fn allowed_mut() -> signals::Computed[Int] {
     xs.length()
   })
 }
-')"
-run_case "neg_inline_allow" "$PKG_ALLOW" "clean"
+'
 
-# 7a. Graceful degradation: --no-reactive flag
-run_case "degrade_no_reactive_flag" "$PKG_E007_DIRECT" "degraded" --no-reactive
-
-# 7b. Graceful degradation: legacy pionc shim without `query analyze`
+# 7. Graceful degradation fixture: legacy pionc shim without `query analyze`
 FAKE_PIONC="$TMP_DIR/fake_pionc"
 cat > "$FAKE_PIONC" <<'SH'
 #!/bin/sh
@@ -274,14 +230,9 @@ echo "error: unknown query kind \`analyze\`" >&2
 exit 1
 SH
 chmod +x "$FAKE_PIONC"
-PIONC="$FAKE_PIONC" run_case "degrade_legacy_pionc" "$PKG_E007_DIRECT" "degraded"
-
-# 7c. --require-reactive fails when reactive audit is skipped (--no-reactive or legacy pionc)
-run_case "require_reactive_no_reactive" "$PKG_E007_DIRECT" "INVAR_E007_REACTIVE_AUDIT_SKIPPED" --no-reactive --require-reactive
-PIONC="$FAKE_PIONC" run_case "require_reactive_legacy_pionc" "$PKG_E007_DIRECT" "INVAR_E007_REACTIVE_AUDIT_SKIPPED" --require-reactive
 
 # 8. Negative E009: effect reading ReadSignal A and writing distinct Signal B must pass clean
-PKG_E009_CROSS="$(make_pkg "neg_e009_cross_signal" '
+add_clean_case "neg_e009_cross_signal" '
 import "signals"
 
 pub fn cross_signal_effect(src : signals::ReadSignal[Int]) -> () -> Unit {
@@ -290,11 +241,10 @@ pub fn cross_signal_effect(src : signals::ReadSignal[Int]) -> () -> Unit {
     dst.set(src.get() + 1)
   })
 }
-')"
-run_case "neg_e009_cross_signal" "$PKG_E009_CROSS" "clean"
+'
 
 # 9. Negative E009: effect reading writable Signal A and writing distinct writable Signal B must pass clean
-PKG_E009_TWO_WRITABLE="$(make_pkg "neg_e009_two_writable" '
+add_clean_case "neg_e009_two_writable" '
 import "signals"
 
 pub fn two_writable_signals_effect() -> () -> Unit {
@@ -304,11 +254,10 @@ pub fn two_writable_signals_effect() -> () -> Unit {
     b.set(a.get() + 1)
   })
 }
-')"
-run_case "neg_e009_two_writable" "$PKG_E009_TWO_WRITABLE" "clean"
+'
 
 # 10. Positive E009: effect reading readonly alias `let ro = s.read()` and writing `s` must fail E009
-PKG_E009_RO_ALIAS="$(make_pkg "pos_e009_ro_alias" '
+add_error_case "pos_e009_ro_alias" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn ro_alias_self_write() -> () -> Unit {
@@ -321,11 +270,10 @@ pub fn ro_alias_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_ro_alias" "$PKG_E009_RO_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 11. Positive E009: effect reading and writing the same writable Signal via Keyed::count/set
-PKG_E009_SAME_SIG="$(make_pkg "pos_e009_same_signal" '
+add_error_case "pos_e009_same_signal" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn same_signal_self_write() -> () -> Unit {
@@ -337,11 +285,10 @@ pub fn same_signal_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_same_signal" "$PKG_E009_SAME_SIG" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 12. Positive E009: plain signal alias `let a2 = a`, read `a.get()`, write `a2.set(...)`
-PKG_E009_PLAIN_ALIAS="$(make_pkg "pos_e009_plain_alias" '
+add_error_case "pos_e009_plain_alias" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn plain_alias_self_write() -> () -> Unit {
@@ -354,8 +301,7 @@ pub fn plain_alias_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_plain_alias" "$PKG_E009_PLAIN_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 13. Positive E009: distant alias `let ro = s.read()` more than 130 lines before effect
 DISTANT_PAD=""
@@ -363,7 +309,7 @@ for _i in $(seq 1 135); do
   DISTANT_PAD="${DISTANT_PAD}  let _pad_${_i} = ${_i}
 "
 done
-PKG_E009_DISTANT_ALIAS="$(make_pkg "pos_e009_distant_alias" "
+add_error_case "pos_e009_distant_alias" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" "
 import \"signals\"
 
 pub fn distant_alias_self_write() -> () -> Unit {
@@ -376,11 +322,10 @@ ${DISTANT_PAD}  signals::effect(fn() -> Unit {
     }
   })
 }
-")"
-run_case "pos_e009_distant_alias" "$PKG_E009_DISTANT_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+"
 
 # 14. Negative E009: commented-out fake alias `// let r = b.read()` must NOT cause false positive
-PKG_E009_COMMENT_ALIAS="$(make_pkg "neg_e009_comment_alias" '
+add_clean_case "neg_e009_comment_alias" '
 import "signals"
 
 pub fn comment_alias_clean() -> () -> Unit {
@@ -393,11 +338,10 @@ pub fn comment_alias_clean() -> () -> Unit {
     b.set(r.get() + 1)
   })
 }
-')"
-run_case "neg_e009_comment_alias" "$PKG_E009_COMMENT_ALIAS" "clean"
+'
 
 # 15. Positive E009: inner local alias inside effect closure body `let r = s.read()`
-PKG_E009_INNER_ALIAS="$(make_pkg "pos_e009_inner_alias" '
+add_error_case "pos_e009_inner_alias" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn inner_alias_self_write() -> () -> Unit {
@@ -410,12 +354,11 @@ pub fn inner_alias_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_inner_alias" "$PKG_E009_INNER_ALIAS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 16. Positive E009: an inner block's `let ro = b.read()` ends with its block; the outer
 #     `let ro = a.read()` is what the effect reads, and it writes `a`
-PKG_E009_BLOCK_SHADOW="$(make_pkg "pos_e009_block_shadow_alias" '
+add_error_case "pos_e009_block_shadow_alias" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn block_shadow_alias_self_write() -> () -> Unit {
@@ -433,11 +376,10 @@ pub fn block_shadow_alias_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_block_shadow_alias" "$PKG_E009_BLOCK_SHADOW" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 17. Positive E009: a char literal `'"'` before the alias must not read as a string opening
-PKG_E009_CHAR_QUOTE="$(make_pkg "pos_e009_char_quote_literal" '
+add_error_case "pos_e009_char_quote_literal" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn char_quote_alias_self_write() -> () -> Unit {
@@ -452,12 +394,11 @@ pub fn char_quote_alias_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_char_quote_literal" "$PKG_E009_CHAR_QUOTE" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 18. Positive E009: inside the effect too, an inner block's `let ro = b.read()` ends with its
 #     block; after it `ro` is the outer `a.read()` again, and the effect writes `a`
-PKG_E009_INNER_BLOCK_SHADOW="$(make_pkg "pos_e009_inner_block_shadow_alias" '
+add_error_case "pos_e009_inner_block_shadow_alias" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn inner_block_shadow_alias_self_write() -> () -> Unit {
@@ -475,13 +416,12 @@ pub fn inner_block_shadow_alias_self_write() -> () -> Unit {
     }
   })
 }
-')"
-run_case "pos_e009_inner_block_shadow_alias" "$PKG_E009_INNER_BLOCK_SHADOW" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 19. Positive E009: `ro` is bound to the outer `a` as it is declared; an inner block's `let a = b`
 #     read through `ro` does not make `ro` the inner `b`, so writing the outer `a` after the block
 #     is still a self-write
-PKG_E009_DECL_IDENTITY_POS="$(make_pkg "pos_e009_decl_identity" '
+add_error_case "pos_e009_decl_identity" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn decl_identity_self_write() -> () -> Unit {
@@ -497,12 +437,11 @@ pub fn decl_identity_self_write() -> () -> Unit {
     a.set(1)
   })
 }
-')"
-run_case "pos_e009_decl_identity" "$PKG_E009_DECL_IDENTITY_POS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
 
 # 20. Negative E009: the same effect writing `b` instead reads `a` (through `ro`) and writes `b`:
 #     two signals, no self-write, though the inner block named `b` `a` while `ro` was read
-PKG_E009_DECL_IDENTITY_NEG="$(make_pkg "neg_e009_decl_identity" '
+add_clean_case "neg_e009_decl_identity" '
 import "signals"
 
 pub fn decl_identity_cross_write() -> () -> Unit {
@@ -518,12 +457,11 @@ pub fn decl_identity_cross_write() -> () -> Unit {
     b.set(1)
   })
 }
-')"
-run_case "neg_e009_decl_identity" "$PKG_E009_DECL_IDENTITY_NEG" "clean"
+'
 
 # 21. Positive E009: `let a = a.get()` reads the outer `a` in its initializer before the shadowed
 #     `a` enters scope, so writing `a` afterwards is still a self-write
-PKG_E009_SELF_SHADOW_RHS="$(make_pkg "pos_e009_self_shadow_rhs" '
+add_error_case "pos_e009_self_shadow_rhs" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set" '
 import "signals"
 
 pub fn self_shadow_rhs_write() -> () -> Unit {
@@ -536,7 +474,164 @@ pub fn self_shadow_rhs_write() -> () -> Unit {
     a.set(1)
   })
 }
-')"
-run_case "pos_e009_self_shadow_rhs" "$PKG_E009_SELF_SHADOW_RHS" "INVAR_E009_EFFECT_SELF_WRITE:signals::Signal::set"
+'
+
+python3 - "$ROOT_DIR" "$TMP_DIR" "$NEG_PKG" "$POS_PKG" "$NEG_EXPECT_FILE" "$POS_EXPECT_FILE" "$PIONC" "$FAKE_PIONC" <<'PY'
+import concurrent.futures
+import json
+import os
+import stat
+import subprocess
+import sys
+
+root_dir, tmp_dir, neg_pkg, pos_pkg, neg_expect_file, pos_expect_file, pionc_bin, fake_pionc = sys.argv[1:9]
+invar_cli = os.path.join(root_dir, "scripts", "invar")
+
+with open(neg_expect_file, "r", encoding="utf-8") as f:
+    neg_cases = [json.loads(line) for line in f if line.strip()]
+with open(pos_expect_file, "r", encoding="utf-8") as f:
+    pos_cases = [json.loads(line) for line in f if line.strip()]
+
+def run_audit(pkg_dir, extra_args, pionc_override=None):
+    env = os.environ.copy()
+    env["PIONC"] = pionc_override or pionc_bin
+    cmd = [sys.executable, invar_cli, "audit", "--json", *extra_args, pkg_dir]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        data = json.loads(proc.stdout)
+    except Exception as e:
+        raise AssertionError(f"invalid JSON ({e}):\n{proc.stdout}\n{proc.stderr}")
+    return proc.returncode, data
+
+def check_neg_all():
+    # Capture the exact `pionc query analyze` JSON payload consumed by `invar audit` itself
+    # via a transparent Python wrapper (repr-escaped literals: zero shell expansion or env pollution).
+    capture_file = os.path.join(tmp_dir, "neg_query_analyze.json")
+    wrap_bin = os.path.join(tmp_dir, "neg_pionc_wrap.py")
+    with open(wrap_bin, "w", encoding="utf-8") as wf:
+        wf.write(
+            "#!/usr/bin/env python3\n"
+            "import os, subprocess, sys\n"
+            f"pionc = {pionc_bin!r}\n"
+            "if sys.argv[1:3] == ['query', 'analyze']:\n"
+            "    p = subprocess.run([pionc, *sys.argv[1:]], stdout=subprocess.PIPE)\n"
+            f"    with open({capture_file!r}, 'wb') as f:\n"
+            "        f.write(p.stdout)\n"
+            "    sys.stdout.buffer.write(p.stdout)\n"
+            "    sys.stdout.buffer.flush()\n"
+            "    sys.exit(p.returncode)\n"
+            "os.execv(pionc, [pionc, *sys.argv[1:]])\n"
+        )
+    os.chmod(wrap_bin, os.stat(wrap_bin).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    rc, data = run_audit(neg_pkg, [], pionc_override=wrap_bin)
+    diags = data.get("diagnostics", [])
+    codes = [d["code"] for d in diags if d.get("severity") == "error"]
+    ra = data.get("reactive_audit", {})
+    assert rc == 0, f"neg_all_clean: expected rc=0, got {rc}: {diags}"
+    assert data.get("ok") is True, f"neg_all_clean: expected ok=True"
+    assert data.get("error_count") == 0, f"neg_all_clean: expected 0 errors, got {codes}: {diags}"
+    assert ra.get("ran") is True, f"neg_all_clean: expected reactive_audit.ran=True, got {ra}"
+    assert ra.get("closures_checked", 0) >= 10, f"neg_all_clean: expected >=10 closures_checked, got {ra}"
+
+    # Verify every clean fixture file actually produced analyzed closures in that exact payload.
+    assert os.path.isfile(capture_file), "neg_all_clean: invar audit did not invoke pionc query analyze"
+    with open(capture_file, "r", encoding="utf-8") as cf:
+        qraw = cf.read()
+    assert qraw.strip(), "neg_all_clean: captured pionc query analyze stdout was empty"
+    qdata = json.loads(qraw)
+    closures = qdata.get("closures", [])
+    assert isinstance(closures, list) and len(closures) > 0, (
+        f"neg_all_clean: captured query analyze returned no closures: {qdata}"
+    )
+    per_file_counts = {}
+    for case in neg_cases:
+        label = case["label"]
+        suffix = f"src/{label}.pion"
+        cnt = sum(1 for c in closures if str(c.get("file", "")).replace("\\", "/").endswith(suffix))
+        assert cnt >= 1, f"neg_all_clean: {suffix} had 0 analyzed closures (silently skipped?)"
+        per_file_counts[label] = cnt
+    return [f"[PASS] neg_all_clean ({len(neg_cases)} files): ok=True errors=0 closures_checked={ra.get('closures_checked')} per_file={per_file_counts}"]
+
+def check_pos_all():
+    rc, data = run_audit(pos_pkg, [])
+    diags = data.get("diagnostics", [])
+    err_diags = [d for d in diags if d.get("severity") == "error"]
+    ra = data.get("reactive_audit", {})
+    assert rc != 0, f"pos_all_errors: expected non-zero rc, got 0"
+    assert data.get("ok") is False, f"pos_all_errors: expected ok=False"
+    assert ra.get("ran") is True, f"pos_all_errors: expected reactive_audit.ran=True, got {ra}"
+    lines = []
+    matched_indices = set()
+    for case in pos_cases:
+        label = case["label"]
+        expected = case["expected"]
+        if ":" in expected:
+            exp_code, exp_substr = expected.split(":", 1)
+        else:
+            exp_code, exp_substr = expected, ""
+        suffix = f"src/{label}.pion"
+        file_diags = [
+            (idx, d) for idx, d in enumerate(err_diags)
+            if str(d.get("file", "")).replace("\\", "/").endswith(suffix)
+        ]
+        matching = [
+            (idx, d) for idx, d in file_diags
+            if d.get("code") == exp_code and (not exp_substr or exp_substr in d.get("message", ""))
+        ]
+        assert len(matching) >= 1, (
+            f"{label}: expected {exp_code} ({exp_substr!r}) in {suffix}, got {[d for _, d in file_diags]}"
+        )
+        for idx, _ in file_diags:
+            matched_indices.add(idx)
+        lines.append(f"[PASS] {label}: code={exp_code}")
+    assert len(err_diags) == len(pos_cases), (
+        f"pos_all_errors: expected exactly {len(pos_cases)} error diagnostics, got {len(err_diags)}: {err_diags}"
+    )
+    assert len(matched_indices) == len(err_diags), (
+        f"pos_all_errors: unmatched error diagnostics: {[d for i, d in enumerate(err_diags) if i not in matched_indices]}"
+    )
+    return lines
+
+def check_degraded(label, extra_args, mode, pionc_override=None):
+    rc, data = run_audit(pos_pkg, extra_args, pionc_override=pionc_override)
+    diags = data.get("diagnostics", [])
+    codes = [d["code"] for d in diags if d.get("severity") == "error"]
+    ra = data.get("reactive_audit", {})
+    if mode == "degraded":
+        assert rc == 0, f"{label}: expected rc=0, got {rc}: {diags}"
+        assert data.get("ok") is True, f"{label}: expected ok=True"
+        assert data.get("error_count") == 0, f"{label}: expected 0 errors, got {codes}"
+        assert ra.get("ran") is False, f"{label}: expected reactive_audit.ran=False, got {ra}"
+        assert isinstance(ra.get("reason"), str) and len(ra["reason"]) > 0, f"{label}: missing reason in {ra}"
+    else:
+        assert rc != 0, f"{label}: expected non-zero rc"
+        assert data.get("ok") is False, f"{label}: expected ok=False"
+        assert ra.get("ran") is False, f"{label}: expected reactive_audit.ran=False, got {ra}"
+        assert mode in codes, f"{label}: expected {mode}, got {codes}"
+    return [f"[PASS] {label}: ok={data.get('ok')} errors={data.get('error_count')} codes={codes} reactive={ra}"]
+
+tasks = [
+    ("pos_all", check_pos_all),
+    ("neg_all", check_neg_all),
+    ("degrade_no_reactive_flag", lambda: check_degraded("degrade_no_reactive_flag", ["--no-reactive"], "degraded")),
+    ("degrade_legacy_pionc", lambda: check_degraded("degrade_legacy_pionc", [], "degraded", pionc_override=fake_pionc)),
+    ("require_reactive_no_reactive", lambda: check_degraded("require_reactive_no_reactive", ["--no-reactive", "--require-reactive"], "INVAR_E007_REACTIVE_AUDIT_SKIPPED")),
+    ("require_reactive_legacy_pionc", lambda: check_degraded("require_reactive_legacy_pionc", ["--require-reactive"], "INVAR_E007_REACTIVE_AUDIT_SKIPPED", pionc_override=fake_pionc)),
+]
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+    futs = [(name, ex.submit(fn)) for name, fn in tasks]
+    failed = 0
+    for name, fut in futs:
+        try:
+            for line in fut.result():
+                print(line)
+        except Exception as e:
+            print(f"[FAIL] {name}: {e}", file=sys.stderr)
+            failed += 1
+    if failed:
+        sys.exit(1)
+PY
 
 echo "=== ALL REACTIVE AUDIT TESTS PASSED ==="

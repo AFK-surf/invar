@@ -29,7 +29,11 @@ print('OK: doctor (os=%s, pionc=%s)' % (d['os'], d['pionc']['path']))
 " "$DOC_JSON"
 
 echo "=== 3. invar audit --json ==="
-AUD_JSON="$("$INVAR" audit --json)"
+if [ -n "${INVAR_CLI_TEST_AUDIT_JSON:-}" ] && [ -f "$INVAR_CLI_TEST_AUDIT_JSON" ]; then
+  AUD_JSON="$(cat "$INVAR_CLI_TEST_AUDIT_JSON")"
+else
+  AUD_JSON="$("$INVAR" audit --json)"
+fi
 assert_py "
 import json, sys
 d = json.loads(sys.argv[1])
@@ -60,7 +64,11 @@ print('OK: test damage (%d passed, %d ms)' % (d['total_passed'], d['elapsed_ms']
 " "$TST_JSON"
 
 echo "=== 5b. invar check (workspace) + parallel multi-pkg --only-pkg + filter + fail reporting ==="
-WS_CHK_JSON="$("$INVAR" check --json)"
+if [ -n "${INVAR_CLI_TEST_WS_CHECK_JSON:-}" ] && [ -f "$INVAR_CLI_TEST_WS_CHECK_JSON" ]; then
+  WS_CHK_JSON="$(cat "$INVAR_CLI_TEST_WS_CHECK_JSON")"
+else
+  WS_CHK_JSON="$("$INVAR" check --json)"
+fi
 assert_py "
 import json, sys
 d = json.loads(sys.argv[1])
@@ -68,7 +76,11 @@ assert d['ok'] is True and len(d['packages']) >= 40, f'workspace check failed: {
 print('OK: workspace check (%d packages, %d ms)' % (len(d['packages']), d['elapsed_ms']))
 " "$WS_CHK_JSON"
 
-WS_TST_JSON="$("$INVAR" test --json)"
+if [ -n "${INVAR_CLI_TEST_WS_TEST_JSON:-}" ] && [ -f "$INVAR_CLI_TEST_WS_TEST_JSON" ]; then
+  WS_TST_JSON="$(cat "$INVAR_CLI_TEST_WS_TEST_JSON")"
+else
+  WS_TST_JSON="$("$INVAR" test --json)"
+fi
 assert_py "
 import json, sys
 d = json.loads(sys.argv[1])
@@ -98,6 +110,9 @@ assert d['ok'] is True and d['total_passed'] == 0 and d['total_failed'] == 0, f'
 print('OK: zero-match filter')
 " "$ZERO_FLT_JSON"
 
+# Run independent heavy E2E groups (6: jsx-app, 7-8b: web, 9-12: diff/install/shot/compare) in parallel.
+(
+set -euo pipefail
 echo "=== 6. invar new jsx-app + check + test + audit + no-overwrite ==="
 JSX_DIR="$TMP/my_jsx_app"
 NEW_JSX="$("$INVAR" new --template jsx-app --json "$JSX_DIR")"
@@ -155,13 +170,20 @@ err = d['packages'][0]['error']
 assert 'intentional_cli_fail' in err and 'cli_fail_sentinel' in err, f'missing fail details: {err}'
 print('OK: jsx-app failing test properly reported')
 " "$FAIL_TST"
+) > "$TMP/log_step6.txt" 2>&1 &
+PID_STEP6=$!
 
-echo "=== 7. invar new web-app + invar web build ==="
+(
+set -euo pipefail
 WEB_DIR="$TMP/my_web_app"
 WEB_OUT="$TMP/web_dist"
-"$INVAR" new --template web-app --json "$WEB_DIR" >/dev/null
-WEB_BLD="$("$INVAR" web build --pkg "$WEB_DIR" --out "$WEB_OUT" --json)"
-assert_py "
+
+(
+  set -euo pipefail
+  echo "=== 7. invar new web-app + invar web build ==="
+  "$INVAR" new --template web-app --json "$WEB_DIR" >/dev/null
+  WEB_BLD="$("$INVAR" web build --pkg "$WEB_DIR" --out "$WEB_OUT" --json)"
+  assert_py "
 import json, os, sys
 d = json.loads(sys.argv[1])
 assert d['ok'] is True, f'web-app build failed: {d}'
@@ -172,31 +194,59 @@ for lf in ('LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'LICENSES/Apache-2.0.t
     assert os.path.isfile(os.path.join(d['out_dir'], lf)), f'missing license file in web dist: {lf}'
 print('OK: web-app build (%d B raw, %d B gzip, %d imports, 0 missing)' % (d['raw_bytes'], d['gzip_bytes'], d['imports_total']))
 " "$WEB_BLD"
+) > "$TMP/log_step7.txt" 2>&1 &
+PID_S7=$!
 
-echo "=== 8. invar web check --json (packages/lg_web) ==="
-WEB_CHK="$("$INVAR" web check --json)"
-assert_py "
+(
+  set -euo pipefail
+  echo "=== 8. invar web check --json (packages/lg_web) ==="
+  if [ -n "${INVAR_CLI_TEST_WEB_CHECK_JSON:-}" ] && [ -f "$INVAR_CLI_TEST_WEB_CHECK_JSON" ]; then
+    WEB_CHK="$(cat "$INVAR_CLI_TEST_WEB_CHECK_JSON")"
+  else
+    WEB_CHK="$("$INVAR" web check --json)"
+  fi
+  assert_py "
 import json, sys
 d = json.loads(sys.argv[1])
 assert d['ok'] is True, f'web check lg_web failed: {d}'
 assert d['imports_total'] > 100 and d['imports_missing'] == []
 print('OK: web check lg_web (%d B raw, %d imports, 0 missing)' % (d['raw_bytes'], d['imports_total']))
 " "$WEB_CHK"
+) > "$TMP/log_step8.txt" 2>&1 &
+PID_S8=$!
+
+W78_FAIL=0
+wait "$PID_S7" || W78_FAIL=1
+wait "$PID_S8" || W78_FAIL=1
+cat "$TMP/log_step7.txt" "$TMP/log_step8.txt"
+if [ "$W78_FAIL" -ne 0 ]; then
+  exit 1
+fi
 
 echo "=== 8b. invar web build cleans stale _headers/_redirects/wasm across packages ==="
-SHARED_OUT="$TMP/shared_web_out"
-"$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
-assert_py "
+# Steps 7 and 8 already exercise full brotli -q 11 compression on both my_web_app and lg_web;
+# step 8b only verifies _web_dist_reconcile stale-file cleanup across 6 rebuilds (stdout discarded).
+NO_BROTLI_BIN="$TMP/no_brotli_bin"
+mkdir -p "$NO_BROTLI_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$NO_BROTLI_BIN/brotli"
+chmod +x "$NO_BROTLI_BIN/brotli"
+
+(
+  set -euo pipefail
+  export PATH="$NO_BROTLI_BIN:$PATH"
+  SHARED_OUT="$TMP/shared_web_out"
+  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+  assert_py "
 import os, sys
 out = sys.argv[1]
 assert os.path.isfile(os.path.join(out, '_headers')), 'lg_web must emit _headers'
 assert os.path.isfile(os.path.join(out, '_redirects')), 'lg_web must emit _redirects'
 assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web must emit lg_web.wasm'
 " "$SHARED_OUT"
-# A file of the caller's own in the output dir: never invar's to remove.
-printf '\0asm\1\0\0\0' > "$SHARED_OUT/decoder.wasm"
-"$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
-assert_py "
+  # A file of the caller's own in the output dir: never invar's to remove.
+  printf '\0asm\1\0\0\0' > "$SHARED_OUT/decoder.wasm"
+  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+  assert_py "
 import os, sys
 out = sys.argv[1]
 assert not os.path.exists(os.path.join(out, '_headers')), 'stale _headers must be removed for custom pkg'
@@ -208,8 +258,8 @@ assert open(os.path.join(out, 'decoder.wasm'), 'rb').read() == b'\\0asm\\1\\0\\0
 assert not any(n.startswith('.invar') for n in os.listdir(out)), 'no build record inside the output dir'
 print('OK: shared web out dir cleaned of stale _headers, _redirects, and lg_web.wasm; decoder.wasm kept')
 " "$SHARED_OUT"
-"$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
-assert_py "
+  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+  assert_py "
 import os, sys
 out = sys.argv[1]
 assert not os.path.exists(os.path.join(out, 'my_web_app.wasm')), 'stale my_web_app.wasm must be removed when lg_web is built again'
@@ -217,24 +267,24 @@ assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web.wasm rebuilt'
 assert os.path.isfile(os.path.join(out, 'decoder.wasm')), 'decoder.wasm still kept'
 print('OK: rebuilding lg_web removes my_web_app.wasm and still keeps decoder.wasm')
 " "$SHARED_OUT"
-# The caller makes the output dir again and puts their own _headers there: a file under a name an
-# earlier build wrote, but not its bytes, is the caller's and stays.
-rm -rf "$SHARED_OUT"
-mkdir -p "$SHARED_OUT"
-printf '/*\n  X-Mine: 1\n' > "$SHARED_OUT/_headers"
-"$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
-assert_py "
+  # The caller makes the output dir again and puts their own _headers there: a file under a name an
+  # earlier build wrote, but not its bytes, is the caller's and stays.
+  rm -rf "$SHARED_OUT"
+  mkdir -p "$SHARED_OUT"
+  printf '/*\n  X-Mine: 1\n' > "$SHARED_OUT/_headers"
+  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+  assert_py "
 import os, sys
 out = sys.argv[1]
 assert open(os.path.join(out, '_headers'), 'rb').read() == b'/*\\n  X-Mine: 1\\n', 'caller _headers in a remade dir kept byte for byte'
 assert os.path.isfile(os.path.join(out, 'my_web_app.wasm')), 'custom wasm built'
 print('OK: a caller _headers in a remade output dir is kept')
 " "$SHARED_OUT"
-# The same when the caller only rewrites a file invar wrote there.
-"$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
-printf '/*\n  X-Mine: 2\n' > "$SHARED_OUT/_headers"
-"$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
-assert_py "
+  # The same when the caller only rewrites a file invar wrote there.
+  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+  printf '/*\n  X-Mine: 2\n' > "$SHARED_OUT/_headers"
+  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+  assert_py "
 import os, sys
 out = sys.argv[1]
 assert open(os.path.join(out, '_headers'), 'rb').read() == b'/*\\n  X-Mine: 2\\n', 'rewritten _headers kept'
@@ -242,7 +292,12 @@ assert not os.path.exists(os.path.join(out, '_redirects')), 'untouched stale _re
 assert not os.path.exists(os.path.join(out, 'lg_web.wasm')), 'untouched stale lg_web.wasm still removed'
 print('OK: a rewritten _headers is kept; untouched stale files are removed')
 " "$SHARED_OUT"
+)
+) > "$TMP/log_step7_8b.txt" 2>&1 &
+PID_STEP7_8B=$!
 
+(
+set -euo pipefail
 echo "=== 9. invar diff --json --out --sbs (synthetic PNGs) ==="
 python3 - "$TMP" << 'PYEOF'
 import os, struct, sys, zlib
@@ -584,5 +639,18 @@ if "$INVAR" compare "$CMP_DIR/ref.png" "$CMP_DIR/cand.png" --out "$CMP_DIR/out_e
   exit 1
 fi
 echo "OK: invar compare rejects empty --roi-file []"
+) > "$TMP/log_step9_12.txt" 2>&1 &
+PID_STEP9_12=$!
+
+CLI_PAR_FAIL=0
+wait "$PID_STEP6" || CLI_PAR_FAIL=1
+wait "$PID_STEP7_8B" || CLI_PAR_FAIL=1
+wait "$PID_STEP9_12" || CLI_PAR_FAIL=1
+
+cat "$TMP/log_step6.txt" "$TMP/log_step7_8b.txt" "$TMP/log_step9_12.txt"
+if [ "$CLI_PAR_FAIL" -ne 0 ]; then
+  echo "FAIL: one or more invar CLI E2E test groups failed" >&2
+  exit 1
+fi
 
 echo "=== ALL 12 INVAR CLI E2E TESTS PASSED! ==="
