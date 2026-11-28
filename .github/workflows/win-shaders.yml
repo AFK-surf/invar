@@ -11,71 +11,159 @@ permissions:
 jobs:
   win-shaders:
     runs-on: windows-latest
+    timeout-minutes: 3
     steps:
+      - name: Record job start & runner fingerprint
+        id: win-env
+        shell: pwsh
+        run: |
+          $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          "JOB_START_EPOCH=$epoch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $os = if ($env:ImageOS) { $env:ImageOS } else { 'windows' }
+          $ver = if ($env:ImageVersion) { $env:ImageVersion } else { 'unknown' }
+          $fp = ("$os-$ver" -replace '[^A-Za-z0-9._-]', '-')
+          "env_fp=$fp" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - name: Checkout invar
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
+      - name: Restore compiled Windows test binaries cache
+        id: bin-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: build_win_shaders/bin
+          key: win-shaders-bin-v2-${{ steps.win-env.outputs.env_fp }}-${{ hashFiles('packages/host/native/**', 'packages/host/compat/**', 'packages/host/tools/bake_win_shaders.c', 'packages/host/tests/win_*.cpp', 'packages/host/tests/raw_premul_test.c', '.github/workflows/win-shaders.yml') }}
+
       - name: Setup MSVC Developer Environment
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
 
-      - name: Build bake_win_shaders.exe and win_render_test.exe
-        shell: cmd
+      - name: Build Windows shader baker and native host tests (parallel)
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        shell: pwsh
         run: |
-          mkdir build_win_shaders
-          cl /nologo /O2 packages\host\tools\bake_win_shaders.c /Fe:build_win_shaders\bake_win_shaders.exe
-          if errorlevel 1 exit /b %errorlevel%
-          cl /nologo /O2 /EHsc /DMB_NO_MOONBIT_H /Ipackages\host\native packages\host\tests\win_render_test.cpp packages\host\native\win_render.cpp /Fe:build_win_shaders\win_render_test.exe
-          if errorlevel 1 exit /b %errorlevel%
-          cl /nologo /O2 /EHsc /W3 /WX /utf-8 /D_CRT_SECURE_NO_WARNINGS /Ipackages\host\native packages\host\tests\win_vbuf_test.cpp /Fo:build_win_shaders\ /Fe:build_win_shaders\win_vbuf_test.exe /link d3d11.lib d3dcompiler.lib dcomp.lib dwmapi.lib dxgi.lib gdi32.lib user32.lib windowscodecs.lib ole32.lib
-          if errorlevel 1 exit /b %errorlevel%
-          cl /nologo /O2 /EHsc /W3 /WX /utf-8 /D_CRT_SECURE_NO_WARNINGS /Ipackages\host\native /Ipackages\host\compat packages\host\tests\win_text_test.cpp /Fo:build_win_shaders\ /Fe:build_win_shaders\win_text_test.exe /link dwrite.lib d2d1.lib windowscodecs.lib user32.lib ole32.lib
-          if errorlevel 1 exit /b %errorlevel%
-          cl /nologo /O2 /W4 /WX /Ipackages\host\native packages\host\tests\raw_premul_test.c /Fo:build_win_shaders\ /Fe:build_win_shaders\raw_premul_test.exe
-          if errorlevel 1 exit /b %errorlevel%
-          cl /nologo /O2 /EHsc /W3 /WX /utf-8 /D_CRT_SECURE_NO_WARNINGS /Ipackages\host\native packages\host\tests\win_image_test.cpp /Fo:build_win_shaders\ /Fe:build_win_shaders\win_image_test.exe /link d3d11.lib windowscodecs.lib ole32.lib urlmon.lib shlwapi.lib shcore.lib runtimeobject.lib
-          if errorlevel 1 exit /b %errorlevel%
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path build_win_shaders/bin, build_win_shaders/obj, build_win_shaders/logs | Out-Null
+          $targets = @(
+            @{ Name = 'bake_win_shaders'; Args = @('/nologo','/O2','packages\host\tools\bake_win_shaders.c','/Fo:build_win_shaders\obj\bake_win_shaders\','/Fe:build_win_shaders\bin\bake_win_shaders.exe') },
+            @{ Name = 'win_render_test'; Args = @('/nologo','/O2','/EHsc','/DMB_NO_MOONBIT_H','/Ipackages\host\native','packages\host\tests\win_render_test.cpp','packages\host\native\win_render.cpp','/Fo:build_win_shaders\obj\win_render_test\','/Fe:build_win_shaders\bin\win_render_test.exe') },
+            @{ Name = 'win_vbuf_test'; Args = @('/nologo','/O2','/EHsc','/W3','/WX','/utf-8','/D_CRT_SECURE_NO_WARNINGS','/Ipackages\host\native','packages\host\tests\win_vbuf_test.cpp','/Fo:build_win_shaders\obj\win_vbuf_test\','/Fe:build_win_shaders\bin\win_vbuf_test.exe','/link','d3d11.lib','d3dcompiler.lib','dcomp.lib','dwmapi.lib','dxgi.lib','gdi32.lib','user32.lib','windowscodecs.lib','ole32.lib') },
+            @{ Name = 'win_text_test'; Args = @('/nologo','/O2','/EHsc','/W3','/WX','/utf-8','/D_CRT_SECURE_NO_WARNINGS','/Ipackages\host\native','/Ipackages\host\compat','packages\host\tests\win_text_test.cpp','/Fo:build_win_shaders\obj\win_text_test\','/Fe:build_win_shaders\bin\win_text_test.exe','/link','dwrite.lib','d2d1.lib','windowscodecs.lib','user32.lib','ole32.lib') },
+            @{ Name = 'raw_premul_test'; Args = @('/nologo','/O2','/W4','/WX','/Ipackages\host\native','packages\host\tests\raw_premul_test.c','/Fo:build_win_shaders\obj\raw_premul_test\','/Fe:build_win_shaders\bin\raw_premul_test.exe') },
+            @{ Name = 'win_image_test'; Args = @('/nologo','/O2','/EHsc','/W3','/WX','/utf-8','/D_CRT_SECURE_NO_WARNINGS','/Ipackages\host\native','packages\host\tests\win_image_test.cpp','/Fo:build_win_shaders\obj\win_image_test\','/Fe:build_win_shaders\bin\win_image_test.exe','/link','d3d11.lib','windowscodecs.lib','ole32.lib','urlmon.lib','shlwapi.lib','shcore.lib','runtimeobject.lib') }
+          )
+          $procs = @()
+          foreach ($t in $targets) {
+            New-Item -ItemType Directory -Force -Path "build_win_shaders\obj\$($t.Name)" | Out-Null
+            $outLog = "build_win_shaders\logs\$($t.Name).out.log"
+            $errLog = "build_win_shaders\logs\$($t.Name).err.log"
+            $p = Start-Process -FilePath 'cl.exe' -ArgumentList $t.Args -NoNewWindow -PassThru -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+            $procs += [PSCustomObject]@{ Name = $t.Name; Proc = $p; Out = $outLog; Err = $errLog }
+          }
+          $failed = $false
+          foreach ($item in $procs) {
+            $item.Proc.WaitForExit()
+            Write-Host "=== build $($item.Name) (exit $($item.Proc.ExitCode)) ==="
+            if (Test-Path $item.Out) { Get-Content $item.Out }
+            if (Test-Path $item.Err) { Get-Content $item.Err }
+            if ($item.Proc.ExitCode -ne 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
 
-      - name: Per-window vertex buffers, dropped-frame counting & frame_late (WARP)
-        shell: cmd
-        run: |
-          set MBUI_NO_WARM=1
-          build_win_shaders\win_vbuf_test.exe
-          if errorlevel 1 exit /b %errorlevel%
+      - name: Save compiled Windows test binaries cache
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: build_win_shaders/bin
+          key: win-shaders-bin-v2-${{ steps.win-env.outputs.env_fp }}-${{ hashFiles('packages/host/native/**', 'packages/host/compat/**', 'packages/host/tools/bake_win_shaders.c', 'packages/host/tests/win_*.cpp', 'packages/host/tests/raw_premul_test.c', '.github/workflows/win-shaders.yml') }}
 
-      - name: DirectWrite rasterization & drawing-ahead tests
-        shell: cmd
+      - name: Run unit tests, Pass 1 fresh D3DCompile WARP smoke, and Pass 2 baked verification (parallel)
+        shell: pwsh
         run: |
-          build_win_shaders\win_text_test.exe
-          if errorlevel 1 exit /b %errorlevel%
+          $ErrorActionPreference = 'Stop'
+          $root = (Get-Location).Path
+          $binDir = "$root\build_win_shaders\bin"
+          New-Item -ItemType Directory -Force -Path "$root\build_win_shaders\gen_cso", "$root\build_win_shaders\empty_verify" | Out-Null
 
-      - name: MBRAWPRE header parser, bounds validator & premultiplied downscaler tests
-        shell: cmd
-        run: |
-          build_win_shaders\raw_premul_test.exe
-          if errorlevel 1 exit /b %errorlevel%
+          function Start-TestProc($name, $exe, $argsList, $envOverrides) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $exe
+            $psi.WorkingDirectory = $root
+            foreach ($a in $argsList) { [void]$psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            foreach ($k in $envOverrides.Keys) {
+              $v = $envOverrides[$k]
+              if ($null -eq $v) {
+                $psi.Environment.Remove($k) | Out-Null
+              } else {
+                $psi.Environment[$k] = $v
+              }
+            }
+            $p = [System.Diagnostics.Process]::new()
+            $p.StartInfo = $psi
+            [void]$p.Start()
+            return [PSCustomObject]@{
+              Name = $name
+              Proc = $p
+              OutTask = $p.StandardOutput.ReadToEndAsync()
+              ErrTask = $p.StandardError.ReadToEndAsync()
+            }
+          }
 
-      - name: D3D11 WARP image upload & 3-format readback tests (R8G8B8A8, B8G8R8X8, B8G8R8A8)
-        shell: cmd
-        run: |
-          build_win_shaders\win_image_test.exe
-          if errorlevel 1 exit /b %errorlevel%
+          $wave1 = @(
+            (Start-TestProc 'win_text_test' "$binDir\win_text_test.exe" @() @{}),
+            (Start-TestProc 'raw_premul_test' "$binDir\raw_premul_test.exe" @() @{}),
+            (Start-TestProc 'pass1_warp_smoke' "$binDir\win_render_test.exe" @('--pass1') @{
+              MBUI_NO_WARM = '1'
+              INVAR_IGNORE_BAKED = '1'
+              MBUI_SHADERS = "$root\build_win_shaders\gen_cso"
+            })
+          )
+          $failed = $false
+          foreach ($r in $wave1) {
+            $r.Proc.WaitForExit()
+            $out = $r.OutTask.GetAwaiter().GetResult()
+            $err = $r.ErrTask.GetAwaiter().GetResult()
+            Write-Host "=== $($r.Name) (exit $($r.Proc.ExitCode)) ==="
+            if ($out) { Write-Host $out.TrimEnd() }
+            if ($err) { Write-Host $err.TrimEnd() }
+            if ($r.Proc.ExitCode -ne 0) { $failed = $true }
+          }
 
-      - name: Pass 1 — Fresh D3DCompile WARP smoke (INVAR_IGNORE_BAKED=1)
-        shell: cmd
-        run: |
-          mkdir build_win_shaders\gen_cso
-          set MBUI_NO_WARM=1
-          set INVAR_IGNORE_BAKED=1
-          set MBUI_SHADERS=%CD%\build_win_shaders\gen_cso
-          build_win_shaders\win_render_test.exe --pass1
-          if errorlevel 1 exit /b %errorlevel%
+          $wave2 = @(
+            (Start-TestProc 'win_vbuf_test' "$binDir\win_vbuf_test.exe" @() @{ MBUI_NO_WARM = '1' }),
+            (Start-TestProc 'win_image_test' "$binDir\win_image_test.exe" @() @{}),
+            (Start-TestProc 'pass2_baked_default' "$binDir\win_render_test.exe" @('--pass2') @{
+              MBUI_NO_WARM = '1'
+              INVAR_IGNORE_BAKED = $null
+              MBUI_SHADERS = "$root\build_win_shaders\empty_verify"
+            }),
+            (Start-TestProc 'pass2_baked_atlas1024' "$binDir\win_render_test.exe" @('--pass2') @{
+              MBUI_NO_WARM = '1'
+              INVAR_IGNORE_BAKED = $null
+              MBUI_ATLAS_SIZE = '1024'
+              MBUI_SHADERS = "$root\build_win_shaders\empty_verify"
+            })
+          )
+          foreach ($r in $wave2) {
+            $r.Proc.WaitForExit()
+            $out = $r.OutTask.GetAwaiter().GetResult()
+            $err = $r.ErrTask.GetAwaiter().GetResult()
+            Write-Host "=== $($r.Name) (exit $($r.Proc.ExitCode)) ==="
+            if ($out) { Write-Host $out.TrimEnd() }
+            if ($err) { Write-Host $err.TrimEnd() }
+            if ($r.Proc.ExitCode -ne 0) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
 
       - name: Pass 1 — Bake win_shaders_baked.h from generated .cso files
         shell: cmd
         run: |
-          build_win_shaders\bake_win_shaders.exe build_win_shaders\gen_cso build_win_shaders\win_shaders_baked.h
+          build_win_shaders\bin\bake_win_shaders.exe build_win_shaders\gen_cso build_win_shaders\win_shaders_baked.h
           if errorlevel 1 exit /b %errorlevel%
 
       - name: Upload freshly baked win_shaders_baked.h artifact
@@ -86,7 +174,7 @@ jobs:
           path: build_win_shaders/win_shaders_baked.h
           if-no-files-found: error
 
-      - name: Pass 1 — Assert baked key count and 0-diff vs committed win_shaders_baked.h
+      - name: Verify baked key count, 0-diff vs committed header, and Pass 2 0-.cso invariant
         shell: bash
         run: |
           KEY_COUNT=$(grep -c 'baked_shader_' build_win_shaders/win_shaders_baked.h)
@@ -95,23 +183,16 @@ jobs:
           echo "Baked shader table entries: $TABLE_COUNT"
           test "$TABLE_COUNT" -eq 21
           diff -u --strip-trailing-cr packages/host/native/win_shaders_baked.h build_win_shaders/win_shaders_baked.h
-
-      - name: Pass 2 — Verify 100% baked_shaders[] hit with empty cache dir & WARP smoke
-        shell: cmd
-        run: |
-          mkdir build_win_shaders\empty_verify
-          set MBUI_NO_WARM=1
-          set INVAR_IGNORE_BAKED=
-          set MBUI_SHADERS=%CD%\build_win_shaders\empty_verify
-          build_win_shaders\win_render_test.exe --pass2
-          if errorlevel 1 exit /b %errorlevel%
-          set MBUI_ATLAS_SIZE=1024
-          build_win_shaders\win_render_test.exe --pass2
-          if errorlevel 1 exit /b %errorlevel%
-
-      - name: Pass 2 — Assert empty_verify dir has 0 .cso files
-        shell: bash
-        run: |
           CSO_COUNT=$(find build_win_shaders/empty_verify -name '*.cso' | wc -l)
           echo "Pass 2 runtime .cso count: $CSO_COUNT"
           test "$CSO_COUNT" -eq 0
+
+      - name: Check 60s duration target
+        if: always()
+        shell: pwsh
+        run: |
+          $elapsed = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [int64]$env:JOB_START_EPOCH
+          Write-Host "Job win-shaders duration: ${elapsed}s"
+          if ($elapsed -gt 60) {
+            Write-Host "::warning title=CI duration > 60s::win-shaders took ${elapsed}s (target <= 60s, hard timeout 180s)"
+          }
