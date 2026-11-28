@@ -42,6 +42,7 @@ moonbit_string_t moonbit_make_string_raw(int32_t len) {
 }
 int mb_atlas_size = 4096;
 void mb_atlas_upload(int, int, int, int, const void *) {}
+int mb_atlas_fits(int x, int y, int w, int h) { return w > 0 && h > 0 && x >= 0 && y >= 0 && x + w <= 4096 && y + h <= 4096; }
 int mb_render_snapshot(const wchar_t *) { return 0; }
 }
 

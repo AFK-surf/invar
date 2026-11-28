@@ -101,10 +101,12 @@ function findChromeBinary() {
   throw new Error('No Chromium/Chrome binary found. Set CHROME_BIN to a valid executable.');
 }
 
-function extractShaders(hostJsPath) {
+function extractShaders(hostJsPath, atlasSide) {
   const src = fs.readFileSync(hostJsPath, 'utf8');
   const atlasMatch = src.match(/const\s+ATLAS\s*=\s*\d+\s*;/);
   if (!atlasMatch) throw new Error('Could not locate ATLAS constant in web/host.js');
+  // (a page side of its own: the atlas pages' draw check below, on a page small enough to fill by hand)
+  if (atlasSide) atlasMatch[0] = `const ATLAS = ${atlasSide};`;
 
   const startIdx = src.indexOf('const VS = `#version 300 es');
   if (startIdx < 0) throw new Error('Could not locate VS shader in web/host.js');
@@ -412,6 +414,54 @@ function buildHtmlPage(programs) {
         const ok = errs.length === 0 && blueOk && redOk;
         if (ok) drawPassed++;
         drawChecks.push({ name: 'draw:FS(ONE_KIND=13)', ok, center: blueCenter, redCenter, glErrors: errs });
+        gl.deleteProgram(p);
+      }
+
+      // 5. Atlas pages: an 8-texel two-page array (page 0 red, page 1 blue); a colour glyph (kind 3) whose v is 0 is
+      // drawn from page 0, one whose v is 8 (a page down) from page 1
+      {
+        const p = linkProg('FS(ONE_KIND=3,ATLAS=8)');
+        gl.useProgram(p);
+        gl.uniform2f(gl.getUniformLocation(p, 'u_vp'), W, H);
+        gl.uniform2f(gl.getUniformLocation(p, 'u_origin'), 0, 0);
+        gl.uniform1f(gl.getUniformLocation(p, 'u_scale'), 1.0);
+        gl.uniform1f(gl.getUniformLocation(p, 'u_top'), H);
+        const uAtlas = gl.getUniformLocation(p, 'u_atlas');
+        if (uAtlas) gl.uniform1i(uAtlas, 0);
+        const pages = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, pages);
+        gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, 8, 8, 2);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        const fill = (r, g, b) => {
+          const px = new Uint8Array(8 * 8 * 4);
+          for (let i = 0; i < 64; i++) px.set([r, g, b, 255], i * 4);
+          return px;
+        };
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 0, 8, 8, 1, gl.RGBA, gl.UNSIGNED_BYTE, fill(230, 40, 30));
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, 1, 8, 8, 1, gl.RGBA, gl.UNSIGNED_BYTE, fill(30, 60, 220));
+        const drawPage = (v) => {
+          const inst = new Float32Array(INST);
+          inst.set([2, 2, 12, 12], 0);
+          inst.set([0, 3, 0, 0], 4);
+          inst.set([1, 1, 1, 1], 8);
+          inst.set([0, v, 8, 8], 12);
+          inst.set([0, 0, W, H], 16);
+          gl.bufferSubData(gl.ARRAY_BUFFER, 0, inst);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
+          return readPx(8, 8);
+        };
+        const page0 = drawPage(0);
+        const page1 = drawPage(8);
+        const errs = drainErr();
+        const ok = errs.length === 0 && near(page0, [230, 40, 30, 255], 3) && near(page1, [30, 60, 220, 255], 3);
+        if (ok) drawPassed++;
+        drawChecks.push({ name: 'draw:FS(ONE_KIND=3,ATLAS=8) atlas pages', ok, page0, page1, glErrors: errs });
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+        gl.deleteTexture(pages);
         gl.deleteProgram(p);
       }
 
@@ -1652,6 +1702,13 @@ async function runCheck() {
   const chromeBin = findChromeBinary();
   const shaders = extractShaders(HOST_JS_PATH);
   const programs = buildTestPrograms(shaders);
+  // the colour-glyph program with 8-texel atlas pages: a glyph a page down drawn from the array's next layer
+  const small = extractShaders(HOST_JS_PATH, 8);
+  programs.push({
+    name: 'FS(ONE_KIND=3,ATLAS=8)',
+    vs: small.VS,
+    fs: `#version 300 es\n#define ONE_KIND 3\n${small.FS.slice('#version 300 es\n'.length)}`,
+  });
   const html = buildHtmlPage(programs);
 
   let resolveResult;

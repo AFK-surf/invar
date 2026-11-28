@@ -903,6 +903,9 @@ static void reset_atlas(void) {
   generation++;
 }
 
+// What the atlas held is gone (win_render.cpp: its device made anew): every glyph drawn again.
+extern "C" void mb_atlas_lost(void) { reset_atlas(); }
+
 // What was measured and drawn before a face changed: its formats made again, its glyphs drawn again.
 static void ahead_forget(void);
 
@@ -2001,7 +2004,7 @@ extern "C" int32_t mb_host_glyph_picture(int32_t key, moonbit_bytes_t out) {
 
 // Pixels made by MoonBit (a halo, RGBA) put in the atlas, their top left at x, y, as a glyph's are. 1 when put.
 extern "C" int32_t mb_host_atlas_put(int32_t x, int32_t y, int32_t w, int32_t h, moonbit_bytes_t px) {
-  if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > mb_atlas_size || y + h > mb_atlas_size) return 0;
+  if (!mb_atlas_fits(x, y, w, h)) return 0;
   if ((size_t)Moonbit_array_length(px) < (size_t)w * h * 4) return 0;
   mb_atlas_upload(x, y, w, h, px);
   return 1;

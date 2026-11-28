@@ -37,7 +37,9 @@
       under: null, underN: 0, whole: 0, picked: 0, grab: null, key: null, valid: false, used: 0,
     }));
   }
-  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, ta, pw;
+  let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, standTex, ta, pw;
+  // the glyphs' atlas's pages, every window's texture of it as many (H.atlasPages), and how far each is filled
+  let atlasPagesN = 1, atlasUsed = [[0, 0]], atlasLayersMost = 256;
   let extParallel = null, bootProgs = null, bootPvs = null, bootReady = true;
   // (the programs of PREWARM_KINDS linking in the background, pendingProgs, adopted as a frame first asks for one;
   // glGen: the context's generation, moved on as it is lost or made again, so a prewarm queued for one never links in
@@ -855,7 +857,8 @@
   uniform float u_scale;
   uniform float u_top;
   uniform vec2 u_origin;
-  uniform sampler2D u_atlas;
+  // the glyphs' atlas: an array of pages ${ATLAS} square (a glyph on page p is p pages down: H.atlasPages)
+  uniform highp sampler2DArray u_atlas;
   uniform sampler2D u_img;
   uniform int u_img_mips;
   // glass (src/ui/glass.mbt): the blurred copy under it and where a point is in it (uv = p * u_map.xy + u_map.zw, kept
@@ -1321,8 +1324,10 @@
       vec2 r0 = v_rect.xy * u_scale, r0i = floor(r0 + 0.5);
       bool exact = v_p.x == 0.0 && max(off.x, off.y) <= 0.05 && max(abs(r0.x - r0i.x), abs(r0.y - r0i.y)) <= 0.05;
       vec2 tex = exact ? floor(p * u_scale - r0i) + 0.5 : (p - v_rect.xy) / v_rect.zw * v_c2.zw;
-      vec2 uv = clamp(v_c2.xy + tex, v_c2.xy + 0.5, v_c2.xy + v_c2.zw - 0.5) / ${ATLAS}.0;
-      vec4 t = texture(u_atlas, uv);
+      float layer = max(floor(v_c2.y / ${ATLAS}.0), 0.0);
+      vec2 at = vec2(v_c2.x, v_c2.y - layer * ${ATLAS}.0);
+      vec2 uv = clamp(at + tex, at + 0.5, at + v_c2.zw - 0.5) / ${ATLAS}.0;
+      vec4 t = texture(u_atlas, vec3(uv, layer));
       #if ONE_KIND < 0 || ONE_KIND == 7
       if (kind == 7) {
         // inked by how light what is under its glass is, looked at round the glass's middle and locally
@@ -2859,6 +2864,20 @@
     if (u.u_ad_n) gl.uniform1i(u.u_ad_n, gadN);
   }
 
+  // The glyphs' atlas in context `g`, `pages` pages ATLAS square: a texture array however many, as the shader takes it;
+  // null where the context could not make it.
+  function atlasMake(g, pages) {
+    const t = g.createTexture();
+    if (!t) return null;
+    g.bindTexture(g.TEXTURE_2D_ARRAY, t);
+    g.texStorage3D(g.TEXTURE_2D_ARRAY, 1, g.RGBA8, ATLAS, ATLAS, Math.max(1, pages));
+    g.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MIN_FILTER, g.LINEAR);
+    g.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_MAG_FILTER, g.LINEAR);
+    g.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
+    g.texParameteri(g.TEXTURE_2D_ARRAY, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
+    return t;
+  }
+
   function setupGL() {
     // with alpha: native views (below) show through the holes the app paints (kind 9), and default-FB glass blits to RGBA8
     gl = canvas.getContext('webgl2', { premultipliedAlpha: true, antialias: false, alpha: true });
@@ -2943,13 +2962,14 @@
     }
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
-    atlasTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, atlasTex);
-    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, ATLAS, ATLAS);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    // (as many layers as the context's arrays take, asked once as it is made)
+    atlasLayersMost = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS) | 0 || 256;
+    atlasTex = atlasMake(gl, atlasPagesN);
+    // (what stands in a sampler2D unit nothing is bound to: an instance with no picture, 1 texel, clear as WebGL
+    // makes a texture's storage)
+    standTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, standTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, 1, 1);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
@@ -4002,13 +4022,13 @@
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, bdTex || atlasTex);
+    gl.bindTexture(gl.TEXTURE_2D, bdTex || standTex);
     gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, segsTex || atlasTex);
+    gl.bindTexture(gl.TEXTURE_2D, segsTex || standTex);
     gl.activeTexture(gl.TEXTURE4);
-    gl.bindTexture(gl.TEXTURE_2D, adTex[adCur] || atlasTex);
+    gl.bindTexture(gl.TEXTURE_2D, adTex[adCur] || standTex);
     progGen++;
     progNow = null;
   }
@@ -4759,7 +4779,7 @@
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, blComp);
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
         gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+        gl.bindTexture(gl.TEXTURE_2D, standTex);
         gl.bindVertexArray(vao);
         gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
         start++;
@@ -4799,7 +4819,7 @@
         gl.bindFramebuffer(gl.FRAMEBUFFER, lensLv[0].fb);
         // (u_bd off any lens level: one bound there by a lens before is drawn into now)
         gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+        gl.bindTexture(gl.TEXTURE_2D, standTex);
         gl.viewport(0, 0, pw, ph);
         gl.disable(gl.SCISSOR_TEST);
         gl.clearColor(0, 0, 0, 0);
@@ -4823,7 +4843,7 @@
             if (cown ? kk !== ck : hasOwnProg(kk)) break;
             ce++;
           }
-          let ct = atlasTex, cmips = 1;
+          let ct = standTex, cmips = 1;
           if (ctid > STREAM_TEX) {
             const st = streams.get(ctid - STREAM_TEX);
             if (!st || !st.tex) { cs = ce; continue; }
@@ -4862,7 +4882,7 @@
         drawRun(start, 1);
         bdTex = prevBd;
         gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D, bdTex || atlasTex);
+        gl.bindTexture(gl.TEXTURE_2D, bdTex || standTex);
         bound = 0;
         start += 1 + childN;
         continue;
@@ -4920,7 +4940,7 @@
       }
       if (!h && tid > 0 && tid <= STREAM_TEX && !tex) drewMissing = true;
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, tex || atlasTex);
+      gl.bindTexture(gl.TEXTURE_2D, tex || standTex);
       if (!simple) setImgMips(tex && tid > 0 && tid <= STREAM_TEX && im && im.mips ? im.mips : 1);
       if (h) {
         gl.disable(gl.BLEND);
@@ -6472,20 +6492,26 @@
     out[4] = e.ox || 0; out[5] = e.oy || 0; out[6] = e.color || 0;
   };
 
-  // the glyph drawn last put in the atlas, its top left at x, y
-  // (the atlas is the run's, one for every window: put in each open window's texture of it, and how far it is filled
-  // kept, for a window opened later to copy that much of the page's: slotAtlas)
-  let atlasUsedW = 0, atlasUsedH = 0;
+  // the glyph drawn last put in the atlas, its top left at x, y (y: its page, ATLAS down for each, and where on it)
+  // (the atlas is the run's, one for every window: put in each open window's texture of it, and how far each page is
+  // filled kept, for a window opened later to copy that much of the page's: slotAtlas)
   const putGlyph = (g, tex, x, y) => {
-    g.bindTexture(g.TEXTURE_2D, tex);
+    const page = Math.floor(y / ATLAS);
+    g.bindTexture(g.TEXTURE_2D_ARRAY, tex);
     g.pixelStorei(g.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-    g.texSubImage2D(g.TEXTURE_2D, 0, x, y, held.pw, held.ph, g.RGBA, g.UNSIGNED_BYTE, held.img);
+    g.texSubImage3D(g.TEXTURE_2D_ARRAY, 0, x, y - page * ATLAS, page, held.pw, held.ph, 1, g.RGBA, g.UNSIGNED_BYTE,
+      held.img);
     // (back as every other upload takes it: left on, it premultiplies the shapes' pieces too, segsUpload's floats
     // each times its four's last, and every icon after the first glyph drawn came out torn)
     g.pixelStorei(g.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   };
   H.glyphPut = (key, x, y) => {
     if (!held || held.key !== key) return;
+    const page = Math.floor(y / ATLAS);
+    if (page < 0 || page >= atlasPagesN || x + held.pw > ATLAS || y - page * ATLAS + held.ph > ATLAS) {
+      held = null;
+      return;
+    }
     putGlyph(gl, atlasTex, x, y);
     if (winsOpen) {
       for (let i = 0; i < MB_WINS; i++) {
@@ -6493,9 +6519,80 @@
         if (i !== winActive && s && !s.closed && s.gl) putGlyph(s.gl, s.atlasTex, x, y);
       }
     }
-    atlasUsedW = Math.min(ATLAS, Math.max(atlasUsedW, x + held.pw));
-    atlasUsedH = Math.min(ATLAS, Math.max(atlasUsedH, y + held.ph));
+    const used = atlasUsed[page];
+    used[0] = Math.min(ATLAS, Math.max(used[0], x + held.pw));
+    used[1] = Math.min(ATLAS, Math.max(used[1], y - page * ATLAS + held.ph));
     held = null;
+  };
+
+  // The atlas's pages (one atlas: colour glyphs in it with the others; atlas_pages.h's cap, at least 2, at most 32 and
+  // 128 MiB, and what the context takes). Each open window's context has its own texture of it: made `n` pages in all
+  // of them or in none (two phases: every new texture made and the pages both have copied first, then each put in its
+  // old one's place), what is put after this putting glyphs in them.
+  const atlasContexts = () => {
+    const out = [[gl, null]];
+    if (winsOpen) {
+      for (let i = 0; i < MB_WINS; i++) {
+        const s = wins[i];
+        if (i !== winActive && s && !s.closed && s.gl) out.push([s.gl, s]);
+      }
+    }
+    return out;
+  };
+  H.atlasPagesMost = (colour) => {
+    if (colour) return 1;
+    const fit = Math.floor(128 * 1024 * 1024 / (ATLAS * ATLAS * 4));
+    return Math.min(Math.max(2, Math.min(32, fit)), atlasLayersMost);
+  };
+  H.atlasPagesNow = (colour) => colour ? 1 : atlasPagesN;
+  H.atlasPages = (colour, n) => {
+    if (colour) return n === 1;
+    if (n === atlasPagesN) return true;
+    if (n < 1 || n > H.atlasPagesMost(false)) return false;
+    const keep = Math.min(n, atlasPagesN);
+    const made = [];
+    let ok = true;
+    for (const [g, s] of atlasContexts()) {
+      if (!g || g.isContextLost()) continue;
+      const old = s ? s.atlasTex : atlasTex;
+      while (g.getError() !== g.NO_ERROR) { /* what was owed before */ }
+      const t = atlasMake(g, n);
+      if (!t || g.getError() !== g.NO_ERROR) {
+        if (t) g.deleteTexture(t);
+        ok = false;
+        break;
+      }
+      if (old && keep > 0) {
+        const was = g.getParameter(g.READ_FRAMEBUFFER_BINDING);
+        const fb = g.createFramebuffer();
+        g.bindFramebuffer(g.READ_FRAMEBUFFER, fb);
+        g.bindTexture(g.TEXTURE_2D_ARRAY, t);
+        for (let i = 0; i < keep; i++) {
+          g.framebufferTextureLayer(g.READ_FRAMEBUFFER, g.COLOR_ATTACHMENT0, old, 0, i);
+          g.copyTexSubImage3D(g.TEXTURE_2D_ARRAY, 0, 0, 0, i, 0, 0, ATLAS, ATLAS);
+        }
+        g.bindFramebuffer(g.READ_FRAMEBUFFER, was);
+        g.deleteFramebuffer(fb);
+      }
+      made.push([g, s, t, old]);
+      if (g.getError() !== g.NO_ERROR) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) {
+      for (const [g, , t] of made) g.deleteTexture(t);
+      return false;
+    }
+    for (const [g, s, t, old] of made) {
+      if (s) s.atlasTex = t;
+      else atlasTex = t;
+      if (old) g.deleteTexture(old);
+    }
+    atlasPagesN = n;
+    atlasUsed.length = Math.min(atlasUsed.length, n);
+    while (atlasUsed.length < n) atlasUsed.push([0, 0]);
+    return true;
   };
 
   // ---- the platform's own text drawing (textref_js.mbt, src/textdiff) ----
@@ -7046,6 +7143,17 @@
     if (contextLoser) requestAnimationFrame(() => contextLoser.restoreContext());
   };
   const contextRestored = () => {
+    // (the page's atlas made anew, one page, as every window's: what was in them is drawn again, textChanged)
+    atlasPagesN = 1;
+    atlasUsed = [[0, 0]];
+    if (winsOpen) {
+      for (let i = 0; i < MB_WINS; i++) {
+        const s = wins[i];
+        if (i === winActive || !s || s.closed || !s.gl || s.gl.isContextLost()) continue;
+        if (s.atlasTex) s.gl.deleteTexture(s.atlasTex);
+        s.atlasTex = atlasMake(s.gl, 1);
+      }
+    }
     setupGL();
     glassLost();
     layers.clear();
@@ -7787,7 +7895,7 @@
   const rolesKept = new Map();
   function winSave(s) {
     Object.assign(s, {
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, pw, U, PU, ADU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, standTex, ta, pw, U, PU, ADU,
       extParallel, bootProgs, bootPvs, bootReady, glGen, prewarmQueued, pendingProgs,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
@@ -7798,7 +7906,7 @@
   }
   function winLoad(s) {
     ({
-      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, ta, pw, U, PU, ADU,
+      canvas, gl, vs, prog, progs, progFlat, ufVp, progRect, urVp, urScale, urTop, progGen, progNow, post, adProg, vao, instBuf, blCompVao, blCompBuf, atlasTex, standTex, ta, pw, U, PU, ADU,
       extParallel, bootProgs, bootPvs, bootReady, glGen, prewarmQueued, pendingProgs,
       cssW, cssH, dpr, curW, curH, curScale, rectLeft, rectTop, rectValid, sizeDirty, sizeObserver,
       lv, lvW, lvH, bdTex, blTex, blFb, blW, blH, blPy, blPyW, blPyH, glassSlots, glassSlotsClock, adTex, adFb, adCur, adSlots, adLastTime, adFrameSerial, adSettling, adRaf, lastN, lastR, lastG, lastB, lastF32,
@@ -7832,13 +7940,14 @@
   const windowsHere = () => shotAt < 0 && !globalThis.__mbrender && typeof window !== 'undefined' &&
     typeof window.open === 'function';
 
-  // A texture of `g`'s read back (premultiplied RGBA, its first row first), or null.
-  function texPixels(g, tex, w, h) {
+  // A texture of `g`'s read back (premultiplied RGBA, its first row first), or null; of an array's, its page `layer`.
+  function texPixels(g, tex, w, h, layer) {
     if (!g || !tex || w <= 0 || h <= 0 || g.isContextLost()) return null;
     const was = g.getParameter(g.FRAMEBUFFER_BINDING);
     const fb = g.createFramebuffer();
     g.bindFramebuffer(g.FRAMEBUFFER, fb);
-    g.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex, 0);
+    if (layer === undefined) g.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, tex, 0);
+    else g.framebufferTextureLayer(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, tex, 0, layer);
     let px = null;
     if (g.checkFramebufferStatus(g.FRAMEBUFFER) === g.FRAMEBUFFER_COMPLETE) {
       px = new Uint8Array(w * h * 4);
@@ -7922,12 +8031,16 @@
   // The atlas of the window in place (just made, or given back after its context was lost) made what the page's
   // holds: as much of it as is filled copied.
   function slotAtlas() {
-    if (!atlasUsedW || !atlasUsedH || !wins[0]) return;
-    const px = texPixels(wins[0].gl, wins[0].atlasTex, atlasUsedW, atlasUsedH);
-    if (!px) return;
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, atlasTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, atlasUsedW, atlasUsedH, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    if (!wins[0]) return;
+    for (let p = 0; p < atlasUsed.length && p < atlasPagesN; p++) {
+      const [w, h] = atlasUsed[p];
+      if (!w || !h) continue;
+      const px = texPixels(wins[0].gl, wins[0].atlasTex, w, h, p);
+      if (!px) continue;
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, p, w, h, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    }
   }
 
   // window `s` let go of (the person closed it, or the app, or the page goes), the page in place; told to the app
@@ -7950,7 +8063,7 @@
     const sg = s.gl;
     if (sg) {
       try {
-        for (const t of [s.atlasTex, s.segsTex]) if (t) sg.deleteTexture(t);
+        for (const t of [s.atlasTex, s.standTex, s.segsTex]) if (t) sg.deleteTexture(t);
         for (const l of s.lv || []) { sg.deleteTexture(l.t); sg.deleteFramebuffer(l.fb); }
         for (const l of s.blPy || []) { sg.deleteTexture(l.t); sg.deleteFramebuffer(l.fb); }
         for (const t of s.blTex || []) if (t) sg.deleteTexture(t);
@@ -7986,7 +8099,7 @@
       gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null, ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null,
       extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
       glGen: (s.glGen || 0) + 1, prewarmQueued: false, pendingProgs: new Array(MB_KINDS + 1).fill(null),
-      progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, segsTex: null, segsHad: null,
+      progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, standTex: null, segsTex: null, segsHad: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,
       adProg: null, ADU: {}, adTex: [null, null], adFb: [null, null], adCur: 0, adSlots: makeAdSlots(),
       adLastTime: 0, adFrameSerial: 0, adSettling: false, adRaf: 0, lastN: 0, lastR: 0, lastG: 0, lastB: 0, lastF32: null,
@@ -8106,7 +8219,7 @@
       canvas: ccanvas, gl: null, vs: null, prog: null, progs: new Array(MB_KINDS + 1).fill(null), progFlat: null,
       extParallel: null, bootProgs: null, bootPvs: null, bootReady: true,
       glGen: 0, prewarmQueued: false, pendingProgs: new Array(MB_KINDS + 1).fill(null),
-      ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, ta: cta, pw: cpw,
+      ufVp: null, progRect: null, urVp: null, urScale: null, urTop: null, progGen: 0, progNow: null, post: null, vao: null, instBuf: null, blCompVao: null, blCompBuf: null, atlasTex: null, standTex: null, ta: cta, pw: cpw,
       U: {}, PU: {}, cssW: 0, cssH: 0, dpr: child.devicePixelRatio || 1, rectLeft: 0, rectTop: 0, rectValid: false,
       sizeDirty: true, sizeObserver: null,
       lv: null, lvW: 0, lvH: 0, bdTex: null, blTex: [null, null, null, null], blFb: [null, null, null, null], blW: 0, blH: 0, blPy: null, blPyW: 0, blPyH: 0, glassSlots: makeGlassSlots(), glassSlotsClock: 0,

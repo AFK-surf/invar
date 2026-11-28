@@ -69,7 +69,7 @@ static jclass autofills_cls;
 static jmethodID m_af_able, m_af_ask, m_af_take, m_af_end;
 static jclass passkeys_cls;
 static jmethodID m_wa_able, m_wa_get, m_wa_out, m_wa_end;
-static jmethodID m_face_add, m_face_add_bytes, m_face_clear, m_ahead, m_flush;
+static jmethodID m_face_add, m_face_add_bytes, m_face_clear, m_ahead, m_flush, m_atlas_pages;
 static jmethodID m_cs_known, m_cs_decode;
 static jmethodID m_v_text, m_v_still, m_v_lost;
 static jmethodID m_ga_access, m_ga_ask, m_ga_answers, m_ga_read, m_ga_state, m_ga_rows, m_ga_end, m_pk_photo;
@@ -155,6 +155,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *v, void *reserved) {
   m_face_clear = (*env)->GetStaticMethodID(env, text_cls, "faceClear", "(I)V");
   m_ahead = (*env)->GetStaticMethodID(env, text_cls, "ahead", "([II)V");
   m_flush = (*env)->GetStaticMethodID(env, text_cls, "flush", "()V");
+  m_atlas_pages = (*env)->GetStaticMethodID(env, text_cls, "atlasPages", "(ZIZ)V");
   m_ref_begin = (*env)->GetStaticMethodID(env, text_cls, "refBegin", "(DDDI)V");
   m_ref_text = (*env)->GetStaticMethodID(env, text_cls, "refText", "(Ljava/lang/String;DIIDDI[D)V");
   m_ref_end = (*env)->GetStaticMethodID(env, text_cls, "refEnd", "(Ljava/lang/String;)Z");
@@ -1113,9 +1114,13 @@ void mb_host_glyphs_ahead(int32_t *keys, int32_t n) {
   (*env)->CallStaticVoidMethod(env, text_cls, m_ahead, ahead_buf, n);
 }
 
+static void atlas_told_sync(void);
+static int atlas_lost_bumps;
+
 int32_t mb_host_atlas_generation(void) {
   JNIEnv *env = env_();
-  return (*env)->CallStaticIntMethod(env, text_cls, m_generation);
+  atlas_told_sync();
+  return (*env)->CallStaticIntMethod(env, text_cls, m_generation) + atlas_lost_bumps;
 }
 
 // The platform's own text drawing beside mbui's (textref_native.mbt, src/textdiff): MBText's StaticLayout into a
@@ -2806,3 +2811,78 @@ void mb_images_upload(void) {
 void mb_render_present(double *buf, int32_t count, double r, double g, double b) {
   mb_host_present(buf, count, r, g, b);
 }
+
+// ---- the glyph atlases' pages (atlas_pages.h) ----
+int mb_atlas_pages_said;
+void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
+
+// the pages each atlas has for what is put from now on (the app's thread's: MBText's ops say it to the GL thread), and
+// pages the GL thread failed to make, as the app's thread last saw them
+static int atlas_told[2] = {1, 1};
+static atomic_int atlas_lost;
+static int atlas_lost_seen;
+
+// (the app's thread, MBText.reset: a GL context made anew, its atlases one page each; told now, before anything is put
+// for it, so nothing the app's thread said of the old context stands)
+JNIEXPORT void JNICALL Java_dev_invar_Native_atlasReset(JNIEnv *env, jclass c) {
+  (void)env;
+  (void)c;
+  atlas_told[0] = atlas_told[1] = 1;
+  atlas_lost_seen = atomic_load(&atlas_lost);
+}
+
+// Pages the GL thread had no memory for, since the app's thread last looked: as many as it has from now on, every glyph
+// drawn again (the generation moves on).
+static void atlas_told_sync(void) {
+  int lost = atomic_load(&atlas_lost);
+  if (lost != atlas_lost_seen) {
+    atlas_lost_seen = lost;
+    atlas_told[0] = gl_atlas_have[0];
+    atlas_told[1] = gl_atlas_have[1];
+    atlas_lost_bumps++;
+  }
+}
+
+int32_t mb_host_atlas_pages_most(int32_t colour) {
+  atlas_told_sync();
+  return gl_atlas_most(colour);
+}
+
+int32_t mb_host_atlas_pages_now(int32_t colour) {
+  atlas_told_sync();
+  return atlas_told[colour ? 1 : 0];
+}
+
+// The atlas `colour` made `n` pages for what is put after this: an op among the glyphs MBText keeps for the GL thread,
+// in order with them (MBText.atlasPages: given back, handed over at once though no frame is drawn).
+int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
+  int c = colour ? 1 : 0;
+  atlas_told_sync();
+  if (n == atlas_told[c]) return 1;
+  if (n < 1 || n > mb_host_atlas_pages_most(colour)) return 0;
+  int fewer = n < atlas_told[c];
+  atlas_told[c] = n;
+  JNIEnv *env = env_();
+  (*env)->CallStaticVoidMethod(env, text_cls, m_atlas_pages, c ? JNI_TRUE : JNI_FALSE, (jint)n,
+                               fewer ? JNI_TRUE : JNI_FALSE);
+  return 1;
+}
+
+// (GL thread, MBText.upload) the atlas made `n` pages: false where there was no memory for them.
+JNIEXPORT jboolean JNICALL Java_dev_invar_Native_atlasPages(JNIEnv *env, jclass c, jboolean colour, jint n) {
+  (void)env;
+  (void)c;
+  if (gl_atlas_pages(colour ? 1 : 0, n)) return JNI_TRUE;
+  atomic_fetch_add(&atlas_lost, 1);
+  return JNI_FALSE;
+}
+
+// (GL thread, MBText.upload) how many pages the atlas has: a glyph on a page past them is not put.
+JNIEXPORT jint JNICALL Java_dev_invar_Native_atlasPagesHave(JNIEnv *env, jclass c, jboolean colour) {
+  (void)env;
+  (void)c;
+  return gl_atlas_have[colour ? 1 : 0];
+}
+
+// How many pages each atlas's texture has (for tests: what the GL thread's ops left).
+int32_t mb_render_atlas_pages_held(int32_t colour) { return gl_atlas_have[colour ? 1 : 0]; }

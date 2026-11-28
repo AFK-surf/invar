@@ -38,6 +38,7 @@ extern "C" size_t invar_test_array_length(const void *p);
 // Exposes only ud_inflate() in this TU (do not expect full ud_apply later in the same TU).
 #define UD_INFLATE_ONLY
 #include "update_delta.h"
+#include "atlas_pages.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -50,7 +51,9 @@ extern "C" size_t invar_test_array_length(const void *p);
 
 int mb_atlas_size = 4096;
 static int video_support = 1;
+// the glyphs' atlas: a texture array of pages mb_atlas_size square (atlas_pages.h), as many as atlas_pages_n
 static ID3D11Texture2D *atlas;
+static int atlas_pages_n = 1;
 
 static int valid_atlas_size(int size) {
   return size >= 512 && size <= 4096 && (size & (size - 1)) == 0;
@@ -88,6 +91,9 @@ static ID3D11PixelShader *rect_ps;
 static ID3D11InputLayout *layout;
 static ID3D11Buffer *ubuf;
 static ID3D11ShaderResourceView *atlas_srv;
+// what stands in a Texture2D slot nothing is bound to (an instance with no picture): 1 texel, clear
+static ID3D11Texture2D *stand_tex;
+static ID3D11ShaderResourceView *stand_srv;
 static ID3D11SamplerState *sampler;
 static ID3D11BlendState *blend;
 // the composition's device, the windows' (NULL: each swap chain is its window's own)
@@ -259,11 +265,12 @@ static const char *shader_src =
     "#ifndef ONE_KIND\n"
     "#define ONE_KIND -1\n"
     "#endif\n"
-    "cbuffer U : register(b0) { float2 vp; float scale; float inv_atlas; float2 origin; float2 _pad2; };\n"
+    "// (inv_atlas: 1 over a page's side, atlas_side; a glyph on page p is p * atlas_side down past its place in it)\n"
+    "cbuffer U : register(b0) { float2 vp; float scale; float inv_atlas; float2 origin; float atlas_side; float _pad2; };\n"
     "// glass (src/ui/glass.mbt): where a point is in the blurred copy under it (uv = p * gmap.xy + gmap.zw, kept in guvc),\n"
     "// a liquid group's bounds, shapes, corners (x of each), how many\n"
     "cbuffer G : register(b1) { float4 gmap; float4 guvc; float4 ggb; float4 gshape[8]; float4 grad[8]; float4 gmisc; float4 gad_box[16]; float4 gad_meta; };\n"
-    "Texture2D atlas : register(t0);\n"
+    "Texture2DArray atlas : register(t0);\n"
     "Texture2D img : register(t1);\n"
     "Texture2D bd : register(t2);\n"
     "// the pieces of the frame's shapes (src/ui/shape.mbt: the instances of kind 12 after every one drawn), 15 fours each\n"
@@ -787,8 +794,11 @@ static const char *shader_src =
     "    float2 r0 = I.rect.xy * scale, r0i = floor(r0 + 0.5);\n"
     "    bool exact = kind == 1 && max(off.x, off.y) <= 0.05 && max(abs(r0.x - r0i.x), abs(r0.y - r0i.y)) <= 0.05 && I.prm.x == 0.0;\n"
     "    float2 tex = exact ? floor(p * scale - r0i) + 0.5 : (p - I.rect.xy) / I.rect.zw * I.c2.zw;\n"
-    "    float2 uv = clamp(I.c2.xy + tex, I.c2.xy + 0.5, I.c2.xy + I.c2.zw - 0.5) * inv_atlas;\n"
-    "    float4 t = atlas.SampleLevel(samp, uv, 0);\n"
+    "    // (its page, and where it is on it)\n"
+    "    float layer = max(floor(I.c2.y * inv_atlas), 0.0);\n"
+    "    float2 at = float2(I.c2.x, I.c2.y - layer * atlas_side);\n"
+    "    float2 uv = clamp(at + tex, at + 0.5, at + I.c2.zw - 0.5) * inv_atlas;\n"
+    "    float4 t = atlas.SampleLevel(samp, float3(uv, layer), 0);\n"
     "    if (kind == 1) {\n"
     "      // (a mask drawn in gray has its three the same as its alpha: as before; a glyph drawn larger or smaller than\n"
     "      // its picture, its stripes no longer on the screen's: in gray, their mean). Its cover blended as it is, light\n"
@@ -2642,6 +2652,8 @@ static void release_pipeline(void) {
   if (sampler) { sampler->Release(); sampler = NULL; }
   if (atlas_srv) { atlas_srv->Release(); atlas_srv = NULL; }
   if (atlas) { atlas->Release(); atlas = NULL; }
+  if (stand_srv) { stand_srv->Release(); stand_srv = NULL; }
+  if (stand_tex) { stand_tex->Release(); stand_tex = NULL; }
   if (ad_cb) { ad_cb->Release(); ad_cb = NULL; }
   if (gbuf) { gbuf->Release(); gbuf = NULL; }
   if (pbuf) { pbuf->Release(); pbuf = NULL; }
@@ -2651,6 +2663,39 @@ static void release_pipeline(void) {
   if (ps) { ps->Release(); ps = NULL; }
   if (vs) { vs->Release(); vs = NULL; }
 }
+
+// The glyphs' atlas made `pages` pages (each mb_atlas_size square, RGBA), and its view: a Texture2DArray's however
+// many pages, as the shader takes it.
+static bool atlas_make(int pages, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv) {
+  *tex = NULL;
+  *srv = NULL;
+  D3D11_TEXTURE2D_DESC td = {};
+  td.Width = td.Height = (UINT)mb_atlas_size;
+  td.MipLevels = 1;
+  td.ArraySize = (UINT)pages;
+  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+  if (FAILED(dev->CreateTexture2D(&td, NULL, tex)) || !*tex) return false;
+  D3D11_SHADER_RESOURCE_VIEW_DESC vd = {};
+  vd.Format = td.Format;
+  vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+  vd.Texture2DArray.MostDetailedMip = 0;
+  vd.Texture2DArray.MipLevels = 1;
+  vd.Texture2DArray.FirstArraySlice = 0;
+  vd.Texture2DArray.ArraySize = (UINT)pages;
+  if (FAILED(dev->CreateShaderResourceView(*tex, &vd, srv)) || !*srv) {
+    (*tex)->Release();
+    *tex = NULL;
+    return false;
+  }
+  return true;
+}
+
+static void atlas_occ_drop_from(int from);
+// (win_text.cpp: what the atlas held is gone, its generation moved on)
+extern "C" void mb_atlas_lost(void);
 
 static bool make_pipeline(void) {
   // (those of a device before, if there was one, let go once made)
@@ -2742,19 +2787,34 @@ static bool make_pipeline(void) {
     return false;
   }
 
-  D3D11_TEXTURE2D_DESC td = {};
-  td.Width = td.Height = (UINT)mb_atlas_size;
-  td.MipLevels = td.ArraySize = 1;
-  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  td.SampleDesc.Count = 1;
-  td.Usage = D3D11_USAGE_DEFAULT;
-  td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  HRESULT hr_at = dev->CreateTexture2D(&td, NULL, &atlas);
-  HRESULT hr_srv = SUCCEEDED(hr_at) && atlas ? dev->CreateShaderResourceView(atlas, NULL, &atlas_srv) : E_FAIL;
-  if (FAILED(hr_at) || !atlas || FAILED(hr_srv) || !atlas_srv) {
+  // (a device made anew has its atlas anew, one page: what it held is drawn again, its generation moved on)
+  if (atlas_pages_n > 1) {
+    atlas_pages_n = 1;
+    atlas_occ_drop_from(1);
+    mb_atlas_lost();
+  }
+  if (!atlas_make(1, &atlas, &atlas_srv)) {
     fprintf(stderr, "win_render: glyph atlas texture/SRV creation failed\n");
     release_pipeline();
     return false;
+  }
+  {
+    D3D11_TEXTURE2D_DESC sd = {};
+    sd.Width = sd.Height = 1;
+    sd.MipLevels = sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_DEFAULT;
+    sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    static const uint32_t clear_texel = 0;
+    D3D11_SUBRESOURCE_DATA init = {&clear_texel, 4, 4};
+    HRESULT hr_st = dev->CreateTexture2D(&sd, &init, &stand_tex);
+    HRESULT hr_ss = SUCCEEDED(hr_st) && stand_tex ? dev->CreateShaderResourceView(stand_tex, NULL, &stand_srv) : E_FAIL;
+    if (FAILED(hr_st) || !stand_tex || FAILED(hr_ss) || !stand_srv) {
+      fprintf(stderr, "win_render: stand-in texture/SRV creation failed\n");
+      release_pipeline();
+      return false;
+    }
   }
 
   D3D11_SAMPLER_DESC smp = {};
@@ -2851,42 +2911,57 @@ void mb_render_set_size(int pw, int ph, double w, double h, double scale) {
 }
 
 static uint64_t g_atlas_overwrite_seq = 0;
-static uint64_t **g_atlas_occ_plots = NULL;
+// each page's occupied texels: per 512 square of it (grid × grid), a lazy 1-bit bitmap (32 KiB a touched square)
+static uint64_t **g_atlas_occ[MB_ATLAS_PAGES_MOST];
 static int g_atlas_occ_grid = 0;
 static int32_t g_atlas_occ_gen = 0;
 static int g_atlas_occ_has_gen = 0;
 
+static void atlas_occ_free_page(int p) {
+  if (p < 0 || p >= MB_ATLAS_PAGES_MOST || !g_atlas_occ[p]) return;
+  int total = g_atlas_occ_grid * g_atlas_occ_grid;
+  for (int i = 0; i < total; i++) free(g_atlas_occ[p][i]);
+  free(g_atlas_occ[p]);
+  g_atlas_occ[p] = NULL;
+}
+
+// The pages from `from` on gone: what was in them is no one's.
+static void atlas_occ_drop_from(int from) {
+  for (int p = from < 0 ? 0 : from; p < MB_ATLAS_PAGES_MOST; p++) atlas_occ_free_page(p);
+}
+
 static void atlas_occ_reset(int32_t gen) {
   int total = g_atlas_occ_grid * g_atlas_occ_grid;
-  for (int i = 0; i < total; i++) {
-    if (g_atlas_occ_plots[i]) memset(g_atlas_occ_plots[i], 0, 512 * 8 * sizeof(uint64_t));
+  for (int p = 0; p < MB_ATLAS_PAGES_MOST; p++) {
+    if (!g_atlas_occ[p]) continue;
+    for (int i = 0; i < total; i++)
+      if (g_atlas_occ[p][i]) memset(g_atlas_occ[p][i], 0, 512 * 8 * sizeof(uint64_t));
   }
   g_atlas_occ_gen = gen;
   g_atlas_occ_has_gen = 1;
 }
 
-// Tracks occupied atlas pixels in lazy 512x512 1-bit bitmaps (32 KiB per touched plot).
-// Normal glyph appends land on fresh pixels (returns 0, preserving partial redraw and other windows'
-// same_as_shown); any overwrite of an existing UV region returns 1 to bump g_atlas_overwrite_seq.
-static int atlas_occ_mark(int x, int y, int w, int h) {
+// Marks the texels x, y, w × h of page `page` occupied. Normal glyph appends land on fresh texels (returns 0,
+// preserving partial redraw and other windows' same_as_shown); any overwrite of an occupied region returns 1 to bump
+// g_atlas_overwrite_seq. A page's grid is the page side's, fixed while the atlas is: pages added keep the others'.
+static int atlas_occ_mark(int page, int x, int y, int w, int h) {
   int32_t gen = mb_atlas_gen_now();
   int grid = (mb_atlas_size + 511) >> 9;
-  if (grid <= 0) return 1;
+  if (grid <= 0 || page < 0 || page >= MB_ATLAS_PAGES_MOST) return 1;
   if (grid != g_atlas_occ_grid) {
-    int old_total = g_atlas_occ_grid * g_atlas_occ_grid;
-    for (int i = 0; i < old_total; i++) free(g_atlas_occ_plots[i]);
-    free(g_atlas_occ_plots);
-    g_atlas_occ_plots = (uint64_t **)calloc((size_t)grid * (size_t)grid, sizeof(uint64_t *));
-    if (!g_atlas_occ_plots) {
-      g_atlas_occ_grid = 0;
-      return 1;
-    }
+    // (a page side other than the bitmaps were made for: the atlas made anew, what was marked no one's)
+    atlas_occ_drop_from(0);
     g_atlas_occ_grid = grid;
     g_atlas_occ_gen = gen;
     g_atlas_occ_has_gen = 1;
   } else if (!g_atlas_occ_has_gen || gen != g_atlas_occ_gen) {
     atlas_occ_reset(gen);
   }
+  if (!g_atlas_occ[page]) {
+    g_atlas_occ[page] = (uint64_t **)calloc((size_t)grid * (size_t)grid, sizeof(uint64_t *));
+    if (!g_atlas_occ[page]) return 1;
+  }
+  uint64_t **plots = g_atlas_occ[page];
   int overlap = 0;
   int px0 = x >> 9, px1 = (x + w - 1) >> 9;
   int py0 = y >> 9, py1 = (y + h - 1) >> 9;
@@ -2895,12 +2970,12 @@ static int atlas_occ_mark(int x, int y, int w, int h) {
     int ly0 = y > gy0 ? y - gy0 : 0;
     int ly1 = (y + h) < (gy0 + 512) ? (y + h - gy0) : 512;
     for (int px = px0; px <= px1; px++) {
-      int idx = py * g_atlas_occ_grid + px;
-      uint64_t *bits = g_atlas_occ_plots[idx];
+      int idx = py * grid + px;
+      uint64_t *bits = plots[idx];
       if (!bits) {
         bits = (uint64_t *)calloc(512 * 8, sizeof(uint64_t));
         if (!bits) return 1;
-        g_atlas_occ_plots[idx] = bits;
+        plots[idx] = bits;
       }
       int gx0 = px << 9;
       int lx0 = x > gx0 ? x - gx0 : 0;
@@ -2923,12 +2998,23 @@ static int atlas_occ_mark(int x, int y, int w, int h) {
   return overlap;
 }
 
+// Whether x, y, w × h lies in one page the atlas has (y: page * side + where on it).
+extern "C" int mb_atlas_fits(int x, int y, int w, int h) {
+  if (w <= 0 || h <= 0 || x < 0 || y < 0 || mb_atlas_size <= 0) return 0;
+  int page = y / mb_atlas_size, ly = y - page * mb_atlas_size;
+  return page < atlas_pages_n && x + w <= mb_atlas_size && ly + h <= mb_atlas_size;
+}
+
 void mb_atlas_upload(int x, int y, int w, int h, const void *rgba) {
   // (a region outside the atlas or empty: its occupancy unknown, so every window's next frame drawn again)
-  if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > mb_atlas_size || y + h > mb_atlas_size || atlas_occ_mark(x, y, w, h))
+  if (!atlas || !mb_atlas_fits(x, y, w, h)) {
     g_atlas_overwrite_seq++;
-  D3D11_BOX box = {(UINT)x, (UINT)y, 0, (UINT)(x + w), (UINT)(y + h), 1};
-  ctx->UpdateSubresource(atlas, 0, &box, rgba, (UINT)w * 4, 0);
+    return;
+  }
+  int page = y / mb_atlas_size, ly = y - page * mb_atlas_size;
+  if (atlas_occ_mark(page, x, ly, w, h)) g_atlas_overwrite_seq++;
+  D3D11_BOX box = {(UINT)x, (UINT)ly, 0, (UINT)(x + w), (UINT)(ly + h), 1};
+  ctx->UpdateSubresource(atlas, D3D11CalcSubresource(0, (UINT)page, 1), &box, rgba, (UINT)w * 4, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3983,9 +4069,9 @@ static void main_state(ID3D11RenderTargetView *target, int pw, int ph) {
   ctx->PSSetShader(ps, NULL, 0);
   ctx->PSSetConstantBuffers(0, 2, cbs);
   ctx->PSSetShaderResources(0, 1, &atlas_srv);
-  ctx->PSSetShaderResources(2, 1, gsrv ? &gsrv : &atlas_srv);
+  ctx->PSSetShaderResources(2, 1, gsrv ? &gsrv : &stand_srv);
   ctx->PSSetShaderResources(3, 1, &segs_srv);
-  ID3D11ShaderResourceView *ad_srv = (rw && rw->ad_tex[rw->ad_cur].srv) ? rw->ad_tex[rw->ad_cur].srv : atlas_srv;
+  ID3D11ShaderResourceView *ad_srv = (rw && rw->ad_tex[rw->ad_cur].srv) ? rw->ad_tex[rw->ad_cur].srv : stand_srv;
   ctx->PSSetShaderResources(5, 1, &ad_srv);
   ctx->PSSetSamplers(0, 1, &sampler);
   ctx->OMSetBlendState(blend, NULL, 0xffffffff);
@@ -4072,7 +4158,7 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
     if (count <= 0) return;
   }
   struct { float vp[2]; float scale; float inv_atlas; float origin[2]; float pad2[2]; } u = {
-    {(float)vw, (float)vh}, (float)vscale, 1.0f / (float)mb_atlas_size, {0, 0}, {0, 0}};
+    {(float)vw, (float)vh}, (float)vscale, 1.0f / (float)mb_atlas_size, {0, 0}, {(float)mb_atlas_size, 0}};
   ctx->UpdateSubresource(ubuf, 0, NULL, &u, 0, 0);
   segs_upload(f, count);
   // (logical points to the target's pixels, as the vertex shader maps them: u.vp over pw × ph)
@@ -4234,7 +4320,7 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
             ctx->PSSetShader(kind_ps(4), NULL, 0);
             ctx->DrawInstanced(6, 1, 0, 0);
             ctx->IASetVertexBuffers(0, 1, &vbuf, &stride, &off);
-            ctx->PSSetShaderResources(1, 1, &atlas_srv);
+            ctx->PSSetShaderResources(1, 1, &stand_srv);
           }
         } else {
           cur_rtv = L.prev_rtv;
@@ -4348,10 +4434,10 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
         ctx->RSSetViewports(1, &lvp);
         ctx->RSSetState(raster);
         struct { float vp[2]; float scale; float inv_atlas; float origin[2]; float pad2[2]; } lu = {
-          {(float)lpw / sc_f, (float)lph / sc_f}, sc_f, 1.0f / (float)mb_atlas_size, {ox, oy}, {0, 0}};
+          {(float)lpw / sc_f, (float)lph / sc_f}, sc_f, 1.0f / (float)mb_atlas_size, {ox, oy}, {(float)mb_atlas_size, 0}};
         ctx->UpdateSubresource(ubuf, 0, NULL, &lu, 0, 0);
         ctx->PSSetShaderResources(0, 1, &atlas_srv);
-        ctx->PSSetShaderResources(2, 1, &atlas_srv);
+        ctx->PSSetShaderResources(2, 1, &stand_srv);
         ctx->PSSetShaderResources(3, 1, &segs_srv);
         int32_t cs = start + 1, cend_all = start + 1 + child_n;
         while (cs < cend_all) {
@@ -4370,10 +4456,10 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
             ce++;
           }
           ID3D11ShaderResourceView *ct = ctid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(ctid - MB_STREAM_TEX)
-                                        : ctid ? (ID3D11ShaderResourceView *)mb_image_srv(ctid) : atlas_srv;
+                                        : ctid ? (ID3D11ShaderResourceView *)mb_image_srv(ctid) : stand_srv;
           if (ctid > MB_STREAM_TEX && !ct) { cs = ce; continue; }
           if (ctid > 0 && ctid <= MB_STREAM_TEX && !ct) encode_missing = 1;
-          ctx->PSSetShaderResources(1, 1, ct ? &ct : &atlas_srv);
+          ctx->PSSetShaderResources(1, 1, ct ? &ct : &stand_srv);
           ctx->PSSetShader(cown ? kind_ps(ck) : ps, NULL, 0);
           ctx->DrawInstanced(6, (UINT)(ce - cs), 0, (UINT)cs);
           cs = ce;
@@ -4417,10 +4503,10 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
         end++;
       }
       // (a hole's image is its view's, src/hostapi/host.mbt view_tex_base + its id: the view is under the canvas here)
-      ID3D11ShaderResourceView *t = hole ? atlas_srv
+      ID3D11ShaderResourceView *t = hole ? stand_srv
                                     : tid > MB_LAYER_TEX ? mb_layer_srv(tid - MB_LAYER_TEX)
                                     : tid > MB_STREAM_TEX ? (ID3D11ShaderResourceView *)mb_stream_srv(tid - MB_STREAM_TEX)
-                                    : tid ? (ID3D11ShaderResourceView *)mb_image_srv(tid) : atlas_srv;
+                                    : tid ? (ID3D11ShaderResourceView *)mb_image_srv(tid) : stand_srv;
       // (a stream or offscreen layer with no texture yet: nothing, not the atlas)
       if (!hole && tid > MB_STREAM_TEX && !t) {
         start = end;
@@ -4429,7 +4515,7 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
       if (!hole && tid > 0 && tid <= MB_STREAM_TEX && !t) encode_missing = 1;
       ID3D11PixelShader *run = fast_rect ? rect_ps : own ? kind_ps(kind) : ps;
       if (!cut_on) {
-        ctx->PSSetShaderResources(1, 1, t ? &t : &atlas_srv);
+        ctx->PSSetShaderResources(1, 1, t ? &t : &stand_srv);
         ctx->PSSetShader(run, NULL, 0);
         if (hole) ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
         if (hole) ctx->DrawInstanced(6, (UINT)(end - start), 0, (UINT)start);
@@ -4456,7 +4542,7 @@ static void encode_rects(ID3D11RenderTargetView *target, int pw, int ph, int32_t
             j++;
           }
           if (!bound_run) {
-            ctx->PSSetShaderResources(1, 1, t ? &t : &atlas_srv);
+            ctx->PSSetShaderResources(1, 1, t ? &t : &stand_srv);
             ctx->PSSetShader(run, NULL, 0);
             if (hole) ctx->OMSetBlendState(NULL, NULL, 0xffffffff);
             bound_run = 1;
@@ -5627,4 +5713,57 @@ extern "C" int32_t mb_host_layer_render(int32_t id, int32_t pw, int32_t ph, doub
   if (rtv) ctx->OMSetRenderTargets(1, &rtv, NULL);
   else ctx->OMSetRenderTargets(0, NULL, NULL);
   return ok ? 1 : 0;
+}
+
+// ---- the glyphs' atlas's pages (atlas_pages.h) ----
+extern "C" {
+int mb_atlas_pages_said;
+void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
+
+// (one atlas: colour glyphs in it with the others, atlas_size(true) 0)
+int32_t mb_host_atlas_pages_most(int32_t colour) {
+  if (colour) return 1;
+  return mb_atlas_pages_cap(mb_atlas_size, 4, D3D11_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION);
+}
+
+int32_t mb_host_atlas_pages_now(int32_t colour) { return colour ? 1 : atlas_pages_n; }
+
+// How many pages the atlas's texture has (for tests).
+int32_t mb_render_atlas_pages_held(int32_t colour) {
+  if (colour || !atlas) return colour ? 1 : 0;
+  D3D11_TEXTURE2D_DESC d;
+  atlas->GetDesc(&d);
+  return (int32_t)d.ArraySize;
+}
+
+// The atlas made `n` pages, now (uploads and draws are this thread's, in order): a texture array of n made, the pages
+// both have copied into it on the GPU, put in the old one's place. Pages given back are no one's (their texels'
+// occupancy dropped) and every window's next frame is drawn whole, as one may show a glyph that was on them.
+int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
+  if (colour) return n == 1;
+  if (n == atlas_pages_n) return 1;
+  if (n < 1 || n > mb_host_atlas_pages_most(0) || !dev || !ctx || !atlas) return 0;
+  ID3D11Texture2D *t = NULL;
+  ID3D11ShaderResourceView *v = NULL;
+  if (!atlas_make(n, &t, &v)) return 0;
+  int keep = n < atlas_pages_n ? n : atlas_pages_n;
+  for (int i = 0; i < keep; i++)
+    ctx->CopySubresourceRegion(t, D3D11CalcSubresource(0, (UINT)i, 1), 0, 0, 0, atlas,
+                               D3D11CalcSubresource(0, (UINT)i, 1), NULL);
+  ID3D11ShaderResourceView *none = NULL;
+  ctx->PSSetShaderResources(0, 1, &none);
+  atlas_srv->Release();
+  atlas->Release();
+  atlas = t;
+  atlas_srv = v;
+  if (n < atlas_pages_n) {
+    atlas_occ_drop_from(n);
+    g_atlas_overwrite_seq++;
+  } else {
+    // (pages added several times in a frame: each copy handed to the GPU before the next texture is made)
+    ctx->Flush();
+  }
+  atlas_pages_n = n;
+  return 1;
+}
 }

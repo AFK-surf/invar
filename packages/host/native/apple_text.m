@@ -1105,10 +1105,13 @@ static void keys_sweep(void) {
   generation++;
 }
 
+// (apple_render.m) how many times an atlas's pages failed to be made: each a generation of its own
+int32_t mb_render_atlas_lost_bumps(void);
+
 int32_t mb_host_atlas_generation(void) {
   keys_sweep();
   mb_text_flush_ahead();
-  return generation;
+  return generation + mb_render_atlas_lost_bumps();
 }
 
 // Glyph `k` asked to be drawn ahead at the phases of `want`, those of `first` before the rest (none of it asked before:

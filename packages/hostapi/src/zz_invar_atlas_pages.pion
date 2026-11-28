@@ -1,0 +1,492 @@
+// INVAR-EXT: a host's glyph atlas in pages (a texture array), placed into by the shelves of atlas.pion's Atlas.
+//
+// A page is a square `side` pixels a side, the host's atlas_size; a glyph on page `p` is said `p * side` down past its
+// place in it (its v), so an instance says its page with no field more and a frame drawing from many pages is still one
+// draw. A frame that draws more than a page holds gets another page (atlas_pages) where it would have gone without
+// some of its glyphs: the shelves of pages already there are emptied first (the lowest page's first, those drawn
+// longest ago), so pages are added only for what one frame draws. The last page is given back once nothing drawn has been on
+// it for a while (trim): its glyphs said gone, as an emptied shelf's are.
+
+///|
+/// How often a run looks whether its last page can be given back, in ms.
+pub let atlas_trim_every : Double = 1000.0
+
+///|
+/// How long nothing drawn is on the last page before it is given back, in ms.
+pub let atlas_page_idle : Double = 10000.0
+
+///|
+struct PageUse {
+  mut side : Int
+}
+
+///|
+let page_use : PageUse = PageUse::{ side: 0 }
+
+///|
+/// The largest square of each page a PagedAtlas made after this places glyphs in (0: all of it): pages fill as an
+/// atlas that small would, while what is said of where a glyph is keeps the host's page side. For tests and pictures
+/// that show pages added without filling pages of 4096.
+pub fn set_atlas_page_use(side : Int) -> Unit {
+  page_use.side = if side > 0 { side } else { 0 }
+}
+
+///|
+/// A host's atlas in pages: where glyphs go in it, which pages it has, when its last page goes.
+pub struct PagedAtlas {
+  priv colour : Bool
+  priv mut atlas : Atlas
+  priv mut side : Int
+  priv mut square : Int
+  priv mut per_page : Int
+  priv mut pages : Int
+  priv mut painted : Int
+  priv mut grew_in : Int
+  priv live_at : Array[Double]
+  priv mut now : Double
+  priv mut checked_at : Double
+  priv mut checked_in : Int
+  priv mut last_live : Bool
+  priv before : () -> Unit
+}
+
+///|
+fn page_square(side : Int) -> Int {
+  if page_use.side > 0 && page_use.side < side { page_use.side } else { side }
+}
+
+///|
+fn atlas_of_side(side : Int, before : () -> Unit) -> (Atlas, Int) {
+  let a = Atlas::new(page_square(side))
+  a.before_full(before)
+  (a, a.plots.length())
+}
+
+///|
+/// The host's atlas of words (or, `colour`, of colour glyphs), `side` pixels a page (its atlas_size; 0: none), one page
+/// of it placed into; `before` asked once a frame before a shelf is emptied (Atlas::before_full). A host left with more
+/// pages by an atlas before this one is told it has one.
+pub fn PagedAtlas::new(colour : Bool, side : Int, before : () -> Unit) -> PagedAtlas {
+  let (a, per_page) = atlas_of_side(side, before)
+  if side > 0 && atlas_pages_now(colour) > 1 {
+    atlas_pages(colour, 1) |> ignore
+  }
+  PagedAtlas::{
+    colour,
+    atlas: a,
+    side,
+    square: page_square(side),
+    per_page,
+    pages: 1,
+    painted: 0,
+    grew_in: -1,
+    live_at: [-1.0],
+    now: -1.0,
+    checked_at: -1.0,
+    checked_in: -1,
+    last_live: true,
+    before,
+  }
+}
+
+///|
+pub fn PagedAtlas::sized(self : PagedAtlas) -> Bool {
+  self.atlas.sized()
+}
+
+///|
+/// A page's side, in pixels: how far down past its place in it a glyph on the next page is said.
+pub fn PagedAtlas::side(self : PagedAtlas) -> Int {
+  self.side
+}
+
+///|
+pub fn PagedAtlas::pages(self : PagedAtlas) -> Int {
+  self.pages
+}
+
+///|
+pub fn PagedAtlas::shelf_count(self : PagedAtlas) -> Int {
+  self.atlas.shelf_count()
+}
+
+///|
+pub fn PagedAtlas::holds(self : PagedAtlas, w : Int, h : Int) -> Bool {
+  self.atlas.holds(w, h)
+}
+
+///|
+/// The next frame begins (Atlas::next_frame).
+pub fn PagedAtlas::next_frame(self : PagedAtlas) -> Unit {
+  self.atlas.next_frame()
+}
+
+///|
+/// Shelf `shelf` drawn from in this frame (Atlas::drawn).
+pub fn PagedAtlas::drawn(self : PagedAtlas, shelf : Int) -> Unit {
+  self.atlas.drawn(shelf)
+}
+
+///|
+/// This frame paints: what it draws is what is on the screen after it (each glyph it draws said drawn, what is made
+/// once and composed again said so by `before`), till the next frame that paints.
+pub fn PagedAtlas::painted_now(self : PagedAtlas) -> Unit {
+  self.painted = self.atlas.frame
+}
+
+///|
+fn PagedAtlas::page_of(self : PagedAtlas, plot : Int) -> Int {
+  if self.per_page > 0 { plot / self.per_page } else { 0 }
+}
+
+///|
+/// Page `p`'s plots added, empty, where it lies (`p * side` down).
+fn PagedAtlas::add_page(self : PagedAtlas, p : Int) -> Unit {
+  let a = self.atlas
+  let n = if a.plot > 0 { self.square / a.plot } else { 0 }
+  for j in 0..<n {
+    for i in 0..<n {
+      a.plots.push(Plot::{ x: i * a.plot, y: p * self.side + j * a.plot, free_y: 0, shelves: [] })
+    }
+  }
+  self.live_at.push(self.now)
+}
+
+///|
+/// The last page given back: what is on it said `gone`, its shelves let go.
+fn PagedAtlas::drop_page(self : PagedAtlas, gone : (Int) -> Unit) -> Unit {
+  let a = self.atlas
+  let base = (self.pages - 1) * self.per_page
+  mbt_compat::arr_retain(a.opens, fn(i) { a.shelves[i].plot < base })
+  for pi in base..<a.plots.length() {
+    let p = a.plots[pi]
+    for i in p.shelves {
+      let s = a.shelves[i]
+      for k in s.keys {
+        gone(k)
+      }
+      s.keys.clear()
+      s.x = 0
+      s.plot = -1
+      a.spare.push(i)
+    }
+    p.shelves.clear()
+    p.free_y = 0
+  }
+  while a.plots.length() > base {
+    a.plots.pop() |> ignore
+  }
+  self.pages = self.pages - 1
+  self.live_at.pop() |> ignore
+}
+
+///|
+/// Everything placed let go, the pages kept (what the host drew is gone: atlas_generation, or the atlas started over),
+/// as many as the host has now (one after it was made anew); made anew where the host's page side changed.
+pub fn PagedAtlas::clear(self : PagedAtlas) -> Unit {
+  // (a host that says no side, none here or between runs, leaves the side as it was)
+  let side = atlas_size(self.colour)
+  if side > 0 && (side != self.side || page_square(side) != self.square || !self.atlas.sized()) {
+    let (a, per_page) = atlas_of_side(side, self.before)
+    self.atlas = a
+    self.side = side
+    self.square = page_square(side)
+    self.per_page = per_page
+    self.pages = 1
+    self.live_at.clear()
+    self.live_at.push(self.now)
+    if side > 0 && atlas_pages_now(self.colour) > 1 {
+      atlas_pages(self.colour, 1) |> ignore
+    }
+  } else {
+    self.atlas.clear()
+    let host = atlas_pages_now(self.colour)
+    let want = if host < 1 { 1 } else { host }
+    while self.pages > want {
+      self.drop_page(fn(_k) { () })
+    }
+    while self.pages < want {
+      self.add_page(self.pages)
+      self.pages = self.pages + 1
+    }
+    for i in 0..<self.live_at.length() {
+      self.live_at[i] = self.now
+    }
+  }
+  self.grew_in = -1
+  self.checked_in = -1
+  self.last_live = true
+}
+
+///|
+/// The most pages: the host's (at least the one it has).
+fn PagedAtlas::most(self : PagedAtlas) -> Int {
+  let m = atlas_pages_most(self.colour)
+  if m < 1 { 1 } else { m }
+}
+
+///|
+/// Pages added for what this frame draws: one, or as many again where this frame added some already. Whether there
+/// are more.
+fn PagedAtlas::grow(self : PagedAtlas) -> Bool {
+  let most = self.most()
+  if self.pages >= most || !self.atlas.sized() {
+    return false
+  }
+  let step = if self.grew_in == self.atlas.frame { self.pages } else { 1 }
+  let want = if self.pages + step > most { most } else { self.pages + step }
+  if !atlas_pages(self.colour, want) {
+    return false
+  }
+  while self.pages < want {
+    self.add_page(self.pages)
+    self.pages = self.pages + 1
+  }
+  self.grew_in = self.atlas.frame
+  true
+}
+
+///|
+/// A glyph `w` × `h` pixels (`key`) placed: its shelf and where its top left is (`page * side` down on a page past
+/// the first), drawn from in this frame; the glyphs of a shelf or plot emptied for it said `gone` first. None when no
+/// page has room for it while this frame is drawn and no page more can be had, or none ever (holds).
+pub fn PagedAtlas::place(self : PagedAtlas, key : Int, w : Int, h : Int, gone : (Int) -> Unit) -> Option[(Int, Int, Int)] {
+  let a = self.atlas
+  if !a.holds(w, h) {
+    return Option::None
+  }
+  // (an open shelf it fits best, on the lowest page)
+  let mut at = -1
+  let mut at_h = 0
+  let mut at_page = 0
+  for i in a.opens {
+    let ih = if a.shelves[i].h > h { a.shelves[i].h } else { h }
+    let pg = self.page_of(a.shelves[i].plot)
+    if a.fits(i, w, h) && (at < 0 || pg < at_page || (pg == at_page && ih < at_h)) {
+      at = i
+      at_h = ih
+      at_page = pg
+    }
+  }
+  if at < 0 {
+    guard self.room(h, gone) is Some(s) else { return Option::None }
+    a.opens.push(s)
+    if a.opens.length() > atlas_open_most {
+      mbt_compat::arr_remove(a.opens, 0) |> ignore
+    }
+    at = s
+  }
+  let s = a.shelves[at]
+  let p = a.plots[s.plot]
+  if h > s.h {
+    s.h = h
+    p.free_y = s.y + h + 1
+  }
+  let x = s.x
+  s.x = x + w + 1
+  s.keys.push(key)
+  s.drawn = a.frame
+  Some((at, p.x + x, p.y + s.y))
+}
+
+///|
+/// A shelf for a glyph `h` tall, empty: on the lowest page that has one, found there as Atlas::room finds one (room no
+/// shelf has taken; else a shelf none of this frame's glyphs are on, emptied; else such a plot, emptied whole); else
+/// on a page more. A page's shelves are emptied before a page above it is placed into, so what is drawn lies on the
+/// lowest pages and those above it are left to be given back (trim).
+fn PagedAtlas::room(self : PagedAtlas, h : Int, gone : (Int) -> Unit) -> Option[Int] {
+  let a = self.atlas
+  let last_plot = match mbt_compat::arr_last(a.opens) {
+    Some(i) => a.shelves[i].plot
+    Option::None => 0
+  }
+  for pg in 0..<self.pages {
+    match self.room_free(pg, last_plot, h) {
+      Some(s) => return Some(s)
+      Option::None => ()
+    }
+    match a.before_full {
+      Some(f) if a.full_frame != a.frame => {
+        a.full_frame = a.frame
+        f()
+      }
+      _ => ()
+    }
+    match self.room_shelf(pg, h, gone) {
+      Some(s) => return Some(s)
+      Option::None => ()
+    }
+    match self.room_plot(pg, h, gone) {
+      Some(s) => return Some(s)
+      Option::None => ()
+    }
+  }
+  let first_new = self.pages * self.per_page
+  if !self.grow() {
+    return Option::None
+  }
+  let p = a.plots[first_new]
+  let s = a.shelf(first_new, 0, h)
+  p.shelves.push(s)
+  p.free_y = h + 1
+  Some(s)
+}
+
+///|
+/// Room no shelf has taken on page `pg`, from the last opened's plot on where it is on this page.
+fn PagedAtlas::room_free(self : PagedAtlas, pg : Int, last_plot : Int, h : Int) -> Option[Int] {
+  let a = self.atlas
+  let per = self.per_page
+  let base = pg * per
+  let first = if last_plot >= base && last_plot < base + per { last_plot - base } else { 0 }
+  for k in 0..<per {
+    let pi = base + mbt_compat::mod_checked_i32(first + k, per)
+    let p = a.plots[pi]
+    if p.free_y + h <= a.plot {
+      let s = a.shelf(pi, p.free_y, h)
+      p.shelves.push(s)
+      p.free_y = p.free_y + h + 1
+      return Some(s)
+    }
+  }
+  Option::None
+}
+
+///|
+/// A shelf of page `pg` none of this frame's glyphs are on, emptied: of those not much taller than the glyph the one
+/// drawn from longest ago, else of any tall enough.
+fn PagedAtlas::room_shelf(self : PagedAtlas, pg : Int, h : Int, gone : (Int) -> Unit) -> Option[Int] {
+  let a = self.atlas
+  let mut best = -1
+  let mut fit = false
+  for i, s in a.shelves {
+    if s.h < h || s.drawn >= a.frame || s.plot < 0 || self.page_of(s.plot) != pg {
+      continue
+    }
+    let close = s.h <= h * 2 + 8
+    if best < 0 || (close && !fit) || (close == fit && s.drawn < a.shelves[best].drawn) {
+      best = i
+      fit = close
+    }
+  }
+  guard best >= 0 else { return Option::None }
+  mbt_compat::arr_retain(a.opens, fn(i) { i != best })
+  let s = a.shelves[best]
+  for k in s.keys {
+    gone(k)
+  }
+  s.keys.clear()
+  s.x = 0
+  let pi = s.plot
+  let p = a.plots[pi]
+  if p.free_y == s.y + s.h + 1 {
+    p.free_y = s.y
+    p.shelves.pop() |> ignore
+    a.spare.push(best)
+    s.plot = -1
+    let n = a.shelf(pi, p.free_y, h)
+    p.shelves.push(n)
+    p.free_y = p.free_y + h + 1
+    return Some(n)
+  }
+  Some(best)
+}
+
+///|
+/// A plot of page `pg` none of whose shelves this frame draws from, emptied whole: the one drawn from longest ago.
+fn PagedAtlas::room_plot(self : PagedAtlas, pg : Int, h : Int, gone : (Int) -> Unit) -> Option[Int] {
+  let a = self.atlas
+  let base = pg * self.per_page
+  let mut at = -1
+  let mut at_last = a.frame
+  for pi in base..<(base + self.per_page) {
+    let mut last = -1
+    for i in a.plots[pi].shelves {
+      if a.shelves[i].drawn > last {
+        last = a.shelves[i].drawn
+      }
+    }
+    if last < at_last {
+      at = pi
+      at_last = last
+    }
+  }
+  guard at >= 0 else { return Option::None }
+  let p = a.plots[at]
+  mbt_compat::arr_retain(a.opens, fn(i) { a.shelves[i].plot != at })
+  for i in p.shelves {
+    let s = a.shelves[i]
+    for k in s.keys {
+      gone(k)
+    }
+    s.keys.clear()
+    s.plot = -1
+    a.spare.push(i)
+  }
+  p.shelves.clear()
+  p.free_y = 0
+  let s = a.shelf(at, 0, h)
+  p.shelves.push(s)
+  p.free_y = h + 1
+  Some(s)
+}
+
+///|
+/// As a frame begins, at `now` (ms), before Atlas::next_frame: at most once in atlas_trim_every, the pages looked
+/// through for what the screen shows (what the last frame that painted drew, and what `before` says is drawn), and the
+/// last given back while nothing on it has been shown for atlas_page_idle, its glyphs said `gone`. Whether one was.
+pub fn PagedAtlas::trim(self : PagedAtlas, now : Double, gone : (Int) -> Unit) -> Bool {
+  self.now = now
+  if self.pages <= 1 {
+    return false
+  }
+  if self.checked_at >= 0.0 && now - self.checked_at < atlas_trim_every {
+    return false
+  }
+  let a = self.atlas
+  self.checked_at = now
+  self.checked_in = a.frame
+  if a.full_frame != a.frame {
+    a.full_frame = a.frame
+    (self.before)()
+  }
+  let live = Array::make(self.pages, false)
+  for s in a.shelves {
+    if s.plot >= 0 && s.drawn >= self.painted && !s.keys.is_empty() {
+      live[self.page_of(s.plot)] = true
+    }
+  }
+  for pg in 0..<self.pages {
+    if live[pg] {
+      self.live_at[pg] = now
+    }
+  }
+  let was = self.pages
+  while self.pages > 1 && !live[self.pages - 1] && now - self.live_at[self.pages - 1] >= atlas_page_idle {
+    self.drop_page(gone)
+  }
+  self.last_live = live[self.pages - 1]
+  if self.pages < was {
+    atlas_pages(self.colour, self.pages) |> ignore
+    return true
+  }
+  false
+}
+
+///|
+/// When a run should look at its pages next though nothing else asks for a frame (a moment of `now`'s clock), or -1:
+/// none while it has one page, or while its last page shows something that has not changed since it looked.
+pub fn PagedAtlas::trim_due(self : PagedAtlas) -> Double {
+  if self.pages <= 1 {
+    return -1.0
+  }
+  let next = if self.checked_at < 0.0 { self.now } else { self.checked_at + atlas_trim_every }
+  if self.painted > self.checked_in {
+    return next
+  }
+  if self.last_live {
+    return -1.0
+  }
+  let idle = self.live_at[self.pages - 1] + atlas_page_idle
+  if idle > next { idle } else { next }
+}

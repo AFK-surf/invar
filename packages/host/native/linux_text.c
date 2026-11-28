@@ -511,6 +511,10 @@ int32_t mb_host_atlas_generation(void) {
   return generation;
 }
 
+// What the atlases held is gone (linux_render.c: a context made anew, pages there was no memory for): every glyph
+// drawn again.
+void mb_text_atlas_lost(void) { generation++; }
+
 int32_t mb_host_atlas_size(int32_t colour) { return colour ? MB_ATLAS_COLOR : MB_ATLAS; }
 
 void mb_text_set_scale(double scale) {
