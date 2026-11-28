@@ -557,11 +557,8 @@ void mb_render_spin(double ms) {
 int mb_atlas_pages_said;
 void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
 
-int32_t mb_host_atlas_pages_most(int32_t colour) {
-  GLint layers = 0;
-  if (ready) glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &layers);
-  return gl_atlas_most(colour, layers > 0 ? layers : 256);
-}
+// (as many layers as the context said its arrays take as it was made: gl_setup; no GL asked here, current or not)
+int32_t mb_host_atlas_pages_most(int32_t colour) { return gl_atlas_most(colour); }
 
 int32_t mb_host_atlas_pages_now(int32_t colour) { return atlas_told[colour ? 1 : 0]; }
 

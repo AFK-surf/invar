@@ -23,6 +23,7 @@
 // the groups of instances the host keeps, drawn out as gl_present takes a frame
 #include "groups.h"
 #include "atlas_pages.h"
+#include <stdatomic.h>
 
 // the numbers of an instance (src/ui/scene.mbt)
 #define MB_INST 60
@@ -1922,11 +1923,13 @@ static const char *AD_FS =
     "}\n";
 
 static GLuint vao, vbo, atlas, catlas, post, ad_prog;
-// how many pages each atlas has (the GL thread's: what its texture has), what stands in a sampler2D unit nothing is
-// bound to (an instance with no picture: 1 texel, clear), and where pages fail to be made (the most there are then)
-static int gl_atlas_have[2] = {1, 1};
+// how many pages each atlas has (the GL thread's: what its texture has, read by the app's thread too), what stands in a
+// sampler2D unit nothing is bound to (an instance with no picture: 1 texel, clear), where pages fail to be made (the most
+// there are then), and how many layers the context's arrays take (asked as it is made: gl_setup)
+static _Atomic int gl_atlas_have[2] = {1, 1};
 static GLuint stand_tex;
-static volatile int gl_atlas_fail_most[2];
+static _Atomic int gl_atlas_fail_most[2];
+static _Atomic int gl_atlas_layers_most = 256;
 // a ground's flat middle (bands.h mb_pieces), and where its window's size goes
 static GLuint prog_flat;
 static GLint uf_vp;
@@ -2090,7 +2093,8 @@ static GLuint gl_atlas_make(int colour, int pages) {
 
 // The most pages an atlas may have: atlas_pages.h's, as many as the context's arrays take, as many as were made where
 // one more failed to be.
-static int gl_atlas_most(int colour, int device_most) {
+static int gl_atlas_most(int colour) {
+  int device_most = gl_atlas_layers_most;
   int n = colour ? mb_atlas_pages_cap(MB_ATLAS_COLOR, 4, device_most) : mb_atlas_pages_cap(MB_ATLAS, 1, device_most);
   int fail = gl_atlas_fail_most[colour ? 1 : 0];
   return fail > 0 && fail < n ? fail : n;
@@ -2217,6 +2221,9 @@ static void gl_setup(void) {
     glVertexAttribDivisor(i, 1);
   }
   // the words' atlas a byte a texel, colour glyphs' four (MB_ATLAS above): a context made anew has them of one page
+  GLint layers = 0;
+  glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &layers);
+  gl_atlas_layers_most = layers > 0 ? layers : 256;
   atlas = gl_atlas_make(0, 1);
   catlas = gl_atlas_make(1, 1);
   gl_atlas_have[0] = gl_atlas_have[1] = 1;

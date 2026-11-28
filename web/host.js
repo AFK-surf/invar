@@ -39,7 +39,7 @@
   }
   let canvas, gl, vs, prog, progs = new Array(MB_KINDS + 1).fill(null), progFlat, ufVp, progRect, urVp, urScale, urTop, progGen = 0, progNow = null, post, vao, instBuf, atlasTex, standTex, ta, pw;
   // the glyphs' atlas's pages, every window's texture of it as many (H.atlasPages), and how far each is filled
-  let atlasPagesN = 1, atlasUsed = [[0, 0]];
+  let atlasPagesN = 1, atlasUsed = [[0, 0]], atlasLayersMost = 256;
   let extParallel = null, bootProgs = null, bootPvs = null, bootReady = true;
   // (the programs of PREWARM_KINDS linking in the background, pendingProgs, adopted as a frame first asks for one;
   // glGen: the context's generation, moved on as it is lost or made again, so a prewarm queued for one never links in
@@ -2962,6 +2962,8 @@
     }
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    // (as many layers as the context's arrays take, asked once as it is made)
+    atlasLayersMost = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS) | 0 || 256;
     atlasTex = atlasMake(gl, atlasPagesN);
     // (what stands in a sampler2D unit nothing is bound to: an instance with no picture, 1 texel, clear as WebGL
     // makes a texture's storage)
@@ -6539,9 +6541,8 @@
   };
   H.atlasPagesMost = (colour) => {
     if (colour) return 1;
-    const layers = gl ? gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS) | 0 : 256;
     const fit = Math.floor(128 * 1024 * 1024 / (ATLAS * ATLAS * 4));
-    return Math.min(Math.max(2, Math.min(32, fit)), layers > 0 ? layers : 256);
+    return Math.min(Math.max(2, Math.min(32, fit)), atlasLayersMost);
   };
   H.atlasPagesNow = (colour) => colour ? 1 : atlasPagesN;
   H.atlasPages = (colour, n) => {
