@@ -1,0 +1,554 @@
+// Glyph atlas placement driven by scripted frames, with the invariants every placement must keep: what is placed lies
+// inside the atlas, no two glyphs still placed overlap, and nothing drawn in the frame being drawn is let go in it.
+
+///|
+struct AtlasRun {
+  side : Int
+  placed : Map[Int, (Int, Int, Int, Int, Int)]
+  drawn_now : Map[Int, Bool]
+  mut frame : Int
+  mut shorts : Int
+  mut gone_drawn : Int
+  mut gone : Int
+  mut overlaps : Int
+  mut outside : Int
+  log : Array[String]
+}
+
+///|
+fn AtlasRun::new(side : Int) -> AtlasRun {
+  AtlasRun::{
+    side,
+    placed: Map::new(),
+    drawn_now: Map::new(),
+    frame: 0,
+    shorts: 0,
+    gone_drawn: 0,
+    gone: 0,
+    overlaps: 0,
+    outside: 0,
+    log: [],
+  }
+}
+
+///|
+fn AtlasRun::let_go(self : AtlasRun, k : Int) -> Unit {
+  self.gone += 1
+  if self.drawn_now.contains(k) {
+    self.gone_drawn += 1
+  }
+  self.placed.remove(k)
+  self.log.push("g\{k}")
+}
+
+///|
+fn rects_meet(a : (Int, Int, Int, Int, Int), b : (Int, Int, Int, Int, Int)) -> Bool {
+  let (_, ax, ay, aw, ah) = a
+  let (_, bx, by, bw, bh) = b
+  ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+///|
+fn AtlasRun::check_put(self : AtlasRun, k : Int, at : (Int, Int, Int, Int, Int)) -> Unit {
+  let (_, x, y, w, h) = at
+  let page_y = y % self.side
+  if x < 0 || y < 0 || x + w > self.side || page_y + h > self.side {
+    self.outside += 1
+  }
+  for other in self.placed.keys() {
+    match self.placed.get(other) {
+      Some(r) if other != k && rects_meet(at, r) => self.overlaps += 1
+      _ => ()
+    }
+  }
+}
+
+///|
+/// One frame drawing `keys`, each `w` × `h` (key → size), through `place` and `drawn` of whatever atlas is driven.
+fn AtlasRun::frame_of(
+  self : AtlasRun,
+  keys : Array[Int],
+  size : (Int) -> (Int, Int),
+  next_frame : () -> Unit,
+  drawn : (Int) -> Unit,
+  place : (Int, Int, Int, (Int) -> Unit) -> Option[(Int, Int, Int)],
+) -> Unit {
+  self.frame += 1
+  next_frame()
+  self.drawn_now.clear()
+  for k in keys {
+    self.drawn_now.set(k, true)
+    match self.placed.get(k) {
+      Some((shelf, _, _, _, _)) => drawn(shelf)
+      None => {
+        let (w, h) = size(k)
+        match place(k, w, h, fn(g) { self.let_go(g) }) {
+          Some((shelf, x, y)) => {
+            let at = (shelf, x, y, w, h)
+            self.check_put(k, at)
+            self.placed.set(k, at)
+            self.log.push("p\{k}@\{shelf},\{x},\{y}")
+          }
+          None => {
+            self.shorts += 1
+            self.log.push("s\{k}")
+          }
+        }
+      }
+    }
+  }
+}
+
+///|
+fn AtlasRun::frame_on(self : AtlasRun, a : Atlas, keys : Array[Int], size : (Int) -> (Int, Int)) -> Unit {
+  self.frame_of(keys, size, fn() { a.next_frame() }, fn(s) { a.drawn(s) }, fn(k, w, h, gone) {
+    a.place(k, w, h, gone)
+  })
+}
+
+///|
+fn AtlasRun::sound(self : AtlasRun) -> Bool {
+  self.overlaps == 0 && self.outside == 0 && self.gone_drawn == 0
+}
+
+///|
+/// A deterministic stream of numbers (a linear congruential generator): the same script on every run.
+struct Lcg {
+  mut s : Int
+}
+
+///|
+fn Lcg::next(self : Lcg, n : Int) -> Int {
+  self.s = (self.s * 1103515245 + 12345) & 0x7FFFFFFF
+  (self.s >> 8) % n
+}
+
+///|
+/// Glyph sizes a screen of words has: mostly ideographs of one size, some narrow letters, a few marks.
+fn script_size(k : Int) -> (Int, Int) {
+  match k % 7 {
+    0 => (12, 30)
+    1 => (8, 10)
+    _ => (30, 32 + k % 3)
+  }
+}
+
+///|
+/// Frames of a screen scrolled through words: each frame draws `per` keys, a window sliding through `total` keys by a
+/// random step, with a few keys from far behind coming back.
+fn scrolled_frames(seed : Int, frames : Int, per : Int, total : Int) -> Array[Array[Int]] {
+  let r = Lcg::{ s: seed }
+  let out : Array[Array[Int]] = []
+  let mut at = 0
+  for _f in 0..<frames {
+    let keys : Array[Int] = []
+    let seen : Map[Int, Bool] = Map::new()
+    for i in 0..<per {
+      let k = (at + i) % total
+      if !seen.contains(k) {
+        seen.set(k, true)
+        keys.push(k)
+      }
+    }
+    for _j in 0..<3 {
+      let k = r.next(total)
+      if !seen.contains(k) {
+        seen.set(k, true)
+        keys.push(k)
+      }
+    }
+    out.push(keys)
+    at = at + r.next(per / 2 + 1)
+  }
+  out
+}
+
+test "atlas run: scrolling through words keeps every placement inside, apart, and what the frame draws" {
+  let a = Atlas::new(512)
+  let run = AtlasRun::new(512)
+  for keys in scrolled_frames(7, 120, 40, 600) {
+    run.frame_on(a, keys, script_size)
+  }
+  debug_assert(run.sound(), "overlaps=\{run.overlaps} outside=\{run.outside} gone_drawn=\{run.gone_drawn}")
+  debug_assert(run.shorts == 0, "a screen of 43 glyphs fits a 512 atlas: shorts=\{run.shorts}")
+  debug_assert(run.gone > 0, "scrolling through 600 keys lets the oldest go: gone=\{run.gone}")
+}
+
+test "atlas run: a tight atlas comes up short as a screen's glyphs lie across all its shelves" {
+  // (a 256 atlas has room for the 43 glyphs a frame draws, but scrolled through, each shelf keeps one or two of them
+  // and none can be emptied: what ui's none_short starts the atlas over for, and what more pages make room for)
+  let a = Atlas::new(256)
+  let run = AtlasRun::new(256)
+  for keys in scrolled_frames(7, 120, 40, 400) {
+    run.frame_on(a, keys, script_size)
+  }
+  debug_assert(run.sound(), "overlaps=\{run.overlaps} outside=\{run.outside} gone_drawn=\{run.gone_drawn}")
+  debug_assert(run.shorts > 0, "fragmented: shorts=\{run.shorts}")
+}
+
+test "atlas run: a frame drawing more than one atlas holds comes up short, and keeps what it drew" {
+  let a = Atlas::new(128)
+  let run = AtlasRun::new(128)
+  let keys : Array[Int] = []
+  for k in 0..<40 {
+    keys.push(k * 7 + 2)
+  }
+  run.frame_on(a, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound(), "overlaps=\{run.overlaps} outside=\{run.outside} gone_drawn=\{run.gone_drawn}")
+  // 128 / 31 = 4 across, 4 down in one plot: 16 of 40 placed, the rest short
+  debug_assert(run.shorts == 24, "16 placed, 24 short: shorts=\{run.shorts}")
+  // the next frame drawing the same keys is short again: none of what it draws may be let go for the rest
+  run.frame_on(a, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound() && run.shorts == 48, "still short, still sound: shorts=\{run.shorts}")
+}
+
+test "atlas run: the same script places the same way twice" {
+  let once = AtlasRun::new(256)
+  let twice = AtlasRun::new(256)
+  let a = Atlas::new(256)
+  let b = Atlas::new(256)
+  let frames = scrolled_frames(11, 60, 50, 300)
+  for keys in frames {
+    once.frame_on(a, keys, script_size)
+    twice.frame_on(b, keys, script_size)
+  }
+  debug_assert(once.log.length() == twice.log.length(), "same length")
+  for i in 0..<once.log.length() {
+    debug_assert(once.log[i] == twice.log[i], "step \{i}: \{once.log[i]} vs \{twice.log[i]}")
+  }
+}
+
+///|
+/// A host whose atlas has pages, as many as it is told (up to `most`, none past `refuse_from` when that is > 0).
+struct PageHost {
+  mut most : Int
+  mut now : Int
+  mut refuse_from : Int
+  said : Array[Int]
+}
+
+///|
+fn PageHost::install(most : Int) -> PageHost {
+  let h = PageHost::{ most, now: 1, refuse_from: 0, said: [] }
+  let ext = HostExt::noop()
+  ext.atlas_pages_most = fn(_c) { h.most }
+  ext.atlas_pages_now = fn(_c) { h.now }
+  ext.atlas_pages = fn(_c, n) {
+    h.said.push(n)
+    if n < 1 || n > h.most || (h.refuse_from > 0 && n >= h.refuse_from) {
+      return false
+    }
+    h.now = n
+    true
+  }
+  set_host_ext(ext)
+  h
+}
+
+///|
+fn page_host_done() -> Unit {
+  set_host_ext(HostExt::noop())
+  set_host(Host::noop())
+  set_atlas_page_use(0)
+}
+
+///|
+/// The host's atlas `side` pixels a page (what PagedAtlas::clear reads again).
+fn page_host_side(side : Int) -> Unit {
+  let h = Host::noop()
+  h.atlas_size = fn(colour) { if colour { 0 } else { side } }
+  set_host(h)
+}
+
+///|
+fn AtlasRun::frame_paged(self : AtlasRun, a : PagedAtlas, keys : Array[Int], size : (Int) -> (Int, Int)) -> Unit {
+  self.frame_of(keys, size, fn() { a.next_frame(); a.painted_now() }, fn(s) { a.drawn(s) }, fn(k, w, h, gone) {
+    a.place(k, w, h, gone)
+  })
+}
+
+///|
+fn same_logs(a : AtlasRun, b : AtlasRun) -> Bool {
+  if a.log.length() != b.log.length() {
+    return false
+  }
+  for i in 0..<a.log.length() {
+    if a.log[i] != b.log[i] {
+      return false
+    }
+  }
+  true
+}
+
+test "paged atlas: with one page it places glyphs as Atlas does, step for step" {
+  for side in [256, 512] {
+    let _host = PageHost::install(1)
+    let plain = AtlasRun::new(side)
+    let paged = AtlasRun::new(side)
+    let a = Atlas::new(side)
+    let b = PagedAtlas::new(false, side, fn() { () })
+    for keys in scrolled_frames(7, 120, 40, 400) {
+      plain.frame_on(a, keys, script_size)
+      paged.frame_paged(b, keys, script_size)
+    }
+    debug_assert(same_logs(plain, paged), "side \{side}: the same placements, shorts and glyphs let go")
+    debug_assert(b.pages() == 1, "one page")
+    page_host_done()
+  }
+}
+
+test "paged atlas: where all of a frame fits one page it never adds one, and places as Atlas does" {
+  let _host = PageHost::install(8)
+  let plain = AtlasRun::new(512)
+  let paged = AtlasRun::new(512)
+  let a = Atlas::new(512)
+  let b = PagedAtlas::new(false, 512, fn() { () })
+  for keys in scrolled_frames(7, 120, 40, 600) {
+    plain.frame_on(a, keys, script_size)
+    paged.frame_paged(b, keys, script_size)
+  }
+  debug_assert(same_logs(plain, paged), "the same placements")
+  debug_assert(b.pages() == 1, "one page: \{b.pages()}")
+  page_host_done()
+}
+
+test "paged atlas: a frame drawing more than a page holds gets pages, one then twice as many, and draws it all" {
+  let host = PageHost::install(8)
+  let run = AtlasRun::new(128)
+  let b = PagedAtlas::new(false, 128, fn() { () })
+  let keys : Array[Int] = []
+  for k in 0..<40 {
+    keys.push(k * 7 + 2)
+  }
+  run.frame_paged(b, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound(), "overlaps=\{run.overlaps} outside=\{run.outside} gone_drawn=\{run.gone_drawn}")
+  debug_assert(run.shorts == 0, "nothing short: \{run.shorts}")
+  // 16 a page: page 0 full, one page more, then (in the same frame) twice as many
+  debug_assert(b.pages() == 4 && host.now == 4, "pages \{b.pages()}, host \{host.now}")
+  debug_assert(host.said.length() == 2 && host.said[0] == 2 && host.said[1] == 4, "told 2 then 4")
+  let mut on_page_1 = 0
+  for k in keys {
+    match run.placed.get(k) {
+      Some((_, _, y, _, _)) if y >= 128 && y < 256 => on_page_1 += 1
+      _ => ()
+    }
+  }
+  debug_assert(on_page_1 == 16, "16 on page 1: \{on_page_1}")
+  // the next frame draws the same: nothing placed again, nothing more
+  let before = run.log.length()
+  run.frame_paged(b, keys, fn(_k) { (30, 30) })
+  debug_assert(run.log.length() == before && b.pages() == 4, "all kept where they were")
+  page_host_done()
+}
+
+test "paged atlas: at the most pages a frame still comes up short, and keeps what it drew" {
+  let host = PageHost::install(2)
+  let run = AtlasRun::new(128)
+  let b = PagedAtlas::new(false, 128, fn() { () })
+  let keys : Array[Int] = []
+  for k in 0..<40 {
+    keys.push(k * 7 + 2)
+  }
+  run.frame_paged(b, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound() && run.shorts == 8, "32 placed, 8 short: \{run.shorts}")
+  run.frame_paged(b, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound() && run.shorts == 16, "still short, still sound: \{run.shorts}")
+  debug_assert(b.pages() == 2 && host.now == 2, "two pages")
+  page_host_done()
+}
+
+test "paged atlas: a host that has no more pages leaves it as one page was" {
+  let host = PageHost::install(8)
+  host.refuse_from = 2
+  let run = AtlasRun::new(128)
+  let b = PagedAtlas::new(false, 128, fn() { () })
+  let keys : Array[Int] = []
+  for k in 0..<20 {
+    keys.push(k)
+  }
+  run.frame_paged(b, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound() && run.shorts == 4 && b.pages() == 1, "16 placed, 4 short, one page")
+  page_host_done()
+}
+
+test "paged atlas: what a later frame draws goes on the lowest page, emptying it before the page above" {
+  let _host = PageHost::install(8)
+  let run = AtlasRun::new(128)
+  let b = PagedAtlas::new(false, 128, fn() { () })
+  let first : Array[Int] = []
+  for k in 0..<24 {
+    first.push(k)
+  }
+  run.frame_paged(b, first, fn(_k) { (30, 30) })
+  debug_assert(b.pages() == 2, "24 glyphs: two pages")
+  // page 1 has room left (8 of 16 taken) yet the next frame's new glyphs empty page 0's shelves first
+  let next : Array[Int] = []
+  for k in 100..<110 {
+    next.push(k)
+  }
+  run.frame_paged(b, next, fn(_k) { (30, 30) })
+  debug_assert(run.sound(), "sound")
+  for k in next {
+    match run.placed.get(k) {
+      Some((_, _, y, _, _)) => debug_assert(y < 128, "key \{k} on page 0: y=\{y}")
+      None => debug_assert(false, "key \{k} placed")
+    }
+  }
+  page_host_done()
+}
+
+test "paged atlas: the last page is given back once nothing shown has been on it for a while" {
+  let host = PageHost::install(8)
+  let run = AtlasRun::new(128)
+  let befores = [0]
+  let b = PagedAtlas::new(false, 128, fn() { befores[0] = befores[0] + 1 })
+  let big : Array[Int] = []
+  for k in 0..<20 {
+    big.push(k)
+  }
+  let mut now = 0.0
+  b.trim(now, fn(g) { run.let_go(g) }) |> ignore
+  run.frame_paged(b, big, fn(_k) { (30, 30) })
+  debug_assert(b.pages() == 2, "two pages for 20")
+  // a screen of 8 now: on page 0 (its shelves emptied first), page 1 left as it was
+  let small : Array[Int] = []
+  for k in 200..<208 {
+    small.push(k)
+  }
+  let mut dropped_at = -1.0
+  let gone_before = run.gone
+  for _i in 0..<30 {
+    now = now + 500.0
+    let calls = befores[0]
+    if b.trim(now, fn(g) { run.let_go(g) }) {
+      dropped_at = now
+    }
+    debug_assert(befores[0] >= calls, "before asked as pages are looked through")
+    run.frame_paged(b, small, fn(_k) { (30, 30) })
+  }
+  debug_assert(run.sound(), "sound")
+  debug_assert(b.pages() == 1 && host.now == 1, "back to one page: \{b.pages()}, host \{host.now}")
+  // page 1 last showed something at 0 ms (the first frame), looked at each second: given back at 10 s or the look after
+  debug_assert(dropped_at >= 10000.0 && dropped_at <= 11000.0, "given back at \{dropped_at}")
+  debug_assert(run.gone > gone_before, "its glyphs said gone")
+  for k in small {
+    debug_assert(run.placed.contains(k), "what is shown stays: \{k}")
+  }
+  debug_assert(b.trim_due() < 0.0, "nothing due with one page")
+  page_host_done()
+}
+
+test "paged atlas: a page still shown is kept, however long, and nothing is due while it shows" {
+  let _host = PageHost::install(8)
+  let run = AtlasRun::new(128)
+  let b = PagedAtlas::new(false, 128, fn() { () })
+  let big : Array[Int] = []
+  for k in 0..<20 {
+    big.push(k)
+  }
+  let mut now = 0.0
+  for _i in 0..<40 {
+    b.trim(now, fn(g) { run.let_go(g) }) |> ignore
+    run.frame_paged(b, big, fn(_k) { (30, 30) })
+    now = now + 1000.0
+  }
+  debug_assert(b.pages() == 2, "kept: \{b.pages()}")
+  // no frame paints after the last: the next look is due, and after it nothing more while the page shows
+  debug_assert(b.trim_due() >= 0.0, "a look due after a frame that painted")
+  b.trim(now, fn(g) { run.let_go(g) }) |> ignore
+  debug_assert(b.trim_due() < 0.0, "nothing due: \{b.trim_due()}")
+  page_host_done()
+}
+
+test "paged atlas: kept by what before says is drawn, though no frame paints it" {
+  let _host = PageHost::install(8)
+  let run = AtlasRun::new(128)
+  let shown : Array[Int] = []
+  let pa : Array[PagedAtlas] = []
+  let b = PagedAtlas::new(false, 128, fn() {
+    for k in shown {
+      match run.placed.get(k) {
+        Some((s, _, _, _, _)) => pa[0].drawn(s)
+        None => ()
+      }
+    }
+  })
+  pa.push(b)
+  let big : Array[Int] = []
+  for k in 0..<20 {
+    big.push(k)
+  }
+  b.trim(0.0, fn(g) { run.let_go(g) }) |> ignore
+  run.frame_paged(b, big, fn(_k) { (30, 30) })
+  // keys 16..19 lie on page 1: said drawn by `before` alone (what is made once and composed again)
+  for k in 16..<20 {
+    shown.push(k)
+  }
+  let mut now = 0.0
+  for _i in 0..<30 {
+    now = now + 1000.0
+    b.trim(now, fn(g) { run.let_go(g) }) |> ignore
+    run.frame_paged(b, [500, 501], fn(_k) { (30, 30) })
+  }
+  debug_assert(b.pages() == 2, "page 1 kept for what before says: \{b.pages()}")
+  page_host_done()
+}
+
+test "paged atlas: cleared, it keeps the host's pages, one again where the host's atlas was made anew" {
+  let host = PageHost::install(8)
+  page_host_side(128)
+  let run = AtlasRun::new(128)
+  let b = PagedAtlas::new(false, 128, fn() { () })
+  let big : Array[Int] = []
+  for k in 0..<40 {
+    big.push(k)
+  }
+  run.frame_paged(b, big, fn(_k) { (30, 30) })
+  debug_assert(b.pages() == 4 && b.shelf_count() > 0, "four pages")
+  b.clear()
+  debug_assert(b.pages() == 4 && b.shelf_count() == 0, "cleared, pages kept")
+  // the host made its atlas anew (a context lost): one page
+  host.now = 1
+  b.clear()
+  debug_assert(b.pages() == 1, "one page as the host has: \{b.pages()}")
+  // a host whose page side changed: made anew, one page
+  host.now = 1
+  b.clear()
+  page_host_side(256)
+  b.clear()
+  debug_assert(b.side() == 256 && b.pages() == 1, "made anew at 256")
+  page_host_side(128)
+  b.clear()
+  // what goes in again starts on page 0
+  let again = AtlasRun::new(128)
+  again.frame_paged(b, [1, 2, 3], fn(_k) { (30, 30) })
+  for k in [1, 2, 3] {
+    match again.placed.get(k) {
+      Some((_, _, y, _, _)) => debug_assert(y < 128, "on page 0")
+      None => debug_assert(false, "placed")
+    }
+  }
+  page_host_done()
+}
+
+test "paged atlas: a page's square in use made smaller for tests keeps the host's page side as its stride" {
+  let _host = PageHost::install(8)
+  set_atlas_page_use(64)
+  let run = AtlasRun::new(1024)
+  let b = PagedAtlas::new(false, 1024, fn() { () })
+  let keys : Array[Int] = []
+  for k in 0..<10 {
+    keys.push(k)
+  }
+  run.frame_paged(b, keys, fn(_k) { (30, 30) })
+  debug_assert(run.sound() && run.shorts == 0, "sound, none short")
+  // 4 to a 64 square: three pages, each 1024 down from the one before
+  debug_assert(b.pages() == 4, "pages \{b.pages()}")
+  for k in keys {
+    match run.placed.get(k) {
+      Some((_, x, y, _, _)) => debug_assert(x < 64 && y % 1024 < 64, "key \{k} in its page's square: \{x},\{y}")
+      None => debug_assert(false, "placed")
+    }
+  }
+  page_host_done()
+}

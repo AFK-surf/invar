@@ -5628,3 +5628,21 @@ extern "C" int32_t mb_host_layer_render(int32_t id, int32_t pw, int32_t ph, doub
   else ctx->OMSetRenderTargets(0, NULL, NULL);
   return ok ? 1 : 0;
 }
+
+// ---- the glyph atlases' pages (atlas_pages.h): one page here as yet ----
+extern "C" {
+int mb_atlas_pages_said;
+void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
+int32_t mb_host_atlas_pages_most(int32_t colour) {
+  (void)colour;
+  return 1;
+}
+int32_t mb_host_atlas_pages_now(int32_t colour) {
+  (void)colour;
+  return 1;
+}
+int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
+  (void)colour;
+  return n == 1;
+}
+}

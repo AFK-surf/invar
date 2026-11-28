@@ -121,8 +121,8 @@ struct TextCache {
   mut seg_thinned : Int
   metrics : mbt_compat::OrderedMap[Int64, (Double, Double, Double, Double, Double, Bool)]
   glyphs : mbt_compat::OrderedMap[Int, Glyph]
-  mut atlas : Option[hostapi::Atlas]
-  mut colour_atlas : Option[hostapi::Atlas]
+  mut atlas : Option[hostapi::PagedAtlas]
+  mut colour_atlas : Option[hostapi::PagedAtlas]
   fresh : Array[Int]
   mut generation : Int
   mut frame : Int
@@ -242,8 +242,14 @@ fn glyphs_forget() -> Unit {
   if !glyphs_ahead_laid_bases.is_empty() {
     glyphs_ahead_laid_bases.clear()
   }
-  text_cache.atlas = None
-  text_cache.colour_atlas = None
+  // (the atlases' pages kept: a frame that drew more than a page drew it all, and draws it again; as many as the host
+  // has, one where it made its atlas anew)
+  for a in [text_cache.atlas, text_cache.colour_atlas] {
+    match a {
+      Some(a) => a.clear()
+      Option::None => ()
+    }
+  }
 }
 
 ///|
@@ -2146,7 +2152,7 @@ fn glyph_sub(key : Int, x : Double, sc : Double, z : Double) -> Int {
 ///|
 /// The host's atlas a glyph goes in (atlas_for), without how far across it is said: what marks a glyph drawn asks it for
 /// each glyph drawn, and a pair is an allocation each.
-fn atlas_of(colour : Bool) -> hostapi::Atlas {
+fn atlas_of(colour : Bool) -> hostapi::PagedAtlas {
   if colour {
     match text_cache.colour_atlas {
       Some(a) if a.sized() => return a
@@ -2162,13 +2168,12 @@ fn atlas_of(colour : Bool) -> hostapi::Atlas {
 ///|
 /// The host's atlas a glyph goes in as its glyphs are placed in it: colour glyphs' own (`colour`, where the host keeps
 /// one), else the words'; how far across past its place in it the glyph is said (@hostapi.colour_atlas_u).
-fn atlas_for(colour : Bool) -> (hostapi::Atlas, Int) {
+fn atlas_for(colour : Bool) -> (hostapi::PagedAtlas, Int) {
   if colour {
     let a = match text_cache.colour_atlas {
       Some(a) => a
       Option::None => {
-        let a = hostapi::Atlas::new(h_atlas_size(true))
-        a.before_full(glyphs_held_drawn)
+        let a = hostapi::PagedAtlas::new(true, h_atlas_size(true), glyphs_held_drawn)
         text_cache.colour_atlas = Some(a)
         a
       }
@@ -2180,12 +2185,62 @@ fn atlas_for(colour : Bool) -> (hostapi::Atlas, Int) {
   match text_cache.atlas {
     Some(a) => (a, 0)
     Option::None => {
-      let a = hostapi::Atlas::new(h_atlas_size(false))
-      a.before_full(glyphs_held_drawn)
+      let a = hostapi::PagedAtlas::new(false, h_atlas_size(false), glyphs_held_drawn)
       text_cache.atlas = Some(a)
       (a, 0)
     }
   }
+}
+
+///|
+/// What a glyph let go of by its atlas (a shelf emptied for another, a page given back) leaves: it is drawn and put
+/// again as it is next asked for, and what drew it from where it was is looked through again.
+fn glyph_gone(k : Int) -> Unit {
+  text_cache.glyphs.remove(k)
+  glyphs_lost.v = true
+  glyph_moves.v += 1
+}
+
+///|
+/// As a frame begins (at `now`, its clock), before text_frame: the atlases' last pages given back where nothing shown
+/// has been on them for a while (PagedAtlas::trim).
+fn text_atlas_trim(now : Double) -> Unit {
+  for a in [text_cache.atlas, text_cache.colour_atlas] {
+    match a {
+      Some(a) => a.trim(now, glyph_gone) |> ignore
+      Option::None => ()
+    }
+  }
+}
+
+///|
+/// This frame paints: what its glyphs are drawn from is what is shown till the next that paints (PagedAtlas::trim).
+fn text_atlas_painted() -> Unit {
+  for a in [text_cache.atlas, text_cache.colour_atlas] {
+    match a {
+      Some(a) => a.painted_now()
+      Option::None => ()
+    }
+  }
+}
+
+///|
+/// When the atlases' pages should be looked at next though nothing else asks for a frame (a moment of the frame's
+/// clock), or -1: what gives a page back to the host while the app is idle.
+fn text_atlas_due() -> Double {
+  let mut due = -1.0
+  for a in [text_cache.atlas, text_cache.colour_atlas] {
+    match a {
+      Some(a) => {
+        let d = a.trim_due()
+        if d >= 0.0 && (due < 0.0 || d < due) {
+          due = d
+        }
+      }
+      Option::None => ()
+    }
+  }
+  due
 }
 
 ///|
@@ -2194,6 +2249,11 @@ fn atlas_for(colour : Bool) -> (hostapi::Atlas, Int) {
 fn glyph_other_scale(g : Glyph, sc : Double) -> Bool {
   g.plot >= 0 && (g.sc - sc).abs() > 0.001
 }
+
+///|
+/// Whether a glyph too large for the atlas has been logged: once a run.
+// kept across runs: only goes to true, and only says whether a line was logged
+let glyph_big_told : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
 
 ///|
 /// Whether a glyph found at another scale has been logged: once a run, what brought it being what is looked for.
@@ -2236,14 +2296,14 @@ fn glyph_miss(key : Int, sc : Double) -> Glyph {
   let w = (o[2] * sc).round().to_int()
   let h = (o[3] * sc).round().to_int()
   if !a.holds(w, h) {
+    if w > 0 && h > 0 && !glyph_big_told.v {
+      glyph_big_told.v = true
+      h_log("GLYPHBIG \{w}x\{h} px at \{mbt_compat::double_to_string(sc)} px/pt: larger than an atlas plot (\{hostapi::atlas_plot}), not drawn")
+    }
     text_cache.glyphs.set(key, no_glyph)
     return no_glyph
   }
-  match a.place(key, w, h, fn(k) {
-    text_cache.glyphs.remove(k)
-    glyphs_lost.v = true
-    glyph_moves.v += 1
-  }) {
+  match a.place(key, w, h, glyph_gone) {
     Some((plot, x, y)) => {
       h_glyph_put(key, x + across, y)
       let g = Glyph::{

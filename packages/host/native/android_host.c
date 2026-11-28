@@ -2806,3 +2806,19 @@ void mb_images_upload(void) {
 void mb_render_present(double *buf, int32_t count, double r, double g, double b) {
   mb_host_present(buf, count, r, g, b);
 }
+
+// ---- the glyph atlases' pages (atlas_pages.h): one page here as yet ----
+int mb_atlas_pages_said;
+void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
+int32_t mb_host_atlas_pages_most(int32_t colour) {
+  (void)colour;
+  return 1;
+}
+int32_t mb_host_atlas_pages_now(int32_t colour) {
+  (void)colour;
+  return 1;
+}
+int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
+  (void)colour;
+  return n == 1;
+}

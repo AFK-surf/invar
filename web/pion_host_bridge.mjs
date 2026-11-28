@@ -1049,6 +1049,18 @@ export function attachHostBridge(rt, perfHooks = {}) {
       const H = host();
       return H.atlasGeneration() | 0;
     },
+    mb_web_atlas_pages_most(colour) {
+      const H = host();
+      return H.atlasPagesMost ? H.atlasPagesMost(!!colour) | 0 : 1;
+    },
+    mb_web_atlas_pages_now(colour) {
+      const H = host();
+      return H.atlasPagesNow ? H.atlasPagesNow(!!colour) | 0 : 1;
+    },
+    mb_web_atlas_pages(colour, n) {
+      const H = host();
+      return H.atlasPages ? (H.atlasPages(!!colour, n | 0) ? 1 : 0) : (n === 1 ? 1 : 0);
+    },
     mb_web_face_add(face, pathPtr, pathLen, weight) {
       const H = host();
       if (!H || !H.faceAdd) return 0;
