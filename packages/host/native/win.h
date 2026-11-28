@@ -97,6 +97,10 @@ int32_t mb_render_pixels_of(const double *inst, int32_t count, double r, double 
 // what the screen shows of the window's client area, as a PNG
 int mb_screen_snapshot(void *hwnd, const wchar_t *path);
 void mb_atlas_upload(int x, int y, int w, int h, const void *rgba);
+// whether x, y, w × h lies in one page of the atlas (y: page * mb_atlas_size + where on it)
+int mb_atlas_fits(int x, int y, int w, int h);
+// what the atlas held is gone: its generation moves on (win_text.cpp)
+void mb_atlas_lost(void);
 extern int mb_atlas_size;
 void *mb_render_device(void);  // ID3D11Device *
 void *mb_render_context(void);  // ID3D11DeviceContext *, the UI thread's

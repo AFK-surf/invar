@@ -56,6 +56,7 @@ void *mb_image_srv(int id) { return id == 1 ? g_test_pic_srv : NULL; }
 uint64_t mb_image_generation(void) { return 0; }
 uint64_t mb_image_free_generation(void) { return 0; }
 int32_t mb_atlas_gen_now(void) { return 0; }
+void mb_atlas_lost(void) {}
 void *mb_stream_srv(int id) { (void)id; return NULL; }
 void mb_text_set_scale(double scale) { (void)scale; }
 int mb_views_count(void) { return 0; }

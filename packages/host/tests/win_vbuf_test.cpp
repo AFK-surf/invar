@@ -79,6 +79,7 @@ uint64_t mb_image_free_generation(void) { return test_image_free_gen; }
 void *mb_stream_srv(int) { return NULL; }
 void mb_text_set_scale(double) {}
 int32_t mb_atlas_gen_now(void) { return test_atlas_gen; }
+void mb_atlas_lost(void) { test_atlas_gen++; }
 int mb_views_count(void) { return 0; }
 void mb_views_draw_under(uint8_t *, int, int, double) {}
 double mb_app_scale(void) { return 1.0; }
@@ -1068,6 +1069,59 @@ int main(void) {
     CHECK(mb_win_try_reveal_win0(&to_show, &shown, 1, sub) == 1);
     CHECK(shown == 1 && to_show == 0 && sub == 1 && pres == 0 && want == 0 && paced_at < 0.0);
     // Restore swap_needs_full before test 18
+    CHECK(mb_render_present_opts(glass_scene, 3, 0.1, 0.1, 0.1, 1) == 1);
+  }
+
+  // 17a. Atlas pages: a page added keeps page 0's texels and is drawn from where an instance's v says (page * side
+  //      down); a fresh glyph on it is no overwrite, one over it is; pages given back count as an overwrite.
+  {
+    const int side = mb_atlas_size;
+    CHECK(atlas_pages_n == 1 && mb_host_atlas_pages_now(0) == 1);
+    CHECK(mb_host_atlas_pages_most(0) >= 2 && mb_host_atlas_pages_most(1) == 1);
+    CHECK(!mb_atlas_fits(0, side, 16, 16) && mb_atlas_fits(0, 0, 16, 16));
+    static double pages_scene[2 * MB_INST];
+    memset(pages_scene, 0, sizeof pages_scene);
+    for (int i = 0; i < 2; i++) {
+      double *q = pages_scene + i * MB_INST;
+      q[0] = 8.0 + 56.0 * i; q[1] = 8.0; q[2] = 48.0; q[3] = 48.0;
+      q[5] = 3.0;
+      q[8] = 1.0; q[9] = 1.0; q[10] = 1.0; q[11] = 1.0;
+      q[12] = 0.0; q[13] = i == 0 ? 0.0 : (double)side; q[14] = 16.0; q[15] = 16.0;
+      q[16] = -1e9; q[17] = -1e9; q[18] = 1e9; q[19] = 1e9;
+    }
+    uint8_t p0_before[4] = {}, p0[4] = {}, p1[4] = {};
+    CHECK(mb_render_present_opts(pages_scene, 1, 0.0, 0.0, 0.0, 1) == 1);
+    CHECK(read_tex_bgra(off_target, 32, 32, p0_before) == 1);
+    uint64_t seq0 = g_atlas_overwrite_seq;
+    CHECK(mb_host_atlas_pages(0, 2) == 1 && atlas_pages_n == 2 && mb_host_atlas_pages_now(0) == 2);
+    CHECK(g_atlas_overwrite_seq == seq0);  // a page added: nothing overwritten
+    CHECK(mb_atlas_fits(0, side, 16, 16) && !mb_atlas_fits(0, 2 * side, 16, 16) && !mb_atlas_fits(side - 8, side, 16, 16));
+    mb_atlas_upload(0, side, 16, 16, atlas_blue);
+    CHECK(g_atlas_overwrite_seq == seq0);  // fresh texels on page 1
+    CHECK(mb_render_present_opts(pages_scene, 2, 0.0, 0.0, 0.0, 1) == 1);
+    CHECK(read_tex_bgra(off_target, 32, 32, p0) == 1);
+    CHECK(read_tex_bgra(off_target, 88, 32, p1) == 1);
+    CHECK(abs((int)p0[0] - (int)p0_before[0]) <= 1 && abs((int)p0[1] - (int)p0_before[1]) <= 1 &&
+          abs((int)p0[2] - (int)p0_before[2]) <= 1);  // page 0 copied as it was
+    CHECK(p1[0] > 200 && p1[1] < 80 && p1[2] < 60);   // page 1's blue, not page 0's
+    mb_atlas_upload(0, side, 16, 16, atlas_red);      // over what is there
+    CHECK(g_atlas_overwrite_seq == seq0 + 1);
+    CHECK(mb_render_present_opts(pages_scene, 2, 0.0, 0.0, 0.0, 1) == 1);
+    CHECK(read_tex_bgra(off_target, 88, 32, p1) == 1);
+    CHECK(p1[2] > 200 && p1[0] < 60);
+    uint64_t seq1 = g_atlas_overwrite_seq;
+    CHECK(mb_host_atlas_pages(0, 1) == 1 && atlas_pages_n == 1);
+    CHECK(g_atlas_overwrite_seq == seq1 + 1);  // a page given back: every window drawn whole
+    CHECK(!mb_atlas_fits(0, side, 16, 16));
+    CHECK(mb_render_present_opts(pages_scene, 1, 0.0, 0.0, 0.0, 1) == 1);
+    CHECK(read_tex_bgra(off_target, 32, 32, p0) == 1);
+    CHECK(abs((int)p0[1] - (int)p0_before[1]) <= 1);  // page 0 still as it was
+    CHECK(mb_host_atlas_pages(0, 2) == 1);
+    uint64_t seq2 = g_atlas_overwrite_seq;
+    mb_atlas_upload(0, side, 16, 16, atlas_green);  // page 1 again, its old occupancy gone with it
+    CHECK(g_atlas_overwrite_seq == seq2);
+    CHECK(mb_host_atlas_pages(0, mb_host_atlas_pages_most(0) + 1) == 0 && atlas_pages_n == 2);
+    CHECK(mb_host_atlas_pages(0, 1) == 1);
     CHECK(mb_render_present_opts(glass_scene, 3, 0.1, 0.1, 0.1, 1) == 1);
   }
 
