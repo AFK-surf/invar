@@ -177,6 +177,7 @@ PID_STEP6=$!
 set -euo pipefail
 WEB_DIR="$TMP/my_web_app"
 WEB_OUT="$TMP/web_dist"
+LG_WASM_OUT="$TMP/lg_web_step8.wasm"
 
 (
   set -euo pipefail
@@ -202,8 +203,17 @@ PID_S7=$!
   echo "=== 8. invar web check --json (packages/lg_web) ==="
   if [ -n "${INVAR_CLI_TEST_WEB_CHECK_JSON:-}" ] && [ -f "$INVAR_CLI_TEST_WEB_CHECK_JSON" ]; then
     WEB_CHK="$(cat "$INVAR_CLI_TEST_WEB_CHECK_JSON")"
+    if [ -z "${INVAR_CLI_TEST_LG_WASM:-}" ] || [ ! -f "$INVAR_CLI_TEST_LG_WASM" ]; then
+      echo "FAIL: INVAR_CLI_TEST_LG_WASM must point to an existing file when INVAR_CLI_TEST_WEB_CHECK_JSON is set" >&2
+      exit 1
+    fi
+    cp "$INVAR_CLI_TEST_LG_WASM" "$LG_WASM_OUT"
   else
-    WEB_CHK="$("$INVAR" web check --json)"
+    WEB_CHK="$("$INVAR" web check --out-wasm "$LG_WASM_OUT" --json)"
+    if [ ! -f "$LG_WASM_OUT" ]; then
+      echo "FAIL: invar web check --out-wasm did not create $LG_WASM_OUT" >&2
+      exit 1
+    fi
   fi
   assert_py "
 import json, sys
@@ -224,8 +234,9 @@ if [ "$W78_FAIL" -ne 0 ]; then
 fi
 
 echo "=== 8b. invar web build cleans stale _headers/_redirects/wasm across packages ==="
-# Steps 7 and 8 already exercise full brotli -q 11 compression on both my_web_app and lg_web;
-# step 8b only verifies _web_dist_reconcile stale-file cleanup across 6 rebuilds (stdout discarded).
+# Steps 7 and 8 already exercise full wasm32 compilation + brotli -q 11 compression on both
+# my_web_app and lg_web; step 8b only verifies _web_dist_reconcile stale-file cleanup across
+# 6 rebuilds by reusing those freshly compiled .wasm binaries via --prebuilt-wasm.
 NO_BROTLI_BIN="$TMP/no_brotli_bin"
 mkdir -p "$NO_BROTLI_BIN"
 printf '#!/bin/sh\nexit 1\n' > "$NO_BROTLI_BIN/brotli"
@@ -235,7 +246,18 @@ chmod +x "$NO_BROTLI_BIN/brotli"
   set -euo pipefail
   export PATH="$NO_BROTLI_BIN:$PATH"
   SHARED_OUT="$TMP/shared_web_out"
-  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+  MY_WEB_WASM="$WEB_OUT/my_web_app.wasm"
+
+  if "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$TMP/missing_prebuilt.wasm" --json >/dev/null 2>&1; then
+    echo "FAIL: invar web build should reject missing --prebuilt-wasm" >&2
+    exit 1
+  fi
+  if "$INVAR" web dev --pkg "$WEB_DIR" --prebuilt-wasm "$MY_WEB_WASM" --json >/dev/null 2>&1; then
+    echo "FAIL: invar web dev should reject --prebuilt-wasm" >&2
+    exit 1
+  fi
+
+  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --prebuilt-wasm "$LG_WASM_OUT" --json >/dev/null
   assert_py "
 import os, sys
 out = sys.argv[1]
@@ -243,9 +265,60 @@ assert os.path.isfile(os.path.join(out, '_headers')), 'lg_web must emit _headers
 assert os.path.isfile(os.path.join(out, '_redirects')), 'lg_web must emit _redirects'
 assert os.path.isfile(os.path.join(out, 'lg_web.wasm')), 'lg_web must emit lg_web.wasm'
 " "$SHARED_OUT"
+  # Truncated prebuilt wasm must fail before touching existing files in SHARED_OUT.
+  printf '\0asm\1\0\0\0\2\x10' > "$TMP/truncated.wasm"
+  IDX_BEFORE="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/index.html")"
+  if "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$TMP/truncated.wasm" --json >/dev/null 2>&1; then
+    echo "FAIL: invar web build should reject truncated --prebuilt-wasm" >&2
+    exit 1
+  fi
+  IDX_AFTER="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/index.html")"
+  if [ "$IDX_BEFORE" != "$IDX_AFTER" ] || [ ! -f "$SHARED_OUT/lg_web.wasm" ]; then
+    echo "FAIL: truncated --prebuilt-wasm modified existing output dir" >&2
+    exit 1
+  fi
+  # Valid WASM structure with unknown host import (env.f) must fail before touching SHARED_OUT.
+  python3 -c '
+import sys
+# Valid WASM module: type ()->(), import env.f : func 0
+wasm = b"\x00asm\x01\x00\x00\x00" + b"\x01\x04\x01\x60\x00\x00" + b"\x02\x09\x01\x03env\x01f\x00\x00"
+open(sys.argv[1], "wb").write(wasm)
+' "$TMP/bad_import.wasm"
+  LG_BEFORE="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/lg_web.wasm")"
+  if "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$TMP/bad_import.wasm" --json >/dev/null 2>&1; then
+    echo "FAIL: invar web build should reject prebuilt wasm with unknown host imports" >&2
+    exit 1
+  fi
+  LG_AFTER="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/lg_web.wasm")"
+  if [ "$LG_BEFORE" != "$LG_AFTER" ]; then
+    echo "FAIL: prebuilt wasm with unknown host imports modified existing lg_web.wasm" >&2
+    exit 1
+  fi
+  # --out-wasm pointing at a managed output file (index.html or nested LICENSES/*) must fail without clobbering it.
+  if "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$MY_WEB_WASM" --out-wasm "$SHARED_OUT/index.html" --json >/dev/null 2>&1; then
+    echo "FAIL: invar web build should reject --out-wasm conflicting with index.html" >&2
+    exit 1
+  fi
+  IDX_AFTER2="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/index.html")"
+  if [ "$IDX_BEFORE" != "$IDX_AFTER2" ]; then
+    echo "FAIL: conflicting --out-wasm modified index.html" >&2
+    exit 1
+  fi
+  LIC_BEFORE="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/LICENSES/Apache-2.0.txt")"
+  if "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$MY_WEB_WASM" --out-wasm "$SHARED_OUT/LICENSES/Apache-2.0.txt" --json >/dev/null 2>&1; then
+    echo "FAIL: invar web build should reject --out-wasm conflicting with LICENSES/Apache-2.0.txt" >&2
+    exit 1
+  fi
+  LIC_AFTER="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$SHARED_OUT/LICENSES/Apache-2.0.txt")"
+  if [ "$LIC_BEFORE" != "$LIC_AFTER" ]; then
+    echo "FAIL: conflicting --out-wasm modified LICENSES/Apache-2.0.txt" >&2
+    exit 1
+  fi
+  echo "OK: web build rejects missing/truncated/bad-import --prebuilt-wasm, conflicting --out-wasm (incl. LICENSES/*), and web dev --prebuilt-wasm"
+
   # A file of the caller's own in the output dir: never invar's to remove.
   printf '\0asm\1\0\0\0' > "$SHARED_OUT/decoder.wasm"
-  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$MY_WEB_WASM" --json >/dev/null
   assert_py "
 import os, sys
 out = sys.argv[1]
@@ -258,7 +331,7 @@ assert open(os.path.join(out, 'decoder.wasm'), 'rb').read() == b'\\0asm\\1\\0\\0
 assert not any(n.startswith('.invar') for n in os.listdir(out)), 'no build record inside the output dir'
 print('OK: shared web out dir cleaned of stale _headers, _redirects, and lg_web.wasm; decoder.wasm kept')
 " "$SHARED_OUT"
-  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --prebuilt-wasm "$LG_WASM_OUT" --json >/dev/null
   assert_py "
 import os, sys
 out = sys.argv[1]
@@ -272,7 +345,7 @@ print('OK: rebuilding lg_web removes my_web_app.wasm and still keeps decoder.was
   rm -rf "$SHARED_OUT"
   mkdir -p "$SHARED_OUT"
   printf '/*\n  X-Mine: 1\n' > "$SHARED_OUT/_headers"
-  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$MY_WEB_WASM" --json >/dev/null
   assert_py "
 import os, sys
 out = sys.argv[1]
@@ -281,9 +354,9 @@ assert os.path.isfile(os.path.join(out, 'my_web_app.wasm')), 'custom wasm built'
 print('OK: a caller _headers in a remade output dir is kept')
 " "$SHARED_OUT"
   # The same when the caller only rewrites a file invar wrote there.
-  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --json >/dev/null
+  "$INVAR" web build --pkg "$ROOT/packages/lg_web" --out "$SHARED_OUT" --prebuilt-wasm "$LG_WASM_OUT" --json >/dev/null
   printf '/*\n  X-Mine: 2\n' > "$SHARED_OUT/_headers"
-  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --json >/dev/null
+  "$INVAR" web build --pkg "$WEB_DIR" --out "$SHARED_OUT" --prebuilt-wasm "$MY_WEB_WASM" --json >/dev/null
   assert_py "
 import os, sys
 out = sys.argv[1]
@@ -366,7 +439,8 @@ print('OK: installed symlink invar doctor passed')
 " "$SYM_JSON"
 
 echo "=== 11. invar shot (--list, fresh output tracking, unknown preset rejection, scale override) ==="
-SHOT_LIST="$("$INVAR" shot --list --json)"
+SHOT_BIN="$TMP/lg_shots_bin"
+SHOT_LIST="$("$INVAR" shot --list --out-bin "$SHOT_BIN" --json)"
 assert_py "
 import json, sys
 d = json.loads(sys.argv[1])
@@ -379,7 +453,7 @@ mkdir -p "$SHOT_DIR"
 # Place a stale PNG in SHOT_DIR and verify unknown --only fails and never reports stale PNG as fresh
 cp "$TMP/before.png" "$SHOT_DIR/stale_old.png"
 BOGUS_RC=0
-BOGUS_JSON="$("$INVAR" shot --only __no_such_preset__ --out "$SHOT_DIR" --json)" || BOGUS_RC=$?
+BOGUS_JSON="$("$INVAR" shot --only __no_such_preset__ --out "$SHOT_DIR" --prebuilt-bin "$SHOT_BIN" --json)" || BOGUS_RC=$?
 if [ "$BOGUS_RC" -eq 0 ]; then
   echo "FAIL: invar shot --only __no_such_preset__ must exit non-zero" >&2
   exit 1
@@ -391,7 +465,7 @@ assert d['ok'] is False and d['pngs'] == [] and d['mp4s'] == [], f'stale PNG lea
 print('OK: unknown preset rejected cleanly without leaking stale PNG')
 " "$BOGUS_JSON"
 
-SHOT_OK="$("$INVAR" shot --only ios27-parity-light --scale 1 --out "$SHOT_DIR" --json)"
+SHOT_OK="$("$INVAR" shot --only ios27-parity-light --scale 1 --out "$SHOT_DIR" --prebuilt-bin "$SHOT_BIN" --json)"
 assert_py "
 import json, os, sys
 d = json.loads(sys.argv[1])
@@ -402,6 +476,20 @@ assert os.path.basename(p['file']) == 'ios27-parity-light.png', f'wrong file: {p
 assert p['width'] == 390 and p['height'] == 844, f'scale=1 override failed: {p}'
 print('OK: invar shot fresh output + scale=1 override (%dx%d, build %d ms, run %d ms)' % (p['width'], p['height'], d['build_ms'], d['run_ms']))
 " "$SHOT_OK"
+
+# Relative --prebuilt-bin from a different cwd must resolve against caller cwd, and combining --prebuilt-bin + --out-bin must fail.
+SHOT_REL="$(cd "$TMP" && "$INVAR" shot --list --prebuilt-bin ./lg_shots_bin --json)"
+assert_py "
+import json, sys
+d = json.loads(sys.argv[1])
+assert d['ok'] is True and d['build_ms'] == 0 and 'ios27-parity' in d['output'], f'relative prebuilt-bin failed: {d}'
+print('OK: invar shot relative --prebuilt-bin works across cwd')
+" "$SHOT_REL"
+if "$INVAR" shot --list --prebuilt-bin "$SHOT_BIN" --out-bin "$TMP/conflict_bin" --json >/dev/null 2>&1; then
+  echo "FAIL: invar shot should reject combining --prebuilt-bin and --out-bin" >&2
+  exit 1
+fi
+echo "OK: invar shot rejects --prebuilt-bin + --out-bin combination"
 
 echo "=== 12. invar compare (full, multi-ROI @2x + zoom + with-diff, exact luma spread, error gates) ==="
 CMP_DIR="$TMP/cmp"
