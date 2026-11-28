@@ -523,8 +523,8 @@ function buildHtmlPage(programs) {
         {
           name: 'V3 dark adaptive regular on #FFFFFF',
           got: sampleGlass([1, 1, 1], darkTint, 1.2, 0.6, 14.0, 20.0, 0.06, true),
-          check: ([r, g, b]) => Math.abs(r - 90) <= 6 && Math.abs(g - 90) <= 6 && Math.abs(b - 90) <= 6,
-          expected: '(90,90,90) +/-6',
+          check: ([r, g, b]) => Math.abs(r - 90) <= 3 && Math.abs(g - 90) <= 3 && Math.abs(b - 90) <= 3,
+          expected: '(90,90,90) +/-3',
         },
         {
           name: 'V4 light regular on #0088FF',
@@ -1555,6 +1555,61 @@ function buildHtmlPage(programs) {
         for (let i = 0; i < 2; i++) { gl.deleteFramebuffer(adF[i]); gl.deleteTexture(adT[i]); }
         gl.deleteProgram(adP);
         gl.deleteProgram(inkP);
+
+        // V16: Progressive .soft scroll-edge glass (kind 5, a_pad.z = -1.0) midpoint attenuation at fade_r ~= 0.5
+        {
+          const frostItem = programs.find((p) => p.name === 'FS(ONE_KIND=5)');
+          const frostP = mkProg(frostItem);
+          const uf = (n) => gl.getUniformLocation(frostP, n);
+          const Wf = 320, Hf = 240, Sf = 2.0;
+          canvas.width = Wf;
+          canvas.height = Hf;
+          gl.viewport(0, 0, Wf, Hf);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, bdTex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+          gl.clearColor(0, 0, 0, 1);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.useProgram(frostP);
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+          gl.uniform1i(uf('u_bd'), 0);
+          gl.uniform2f(uf('u_vp'), 160.0, 120.0);
+          gl.uniform2f(uf('u_origin'), 0.0, 0.0);
+          gl.uniform1f(uf('u_scale'), Sf);
+          gl.uniform1f(uf('u_top'), Hf);
+          gl.uniform4f(uf('u_map'), 1.0 / 160.0, 1.0 / 120.0, 0.0, 0.0);
+          gl.uniform4f(uf('u_uvc'), 0.0, 0.0, 1.0, 1.0);
+          gl.vertexAttrib4f(0, 0.0, 0.0, 160.0, 80.0);
+          gl.vertexAttrib4f(1, 0.0, 5.0, 1.0, 8.0);
+          gl.vertexAttrib4f(2, 1.0, 1.0, 1.0, 0.8);
+          gl.vertexAttrib4f(3, 0.0, 0.0, 0.0, 1.0);
+          gl.vertexAttrib4f(4, 0.0, 0.0, 1e9, 1e9);
+          gl.vertexAttrib4f(5, -1.0, 0.0, -1.0, 0.0);
+          gl.vertexAttrib4f(6, 0.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(7, 0.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(8, 0.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(9, 0.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(10, 0.0, 0.0, 1e9, 1e9);
+          gl.vertexAttrib4f(11, 0.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(12, 0.0, 0.0, 0.0, 0.0);
+          gl.vertexAttrib4f(13, 0.0, 0.0, 80.0, 80.0);
+          gl.vertexAttrib4f(14, 0.0, 0.0, 0.0, 0.0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+          const outF = new Uint8Array(Wf * Hf * 4);
+          gl.readPixels(0, 0, Wf, Hf, gl.RGBA, gl.UNSIGNED_BYTE, outF);
+          const chAt = (px, py) => outF[((Hf - 1 - py) * Wf + px) * 4];
+          const rTop = chAt(160, 4);
+          const rMid = chAt(160, 80);
+          const rEdge = chAt(160, 158);
+          const rOut = chAt(160, 190);
+          const v16Ok = rTop >= 195 && rTop <= 212 && rMid >= 52 && rMid <= 68 && rEdge <= 5 && rOut === 0;
+          pushVec('V16 progressive .soft scroll-edge midpoint attenuation (fade_r~=0.5)', v16Ok,
+            [rTop, rMid, rEdge, rOut],
+            'top [195..212], mid(fade_r~=0.5) [52..68], edge<=5, out==0');
+          gl.vertexAttrib4f(13, 0.0, 0.0, 0.0, 0.0);
+          gl.deleteProgram(frostP);
+        }
       }
 
       gl.deleteTexture(bdTex);
@@ -1567,7 +1622,7 @@ function buildHtmlPage(programs) {
     }
 
     report = {
-      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 16,
+      ok: passed === programs.length && drawPassed === drawChecks.length && drawChecks.length > 0 && vectorsPassed === vectorResults.length && vectorResults.length === 17,
       passed,
       total: programs.length,
       drawPassed,
@@ -1682,7 +1737,7 @@ runCheck()
     if (JSON_MODE) {
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     } else {
-      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V14) — ${report.ok ? 'PASS' : 'FAIL'}`);
+      console.log(`WebGL2 Shader Gate (${report.passed}/${report.total} compile/link, ${report.drawPassed || 0}/${report.drawTotal || 0} draw/readPixels, ${report.vectorsPassed || 0}/${report.vectorsTotal || 0} V1..V16) — ${report.ok ? 'PASS' : 'FAIL'}`);
       if (report.renderer) console.log(`  renderer: ${report.renderer}`);
       if (report.version) console.log(`  version : ${report.version}`);
       for (const r of report.results || []) {

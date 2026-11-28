@@ -108,9 +108,7 @@ BASELINE_BAD_HEADER_FILES = {
     "packages/headless/src/trigger_menu.pion",
     "packages/headless/src/typeahead.pion",
 }
-BASELINE_ROGUE_FILES = {
-    "packages/hostapi/src/json.pion",
-}
+BASELINE_ROGUE_FILES = set()
 
 def is_allowed_overlay(fname: str) -> bool:
     return (
