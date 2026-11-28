@@ -65,6 +65,74 @@ public final class RawPremulTest {
         int[] s4 = RawPremul.targetSize(200, 100, 0);
         check(s4[0] == 200 && s4[1] == 100, "maxPx<=0 passthrough");
 
+        // Area-averaging downscale: constant color + 4x and 3.2x 1px line preservation (matches raw_premul_test.c)
+        byte[] solid = makeBuf(8, 4, 8 * 4 * 4);
+        for (int i = 0; i < 8 * 4; i++) {
+            int o = 16 + i * 4;
+            solid[o] = 100; solid[o + 1] = 50; solid[o + 2] = 25; solid[o + 3] = (byte) 128;
+        }
+        byte[] solidOut = RawPremul.downscale(solid, 16, 8, 4, 4, 2);
+        for (int i = 0; i < 4 * 2; i++) {
+            int o = i * 4;
+            check((solidOut[o] & 0xFF) == 100 && (solidOut[o + 1] & 0xFF) == 50
+                    && (solidOut[o + 2] & 0xFF) == 25 && (solidOut[o + 3] & 0xFF) == 128,
+                    "solid downscale");
+        }
+        byte[] lines = makeBuf(16, 4, 16 * 4 * 4);
+        for (int y = 0; y < 4; y++) {
+            for (int x = 0; x < 16; x += 4) {
+                int o = 16 + (y * 16 + x) * 4;
+                lines[o] = (byte) 255; lines[o + 1] = (byte) 255;
+                lines[o + 2] = (byte) 255; lines[o + 3] = (byte) 255;
+            }
+        }
+        byte[] linesOut = RawPremul.downscale(lines, 16, 16, 4, 4, 1);
+        for (int x = 0; x < 4; x++) {
+            int o = x * 4;
+            check((linesOut[o] & 0xFF) == 64 && (linesOut[o + 1] & 0xFF) == 64
+                    && (linesOut[o + 2] & 0xFF) == 64 && (linesOut[o + 3] & 0xFF) == 64,
+                    "4x 1px line preserved");
+        }
+        byte[] linesOut5 = RawPremul.downscale(lines, 16, 16, 4, 5, 1);
+        int sumR = 0;
+        for (int x = 0; x < 5; x++) {
+            int o = x * 4;
+            int r = linesOut5[o] & 0xFF;
+            int g = linesOut5[o + 1] & 0xFF;
+            int b = linesOut5[o + 2] & 0xFF;
+            int a = linesOut5[o + 3] & 0xFF;
+            check(r <= a && g <= a && b <= a, "3.2x premul rgb <= a");
+            sumR += r;
+        }
+        check(sumR >= 314 && sumR <= 324, "3.2x 1px line energy preserved");
+
+        // Exact integer half-up midpoint rounding: 98x1 -> 1x1 (49 of r=1 + 49 of r=2 => exact 1.5 => 2)
+        byte[] src98 = makeBuf(98, 1, 98 * 4);
+        for (int x = 0; x < 98; x++) {
+            int o = 16 + x * 4;
+            src98[o] = (byte) (x < 49 ? 1 : 2);
+            src98[o + 3] = (byte) 255;
+        }
+        byte[] dst98 = RawPremul.downscale(src98, 16, 98, 1, 1, 1);
+        check((dst98[0] & 0xFF) == 2 && (dst98[1] & 0xFF) == 0
+                && (dst98[2] & 0xFF) == 0 && (dst98[3] & 0xFF) == 255,
+                "98x1->1x1 exact half-up");
+
+        // Exact integer midpoint overlap: 18x1 -> 11x1 (only x=8 has r=1 => dst x=5 overlap 9/18=0.5 => r=1, others 0)
+        byte[] src18 = makeBuf(18, 1, 18 * 4);
+        for (int x = 0; x < 18; x++) {
+            int o = 16 + x * 4;
+            src18[o] = (byte) (x == 8 ? 1 : 0);
+            src18[o + 3] = (byte) 255;
+        }
+        byte[] dst11 = RawPremul.downscale(src18, 16, 18, 1, 11, 1);
+        for (int x = 0; x < 11; x++) {
+            int o = x * 4;
+            check((dst11[o] & 0xFF) == (x == 5 ? 1 : 0) && (dst11[o + 1] & 0xFF) == 0
+                    && (dst11[o + 2] & 0xFF) == 0 && (dst11[o + 3] & 0xFF) == 255,
+                    "18x1->11x1 exact midpoint at x=" + x);
+        }
+
         System.out.println("RawPremulTest: OK");
     }
 }

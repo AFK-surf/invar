@@ -181,22 +181,15 @@ final class Images {
                     return;
                 }
                 int w = dims[0], h = dims[1];
+                orig[0] = w;
+                orig[1] = h;
                 if (Math.max(w, h) <= maxPx) {
-                    toRender(() -> uploadRawPremul(id, rawData, w, h, w, h));
+                    toRender(() -> uploadRawPremul(id, rawData, RawPremul.HEADER_BYTES, w, h, w, h));
                     return;
                 }
                 int[] sz = RawPremul.targetSize(w, h, maxPx);
-                Bitmap src = null;
-                Bitmap scaled = null;
-                try {
-                    src = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                    src.copyPixelsFromBuffer(ByteBuffer.wrap(rawData, RawPremul.HEADER_BYTES, w * h * 4));
-                    scaled = Bitmap.createScaledBitmap(src, sz[0], sz[1], true);
-                } finally {
-                    if (src != null && src != scaled) src.recycle();
-                }
-                final Bitmap outBmp = scaled;
-                toRender(() -> upload(id, outBmp, w, h));
+                final byte[] scaled = RawPremul.downscale(rawData, RawPremul.HEADER_BYTES, w, h, sz[0], sz[1]);
+                toRender(() -> uploadRawPremul(id, scaled, 0, sz[0], sz[1], w, h));
                 return;
             }
             if (data == null && r.src.startsWith("content://")) {
@@ -309,21 +302,33 @@ final class Images {
         else MBView.onApp(() -> Native.imageTold(id, ok, w, h, ow, oh));
     }
 
-    static void uploadRawPremul(int id, byte[] data, int w, int h, int ow, int oh) {
+    static void uploadRawPremul(int id, byte[] data, int offset, int w, int h, int ow, int oh) {
         if (!live.containsKey(id)) return;
         NativeViews.textureMostRead();
         int most = NativeViews.textureMost;
         if (most > 0 && (w > most || h > most)) {
-            Bitmap bmp = null;
+            final int[] sz = RawPremul.targetSize(w, h, most);
+            final byte[] srcData = data;
+            final int srcOffset = offset;
+            final int sw = w, sh = h;
             try {
-                bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(data, RawPremul.HEADER_BYTES, w * h * 4));
+                pool.execute(() -> {
+                    if (!live.containsKey(id)) return;
+                    try {
+                        final byte[] scaled = RawPremul.downscale(srcData, srcOffset, sw, sh, sz[0], sz[1]);
+                        toRender(() -> uploadRawPremul(id, scaled, 0, sz[0], sz[1], ow, oh));
+                    } catch (Throwable e) {
+                        Host.log("image raw premul downscale: " + e);
+                        toRender(() -> {
+                            if (!live.containsKey(id)) return;
+                            finishUpload(id, 0, 0, 0, ow, oh);
+                        });
+                    }
+                });
             } catch (Throwable e) {
-                Host.log("image raw premul fallback: " + e);
-                if (bmp != null) bmp.recycle();
-                bmp = null;
+                Host.log("image raw premul downscale submit: " + e);
+                finishUpload(id, 0, 0, 0, ow, oh);
             }
-            upload(id, bmp, ow, oh);
             return;
         }
         int[] t = {0};
@@ -339,7 +344,7 @@ final class Images {
                 GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 4);
                 GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, w, h, 0,
                         GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE,
-                        ByteBuffer.wrap(data, RawPremul.HEADER_BYTES, w * h * 4));
+                        ByteBuffer.wrap(data, offset, w * h * 4));
                 if (GLES30.glGetError() != GLES30.GL_NO_ERROR) {
                     GLES30.glDeleteTextures(1, t, 0);
                     t[0] = 0;

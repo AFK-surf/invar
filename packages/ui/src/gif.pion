@@ -7,7 +7,8 @@ import "pixels"
 // image handed over as a GIF of more than one frame (add_image) is shown as its frames in turn, a cycle of their
 // lengths (Ctx::loop_at: a frame of each length, the same at any frame rate); `still` holds its first. Handed over, its
 // blocks are walked once for how many frames it has and how long each stays, and only its first frame is decoded and
-// made a picture (a PNG, png_of, which the host decodes as any picture): the rest are each decoded and made as they are
+// made a picture (`MBRAWPRE` premultiplied RGBA via `raw_premul_of`, which every host decodes directly without PNG
+// checksums or codecs): the rest are each decoded and made as they are
 // first wanted (Ctx::moving_key: the frame its loop is at, and the one after it, so the host has that one decoded by its
 // turn), by one decoder kept with it till all are made, then let go. When it is made decides only when the work is
 // done: which frame shows at a moment is the loop's at that moment, as it was when all were made at once. One whose
@@ -29,8 +30,8 @@ pub struct GifFrames {
 
 ///|
 /// The most pixels a GIF that moves keeps all of its frames for (frames × width × height): ≈64 MB as RGBA, which each
-/// frame is held as twice once it is made, here (a PNG of it, png_of, stored, not compressed) and again by the host it
-/// is handed to (its decode, and on Android the PNG's bytes, kept to decode again). 132 frames of 360 × 734 took a
+/// frame is held as twice once it is made, here (`MBRAWPRE` raw premultiplied RGBA, `raw_premul_of`) and again by the host it
+/// is handed to (its decode, and on Android the frame's bytes, kept to decode again). 132 frames of 360 × 734 took a
 /// phone's whole Java heap. Past this, a GIF whose single frame fits gif_streaming_frame_most streams instead: only its
 /// first frame and the frames wanted this frame (drawn, wanted and next) are kept at a time (trim_gif_frames).
 // moved to 00_init_order.pion: gif_moving_most
@@ -169,15 +170,21 @@ fn gif_delays(data : Bytes, start : Int) -> Array[Double] {
 
 ///|
 /// A GIF's frames decoded one at a time, in order, onto its canvas: after `next`, the canvas is the frame it decoded as
-/// the screen shows it (RGBA, straight, rows from the top). What a frame leaves once shown (its disposal) is done as the
-/// next one is decoded. Its tables and buffers are made once and kept from frame to frame.
+/// the screen shows it (RGBA, premultiplied = straight since GIF alpha is binary 0/255, rows from the top). What a
+/// frame leaves once shown (its disposal) is done as the next one is decoded. Its tables and buffers are made once and
+/// kept from frame to frame.
 struct GifDecoder {
   data : Bytes
   w : Int
   h : Int
   start : Int
-  global : FixedArray[Int]
-  local_colors : FixedArray[Int]
+  global_r : FixedArray[Byte]
+  global_g : FixedArray[Byte]
+  global_b : FixedArray[Byte]
+  global_len : Int
+  local_r : FixedArray[Byte]
+  local_g : FixedArray[Byte]
+  local_b : FixedArray[Byte]
   canvas : FixedArray[Byte]
   mut was : FixedArray[Byte]
   mut at : Int
@@ -198,19 +205,27 @@ struct GifDecoder {
 ///|
 /// A decoder of GIF `data`, whose screen is `w` by `h` and blocks start at `start` (gif_screen's), at its first frame.
 fn GifDecoder::new(data : Bytes, w : Int, h : Int, start : Int) -> GifDecoder {
-  let global = FixedArray::make((start - 13) / 3, 0)
-  for k in 0..<global.length() {
-    global[k] = (gif_u8(data, 13 + 3 * k) << 16) |
-    (gif_u8(data, 13 + 3 * k + 1) << 8) |
-    gif_u8(data, 13 + 3 * k + 2)
+  let global_len = (start - 13) / 3
+  let global_r = FixedArray::make(256, 0.to_byte())
+  let global_g = FixedArray::make(256, 0.to_byte())
+  let global_b = FixedArray::make(256, 0.to_byte())
+  for k in 0..<global_len {
+    global_r[k] = gif_u8(data, 13 + 3 * k).to_byte()
+    global_g[k] = gif_u8(data, 13 + 3 * k + 1).to_byte()
+    global_b[k] = gif_u8(data, 13 + 3 * k + 2).to_byte()
   }
   GifDecoder::{
     data: data,
     w: w,
     h: h,
     start: start,
-    global: global,
-    local_colors: FixedArray::make(256, 0),
+    global_r: global_r,
+    global_g: global_g,
+    global_b: global_b,
+    global_len: global_len,
+    local_r: FixedArray::make(256, 0.to_byte()),
+    local_g: FixedArray::make(256, 0.to_byte()),
+    local_b: FixedArray::make(256, 0.to_byte()),
     canvas: FixedArray::make(w * h * 4, 0.to_byte()),
     was: FixedArray::make(0, 0.to_byte()),
     at: start,
@@ -232,9 +247,7 @@ fn GifDecoder::new(data : Bytes, w : Int, h : Int, start : Int) -> GifDecoder {
 ///|
 /// Back at the first frame, the canvas empty: to decode a frame before the one it is at.
 fn GifDecoder::restart(self : GifDecoder) -> Unit {
-  for i in 0..<self.canvas.length() {
-    self.canvas[i] = 0.to_byte()
-  }
+  self.canvas.fill(0.to_byte())
   self.at = self.start
   self.decoded = 0
   self.transparent = -1
@@ -248,13 +261,19 @@ fn GifDecoder::restart(self : GifDecoder) -> Unit {
 fn GifDecoder::next(self : GifDecoder) -> Bool {
   let w = self.w
   if self.leaves == 2 {
-    for y in self.ly..<imin(self.ly + self.lh, self.h) {
-      for x in self.lx..<imin(self.lx + self.lw, w) {
-        let o = (y * w + x) * 4
-        self.canvas[o] = 0.to_byte()
-        self.canvas[o + 1] = 0.to_byte()
-        self.canvas[o + 2] = 0.to_byte()
-        self.canvas[o + 3] = 0.to_byte()
+    let y_end = imin(self.ly + self.lh, self.h)
+    let x_end = imin(self.lx + self.lw, w)
+    if self.lx < x_end && self.ly < y_end {
+      if self.lx == 0 && x_end == w && self.ly == 0 && y_end == self.h {
+        self.canvas.fill(0.to_byte())
+      } else {
+        let span = (x_end - self.lx) * 4
+        for y in self.ly..<y_end {
+          let base = (y * w + self.lx) * 4
+          for i in 0..<span {
+            self.canvas[base + i] = 0.to_byte()
+          }
+        }
       }
     }
   } else if self.leaves == 3 {
@@ -298,17 +317,17 @@ fn GifDecoder::draw(self : GifDecoder, at : Int) -> Unit {
   let fh = u16(at + 7)
   let lf = gif_u8(data, at + 9)
   let mut p = at + 10
-  let (table, colours) = if (lf & 0x80) != 0 {
+  let (tr, tg, tb, colours) = if (lf & 0x80) != 0 {
     let size = 1 << ((lf & 7) + 1)
     for k in 0..<size {
-      self.local_colors[k] = (gif_u8(data, p + 3 * k) << 16) |
-      (gif_u8(data, p + 3 * k + 1) << 8) |
-      gif_u8(data, p + 3 * k + 2)
+      self.local_r[k] = gif_u8(data, p + 3 * k).to_byte()
+      self.local_g[k] = gif_u8(data, p + 3 * k + 1).to_byte()
+      self.local_b[k] = gif_u8(data, p + 3 * k + 2).to_byte()
     }
     p = p + 3 * size
-    (self.local_colors, size)
+    (self.local_r, self.local_g, self.local_b, size)
   } else {
-    (self.global, self.global.length())
+    (self.global_r, self.global_g, self.global_b, self.global_len)
   }
   // what the canvas goes back to once this frame has been shown (disposal 3)
   if self.disposal == 3 {
@@ -322,7 +341,7 @@ fn GifDecoder::draw(self : GifDecoder, at : Int) -> Unit {
   self.ly = fy
   self.lw = fw
   self.lh = fh
-  self.lzw_draw(p, fx, fy, fw, fh, interlace_rows(fh, (lf & 0x40) != 0), table, colours)
+  self.lzw_draw(p, fx, fy, fw, fh, (lf & 0x40) != 0, tr, tg, tb, colours)
 }
 
 ///|
@@ -345,10 +364,22 @@ fn interlace_rows(h : Int, interlaced : Bool) -> Array[Int] {
 
 ///|
 /// An image's LZW-coded colour indices (its code size at `p`, its sub-blocks after it, read where they lie in the GIF)
-/// drawn as they come onto the canvas, its rect `fx`, `fy`, `fw` by `fh` (`rows`: which row each line of its data is),
-/// in `table`'s first `colours` colours: an index past them, the transparent one, or a pixel off the canvas left as it
-/// is. `fw` × `fh` indices at most; where its data ends or is not LZW, the rest of the rect left as it is.
-fn GifDecoder::lzw_draw(self : GifDecoder, p : Int, fx : Int, fy : Int, fw : Int, fh : Int, rows : Array[Int], table : FixedArray[Int], colours : Int) -> Unit {
+/// drawn as they come onto the canvas, its rect `fx`, `fy`, `fw` by `fh` (`interlaced`: whether lines are interlaced),
+/// in `(tr, tg, tb)`'s first `colours` colours: an index past them, the transparent one, or a pixel off the canvas left
+/// as it is. `fw` × `fh` indices at most; where its data ends or is not LZW, the rest of the rect left as it is.
+fn GifDecoder::lzw_draw(
+  self : GifDecoder,
+  p : Int,
+  fx : Int,
+  fy : Int,
+  fw : Int,
+  fh : Int,
+  interlaced : Bool,
+  tr : FixedArray[Byte],
+  tg : FixedArray[Byte],
+  tb : FixedArray[Byte],
+  colours : Int,
+) -> Unit {
   let data = self.data
   let n = data.length()
   let min_code = gif_u8(data, p)
@@ -365,6 +396,8 @@ fn GifDecoder::lzw_draw(self : GifDecoder, p : Int, fx : Int, fy : Int, fw : Int
     first[k] = k
   }
   let mut size = min_code + 1
+  let mut mask = (1 << size) - 1
+  let mut max_next = 1 << size
   let mut next = end + 1
   let mut prev = -1
   let mut bits = 0
@@ -374,39 +407,41 @@ fn GifDecoder::lzw_draw(self : GifDecoder, p : Int, fx : Int, fy : Int, fw : Int
   let mut left = 0
   // where the next index goes: its line of data `r`, `x` along it; its row's first pixel on the canvas (-1: below it)
   // and how many of its pixels are on the canvas
+  let rows : Array[Int] = if interlaced { interlace_rows(fh, true) } else { [] }
   let mut r = 0
   let mut x = 0
-  let row_at = fn(r : Int) {
-    let y = fy + rows[r]
-    if y < h {
-      (y * w + fx) * 4
-    } else {
-      -1
-    }
+  let across = if fx < w { imin(fw, w - fx) } else { 0 }
+  let mut o = if !interlaced {
+    if fy < h { (fy * w + fx) * 4 } else { -1 }
+  } else {
+    let y = fy + rows[0]
+    if y < h { (y * w + fx) * 4 } else { -1 }
   }
-  let mut o = row_at(0)
-  let across = imin(fw, w - fx)
   while r < fh {
-    if left == 0 {
-      if q >= n || data[q] == 0.to_byte() {
+    while bits < size {
+      if left == 0 {
+        if q >= n || data[q] == 0.to_byte() {
+          return
+        }
+        left = data[q].to_int()
+        q = q + 1
+      }
+      if q >= n {
         return
       }
-      left = data[q].to_int()
+      acc = acc | (data[q].to_int() << bits)
       q = q + 1
+      left = left - 1
+      bits = bits + 8
     }
-    if q >= n {
-      return
-    }
-    acc = acc | (data[q].to_int() << bits)
-    q = q + 1
-    left = left - 1
-    bits = bits + 8
     while bits >= size && r < fh {
-      let code = acc & ((1 << size) - 1)
+      let code = acc & mask
       acc = acc >> size
       bits = bits - size
       if code == clear {
         size = min_code + 1
+        mask = (1 << size) - 1
+        max_next = 1 << size
         next = end + 1
         prev = -1
         continue
@@ -432,22 +467,47 @@ fn GifDecoder::lzw_draw(self : GifDecoder, p : Int, fx : Int, fy : Int, fw : Int
       }
       let head = stack[top - 1]
       while top > 0 && r < fh {
-        top = top - 1
-        let ci = stack[top]
-        if o >= 0 && x < across && ci != transparent && ci < colours {
-          let rgb = table[ci]
-          let k = o + x * 4
-          canvas[k] = ((rgb >> 16) & 0xFF).to_byte()
-          canvas[k + 1] = ((rgb >> 8) & 0xFF).to_byte()
-          canvas[k + 2] = (rgb & 0xFF).to_byte()
-          canvas[k + 3] = 255.to_byte()
+        if o >= 0 && x < across {
+          let run = imin(top, across - x)
+          let mut k = o + x * 4
+          let end_top = top - run
+          if transparent < 0 {
+            while top > end_top {
+              top = top - 1
+              let ci = stack[top]
+              if ci < colours {
+                canvas[k] = tr[ci]
+                canvas[k + 1] = tg[ci]
+                canvas[k + 2] = tb[ci]
+                canvas[k + 3] = 255.to_byte()
+              }
+              k = k + 4
+            }
+          } else {
+            while top > end_top {
+              top = top - 1
+              let ci = stack[top]
+              if ci != transparent && ci < colours {
+                canvas[k] = tr[ci]
+                canvas[k + 1] = tg[ci]
+                canvas[k + 2] = tb[ci]
+                canvas[k + 3] = 255.to_byte()
+              }
+              k = k + 4
+            }
+          }
+          x = x + run
+        } else {
+          let skip = imin(top, fw - x)
+          top = top - skip
+          x = x + skip
         }
-        x = x + 1
         if x == fw {
           x = 0
           r = r + 1
           if r < fh {
-            o = row_at(r)
+            let y = if !interlaced { fy + r } else { fy + rows[r] }
+            o = if y < h { (y * w + fx) * 4 } else { -1 }
           }
         }
       }
@@ -456,8 +516,10 @@ fn GifDecoder::lzw_draw(self : GifDecoder, p : Int, fx : Int, fy : Int, fw : Int
         suffix[next] = head
         first[next] = first[prev]
         next = next + 1
-        if next == (1 << size) && size < 12 {
+        if next == max_next && size < 12 {
           size = size + 1
+          mask = (1 << size) - 1
+          max_next = 1 << size
         }
       }
       prev = code
@@ -485,9 +547,10 @@ pub fn gif_frames(data : Bytes) -> Option[GifFrames] {
 }
 
 ///|
-/// A GIF that moves, handed over (add_image): each frame's key (`key#<n>`, its pixels as a PNG the host decodes as any
-/// picture) and when in its cycle it ends (ms, the frames' lengths summed); which frames are made (their bytes in
-/// image_data), and the decoder that makes the rest, let go once none is left.
+/// A GIF that moves, handed over (add_image): each frame's key (`key#<n>`, its pixels as `MBRAWPRE` premultiplied RGBA
+/// — falling back to PNG when either side exceeds 16384 — that the host decodes as any picture) and when in its cycle it
+/// ends (ms, the frames' lengths summed); which frames are made (their bytes in image_data), and the decoder that makes
+/// the rest, let go once none is left.
 struct GifCycle {
   keys : Array[String]
   ends : Array[Double]
@@ -659,7 +722,9 @@ fn add_gif(key : String, data : Bytes) -> Bool {
 ///|
 /// Frame `k` made, where it is not yet: its decoder taken on to it (the frames on the way decoded onto its canvas, not
 /// made; begun again from the first where it is past it, or made again from its GIF where it was let go of:
-/// trim_gif_frames), its pixels made a PNG in image_data, said to be here. The decoder let go once every frame is made.
+/// trim_gif_frames), its pixels packed as `MBRAWPRE` premultiplied RGBA8888 (GIF alpha is binary 0/255 so straight ==
+/// premultiplied, avoiding UI-thread PNG checksums and host PNG decoding; falls back to `png_of` if either side exceeds
+/// 16384), put in image_data, and said to be here. The decoder let go once every frame is made.
 fn GifCycle::make(self : GifCycle, k : Int) -> Unit {
   if self.made[k] {
     return
@@ -679,14 +744,17 @@ fn GifCycle::make(self : GifCycle, k : Int) -> Unit {
   while d.decoded < k + 1 && d.next() {
     ()
   }
-  let png = png_of(d.w, d.h, d.canvas)
+  let encoded = match raw_premul_of(d.w, d.h, d.canvas) {
+    Some(raw) => raw
+    Option::None => png_of(d.w, d.h, d.canvas)
+  }
   if t0 >= 0.0 {
     hostapi::work_took("gif frame", hostapi::work_began() - t0)
   }
-  image_data.set(self.keys[k], png)
-  self.frame_bytes[k] = png.length()
+  image_data.set(self.keys[k], encoded)
+  self.frame_bytes[k] = encoded.length()
   if k > 0 {
-    gif_expanded_bytes.v = gif_expanded_bytes.v + png.length()
+    gif_expanded_bytes.v = gif_expanded_bytes.v + encoded.length()
   }
   self.made[k] = true
   self.unmade = self.unmade - 1
