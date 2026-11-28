@@ -1173,6 +1173,37 @@ fn box_corner_smoothness(r : Double, w : Double, h : Double) -> Double {
   paint::smoothness(dmin(r, room), room)
 }
 
+/// A box's edge drawn over what it holds (as mbui's view_host drew it, when the box closed): where anything was drawn
+/// after its ground instance `g` (its image, words, rects or its children), the ground keeps only its fill and a copy of
+/// it, the edge alone in the edge's own colour, goes on top, cut as the ground was (its clip, corners, turn).
+fn edge_over_held(scene : Scene, g : Int, ecol : Int64, alpha : Double) -> Unit {
+  if scene.ninst <= g + 1 {
+    return
+  }
+  let gb = g * inst_size
+  let idx = scene.ninst
+  let db = idx * inst_size
+  scene.ensure_inst_len(db + inst_size)
+  let mut f = 0
+  while f < inst_size {
+    scene.inst[db + f] = scene.inst[gb + f]
+    f += 1
+  }
+  scene.inst[gb + 6] = 0.0
+  scene.inst[db + 8] = 0.0
+  scene.inst[db + 9] = 0.0
+  scene.inst[db + 10] = 0.0
+  scene.inst[db + 11] = 0.0
+  let (r, gg, b, a) = color_rgba_tuple(ecol, alpha)
+  scene.inst[db + 12] = r
+  scene.inst[db + 13] = gg
+  scene.inst[db + 14] = b
+  scene.inst[db + 15] = a
+  scene.ninst = idx + 1
+  scene.glass_run_start = -1
+  scene.glass_run_len = 0
+}
+
 fn intersect_clip(
   a_clip : (Double, Double, Double, Double),
   a_rc : (Double, Double, Double, Double, Double, Double, Double, Double),
@@ -1189,8 +1220,10 @@ fn intersect_clip(
   let ny1 = dmin(ay1, by1)
   let eps = 0.01
   let (bw, bh) = (bx1 - bx0, by1 - by0)
+  // (each corner at most the box's shorter half, as its ground is drawn)
+  let half = dmax(0.0, dmin(bw, bh) / 2.0)
   let b_rc = (
-    b_r.0, b_r.1, b_r.2, b_r.3,
+    dmin(b_r.0, half), dmin(b_r.1, half), dmin(b_r.2, half), dmin(b_r.3, half),
     box_corner_smoothness(b_r.0, bw, bh),
     box_corner_smoothness(b_r.1, bw, bh),
     box_corner_smoothness(b_r.2, bw, bh),
@@ -3436,11 +3469,19 @@ fn encode_held_tree(
   let glass_open : Array[Int] = []
   let lens_open : Array[LensOpenFrame] = []
   let deferred_over_scrim : Array[DeferredOverScrim] = []
+  // (boxes with an edge still open: their ground instance, the edge's colour and alpha; see edge_over_held)
+  let edge_open : Array[(view::NodeId, Int, Int64, Double)] = []
   let mut i = 0
   while i < n {
     let (d, holder, _) = held[i]
     while fading.length() > 0 && !tree.holds_in_order(fading[fading.length() - 1].0, d.id) {
       let _ = fading.pop()
+    }
+    while edge_open.length() > 0 && !tree.holds_in_order(edge_open[edge_open.length() - 1].0, d.id) {
+      match edge_open.pop() {
+        Some((_, g, ecol, ea)) => edge_over_held(scene, g, ecol, ea)
+        None => ()
+      }
     }
     close_optical_while(scene, tree, blur_stack, lens_open, deferred_shadows, fading, Some(d.id), None)
     while glass_open.length() > 0 && !tree.holds_in_order(glass_slots[glass_open[glass_open.length() - 1]].id, d.id) {
@@ -3558,6 +3599,15 @@ fn encode_held_tree(
       shadow_out,
       bypass_blocks=bypass_blocks,
     )
+    if mag.is_none() && d.glass.is_none() && d.edge.0 > 0.0 && (d.edge.1 & 0xFFL) != 0L {
+      let mut g = k0
+      while g < scene.ninst && !(scene.inst[g * inst_size + 5] == 0.0 && scene.inst[g * inst_size + 6] > 0.0) {
+        g += 1
+      }
+      if g < scene.ninst {
+        edge_open.push((d.id, g, d.edge.1, d.alpha))
+      }
+    }
     if d.glass.is_some() && !solid_now() {
       match d.glass {
         Some(gl) if gl.liquid && gl.layer > 0 && gl.strength > 0.001 => {
@@ -4173,6 +4223,12 @@ fn encode_held_tree(
         scene.ink_y = py
         scene.ink_r = pr
       }
+      None => ()
+    }
+  }
+  while edge_open.length() > 0 {
+    match edge_open.pop() {
+      Some((_, g, ecol, ea)) => edge_over_held(scene, g, ecol, ea)
       None => ()
     }
   }
