@@ -522,8 +522,8 @@ test "skia: lowp fast paths byte-exact equivalence with generic stage pipeline" 
     let ctx = Context::new()
     ctx.uniform_rgba = rgba
     ctx.current_coverage = cov
-    lowp_start(stages, r, aa, m_none, ctx, pm_fast.as_subpixmap())
-    lowp_start_generic(stages, r, aa, m_none, ctx, pm_ref.as_subpixmap())
+    lowp_start(stages, r, aa, m_none, ctx, pm_fast.as_subpixmap(), PipelineScratch::new())
+    lowp_start_generic(stages, r, aa, m_none, ctx, pm_ref.as_subpixmap(), LowPScratch::new())
     assert_bytes_eq(pm_fast.data, pm_ref.data, label)
   }
 
@@ -535,8 +535,8 @@ test "skia: lowp fast paths byte-exact equivalence with generic stage pipeline" 
     let ctx = Context::new()
     ctx.uniform_rgba = rgba
     ctx.current_coverage = cov
-    lowp_start(stages, rect, aa_none, m_none, ctx, m_fast.as_subpixmap())
-    lowp_start_generic(stages, rect, aa_none, m_none, ctx, m_ref.as_subpixmap())
+    lowp_start(stages, rect, aa_none, m_none, ctx, m_fast.as_subpixmap(), PipelineScratch::new())
+    lowp_start_generic(stages, rect, aa_none, m_none, ctx, m_ref.as_subpixmap(), LowPScratch::new())
     assert_bytes_eq(m_fast.data, m_ref.data, label)
   }
 
@@ -635,4 +635,737 @@ test "skia: microbench 600x400 100x AA path + translucent rect" {
     pm.fill_path(circle, p_solid, FillRule::Winding, Transform::identity(), None)
   }
   debug_assert(unwrap_opt(pm.pixel(300, 200), "c").a == 255, "bench sanity")
+}
+
+// ── Bit-exact rasterization parity tests (highp, lowp, gradients, apply_mask, sampler, blitter cache, scratch isolation) ──
+
+test "skia: highp unnorm matches round_int reference on all byte boundaries and edge floats" {
+  let ref_unnorm = fn(v : Float) -> Int {
+    round_int(smin(smax(v, 0.0f), 1.0f) * 255.0f) & 0xFF
+  }
+  let inv255 : Float = 1.0f / 255.0f
+  for b in 0..=255 {
+    let f = fi(b) * inv255
+    debug_assert(unnorm(f) == b, "unnorm exact roundtrip")
+    debug_assert(unnorm(f) == ref_unnorm(f), "unnorm matches ref")
+  }
+  debug_assert(fi(255) * inv255 == 1.0f, "255 * inv255 == 1.0")
+  for k in 0..<255 {
+    let half = (fi(k) + 0.5f) / 255.0f
+    let b_bits = half.reinterpret_as_uint()
+    let prev = bits(b_bits - 1U)
+    let next = bits(b_bits + 1U)
+    debug_assert(unnorm(half) == ref_unnorm(half), "unnorm half")
+    debug_assert(unnorm(prev) == ref_unnorm(prev), "unnorm prev ulp")
+    debug_assert(unnorm(next) == ref_unnorm(next), "unnorm next ulp")
+  }
+  let edges : Array[Float] = [
+    -100.0f,
+    -0.5f,
+    -0.0f,
+    0.0f,
+    1.0f,
+    1.5f,
+    1000.0f,
+    bits(0x7f800000U),
+    bits(0xff800000U),
+    bits(0x7fc00000U),
+  ]
+  for v in edges {
+    debug_assert(unnorm(v) == ref_unnorm(v), "unnorm edge float")
+  }
+}
+
+test "skia: highp gather-translate fast paths byte-exact equivalence with generic stage pipeline" {
+  let sw = 19
+  let sh = 7
+  let src = unwrap_opt(Pixmap::new(sw, sh), "src")
+  for i in 0..<(sw * sh) {
+    let mode = i % 5
+    if mode == 0 {
+      src.data[i * 4] = b'\x00'
+      src.data[i * 4 + 1] = b'\x00'
+      src.data[i * 4 + 2] = b'\x00'
+      src.data[i * 4 + 3] = b'\x00'
+    } else if mode == 1 {
+      src.data[i * 4] = ((i * 41) % 256).to_byte()
+      src.data[i * 4 + 1] = ((i * 73) % 256).to_byte()
+      src.data[i * 4 + 2] = ((i * 97) % 256).to_byte()
+      src.data[i * 4 + 3] = b'\xFF'
+    } else if mode == 2 {
+      src.data[i * 4] = ((i * 29 + 1) % 256).to_byte()
+      src.data[i * 4 + 1] = ((i * 19 + 3) % 256).to_byte()
+      src.data[i * 4 + 2] = ((i * 11 + 5) % 256).to_byte()
+      src.data[i * 4 + 3] = b'\x00'
+    } else {
+      let a = 1 + (i * 53) % 254
+      src.data[i * 4] = ((i * 37) % (a + 1)).to_byte()
+      src.data[i * 4 + 1] = ((i * 61) % (a + 1)).to_byte()
+      src.data[i * 4 + 2] = ((i * 89) % (a + 1)).to_byte()
+      src.data[i * 4 + 3] = a.to_byte()
+    }
+  }
+  let dw = 25
+  let dh = 11
+  let rect = unwrap_opt(ScreenIntRect::from_xywh(1, 1, 23, 9), "rect")
+
+  let check = fn(stages : Array[Stage], ts : Transform, cov : Float, empty_dst : Bool, label : String) -> Unit {
+    let dst_fast = unwrap_opt(Pixmap::new(dw, dh), "df")
+    let dst_ref = unwrap_opt(Pixmap::new(dw, dh), "dr")
+    if !empty_dst {
+      fill_pattern_pixmap(dst_fast)
+      fill_pattern_pixmap(dst_ref)
+    }
+    let ctx = Context::new()
+    ctx.transform = ts
+    ctx.current_coverage = cov
+    highp_start(stages, rect, aa_mask_none, mask_none, ctx, src, dst_fast.as_subpixmap(), PipelineScratch::new())
+    highp_start_generic(stages, rect, aa_mask_none, mask_none, ctx, src, dst_ref.as_subpixmap(), HighPScratch::new())
+    assert_bytes_eq(dst_fast.data, dst_ref.data, label)
+  }
+
+  let id = Transform::identity()
+  let translations : Array[Transform] = [
+    Transform::from_translate(0.0f, 0.0f),
+    Transform::from_translate(-5.0f, -3.0f),
+    Transform::from_translate(4.0f, 2.0f),
+    Transform::from_translate(-30.0f, 15.0f),
+    Transform::from_translate(2.5f, -1.25f),
+  ]
+
+  for empty_dst in [false, true] {
+    check([Stage::SeedShader, Stage::Gather, Stage::Store], id, 1.0f, empty_dst, "gather store")
+    check([Stage::SeedShader, Stage::Gather, Stage::SourceOverRgba], id, 1.0f, empty_dst, "gather srcover")
+    check([Stage::SeedShader, Stage::Gather, Stage::Scale1Float, Stage::Store], id, 0.63f, empty_dst, "gather scale store")
+    check([Stage::SeedShader, Stage::Gather, Stage::Scale1Float, Stage::SourceOverRgba], id, 0.63f, empty_dst, "gather scale srcover")
+    check([Stage::SeedShader, Stage::Gather, Stage::Scale1Float, Stage::SourceOverRgba], id, 0.0f, empty_dst, "gather scale 0")
+    for ts in translations {
+      check([Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Store], ts, 1.0f, empty_dst, "ts gather store")
+      check([Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::SourceOverRgba], ts, 1.0f, empty_dst, "ts gather srcover")
+      check([Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Scale1Float, Stage::Store], ts, 0.47f, empty_dst, "ts gather scale store")
+      check([Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Scale1Float, Stage::SourceOverRgba], ts, 0.47f, empty_dst, "ts gather scale srcover")
+    }
+  }
+
+  // Self-aliasing fallback must match generic exactly
+  let self_fast = unwrap_opt(Pixmap::new(sw, sh), "sf")
+  let self_ref = unwrap_opt(Pixmap::new(sw, sh), "sr")
+  fill_pattern_pixmap(self_fast)
+  fill_pattern_pixmap(self_ref)
+  let ctx_alias = Context::new()
+  ctx_alias.transform = Transform::from_translate(-2.0f, 0.0f)
+  let r_alias = unwrap_opt(ScreenIntRect::from_xywh(0, 0, sw, sh), "ra")
+  highp_start([Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Store], r_alias, aa_mask_none, mask_none, ctx_alias, self_fast, self_fast.as_subpixmap(), PipelineScratch::new())
+  highp_start_generic([Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Store], r_alias, aa_mask_none, mask_none, ctx_alias, self_ref, self_ref.as_subpixmap(), HighPScratch::new())
+  assert_bytes_eq(self_fast.data, self_ref.data, "self-aliasing gather")
+}
+
+test "skia: highp gather-translate edge cases (subpixmap, non-unit cov, 1x1/1x5/5x1 src)" {
+  let src = unwrap_opt(Pixmap::new(9, 5), "s9x5")
+  fill_pattern_pixmap(src)
+  let backing_fast = unwrap_opt(Pixmap::new(30, 14), "bf")
+  let backing_ref = unwrap_opt(Pixmap::new(30, 14), "br")
+  fill_pattern_pixmap(backing_fast)
+  fill_pattern_pixmap(backing_ref)
+  let sub_rect = unwrap_opt(IntRect::from_xywh(4, 3, 19, 8), "subr")
+  let sub_fast = unwrap_opt(backing_fast.subpixmap(sub_rect), "sf")
+  let sub_ref = unwrap_opt(backing_ref.subpixmap(sub_rect), "sr")
+  let blit_rect = unwrap_opt(ScreenIntRect::from_xywh(1, 1, 17, 6), "br")
+  let covs : Array[Float] = [0.55f, -0.5f, 1.75f, bits(0x7fc00000U)]
+  for cov in covs {
+    for stages in [
+      [Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Scale1Float, Stage::Store],
+      [Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Scale1Float, Stage::SourceOverRgba],
+    ] {
+      let ctx = Context::new()
+      ctx.transform = Transform::from_translate(-3.0f, -2.0f)
+      ctx.current_coverage = cov
+      highp_start(stages, blit_rect, aa_mask_none, mask_none, ctx, src, sub_fast, PipelineScratch::new())
+      highp_start_generic(stages, blit_rect, aa_mask_none, mask_none, ctx, src, sub_ref, HighPScratch::new())
+      assert_bytes_eq(backing_fast.data, backing_ref.data, "subpixmap gather")
+    }
+  }
+
+  for dims in [(1, 1), (1, 5), (5, 1)] {
+    let (sw, sh) = dims
+    let s = unwrap_opt(Pixmap::new(sw, sh), "s")
+    fill_pattern_pixmap(s)
+    let df = unwrap_opt(Pixmap::new(11, 7), "df")
+    let dr = unwrap_opt(Pixmap::new(11, 7), "dr")
+    fill_pattern_pixmap(df)
+    fill_pattern_pixmap(dr)
+    let ctx = Context::new()
+    ctx.transform = Transform::from_translate(-2.0f, -1.0f)
+    ctx.current_coverage = 0.65f
+    let r = unwrap_opt(ScreenIntRect::from_xywh(0, 0, 11, 7), "r")
+    for stages in [
+      [Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Store],
+      [Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::SourceOverRgba],
+      [Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Scale1Float, Stage::SourceOverRgba],
+    ] {
+      highp_start(stages, r, aa_mask_none, mask_none, ctx, s, df.as_subpixmap(), PipelineScratch::new())
+      highp_start_generic(stages, r, aa_mask_none, mask_none, ctx, s, dr.as_subpixmap(), HighPScratch::new())
+      assert_bytes_eq(df.data, dr.data, "1xN gather")
+    }
+  }
+}
+
+test "skia: Pixmap::apply_mask direct loop matches DestinationIn lowp math byte-for-byte" {
+  let w = 23
+  let h = 5
+  let pm_fast = unwrap_opt(Pixmap::new(w, h), "pf")
+  let pm_ref = unwrap_opt(Pixmap::new(w, h), "pr")
+  fill_pattern_pixmap(pm_fast)
+  fill_pattern_pixmap(pm_ref)
+  let mask = unwrap_opt(Mask::new(w, h), "m")
+  for i in 0..<(w * h) {
+    mask.data[i] = match i % 4 {
+      0 => b'\x00'
+      1 => b'\xFF'
+      _ => ((i * 53 + 17) % 256).to_byte()
+    }
+  }
+  pm_fast.apply_mask(mask)
+  for i in 0..<(w * h) {
+    let sa = mask.data[i].to_int()
+    let o = i * 4
+    pm_ref.data[o] = (div255(mul16(pm_ref.data[o].to_int(), sa)) & 0xFF).to_byte()
+    pm_ref.data[o + 1] = (div255(mul16(pm_ref.data[o + 1].to_int(), sa)) & 0xFF).to_byte()
+    pm_ref.data[o + 2] = (div255(mul16(pm_ref.data[o + 2].to_int(), sa)) & 0xFF).to_byte()
+    pm_ref.data[o + 3] = (div255(mul16(pm_ref.data[o + 3].to_int(), sa)) & 0xFF).to_byte()
+  }
+  assert_bytes_eq(pm_fast.data, pm_ref.data, "apply_mask parity")
+}
+
+test "skia: Pixmap::draw_pixmap identity-transform fast path matches generic highp pipeline byte-for-byte" {
+  let src = unwrap_opt(Pixmap::new(17, 9), "src")
+  fill_pattern_pixmap(src)
+  for i in 0..<17 {
+    src.data[i * 4] = b'\x00'
+    src.data[i * 4 + 1] = b'\x00'
+    src.data[i * 4 + 2] = b'\x00'
+    src.data[i * 4 + 3] = b'\x00'
+  }
+  let modes : Array[BlendMode] = [BlendMode::SourceOver, BlendMode::Source]
+  let opacities : Array[Float] = [1.0f, 0.55f, 0.0f]
+  let offsets : Array[(Int, Int)] = [(0, 0), (5, 3), (-4, -2), (18, 6)]
+  for mode in modes {
+    for opacity in opacities {
+      for off in offsets {
+        let (ox, oy) = off
+        let dst_fast = unwrap_opt(Pixmap::new(25, 13), "df")
+        let dst_ref = unwrap_opt(Pixmap::new(25, 13), "dr")
+        fill_pattern_pixmap(dst_fast)
+        fill_pattern_pixmap(dst_ref)
+        let pp = PixmapPaint::{ opacity: opacity, blend_mode: mode, quality: FilterQuality::Bilinear }
+        dst_fast.draw_pixmap(ox, oy, src, pp, Transform::identity(), None)
+        let pb = RasterPipelineBuilder::new()
+        let patt = Pattern::new(src, SpreadMode::Pad, FilterQuality::Bilinear, opacity, Transform::from_translate(fi(ox), fi(oy)))
+        debug_assert(patt.push_stages(ColorSpace::Linear, pb), "pattern push_stages")
+        if mode == BlendMode::SourceOver {
+          pb.push(Stage::SourceOverRgba)
+        } else {
+          pb.push(Stage::Store)
+        }
+        let rp = pb.compile()
+        debug_assert(!rp.low, "pattern pipeline is highp")
+        let src_rect = src.size().to_int_rect(ox, oy)
+        let dst_bounds = dst_ref.size().to_screen_int_rect(0, 0).to_int_rect()
+        match src_rect.intersect(dst_bounds) {
+          Some(ir) =>
+            match ir.to_screen_int_rect() {
+              Some(sr) => highp_start_generic(rp.stages, sr, aa_mask_none, mask_none, rp.ctx, src, dst_ref.as_subpixmap(), HighPScratch::new())
+              None => ()
+            }
+          None => ()
+        }
+        assert_bytes_eq(dst_fast.data, dst_ref.data, "draw_pixmap fast path parity")
+      }
+    }
+  }
+}
+
+fn ref_sampler(
+  src : Pixmap,
+  ctx : Context,
+  n : Int,
+  r : FixedArray[Float],
+  g : FixedArray[Float],
+  b : FixedArray[Float],
+  a : FixedArray[Float],
+) -> Unit {
+  let cx = FixedArray::make(8, 0.0f)
+  let cy = FixedArray::make(8, 0.0f)
+  for i in 0..<8 {
+    cx[i] = r[i]
+    cy[i] = g[i]
+  }
+  let wx : Array[FixedArray[Float]] = []
+  let wy : Array[FixedArray[Float]] = []
+  for _ in 0..<n {
+    wx.push(FixedArray::make(8, 0.0f))
+    wy.push(FixedArray::make(8, 0.0f))
+  }
+  for i in 0..<8 {
+    let fx = (cx[i] + 0.5f) - lfloor(cx[i] + 0.5f)
+    let fy = (cy[i] + 0.5f) - lfloor(cy[i] + 0.5f)
+    if n == 2 {
+      wx[0][i] = 1.0f - fx
+      wx[1][i] = fx
+      wy[0][i] = 1.0f - fy
+      wy[1][i] = fy
+    } else {
+      wx[0][i] = bicubic_far(1.0f - fx)
+      wx[1][i] = bicubic_near(1.0f - fx)
+      wx[2][i] = bicubic_near(fx)
+      wx[3][i] = bicubic_far(fx)
+      wy[0][i] = bicubic_far(1.0f - fy)
+      wy[1][i] = bicubic_near(1.0f - fy)
+      wy[2][i] = bicubic_near(fy)
+      wy[3][i] = bicubic_far(fy)
+    }
+  }
+  for i in 0..<8 {
+    r[i] = 0.0f
+    g[i] = 0.0f
+    b[i] = 0.0f
+    a[i] = 0.0f
+  }
+  let start : Float = if n == 2 { -0.5f } else { -1.5f }
+  let ys = FixedArray::make(8, 0.0f)
+  for i in 0..<8 {
+    ys[i] = cy[i] + start
+  }
+  let w_ulp = ulp_sub(fi(src.width))
+  let h_ulp = ulp_sub(fi(src.height))
+  let inv255 : Float = 1.0f / 255.0f
+  for j in 0..<n {
+    let xs = FixedArray::make(8, 0.0f)
+    for i in 0..<8 {
+      xs[i] = cx[i] + start
+    }
+    for k in 0..<n {
+      for i in 0..<8 {
+        let tx = tile(xs[i], ctx.sampler_spread, fi(src.width), ctx.sampler_inv_width)
+        let ty = tile(ys[i], ctx.sampler_spread, fi(src.height), ctx.sampler_inv_height)
+        let x = smin(smax(tx, 0.0f), w_ulp)
+        let y = smin(smax(ty, 0.0f), h_ulp)
+        let o = (trunc_int(y) * src.width + trunc_int(x)) * 4
+        let w = wx[k][i] * wy[j][i]
+        r[i] = w * (fi(src.data[o].to_int()) * inv255) + r[i]
+        g[i] = w * (fi(src.data[o + 1].to_int()) * inv255) + g[i]
+        b[i] = w * (fi(src.data[o + 2].to_int()) * inv255) + b[i]
+        a[i] = w * (fi(src.data[o + 3].to_int()) * inv255) + a[i]
+        xs[i] = xs[i] + 1.0f
+      }
+    }
+    for i in 0..<8 {
+      ys[i] = ys[i] + 1.0f
+    }
+  }
+}
+
+test "skia: highp allocation-free sampler matches reference bit-for-bit across Pad/Repeat/Reflect and tails" {
+  let src = unwrap_opt(Pixmap::new(8, 7), "src")
+  fill_pattern_pixmap(src)
+  let spreads : Array[SpreadMode] = [SpreadMode::Pad, SpreadMode::Repeat, SpreadMode::Reflect]
+  let ts = unwrap_opt(Transform::from_scale(1.7f, 1.3f).post_rotate(15.0f).invert(), "inv")
+  let pm = unwrap_opt(Pixmap::new(19, 13), "pm")
+  for spread in spreads {
+    for n in [2, 4] {
+      for tail in [1, 3, 5, 8] {
+        let ctx = Context::new()
+        ctx.sampler_spread = spread
+        ctx.sampler_inv_width = 1.0f / fi(src.width)
+        ctx.sampler_inv_height = 1.0f / fi(src.height)
+        ctx.transform = ts
+        let r = FixedArray::make(8, 0.0f)
+        let g = FixedArray::make(8, 0.0f)
+        let b = FixedArray::make(8, 0.0f)
+        let a = FixedArray::make(8, 0.0f)
+        let rr = FixedArray::make(8, 0.0f)
+        let rg = FixedArray::make(8, 0.0f)
+        let rb = FixedArray::make(8, 0.0f)
+        let ra = FixedArray::make(8, 0.0f)
+        for i in 0..<8 {
+          let sx = fi(3 + i) + 0.5f
+          let sy = fi(5) + 0.5f
+          let tx = sx * ts.sx + (sy * ts.kx + ts.tx)
+          let ty = sx * ts.ky + (sy * ts.sy + ts.ty)
+          r[i] = tx
+          g[i] = ty
+          rr[i] = tx
+          rg[i] = ty
+        }
+        let sc = HighPScratch::new()
+        let p = HighP::{
+          r: r,
+          g: g,
+          b: b,
+          a: a,
+          dr: sc.dr,
+          dg: sc.dg,
+          db: sc.db,
+          da: sc.da,
+          mask_c: sc.mask_c,
+          cx: sc.cx,
+          cy: sc.cy,
+          xs: sc.xs,
+          ys: sc.ys,
+          wx: sc.wx,
+          wy: sc.wy,
+          tail: tail,
+          dx: 3,
+          dy: 5,
+          ctx: ctx,
+          mask_ctx: mask_none,
+          aa_mask_ctx: aa_mask_none,
+          src: src,
+          dst: pm.as_subpixmap(),
+        }
+        p.sampler(n)
+        ref_sampler(src, ctx, n, rr, rg, rb, ra)
+        for i in 0..<tail {
+          debug_assert(p.r[i].reinterpret_as_uint() == rr[i].reinterpret_as_uint(), "sampler r bit-exact")
+          debug_assert(p.g[i].reinterpret_as_uint() == rg[i].reinterpret_as_uint(), "sampler g bit-exact")
+          debug_assert(p.b[i].reinterpret_as_uint() == rb[i].reinterpret_as_uint(), "sampler b bit-exact")
+          debug_assert(p.a[i].reinterpret_as_uint() == ra[i].reinterpret_as_uint(), "sampler a bit-exact")
+        }
+      }
+    }
+  }
+}
+
+test "skia: lowp gradient fast paths byte-exact equivalence with generic stage pipeline" {
+  let w = 29
+  let h = 11
+  let rect = unwrap_opt(ScreenIntRect::from_xywh(1, 1, 27, 9), "r27x9")
+  let spreads : Array[SpreadMode] = [SpreadMode::Pad, SpreadMode::Reflect, SpreadMode::Repeat]
+  let stops_2_opaque : Array[GradientStop] = [
+    GradientStop::new(0.0f, Color::from_rgba8(240, 60, 20, 255)),
+    GradientStop::new(1.0f, Color::from_rgba8(20, 140, 250, 255)),
+  ]
+  let stops_2_alpha : Array[GradientStop] = [
+    GradientStop::new(0.0f, Color::from_rgba8(240, 60, 20, 80)),
+    GradientStop::new(1.0f, Color::from_rgba8(20, 140, 250, 220)),
+  ]
+  let stops_4_alpha : Array[GradientStop] = [
+    GradientStop::new(0.0f, Color::from_rgba8(255, 0, 0, 0)),
+    GradientStop::new(0.25f, Color::from_rgba8(255, 200, 0, 140)),
+    GradientStop::new(0.7f, Color::from_rgba8(0, 220, 120, 255)),
+    GradientStop::new(1.0f, Color::from_rgba8(40, 60, 255, 190)),
+  ]
+  let stops_4_opaque : Array[GradientStop] = [
+    GradientStop::new(0.0f, Color::from_rgba8(255, 30, 10, 255)),
+    GradientStop::new(0.3f, Color::from_rgba8(255, 220, 40, 255)),
+    GradientStop::new(0.65f, Color::from_rgba8(20, 200, 140, 255)),
+    GradientStop::new(1.0f, Color::from_rgba8(30, 50, 240, 255)),
+  ]
+
+  let check_shader = fn(shader : Shader, blend : BlendMode, cov : Float, is_aa_edge : Bool, label : String) -> Unit {
+    let pb = RasterPipelineBuilder::new()
+    debug_assert(shader.push_stages(ColorSpace::Linear, pb), label + " push_stages")
+    if is_aa_edge {
+      if blend.should_pre_scale_coverage() {
+        pb.push(Stage::Scale1Float)
+        pb.push(Stage::LoadDestination)
+        match blend.to_stage() {
+          Some(s) => pb.push(s)
+          None => ()
+        }
+      } else {
+        pb.push(Stage::LoadDestination)
+        match blend.to_stage() {
+          Some(s) => pb.push(s)
+          None => ()
+        }
+        pb.push(Stage::Lerp1Float)
+      }
+      pb.push(Stage::Store)
+    } else if blend == BlendMode::SourceOver {
+      pb.push(Stage::SourceOverRgba)
+    } else {
+      pb.push(Stage::Store)
+    }
+    let rp = pb.compile()
+    debug_assert(rp.low, label + " must be lowp")
+    rp.ctx.current_coverage = cov
+    let pm_fast = unwrap_opt(Pixmap::new(w, h), "pf")
+    let pm_ref = unwrap_opt(Pixmap::new(w, h), "pr")
+    fill_pattern_pixmap(pm_fast)
+    fill_pattern_pixmap(pm_ref)
+    lowp_start(rp.stages, rect, aa_mask_none, mask_none, rp.ctx, pm_fast.as_subpixmap(), PipelineScratch::new())
+    lowp_start_generic(rp.stages, rect, aa_mask_none, mask_none, rp.ctx, pm_ref.as_subpixmap(), LowPScratch::new())
+    assert_bytes_eq(pm_fast.data, pm_ref.data, label)
+  }
+
+  let stop_sets = [stops_2_opaque, stops_2_alpha, stops_4_opaque, stops_4_alpha]
+  let lines : Array[(Point, Point)] = [
+    (Point::from_xy(2.0f, 5.0f), Point::from_xy(26.0f, 5.0f)),
+    (Point::from_xy(14.0f, 1.0f), Point::from_xy(14.0f, 10.0f)),
+    (Point::from_xy(2.0f, 2.0f), Point::from_xy(25.0f, 9.0f)),
+  ]
+
+  for spread in spreads {
+    for stops in stop_sets {
+      for seg in lines {
+        let (p0, p1) = seg
+        let sh = unwrap_opt(LinearGradient::new(p0, p1, stops, spread, Transform::identity()), "lg")
+        check_shader(sh, BlendMode::Source, 1.0f, false, "linear src")
+        check_shader(sh, BlendMode::SourceOver, 1.0f, false, "linear srcover")
+        check_shader(sh, BlendMode::Source, 0.43f, true, "linear src aa")
+        check_shader(sh, BlendMode::SourceOver, 0.67f, true, "linear srcover aa")
+      }
+      let rsh = unwrap_opt(
+        RadialGradient::new(
+          Point::from_xy(14.0f, 5.5f),
+          0.0f,
+          Point::from_xy(14.0f, 5.5f),
+          10.0f,
+          stops,
+          spread,
+          Transform::identity(),
+        ),
+        "rg",
+      )
+      check_shader(rsh, BlendMode::Source, 1.0f, false, "radial src")
+      check_shader(rsh, BlendMode::SourceOver, 1.0f, false, "radial srcover")
+      check_shader(rsh, BlendMode::Source, 0.51f, true, "radial src aa")
+      check_shader(rsh, BlendMode::SourceOver, 0.79f, true, "radial srcover aa")
+    }
+  }
+}
+
+test "skia: multi-round repeated rendering scratch reuse has no cross-contamination" {
+  let circle = unwrap_opt(PathBuilder::from_circle(24.0f, 24.0f, 16.0f), "c")
+  let rect = unwrap_opt(Rect::from_xywh(4.0f, 4.0f, 40.0f, 40.0f), "r")
+  let stops = [
+    GradientStop::new(0.0f, Color::from_rgba8(255, 60, 20, 220)),
+    GradientStop::new(1.0f, Color::from_rgba8(20, 120, 255, 255)),
+  ]
+  let lg = unwrap_opt(
+    LinearGradient::new(Point::from_xy(0.0f, 0.0f), Point::from_xy(48.0f, 48.0f), stops, SpreadMode::Pad, Transform::identity()),
+    "lg",
+  )
+  let p_grad = Paint::default()
+  p_grad.shader = lg
+  p_grad.anti_alias = true
+
+  let p_solid = Paint::default()
+  p_solid.set_color_rgba8(40, 200, 90, 180)
+  p_solid.anti_alias = true
+
+  // Round 1: reference render of scene A
+  let pm_a1 = unwrap_opt(Pixmap::new(48, 48), "a1")
+  pm_a1.fill_rect(rect, p_grad, Transform::identity(), None)
+  pm_a1.fill_path(circle, p_solid, FillRule::Winding, Transform::identity(), None)
+
+  // Intervening renders of a different scene B at a larger size and different transform
+  let pm_b = unwrap_opt(Pixmap::new(96, 64), "b")
+  let p_b = Paint::default()
+  p_b.set_color_rgba8(255, 0, 255, 255)
+  p_b.anti_alias = true
+  pm_b.fill_path(circle, p_b, FillRule::EvenOdd, Transform::from_scale(2.0f, 1.3f), None)
+
+  // Round 2: re-render scene A; must be byte-identical to Round 1
+  let pm_a2 = unwrap_opt(Pixmap::new(48, 48), "a2")
+  pm_a2.fill_rect(rect, p_grad, Transform::identity(), None)
+  pm_a2.fill_path(circle, p_solid, FillRule::Winding, Transform::identity(), None)
+  assert_bytes_eq(pm_a1.data, pm_a2.data, "scratch reuse parity across rounds")
+
+  // Sequential HighP (force_hq_pipeline = true) multi-round scratch reuse
+  let p_hq_a = Paint::default()
+  p_hq_a.shader = lg
+  p_hq_a.anti_alias = true
+  p_hq_a.force_hq_pipeline = true
+  let p_hq_b = Paint::default()
+  p_hq_b.set_color_rgba8(180, 30, 210, 140)
+  p_hq_b.anti_alias = true
+  p_hq_b.force_hq_pipeline = true
+
+  let hq_a1 = unwrap_opt(Pixmap::new(48, 48), "hq_a1")
+  hq_a1.fill_rect(rect, p_hq_a, Transform::identity(), None)
+  hq_a1.fill_path(circle, p_hq_b, FillRule::Winding, Transform::identity(), None)
+
+  let hq_mid = unwrap_opt(Pixmap::new(80, 56), "hq_mid")
+  hq_mid.fill_path(circle, p_hq_b, FillRule::EvenOdd, Transform::from_scale(1.8f, 1.2f), None)
+
+  let hq_a2 = unwrap_opt(Pixmap::new(48, 48), "hq_a2")
+  hq_a2.fill_rect(rect, p_hq_a, Transform::identity(), None)
+  hq_a2.fill_path(circle, p_hq_b, FillRule::Winding, Transform::identity(), None)
+  assert_bytes_eq(hq_a1.data, hq_a2.data, "HighP sequential multi-round scratch reuse parity")
+}
+
+test "skia: direct fast-path dispatch (highp_try_gather_translate & lowp_try_gradient) returns true and matches generic" {
+  // 1. Direct highp_try_gather_translate dispatch
+  let src = unwrap_opt(Pixmap::new(15, 9), "src")
+  fill_pattern_pixmap(src)
+  let dst_fast = unwrap_opt(Pixmap::new(23, 13), "df")
+  let dst_ref = unwrap_opt(Pixmap::new(23, 13), "dr")
+  fill_pattern_pixmap(dst_fast)
+  fill_pattern_pixmap(dst_ref)
+  let rect = unwrap_opt(ScreenIntRect::from_xywh(1, 1, 21, 11), "r")
+  let ctx = Context::new()
+  ctx.transform = Transform::from_translate(-3.0f, -2.0f)
+  ctx.current_coverage = 0.58f
+  let stages = [Stage::SeedShader, Stage::StTransform, Stage::Gather, Stage::Scale1Float, Stage::SourceOverRgba]
+  let hit_hp = highp_try_gather_translate(stages, rect, ctx, src, dst_fast.as_subpixmap())
+  debug_assert(hit_hp, "highp_try_gather_translate must dispatch fast path")
+  highp_start_generic(stages, rect, aa_mask_none, mask_none, ctx, src, dst_ref.as_subpixmap(), HighPScratch::new())
+  assert_bytes_eq(dst_fast.data, dst_ref.data, "direct highp_try_gather_translate parity")
+
+  // 2. Direct lowp_try_gradient dispatch for both linear and concentric radial gradients
+  let stops = [
+    GradientStop::new(0.0f, Color::from_rgba8(240, 60, 20, 200)),
+    GradientStop::new(0.5f, Color::from_rgba8(40, 210, 120, 255)),
+    GradientStop::new(1.0f, Color::from_rgba8(20, 100, 250, 180)),
+  ]
+  let lg = unwrap_opt(
+    LinearGradient::new(Point::from_xy(2.0f, 2.0f), Point::from_xy(20.0f, 10.0f), stops, SpreadMode::Pad, Transform::identity()),
+    "lg",
+  )
+  let pb_l = RasterPipelineBuilder::new()
+  debug_assert(lg.push_stages(ColorSpace::Linear, pb_l), "lg push_stages")
+  pb_l.push(Stage::SourceOverRgba)
+  let rp_l = pb_l.compile()
+  let lg_fast = unwrap_opt(Pixmap::new(23, 13), "lg_f")
+  let lg_ref = unwrap_opt(Pixmap::new(23, 13), "lg_r")
+  fill_pattern_pixmap(lg_fast)
+  fill_pattern_pixmap(lg_ref)
+  let hit_lg = lowp_try_gradient(rp_l.stages, rect, rp_l.ctx, lg_fast.as_subpixmap())
+  debug_assert(hit_lg, "lowp_try_gradient linear must dispatch fast path")
+  lowp_start_generic(rp_l.stages, rect, aa_mask_none, mask_none, rp_l.ctx, lg_ref.as_subpixmap(), LowPScratch::new())
+  assert_bytes_eq(lg_fast.data, lg_ref.data, "direct lowp_try_gradient linear parity")
+
+  let rg = unwrap_opt(
+    RadialGradient::new(Point::from_xy(11.0f, 6.0f), 0.0f, Point::from_xy(11.0f, 6.0f), 9.0f, stops, SpreadMode::Reflect, Transform::identity()),
+    "rg",
+  )
+  let pb_r = RasterPipelineBuilder::new()
+  debug_assert(rg.push_stages(ColorSpace::Linear, pb_r), "rg push_stages")
+  pb_r.push(Stage::SourceOverRgba)
+  let rp_r = pb_r.compile()
+  let rg_fast = unwrap_opt(Pixmap::new(23, 13), "rg_f")
+  let rg_ref = unwrap_opt(Pixmap::new(23, 13), "rg_r")
+  fill_pattern_pixmap(rg_fast)
+  fill_pattern_pixmap(rg_ref)
+  let hit_rg = lowp_try_gradient(rp_r.stages, rect, rp_r.ctx, rg_fast.as_subpixmap())
+  debug_assert(hit_rg, "lowp_try_gradient radial must dispatch fast path")
+  lowp_start_generic(rp_r.stages, rect, aa_mask_none, mask_none, rp_r.ctx, rg_ref.as_subpixmap(), LowPScratch::new())
+  assert_bytes_eq(rg_fast.data, rg_ref.data, "direct lowp_try_gradient radial parity")
+}
+
+test "skia: RasterPipelineBlitter lazy pipeline cache and per-blitter PipelineScratch lifecycle" {
+  // Solid opaque paint: memset2d fast path never allocates scratch or pipeline caches
+  let pm_solid = unwrap_opt(Pixmap::new(16, 16), "pm_s")
+  let p_solid = Paint::default()
+  p_solid.set_color_rgba8(100, 150, 200, 255)
+  let b_solid = unwrap_opt(RasterPipelineBlitter::new(p_solid, None, pm_solid.as_subpixmap()), "bs")
+  debug_assert(b_solid.blit_rect_rp.is_none(), "solid init blit_rect_rp is None")
+  debug_assert(b_solid.blit_anti_h_rp.is_none(), "solid init blit_anti_h_rp is None")
+  debug_assert(b_solid.blit_mask_rp.is_none(), "solid init blit_mask_rp is None")
+  debug_assert(b_solid.scratch.is_none(), "solid init scratch is None")
+  b_solid.blit_rect(unwrap_opt(ScreenIntRect::from_xywh(2, 2, 10, 10), "r10"))
+  debug_assert(b_solid.scratch.is_none(), "solid memset2d allocates zero scratch")
+  debug_assert(b_solid.blit_rect_rp.is_none(), "solid memset2d keeps blit_rect_rp None")
+
+  // Gradient paint (non-memset2d): lazy pipeline & scratch allocation on first demand and reuse
+  let pm_grad = unwrap_opt(Pixmap::new(24, 24), "pm_g")
+  let stops = [
+    GradientStop::new(0.0f, Color::from_rgba8(220, 40, 30, 180)),
+    GradientStop::new(1.0f, Color::from_rgba8(30, 120, 240, 220)),
+  ]
+  let p_grad = Paint::default()
+  p_grad.shader = unwrap_opt(
+    LinearGradient::new(Point::from_xy(0.0f, 0.0f), Point::from_xy(24.0f, 24.0f), stops, SpreadMode::Pad, Transform::identity()),
+    "lg",
+  )
+  p_grad.force_hq_pipeline = true
+  let b_grad = unwrap_opt(RasterPipelineBlitter::new(p_grad, None, pm_grad.as_subpixmap()), "bg")
+  debug_assert(b_grad.blit_rect_rp.is_none() && b_grad.blit_anti_h_rp.is_none() && b_grad.blit_mask_rp.is_none() && b_grad.scratch.is_none(), "grad init all lazy caches None")
+
+  b_grad.blit_rect(unwrap_opt(ScreenIntRect::from_xywh(2, 2, 12, 8), "rg1"))
+  debug_assert(b_grad.blit_rect_rp.is_some(), "blit_rect populates blit_rect_rp")
+  debug_assert(b_grad.scratch.is_some(), "blit_rect populates scratch")
+  debug_assert(b_grad.blit_anti_h_rp.is_none() && b_grad.blit_mask_rp.is_none(), "untouched variants stay None")
+
+  // Second blit_rect reuses cached pipeline & scratch
+  b_grad.blit_rect(unwrap_opt(ScreenIntRect::from_xywh(4, 12, 12, 8), "rg2"))
+  debug_assert(b_grad.blit_rect_rp.is_some() && b_grad.scratch.is_some(), "cached rect pipeline and scratch reused")
+
+  let aa_arr = FixedArray::make(4, 128)
+  let runs_arr = FixedArray::make(4, 0)
+  runs_arr[0] = 3
+  runs_arr[3] = 0
+  b_grad.blit_anti_h(2, 10, aa_arr, runs_arr)
+  debug_assert(b_grad.blit_anti_h_rp.is_some(), "blit_anti_h populates blit_anti_h_rp")
+
+  let mask_rect = unwrap_opt(ScreenIntRect::from_xywh(6, 6, 2, 1), "mr")
+  b_grad.blit_mask((200, 100), mask_rect, 24, mask_rect)
+  debug_assert(b_grad.blit_mask_rp.is_some(), "blit_mask populates blit_mask_rp")
+}
+
+test "skia: interleaved 100-round HighP and LowP per-blitter scratch isolation (0/100 mismatches)" {
+  let rect_a = unwrap_opt(Rect::from_xywh(2.0f, 2.0f, 28.0f, 18.0f), "ra")
+  let rect_b = unwrap_opt(Rect::from_xywh(3.0f, 1.0f, 36.0f, 22.0f), "rb")
+  let stops_a = [
+    GradientStop::new(0.0f, Color::from_rgba8(240, 40, 20, 190)),
+    GradientStop::new(1.0f, Color::from_rgba8(20, 80, 240, 230)),
+  ]
+  let stops_b = [
+    GradientStop::new(0.0f, Color::from_rgba8(30, 230, 90, 160)),
+    GradientStop::new(1.0f, Color::from_rgba8(240, 210, 20, 250)),
+  ]
+  for force_hq in [false, true] {
+    let p_a = Paint::default()
+    p_a.shader = unwrap_opt(
+      LinearGradient::new(Point::from_xy(0.0f, 0.0f), Point::from_xy(32.0f, 24.0f), stops_a, SpreadMode::Pad, Transform::identity()),
+      "lga",
+    )
+    p_a.anti_alias = true
+    p_a.force_hq_pipeline = force_hq
+
+    let p_b = Paint::default()
+    p_b.shader = unwrap_opt(
+      LinearGradient::new(Point::from_xy(0.0f, 0.0f), Point::from_xy(44.0f, 28.0f), stops_b, SpreadMode::Reflect, Transform::identity()),
+      "lgb",
+    )
+    p_b.anti_alias = true
+    p_b.force_hq_pipeline = force_hq
+
+    let ref_a = unwrap_opt(Pixmap::new(32, 24), "ref_a")
+    ref_a.fill_rect(rect_a, p_a, Transform::identity(), None)
+    let ref_b = unwrap_opt(Pixmap::new(44, 28), "ref_b")
+    ref_b.fill_rect(rect_b, p_b, Transform::identity(), None)
+
+    let mut mismatches_a = 0
+    let mut mismatches_b = 0
+    for _ in 0..<100 {
+      let pm_a = unwrap_opt(Pixmap::new(32, 24), "pm_a")
+      let pm_b = unwrap_opt(Pixmap::new(44, 28), "pm_b")
+      pm_a.fill_rect(rect_a, p_a, Transform::identity(), None)
+      pm_b.fill_rect(rect_b, p_b, Transform::identity(), None)
+      let mut eq_a = true
+      for i in 0..<ref_a.data.length() {
+        if pm_a.data[i] != ref_a.data[i] {
+          eq_a = false
+          break
+        }
+      }
+      if !eq_a {
+        mismatches_a += 1
+      }
+      let mut eq_b = true
+      for i in 0..<ref_b.data.length() {
+        if pm_b.data[i] != ref_b.data[i] {
+          eq_b = false
+          break
+        }
+      }
+      if !eq_b {
+        mismatches_b += 1
+      }
+    }
+    debug_assert(mismatches_a == 0 && mismatches_b == 0, "0/100 mismatches across HighP/LowP isolation")
+  }
 }

@@ -456,3 +456,363 @@ test "svg: CSS Color 4 oklab() and oklch() parsing and rasterization" {
   let (gr1, gg1, gb1, ga1) = px_rgba(rgba, w, 59, 10)
   debug_assert(gr1 < 30 && gg1 < 30 && gb1 > 220 && ga1 == 255, "svg stop-color=oklab end blue")
 }
+
+// ── Bit-exact filter, box blur, drop-shadow LUT, premul & scratch reuse tests ──
+
+fn copy_bytes(src : FixedArray[Byte]) -> FixedArray[Byte] {
+  let out = FixedArray::make(src.length(), b'\x00')
+  for i in 0..<src.length() {
+    out[i] = src[i]
+  }
+  out
+}
+
+fn assert_svg_bytes_eq(a : FixedArray[Byte], b : FixedArray[Byte], label : String) -> Unit {
+  debug_assert(a.length() == b.length(), label + " length")
+  for i in 0..<a.length() {
+    debug_assert(a[i] == b[i], label + " byte mismatch at " + i.to_string())
+  }
+}
+
+fn ref_multiply_alpha(d : FixedArray[Byte]) -> Unit {
+  let n = d.length() / 4
+  for i in 0..<n {
+    let a = fi(d[i * 4 + 3].to_int()) / 255.0f
+    for k in 0..<3 {
+      d[i * 4 + k] = f2u8(fi(d[i * 4 + k].to_int()) * a + 0.5f).to_byte()
+    }
+  }
+}
+
+fn ref_demultiply_alpha(d : FixedArray[Byte]) -> Unit {
+  let n = d.length() / 4
+  for i in 0..<n {
+    let a = fi(d[i * 4 + 3].to_int()) / 255.0f
+    for k in 0..<3 {
+      d[i * 4 + k] = f2u8(fi(d[i * 4 + k].to_int()) / a + 0.5f).to_byte()
+    }
+  }
+}
+
+fn ref_map_rgb(d : FixedArray[Byte], table : FixedArray[Byte]) -> Unit {
+  let n = d.length() / 4
+  for i in 0..<n {
+    for k in 0..<3 {
+      d[i * 4 + k] = table[d[i * 4 + k].to_int()]
+    }
+  }
+}
+
+fn ref_box_blur_line(radius : Int, src : FixedArray[Byte], dst : FixedArray[Byte], start : Int, step : Int, count : Int) -> Unit {
+  let iarr : Float = 1.0f / fi(radius + radius + 1)
+  let line_end = start + step * (count - 1)
+  let mut ti = start
+  let mut li = ti
+  let mut ri = ti + radius * step
+  let mut vr = 0
+  let mut vg = 0
+  let mut vb = 0
+  let mut va = 0
+  let px = fn(i : Int, k : Int) -> Int { src[i * 4 + k].to_int() }
+  let lim = if radius < count { radius } else { count }
+  for j in 0..<lim {
+    let i = ti + j * step
+    vr += px(i, 0)
+    vg += px(i, 1)
+    vb += px(i, 2)
+    va += px(i, 3)
+  }
+  let n1 = if count < radius + 1 { count } else { radius + 1 }
+  for _ in 0..<n1 {
+    if ri <= line_end {
+      vr += px(ri, 0)
+      vg += px(ri, 1)
+      vb += px(ri, 2)
+      va += px(ri, 3)
+    }
+    ri += step
+    dst[ti * 4] = f2u8(bround(fi(vr) * iarr)).to_byte()
+    dst[ti * 4 + 1] = f2u8(bround(fi(vg) * iarr)).to_byte()
+    dst[ti * 4 + 2] = f2u8(bround(fi(vb) * iarr)).to_byte()
+    dst[ti * 4 + 3] = f2u8(bround(fi(va) * iarr)).to_byte()
+    ti += step
+  }
+  if count <= radius {
+    return
+  }
+  for _ in (radius + 1)..<(count - radius) {
+    vr += px(ri, 0) - px(li, 0)
+    vg += px(ri, 1) - px(li, 1)
+    vb += px(ri, 2) - px(li, 2)
+    va += px(ri, 3) - px(li, 3)
+    ri += step
+    li += step
+    dst[ti * 4] = f2u8(bround(fi(vr) * iarr)).to_byte()
+    dst[ti * 4 + 1] = f2u8(bround(fi(vg) * iarr)).to_byte()
+    dst[ti * 4 + 2] = f2u8(bround(fi(vb) * iarr)).to_byte()
+    dst[ti * 4 + 3] = f2u8(bround(fi(va) * iarr)).to_byte()
+    ti += step
+  }
+  let n3 = if count - radius - 1 < radius { count - radius - 1 } else { radius }
+  for _ in 0..<n3 {
+    if li >= start {
+      vr -= px(li, 0)
+      vg -= px(li, 1)
+      vb -= px(li, 2)
+      va -= px(li, 3)
+    }
+    li += step
+    dst[ti * 4] = f2u8(bround(fi(vr) * iarr)).to_byte()
+    dst[ti * 4 + 1] = f2u8(bround(fi(vg) * iarr)).to_byte()
+    dst[ti * 4 + 2] = f2u8(bround(fi(vb) * iarr)).to_byte()
+    dst[ti * 4 + 3] = f2u8(bround(fi(va) * iarr)).to_byte()
+    ti += step
+  }
+}
+
+test "svg: filter multiply/demultiply and fused remap_premul_rgb (into_srgb/into_linear) match 3-pass reference byte-for-byte" {
+  let n = 512
+  let init = FixedArray::make(n * 4, b'\x00')
+  for i in 0..<n {
+    let o = i * 4
+    if i < 16 {
+      init[o] = (i * 17).to_byte()
+      init[o + 1] = (i * 31 % 256).to_byte()
+      init[o + 2] = (if i == 0 { 0 } else { 255 }).to_byte()
+      init[o + 3] = b'\x00'
+    } else {
+      let a = (i - 16) % 256
+      init[o] = ((i * 53) % 256).to_byte()
+      init[o + 1] = ((i * 97) % 256).to_byte()
+      init[o + 2] = ((i * 131) % 256).to_byte()
+      init[o + 3] = a.to_byte()
+    }
+  }
+  let a1 = copy_bytes(init)
+  let b1 = copy_bytes(init)
+  multiply_alpha(a1)
+  ref_multiply_alpha(b1)
+  assert_svg_bytes_eq(a1, b1, "multiply_alpha")
+
+  let a2 = copy_bytes(init)
+  let b2 = copy_bytes(init)
+  demultiply_alpha(a2)
+  ref_demultiply_alpha(b2)
+  assert_svg_bytes_eq(a2, b2, "demultiply_alpha")
+
+  let a3 = copy_bytes(init)
+  let b3 = copy_bytes(init)
+  into_srgb(a3)
+  ref_demultiply_alpha(b3)
+  ref_map_rgb(b3, linear_to_srgb)
+  ref_multiply_alpha(b3)
+  assert_svg_bytes_eq(a3, b3, "into_srgb")
+
+  let a4 = copy_bytes(init)
+  let b4 = copy_bytes(init)
+  into_linear(a4)
+  ref_demultiply_alpha(b4)
+  ref_map_rgb(b4, srgb_to_linear)
+  ref_multiply_alpha(b4)
+  assert_svg_bytes_eq(a4, b4, "into_linear")
+}
+
+test "svg: row-major box_blur_vert and closure-free box_blur_horz match box_blur_line across all boundary sizes" {
+  for radius in [0, 1, 2, 4] {
+    let heights = [1, radius, radius + 1, 2 * radius, 2 * radius + 1, 2 * radius + 2]
+    for w in [1, 2, 3, 4, 5, 6, 7] {
+      for h in heights {
+        if h <= 0 {
+          continue
+        }
+        let len = w * h * 4
+        let src = FixedArray::make(len, b'\x00')
+        for i in 0..<len {
+          src[i] = ((i * 37 + 19) % 256).to_byte()
+        }
+        let dst_v_fast = FixedArray::make(len, b'\x00')
+        let dst_v_ref = FixedArray::make(len, b'\x00')
+        box_blur_vert(radius, src, dst_v_fast, w, h)
+        if radius == 0 {
+          for i in 0..<len {
+            dst_v_ref[i] = src[i]
+          }
+        } else {
+          for col in 0..<w {
+            ref_box_blur_line(radius, src, dst_v_ref, col, w, h)
+          }
+        }
+        assert_svg_bytes_eq(dst_v_fast, dst_v_ref, "box_blur_vert")
+
+        let dst_h_fast = FixedArray::make(len, b'\x00')
+        let dst_h_ref = FixedArray::make(len, b'\x00')
+        box_blur_horz(radius, src, dst_h_fast, w, h)
+        if radius == 0 {
+          for i in 0..<len {
+            dst_h_ref[i] = src[i]
+          }
+        } else {
+          for row in 0..<h {
+            ref_box_blur_line(radius, src, dst_h_ref, row * w, 1, w)
+          }
+        }
+        assert_svg_bytes_eq(dst_h_fast, dst_h_ref, "box_blur_horz")
+      }
+    }
+  }
+}
+
+test "svg: SvgDoc::parse and rasterize_premul (premul parity, portrait, extreme aspect, multi-bucket reuse)" {
+  let src = "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'>" +
+    "<rect x='0' y='0' width='20' height='10' fill='#ff0000' fill-opacity='1'/>" +
+    "<rect x='20' y='0' width='20' height='10' fill='#0000ff' fill-opacity='0.5'/>" +
+    "<rect x='0' y='10' width='20' height='10' fill='#00ff00' fill-opacity='0.5'/>" +
+    "</svg>"
+  let bytes = src.to_bytes()
+  let doc = opt_unwrap(SvgDoc::parse(bytes))
+  let (pw, ph, premul) = opt_unwrap(doc.rasterize_premul(80))
+  let (sw, sh, straight) = opt_unwrap(doc.rasterize(80))
+  debug_assert(pw == 80 && ph == 40, "premul 80x40")
+  debug_assert(sw == 80 && sh == 40, "straight 80x40")
+  let (or0, og0, ob0, oa0) = px_rgba(premul, pw, 10, 5)
+  debug_assert(or0 == 255 && og0 == 0 && ob0 == 0 && oa0 == 255, "premul opaque red")
+  let (sr0, sg0, sb0, sa0) = px_rgba(straight, sw, 10, 5)
+  debug_assert(sr0 == 255 && sg0 == 0 && sb0 == 0 && sa0 == 255, "straight opaque red")
+  let (pr, pg, pb, pa) = px_rgba(premul, pw, 60, 5)
+  let exp_blue = skia::Color::from_rgba8(0, 0, 255, opacity_u8(0.5f)).premultiply().to_color_u8()
+  debug_assert(pr == exp_blue.r && pg == exp_blue.g && pb == exp_blue.b && pa == exp_blue.a, "premul semi-blue exact")
+  let (sr, sg, sb, sa) = px_rgba(straight, sw, 60, 5)
+  debug_assert(sr == 0 && sg == 0 && sb == 255 && sa == exp_blue.a, "straight semi-blue exact")
+  let (gr, gg, gb, ga) = px_rgba(premul, pw, 10, 30)
+  let exp_green = skia::Color::from_rgba8(0, 255, 0, opacity_u8(0.5f)).premultiply().to_color_u8()
+  debug_assert(gr == exp_green.r && gg == exp_green.g && gb == exp_green.b && ga == exp_green.a, "premul semi-green exact")
+  let (tr, tg, tb, ta) = px_rgba(premul, pw, 60, 30)
+  debug_assert(tr == 0 && tg == 0 && tb == 0 && ta == 0, "premul transparent")
+
+  let (w64, h64, p64) = opt_unwrap(doc.rasterize_premul(64))
+  let (w256, h256, p256) = opt_unwrap(doc.rasterize_premul(256))
+  let (w512, h512, p512) = opt_unwrap(doc.rasterize_premul(512))
+  debug_assert(w64 == 64 && h64 == 32, "bucket 64")
+  debug_assert(w256 == 256 && h256 == 128, "bucket 256")
+  debug_assert(w512 == 512 && h512 == 256, "bucket 512")
+  let (r64, g64, b64, a64) = px_rgba(p64, w64, 8, 4)
+  debug_assert(r64 == 255 && g64 == 0 && b64 == 0 && a64 == 255, "bucket 64 red pixel")
+  let (r256, g256, b256, a256) = px_rgba(p256, w256, 192, 16)
+  debug_assert(r256 == exp_blue.r && g256 == exp_blue.g && b256 == exp_blue.b && a256 == exp_blue.a, "bucket 256 blue pixel")
+  let (r512, g512, b512, a512) = px_rgba(p512, w512, 64, 192)
+  debug_assert(r512 == exp_green.r && g512 == exp_green.g && b512 == exp_green.b && a512 == exp_green.a, "bucket 512 green pixel")
+
+  let portrait = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='300'/>".to_bytes()
+  let (ptw, pth, _) = opt_unwrap(rasterize_premul(portrait, 512))
+  debug_assert(ptw == 171 && pth == 512, "portrait 171x512")
+
+  let extreme = "<svg xmlns='http://www.w3.org/2000/svg' width='1' height='20000'/>".to_bytes()
+  let (exw, exh, _) = opt_unwrap(rasterize_premul(extreme, 64))
+  debug_assert(exw == 1 && exh == 64, "extreme 1x64")
+
+  let huge_land = "<svg xmlns='http://www.w3.org/2000/svg' width='1e35' height='5e34'/>".to_bytes()
+  let (hlw, hlh, _) = opt_unwrap(rasterize_premul(huge_land, 100))
+  debug_assert(hlw == 100 && hlh == 50, "huge landscape 100x50")
+  let huge_port = "<svg xmlns='http://www.w3.org/2000/svg' width='5e34' height='1e35'/>".to_bytes()
+  let (hpw, hph, _) = opt_unwrap(rasterize_premul(huge_port, 100))
+  debug_assert(hpw == 50 && hph == 100, "huge portrait 50x100")
+
+  debug_assert(match SvgDoc::parse("not svg".to_bytes()) { None => true, Some(_) => false }, "invalid SvgDoc")
+  debug_assert(match doc.rasterize_premul(0) { None => true, Some(_) => false }, "zero long_side")
+  debug_assert(match doc.rasterize_premul(-10) { None => true, Some(_) => false }, "neg long_side")
+}
+
+test "svg: isolated opacity/clip groups, feDropShadow, and multi-round scratch reuse" {
+  let src = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='60' viewBox='0 0 100 60'>" +
+    "<defs>" +
+    "<filter id='sh' x='-20%' y='-20%' width='140%' height='140%'>" +
+    "<feDropShadow dx='3' dy='3' stdDeviation='3' flood-color='#000000' flood-opacity='0.5'/>" +
+    "</filter>" +
+    "<clipPath id='cp'><rect x='5' y='5' width='40' height='40' rx='6'/></clipPath>" +
+    "</defs>" +
+    "<rect width='100' height='60' fill='#ffffff'/>" +
+    "<g opacity='0.6' clip-path='url(#cp)'>" +
+    "<rect x='0' y='0' width='50' height='50' fill='#ff0000'/>" +
+    "</g>" +
+    "<rect x='55' y='10' width='30' height='30' fill='#2060e0' filter='url(#sh)'/>" +
+    "</svg>"
+  let (w, h, rgba) = opt_unwrap(rasterize_premul(src.to_bytes(), 100))
+  debug_assert(w == 100 && h == 60, "drop shadow 100x60")
+  let (r, g, b, a) = px_rgba(rgba, w, 25, 25)
+  debug_assert(a == 255 && r == 255 && g >= 98 && g <= 108 && b >= 98 && b <= 108, "opacity group blend")
+  let (wr, wg, wb, wa) = px_rgba(rgba, w, 2, 2)
+  debug_assert(wr == 255 && wg == 255 && wb == 255 && wa == 255, "outside clipPath white")
+  let (br, bg, bb, ba) = px_rgba(rgba, w, 70, 25)
+  debug_assert(ba == 255 && bb > 200 && br < 50 && bg < 120, "blue rect")
+  let (sr, sg, sb, sa) = px_rgba(rgba, w, 87, 42)
+  debug_assert(sa == 255 && sr < 245 && sg < 245 && sb < 245, "feDropShadow darkened")
+
+  // Multi-round scratch reuse: render an unrelated SVG at a different size, then re-render src
+  let other = "<svg xmlns='http://www.w3.org/2000/svg' width='60' height='60'>" +
+    "<defs><filter id='b'><feGaussianBlur stdDeviation='2'/></filter></defs>" +
+    "<circle cx='30' cy='30' r='20' fill='#00aa88' filter='url(#b)'/></svg>"
+  let _ = opt_unwrap(rasterize_premul(other.to_bytes(), 120))
+  let (w2, h2, rgba2) = opt_unwrap(rasterize_premul(src.to_bytes(), 100))
+  debug_assert(w2 == w && h2 == h, "repeat render dimensions")
+  assert_svg_bytes_eq(rgba, rgba2, "multi-round svg scratch reuse parity")
+}
+
+test "svg: apply_fe_drop_shadow LUT matches independent per-pixel reference byte-for-byte" {
+  let w = 24
+  let h = 20
+  let src_pm = opt_unwrap(skia::Pixmap::new(w, h))
+  for y in 0..<h {
+    for x in 0..<w {
+      let o = (y * w + x) * 4
+      if x >= 4 && x < 16 && y >= 3 && y < 14 {
+        let a = ((x * 29 + y * 43) % 256)
+        let r = ((x * 17) % (a + 1))
+        let g = ((y * 23) % (a + 1))
+        let b = (((x + y) * 19) % (a + 1))
+        src_pm.data[o] = r.to_byte()
+        src_pm.data[o + 1] = g.to_byte()
+        src_pm.data[o + 2] = b.to_byte()
+        src_pm.data[o + 3] = a.to_byte()
+      }
+    }
+  }
+  let flood = Rgb::{ r: 28, g: 64, b: 140 }
+  let opacity = 0.65f
+  let dx = 3.0f
+  let dy = 2.0f
+  let sx = 2.0f
+  let sy = 1.5f
+  let ts = skia::Transform::identity()
+
+  for cs in [ColorInterp::SRGB, ColorInterp::LinearRGB] {
+    let inp_fast = FImage::from_pixmap(src_pm.copy(), ColorInterp::SRGB)
+    let out_fast = opt_unwrap(apply_fe_drop_shadow(dx, dy, sx, sy, flood, opacity, cs, ts, inp_fast))
+
+    // Independent per-pixel reference without 256-entry LUT
+    let inp_ref = FImage::from_pixmap(src_pm.copy(), ColorInterp::SRGB).into_cs(cs).pixmap
+    let shadow_ref = inp_ref.copy()
+    match resolve_std_dev(sx, sy, ts) {
+      Some((bx, by, use_box)) => if use_box { box_blur(bx, by, shadow_ref) } else { iir_blur(bx, by, shadow_ref) }
+      None => ()
+    }
+    let c = skia::Color::from_rgba8(flood.r, flood.g, flood.b, opacity_u8(opacity))
+    let n = shadow_ref.width * shadow_ref.height
+    for i in 0..<n {
+      let o = i * 4
+      let a = fi(shadow_ref.data[o + 3].to_int()) / 255.0f
+      let p = c.with_opacity(a).premultiply().to_color_u8()
+      shadow_ref.data[o] = p.r.to_byte()
+      shadow_ref.data[o + 1] = p.g.to_byte()
+      shadow_ref.data[o + 2] = p.b.to_byte()
+      shadow_ref.data[o + 3] = p.a.to_byte()
+    }
+    match cs {
+      ColorInterp::SRGB => into_srgb(shadow_ref.data)
+      ColorInterp::LinearRGB => into_linear(shadow_ref.data)
+    }
+    let pm_ref = opt_unwrap(skia::Pixmap::new(w, h))
+    pm_ref.draw_pixmap(f2i(dx), f2i(dy), shadow_ref, skia::PixmapPaint::default(), skia::Transform::identity(), None)
+    pm_ref.draw_pixmap(0, 0, inp_ref, skia::PixmapPaint::default(), skia::Transform::identity(), None)
+    assert_svg_bytes_eq(out_fast.pixmap.data, pm_ref.data, "apply_fe_drop_shadow LUT parity")
+  }
+}
