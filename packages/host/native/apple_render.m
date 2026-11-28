@@ -274,8 +274,12 @@ typedef struct {
   int pages;
   void *tex;
 } AtlasPut;
-// the PAGES ops kept and not yet done (under present_mu)
+// the PAGES ops kept and not yet done (under present_mu); how many pages each texture has, the most there are where
+// pages failed to be made, and how many times they did (the thread that draws: atlas_pages_put)
 static int atlas_ops_owed;
+static atomic_int atlas_held[2] = {1, 1};
+static atomic_int atlas_fail_most[2];
+static atomic_int atlas_lost;
 static void atlas_ops_kick(void);
 static AtlasPut *atlas_puts;
 static size_t atlas_puts_n, atlas_puts_cap, atlas_puts_head;
@@ -2175,20 +2179,32 @@ void mb_atlas_upload(int color, int x, int y, int w, int h, const void *px) {
 // put in the old one's place. Copied on the CPU, as every glyph is put in (replaceRegion): the CPU's is what the atlas
 // holds on any Mac, a blit's slices on the GPU were lost on a paravirtual one (GitHub's macOS runners), and nothing waits
 // for the GPU. What the GPU still draws with the old one keeps it till done.
+// Where there is no memory to copy through, the old texture stays, as many pages as it has are the most from now on
+// and every glyph is drawn again (atlas_lost: the generation moves on, mb_render_atlas_lost_bumps).
 static void atlas_pages_put(int color, id<MTLTexture> t) {
   id<MTLTexture> old = color ? catlas : atlas;
   NSUInteger keep = old ? MIN(old.arrayLength, t.arrayLength) : 0;
   NSUInteger side = MIN(old ? old.width : 0, t.width), row = side * (color ? 4 : 1);
-  uint8_t *page = keep > 0 && side > 0 ? malloc(row * side) : NULL;
-  for (NSUInteger i = 0; page && i < keep; i++) {
-    [old getBytes:page bytesPerRow:row bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0
-              slice:i];
-    [t replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0 slice:i withBytes:page bytesPerRow:row
-         bytesPerImage:0];
+  // (a strip of rows at a time, some 256 KiB: not a page's 16 MiB at once)
+  NSUInteger strip = row > 0 ? MAX((NSUInteger)1, MIN(side, (NSUInteger)(256 * 1024) / row)) : 0;
+  uint8_t *rows = keep > 0 && strip > 0 ? malloc(row * strip) : NULL;
+  if (keep > 0 && !rows) {
+    atomic_store(&atlas_fail_most[color], (int)old.arrayLength);
+    atomic_fetch_add(&atlas_lost, 1);
+    return;
   }
-  free(page);
+  for (NSUInteger i = 0; i < keep; i++) {
+    for (NSUInteger y = 0; y < side; y += strip) {
+      NSUInteger h = MIN(strip, side - y);
+      MTLRegion r = MTLRegionMake2D(0, y, side, h);
+      [old getBytes:rows bytesPerRow:row bytesPerImage:0 fromRegion:r mipmapLevel:0 slice:i];
+      [t replaceRegion:r mipmapLevel:0 slice:i withBytes:rows bytesPerRow:row bytesPerImage:0];
+    }
+  }
+  free(rows);
   if (color) catlas = t;
   else atlas = t;
+  atomic_store(&atlas_held[color], (int)t.arrayLength);
 }
 
 // The glyphs kept put into the atlases, in order, those numbered up to `upto`.
@@ -5171,7 +5187,23 @@ static int atlas_pages_n[2] = {1, 1};
 
 int32_t mb_host_atlas_pages_most(int32_t colour) {
   // (Metal's arrays take 2048 layers)
-  return colour ? mb_atlas_pages_cap(MB_ATLAS_COLOR_SIDE, 4, 2048) : mb_atlas_pages_cap(MB_ATLAS_SIDE, 1, 2048);
+  int n = colour ? mb_atlas_pages_cap(MB_ATLAS_COLOR_SIDE, 4, 2048) : mb_atlas_pages_cap(MB_ATLAS_SIDE, 1, 2048);
+  int fail = atomic_load(&atlas_fail_most[colour ? 1 : 0]);
+  return fail > 0 && fail < n ? fail : n;
+}
+
+// (the main thread's, as the generation is read: apple_text.m) how many times pages failed to be made since it was
+// first read, the pages said of each atlas put back to those its texture has
+static int atlas_lost_seen, atlas_lost_bumps;
+int32_t mb_render_atlas_lost_bumps(void) {
+  int lost = atomic_load(&atlas_lost);
+  if (lost != atlas_lost_seen) {
+    atlas_lost_seen = lost;
+    atlas_pages_n[0] = atomic_load(&atlas_held[0]);
+    atlas_pages_n[1] = atomic_load(&atlas_held[1]);
+    atlas_lost_bumps++;
+  }
+  return atlas_lost_bumps;
 }
 
 int32_t mb_host_atlas_pages_now(int32_t colour) { return atlas_pages_n[colour ? 1 : 0]; }

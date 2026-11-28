@@ -29,6 +29,7 @@ void mb_atlas_upload(int color, int x, int y, int w, int h, const void *px) {
   (void)color, (void)x, (void)y, (void)w, (void)h, (void)px;
 }
 void mb_host_request_frame(void) {}
+int32_t mb_render_atlas_lost_bumps(void) { return 0; }
 int mb_render_snapshot(const char *path) {
   (void)path;
   return 0;
