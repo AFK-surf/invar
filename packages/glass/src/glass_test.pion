@@ -1,0 +1,675 @@
+// Unit tests for packages/glass:
+// Covers liquid_morph_physics, tokens/themes/words_at, symbols, damped_drag,
+// interactive_highlight, solid-mode degradation, interactive controls (toggle,
+// slider, segmented, pill_group, capsule, panel_shell, scroll_edge, merge),
+// and surface decorators (active gating, tab bar solid border).
+
+import "headless"
+import "paint"
+import "signals"
+import "ui"
+import "view"
+
+let glass_test_settle_ms : Double = 1000.0
+let glass_test_hold_ms : Double = 300.0
+let glass_test_drag_ms : Double = 250.0
+
+fn abs_f(x : Double) -> Double {
+  if x < 0.0 { -x } else { x }
+}
+
+fn check(cond : Bool, msg : String) -> Unit {
+  debug_assert(cond, msg)
+}
+
+fn check_eq_i(a : Int, b : Int, msg : String) -> Unit {
+  debug_assert(a == b, msg)
+}
+
+fn check_eq_i64(a : Int64, b : Int64, msg : String) -> Unit {
+  debug_assert(a == b, msg)
+}
+
+fn check_eq_f(a : Double, b : Double, msg : String) -> Unit {
+  debug_assert(a == b, msg)
+}
+
+fn check_eq_b(a : Bool, b : Bool, msg : String) -> Unit {
+  debug_assert(a == b, msg)
+}
+
+fn glass_test_case(dark : Bool, solid : Bool, make : (view::View) -> Unit) -> ui::Tester {
+  let t = ui::Tester::new(fn(_c : ui::Ctx) { () }, w=900.0, h=760.0, dark=dark, platform=0)
+  ui::set_glass_solid(if solid { Some(true) } else { None })
+  set_dark(Some(dark))
+  ui::set_tree_theme(ui_theme)
+  ui::set_view_app(fn(root : view::View) {
+    let _ = root.box(fn(page : view::View) {
+      let _ = page
+        .grow(view::Live::Is(1.0))
+        .padding(view::Live::Is((24.0, 24.0, 24.0, 24.0)))
+        .gap(view::Live::Is(16.0))
+        .ground(view::Live::Is(if dark { 0x0B0C10FFL } else { 0xF4F1EAFFL }))
+      make(page)
+    })
+  })
+  t.draw()
+  t
+}
+
+test "liquid_morph_physics springs, recoil pulse, horizontal splash, and optical anchors" {
+  // 1. Open spring: critically damped monotonic rise (~95% at 180ms, >99.9% at 420ms, no overshoot)
+  check_eq_f(lm_open_progress(0.0), 0.0, "open progress at t=0")
+  let open_180 = lm_open_progress(0.18)
+  let open_210 = lm_open_progress(0.21)
+  check(open_180 > 0.93 && open_180 < 1.0, "open spring ~95% at 180ms")
+  check(open_210 >= open_180 && open_210 <= 1.0, "open spring monotonic without overshoot")
+  let open_end = lm_open_progress(0.42)
+  check(open_end > 0.999 && open_end <= 1.0, "open spring settled by 420ms")
+
+  let f67 = lm_eval_pill_morph(300.0, 35.0, 74.0, 36.0, 358.0, 184.0, 35.0, 190.0, 265.0, 20.0, 1.0, false, 0.067)
+  let aspect67 = f67.cur_w / f67.cur_h
+  check(aspect67 >= 0.72 && aspect67 <= 1.15, "open mid bubble balanced at 67ms")
+  check(f67.radius <= 26.0, "open mid corner radius capped")
+  check(lm_open_size_progress(0.5, lm_scale_delta(36.0, 36.0, 190.0, 265.0)) > 0.65, "open size progress > 0.65")
+
+  let f_big = lm_eval_pill_morph(300.0, 500.0, 60.0, 32.0, 330.0, 40.0, 192.0, 320.0, 340.0, 20.0, 1.0, false, 0.09)
+  check(f_big.radius <= 26.0, "large open radius <= 26pt")
+  let f_big_close = lm_eval_pill_morph(300.0, 500.0, 60.0, 32.0, 330.0, 40.0, 192.0, 320.0, 340.0, 20.0, 1.0, true, 0.11)
+  check(f_big_close.radius <= 32.0, "large mid-close radius <= 32pt")
+
+  // 2. Close spring: platter active at 200ms, hands off by 320ms
+  check_eq_f(lm_close_progress(0.0), 1.0, "close progress at t=0")
+  check(lm_close_platter_active(lm_close_progress(0.20)), "platter active at 200ms")
+  check(!lm_close_platter_active(lm_close_progress(0.32)), "platter handed off by 320ms")
+
+  // 3. Parallel close recoil pulse: 0 for t<=0.03s, peak ~1.0 at t=0.213s, near 0 at 0.58s
+  check_eq_f(lm_recoil_pulse(0.0), 0.0, "recoil pulse at t=0")
+  check_eq_f(lm_recoil_pulse(0.03), 0.0, "recoil pulse at t=0.03")
+  check(abs_f(lm_recoil_pulse(0.213) - 1.0) < 0.02, "recoil pulse peaks ~1.0 at 213ms")
+  check(abs_f(lm_recoil_pulse(0.58)) < 0.06, "recoil pulse settles near 0 by 580ms")
+
+  // 4. Recoil vertical offset & impact compression scale
+  let dy_phone = lm_recoil_offset_y(0.213, 120.0, 10.0)
+  check(dy_phone < -9.0 && dy_phone > -10.5, "phone recoil peak ~-9.8pt")
+  let dy_capped = lm_recoil_offset_y(0.213, 120.0, 5.0)
+  check(dy_capped < -4.8 && dy_capped > -5.2, "capped recoil peak ~-5.0pt")
+  check_eq_f(lm_impact_scale(0.0, 120.0), 1.0, "impact scale at t=0")
+  let imp = lm_impact_scale(0.213, 120.0)
+  check(imp > 0.95 && imp < 0.975, "impact scale ~0.965 at 213ms")
+
+  // 5. Horizontal splash & C0 continuity at handoff
+  let w_400 = lm_close_trigger_width(0.40)
+  check(w_400 > 1.010 && w_400 < 1.025, "horizontal splash ~1.016 at 400ms")
+  check(abs_f(lm_delayed_close_width(0.283) - lm_close_trigger_width(0.283)) < 1.0e-6, "delayed close width C0 at handoff")
+
+  // 6. Three-anchor liquid_menu_morph_glass optical recipe invariants (Light & Dark)
+  let g0 = liquid_menu_morph_glass(0.0, dark=false)
+  let g5 = liquid_menu_morph_glass(0.5, dark=false)
+  let g1 = liquid_menu_morph_glass(1.0, dark=false)
+  check_eq_i64(g0.tint, 0xFDFCFD67L, "g0 tint")
+  check_eq_f(g0.blur, 1.2, "g0 blur")
+  check_eq_f(g0.bezel, 14.0, "g0 bezel")
+  check_eq_f(g0.refraction, 20.0, "g0 refraction")
+  check_eq_f(g0.rim, 0.60, "g0 rim")
+  check_eq_f(g0.chroma, 0.0, "g0 chroma")
+  check_eq_i64(g5.tint, 0xFDFCFD74L, "g5 tint")
+  check(abs_f(g5.blur - 6.0) < 1.0e-9, "g5 blur")
+  check(abs_f(g5.bezel - 18.0) < 1.0e-9, "g5 bezel")
+  check(abs_f(g5.refraction - 18.0) < 1.0e-9, "g5 refraction")
+  check(abs_f(g5.rim - 0.68) < 1.0e-9, "g5 rim")
+  check_eq_f(g5.chroma, 0.0, "g5 chroma")
+  check_eq_i64(g1.tint, 0xFDFCFD80L, "g1 tint")
+  check_eq_f(g1.blur, 14.0, "g1 blur")
+  check_eq_f(g1.bezel, 20.0, "g1 bezel")
+  check_eq_f(g1.refraction, 16.0, "g1 refraction")
+  check_eq_f(g1.rim, 0.60, "g1 rim")
+  check_eq_f(g1.chroma, 0.0, "g1 chroma")
+
+  let gd0 = liquid_menu_morph_glass(0.0, dark=true)
+  let gd5 = liquid_menu_morph_glass(0.5, dark=true)
+  let gd1 = liquid_menu_morph_glass(1.0, dark=true)
+  check_eq_i64(gd0.tint, 0x20202067L, "gd0 tint")
+  check_eq_i64(gd5.tint, 0x20202074L, "gd5 tint")
+  check_eq_i64(gd1.tint, 0x20202080L, "gd1 tint")
+  check_eq_f(gd1.blur, g1.blur, "dark/light blur parity")
+  check_eq_f(gd1.bezel, g1.bezel, "dark/light bezel parity")
+  check_eq_f(gd1.refraction, g1.refraction, "dark/light refraction parity")
+
+  let pl = liquid_panel_glass()
+  check_eq_f(pl.blur, g1.blur, "panel blur matches g1")
+  check_eq_f(pl.bezel, g1.bezel, "panel bezel matches g1")
+  check_eq_f(pl.refraction, g1.refraction, "panel refraction matches g1")
+  check_eq_f(pl.rim, g1.rim, "panel rim matches g1")
+  check_eq_f(pl.chroma, g1.chroma, "panel chroma matches g1")
+}
+
+test "liquid_morph_physics closing teardrop geometry stays NaN-free and bounded across 0..600ms" {
+  let mut i = 0
+  while i <= 60 {
+    let t = i.to_double() * 0.01
+    let raw_c = lm_close_progress(t)
+    let (mx, my, mw, mh, r) = lm_closing_teardrop_geometry(
+      raw_c,
+      150.0,
+      18.0,
+      74.0,
+      36.0,
+      190.0,
+      265.0,
+      20.0,
+      lm_recoil_offset_y(t, 114.0, 10.0),
+      t,
+      1.0,
+    )
+    check(mx == mx && my == my && mw == mw && mh == mh && r == r, "no NaN in close geometry")
+    check(mw >= 0.0 && mh >= 0.0 && r >= 0.0, "non-negative close geometry")
+    if lm_close_platter_active(raw_c) {
+      check(my <= 36.0 + 18.0, "close hugs top bar without plunging")
+    }
+    let em = lm_close_blob_a_emergence(mx, my, mw, mh, r, 150.0, 18.0, raw_c)
+    check(em == 0.0 || (em >= 0.45 && em <= 1.0), "blob A emergence in valid range")
+    let bl = lm_close_blend(raw_c)
+    check(bl >= 0.0 && bl <= 14.0, "close blend in [0, 14]")
+    i = i + 1
+  }
+}
+
+test "tokens, theme polarity, words_at struct defaults, and symbols" {
+  set_dark(Some(false))
+  check_eq_b(is_dark(), false, "light mode active")
+  check_eq_i64(colors().accent, light.accent, "light accent")
+  check_eq_i64(colors().content, 0x000000FFL, "light content ink")
+  check_eq_i64(toggle_off_track(), 0x78788068L, "light toggle off track")
+  let light_theme = ui_theme()
+  check_eq_b(light_theme.dark, false, "light ui_theme.dark")
+
+  set_dark(Some(true))
+  check_eq_b(is_dark(), true, "dark mode active")
+  check_eq_i64(colors().accent, dark.accent, "dark accent")
+  check_eq_i64(colors().content, 0xFFFFFFFFL, "dark content ink")
+  check_eq_i64(toggle_off_track(), 0x787880ADL, "dark toggle off track")
+  let dark_theme = ui_theme()
+  check_eq_b(dark_theme.dark, true, "dark ui_theme.dark")
+  set_dark(None)
+
+  // Verify words_at populates WordsLook including [struct_defaults] fields
+  let w = words_at(15.0, weight=600, wrap=true, lines=2)
+  check_eq_f(w.size, 15.0, "words_at size")
+  check_eq_i(w.weight, 600, "words_at weight")
+  check_eq_b(w.wrap, true, "words_at wrap")
+  check_eq_i(w.max_lines, 2, "words_at max_lines")
+  check_eq_b(w.diagonal_fractions, false, "words_at diagonal_fractions default")
+  let tab_none = match w.tabular {
+    None => true
+    Some(_) => false
+  }
+  check(tab_none, "words_at tabular default is None")
+
+  // Verify all 9 built-in symbols return non-empty vector shapes and unknown returns empty
+  let names = ["settings", "sliders", "layers", "sparkles", "moon", "sun", "heart", "eye", "search"]
+  let mut idx = 0
+  while idx < names.length() {
+    let shapes = glass_symbol_shapes(names[idx], 24.0, 0xFFFFFFFFL)
+    check(shapes.length() >= 1, "known symbol produces at least one shape")
+    idx = idx + 1
+  }
+  check_eq_i(glass_symbol_shapes("nonexistent_symbol", 24.0, 0xFFFFFFFFL).length(), 0, "unknown symbol returns empty")
+
+  // Mount glass_symbol_node inside Tester and verify layout
+  let t = glass_test_case(false, false, fn(page : view::View) {
+    let _ = glass_symbol_node(page, "sparkles", 20.0, fn() { colors().content })
+  })
+  t.draw()
+  check_eq_i(t.audit().length(), 0, "glass_symbol_node zero audit faults")
+  set_dark(None)
+}
+
+test "damped_drag attach, press, update_value, settle, jelly, and bounds" {
+  let dd = DampedDrag::new(0.2, lo=0.0, hi=1.0, held_scale=1.25)
+  check_eq_f(dd.target(), 0.2, "initial target")
+  check_eq_b(dd.pressing(), false, "initially not pressing")
+  let host_ref : Array[view::View] = []
+  let t = glass_test_case(false, false, fn(page : view::View) {
+    let _ = page.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(100.0))).height(view::Live::Is(Some(40.0)))
+      dd.attach(b)
+      check(dd.same_host(Some(b)), "attached to host view")
+      dd.claim_gesture(b)
+      check(dd.gesture_owned_by(b), "gesture owned by host view")
+      host_ref.push(b)
+    })
+  })
+  let host = host_ref[host_ref.length() - 1]
+  check(dd.host_node() is Some(_), "drag has attached host node")
+  check_eq_b(dd.same_host(None), false, "attached drag is not None host")
+  check(abs_f(dd.progress(host) - 0.2) < 1.0e-6, "initial progress is 0.2")
+
+  t.by_hand(fn() {
+    dd.press()
+    dd.update_value(0.8)
+  })
+  check_eq_b(dd.pressing(), true, "pressing after press()")
+  check_eq_f(dd.target(), 0.8, "target updated to 0.8")
+  t.run_for(glass_test_hold_ms)
+  check(dd.pressed(host) > 0.9, "pressed approaches 1.0 while held")
+  let (jx, jy) = dd.jelly(host, 10.0)
+  check(jx > 1.0 && jy > 1.0, "held jelly scales above 1.0")
+
+  t.by_hand(fn() { dd.settle_to(0.5) })
+  t.run_for(glass_test_settle_ms)
+  check(abs_f(dd.value(host) - 0.5) < 0.01, "value settles to 0.5")
+  check(dd.pressed(host) < 0.05, "pressed settles back to 0.0")
+
+  // Reactive progress invalidation when set_bounds changes lo/hi
+  let prog_sig = signals::computed(fn(_) { dd.progress(host) })
+  check(abs_f(prog_sig.get() - 0.5) < 0.01, "computed progress starts at 0.5 on [0, 1]")
+  dd.set_bounds(lo=0.0, hi=2.0)
+  check(abs_f(prog_sig.get() - 0.25) < 0.01, "computed progress updates immediately to 0.25 after set_bounds(0, 2)")
+
+  // Clamping and set_bounds
+  dd.set_bounds(lo=10.0, hi=20.0)
+  t.by_hand(fn() { dd.slide_to(99.0) })
+  check_eq_f(dd.target(), 20.0, "clamped target to hi")
+  t.run_for(glass_test_settle_ms)
+  check(abs_f(dd.progress(host) - 1.0) < 0.02, "clamped progress reaches 1.0")
+
+  // drop_lens() while lens is actively raised must immediately drop press to 0.0
+  t.by_hand(fn() { dd.press() })
+  t.run_for(glass_test_hold_ms)
+  check_eq_b(dd.pressing(), true, "lens raised before drop_lens")
+  check(dd.pressed(host) > 0.9, "pressed > 0.9 while held before drop_lens")
+  dd.drop_lens()
+  check_eq_b(dd.pressing(), false, "drop_lens immediately clears pressing")
+  check_eq_f(dd.pressed(host), 0.0, "drop_lens immediately drops pressed to 0.0")
+  set_dark(None)
+}
+
+test "interactive_highlight down, moved, up, spot clamping, and stretch" {
+  let hl = InteractiveHighlight::new()
+  let host_ref : Array[view::View] = []
+  let t = glass_test_case(false, false, fn(page : view::View) {
+    let _ = page.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(44.0)))
+      hl.attach(b)
+      host_ref.push(b)
+    })
+  })
+  let host = host_ref[host_ref.length() - 1]
+  check_eq_f(hl.pressed(host), 0.0, "initial highlight press is 0")
+
+  t.by_hand(fn() {
+    hl.down(40.0, 22.0, 120.0, 44.0)
+    hl.moved(200.0, -50.0)
+  })
+  t.run_for(glass_test_hold_ms)
+  check(hl.pressed(host) > 0.9, "highlight pressed rises toward 1.0")
+  let (sx, sy) = hl.spot(host, 120.0, 44.0)
+  check_eq_f(sx, 120.0, "spot x clamped to width")
+  check_eq_f(sy, 0.0, "spot y clamped to 0")
+  let (tx, ty, scx, scy) = hl.stretch(host)
+  check(tx > 0.0 && ty < 0.0, "stretch translation follows drag direction")
+  check(scx > 1.0 && scy > 1.0, "stretch scale grows while pressed")
+
+  t.by_hand(fn() { hl.up() })
+  t.run_for(glass_test_settle_ms)
+  check(hl.pressed(host) < 0.02, "highlight press decays to 0 after up")
+  set_dark(None)
+}
+
+test "solid mode degrades all glass controls and decorators with zero audit faults" {
+  let modes = [false, true]
+  let mut mi = 0
+  while mi < modes.length() {
+    let dark = modes[mi]
+    let toggle_on = signals::signal(true)
+    let slider_val = signals::signal(55.0)
+    let seg_idx = signals::signal(1)
+    let t = glass_test_case(dark, true, fn(page : view::View) {
+      let _ = page.box(fn(row : view::View) {
+        let _ = row
+          .row(view::Live::Is(true))
+          .gap(view::Live::Is(12.0))
+          .lines_up(view::Live::Is(Some(view::Along::Middle)))
+        let _ = liquid_toggle_node(row, fn() { toggle_on.get() }, fn(v : Bool) { toggle_on.set(v) }, fn() { "Wi-Fi" })
+        let _ = liquid_pill_group_node(row, fn(g : view::View) {
+          let _ = g.box(fn(w : view::View) {
+            let _ = w
+              .padding(view::Live::Is((10.0, 0.0, 10.0, 0.0)))
+              .words(view::Live::Is("Pill"), look=words_at(14.0))
+              .ink(view::Live::By(fn() { colors().content }))
+          })
+        }, height=40.0, pad=4.0)
+        let _ = liquid_capsule_node(row, fn(c : view::View) {
+          let _ = c.padding(view::Live::Is((14.0, 8.0, 14.0, 8.0)))
+          let _ = c.box(fn(w : view::View) {
+            let _ = w
+              .words(view::Live::Is("Capsule"), look=words_at(14.0))
+              .ink(view::Live::By(fn() { colors().content }))
+          })
+        }, tone=LiquidCapsuleTone::Floating, radius=Some(20.0))
+      })
+      let _ = page.box(fn(s : view::View) {
+        let _ = s.width(view::Live::Is(Some(320.0)))
+        let _ = liquid_slider_node(s, fn() { slider_val.get() }, fn(v : Double) { slider_val.set(v) }, fn() { "Volume" })
+      })
+      let _ = liquid_segmented_node(
+        page,
+        fn() { ["Day", "Week", "Month"] },
+        fn() { seg_idx.get() },
+        fn(i : Int) { seg_idx.set(i) },
+        width=320.0,
+      )
+      let _ = liquid_panel_shell_node(page, fn(p : view::View) {
+        let _ = p.padding(view::Live::Is((14.0, 10.0, 14.0, 10.0)))
+        let _ = p.box(fn(w : view::View) {
+          let _ = w
+            .words(view::Live::Is("Panel Shell"), look=words_at(14.0))
+            .ink(view::Live::By(fn() { colors().content }))
+        })
+      })
+      let _ = page.box(fn(surfaces : view::View) {
+        let _ = surfaces.row(view::Live::Is(true)).gap(view::Live::Is(10.0))
+        let _ = surfaces.box(fn(pop : view::View) {
+          let _ = pop.padding(view::Live::Is((12.0, 8.0, 12.0, 8.0)))
+          let _ = liquid_popover_surface_decorate(pop, radius=16.0)
+          let _ = pop.box(fn(w : view::View) {
+            let _ = w.words(view::Live::Is("Popover"), look=words_at(13.0)).ink(view::Live::By(fn() { colors().content }))
+          })
+        })
+        let _ = surfaces.box(fn(tip : view::View) {
+          let _ = tip.padding(view::Live::Is((10.0, 6.0, 10.0, 6.0)))
+          let _ = liquid_tooltip_surface_decorate(tip, radius=12.0)
+          let _ = tip.box(fn(w : view::View) {
+            let _ = w.words(view::Live::Is("Tooltip"), look=words_at(13.0)).ink(view::Live::By(fn() { colors().content }))
+          })
+        })
+        let _ = surfaces.box(fn(drw : view::View) {
+          let _ = drw.padding(view::Live::Is((12.0, 8.0, 12.0, 8.0)))
+          let _ = liquid_drawer_surface_decorate(drw, radius=20.0)
+          let _ = drw.box(fn(w : view::View) {
+            let _ = w.words(view::Live::Is("Drawer"), look=words_at(13.0)).ink(view::Live::By(fn() { colors().content }))
+          })
+        })
+        let _ = surfaces.box(fn(sh : view::View) {
+          let _ = sh.padding(view::Live::Is((12.0, 8.0, 12.0, 8.0)))
+          let _ = liquid_sheet_surface_decorate(sh, radius=20.0)
+          let _ = sh.box(fn(w : view::View) {
+            let _ = w.words(view::Live::Is("Sheet"), look=words_at(13.0)).ink(view::Live::By(fn() { colors().content }))
+          })
+        })
+        let _ = surfaces.box(fn(dlg : view::View) {
+          let _ = dlg.padding(view::Live::Is((12.0, 8.0, 12.0, 8.0)))
+          let _ = liquid_dialog_surface_decorate(dlg, radius=20.0)
+          let _ = dlg.box(fn(w : view::View) {
+            let _ = w.words(view::Live::Is("Dialog"), look=words_at(13.0)).ink(view::Live::By(fn() { colors().content }))
+          })
+        })
+        let _ = surfaces.box(fn(tst : view::View) {
+          let _ = tst.padding(view::Live::Is((12.0, 8.0, 12.0, 8.0)))
+          let _ = liquid_toast_surface_decorate(tst, radius=20.0)
+          let _ = tst.box(fn(w : view::View) {
+            let _ = w.words(view::Live::Is("Toast"), look=words_at(13.0)).ink(view::Live::By(fn() { colors().content }))
+          })
+        })
+      })
+      let _ = liquid_merge_node(page, label=fn() { "Solid Merge" })
+      let _ = liquid_scroll_edge_node(page, fn(_v : view::View) { 40.0 }, fn(_v : view::View) { 40.0 }, side=ScrollEdgeSide::Top)
+    })
+    t.run_for(glass_test_settle_ms)
+    let mut liquid_count = 0
+    for g in t.drawn_glass() {
+      if g.4 == 6 {
+        liquid_count = liquid_count + 1
+      }
+    }
+    let audits = t.audit()
+    ui::set_glass_solid(None)
+    check_eq_i(liquid_count, 0, "solid mode emits zero liquid glass instances")
+    check_eq_i(audits.length(), 0, "solid mode has zero audit faults")
+    mi = mi + 1
+  }
+  set_dark(None)
+}
+
+test "toggle, slider, segmented, pill_group, active gating, and liquid_merge interactions" {
+  let toggle_on = signals::signal(false)
+  let slider_val = signals::signal(20.0)
+  let seg_idx = signals::signal(0)
+  let deco_active = signals::signal(false)
+  let pill_pressed = signals::signal(false)
+  let merge_ctrl = LiquidMerge::new(separated=false)
+  let t = glass_test_case(false, false, fn(page : view::View) {
+    let _ = liquid_toggle_node(page, fn() { toggle_on.get() }, fn(v : Bool) { toggle_on.set(v) }, fn() { "Bluetooth" })
+    let _ = page.box(fn(s : view::View) {
+      let _ = s.width(view::Live::Is(Some(240.0)))
+      let _ = liquid_slider_node(s, fn() { slider_val.get() }, fn(v : Double) { slider_val.set(v) }, fn() { "Brightness" })
+    })
+    let _ = liquid_segmented_node(
+      page,
+      fn() { ["One", "Two", "Three"] },
+      fn() { seg_idx.get() },
+      fn(i : Int) { seg_idx.set(i) },
+      width=300.0,
+      glass_track=false,
+    )
+    let _ = liquid_pill_group_node(page, fn(g : view::View) {
+      let _ = headless::button(g, fn() { "Act" }, fn(_v : view::View) { pill_pressed.set(true) }, fn(b : view::View, _s : headless::Button) {
+        bind_pill_press(b)
+        let _ = b.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0))).radius(view::Live::Is(16.0))
+      })
+    }, height=36.0, pad=2.0)
+    let _ = page.box(fn(gated : view::View) {
+      let _ = gated.width(view::Live::Is(Some(120.0))).height(view::Live::Is(Some(40.0)))
+      let _ = liquid_panel_surface_decorate(gated, radius=16.0, active=fn() { deco_active.get() })
+    })
+    let _ = liquid_merge_node(page, controller=merge_ctrl, label=fn() { "Merge" })
+  })
+  t.run_for(glass_test_settle_ms)
+
+  // Inactive panel decorator emits zero glass; pill_group (1) + merge main & sat (2) = 3 liquid instances
+  let mut idle_glass = 0
+  for g in t.drawn_glass() {
+    if g.4 == 6 {
+      idle_glass = idle_glass + 1
+    }
+  }
+  check_eq_i(idle_glass, 3, "idle liquid glass count is 3")
+
+  // Toggle via tap
+  let r_sw = t.get(view::Role::Switch, label="Bluetooth").rect
+  t.tap(r_sw.0 + r_sw.2 / 2.0, r_sw.1 + r_sw.3 / 2.0)
+  t.run_for(glass_test_settle_ms)
+  check_eq_b(toggle_on.untracked(), true, "toggle turned on after tap")
+
+  // Slider via real press + drag + release updates value
+  let r_sl = t.get(view::Role::Slider, label="Brightness").rect
+  let sl_y = r_sl.1 + r_sl.3 / 2.0
+  let sl_x0 = r_sl.0 + r_sl.2 * 0.2
+  let sl_x1 = r_sl.0 + r_sl.2 * 0.75
+  t.press_at(sl_x0, sl_y)
+  t.run_for(glass_test_hold_ms)
+  t.move_to(sl_x1, sl_y)
+  t.run_for(glass_test_drag_ms)
+  t.release(sl_x1, sl_y)
+  t.run_for(glass_test_settle_ms)
+  check(slider_val.untracked() > 55.0, "slider drag updated value above 55.0")
+
+  // Segmented switch via tap
+  let r_tab = t.get(view::Role::Tab, label="Three").rect
+  t.tap(r_tab.0 + r_tab.2 / 2.0, r_tab.1 + r_tab.3 / 2.0)
+  t.run_for(glass_test_settle_ms)
+  check_eq_i(seg_idx.untracked(), 2, "segmented switched to index 2")
+
+  // Pill group button press
+  let r_btn = t.get(view::Role::Button, label="Act").rect
+  t.tap(r_btn.0 + r_btn.2 / 2.0, r_btn.1 + r_btn.3 / 2.0)
+  t.run_for(glass_test_settle_ms)
+  check_eq_b(pill_pressed.untracked(), true, "pill group button pressed")
+
+  // Enabling active panel decorator adds exactly 1 liquid glass instance
+  deco_active.set(true)
+  t.draw()
+  let mut active_glass = 0
+  for g in t.drawn_glass() {
+    if g.4 == 6 {
+      active_glass = active_glass + 1
+    }
+  }
+  check_eq_i(active_glass, 4, "active panel decorator adds 1 liquid glass instance")
+
+  // LiquidMerge programmatic split and fuse
+  t.by_hand(fn() { merge_ctrl.set_separated(true, at=t.time()) })
+  t.run_for(glass_test_settle_ms)
+  check_eq_b(merge_ctrl.is_separated(), true, "merge separated")
+  check_eq_b(merge_ctrl.is_bonded(), false, "merge unbonded when separated")
+  t.by_hand(fn() { merge_ctrl.set_separated(false, at=t.time()) })
+  t.run_for(glass_test_settle_ms)
+  check_eq_b(merge_ctrl.is_separated(), false, "merge fused")
+  check_eq_b(merge_ctrl.is_bonded(), true, "merge bonded when fused")
+  check_eq_i(t.audit().length(), 0, "interactive test zero audit faults")
+  set_dark(None)
+}
+
+test "liquid_segmented glass_track=true lens Z-order, zero relayout, and tab_bar solid border" {
+  let seg_idx = signals::signal(0)
+  let t = glass_test_case(false, false, fn(page : view::View) {
+    let _ = liquid_segmented_node(
+      page,
+      fn() { ["Day", "Week", "Month"] },
+      fn() { seg_idx.get() },
+      fn(i : Int) { seg_idx.set(i) },
+      width=360.0,
+      height=44.0,
+      glass_track=true,
+    )
+  })
+  t.run_for(glass_test_settle_ms)
+  check_eq_i(t.drawn_glass().length(), 1, "rest draws only track glass")
+  check_eq_i(t.audit().length(), 0, "rest audit empty")
+
+  // Press and drag to "Week" -> clear lens draws AFTER text glyphs, laid == 0
+  let r0 = t.get(view::Role::Tab, label="Day").rect
+  let r1 = t.get(view::Role::Tab, label="Week").rect
+  let cy = r0.1 + r0.3 / 2.0
+  t.press_at(r0.0 + r0.2 / 2.0, cy)
+  t.run_for(glass_test_hold_ms)
+  t.tree_frames_from_now()
+  t.move_to(r1.0 + r1.2 / 2.0, cy)
+  t.run_for(glass_test_drag_ms)
+  for f in t.tree_frames() {
+    check_eq_i(f.laid, 0, "dragging segmented must not relayout")
+  }
+  let insts = t.drawn_instances()
+  let mut last_glyph_idx = -1
+  let mut lens_idx = -1
+  let mut lens_h = 0.0
+  let mut idx = 0
+  while idx < insts.length() {
+    let inst = insts[idx]
+    if inst[5] == 1.0 {
+      last_glyph_idx = idx
+    } else if inst[5] == 6.0 && inst[14] == 0.0 {
+      lens_idx = idx
+      lens_h = inst[3]
+    }
+    idx = idx + 1
+  }
+  check(last_glyph_idx >= 0, "must draw label glyphs")
+  check(lens_idx > last_glyph_idx, "clear lens must draw AFTER text glyphs")
+  check(lens_h >= 44.0 + 9.0 && lens_h <= 44.0 + 16.0, "held lens overhangs 44pt track")
+
+  t.release(r1.0 + r1.2 / 2.0, cy)
+  t.run_for(glass_test_settle_ms)
+  check_eq_i(seg_idx.untracked(), 1, "release on Week selects index 1")
+  check_eq_i(t.drawn_glass().length(), 1, "settled returns to track glass only")
+
+  // Tab bar surface decorator: hairline solid border in Solid mode, zero border in Liquid mode
+  let tb = glass_test_case(false, true, fn(page : view::View) {
+    let _ = page.box(fn(bar : view::View) {
+      let _ = bar.width(view::Live::Is(Some(240.0))).height(view::Live::Is(Some(54.0))).radius(view::Live::Is(27.0))
+      let _ = liquid_tab_bar_surface_decorate(bar, fn() { (None, 0.0) })
+    })
+  })
+  tb.draw()
+  check_eq_i(tb.drawn_glass().length(), 0, "solid tab bar emits 0 glass")
+  let (exp_w, _) = liquid_solid_edge()
+  let mut bordered = 0
+  for a in tb.drawn_instances() {
+    if a.length() > 15 && a[5] == 0.0 && abs_f(a[2] - 240.0) < 0.5 && abs_f(a[3] - 54.0) < 0.5 && abs_f(a[6] - exp_w) < 0.01 && a[15] > 0.05 {
+      bordered = bordered + 1
+    }
+  }
+  check_eq_i(bordered, 1, "solid tab bar draws 1 hairline border")
+  ui::set_glass_solid(None)
+  tb.draw()
+  let mut liquid_bordered = 0
+  for a in tb.drawn_instances() {
+    if a.length() > 15 && a[5] == 0.0 && abs_f(a[2] - 240.0) < 0.5 && abs_f(a[3] - 54.0) < 0.5 && a[6] > 0.0 {
+      liquid_bordered = liquid_bordered + 1
+    }
+  }
+  check_eq_i(liquid_bordered, 0, "liquid tab bar draws 0 solid border")
+  set_dark(None)
+}
+
+test "pill_group morph_glass signal replacement refreshes rendered glass without touching fx" {
+  let trig_ref : Array[PillTriggerScope] = []
+  let t = glass_test_case(false, false, fn(page : view::View) {
+    let _ = liquid_pill_group_node(page, fn(g : view::View) {
+      let _ = g.box(fn(child : view::View) {
+        let _ = child.width(view::Live::Is(Some(32.0))).height(view::Live::Is(Some(32.0)))
+        match child.lent(liquid_pill_trigger_lent) {
+          Some(tr) => trig_ref.push(tr)
+          None => ()
+        }
+      })
+    }, height=40.0, pad=4.0)
+  })
+  t.draw()
+  check(trig_ref.length() >= 1, "pill_group lends PillTriggerScope to child")
+  let trig = trig_ref[trig_ref.length() - 1]
+  // Enter private SDF layer 7 once and record baseline blur slot
+  trig.fx.set((None, 7))
+  t.draw()
+  check_eq_i(t.drawn_glass().length(), 1, "layer 7 pill draws 1 liquid glass instance")
+  let mut base_blur = -1.0
+  for inst in t.drawn_instances() {
+    if inst.length() > 7 && inst[5] == 6.0 {
+      base_blur = inst[7]
+    }
+  }
+  check(base_blur >= 0.0, "baseline layer 7 glass instance found")
+
+  // Replace morph_glass signal with None-returning override WITHOUT touching trig.fx -> immediately suppresses glass
+  trig.morph_glass.set(Some(fn() { None }))
+  t.draw()
+  check_eq_i(t.drawn_glass().length(), 0, "morph_glass.set(Some(->None)) immediately suppresses glass without touching fx")
+
+  // Replace morph_glass signal with higher-blur liquid_menu_morph_glass(1.0) WITHOUT touching trig.fx
+  trig.morph_glass.set(Some(fn() {
+    Some(liquid_menu_morph_glass(1.0, dark=false, layer=7))
+  }))
+  t.draw()
+  check_eq_i(t.drawn_glass().length(), 1, "morph_glass.set(Some(->Some)) immediately renders glass without touching fx")
+  let mut override_blur = -1.0
+  for inst in t.drawn_instances() {
+    if inst.length() > 7 && inst[5] == 6.0 {
+      override_blur = inst[7]
+    }
+  }
+  check(override_blur > base_blur + 1.0, "morph_glass override immediately increases rendered glass blur without touching fx")
+
+  // Clearing morph_glass back to None WITHOUT touching trig.fx restores baseline layer 7 glass blur
+  trig.morph_glass.set(None)
+  t.draw()
+  check_eq_i(t.drawn_glass().length(), 1, "clearing morph_glass restores default layer 7 glass")
+  let mut restored_blur = -1.0
+  for inst in t.drawn_instances() {
+    if inst.length() > 7 && inst[5] == 6.0 {
+      restored_blur = inst[7]
+    }
+  }
+  check(abs_f(restored_blur - base_blur) < 0.01, "clearing morph_glass restores baseline glass blur")
+  set_dark(None)
+}

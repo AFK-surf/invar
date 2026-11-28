@@ -64,9 +64,10 @@ pub fn main(world : World) -> Int {
 
 ### 1.2 Never hand-roll `Glass::liquid` in downstream app code
 - Downstream application and business packages **MUST NEVER** call `paint::Glass::liquid(...)` directly.
+- Liquid Glass in Invar is organized into two layers: `packages/glass` (the generated Liquid Glass primitive layer) and `packages/lg` (the high-level component & JSX facade).
 - 100% of Liquid Glass UI must be built from `packages/lg` components. Before building any glass surface, control, toolbar, panel, menu, or overlay, look up the right component in [`packages/lg/CATALOG.md`](packages/lg/CATALOG.md) and read [`packages/lg/DESIGN.md`](packages/lg/DESIGN.md).
 - Downstream repos must enforce two automated gates:
-  1. Static grep gate: `grep -rn "Glass::liquid" src/` must return **0 hits** outside `invar/packages/lg`.
+  1. Static grep gate: `grep -rn "Glass::liquid" src/` must return **0 hits** outside `invar/packages/lg` and `invar/packages/glass`.
   2. Runtime/layout test gate: every UI test suite must run `lg::assert_no_nested_glass(t, label="...")` (exported from `packages/lg/src/audit.pion`).
 
 ### 1.3 Upstream missing primitives to `AFK-surf/invar` first

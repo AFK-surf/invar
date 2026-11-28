@@ -47,7 +47,7 @@ scope(world, fn(s : Scope) -> Unit {
 
 ---
 
-## 47 个包架构总览 / 47-Package Layout
+## 48 个包架构总览 / 48-Package Layout
 
 | 层级 | 包列表 | 数量 | 职责说明 |
 |---|---|---:|---|
@@ -57,9 +57,9 @@ scope(world, fn(s : Scope) -> Unit {
 | **Layer 2（节点树、动效、导航与交互框架）** | `view`、`headless`、`ui`、`motion`、`editor`、`nav` | 6 | 保留模式纯节点树与 `ViewBlock` 快路径（`view`）、无头交互与无障碍原语（`headless`）、主题/输入法/只读选区与超链接/`ui::Worker`/6 道自动 UI 门禁/`InputTape` 回放/桌面缩放拖拽文件手柄/离屏 `Tester`（`ui`）、闭式弹簧与液态物理动效（`motion`，依赖 `view`/`ui`）、多行编辑器与光学放大镜（`editor`）、原生栈与手势导航（`nav`） |
 | **Layer 3（宿主桥接、出片与基础套件）** | `hostapi`、`host`、`host_web`、`film`、`kit`、`icons` | 6 | 统一宿主 ABI、六端原生宿主、Web 宿主、确定性离屏出图/录片引擎（`film`）、基础 UI 套件（`kit`）、纯矢量图标集（`icons`） |
 | **领域组件与系统扩展** | `code_field`、`terminal`、`player`、`media`、`figure`、`webpage`、`updater`、`textdiff`、`runfs` | 9 | 语法高亮代码编辑器、VT100/ANSI 终端、媒体播放状态机、媒体容器与转码、图表/插图组件、网页容器与桥接、SHA-512 + Ed25519 自更新验签、Myers 文本差分、沙箱文件系统 |
-| **Liquid Glass 组件与展台** | `lg`、`lg_pages`、`lg_shots`、`lg_web` | 4 | iOS 27 液态玻璃组件库（含单层液态玻璃编辑条 `edit_bar` 与 `audit_glass` 门禁）、展厅页面、Metal 离屏出图器、WebAssembly 展台 |
+| **Liquid Glass 组件与展台** | `glass`、`lg`、`lg_pages`、`lg_shots`、`lg_web` | 5 | 生成的 Liquid Glass 原语层（`glass`）与高层 iOS 27 液态玻璃组件库（`lg`，含单层液态玻璃编辑条 `edit_bar` 与 `audit_glass` 门禁）构成两层架构，以及展厅页面、Metal 离屏出图器、WebAssembly 展台 |
 | **站点与性能基准** | `site`、`bench`、`bench_gpu` | 3 | 官方展示站点、Layer-1 CPU 基准套件、Layer-2 同步 GPU 帧时基准套件 |
-| **合计** | `packages/*` | **47** | 全量纯 Pion 构建，零 MoonBit 依赖 |
+| **合计** | `packages/*` | **48** | 全量纯 Pion 构建，零 MoonBit 依赖 |
 
 ---
 
