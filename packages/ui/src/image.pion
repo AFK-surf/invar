@@ -1,11 +1,14 @@
-// Image registration, deduplication, vector rasterization hook, LRU cache, and byte accounting.
-// Ported from libs/mbui/src/ui/image.mbt and fake_host.mbt's host_image_bytes_known.
-
+import "flex"
 import "hostapi"
-import "pixels"
+import "mbt_compat"
 import "signals"
 
-/// Image fitting mode inside a box.
+// Images: decoded by the host to the size they are shown at (rounded up to
+// a power of two, so a few sizes serve every layout), kept while used and
+// dropped least recently used first once they take more than the budget.
+
+///|
+
 #derive(Eq)
 pub enum Fit {
   FitCover
@@ -15,436 +18,1332 @@ pub enum Fit {
   FitFill
 }
 
-pub fn Fit::cover_from(self : Fit) -> (Double, Double) {
-  match self {
-    Fit::FitCover => (0.5, 0.5)
-    Fit::FitCoverAt(down) => (0.5, dclamp(down, 0.0, 1.0))
-    Fit::FitCoverFrom(across, down) => (dclamp(across, 0.0, 1.0), dclamp(down, 0.0, 1.0))
-    Fit::FitContain => (0.5, 0.5)
-    Fit::FitFill => (0.5, 0.5)
-  }
-}
-
+///|
 struct ImageEntry {
   id : Int
   mut px : Int
-  mut state : Int // 0 decoding, 1 ready, -1 failed
+  mut state : Int
   mut w : Double
   mut h : Double
+  mut ow : Double
+  mut oh : Double
   mut used : Int
   mut ready_at : Double
+  follows : Option[Double]
+  mover : Mover
+  mut fade_told : Bool
 }
 
-let image_budget : Double = 192.0 * 1024.0 * 1024.0
-let image_data : Map[String, Bytes] = Map::new()
-let image_vector_drawers : Map[String, (Bytes, Int) -> Option[(Int, Int, Array[Byte])]] = Map::new()
-let image_cache : Map[String, Array[ImageEntry]] = Map::new()
-let image_bytes_total : signals::Ref[Double] = ref_new(0.0)
-let image_rev : signals::Ref[signals::Signal[Int]] = ref_new(signals::signal(0))
-let host_image_byte_bars : Map[String, Int] = Map::new()
-let image_obs_recording : signals::Ref[Bool] = ref_new(false)
-let image_obs_node_at : signals::Ref[Int] = ref_new(-1)
-let image_obs_node_gen : signals::Ref[Int] = ref_new(-1)
-let image_obs_call_slot : signals::Ref[Int] = ref_new(0)
-let frame_image_obs : Map[String, Option[(Int, Double, Double)]] = Map::new()
-let image_obs_block_sink : signals::Ref[Option[Array[(String, Option[(Int, Double, Double)])]]] = ref_new(None)
-let image_invalidate_epoch : signals::Ref[Int] = ref_new(0)
-let image_resolve_transitional : signals::Ref[Bool] = ref_new(false)
+///|
+/// An image fading in is at rest image_fade_ms after it was ready.
+fn ImageEntry::rest_at(self : ImageEntry, now : Double, frame : Int) -> Double {
+  ignore(now)
+  ignore(frame)
+  self.ready_at + image_fade_ms
+}
 
-fn image_list_has_transitional(list : Array[ImageEntry]) -> Bool {
-  for e in list {
-    if e.px == 0 {
-      return true
-    }
+///|
+/// What moves, as Ctx::moving is told it (Moving).
+fn ImageEntry::as_moving(self : ImageEntry) -> Moving {
+  Moving::new(fn(now, frame) { self.rest_at(now, frame) })
+}
+
+///|
+/// Decodes by source, smallest first.
+// moved to 00_init_order.pion: image_cache
+
+///|
+// kept across runs: each decode in image_cache by its host's number, and its source (a host numbers each anew, never one
+// let go of again), gone with it (image_dropped, Tester's reset)
+// moved to 00_init_order.pion: image_by_id
+
+///|
+// kept across runs: the bytes of the ready decodes in image_cache (each w·h·4 as it is ready, image_dropped's taken off):
+// what Ctx::trim_images holds to its budget, told as they change, not added up each frame (Tester's reset)
+// moved to 00_init_order.pion: image_bytes
+
+///|
+/// Decode `e` of `src` put in image_cache: known by its number, its bytes counted where it is ready already (else as
+/// it comes to be, ImageEntry::poll).
+fn image_added(src : String, e : ImageEntry) -> Unit {
+  image_by_id.set(e.id, (src, e))
+  if e.state == 1 {
+    image_bytes.v = image_bytes.v + e.w * e.h * 4.0
   }
-  false
 }
 
-fn image_list_has_pending(list : Array[ImageEntry]) -> Bool {
-  for e in list {
-    if e.state == 0 {
-      return true
-    }
+///|
+/// Decode `e` let go of from image_cache (its host's freed by what lets it go): its number and its bytes with it.
+fn image_dropped(e : ImageEntry) -> Unit {
+  match image_by_id.get(e.id) {
+    Some((_, x)) if physical_equal(x, e) => image_by_id.remove(e.id)
+    _ => ()
   }
-  false
+  image_bytes.v = image_bytes.v - e.w * e.h * 4.0
 }
 
-fn image_obs_begin_frame(record : Bool) -> Unit {
-  frame_image_obs.clear()
-  image_obs_recording.v = record
-  image_obs_node_at.v = -1
-  image_obs_node_gen.v = -1
-  image_obs_call_slot.v = 0
-}
-
-fn image_obs_end_frame() -> Unit {
-  frame_image_obs.clear()
-  image_obs_recording.v = false
-  image_obs_node_at.v = -1
-  image_obs_node_gen.v = -1
-  image_obs_call_slot.v = 0
-  image_resolve_transitional.v = false
-}
-
-fn image_obs_key(key : String, px : Int) -> String {
-  "\{image_obs_node_at.v}:\{image_obs_node_gen.v}:\{px}:\{image_obs_call_slot.v}:\{key}"
-}
-
-fn image_bytes_from_arr(arr : Array[Byte]) -> Bytes {
-  let sb = StringBuilder::new()
-  for b in arr {
-    sb.write_byte(b)
-  }
-  sb.to_string().to_bytes()
-}
-
-fn bytes_equal(a : Bytes, b : Bytes) -> Bool {
-  if a.length() != b.length() {
-    return false
-  }
-  let mut i = 0
-  while i < a.length() {
-    if a[i] != b[i] {
-      return false
-    }
-    i += 1
-  }
-  true
-}
-
-fn image_bump_rev() -> Unit {
-  image_rev.v.set(image_rev.v.untracked() + 1)
-}
-
-fn image_cache_renew(key : String) -> Unit {
-  match image_cache.get(key) {
-    Some(list) => {
-      let kept : Array[ImageEntry] = []
-      for e in list {
-        if e.state == 1 {
-          e.px = 0
-          kept.push(e)
-        } else {
-          hostapi::image_free(e.id)
-          image_bytes_total.v = dmax(0.0, image_bytes_total.v - e.w * e.h * 4.0)
-        }
-      }
-      if kept.length() == 0 {
-        image_cache.remove(key)
-      } else {
-        image_cache[key] = kept
-      }
-    }
-    None => ()
-  }
-  image_invalidate_epoch.v = image_invalidate_epoch.v + 1
-  image_bump_rev()
-}
-
-/// Register an encoded raster image under `key`, deduplicating identical bytes.
-pub fn add_image(key : String, data : Bytes) -> Unit {
-  let changed = if image_vector_drawers.contains(key) {
-    true
+///|
+/// Whether a named picture's current decodes are ready, still coming, or failed. An exact source wins over a suffix
+/// or prefix; an incomplete name matching more than one picture is an error, not whichever the map happens to visit.
+/// Old decodes with px=0 only stand in while a replacement is drawn and do not make the replacement ready.
+fn named_image_state(name : String) -> (Int, Array[String]) {
+  let named = []
+  if image_cache.contains(name) {
+    named.push(name)
   } else {
-    match image_data.get(key) {
-      Some(old) => !bytes_equal(old, data)
-      None => true
+    { let __mbt_mit_91 = mbt_compat::ordered_map_iter_lazy(image_cache); while true { match (__mbt_mit_91.next)() { Some((src, _)) => {
+      if mbt_compat::str_has_prefix(src, name) || mbt_compat::str_has_suffix(src, name) {
+        named.push(src)
+      }
+    }, None => break } } }
+  }
+  if named.length() > 1 {
+    named.sort()
+    return (-2, named)
+  }
+  if named.is_empty() {
+    return (0, named)
+  }
+  let mut pending = false
+  let mut failed = false
+  let mut ready = false
+  for e in mbt_compat::opt_unwrap(image_cache.get(named[0])) {
+    if e.px > 0 {
+      if e.state == 0 {
+        pending = true
+      } else if e.state < 0 {
+        failed = true
+      } else {
+        ready = true
+      }
     }
   }
+  (if pending { 0 } else if failed { -1 } else if ready { 1 } else { 0 }, named)
+}
+
+///|
+/// Encoded images the app handed over (thumbnails from the core, say), by
+/// the key views show them by.
+// moved to 00_init_order.pion: image_data
+
+///|
+/// A vector picture's own renderer when the code that supplies the picture has one, by its source.
+// moved to 00_init_order.pion: image_vector_drawers
+
+///|
+/// Decoded bytes kept before unused images are dropped.
+// moved to 00_init_order.pion: image_budget
+
+///|
+// kept across runs: scratch the host writes into before each read, read at once: nothing is carried in it
+// moved to 00_init_order.pion: image_info_out
+
+///|
+/// Hands over an encoded image (JPEG, PNG, HEIC, WebP…) to show as `key`.
+pub fn Ctx::image_bytes(self : Ctx, key : String, data : Bytes) -> Unit {
+  ignore(self)
+  let changed = image_bytes_changed(key, data)
   image_vector_drawers.remove(key)
-  image_data[key] = data
+  // (a GIF handed over as it before: its frames let go of, gif.pion)
+  moving_forget(key)
+  if !add_gif(key, data) {
+    image_data.set(key, data)
+  }
+  image_bytes_here(key)
   if changed {
     image_cache_renew(key)
+    outside_came()
+    h_frame_owed()
   }
 }
 
-/// Register a vector image under `key` with its custom rasterizer `(bytes, max_px) -> Option[(w, h, rgba)]`.
-pub fn add_vector_image(
-  key : String,
-  data : Bytes,
-  draw : (Bytes, Int) -> Option[(Int, Int, Array[Byte])],
-) -> Unit {
-  image_data[key] = data
-  image_vector_drawers[key] = draw
-  image_cache_renew(key)
+///|
+/// Hands over an encoded image to show as `key`, from outside a frame (a
+/// core call's answer). Keys starting `mem:` show nothing until given.
+pub fn add_image(key : String, data : Bytes) -> Unit {
+  let changed = image_bytes_changed(key, data)
+  image_vector_drawers.remove(key)
+  // (a GIF handed over as it before: its frames let go of)
+  moving_forget(key)
+  // a GIF that moves: its frames each a picture (gif.pion)
+  if !add_gif(key, data) {
+    image_data.set(key, data)
+  }
+  image_bytes_here(key)
+  if changed {
+    image_cache_renew(key)
+    outside_came()
+    h_frame_owed()
+  }
 }
 
-/// Forget an image, releasing its cached decodes on the host and freeing its byte records.
+///|
+/// Whether `data` handed over as `key` (add_image, Ctx::image_bytes) changes what it shows: other bytes than those it
+/// was handed before (the same ones, as an old view hands them over each frame, are not decoded again), a vector
+/// renderer of its own let go of, or a picture decoded from elsewhere by that name before (a file, a URL).
+fn image_bytes_changed(key : String, data : Bytes) -> Bool {
+  if image_vector_drawers.contains(key) {
+    return true
+  }
+  // (a GIF that moves: the bytes it was made from; its first frame's PNG in image_data is made anew each time)
+  let prev = match moving_images.get(key) {
+    Some(m) => Some(m.data)
+    Option::None => image_data.get(key)
+  }
+  match prev {
+    Some(old) => !(physical_equal(old, data) || mbt_compat::bytes_eq(old, data))
+    Option::None => image_cache.contains(key)
+  }
+}
+
+///|
+/// The decodes of `key` made from what it showed before let go of, as other bytes are handed over for it: one still
+/// coming or failed at once, one ready kept only to stand in (px 0, as redraw_vector_pictures has it) until a decode of
+/// the new bytes is ready (image_done lets it go then), so no frame shows nothing between them; what was read back of
+/// its pixels with them. Its decodes' state told, so what draws it asks for a decode of the new bytes.
+fn image_cache_renew(key : String) -> Unit {
+  vector_parsed_remove(key)
+  pixels_forget(key)
+  match image_cache.get(key) {
+    Some(list) => {
+      for e in list {
+        if e.state != 1 {
+          h_image_free(e.id)
+          image_dropped(e)
+        }
+      }
+      mbt_compat::arr_retain(list, fn(e) { e.state == 1 })
+      for e in list {
+        e.px = 0
+      }
+      if list.is_empty() {
+        image_cache.remove(key)
+      }
+    }
+    Option::None => ()
+  }
+  signals::start_batch()
+  let said = image_said(key)
+  said.bytes.set(true)
+  said.decodes.set(said.decodes.untracked() + 1)
+  sizes_told(key, said)
+  signals::end_batch()
+}
+
+///|
+/// Hands over a vector picture with the renderer that belongs to it. Other pictures continue to use the app's
+/// renderer; if this renderer declines the bytes, the app's gets the same chance as for any other picture.
+pub fn add_vector_image(key : String, data : Bytes, draw : (Bytes, Int) -> Option[(Int, Int, FixedArray[Byte])]) -> Unit {
+  // (decoded before: drawn again, its renderer or its bytes others now)
+  let changed = image_cache.contains(key)
+  // (a GIF handed over as it before: its frames let go of, gif.pion)
+  moving_forget(key)
+  image_data.set(key, data)
+  image_vector_drawers.set(key, draw)
+  image_bytes_here(key)
+  if changed {
+    image_cache_renew(key)
+    outside_came()
+    h_frame_owed()
+  }
+}
+
+///|
+/// Encodes a premultiplied sRGB RGBA8888 pixel buffer into the `MBRAWPRE` binary wire format:
+/// 8-byte ASCII magic `"MBRAWPRE"`, LE uint32 `w`, LE uint32 `h`, followed by `w * h * 4` tight top-down bytes.
+/// Returns `None` if dimensions are out of `1..=16384` or `premul_rgba` is too short.
+pub fn raw_premul_of(w : Int, h : Int, premul_rgba : FixedArray[Byte]) -> Option[Bytes] {
+  if w <= 0 || h <= 0 || w > 16384 || h > 16384 {
+    return Option::None
+  }
+  let n64 = w.to_int64() * h.to_int64() * 4L
+  if n64 > premul_rgba.length().to_int64() {
+    return Option::None
+  }
+  let n = n64.to_int()
+  let out = FixedArray::make(16 + n, 0.to_byte())
+  out[0] = 77.to_byte()
+  out[1] = 66.to_byte()
+  out[2] = 82.to_byte()
+  out[3] = 65.to_byte()
+  out[4] = 87.to_byte()
+  out[5] = 80.to_byte()
+  out[6] = 82.to_byte()
+  out[7] = 69.to_byte()
+  out[8] = (w & 0xFF).to_byte()
+  out[9] = ((w >> 8) & 0xFF).to_byte()
+  out[10] = ((w >> 16) & 0xFF).to_byte()
+  out[11] = ((w >> 24) & 0xFF).to_byte()
+  out[12] = (h & 0xFF).to_byte()
+  out[13] = ((h >> 8) & 0xFF).to_byte()
+  out[14] = ((h >> 16) & 0xFF).to_byte()
+  out[15] = ((h >> 24) & 0xFF).to_byte()
+  premul_rgba.blit_to(out, len=n, dst_offset=16)
+  Some(mbt_compat::bytes_from_array(mbt_compat::fixed_array_slice_clamp(out, 0, out.length())))
+}
+
+///|
+enum VectorPictures {
+  VecNone
+  VecStraight((Bytes, Int) -> Option[(Int, Int, FixedArray[Byte])])
+  VecPremul((Bytes, Int) -> Option[(Int, Int, FixedArray[Byte])])
+  VecParsedPremul((Bytes) -> Option[(Int) -> Option[(Int, Int, FixedArray[Byte])]])
+}
+
+///|
+// kept across runs: set once as the app starts (its main), what draws vector pictures for every run after
+// moved to 00_init_order.pion: vector_pictures
+
+///|
+// moved to 00_init_order.pion: vector_parsed_max_entries
+
+///|
+// moved to 00_init_order.pion: vector_parsed_max_bytes
+
+///|
+// kept across runs: bounded LRU of parsed vector documents (<= 4 entries, <= 512 KB input), cleared on Tester reset
+// moved to 00_init_order.pion: vector_parsed_cache
+
+///|
+// kept across runs: LRU key order for vector_parsed_cache (most recently used at end), shrunk on eviction/clear
+// moved to 00_init_order.pion: vector_parsed_order
+
+///|
+fn vector_parsed_remove(key : String) -> Unit {
+  if vector_parsed_cache.contains(key) {
+    vector_parsed_cache.remove(key)
+    for i in 0..<vector_parsed_order.v.length() {
+      if vector_parsed_order.v[i] == key {
+        mbt_compat::arr_remove(vector_parsed_order.v, i) |> ignore
+        break
+      }
+    }
+  }
+}
+
+///|
+fn vector_parsed_clear() -> Unit {
+  vector_parsed_cache.clear()
+  vector_parsed_order.v = []
+}
+
+///|
+fn vector_parsed_touch(key : String) -> Unit {
+  let n = vector_parsed_order.v.length()
+  if n > 0 && vector_parsed_order.v[n - 1] == key {
+    return
+  }
+  for i in 0..<n {
+    if vector_parsed_order.v[i] == key {
+      mbt_compat::arr_remove(vector_parsed_order.v, i) |> ignore
+      break
+    }
+  }
+  vector_parsed_order.v.push(key)
+}
+
+///|
+fn vector_parsed_insert(key : String, data : Bytes, draw : (Int) -> Option[(Int, Int, FixedArray[Byte])]) -> Unit {
+  if data.length() > vector_parsed_max_bytes {
+    return
+  }
+  if vector_parsed_cache.contains(key) {
+    vector_parsed_cache.set(key, (data, draw))
+    vector_parsed_touch(key)
+    return
+  }
+  while vector_parsed_order.v.length() >= vector_parsed_max_entries {
+    let oldest = mbt_compat::arr_remove(vector_parsed_order.v, 0)
+    vector_parsed_cache.remove(oldest)
+  }
+  vector_parsed_cache.set(key, (data, draw))
+  vector_parsed_order.v.push(key)
+}
+
+///|
+/// Sets what draws vector pictures (SVG) handed over as bytes (`add_image`, `Ctx::image_bytes`) as straight RGBA.
+pub fn set_vector_pictures(draw : (Bytes, Int) -> Option[(Int, Int, FixedArray[Byte])]) -> Unit {
+  vector_parsed_clear()
+  vector_pictures.v = VecStraight(draw)
+}
+
+///|
+/// Sets what draws vector pictures (SVG) handed over as bytes as premultiplied RGBA (`MBRAWPRE` fast path).
+pub fn set_vector_pictures_premul(draw : (Bytes, Int) -> Option[(Int, Int, FixedArray[Byte])]) -> Unit {
+  vector_parsed_clear()
+  vector_pictures.v = VecPremul(draw)
+}
+
+///|
+/// Sets what parses vector pictures (SVG) handed over as bytes into a reusable premultiplied rasterizer
+/// (cached in a bounded LRU across bucket upgrades, encoded via `MBRAWPRE`).
+pub fn set_vector_pictures_parsed(parse : (Bytes) -> Option[(Int) -> Option[(Int, Int, FixedArray[Byte])]]) -> Unit {
+  vector_parsed_clear()
+  vector_pictures.v = VecParsedPremul(parse)
+}
+
+///|
+/// An encoded picture as the host decodes it: a vector one drawn here at `px` on its longer side (PNG for straight-alpha
+/// drawers, `MBRAWPRE` for premultiplied drawers).
+fn host_bytes(src : String, data : Bytes, px : Int) -> Bytes {
+  if looks_like_svg(data) {
+    match image_vector_drawers.get(src) {
+      Some(draw) => {
+        let t0 = hostapi::work_began()
+        match draw(data, px) {
+          Some((w, h, rgba)) => {
+            let out = png_of(w, h, rgba)
+            if t0 >= 0.0 {
+              hostapi::work_took("svg raster", hostapi::work_began() - t0)
+            }
+            return out
+          }
+          Option::None => ()
+        }
+      }
+      Option::None => ()
+    }
+    match vector_pictures.v {
+      .VecParsedPremul(parse) => {
+        let t0 = hostapi::work_began()
+        let draw_opt = match vector_parsed_cache.get(src) {
+          Some((cached_bytes, draw)) if physical_equal(cached_bytes, data) => {
+            vector_parsed_touch(src)
+            Some(draw)
+          }
+          _ =>
+          match parse(data) {
+            Some(draw) => {
+              vector_parsed_insert(src, data, draw)
+              Some(draw)
+            }
+            Option::None => None
+          }
+        }
+        match draw_opt {
+          Some(draw) =>
+          match draw(px) {
+            Some((w, h, premul)) =>
+            match raw_premul_of(w, h, premul) {
+              Some(out) => {
+                if t0 >= 0.0 {
+                  hostapi::work_took("svg raster", hostapi::work_began() - t0)
+                }
+                return out
+              }
+              Option::None => ()
+            }
+            None => ()
+          }
+          None => ()
+        }
+      }
+      .VecPremul(draw) => {
+        let t0 = hostapi::work_began()
+        match draw(data, px) {
+          Some((w, h, premul)) =>
+          match raw_premul_of(w, h, premul) {
+            Some(out) => {
+              if t0 >= 0.0 {
+                hostapi::work_took("svg raster", hostapi::work_began() - t0)
+              }
+              return out
+            }
+            Option::None => ()
+          }
+          Option::None => ()
+        }
+      }
+      .VecStraight(draw) => {
+        let t0 = hostapi::work_began()
+        match draw(data, px) {
+          Some((w, h, rgba)) => {
+            let out = png_of(w, h, rgba)
+            if t0 >= 0.0 {
+              hostapi::work_took("svg raster", hostapi::work_began() - t0)
+            }
+            return out
+          }
+          Option::None => ()
+        }
+      }
+      .VecNone => ()
+    }
+  }
+  data
+}
+
+///|
+/// Draws the vector pictures handed over again, as what draws them can draw more of them now (a font it lacked come):
+/// each shown as it was until its new drawing is ready (followed on from, not faded in again).
+pub fn redraw_vector_pictures() -> Unit {
+  vector_parsed_clear()
+  signals::start_batch()
+  { let __mbt_mit_482 = mbt_compat::ordered_map_iter_lazy(image_data); while true { match (__mbt_mit_482.next)() { Some((src, d)) => {
+    guard looks_like_svg(d) else { continue }
+    pixels_forget(src)
+    match image_cache.get(src) {
+      Some(list) => {
+        for e in list {
+          if e.state == -1 {
+            h_image_free(e.id)
+            image_dropped(e)
+          }
+        }
+        mbt_compat::arr_retain(list, fn(e) { e.state != -1 })
+        for e in list {
+          e.px = 0
+        }
+      }
+      Option::None => ()
+    }
+    let said = image_said(src)
+    said.decodes.set(said.decodes.untracked() + 1)
+    sizes_told(src, said)
+  }, None => break } } }
+  signals::end_batch()
+}
+
+///|
+/// An `<svg` near the start of the bytes, or gzip's magic (an .svgz).
+fn looks_like_svg(data : Bytes) -> Bool {
+  if data.length() >= 2 && data[0] == 31.to_byte() && data[1] == 139.to_byte() {
+    return true
+  }
+  let n = if data.length() < 1024 { data.length() } else { 1024 }
+  for i in 0..<(n - 3) {
+    if data[i] == 60.to_byte() && data[i + 1] == 115.to_byte() && data[i + 2] == 118.to_byte() && data[i + 3] == 103.to_byte() {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Whether an image was handed over as `key` (add_image, Ctx::image_bytes): what one made from its key needs make only
+/// once (a Tester starts without any).
+pub fn has_image(key : String) -> Bool {
+  image_data.contains(key)
+}
+
+///|
+fn bucket(px : Double) -> Int {
+  let mut b = 64
+  while b.to_double() < px && b < 8192 {
+    b = b * 2
+  }
+  b
+}
+
+///|
+fn ImageEntry::poll(self : ImageEntry, now : Double) -> Unit {
+  // INVAR-EXT: do not re-poll pending async images during Tester reference looks rebuild
+  if looks_ref_pass.v {
+    return
+  }
+  if self.state == 0 {
+    let st = h_image_info(self.id, image_info_out)
+    if st == 1 {
+      self.w = image_info_out[0]
+      self.h = image_info_out[1]
+      image_bytes.v = image_bytes.v + self.w * self.h * 4.0
+      self.ow = image_info_out[2]
+      self.oh = image_info_out[3]
+      self.ready_at = self.follows.unwrap_or(now)
+    }
+    self.state = st
+  }
+}
+
+///|
+/// The decode of `src` to show at `px` pixels on the long side: the one
+/// of that bucket once ready, else, while it decodes (started here if
+/// none at least that big is coming), the smallest ready one bigger than
+/// it, or the biggest ready one smaller. (A much bigger decode is not kept to draw small: the
+/// GPU's bilinear sample of a texture without mipmaps, shrunk several
+/// times over, is jagged.)
+fn Ctx::image_for(self : Ctx, src : String, px : Double) -> Option[ImageEntry] {
+  image_entry_for(src, px, self.frame_no, self.clock)
+}
+
+///|
+/// Ctx::image_for's decode of `src` at `px`, by whoever asks: what asks it marked as using it as of frame `used`, a
+/// decode it starts done as of `at` where the host has it done at once (the moment it was asked: a build's clock, a
+/// node's moment).
+fn image_entry_for(src : String, px : Double, used : Int, at : Double) -> Option[ImageEntry] {
+  if src == "" {
+    return Option::None
+  }
+  // (followed: which of its decodes is ready changes as the host says one is, or failed)
+  image_decodes_read(src)
+  // bytes still on their way: nothing to load yet
+  if mbt_compat::str_has_prefix(src, "mem:") && !image_data.contains(src) {
+    return Option::None
+  }
+  let want = bucket(px)
+  let list = match image_cache.get(src) {
+    Some(l) => l
+    Option::None => {
+      let l = []
+      image_cache.set(src, l)
+      l
+    }
+  }
+  let mut good : Option[ImageEntry] = Option::None
+  let mut bigger : Option[ImageEntry] = Option::None
+  let mut smaller : Option[ImageEntry] = Option::None
+  let mut pending = false
+  let mut failed = false
+  // (a decode is ready, or failed, as the host's word that it is says, at that word's moment: image_decoded; never as a
+  // frame happens to look)
+  for e in list {
+    if e.state == 0 {
+      e.poll(at)
+    }
+    if e.state == -1 {
+      failed = true
+      continue
+    }
+    if e.state == 0 {
+      // (one coming at least as big: waited for, as it will be drawn from (once ready, it stands in while one of this
+      // size decodes))
+      if e.px >= want {
+        pending = true
+      }
+    } else if e.px == want {
+      good = Some(e)
+    } else if e.px > want {
+      if bigger is Option::None {
+        bigger = Some(e)
+      }
+    } else {
+      smaller = Some(e)
+    }
+  }
+  let fallback = if bigger is Some(_) { bigger } else { smaller }
+  if good is Option::None && !pending && !failed {
+    let draw_px = if image_vector_drawers.contains(src) && px > 0.0 && px < want.to_double() {
+      px.ceil().to_int()
+    } else {
+      want
+    }
+    let id = match image_data.get(src) {
+      Some(d) => h_image_load_bytes(host_bytes(src, d, draw_px), want, src)
+      Option::None =>
+      if mbt_compat::str_has_prefix(src, "pdf:") {
+        pdf_page_load(src, want)
+      } else {
+        h_image_load(src, want)
+      }
+    }
+    let e = ImageEntry::{
+      id: id,
+      px: want,
+      state: 0,
+      w: 0.0,
+      h: 0.0,
+      ow: 0.0,
+      oh: 0.0,
+      used: used,
+      ready_at: 0.0,
+      follows: mbt_compat::opt_map(fallback, fn(f) { f.ready_at }),
+      mover: Mover::new(),
+      fade_told: false,
+    }
+    // smallest first
+    let mut k = 0
+    while k < list.length() && list[k].px < want {
+      k = k + 1
+    }
+    mbt_compat::arr_insert(list, k, e)
+    image_added(src, e)
+    // (done at once, as the host decoded it, or failed, while asked: so at the moment it was asked, this build's, said
+    // as a word of the host's that it is done is, image_decoded)
+    image_done(src, e, at)
+    if e.state >= 0 && !image_data.contains(src) && !mbt_compat::str_has_prefix(src, "pdf:") {
+      outside_start(outside_image, e.id, "image \{e.id} \{src}")
+    }
+    if e.state == 1 {
+      good = Some(e)
+    }
+  }
+  let r = if good is Some(_) { good } else { fallback }
+  match r {
+    Some(e) => {
+      e.used = used
+      built_used(fn() { e.used = g().frame_no })
+    }
+    Option::None => ()
+  }
+  r
+}
+
+///|
+/// Whether a decode of the image at `src` is ready, of any size (what Ctx::image_ready finds once one is asked: that
+/// size's, or one standing in for it), followed as the host's word on its decodes comes (image_decoded), asking for
+/// none: what waits for a picture a build asked for reads it so, between frames.
+pub fn image_any_ready(src : String) -> Bool {
+  image_decodes_read(src)
+  match image_cache.get(src) {
+    Some(list) => mbt_compat::arr_iter(list).any(fn(e) { e.state == 1 })
+    Option::None => false
+  }
+}
+
+///|
+/// Whether the image at `src` is still coming at `px` on its long side (its bytes on their way, or a decode of it that
+/// large not ready yet and not failed): a shot waits for it (shot.pion).
+fn image_awaited(src : String, px : Double) -> Bool {
+  image_decodes_read(src)
+  if mbt_compat::str_has_prefix(src, "mem:") && !image_data.contains(src) {
+    return true
+  }
+  let want = bucket(px)
+  match image_cache.get(src) {
+    Some(list) => {
+      let mut coming = false
+      for e in list {
+        if e.state == 1 && e.px == want {
+          return false
+        }
+        if e.state == 0 && e.px >= want {
+          coming = true
+        }
+      }
+      coming
+    }
+    Option::None => false
+  }
+}
+
+///|
+/// The original's size in pixels, once any decode of it is ready.
+fn image_size(src : String) -> Option[(Double, Double)] {
+  // (followed, by this picture alone: what reads its size worked out again as it is first known or changes, read
+  // only: image_decoded)
+  image_said(src).size.get()
+}
+
+///|
+/// How many pixels on its long side `src` is decoded at to be shown in a box `bw` × `bh` at `fit`: the box's long
+/// side, unless the picture covers the box and its proportions are known: then its own long side as it is drawn,
+/// cropped. (A wide screenshot covering a square tile is as tall as the tile and several times as wide: decoded at the
+/// tile's side it would be stretched several times over, blurred.)
+fn Ctx::image_px(self : Ctx, src : String, bw : Double, bh : Double, fit : Fit) -> Double {
+  match (fit, image_size(src)) {
+    (FitCover, Some((ow, oh))) | (FitCoverAt(_), Some((ow, oh))) | (FitCoverFrom(_, _), Some((ow, oh))) if ow > 0.0 && oh > 0.0 && bw > 0.0 && bh > 0.0 =>
+    dmax(ow, oh) * dmax(bw / ow, bh / oh) * self.scale
+    _ => dmax(bw, bh) * self.scale
+  }
+}
+
+///|
+/// Drops images not drawn this frame, least recently drawn first, until
+/// what is kept fits the budget.
+fn Ctx::trim_images(self : Ctx) -> Unit {
+  images_said_trim()
+  // (the frames of GIFs that move made past their first, by their own budget: gif.pion)
+  trim_gif_frames(self.frame_no)
+  let mut total = image_bytes.v
+  if total <= image_budget {
+    return
+  }
+  let all : Array[(String, ImageEntry)] = []
+  { let __mbt_mit_734 = mbt_compat::ordered_map_iter_lazy(image_cache); while true { match (__mbt_mit_734.next)() { Some((src, list)) => {
+    for e in list {
+      if e.used < self.frame_no && e.state != 0 {
+        all.push((src, e))
+      }
+    }
+  }, None => break } } }
+  mbt_compat::arr_sort_by(all, fn(a, b) { mbt_compat::int_compare(a.1.used, b.1.used) })
+  for item in all {
+    if total <= image_budget {
+      break
+    }
+    let (src, e) = item
+    total = total - e.w * e.h * 4.0
+    h_image_free(e.id)
+    image_dropped(e)
+    match image_cache.get(src) {
+      Some(list) => {
+        mbt_compat::arr_retain(list, fn(x) { x.id != e.id })
+        if list.length() == 0 {
+          image_cache.remove(src)
+          image_forget(src)
+        }
+      }
+      Option::None => ()
+    }
+  }
+}
+
+///|
+/// An image from `src` (a file path, an http(s) URL, or a key given to
+/// image_bytes). With one side Auto it keeps the image's proportions
+/// (until the image is known that side is 0); `bg` shows until it has
+/// loaded, and it fades in. With `matte`, the image is composited over `bg` before either is cut to its rounded edge;
+/// the background remains in any part the image does not fill (as around a letterboxed video).
+pub fn Ctx::image(self : Ctx, src : String, w? : Size, h? : Size, fit? : Fit, radius? : Double, bg? : Int64, fade? : Bool, still? : Bool, matte? : Bool) -> Int {
+  let w = match w { Some(__mbt_v) => __mbt_v, None => Size::Auto }
+  let h = match h { Some(__mbt_v) => __mbt_v, None => Size::Auto }
+  let fit = match fit { Some(__mbt_v) => __mbt_v, None => Fit::FitCover }
+  let radius = match radius { Some(__mbt_v) => __mbt_v, None => 0.0 }
+  let bg = match bg { Some(__mbt_v) => __mbt_v, None => 0xE5E5EAFFL }
+  let fade = match fade { Some(__mbt_v) => __mbt_v, None => true }
+  let still = match still { Some(__mbt_v) => __mbt_v, None => false }
+  let matte = match matte { Some(__mbt_v) => __mbt_v, None => false }
+
+  let i = self.alloc_part(kind_image, true, false)
+  let n = self.nodes[i]
+  n.fade = fade
+  n.matte = matte
+  // a GIF that moves held at its first frame (gif.pion)
+  n.still = still
+  // (its frame is picked as it is painted, after the build: what is built kept as it was drawn (a part, a list's row)
+  // reads here when its next frame comes, so it is built again then and moves with nothing else changing)
+  match moving_images.get(src) {
+    Some(m) if !still && part_building() => ignore(self.loop_at(m.ends[m.ends.length() - 1], m.ends))
+    _ => ()
+  }
+  n.text = src
+  n.w = w
+  n.h = h
+  n.fit = fit
+  n.radius = radius
+  n.bg = bg
+  i
+}
+
+///|
+/// Whether `src` is decoded, ready to show `px` pixels on its long side (its decode started here where it is not): a
+/// picture put in another's place keeps that one until this is, with no frame of nothing between.
+pub fn Ctx::image_ready(self : Ctx, src : String, px : Double) -> Bool {
+  match self.image_for(src, px) {
+    Some(e) => {
+      if e.state == 0 {
+        e.poll(self.clock)
+      }
+      e.state == 1
+    }
+    Option::None => false
+  }
+}
+
+///|
+/// Its size in the layout: proportional when one side is free.
+fn image_leaf_size(n : Node, w : Double, wm : flex::MeasureMode, h : Double, hm : flex::MeasureMode) -> (Double, Double) {
+  let (ow, oh) = match image_size(n.text) {
+    Some(s) => s
+    Option::None => return (if wm == .Exactly { w } else { 0.0 }, if hm == .Exactly { h } else { 0.0 })
+  }
+  let ratio = if oh > 0.0 { ow / oh } else { 1.0 }
+  if wm == .Exactly && hm == .Exactly {
+    (w, h)
+  } else if wm == .Exactly {
+    (w, w / ratio)
+  } else if hm == .Exactly {
+    (h * ratio, h)
+  } else {
+    // its pixels at the screen's scale, no bigger than the room given
+    let mut iw = ow / g().scale
+    let mut ih = oh / g().scale
+    if wm == .AtMost && iw > w {
+      ih = ih * w / iw
+      iw = w
+    }
+    if hm == .AtMost && ih > h {
+      iw = iw * h / ih
+      ih = h
+    }
+    (iw, ih)
+  }
+}
+
+///|
+fn Ctx::paint_image(self : Ctx, i : Int, n : Node, alpha : Double) -> Unit {
+  // a stream's picture (Ctx::stream)
+  if self.paint_stream(i, n, alpha) {
+    return
+  }
+  let before = self.ninst
+  match picture_at.get(i) {
+    // drawn at a rect of its own (Ctx::picture)
+    // drawn at a rect of its own (Ctx::picture)
+    Some((x, y, w, h, max_px)) =>
+    self.draw_image(n.text, n.x + x, n.y + y, w, h, Fit::FitFill, n.radius, alpha, fade=n.fade, max_px=max_px, ground=n.bg, matte=n.matte, frame=if n.matte { Some((n.x, n.y, n.fw, n.fh)) } else { Option::None })
+    Option::None =>
+    self.draw_image(self.moving_src(n), n.x, n.y, n.fw, n.fh, n.fit, n.radius, alpha, fade=n.fade, ground=n.bg, matte=n.matte)
+  }
+  // (its corners each its own, where it was drawn: its ground's, its picture's)
+  for k = before; k < self.ninst; k = k + 1 {
+    self.corners_on(k, n)
+  }
+}
+
+///|
+/// What a picture node shows now: a GIF that moves the frame of its loop at this frame's time (Ctx::loop_at: as long as
+/// its frames' lengths summed, a frame of the window as its next frame comes), unless held still; any other its source.
+/// Every frame of it made is asked for at the size it is shown, the next made a turn ahead of its own, so each is
+/// decoded before its turn; one not yet is stood in for by the last one before it that is (never a frame of nothing
+/// between them).
+fn Ctx::moving_src(self : Ctx, n : Node) -> String {
+  if n.still {
+    return n.text
+  }
+  self.moving_key(n.text, n.fw, n.fh, n.fit)
+}
+
+///|
+/// What picture `src` shows now drawn `bw` by `bh` as `fit` fits it (Ctx::moving_src's, an old view's or a node's): a
+/// GIF that moves the frame of its loop at this frame's time, the frame woken for as its turn comes (Ctx::loop_at),
+/// made as it is first wanted and the one after it with it (GifCycle::make: so the host has that one decoded by its
+/// turn), each frame made asked for at the size it is shown (one with no bytes yet never: its key is no picture the host
+/// could find) and one not decoded yet stood in for by the last before it that is; any other `src`.
+fn Ctx::moving_key(self : Ctx, src : String, bw : Double, bh : Double, fit : Fit) -> String {
+  match moving_images.get(src) {
+    Some(m) => {
+      // (drawn this frame: its frames kept while it is, trim_gif_frames)
+      m.last_used = self.frame_no
+      let px = self.image_px(m.keys[0], bw, bh, fit)
+      let px = if px <= 0.0 { 256.0 } else { px }
+      let length = m.ends[m.ends.length() - 1]
+      let want = moving_frame(m, self.loop_at(length, m.ends) / length)
+      let next = mbt_compat::mod_checked_i32((want + 1), m.keys.length())
+      // (made as it is painted: what it makes is bytes in image_data, read by nothing built; their being here said as
+      // a decode's being done is, image_done, while a frame is painted)
+      m.make(want)
+      m.make(next)
+      if m.streaming {
+        m.frame_used[want] = self.frame_no
+        m.frame_used[next] = self.frame_no
+      }
+      let ready = mbt_compat::arr_makei(m.keys.length(), fn(i) { m.made[i] && self.image_ready(m.keys[i], px) })
+      let mut k = want
+      while k > 0 && !ready[k] {
+        k = k - 1
+      }
+      if ready[k] {
+        if m.streaming {
+          m.frame_used[k] = self.frame_no
+        }
+        m.keys[k]
+      } else {
+        src
+      }
+    }
+    Option::None => src
+  }
+}
+
+///|
+/// How long an image takes to fade in once it is decoded (ms).
+// moved to 00_init_order.pion: image_fade_ms
+
+///|
+/// Draws the image from `src` in the box (x, y, w, h), loading it at the
+/// size of the box; `ground` under it until it is in (decoded, faded in), never under it once it is: its edge's
+/// pixels, partly covered by it, would show that through as a rim round it. A `matte` is instead composited into the
+/// same image before its edge is cut. `frame`, when given, is the box in which a picture and matte are drawn.
+fn Ctx::draw_image(self : Ctx, src : String, bx : Double, by : Double, bw : Double, bh : Double, fit : Fit, radius : Double, alpha : Double, fade? : Bool, max_px? : Int, ground? : Int64, matte? : Bool, frame? : Option[(Double, Double, Double, Double)], decode_size? : Option[(Double, Double)]) -> Unit {
+  let fade = match fade { Some(__mbt_v) => __mbt_v, None => true }
+  let max_px = match max_px { Some(__mbt_v) => __mbt_v, None => 8192 }
+  let ground = match ground { Some(__mbt_v) => __mbt_v, None => 0L }
+  let matte = match matte { Some(__mbt_v) => __mbt_v, None => false }
+  let frame = match frame { Some(__mbt_v) => __mbt_v, None => Option::None }
+  let decode_size = match decode_size { Some(__mbt_v) => __mbt_v, None => Option::None }
+
+  let (gx, gy, gw, gh) = frame.unwrap_or((bx, by, bw, bh))
+  let grounded = (ground & 0xFFL) != 0L && gw > 0.0 && gh > 0.0
+  // a side still 0 waits for the image's proportions: load it anyway,
+  // small if it has no size yet at all
+  let (dw, dh) = decode_size.unwrap_or((bw, bh))
+  let px = dmin(self.image_px(src, dw, dh, fit), max_px.to_double())
+  let px = if px <= 0.0 { 256.0 } else { px }
+  let found = self.image_for(src, px)
+  // The failed pictures this frame actually needed (frame_failed_images). A good decode at the requested size makes
+  // an older failed decode irrelevant; a smaller fallback does not stand in for the requested resolution.
+  if !shooting.v {
+    let needs_decode = match found {
+      Some(e) => e.px != bucket(px)
+      Option::None => true
+    }
+    if needs_decode {
+      match image_cache.get(src) {
+        Some(list) =>
+        { for e in list {
+          if e.state < 0 && !frame_failed_images.contains(e.id) {
+            frame_failed_images.push(e.id)
+          }
+        } }
+        Option::None => ()
+      }
+    }
+  }
+  let e = match found {
+    Some(e) => e
+    Option::None => {
+      if shooting.v && image_awaited(src, px) {
+        shot_waits.v = true
+      }
+      if grounded {
+        self.emit_rect(gx, gy, gw, gh, radius, ground, 0.0, 0L, alpha)
+      }
+      return
+    }
+  }
+  if bw <= 0.0 || bh <= 0.0 || (matte && (gw <= 0.0 || gh <= 0.0)) {
+    return
+  }
+  // (in a shot: whole, and one still decoding there waited for)
+  if shooting.v && image_awaited(src, px) {
+    shot_waits.v = true
+  }
+  let fade = if fade && !shooting.v {
+    dclamp((self.now_before(e.ready_at + image_fade_ms) - e.ready_at) / image_fade_ms, 0.0, 1.0)
+  } else {
+    1.0
+  }
+  if grounded && fade < 1.0 && !matte {
+    self.emit_rect(bx, by, bw, bh, radius, ground, 0.0, 0L, alpha)
+  }
+  if fade < 1.0 && !e.fade_told {
+    e.fade_told = true
+    self.moving(e.mover, e.as_moving(), what="image \"\{src}\" fading in")
+  }
+  let (x, y, w, h, u0, v0, du, dv) = match fit {
+    Fit::FitFill => (bx, by, bw, bh, 0.0, 0.0, 1.0, 1.0)
+    Fit::FitCover | Fit::FitCoverAt(_) | Fit::FitCoverFrom(_, _) => {
+      // The part of the image the box shows, placed across and down by fit (Fit::cover_from).
+      let k = dmax(bw / e.w, bh / e.h)
+      let du = bw / k / e.w
+      let dv = bh / k / e.h
+      let (across, down) = fit.cover_from()
+      (bx, by, bw, bh, (1.0 - du) * across, (1.0 - dv) * down, du, dv)
+    }
+    Fit::FitContain => {
+      let k = dmin(bw / e.w, bh / e.h)
+      let w = e.w * k
+      let h = e.h * k
+      (bx + (bw - w) / 2.0, by + (bh - h) / 2.0, w, h, 0.0, 0.0, 1.0, 1.0)
+    }
+  }
+  if w <= 0.0 || h <= 0.0 {
+    return
+  }
+  if matte {
+    // Draw the whole frame once. UVs outside the fitted picture say where its matte shows; the shader composites the
+    // picture over the matte before the frame's own and enclosing clips cover their edges.
+    self.push_inst(gx, gy, gw, gh, radius, 4.0, 0.0, 0.0, 0xFFFFFFFFL, alpha, u0 + (gx - x) * du / w, v0 + (gy - y) * dv / h, gw * du / w, gh * dv / h)
+    let base = (self.ninst - 1) * inst_size
+    self.inst[base + 8] = ((ground >> 24) & 0xFFL).to_double() / 255.0
+    self.inst[base + 9] = ((ground >> 16) & 0xFFL).to_double() / 255.0
+    self.inst[base + 10] = ((ground >> 8) & 0xFFL).to_double() / 255.0
+    self.inst[base + 21] = (ground & 0xFFL).to_double() / 255.0
+    self.inst[base + 22] = 1.0
+    self.inst[base + 23] = fade
+  } else {
+    self.push_inst(x, y, w, h, radius, 4.0, 0.0, 0.0, 0xFFFFFFFFL, alpha * fade, u0, v0, du, dv)
+  }
+  self.inst[(self.ninst - 1) * inst_size + 20] = e.id.to_double()
+}
+
+///|
+/// What is said of a picture (by its source) as the host's words about its decodes come (image_decoded): its size once
+/// one is ready (told where it is new: what lays it out follows it), and its decodes' states (told as one is ready or
+/// fails: what draws it, waits for it or asks whether it is ready follows it). That picture's alone.
+struct ImageSaid {
+  size : signals::Signal[Option[(Double, Double)]]
+  decodes : signals::Signal[Int]
+  bytes : signals::Signal[Bool]
+  sizes : mbt_compat::OrderedMap[Int, signals::Signal[DecodeState]]
+}
+
+///|
+/// How the decode of a picture to one size (bucket) stands: coming (or not yet started), done, or failed (it, or one
+/// at least as large: pixels_for's). Told as the host's word on one of its decodes comes (image_done).
+
+#derive(Eq)
+enum DecodeState {
+  DecodeComing
+  DecodeDone
+  DecodeFailed
+}
+
+///|
+// kept across runs: what is said of the pictures kept, gone with them (image_forget, Tester's reset)
+// moved to 00_init_order.pion: images_said
+
+///|
+fn image_said(src : String) -> ImageSaid {
+  match images_said.get(src) {
+    Some(s) => s
+    Option::None => {
+      let s = ImageSaid::{
+        size: signals::signal(Option::None, same=fn(a, b) { a == b }),
+        decodes: signals::signal(0),
+        bytes: signals::signal(!mbt_compat::str_has_prefix(src, "mem:") || image_data.contains(src), same=fn(a, b) { a == b }),
+        sizes: mbt_compat::ordered_map_new(),
+      }
+      images_said.set(src, s)
+      s
+    }
+  }
+}
+
+///|
+/// Whether something follows what is said of a picture.
+fn ImageSaid::watched(self : ImageSaid) -> Bool {
+  if self.size.watched() || self.decodes.watched() || self.bytes.watched() {
+    return true
+  }
+  { let __mbt_mit_1079 = mbt_compat::ordered_map_iter_lazy(self.sizes); while true { match (__mbt_mit_1079.next)() { Some((_, s)) => {
+    if s.watched() {
+      return true
+    }
+  }, None => break } } }
+  false
+}
+
+///|
+/// Read where what is built follows the states of `src`'s decodes (one ready, or failed).
+fn image_decodes_read(src : String) -> Unit {
+  image_said(src).decodes.get() |> ignore
+}
+
+///|
+/// The bytes of the picture `key` handed over (add_image): said to be here, where something follows whether they are
+/// (a node waiting on its pixels, whose decode could not start before them: tree_image_pixels).
+fn image_bytes_here(key : String) -> Unit {
+  match images_said.get(key) {
+    Some(s) => s.bytes.set(true)
+    Option::None => ()
+  }
+}
+
+///|
+/// How the decode of `src` to the size `want` (a bucket) stands, as its cache has it now.
+fn decode_state_now(src : String, want : Int) -> DecodeState {
+  match image_cache.get(src) {
+    Some(list) =>
+    if mbt_compat::arr_iter(list).any(fn(e) { e.state == 1 && e.px == want }) {
+      .DecodeDone
+    } else if arr_any(list, fn(e) { e.state == -1 && e.px >= want }) {
+      .DecodeFailed
+    } else {
+      .DecodeComing
+    }
+    Option::None => .DecodeComing
+  }
+}
+
+///|
+/// How the decode of `src` to the size `want` (a bucket) stands, followed: told as it changes (sizes_told).
+fn decode_state(src : String, want : Int) -> signals::Signal[DecodeState] {
+  let said = image_said(src)
+  match said.sizes.get(want) {
+    Some(s) => s
+    Option::None => {
+      let s = signals::signal(decode_state_now(src, want), same=fn(a, b) { a == b })
+      said.sizes.set(want, s)
+      s
+    }
+  }
+}
+
+///|
+/// The states of `src`'s decodes to the sizes followed, told as its cache now has them (one done or failed, as the host
+/// says; or let go to be drawn again).
+fn sizes_told(src : String, said : ImageSaid) -> Unit {
+  { let __mbt_mit_1138 = mbt_compat::ordered_map_iter_lazy(said.sizes); while true { match (__mbt_mit_1138.next)() { Some((want, s)) => {
+    s.set(decode_state_now(src, want))
+  }, None => break } } }
+}
+
+///|
+/// What is said of the picture `src`, let go with its decodes: unless something follows it still (its signal, the one it
+/// reads, kept for it).
+fn image_forget(src : String) -> Unit {
+  match images_said.get(src) {
+    Some(s) if !s.watched() && !image_cache.contains(src) => images_said.remove(src)
+    _ => ()
+  }
+}
+
+///|
+/// What is said of the pictures no longer kept and followed by nothing (one read of a picture never decoded, say).
+fn images_said_trim() -> Unit {
+  let gone = []
+  { let __mbt_mit_1157 = mbt_compat::ordered_map_iter_lazy(images_said); while true { match (__mbt_mit_1157.next)() { Some((src, s)) => {
+    if !s.watched() && !image_cache.contains(src) {
+      gone.push(src)
+    }
+  }, None => break } } }
+  for src in gone {
+    images_said.remove(src)
+  }
+}
+
+///|
+/// Decode `e` of `src` (in its cache already) as the host has it at `at`: where it is done (ready, or failed), so as of
+/// then, and said: that picture's size where it is ready (told where it is new), its decodes' state told.
+fn image_done(src : String, e : ImageEntry, at : Double) -> Unit {
+  if e.state == 0 {
+    e.poll(at)
+  } else if e.state == 1 {
+    // Host re-notified an already-ready image (e.g. GL context lost & recreated with a smaller texture cap or failure).
+    image_bytes.v = image_bytes.v - e.w * e.h * 4.0
+    let old_w = e.w
+    let old_h = e.h
+    let st = h_image_info(e.id, image_info_out)
+    if st == 1 {
+      e.w = image_info_out[0]
+      e.h = image_info_out[1]
+      e.ow = image_info_out[2]
+      e.oh = image_info_out[3]
+      image_bytes.v = image_bytes.v + e.w * e.h * 4.0
+      if e.w != old_w || e.h != old_h {
+        pixels_forget(src)
+      }
+    } else if st < 0 {
+      e.w = 0.0
+      e.h = 0.0
+      e.state = st
+      pixels_forget(src)
+    } else {
+      // Transient st == 0 while still ready: restore image_bytes accounting and keep current ready entry intact.
+      image_bytes.v = image_bytes.v + e.w * e.h * 4.0
+      return
+    }
+  }
+  if e.state == 0 {
+    return
+  }
+  // (its size and its decodes' state told as one: what reads both sees both, never one)
+  let said = image_said(src)
+  // (a decode of what it showed before, ready now (px 0, only standing in): its size no longer this picture's)
+  let current = e.state == 1 && e.px > 0
+  // (a decode of what it shows now ready: what stood in for it, of what it showed before, let go of)
+  if current && image_cache.get(src) is Some(list) && mbt_compat::arr_iter(list).any(fn(x) { x.px == 0 }) {
+    for x in list {
+      if x.px == 0 {
+        h_image_free(x.id)
+        image_dropped(x)
+      }
+    }
+    mbt_compat::arr_retain(list, fn(x) { x.px != 0 })
+  }
+  signals::start_batch()
+  if current {
+    said.size.set(Some((e.ow, e.oh)))
+  }
+  said.decodes.set(said.decodes.untracked() + 1)
+  sizes_told(src, said)
+  signals::end_batch()
+}
+
+///|
+/// The host said decode `id` is done (or could not be), at `at` (its word's moment): it is ready then (its fade from
+/// then, or on from the one it follows), and its picture's size told, that picture's alone, where it is new.
+fn image_decoded(id : Int, at : Double) -> Unit {
+  match image_by_id.get(id) {
+    Some((src, e)) => image_done(src, e, at)
+    Option::None => ()
+  }
+}
+
+///|
+/// Failed decodes the frame painted last needed, by the host's image id (Ctx::image): not every failed decode still in
+/// the cache, those of pictures no longer in the frame not among them.
+// kept across runs: emptied as each frame is painted (frame_paint)
+// moved to 00_init_order.pion: frame_failed_images
+
+///|
+/// Whether Ctx::image_ready would say `src` is ready, asking for no decode and marking none used: a decode of it of any
+/// size ready (the one it would draw, or one standing in for it), its bytes here where they are handed over. Followed
+/// as the host's word on its decodes comes (image_decoded). What a node of the window's tree reads (View::image_ready).
+fn image_ready_asking_none(src : String) -> Bool {
+  image_decodes_read(src)
+  if mbt_compat::str_has_prefix(src, "mem:") && !image_data.contains(src) {
+    return false
+  }
+  match image_cache.get(src) {
+    Some(list) => mbt_compat::arr_iter(list).any(fn(e) { e.state == 1 })
+    Option::None => false
+  }
+}
+
+///|
+/// The image handed over as `key` (add_image, Ctx::image_bytes) let go of: its bytes and every decode of it the host
+/// holds, so what draws it shows nothing more (a picture drawn again under another key, the one before no longer
+/// shown: a tile of a page each time it changes). What is told of it goes once nothing follows it.
 pub fn forget_image(key : String) -> Unit {
+  // (a GIF that moves: each of its frames with it, its first too, and what it is made from)
+  moving_forget(key)
+  pixels_forget(key)
+  vector_parsed_remove(key)
   image_data.remove(key)
   image_vector_drawers.remove(key)
   match image_cache.get(key) {
     Some(list) => {
       for e in list {
-        hostapi::image_free(e.id)
-        image_bytes_total.v = dmax(0.0, image_bytes_total.v - e.w * e.h * 4.0)
+        h_image_free(e.id)
+        image_dropped(e)
       }
       image_cache.remove(key)
     }
-    None => ()
+    Option::None => ()
   }
-  image_invalidate_epoch.v = image_invalidate_epoch.v + 1
-  image_bump_rev()
+  image_forget(key)
 }
 
-/// Record known host image byte budgets (matching upstream fake_host.mbt host_image_bytes_known).
-pub fn host_image_bytes_known(bars : Array[(String, Int)]) -> Unit {
-  host_image_byte_bars.clear()
-  for entry in bars {
-    host_image_byte_bars[entry.0] = entry.1
-  }
-}
-
-/// Query known byte budget for a named host image bar (0 if not set).
-pub fn host_image_bytes_bar(name : String) -> Int {
-  match host_image_byte_bars.get(name) {
-    Some(v) => v
-    None => 0
+///|
+/// Where a covering fit places its crop, across and down (0 the start, 1 the end; 0.5 its middle).
+fn Fit::cover_from(self : Fit) -> (Double, Double) {
+  match self {
+    Fit::FitCoverAt(y) => (0.5, dclamp(y, 0.0, 1.0))
+    Fit::FitCoverFrom(x, y) => (dclamp(x, 0.0, 1.0), dclamp(y, 0.0, 1.0))
+    _ => (0.5, 0.5)
   }
 }
 
-/// Look up registered encoded bytes for `key`.
-pub fn image_bytes_for(key : String) -> Option[Bytes] {
-  image_data.get(key)
+///|
+/// A decode of the image at `src` at `px` on its long side asked for ahead of what draws it (a page waiting to come in
+/// with it: what it waits for is read by image_decoding), where none of it is asked for yet and its bytes are here: as a
+/// build asks one, at the window's clock, once what reads it now is over (@signals.after_computing), so what the host
+/// says of it at once is told outside that read. Followed, as image_decoding is.
+pub fn image_decode_ahead(src : String, px : Double) -> Unit {
+  image_decodes_read(src)
+  if image_cache.get(src) is Some(list) && !list.is_empty() {
+    return
+  }
+  if mbt_compat::str_has_prefix(src, "mem:") && !image_data.contains(src) {
+    return
+  }
+  guard !images_ahead.contains(src) else { return }
+  images_ahead.set(src, true)
+  signals::after_computing(fn() {
+    images_ahead.remove(src)
+    image_entry_for(src, px, g().frame_no, g().clock) |> ignore
+  })
 }
 
-/// Check if a vector drawer is registered for `key`.
-pub fn image_has_vector_drawer(key : String) -> Bool {
-  image_vector_drawers.contains(key)
-}
+///|
+/// The images whose decode image_decode_ahead asked for, till it is asked of the host.
+// kept across runs: each taken off as its decode is asked, within the read that put it there
+// moved to 00_init_order.pion: images_ahead
 
-/// Rasterize a registered vector image at target `px` if a drawer is registered.
-pub fn image_rasterize_vector(key : String, px : Int) -> Option[(Int, Int, Array[Byte])] {
-  match (image_data.get(key), image_vector_drawers.get(key)) {
-    (Some(data), Some(draw)) => draw(data, px)
-    _ => None
+///|
+/// Whether a decode of the image at `src` has been asked for (a build drew it) and none of it is ready yet, nor has one
+/// failed: what waits for a picture a build asked for reads it so (image_any_ready's other side), followed as the host's
+/// word on its decodes comes. False of one no build asked for: nothing is coming of it to wait for.
+pub fn image_decoding(src : String) -> Bool {
+  image_decodes_read(src)
+  if images_ahead.contains(src) {
+    return true
   }
-}
-
-/// Ensure a host decode entry exists for `key` at `px` and poll its readiness.
-/// Returns Option[(host_id, w, h)] when ready.
-pub fn image_resolve(key : String, px : Int, frame_no : Int, now : Double) -> Option[(Int, Double, Double)] {
-  let req_px = if px <= 0 { 256 } else { px }
-  if bypass_glyph_atlas_writes.v {
-    match frame_image_obs.get(image_obs_key(key, req_px)) {
-      Some(Some((hid, w, h))) => {
-        let mut live = false
-        match image_cache.get(key) {
-          Some(list) => {
-            for e in list {
-              if e.id == hid && e.state == 1 {
-                live = true
-                break
-              }
-            }
-          }
-          None => ()
-        }
-        if live {
-          return Some((hid, w, h))
-        }
-      }
-      Some(None) => return None
-      None => ()
-    }
-    match image_cache.get(key) {
-      Some(list) => {
-        let mut best_ready : Option[ImageEntry] = None
-        for e in list {
-          if e.state == 1 {
-            best_ready = Some(e)
-          }
-        }
-        return match best_ready {
-          Some(e) => Some((e.id, e.w, e.h))
-          None => None
-        }
-      }
-      None => return None
-    }
+  match image_cache.get(src) {
+    Some(list) => mbt_compat::arr_iter(list).any(fn(e) { e.state == 0 }) && !mbt_compat::arr_iter(list).any(fn(e) { e.state != 0 })
+    Option::None => false
   }
-  image_resolve_transitional.v = false
-  let _ = image_rev.v.get()
-  let list = match image_cache.get(key) {
-    Some(l) => l
-    None => {
-      let l : Array[ImageEntry] = []
-      image_cache[key] = l
-      l
-    }
-  }
-  // Check existing entries
-  let mut best_ready : Option[ImageEntry] = None
-  let mut has_target = false
-  for e in list {
-    if e.state == 0 {
-      let info : FixedArray[Double] = [0.0, 0.0, 0.0, 0.0]
-      let st = hostapi::image_info(e.id, info)
-      if st == 1 {
-        e.state = 1
-        e.w = info[0]
-        e.h = info[1]
-        e.ready_at = now
-        image_bytes_total.v = image_bytes_total.v + e.w * e.h * 4.0
-        if image_list_has_transitional(list) {
-          image_invalidate_epoch.v = image_invalidate_epoch.v + 1
-        }
-      } else if st < 0 {
-        e.state = -1
-      }
-    }
-    if e.px >= req_px {
-      has_target = true
-    }
-    if e.state == 1 {
-      best_ready = Some(e)
-    }
-  }
-  if !has_target {
-    let id = match image_vector_drawers.get(key) {
-      Some(draw) =>
-      match image_data.get(key) {
-        Some(bytes) =>
-        match draw(bytes, req_px) {
-          Some((vw, vh, rgba_arr)) if vw > 0 && vh > 0 && rgba_arr.length() >= vw * vh * 4 => {
-            let png_bytes = pixels::png(vw, vh, pixels::array_to_fixed(rgba_arr))
-            let max_side = if vw > vh { vw } else { vh }
-            hostapi::image_load_bytes(png_bytes, max_side)
-          }
-          _ => 0
-        }
-        None => 0
-      }
-      None =>
-      match image_data.get(key) {
-        Some(bytes) => hostapi::image_load_bytes(bytes, req_px)
-        None =>
-        if str_has_prefix(key, "mem:") {
-          0
-        } else {
-          hostapi::image_load(key, req_px)
-        }
-      }
-    }
-    if id > 0 {
-      let entry = ImageEntry::{ id, px: req_px, state: 0, w: 0.0, h: 0.0, used: frame_no, ready_at: 0.0 }
-      let info : FixedArray[Double] = [0.0, 0.0, 0.0, 0.0]
-      let st = hostapi::image_info(id, info)
-      if st == 1 {
-        entry.state = 1
-        entry.w = info[0]
-        entry.h = info[1]
-        entry.ready_at = now
-        image_bytes_total.v = image_bytes_total.v + entry.w * entry.h * 4.0
-        if image_list_has_transitional(list) {
-          image_invalidate_epoch.v = image_invalidate_epoch.v + 1
-        }
-        best_ready = Some(entry)
-      } else if st < 0 {
-        entry.state = -1
-      }
-      list.push(entry)
-    }
-  }
-  let res = match best_ready {
-    Some(e) => {
-      e.used = frame_no
-      if e.px == 0 || (e.px < req_px && image_list_has_pending(list)) {
-        image_resolve_transitional.v = true
-      }
-      Some((e.id, e.w, e.h))
-    }
-    None => None
-  }
-  if image_obs_recording.v {
-    frame_image_obs[image_obs_key(key, req_px)] = res
-  }
-  match image_obs_block_sink.v {
-    Some(sink) => sink.push((image_obs_key(key, req_px), res))
-    None => ()
-  }
-  res
-}
-
-/// Whether a decode of `key` large enough for `px` is ready (subscribes to `image_rev`, never starts a decode).
-pub fn image_ready_at(key : String, px : Double) -> Bool {
-  let _ = image_rev.v.get()
-  let req_px = if px <= 0.0 { 1 } else { px.ceil().to_int() }
-  match image_cache.get(key) {
-    Some(list) => {
-      for e in list {
-        if e.state == 0 {
-          let info : FixedArray[Double] = [0.0, 0.0, 0.0, 0.0]
-          let st = hostapi::image_info(e.id, info)
-          if st == 1 {
-            e.state = 1
-            e.w = info[0]
-            e.h = info[1]
-            e.ready_at = hostapi::now()
-            image_bytes_total.v = image_bytes_total.v + e.w * e.h * 4.0
-            if image_list_has_transitional(list) {
-              image_invalidate_epoch.v = image_invalidate_epoch.v + 1
-            }
-          } else if st < 0 {
-            e.state = -1
-          }
-        }
-        if e.state == 1 && e.px >= req_px {
-          return true
-        }
-      }
-      false
-    }
-    None => false
-  }
-}
-
-/// Ask the host to decode `key` at `px` if no decode that large is ready or in flight.
-pub fn image_ask_at(key : String, px : Double) -> Unit {
-  let req_px = if px <= 0.0 { 256 } else { px.ceil().to_int() }
-  let _ = image_resolve(key, req_px, 0, hostapi::now())
-}
-
-/// Whether a picture asked of the host is still being decoded.
-pub fn images_pending() -> Bool {
-  for k in image_cache.keys() {
-    match image_cache.get(k) {
-      Some(list) => {
-        for e in list {
-          if e.state == 0 {
-            return true
-          }
-        }
-      }
-      None => ()
-    }
-  }
-  false
-}
-
-pub fn image_bytes_used() -> Double {
-  image_bytes_total.v
-}
-
-pub fn image_cache_count() -> Int {
-  image_data.length()
-}
-
-pub fn images_reset() -> Unit {
-  for k in image_cache.keys() {
-    match image_cache.get(k) {
-      Some(list) => {
-        for e in list {
-          hostapi::image_free(e.id)
-        }
-      }
-      None => ()
-    }
-  }
-  image_cache.clear()
-  image_data.clear()
-  image_vector_drawers.clear()
-  image_bytes_total.v = 0.0
-  image_invalidate_epoch.v = image_invalidate_epoch.v + 1
-  image_obs_end_frame()
 }

@@ -1,5 +1,8 @@
+import "mbt_compat"
+import "view"
+
 // Framework-level automatic same-layer proximity fusion for `Glass::liquid(layer>0)` surfaces:
-// collects painted liquid glass subtrees (`GlassSlot`) in `encode_held_tree`, clusters disjoint
+// collects painted liquid glass subtrees (`GlassSlot`) in `Ctx::view_paint`, clusters disjoint
 // same-layer slots whose 2D signed edge gap is `< break_gap` (up to 8 shapes per cluster matching
 // GPU `shape[8]`), and reorders instances in-place at the cluster's anchor so shadows sit strictly
 // beneath the merged `kind == 6` glass run, the merged glass instances are strictly adjacent with
@@ -7,9 +10,7 @@
 // subtree content (icons, labels, badges, menu rows) renders razor-sharp on top of the glass.
 // Zero copies and zero allocations at rest when no cluster has >= 2 members.
 
-import "dmath"
-import "view"
-
+///|
 struct GlassSlot {
   layer : Int
   nav_scope : Int
@@ -30,24 +31,28 @@ struct GlassSlot {
   break_gap : Double
 }
 
+///|
 fn glass_slots_nav_compatible(a : Int, b : Int) -> Bool {
   a == b || a == 0 || b == 0
 }
 
+///|
 fn glass_slots_clips_overlap(a : GlassSlot, b : GlassSlot) -> Bool {
   dmin(a.cx1, b.cx1) > dmax(a.cx0, b.cx0) && dmin(a.cy1, b.cy1) > dmax(a.cy0, b.cy0)
 }
 
+///|
 fn glass_slot_gap(a : GlassSlot, b : GlassSlot) -> Double {
   let dx = dmax(0.0, dmax(a.x0 - b.x1, b.x0 - a.x1))
   let dy = dmax(0.0, dmax(a.y0 - b.y1, b.y0 - a.y1))
   if dx > 0.0 || dy > 0.0 {
-    dmath::sqrt(dx * dx + dy * dy)
+    (dx * dx + dy * dy).sqrt()
   } else {
     -dmin(dmin(a.x1, b.x1) - dmax(a.x0, b.x0), dmin(a.y1, b.y1) - dmax(a.y0, b.y0))
   }
 }
 
+///|
 fn glass_slot_break_gap(a : GlassSlot, b : GlassSlot) -> Double {
   if a.break_gap > 0.0 && b.break_gap > 0.0 {
     dmin(a.break_gap, b.break_gap)
@@ -56,93 +61,52 @@ fn glass_slot_break_gap(a : GlassSlot, b : GlassSlot) -> Double {
   }
 }
 
-fn sort_glass_slots_by_sub_start(list : Array[GlassSlot]) -> Unit {
-  let n = list.length()
-  let mut i = 1
-  while i < n {
-    let key = list[i]
-    let mut j = i - 1
-    while j >= 0 && list[j].sub_start > key.sub_start {
-      list[j + 1] = list[j]
-      j -= 1
-    }
-    list[j + 1] = key
-    i += 1
-  }
-}
-
-fn sort_glass_slots_by_opacity_desc(list : Array[GlassSlot], inst : FixedArray[Double]) -> Unit {
-  let n = list.length()
-  let mut i = 1
-  while i < n {
-    let key = list[i]
-    let key_op = inst[key.glass_idx * inst_size + 15]
-    let mut j = i - 1
-    while j >= 0 && inst[list[j].glass_idx * inst_size + 15] < key_op {
-      list[j + 1] = list[j]
-      j -= 1
-    }
-    list[j + 1] = key
-    i += 1
-  }
-}
-
-fn Scene::merge_liquid_layers(self : Scene, n0 : Int, slots : Array[GlassSlot]) -> Unit {
+///|
+fn Ctx::merge_liquid_layers(self : Ctx, n0 : Int, slots : Array[GlassSlot]) -> Unit {
   let count = slots.length()
   if count < 2 || self.ninst <= n0 {
     return
   }
   // 1. Filter out slots whose subtree is strictly contained inside another slot of the same layer.
   let active : Array[GlassSlot] = []
-  let mut i = 0
-  while i < count {
+  for i in 0..<count {
     let si = slots[i]
     if si.sub_start < n0 || si.sub_end > self.ninst || si.glass_idx < si.sub_start || si.glass_idx >= si.sub_end {
-      i += 1
       continue
     }
     let mut nested = false
-    let mut j = 0
-    while j < count {
-      if i != j {
-        let sj = slots[j]
-        if sj.layer == si.layer && sj.sub_start <= si.sub_start && si.sub_end <= sj.sub_end {
-          if sj.sub_start < si.sub_start || si.sub_end < sj.sub_end || j < i {
-            nested = true
-            break
-          }
+    for j in 0..<count {
+      if i == j {
+        continue
+      }
+      let sj = slots[j]
+      if sj.layer == si.layer && sj.sub_start <= si.sub_start && si.sub_end <= sj.sub_end {
+        if sj.sub_start < si.sub_start || si.sub_end < sj.sub_end || j < i {
+          nested = true
+          break
         }
       }
-      j += 1
     }
     if !nested {
       active.push(si)
     }
-    i += 1
   }
   let m = active.length()
   if m < 2 {
     return
   }
   // 2. Spatial BFS clustering per layer (max 8 shapes per cluster matching GPU `shape[8]`).
-  let visited : Array[Bool] = []
-  let mut vi = 0
-  while vi < m {
-    visited.push(false)
-    vi += 1
-  }
+  let visited = Array::make(m, false)
   let clusters : Array[(Array[GlassSlot], Double, Int)] = []
-  let mut ci_start = 0
-  while ci_start < m {
-    if visited[ci_start] {
-      ci_start += 1
+  for i in 0..<m {
+    if visited[i] {
       continue
     }
-    visited[ci_start] = true
-    let layer = active[ci_start].layer
-    let mut cluster_scope = active[ci_start].nav_scope
-    let queue : Array[Int] = [ci_start]
-    let members : Array[Int] = [ci_start]
+    visited[i] = true
+    let layer = active[i].layer
+    let mut cluster_scope = active[i].nav_scope
+    let queue : Array[Int] = [i]
+    let members : Array[Int] = [i]
     let mut head = 0
     let mut min_gap = 1.0e9
     let mut best_bg = 0.0
@@ -151,36 +115,37 @@ fn Scene::merge_liquid_layers(self : Scene, n0 : Int, slots : Array[GlassSlot]) 
       let cur = queue[head]
       head += 1
       let sa = active[cur]
-      let mut j = 0
-      while j < m {
-        if active[j].layer == layer && j != cur {
-          let sb = active[j]
-          if glass_slots_nav_compatible(cluster_scope, sb.nav_scope) &&
-          glass_slots_nav_compatible(sa.nav_scope, sb.nav_scope) &&
-          glass_slots_clips_overlap(sa, sb) {
-            let bg = glass_slot_break_gap(sa, sb)
-            let max_m = dmax(sa.merge_max, sb.merge_max)
-            if max_m > 0.0 && bg > 0.0 {
-              let gap = glass_slot_gap(sa, sb)
-              if gap < bg {
-                if gap < min_gap {
-                  min_gap = gap
-                  best_bg = bg
-                  best_max_m = max_m
-                }
-                if !visited[j] && members.length() < 8 {
-                  visited[j] = true
-                  if cluster_scope == 0 && sb.nav_scope != 0 {
-                    cluster_scope = sb.nav_scope
-                  }
-                  members.push(j)
-                  queue.push(j)
-                }
-              }
+      for j in 0..<m {
+        if active[j].layer != layer || j == cur {
+          continue
+        }
+        let sb = active[j]
+        if !glass_slots_nav_compatible(cluster_scope, sb.nav_scope) ||
+        !glass_slots_nav_compatible(sa.nav_scope, sb.nav_scope) ||
+        !glass_slots_clips_overlap(sa, sb) {
+          continue
+        }
+        let bg = glass_slot_break_gap(sa, sb)
+        let max_m = dmax(sa.merge_max, sb.merge_max)
+        if max_m <= 0.0 || bg <= 0.0 {
+          continue
+        }
+        let gap = glass_slot_gap(sa, sb)
+        if gap < bg {
+          if gap < min_gap {
+            min_gap = gap
+            best_bg = bg
+            best_max_m = max_m
+          }
+          if !visited[j] && members.length() < 8 {
+            visited[j] = true
+            if cluster_scope == 0 && sb.nav_scope != 0 {
+              cluster_scope = sb.nav_scope
             }
+            members.push(j)
+            queue.push(j)
           }
         }
-        j += 1
       }
     }
     if members.length() >= 2 && best_bg > 0.0 && best_max_m > 0.0 {
@@ -193,11 +158,8 @@ fn Scene::merge_liquid_layers(self : Scene, n0 : Int, slots : Array[GlassSlot]) 
         cap_m * (1.0 - sm)
       }
       if m_eff > 0.01 {
-        let list : Array[GlassSlot] = []
-        for idx in members {
-          list.push(active[idx])
-        }
-        sort_glass_slots_by_sub_start(list)
+        let list : Array[GlassSlot] = mbt_compat::arr_map(members, fn(idx) { active[idx] })
+        mbt_compat::arr_sort_by(list, fn(a, b) { mbt_compat::int_compare(a.sub_start, b.sub_start) })
         let mut anchor_pos = list[0].sub_end
         for s in list {
           if s.sub_end > anchor_pos {
@@ -207,37 +169,27 @@ fn Scene::merge_liquid_layers(self : Scene, n0 : Int, slots : Array[GlassSlot]) 
         clusters.push((list, m_eff, anchor_pos))
       }
     }
-    ci_start += 1
   }
   // Fast path: nothing to merge at rest -> zero copies, zero allocations.
-  if clusters.length() == 0 {
+  if clusters.is_empty() {
     return
   }
   // 3. Build exact permutation of [n0 ..< self.ninst] moving each cluster to its `anchor_pos` in
   //    [shadows] -> [strictly adjacent merged glass] -> [member subtree children] order.
   let total = self.ninst - n0
-  let member_of : Array[Int] = []
-  let mut mi = 0
-  while mi < total {
-    member_of.push(-1)
-    mi += 1
-  }
-  let mut ci = 0
-  while ci < clusters.length() {
+  let member_of = Array::make(total, -1)
+  for ci in 0..<clusters.length() {
     let (list, _, _) = clusters[ci]
     for s in list {
-      let mut k = s.sub_start
-      while k < s.sub_end {
+      for k in s.sub_start..<s.sub_end {
         member_of[k - n0] = ci
-        k += 1
       }
     }
-    ci += 1
   }
-  let perm : Array[Int] = []
+  let perm : Array[Int] = { mbt_compat::arr_capacity_check(total); [] }
   let merged_runs : Array[(Int, Int, Double)] = []
-  let emit_cluster = fn(cidx : Int) -> Unit {
-    let (list, m_eff, _) = clusters[cidx]
+  let emit_cluster = fn(ci : Int) -> Unit {
+    let (list, m_eff, _) = clusters[ci]
     // (a) All shadows first, strictly beneath the merged liquid glass.
     for s in list {
       if s.shadow_idx >= 0 {
@@ -247,11 +199,18 @@ fn Scene::merge_liquid_layers(self : Scene, n0 : Int, slots : Array[GlassSlot]) 
     // (b) All liquid glass instances strictly adjacent, highest opacity first so a fading-in trigger pill
     //     never overrides the full-opacity droplet's optical parameters in merged_liquid.
     let run_from = n0 + perm.length()
-    let ordered : Array[GlassSlot] = []
-    for s in list {
-      ordered.push(s)
-    }
-    sort_glass_slots_by_opacity_desc(ordered, self.inst)
+    let ordered = list.copy()
+    mbt_compat::arr_sort_by(ordered, fn(a, b) {
+      let oa = self.inst[a.glass_idx * inst_size + 15]
+      let ob = self.inst[b.glass_idx * inst_size + 15]
+      if oa > ob {
+        -1
+      } else if oa < ob {
+        1
+      } else {
+        0
+      }
+    })
     for s in ordered {
       perm.push(s.glass_idx)
     }
@@ -259,64 +218,116 @@ fn Scene::merge_liquid_layers(self : Scene, n0 : Int, slots : Array[GlassSlot]) 
     merged_runs.push((run_from, run_to, m_eff))
     // (c) All remaining subtree instances (icons, text, badges, menu rows) razor-sharp on top.
     for s in list {
-      let mut k = s.sub_start
-      while k < s.sub_end {
+      for k in s.sub_start..<s.sub_end {
         if k != s.glass_idx && k != s.shadow_idx {
           perm.push(k)
         }
-        k += 1
       }
     }
   }
-  let mut k = n0
-  while k <= self.ninst {
-    let mut cj = 0
-    while cj < clusters.length() {
-      if clusters[cj].2 == k {
-        emit_cluster(cj)
+  for k in n0..=self.ninst {
+    for ci in 0..<clusters.length() {
+      if clusters[ci].2 == k {
+        emit_cluster(ci)
       }
-      cj += 1
     }
     if k < self.ninst && member_of[k - n0] == -1 {
       perm.push(k)
     }
-    k += 1
   }
   if perm.length() != total {
     return
   }
-  // 4. Apply permutation to `self.inst`.
-  let base_off = n0 * inst_size
-  let total_doubles = total * inst_size
-  let saved : Array[Double] = []
-  let mut si = 0
-  while si < total_doubles {
-    saved.push(self.inst[base_off + si])
-    si += 1
-  }
-  let mut dst_rel = 0
-  while dst_rel < total {
+  // 4. Apply permutation to `self.inst` and keep `ride_spans` / `list_heads` indices in sync.
+  let saved = inst_copy(self.inst, n0 * inst_size, total * inst_size)
+  let inv_perm = Array::make(total, 0)
+  for dst_rel in 0..<total {
     let src_rel = perm[dst_rel] - n0
-    let src_off = src_rel * inst_size
-    let dst_off = (n0 + dst_rel) * inst_size
-    let mut f = 0
-    while f < inst_size {
-      self.inst[dst_off + f] = saved[src_off + f]
-      f += 1
+    inv_perm[src_rel] = n0 + dst_rel
+    saved.blit_to(
+      self.inst,
+      len=inst_size,
+      src_offset=src_rel * inst_size,
+      dst_offset=(n0 + dst_rel) * inst_size,
+    )
+  }
+  for j in 0..<ride_spans.length() {
+    let idx = ride_spans[j]
+    if idx >= n0 && idx < self.ninst {
+      ride_spans[j] = inv_perm[idx - n0]
     }
-    dst_rel += 1
+  }
+  for j in 0..<list_heads.length() {
+    let idx = list_heads[j].at
+    if idx >= n0 && idx < self.ninst {
+      list_heads[j].at = inv_perm[idx - n0]
+    }
   }
   // 5. Assign one fresh negative capture id & effective merge radius to each merged glass run.
   for run in merged_runs {
     let (from, to, m_eff) = run
-    self.glass_run = self.glass_run + 1
-    let cap = -self.glass_run.to_double()
-    let mut rk = from
-    while rk < to {
-      let off = rk * inst_size
+    glass_paint.run = glass_paint.run + 1
+    let cap = -glass_paint.run.to_double()
+    for k in from..<to {
+      let off = k * inst_size
       self.inst[off + 20] = cap
       self.inst[off + 23] = m_eff
-      rk += 1
+    }
+  }
+  // 6. Keep `inst_owners` and `bone_insts` bit-identical with the permuted instance stream.
+  if inst_owners_kept() {
+    let o = inst_owners.owner
+    let cl = inst_owners.cell
+    let tr = inst_owners.tree
+    let mk = inst_owners.mark
+    let saved_o : Array[Int] = Array::make(total, -1)
+    let saved_cl : Array[(Double, Double)] = Array::make(total, (0.0, 1.0))
+    let saved_tr : Array[Option[view::NodeId]] = Array::make(total, Option::None)
+    let saved_mk : Array[Int] = Array::make(total, 0)
+    for rel in 0..<total {
+      let k = n0 + rel
+      if k < o.length() {
+        saved_o[rel] = o[k]
+      }
+      if k < cl.length() {
+        saved_cl[rel] = cl[k]
+      }
+      if k < tr.length() {
+        saved_tr[rel] = tr[k]
+      }
+      if k < mk.length() {
+        saved_mk[rel] = mk[k]
+      }
+    }
+    let has_bones = !bone_insts.is_empty()
+    let saved_bones : Array[Bool] = if has_bones {
+      mbt_compat::arr_makei(total, fn(rel) { bone_insts.contains(n0 + rel) })
+    } else {
+      []
+    }
+    if has_bones {
+      for rel in 0..<total {
+        bone_insts.remove(n0 + rel)
+      }
+    }
+    for dst_rel in 0..<total {
+      let src_rel = perm[dst_rel] - n0
+      let dst = n0 + dst_rel
+      if dst < o.length() {
+        o[dst] = saved_o[src_rel]
+      }
+      if dst < cl.length() {
+        cl[dst] = saved_cl[src_rel]
+      }
+      if dst < tr.length() {
+        tr[dst] = saved_tr[src_rel]
+      }
+      if dst < mk.length() {
+        mk[dst] = saved_mk[src_rel]
+      }
+      if has_bones && saved_bones[src_rel] {
+        bone_insts.insert(dst)
+      }
     }
   }
 }

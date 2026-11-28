@@ -1,0 +1,2221 @@
+import "hostapi"
+import "mbt_compat"
+import "view"
+
+// Scripted runs over the app's own screen (MBUI_DRIVE, or MBUI_DRIVE_B64 as base64): a script of steps, one a line,
+// run frame by frame on any host, finding what to tap by its words on screen and waiting on what should come there,
+// for end-to-end runs against a live backend (scripts/e2e-local.sh, e2e/flows). Input goes the way the system sends
+// it where the host has that way (@hostapi.drive: on macOS the input method's calls and Cmd+V, on Android the view's
+// InputConnection and KEYCODE_PASTE); else straight to the app's handlers.
+//
+//   # a comment                 wait MS                   timeout MS (for until/gone/field after it; 20000 to start)
+//   window N                    the steps after it act in window N of the run (window_slots.pion; 0 the first)
+//   until TEXT                  words containing TEXT on screen (a text, rich text, a field's placeholder, or
+//                               icon:NAME, an @sf icon; img:NAME an image whose source has NAME in it; switch:LABEL
+//                               the switch that turns LABEL), within the
+//                               timeout; else the run fails
+//                               (=TEXT: words that are TEXT exactly)
+//   untiln N TEXT               N or more of them on screen
+//   gone TEXT                   no longer on screen
+//   field TEXT                  a field's words contain TEXT (\n a new line)     empty   the focused field is empty
+//   empty now                   the focused field empty in the frame the step before acted in: read at once, not
+//                               waited for (words sent: the field given up as they go, not later)
+//   said TEXT                   an event the app said (Ctx::say) holding TEXT, within the timeout: a fact of its state
+//                               or of what came from outside it (a message sent is in the list, by its row's key),
+//                               never a motion's end (no step waits for a motion to be over); the run's
+//                               k-th `said` line the k-th such event, counted from the run's start
+//   clear                       the focused field emptied (all selected, deleted)
+//   tap TEXT                    taps the lowest TEXT on screen (in a chat, the newest), once there (within the
+//                               timeout), holding still and not under something else a press would go to (a
+//                               composer over a list's last row, a sheet); tap1 TEXT the highest
+//   tapxy X Y                   taps there (negative: from the right, the bottom)
+//   hold MS TEXT                pressed on TEXT for MS, then let go (a long press)
+//   type TEXT                   committed by the input method (the next step once they are in a field)
+//   mark TEXT                   composed (not yet committed)
+//   enter                       backspace                 back       the system's back
+//   paste TEXT                  TEXT on the clipboard, then the system's paste
+//   pasten N TEXT               TEXT repeated to N characters, pasted
+//   clip TEXT                   under a Tester (a film's run), the clipboard holds TEXT as the app next reads it (an
+// editing menu's : Tester::clipboard_gives); a real host's clipboard is its own
+//   wheel DY [MODS]             the list under the middle of the window scrolled by DY (with MODS held: cmd, ctrl,
+//                               alt, shift joined by +; ⌘ and a wheel over a picture zoom it)
+//   wheelat DY TEXT             the list under the lowest TEXT scrolled by DY at once, as a test's Flow::wheel_at
+//                               gives it (no notch eased in: what is pressed next finds it where it went)
+//   wheelxat DX TEXT            what scrolls sideways under the lowest TEXT scrolled by DX, the same
+//   move X Y                    the pointer moved there, no button down (negative: from the right, the bottom)
+//   hover TEXT                  the pointer moved onto the lowest TEXT, where the frame has it
+//   rightclick TEXT             a secondary click (a context menu's) on the lowest TEXT, where the frame has it
+//   key NAME                    a key, with what is held before it: esc, tab, enter, space, up, down, left, right,
+//                               home, end, pageup, pagedown, backspace, a character; cmd+ (⌘ on macOS, Ctrl
+//                               elsewhere), ctrl+, alt+, shift+ (cmd+k, shift+enter, alt+down)
+//   mods MODS                   only modifiers pressed, no other key (the host's code 0): cmd, ctrl, alt, shift joined
+//                               by + as wheel's MODS (cmd+ as a key's), or none to release them all; later key steps
+//                               carry their own modifiers
+//   resize W H                  the window's content resized to W by H (the host's own window, where it can)
+//   trackpad begin|DX DY|end    the keyboard's trackpad (iOS's floating cursor) begun, its finger at DX DY from where it
+//                               began, let go
+//   ime H                       under a Tester (a film's run), the soft keyboard H points over the window's foot, as a
+//                               host says it while it moves (Tester::set_ime_inset); a real host's is its own
+//   viewsaid JSON               under a Tester (a film's run), its host says JSON of a native view, as Tester::view_said
+//                               has it (a frame grabbed: {"still":{"view":N},"b":HEX}); a real host's views say their own
+//   appsaid NAME TEXT           under a Tester (a film's run), the app's own native call NAME says TEXT from here on,
+//                               posted on its channel as a host tells a change (@hostapi.app_said); a real host's says
+//                               its own
+//   system JSON                 under a Tester (a film's run), the system says JSON on its channel as a host says it
+//                               (@hostapi.system_channel: a size class, the hinge and its fold, the bars), taken at
+//                               the next frame; a real host's system says its own, and the run fails
+//   drag X Y DX DY [MS]         a finger down at X Y (negative: from the right, the bottom), moved by DX DY over MS
+//                               (300 by default), a move a frame, then lifted there
+//   dragon DX DY MS TEXT        the same from the lowest TEXT on screen, where the frame has it
+//   holdon MS DX DY MOVE TEXT   held still on the lowest TEXT (or @X,Y) MS, then dragged DX DY over MOVE ms and held
+//                               there MS again before it is lifted (a long press slid on)
+//   samples N [apart]           the drags after it move N times a frame, the way from the frame before cut in N, as a
+//                               phone's system hands a frame's samples in one batch (touches.pion: each but the last
+//                               with more after it); apart: each a move of its own, as hosts did before batches (1)
+//   swipe DX [MS]               a trackpad's two fingers swept across the middle of the window by DX (to the right
+//                               positive) over MS (300 by default), the wheel a frame apart as a browser's page is
+//                               told it (no phase), then lifted: the wheel still after (wheel_back.pion)
+//   backswipe DX [MS] [right] [off]  the system's back gesture (Android's predictive back) from the left edge (right:
+//                               the right's), DX across over MS (300 by default), a step a frame, then gone through
+//                               (off: called off)
+//   shot NAME                   the window's picture, as the frame just drawn, as $MBUI_SHOT_DIR/NAME.png (where the host cannot,
+//                               "SHOT NAME" is logged and the run waits 1.5 s for whoever takes it: adb's screencap)
+//   noticed TEXT                one of the app's notifications (the system's, @hostapi.notice_show) holds TEXT in its
+//                               title or words, within the timeout       nonotice TEXT   none does
+//   notice TEXT                 that notification, once there, tapped (as the system's shade sends the tap)
+//   drop X Y PATH|PATH…         those files let go at (X, Y) of the window as a file manager lets them go (the host's
+//                               own drop, @hostapi.drive 13: Linux's)
+//   log TEXT                    DRIVE LOG TEXT on the log (a mark for whoever watches it)
+//   picks NAME:SIZE …           what the system's pickers give from then on, under a Tester (film): files so named, of
+//                               so many bytes each, or NAME:WxH a picture so many pixels across and down (a PNG)
+//                               (none: called off); a host's own pickers are not stood in for
+//   exit                        ends the run: DRIVE PASS, exit 0
+//   ends                        the app ends by itself, its host quitting it (an update handed to its installer), within
+//                               the timeout; else the run fails. What follows it is never reached
+//   latency MODE TEXT           input to the screen measured by the host itself (macOS, Android), from the lowest TEXT
+//                               on screen (or @X,Y; none: the window's middle): its own events from then on (type,
+//                               scroll, drag; anim none), the process ending with what it measured (LATENCY …, said by
+//                               the host: the app's scripts/latency.sh); `ends` after it. For people, never a check
+//   linger MS                   the run passed (DRIVE PASS said now), the app left running MS more for what the last
+//                               step set off (a share sheet, a download): a check beside the run looks at it
+//   answered CALL               a call to the core named CALL (drive.read; or a subscription's topic key, its first
+//                               value) answered, and a frame drawn after it, within the timeout: the run's k-th
+//                               `answered CALL` line its k-th answer, counted from the run's start (one come before
+//                               the step that acted ahead of the line is as good), each line an answer of its own.
+//                               What is counted is the core's answers as they come, whether the app reads them or
+//                               not: where the app's conversation with its core is kept (drive_heard, its
+//                               MBUI_CORE_TRACE), each answer heard there; else each wait on the core that ended
+//                               (one whose answer nobody reads is awaited by nothing, so not counted there)
+//   decoded SRC                 a picture whose source ends with SRC (e2e-photo.jpg; a PDF's page: "PDF") or
+//                               begins with it (a prefix: a gallery's content://media/) decoded, from its address or
+//                               from bytes handed over for it (Ctx::image_bytes, add_image)
+//   image_ready SRC             the named picture is currently decoded, including before the run; wait for its current
+//                               decodes, and fail if one failed. An exact source wins; a prefix or suffix must name one
+//   ready VIEW                  a native view ready: by its kind's name (video, audio, web, site), pdf (a PDF's page
+//                               drawn), its kind's number (1 video or audio, 2 web, 3 site), #ID its id
+//   outside_done NAME           work outside the app (a wait on the host or the core, by its name: "an update
+//                               downloading") with NAME in it done since the last step that acted (what it set off),
+//                               and a frame drawn after it, within the timeout; NAME naming more than one done, the
+//                               run fails. Never a motion: no step waits for one to end
+//   hosted                      from here on the app is as the host says it is (shown or not, in front or not), as
+//                               out of a run; till then a run keeps it shown and in front, whatever the host says
+//                               (a locked screen's window is covered): a run about the app put away (e2e/win's)
+//   shown                       the host's word that the app is shown again (after it was not: another app's page
+//                               over it gone) since the last step that acted, and a frame drawn after it
+//   typedone X                  the words the runner found doing X (`ok WORDS`: a code another device shows) typed, as
+//                               `type` types its own, once it has done X
+//   done X                      the run's runner (the app's run.sh: what `log do: X` asked of it) has done X: its
+//                               file X come in the directory the run names (MBUI_DONE_DIR, else $MBUI_SHOT_DIR/done),
+//                               the host told of it by its system (src/host/done_watch.h: macOS, Android, Windows);
+//                               its words "ok" (or none): done; else what went wrong, and the run fails saying it.
+//                               Where the host watches no such directory (a Tester's, the web's, iOS's), it fails
+//                               at once
+//   now STEP                    STEP (as written before steps waited for nothing: kept, the same as STEP)
+// No step waits for the app to be settled. What a step looks for comes with a frame (an input's, a message's, the
+// host's event's, a motion's), and it is looked for at each; a tap, a hold, a hover or a drag on words goes where the
+// frame just drawn has them, that frame, never waiting for them to hold still. What comes later than a frame is waited
+// for by name (until, gone, answered, decoded, image_ready, ready, outside_done, shown, done), within the timeout. Nothing waits for
+// the app to be at rest (settled by another name): that is asserted of a run, never waited on (a Tester's
+// assert_true(t.at_rest())). The run asks for no frame of its own: what it waits for in time (a timeout, a hold let
+// go, a `wait`, a shot another takes) is a wake at that time. `wait` stays a pause in real time, for what is outside
+// the app (a command beside the run, the other device, the station) that no `until` can see, and that the runner does
+// not say it has done (`done`).
+// A step that fails logs DRIVE FAIL (its line, what was on screen), takes a shot "fail" and exits 1.
+
+///|
+struct Driver {
+  steps : Array[String]
+  mut at : Int
+  mut wid : Int
+  mut since : Double
+  mut timeout : Double
+  mut release_at : Double
+  mut rx : Double
+  mut ry : Double
+  mut gx : Double
+  mut gy : Double
+  mut gdx : Double
+  mut gdy : Double
+  mut gt0 : Double
+  mut gstay : Double
+  mut gsamples : Int
+  mut gapart : Bool
+  mut gfrom : Double
+  mut gms : Double
+  mut bdx : Double
+  mut bedge : Int
+  mut boff : Bool
+  mut bt0 : Double
+  mut bms : Double
+  mut sdx : Double
+  mut st0 : Double
+  mut sms : Double
+  mut sdone : Double
+  mut shot_at : Double
+  mut mark : Int
+  mut shown_mark : Int
+  mut shown : Int
+  mut said_state : Int
+  mut takes_state : Bool
+  answers : mbt_compat::OrderedMap[String, Int]
+  mut counted : Int
+  answers_taken : mbt_compat::OrderedMap[String, Int]
+  watching : Bool
+  runner_done : mbt_compat::OrderedMap[String, String]
+  mut seen_frame : Int
+  dir : String
+  mut said_taken : Int
+  mut typed : String
+  mut wheel_follow : Option[(view::NodeId, String, Double, Double, Double)]
+}
+
+///|
+// moved to 00_init_order.pion: driver
+
+///|
+/// What the app said happened (Ctx::say), in order, while a run is driven (`said`).
+// moved to 00_init_order.pion: app_said
+
+///|
+/// Says that `what` is so (a fact of the app's state, or of what came from outside it: a message sent is in the list,
+/// by its row's key; never a motion's end): an event a driven run waits for by name (`said`), logged as SAID; nothing
+/// when no run is driven.
+pub fn Ctx::say(self : Ctx, what : String) -> Unit {
+  ignore(self)
+  if driver.v is Some(_) {
+    app_said.push(what)
+    h_log("SAID \{what}")
+  }
+}
+
+///|
+/// Reads the script from the environment, once, as the window opens.
+fn drive_init() -> Unit {
+  let script = hostapi::env_text("MBUI_DRIVE")
+  if script != "" {
+    let dir = hostapi::env("MBUI_SHOT_DIR")
+    let done_dir = match hostapi::env("MBUI_DONE_DIR") {
+      "" => if dir == "" { "" } else { dir + "/done" }
+      d => d
+    }
+    drive_start(script, dir, done_dir=done_dir)
+  }
+}
+
+///|
+/// The moments of a script's line a run's tracer is told of (@ui.trace_steps).
+
+#derive(Eq)
+pub enum StepMoment {
+  Began
+  Acted
+}
+
+///|
+/// Who is told each line of a script as it begins and as it acts (@ui.trace_steps): a run's record of it.
+// kept across runs: the app's own, set once as it starts
+// moved to 00_init_order.pion: steps_tracer
+
+///|
+/// Each line of a scripted run's script (MBUI_DRIVE) given to `step` as written : as it
+/// begins (Began), before anything of it is done, and, a line that acts, again as its input is handed over (Acted),
+/// in the frame its words are on screen: what a run keeps beside its other messages (its own clock added), for a
+/// replay to know when each step came and when its input did.
+pub fn trace_steps(step : (String, StepMoment) -> Unit) -> Unit {
+  steps_tracer.v = Some(step)
+}
+
+///|
+fn tell_step(line : String, moment : StepMoment) -> Unit {
+  match steps_tracer.v {
+    Some(told) => told(line, moment)
+    Option::None => ()
+  }
+}
+
+///|
+/// What the host posted of the runner (done_watch.h: {"done": X, "said": WORDS}) kept in `done`, by X.
+fn runner_said(done : mbt_compat::OrderedMap[String, String], j : String) -> Unit {
+  match (match mbt_compat::mbt_json_parse(j) { Ok(__mbt_ok_4) => Some(__mbt_ok_4), Err(_) => None }) {
+    Some(.Object(o)) =>
+    match (o.get("done"), o.get("said")) {
+      (Some(String(x)), Some(String(said))) => {
+        h_log("DRIVE runner done \{x}: \{mbt_compat::str_trim(said, chars=" \n\r\t")}")
+        done.set(x, said)
+      }
+      _ => ()
+    }
+    _ => ()
+  }
+}
+
+///|
+/// Whether `drive_steps` is acting on the frame just presented: what it hands the app has no host timestamp of its
+/// own and meets the tree at that frame's logic moment (`view_logic_at`), however long presenting the frame took.
+// kept across runs: true only while drive_steps runs in drive_frame
+// moved to 00_init_order.pion: drive_acting
+
+///|
+fn drive_start(script : String, dir : String, done_dir? : String) -> Unit {
+  let done_dir = match done_dir { Some(__mbt_v) => __mbt_v, None => "" }
+
+  drive_acting.v = false
+  // (the answers heard counted from the run's start, as the waits ended are)
+  heard_answers.clear()
+  let steps = mbt_compat::arr_to_array(mbt_compat::arr_map(script.split("\n"), fn(l) { mbt_compat::str_to_owned(mbt_compat::str_trim(l, chars=" \t\r")) }))
+  // what the runner has done, as the host posts it (done_watch.h: {"done": X, "said": WORDS}), the frame its post
+  // wakes taking it
+  let runner_done : mbt_compat::OrderedMap[String, String] = mbt_compat::ordered_map_new()
+  let watching = done_dir != "" && h_drive(9, done_dir)
+  if watching {
+    on_message("runner", fn(j, _) { runner_said(runner_done, j) })
+  }
+  { let __mbt_r = driver; __mbt_r.v = (Some(Driver::{
+    steps: steps,
+    at: 0,
+    since: -1.0,
+    timeout: 20000.0,
+    release_at: -1.0,
+    wid: 0,
+    rx: 0.0,
+    ry: 0.0,
+    gx: 0.0,
+    gy: 0.0,
+    gdx: 0.0,
+    gdy: 0.0,
+    gt0: 0.0,
+    gstay: 0.0,
+    gsamples: 1,
+    gapart: false,
+    gfrom: 0.0,
+    gms: 0.0,
+    bdx: 0.0,
+    bedge: 0,
+    boff: false,
+    bt0: 0.0,
+    bms: 0.0,
+    sdx: 0.0,
+    st0: 0.0,
+    sms: 0.0,
+    sdone: 0.0,
+    shot_at: -1.0,
+    mark: runtime().outside_ended(),
+    shown_mark: 0,
+    shown: 0,
+    said_state: 3,
+    takes_state: false,
+    answers: mbt_compat::ordered_map_new(),
+    counted: runtime().outside_ended(),
+    answers_taken: mbt_compat::ordered_map_new(),
+    watching: watching,
+    runner_done: runner_done,
+    seen_frame: -1,
+    dir: dir,
+    said_taken: 0,
+    wheel_follow: Option::None,
+    typed: "",
+  })) }
+  let watched = if watching { " (the runner's directory \{done_dir} watched)" } else { "" }
+  h_log("DRIVE start: \{steps.length()} lines" + watched)
+}
+
+///|
+/// The words on screen a step looks for: text, rich text, a field's placeholder; `icon:NAME` an @sf icon. Only what
+/// is laid out inside the window counts; what is only drawn (Ctx::draw_only) does not.
+fn on_screen(c : Ctx, what : String) -> Array[(Double, Double)] {
+  mbt_compat::arr_concat(mbt_compat::arr_map(on_screen_nodes(c, what), fn(p) { (p.0, p.1) }), mbt_compat::arr_map(tree_on_screen(c, what), fn(p) { (p.0, p.1) }))
+}
+
+///|
+/// What of the window's tree shows `what` (its words, `=WORDS` exactly, `field:WORDS` a field by the words in it,
+/// `icon:NAME` what it draws is called so: View::drawn_as; `img:NAME` a picture whose source, or shapes whose name,
+/// contains NAME, as on_screen_nodes' `img:`; or is called `what`, its label whole: View::says), the
+/// middle of each where it is drawn, in the window, as it is made, however faded this frame (made transparent, coming
+/// in), as on_screen_nodes finds an old view's laid out; not on its way out (View::leaving: drawn only, as an old layer leaving is, Ctx::overlay's inert);
+/// whether it takes a press or not, whatever lies over it (reachable says which of it a finger
+/// reaches). What is seen is the glyphs' to say (Tester::glyphs_seen), not this.
+fn tree_on_screen(c : Ctx, what : String) -> Array[(Double, Double, view::NodeId)] {
+  mbt_compat::arr_map(tree_on_screen_nodes(c, what), fn(p) { (p.0, p.1, p.2) })
+}
+
+///|
+/// tree_on_screen's, each with where it is (x0, y0, x1, y1 in the window: its words in pieces their first line's
+/// words looked for, as on_screen_nodes' box of an old view's rich text; else the node's drawn box): where reachable
+/// looks for a point of it a finger reaches (tree_reach_point).
+fn tree_on_screen_nodes(c : Ctx, what : String) -> Array[(Double, Double, view::NodeId, (Double, Double, Double, Double))] {
+  guard view_app.v is Some(tree) else { return [] }
+  // (each: where, which, where it is, and whether by its words, not its label alone)
+  let hits : Array[(Double, Double, view::NodeId, (Double, Double, Double, Double), Bool)] = []
+  for d in tree.drawn() {
+    // (none of a page's bones: not there yet, View::bones)
+    if d.bones != 0L {
+      continue
+    }
+    // (or by what it is called, its label whole, as an old view's box is: as Compose's test finds a node by its
+    // contentDescription, on_screen_nodes)
+    let label = tree.said_label(d.id)
+    // (its words as they are drawn: on one line where they do not wrap, as an old view's text is found: view_words_set)
+    let words = view_words_found(d)
+    let by_words = !mbt_compat::str_has_prefix(what, "icon:") && words != "" &&
+    (if mbt_compat::str_has_prefix(what, "=") { words == mbt_compat::str_unsafe_substring(what, start=1, end=mbt_compat::utf16_len(what)) } else { words.contains(what) })
+    let hit = if mbt_compat::str_has_prefix(what, "icon:") {
+      tree.drawn_name(d.id).contains("/icon/" + mbt_compat::str_unsafe_substring(what, start=5, end=mbt_compat::utf16_len(what)) + "/")
+    } else if mbt_compat::str_has_prefix(what, "img:") {
+      // a picture by its source, or shapes by what they are called (View::drawn_as: a glyph's "…/glyph/NAME"), its
+      // name containing what follows: on_screen_nodes' `img:` of an old view's image and drawable, the same rule
+      let name = mbt_compat::str_unsafe_substring(what, start=4, end=mbt_compat::utf16_len(what))
+      match d.image {
+        Some((src, _, _)) => src.contains(name)
+        None => d.shapes.length() > 0 && tree.drawn_name(d.id).contains(name)
+      }
+    } else if mbt_compat::str_has_prefix(what, "switch:") {
+      // a switch by what it turns (its label, whole), as on_screen_nodes finds an old view's: the switch alone
+      let label = mbt_compat::str_unsafe_substring(what, start=7, end=mbt_compat::utf16_len(what))
+      match tree.said_of(d.id) {
+        Some(said) => said.role is Switch && said.label == label
+        Option::None => false
+      }
+    } else if mbt_compat::str_has_prefix(what, "field:") && mbt_compat::utf16_len(what) > 6 {
+      // a field by the words in it, not its placeholder, as on_screen_nodes finds an old view's
+      match tree_fields.get(d.id) {
+        Some(tf) => tf.st.shown().contains(mbt_compat::str_unsafe_substring(what, start=6, end=mbt_compat::utf16_len(what)))
+        Option::None => false
+      }
+    } else if mbt_compat::str_has_prefix(what, "=") && mbt_compat::utf16_len(what) > 1 {
+      let exact = mbt_compat::str_unsafe_substring(what, start=1, end=mbt_compat::utf16_len(what))
+      words == exact || (label != "" && label == exact)
+    } else if step_kind_of(what) {
+      false
+    } else {
+      (words != "" && words.contains(what)) || (label != "" && label == what)
+    }
+    // (words in pieces by their own middle, as on_screen_nodes finds the words looked for in an old view's rich text:
+    // a short message's words in a node as wide as its column are drawn at its start, its middle nothing of them)
+    let whole = (d.x, d.y, d.x + d.w, d.y + d.h)
+    let (x, y, box) = match (by_words && hit, d.runs.is_empty()) {
+      (true, false) =>
+      match tree_words_box(tree, d.id, what) {
+        Some(w) => w
+        Option::None => (d.x + d.w / 2.0, d.y + d.h / 2.0, whole)
+      }
+      _ => (d.x + d.w / 2.0, d.y + d.h / 2.0, whole)
+    }
+    if hit && !tree.leaving(d.id) && d.w > 0.0 && d.h > 0.0 && x >= 0.0 && x <= c.width && y >= 0.0 && y <= c.height {
+      hits.push((x, y, d.id, box, by_words))
+    }
+  }
+  // (one called so that holds words found: those words, once, as an old view's row read out by its words is found by
+  // its text alone)
+  mbt_compat::arr_map(mbt_compat::arr_filter(hits, fn(h) { h.4 || !arr_any(hits, fn(w) { w.4 && w.2 != h.2 && tree.holds(h.2, w.2) }) }), fn(h) { (h.0, h.1, h.2, h.3) })
+
+}
+
+///|
+/// The middle of the words `what` (`=WORDS`: all of them) of node `id` of `tree`'s words in pieces where they are drawn,
+/// laid out as it lays them out now (tree_run_rects'), their first line's, and their box there (x0, y0, x1, y1 in the
+/// window): None where they hold no such words.
+fn tree_words_box(tree : view::Tree, id : view::NodeId, what : String) -> Option[(Double, Double, (Double, Double, Double, Double))] {
+  let mut at : Option[(Double, Double, (Double, Double, Double, Double))] = Option::None
+  tree.each_drawn_scaled(fn(c, x, y, a, sc) {
+    if at is Some(_) || c.id != id || c.runs.is_empty() || a <= 0.0 {
+      return
+    }
+    let (_, lay, _) = view_runs_laid(c.runs, c.words_look, c.runs_look, c.w, tree.words_scale_of(c.id), kept=c.words_breaks, tabular=c.words_tabular)
+    let (from, to) = if mbt_compat::str_has_prefix(what, "=") {
+      (0, mbt_compat::utf16_len(lay.text))
+    } else {
+      match mbt_compat::str_find(lay.text, what) {
+        Some(i) => (i, i + mbt_compat::utf16_len(what))
+        None => return
+      }
+    }
+    match mbt_compat::arr_get(lay.rects(from, to), 0) {
+      Option::Some(r) => {
+        let dx = rich_shift_at(lay, r.1 + r.3 / 2.0, if c.words_center { c.w } else { -1.0 })
+        let (rx0, ry0) = (x + (r.0 + dx) * sc, y + r.1 * sc)
+        at = Some(
+          (
+            x + (r.0 + dx + r.2 / 2.0) * sc,
+            y + (r.1 + r.3 / 2.0) * sc,
+            (rx0, ry0, rx0 + r.2 * sc, ry0 + r.3 * sc),
+          ),
+        )
+      }
+      Option::None => ()
+    }
+  })
+  at
+}
+
+///|
+/// Whether `what` names a kind of thing a step looks for (`kind:`, the letters before its first colon), not words: a
+/// time's words (`0:00 / 0:04`) are words, as an old view's are found by them.
+fn step_kind_of(what : String) -> Bool {
+  match mbt_compat::str_find(what, ":") {
+    Some(k) if k > 0 => mbt_compat::str_iter(mbt_compat::str_unsafe_substring(what, start=0, end=k)).all(fn(ch) { ch >= 'a' && ch <= 'z' })
+    _ => false
+  }
+}
+
+///|
+/// Those of them a finger reaches: what the press there goes to (the last frame's hit targets) is the words' own
+/// (theirs, or what holds them), or nothing; not words under what lies over them (a composer over a list's last row,
+/// a sheet, a scrim): a step waits for them to come out from under it, as someone would.
+fn reachable(c : Ctx, what : String) -> Array[(Double, Double)] {
+  let at = []
+  for p in on_screen_nodes(c, what) {
+    match reach_point(c, p.2, p.0, p.1, p.3) {
+      Some(q) => at.push(q)
+      Option::None => ()
+    }
+  }
+  // (of the window's tree: where what a press there goes to is it, or holds it, as the tree finds it then)
+  match view_app.v {
+    Some(tree) =>
+    { for p in tree_on_screen_nodes(c, what) {
+      match tree_reach_point(c, tree, p.2, p.0, p.1, p.3) {
+        Some(q) => at.push(q)
+        Option::None => ()
+      }
+    } }
+    Option::None => ()
+  }
+  at
+}
+
+///|
+/// Whether a finger at (x, y) reaches node `target` of the window's tree: what a press there goes to is it, or holds it;
+/// or, where a press goes to nothing (words that take no press of their own, nothing that does over them), what is
+/// found there first is it, what holds it, or what it holds, nothing lying over it. Or words that take no press of
+/// their own over what takes it under them (a sheet's title over the top that drags the sheet): what takes the press
+/// drawn before them, there in its own box (not a small button's finger room grown past its box), and what is drawn
+/// first there them; never a press of something they hold (a card's own ✕) nor of what lies over them.
+fn tree_reaches_at(c : Ctx, tree : view::Tree, target : view::NodeId, x : Double, y : Double) -> Bool {
+  if !tree.takes_points(target) {
+    return false
+  }
+  match view_presses_at(x, y) {
+    Some(id) =>
+    tree.holds(id, target) ||
+    (
+      !tree.holds(target, id) &&
+      tree_point_in(tree, id, x, y) &&
+      (tree.drop_at(x, y) is Some(.OnNode(d)) && (tree.holds(d, target) || tree.holds(target, d))) &&
+      tree.drawn_later(target, id)
+    )
+    Option::None =>
+    !old_root_hit(c, x, y, pressed=true) &&
+    tree.drop_at(x, y) is Some(.OnNode(id)) &&
+    (tree.holds(id, target) || tree.holds(target, id))
+  }
+}
+
+///|
+/// Whether (x, y) is in what node `id` of the window's tree takes a finger in, its own (Tree::finger_areas: not the
+/// room a small part's press is given past it).
+fn tree_point_in(tree : view::Tree, id : view::NodeId, x : Double, y : Double) -> Bool {
+  match tree.finger_areas(id) {
+    .InWindow(rs) => mbt_compat::arr_iter(rs).any(fn(r) { x >= r.0 && y >= r.1 && x < r.2 && y < r.3 })
+    .AsItHosts => false
+  }
+}
+
+///|
+/// Where a finger reaches node `id` of the window's tree, (x, y) its middle, `box` where it is (tree_on_screen_nodes'),
+/// as reach_point finds an old view's: there, else the point of it in sight (its box cut by what holds it clipping:
+/// Tree::seen_bounds, and by the window) nearest it that a finger reaches it at (a picture half under a page's bar),
+/// the same each run (on a grid of reach_step, the nearest first, then the higher, then the one further left). None:
+/// no point of it in sight is reached.
+fn tree_reach_point(c : Ctx, tree : view::Tree, id : view::NodeId, x : Double, y : Double, box : (Double, Double, Double, Double)) -> Option[(Double, Double)] {
+  if tree_reaches_at(c, tree, id, x, y) {
+    return Some((x, y))
+  }
+  let (sx0, sy0, sx1, sy1) = tree.seen_bounds(id)
+  let x0 = dmax(dmax(box.0, sx0), 0.0)
+  let y0 = dmax(dmax(box.1, sy0), 0.0)
+  let x1 = dmin(dmin(box.2, sx1), c.width)
+  let y1 = dmin(dmin(box.3, sy1), c.height)
+  let mut best : Option[(Double, Double)] = Option::None
+  let mut best_d = mbt_compat::double_inf()
+  let mut py = y0 + reach_step / 2.0
+  while py < y1 {
+    let mut px = x0 + reach_step / 2.0
+    while px < x1 {
+      let d = (px - x) * (px - x) + (py - y) * (py - y)
+      if d < best_d && tree_reaches_at(c, tree, id, px, py) {
+        best = Some((px, py))
+        best_d = d
+      }
+      px = px + reach_step
+    }
+    py = py + reach_step
+  }
+  best
+}
+
+///|
+/// Where a finger reaches node `i`'s words, (x, y) their middle, `box` where they are (x0, y0, x1, y1: in a paragraph
+/// the words' own, not the paragraph's): there, else the point of them in sight nearest it that a press goes to them
+/// at (part of them out from under what lies over the rest: a link half under a composer), the same each run (on a
+/// grid of reach_step, the nearest first, then the higher, then the one further left). None: no point of them in
+/// sight is theirs to press.
+fn reach_point(c : Ctx, i : Int, x : Double, y : Double, box : (Double, Double, Double, Double)) -> Option[(Double, Double)] {
+  if !under_another(c, i, x, y) {
+    return Some((x, y))
+  }
+  let n = c.nodes[i]
+  // what of them is in sight: their box, cut by what clips it and by the window
+  let mut x0 = dmax(box.0, 0.0)
+  let mut y0 = dmax(box.1, 0.0)
+  let mut x1 = dmin(box.2, c.width)
+  let mut y1 = dmin(box.3, c.height)
+  let mut j = n.parent
+  let mut up = 0
+  while j >= 0 && j < c.count && up < c.count {
+    let a = c.nodes[j]
+    if a.clip {
+      x0 = dmax(x0, a.x)
+      y0 = dmax(y0, a.y)
+      x1 = dmin(x1, a.x + a.fw)
+      y1 = dmin(y1, a.y + a.fh)
+    }
+    j = a.parent
+    up += 1
+  }
+  let mut best : Option[(Double, Double)] = Option::None
+  let mut best_d = mbt_compat::double_inf()
+  let mut py = y0 + reach_step / 2.0
+  while py < y1 {
+    let mut px = x0 + reach_step / 2.0
+    while px < x1 {
+      let d = (px - x) * (px - x) + (py - y) * (py - y)
+      if d < best_d && !under_another(c, i, px, py) {
+        best = Some((px, py))
+        best_d = d
+      }
+      px = px + reach_step
+    }
+    py = py + reach_step
+  }
+  best
+}
+
+///|
+/// How far apart the points of words in sight are tried for one a finger reaches (reach_point), in points.
+// moved to 00_init_order.pion: reach_step
+
+///|
+/// Whether (x, y), where node `i` is, is another's to press: the hit target there neither the node (a paragraph's
+/// links its own) nor what holds it.
+fn under_another(c : Ctx, i : Int, x : Double, y : Double) -> Bool {
+  // (a press there taken by a node of the window's tree: it, or what it is pressed through, is that node's; else what
+  // the tree takes there lies over it)
+  match view_presses_at(x, y) {
+    Some(n) => {
+      let mut j = i
+      let mut up = 0
+      while j >= 0 && j < c.count && up < c.count {
+        if c.nodes[j].press_node is Some(m) && m == n {
+          return false
+        }
+        j = c.nodes[j].parent
+        up += 1
+      }
+      return true
+    }
+    Option::None => ()
+  }
+  let top = hit_in(c.hit_ids, c.hit_rects, x, y)
+  if top == 0 {
+    return false
+  }
+  if c.nodes[i].rich is Some(r) {
+    for k, run in r.runs {
+      if run.link != "" && link_id(r.base, r.runs, k) == top {
+        return false
+      }
+    }
+  }
+  let mut j = i
+  let mut up = 0
+  while j >= 0 && j < c.count && up < c.count {
+    // (it, what holds it, or what takes the presses on either: Ctx::presses_to)
+    if c.nodes[j].id == top || (c.nodes[j].press_owner is Some((a, _)) && a == top) {
+      return false
+    }
+    j = c.nodes[j].parent
+    up += 1
+  }
+  true
+}
+
+///|
+/// The words a field holds, as it shows them (a secret one's masked): what `field:WORDS` looks for (a field's own text
+/// node is its placeholder).
+fn field_words_of(c : Ctx, n : Node) -> String {
+  match c.editors.get(n.id) {
+    Some(st) => st.shown()
+    Option::None => ""
+  }
+}
+
+///|
+/// The words looked for on screen with their node: (x, y, node, where they are: x0 y0 x1 y1).
+fn on_screen_nodes(c : Ctx, what : String) -> Array[(Double, Double, Int, (Double, Double, Double, Double))] {
+  let found = []
+  // a switch by what it turns (its label in the semantics tree, whole): the switch alone takes the press, not the
+  // words beside it (sf's switch rows)
+  if mbt_compat::str_has_prefix(what, "switch:") {
+    let label = mbt_compat::str_unsafe_substring(what, start=7, end=mbt_compat::utf16_len(what))
+    for sem in c.sems {
+      if sem.role is view::Role::Switch && sem.label == label && !sem.hidden && sem.node >= 0 && sem.node < c.count {
+        let n = c.nodes[sem.node]
+        let x = n.x + n.fw / 2.0
+        let y = n.y + n.fh / 2.0
+        if n.fw > 0.0 && n.fh > 0.0 && !c.in_draw_only(sem.node) && x >= 0.0 && x <= c.width && y >= 0.0 && y <= c.height {
+          found.push((x, y, sem.node, (n.x, n.y, n.x + n.fw, n.y + n.fh)))
+        }
+      }
+    }
+    return found
+  }
+  let icon = if mbt_compat::str_has_prefix(what, "icon:") {
+    Some("/icon/" + mbt_compat::str_unsafe_substring(what, start=5, end=mbt_compat::utf16_len(what)) + "/")
+  } else if mbt_compat::str_has_prefix(what, "img:") {
+    // an image by its source (a chat's file: its key ends with the file's name), or a drawable by its name (the window's
+    // tree's the same: tree_on_screen's `img:`)
+    Some(mbt_compat::str_unsafe_substring(what, start=4, end=mbt_compat::utf16_len(what)))
+  } else {
+    None
+  }
+  let field = if mbt_compat::str_has_prefix(what, "field:") && mbt_compat::utf16_len(what) > 6 {
+    Some(mbt_compat::str_unsafe_substring(what, start=6, end=mbt_compat::utf16_len(what)))
+  } else {
+    None
+  }
+  let exact = if mbt_compat::str_has_prefix(what, "=") && mbt_compat::utf16_len(what) > 1 {
+    Some(mbt_compat::str_unsafe_substring(what, start=1, end=mbt_compat::utf16_len(what)))
+  } else {
+    None
+  }
+  for i in 0..<c.count {
+    let n = c.nodes[i]
+    let hit = match icon {
+      Some(k) => (n.kind == kind_image || n.shapes.length() > 0) && n.text.contains(k)
+      None =>
+      // a box by what it is called (its label, whole), as Compose's test finds a node by its contentDescription
+      (n.kind == kind_box && n.label != "" && field is None && n.label == exact.unwrap_or(what)) ||
+      ((n.kind == kind_text || n.kind == kind_rich || n.kind == kind_editor) &&
+        (match field {
+          // a field by the words in it (`field:WORDS`), not its placeholder
+          // a field by the words in it (`field:WORDS`), not its placeholder
+          Some(w) => n.kind == kind_editor && field_words_of(c, n).contains(w)
+          None =>
+          match exact {
+            Some(e) => n.text == e
+            None => n.text.contains(what)
+          }
+      }))
+    }
+    // (not what a page's bones are made of: not there yet, bones.pion)
+    if hit && n.bones == 0L && n.fw > 0.0 && n.fh > 0.0 && !c.in_draw_only(i) {
+      // where it is laid out: where it is tapped (a look moves only what is drawn: draw.pion); in rich text, the
+      // middle of the words looked for (a link in a paragraph, a word in a long line of code), and their box
+      let whole = (n.x, n.y, n.x + n.fw, n.y + n.fh)
+      let (x0, y0, x1, y1) = match (n.rl, exact) {
+        (Some(rl), None) =>
+        match mbt_compat::str_find(n.text, what) {
+          Some(k) =>
+          match mbt_compat::arr_get(rl.rects(k, k + mbt_compat::utf16_len(what)), 0) {
+            Option::Some(r) => {
+              let rx = n.x + n.pad_l + r.0
+              let ry = n.y + n.pad_t + r.1
+              (rx, ry, rx + r.2, ry + r.3)
+            }
+            Option::None => whole
+          }
+          None => whole
+        }
+        _ => whole
+      }
+      let x = (x0 + x1) / 2.0
+      let y = (y0 + y1) / 2.0
+      if x >= 0.0 && x <= c.width && y >= 0.0 && y <= c.height {
+        found.push((x, y, i, (x0, y0, x1, y1)))
+      }
+    }
+  }
+  found
+}
+
+///|
+/// Why a step that presses on `what` found nothing to press, after `ms`: not on screen, or only under something else.
+fn not_reachable(c : Ctx, what : String, ms : Double) -> String {
+  if on_screen(c, what).length() == 0 {
+    "not on screen after \{ms.to_int()} ms"
+  } else {
+    "on screen but under something else to press (what lies over it: a composer, a sheet, a scrim) after " +
+    "\{ms.to_int()} ms: " +
+    (mbt_compat::arr_concat(mbt_compat::arr_map(on_screen_nodes(c, what), fn(p) { over_it(c, p.0, p.1) }), mbt_compat::arr_map(tree_on_screen(c, what), fn(p) { over_it(c, p.0, p.1) }))).join("; ")
+
+  }
+}
+
+///|
+/// What is on screen, in words, for a failure's report.
+fn screen_words(c : Ctx) -> String {
+  let words = []
+  for i in 0..<c.count {
+    let n = c.nodes[i]
+    if (n.kind == kind_text || n.kind == kind_rich) && n.text != "" {
+      let y = n.y + n.fh / 2.0
+      if y >= 0.0 && y <= c.height {
+        words.push(n.text)
+      }
+    }
+  }
+  // (and the window's tree's: a page made of nodes said too, not an empty screen)
+  match view_app.v {
+    Some(tree) =>
+    { for e in tree.drawn() {
+      let w = view_words_found(e)
+      let y = e.y + e.h / 2.0
+      if w != "" && e.bones == 0L && y >= 0.0 && y <= c.height {
+        words.push(w)
+      }
+    } }
+    Option::None => ()
+  }
+  let all = words.join(" | ")
+  if mbt_compat::utf16_len(all) > 1500 {
+    mbt_compat::str_unsafe_substring(all, start=0, end=1500) + "…"
+  } else {
+    all
+  }
+}
+
+///|
+/// The focused field's words ("" when none is focused).
+fn field_words(c : Ctx) -> String {
+  match c.editors.get(c.focus) {
+    Some(st) => st.display()
+    Option::None => ""
+  }
+}
+
+///|
+/// Whether a field (focused or not: a draft put back) holds `words`.
+fn fields_hold(c : Ctx, words : String) -> Bool {
+  { let __mbt_mit_829 = mbt_compat::ordered_map_iter_lazy(c.editors); while true { match (__mbt_mit_829.next)() { Some((_, st)) => {
+    if st.display().contains(words) {
+      return true
+    }
+  }, None => break } } }
+  false
+}
+
+///|
+/// The host's way of sending a step's input (@hostapi.drive).
+fn h_drive(kind : Int, text : String) -> Bool {
+  hostapi::drive(kind, text)
+}
+
+///|
+/// The run over: the app ends with its verdict (a test's fake host notes it). An interactive preview may keep a
+/// successfully replayed scene open; a failed script still ends with its error.
+fn drive_end(code : Int) -> Unit {
+  h_log(if code == 0 { "DRIVE PASS" } else { "DRIVE END \{code}" })
+  driver.v = None
+  drive_acting.v = false
+  if code == 0 && h_env("MBUI_DRIVE_KEEP_OPEN") == "1" {
+    return
+  }
+  hostapi::exit(code)
+}
+
+///|
+fn drive_shot(d : Driver, name : String) -> Bool {
+  let path = (if d.dir == "" { "." } else { d.dir }) + "/" + name + ".png"
+  if h_drive(4, path) {
+    true
+  } else {
+    h_log("SHOT " + name)
+    false
+  }
+}
+
+///|
+fn drive_fail(c : Ctx, d : Driver, why : String) -> Unit {
+  let line = if d.at < d.steps.length() { d.steps[d.at] } else { "(the script's end)" }
+  h_log("DRIVE FAIL line \{d.at + 1}: \{line}: \{why}")
+  h_log("DRIVE FAIL on screen: " + screen_words(c))
+  let f = field_words(c)
+  if f != "" {
+    h_log("DRIVE FAIL in the field: " + f)
+  }
+  drive_shot(d, "fail") |> ignore
+  drive_end(1)
+}
+
+///|
+/// A step's number: digits, a sign, a fraction (0 for anything else).
+fn number(s : String) -> Double {
+  let mut v = 0.0
+  let mut neg = false
+  let mut scale = 0.0
+  { let __mbt_s_886 = s; let __mbt_sn_886 = mbt_compat::str_byte_len(__mbt_s_886); let mut __mbt_sp_886 = 0; while __mbt_sp_886 < __mbt_sn_886 { let (__mbt_ch_886, __mbt_spn_886) = mbt_compat::str_cursor_step(__mbt_s_886, __mbt_sp_886); __mbt_sp_886 = __mbt_spn_886; let ch = __mbt_ch_886;
+    if ch == '-' {
+      neg = true
+    } else if ch == '.' {
+      scale = 1.0
+    } else if ch >= '0' && ch <= '9' {
+      let digit = (ch.to_int() - '0'.to_int()).to_double()
+      if scale > 0.0 {
+        scale = scale / 10.0
+        v = v + digit * scale
+      } else {
+        v = v * 10.0 + digit
+      }
+    }
+  } }
+  if neg {
+    -v
+  } else {
+    v
+  }
+}
+
+///|
+/// The place a step says as `@X,Y` (none where it says no such place).
+fn point_said(what : String) -> Array[(Double, Double)] {
+  match mbt_compat::str_find(what, ",") {
+    Some(i) => {
+      let x = number(mbt_compat::str_unsafe_substring(what, start=1, end=i))
+      [(x, number(mbt_compat::str_unsafe_substring(what, start=i + 1, end=mbt_compat::utf16_len(what))))]
+    }
+    None => []
+  }
+}
+
+///|
+/// The lowest of the places found (a list builds its rows in no order on screen: the newest is the lowest).
+fn lowest(at : Array[(Double, Double)]) -> (Double, Double) {
+  let mut best = at[0]
+  for p in at {
+    if p.1 > best.1 {
+      best = p
+    }
+  }
+  best
+}
+
+///|
+/// The highest of the places found.
+fn topmost(at : Array[(Double, Double)]) -> (Double, Double) {
+  let mut best = at[0]
+  for p in at {
+    if p.1 < best.1 {
+      best = p
+    }
+  }
+  best
+}
+
+///|
+fn press(x : Double, y : Double, up : Bool) -> Unit {
+  on_pointer(0, x, y, 0)
+  if up {
+    on_pointer(2, x, y, 0)
+  }
+}
+
+///|
+/// Runs the script's steps due this frame (after it was presented and all of its own work done, where a device's input
+/// comes: on_frame): steps that only look run on at once; one that acts
+/// ends the frame's turn, so the app sees it before the next (its input's frames). The run asks for no frame of its
+/// own: what it waits for on screen comes with a frame (an input's, a message's, a motion's, the host's event); what
+/// it waits for in time (a step's timeout, a hold let go, a pause, a shot taken by another) is a wake at that time.
+fn drive_frame(c : Ctx) -> Unit {
+  // (its steps that window's of the run they act in: taken by its frames alone)
+  match driver.v {
+    Some(d) if d.wid != window_now.now => return
+    _ => ()
+  }
+  drive_acting.v = true
+  drive_steps(c)
+  drive_acting.v = false
+  guard driver.v is Some(d) else { return }
+  // (on the frames that come after it, none asked for of its own: what the wheel set moving draws them)
+  wheel_followed(d)
+  let now = h_now()
+  let mut at = mbt_compat::double_inf()
+  let soon = fn(t : Double) { if t < at { at = t } }
+  if d.release_at >= 0.0 {
+    soon(d.release_at)
+  }
+  if d.shot_at >= 0.0 {
+    soon(d.shot_at + shot_taker_ms)
+  }
+  if d.since >= 0.0 && d.at < d.steps.length() {
+    let line = d.steps[d.at]
+    if mbt_compat::str_has_prefix(line, "wait ") {
+      // (a pause ends at its own time, never timed out: one longer than the timeout woke at no moment past it)
+      soon(d.since + number(mbt_compat::str_unsafe_substring(line, start=5, end=mbt_compat::utf16_len(line))))
+    } else {
+      soon(d.since + d.timeout)
+    }
+    // what it saw end wants a frame drawn after it
+    if d.seen_frame >= 0 {
+      soon(now)
+    }
+  }
+  if at < mbt_compat::double_inf() {
+    c.wake_at_time(dmax(at, now), later=true)
+  }
+}
+
+///|
+/// How long the words nearest a wheel are followed after it (wheel_followed).
+// moved to 00_init_order.pion: wheel_follow_ms
+
+///|
+/// The window's tree's node drawing words nearest (x, y), those words, and where they are drawn (their middle's y).
+fn tree_words_near(x : Double, y : Double) -> Option[(view::NodeId, String, Double)] {
+  guard view_app.v is Some(tree) else { return Option::None }
+  let mut best : Option[(view::NodeId, String, Double)] = Option::None
+  let mut far = mbt_compat::double_inf()
+  for d in tree.drawn() {
+    let words = view_words_found(d)
+    if words == "" || d.bones != 0L || d.w <= 0.0 || d.h <= 0.0 {
+      continue
+    }
+    let (mx, my) = (d.x + d.w / 2.0, d.y + d.h / 2.0)
+    let dist = (mx - x).abs() + (my - y).abs()
+    if dist < far {
+      far = dist
+      best = Some((d.id, words, my))
+    }
+  }
+  best
+}
+
+///|
+/// What a scripted run's `wheel` says of itself, in its log: where it turned, what took it (the window's tree's node
+/// found there and the one that took it, or the old frame's, wheel_went), what was moving as it turned (the page's
+/// way in among it), and the words nearest it, followed after it for wheel_follow_ms (wheel_followed): whether what
+/// it scrolled moved, and stayed. So a wheel that did nothing is told from one undone after.
+fn wheel_said(d : Driver, x : Double, y : Double, dy : String, near : Option[(view::NodeId, String, Double)], moving : Array[String]) -> Unit {
+  let named = fn(id : Option[view::NodeId]) {
+    match (id, view_app.v) {
+      (Some(i), Some(tree)) => {
+        let name = tree.drawn_name(i)
+        "\{i.at}" + (if name == "" { "" } else { " (" + name + ")" })
+      }
+      _ => "none"
+    }
+  }
+  let last = view::wheel_last
+  let found : Option[view::NodeId] = if last.found_at >= 0 { Some({ at: last.found_at, gen: last.found_gen }) } else { Option::None }
+  let took : Option[view::NodeId] = if last.took_at >= 0 { Some({ at: last.took_at, gen: last.took_gen }) } else { Option::None }
+  // (what of an old view's scrolls where it went, as it stands now the wheel has moved it)
+  let old_said = fn() {
+    let target = wheel_old_target.v
+    if target == 0 {
+      "nothing that scrolls there"
+    } else {
+      "what scrolls there, \{target}" +
+      (match g().lists.get(target) {
+        Option::Some(st) => if st.wheel_moves(number(dy)) { ", a list not at its end that way" } else { ", a list at its end that way" }
+        Option::None => ""
+      })
+    }
+  }
+  let went = match wheel_went.v {
+    1 => "the window's tree"
+    2 => "the old view the tree hosts there: " + old_said()
+    3 => old_said()
+    _ => "nowhere"
+  }
+  let words = match near {
+    Some((_, w, wy)) => "\"" + w + "\" at y \{mbt_compat::double_to_string(wy)}"
+    Option::None => "no words of the tree's"
+  }
+  h_log("DRIVE wheel \{dy} at \{x.to_int()},\{y.to_int()}: went to \{went}; the tree's found \{named(found)}, taken by \{named(took)}; nearest " +
+    words + "; moving: " + (if moving.length() == 0 { "nothing" } else { moving.join("; ") }))
+  d.wheel_follow = match near {
+    Some((id, w, wy)) => Some((id, w, wy, wy, view_logic_at.v))
+    Option::None => Option::None
+  }
+}
+
+///|
+/// The words a wheel followed (wheel_said), this frame: said where they moved (by half a point or more) since last
+/// said, gone, or where they are on the first frame after wheel_follow_ms (none asked for: a frame comes as something
+/// moves, so none drawn means nothing moved).
+fn wheel_followed(d : Driver) -> Unit {
+  guard d.wheel_follow is Some((id, words, y0, last, t0)) else { return }
+  let after = (view_logic_at.v - t0).to_int()
+  let drawn = match view_app.v {
+    Some(tree) => arr_find_first(tree.drawn(), fn(e) { e.id == id })
+    Option::None => Option::None
+  }
+  match drawn {
+    Option::None => {
+      h_log("DRIVE wheel +\{after} ms: \"\{words}\" no longer drawn")
+      d.wheel_follow = Option::None
+    }
+    Some(e) => {
+      let y = e.y + e.h / 2.0
+      if (y - last).abs() >= 0.5 {
+        h_log("DRIVE wheel +\{after} ms: \"\{words}\" at y \{mbt_compat::double_to_string(y)}")
+        d.wheel_follow = Some((id, words, y0, y, t0))
+      }
+      if view_logic_at.v > t0 + wheel_follow_ms {
+        h_log("DRIVE wheel +\{after} ms: \"\{words}\" ends at y \{mbt_compat::double_to_string(y)}, from \{mbt_compat::double_to_string(y0)}")
+        d.wheel_follow = Option::None
+      }
+    }
+  }
+}
+
+///|
+/// How long a shot the host cannot take itself is left for whoever takes it (adb's screencap: "SHOT NAME").
+// moved to 00_init_order.pion: shot_taker_ms
+
+///|
+fn drive_steps(c : Ctx) -> Unit {
+  guard driver.v is Some(d) else { return }
+  // (the frame's logic moment, where it found what it acts on: not the clock after presenting it, h_event_time)
+  let now = view_logic_at.v
+  if d.release_at >= 0.0 {
+    if now < d.release_at {
+      return
+    }
+    on_pointer(2, d.rx, d.ry, 0)
+    d.release_at = -1.0
+    d.at = d.at + 1
+    d.since = -1.0
+    return
+  }
+  if d.bms > 0.0 {
+    // the system's back gesture on its way: a step this frame, gone through (or called off) once all the way
+    let f = dmin((now - d.bt0) / d.bms, 1.0)
+    let x = if d.bedge == 1 { c.width - d.bdx * f } else { d.bdx * f }
+    on_back(1, x, f, d.bedge)
+    if f >= 1.0 {
+      on_back(if d.boff { 3 } else { 2 }, x, f, d.bedge)
+      d.bms = 0.0
+      d.at = d.at + 1
+      d.since = -1.0
+    }
+    return
+  }
+  if d.sms > 0.0 {
+    // a trackpad's sweep on its way: the wheel this frame by what of it is owed since the last, done once all the way
+    let f = dmin((now - d.st0) / d.sms, 1.0)
+    on_wheel(c.width / 2.0, c.height / 2.0, -d.sdx * (f - d.sdone), 0.0, 0)
+    d.sdone = f
+    if f >= 1.0 {
+      d.sms = 0.0
+      d.at = d.at + 1
+      d.since = -1.0
+    }
+    return
+  }
+  if d.gms > 0.0 {
+    // a drag on its way: a move this frame, lifted once all the way (`holdon`'s held still till it sets out)
+    if now < d.gt0 {
+      return
+    }
+    let f = dmin((now - d.gt0) / d.gms, 1.0)
+    let x = d.gx + d.gdx * f
+    let y = d.gy + d.gdy * f
+    // (a frame's samples, the way since the last move cut in `gsamples`, each but the last with more after it)
+    let n = d.gsamples
+    for k in 1..<n {
+      let fk = d.gfrom + (f - d.gfrom) * k.to_double() / n.to_double()
+      pointer_in(1, d.gx + d.gdx * fk, d.gy + d.gdy * fk, 0, 0, more=!d.gapart)
+    }
+    d.gfrom = f
+    on_pointer(1, x, y, 0)
+    if f >= 1.0 && now >= d.gt0 + d.gms + d.gstay {
+      d.gstay = 0.0
+      on_pointer(2, x, y, 0)
+      d.gms = 0.0
+      d.at = d.at + 1
+      d.since = -1.0
+    }
+    return
+  }
+  while d.at < d.steps.length() {
+    let line = d.steps[d.at]
+    if d.since < 0.0 {
+      d.since = now
+      d.seen_frame = -1
+      tell_step(line, StepMoment::Began)
+    }
+    let waited = now - d.since
+    // (`now STEP`: STEP)
+    let line = if mbt_compat::str_has_prefix(line, "now ") {
+      mbt_compat::str_to_owned(mbt_compat::str_trim(mbt_compat::str_unsafe_substring(line, start=4, end=mbt_compat::utf16_len(line)), chars=" "))
+    } else {
+      line
+    }
+    let (cmd, arg) = match mbt_compat::str_find(line, " ") {
+      Some(i) =>
+      (mbt_compat::str_unsafe_substring(line, start=0, end=i), mbt_compat::str_unsafe_substring(line, start=i + 1, end=mbt_compat::utf16_len(line)))
+      None => (line, "")
+    }
+    let next = fn() {
+      d.at = d.at + 1
+      d.since = -1.0
+      d.shot_at = -1.0
+    }
+    // a step that acted: its input's frames come next; what it set off from outside is counted from here
+    let raw = d.steps[d.at]
+    let acted = fn() {
+      tell_step(raw, StepMoment::Acted)
+      next()
+      d.count_answers()
+      d.mark = runtime().outside_ended()
+      d.shown_mark = d.shown
+    }
+    if d.typed != "" {
+      if fields_hold(c, d.typed) {
+        d.typed = ""
+      } else if waited > d.timeout {
+        drive_fail(c, d, "the words typed (\"\{d.typed}\") never reached a field after \{d.timeout.to_int()} ms")
+        return
+      } else {
+        return
+      }
+    }
+    match cmd {
+      "" => next()
+      _ if mbt_compat::str_has_prefix(cmd, "#") => next()
+      "wait" =>
+      if waited >= number(arg) {
+        next()
+      } else {
+        return
+      }
+      "timeout" => {
+        d.timeout = number(arg)
+        next()
+      }
+      "samples" => {
+        let words = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { mbt_compat::str_to_owned(v) }))
+        let n = number(words[0]).to_int()
+        d.gsamples = if n < 1 { 1 } else { n }
+        d.gapart = words.length() > 1 && words[1] == "apart"
+        next()
+      }
+      // the steps after it act in window N of the run (0 the first), taken by that window's frames
+      // the steps after it act in window N of the run (0 the first), taken by that window's frames
+      "window" => {
+        d.wid = number(arg).to_int()
+        next()
+      }
+      "empty" if arg == "now" =>
+      if field_words(c) == "" {
+        h_log("DRIVE ok \{line}")
+        next()
+      } else {
+        drive_fail(c, d, "the focused field holds \"\{field_words(c)}\"")
+        return
+      }
+      "said" => {
+        let mut k = d.said_taken
+        while k < app_said.length() && !app_said[k].contains(arg) {
+          k = k + 1
+        }
+        if k < app_said.length() {
+          d.said_taken = k + 1
+          h_log("DRIVE ok \{line} (\{waited.to_int()} ms): \{app_said[k]}")
+          next()
+        } else if waited > d.timeout {
+          let last = if app_said.is_empty() { "none" } else { app_said[app_said.length() - 1] }
+          drive_fail(c, d, "not said after \{d.timeout.to_int()} ms (the last: \{last})")
+          return
+        } else {
+          return
+        }
+      }
+      "until" | "untiln" | "gone" | "field" | "empty" => {
+        let ok = match cmd {
+          "until" => on_screen(c, arg).length() > 0
+          "untiln" =>
+          match mbt_compat::str_find(arg, " ") {
+            Some(i) =>
+            on_screen(c, mbt_compat::str_unsafe_substring(arg, start=i + 1, end=mbt_compat::utf16_len(arg))).length() >=
+            number(mbt_compat::str_unsafe_substring(arg, start=0, end=i)).to_int()
+            None => false
+          }
+          "gone" => on_screen(c, arg).length() == 0
+          "field" => fields_hold(c, arg.replace("\\n", "\n"))
+          _ => field_words(c) == ""
+        }
+        if ok {
+          h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+          next()
+        } else if waited > d.timeout {
+          drive_fail(c, d, "not so after \{d.timeout.to_int()} ms")
+          return
+        } else {
+          return
+        }
+      }
+      "outside_done" | "shown" => {
+        // what it names done outside (or the app shown again) since the last step that acted, and a frame drawn after
+        // the one that saw it
+        let come = if cmd == "shown" {
+          d.shown > d.shown_mark
+        } else {
+          let named = []
+          for w in runtime().outside_ended_since(d.mark) {
+            if w.contains(arg) {
+              named.push(w)
+            }
+          }
+          // (one thing named: more than one done, the name does not say which the run means)
+          if named.length() > 1 {
+            drive_fail(c, d, "\{arg} names more than one thing done outside: \{named.join("; ")}")
+            return
+          }
+          named.length() == 1
+        }
+        if d.seen_frame < 0 && come {
+          d.seen_frame = c.frame_no
+        }
+        if d.seen_frame >= 0 && c.frame_no > d.seen_frame {
+          h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+          next()
+        } else if waited > d.timeout {
+          drive_fail(c, d, "not so after \{d.timeout.to_int()} ms (awaiting \{runtime().awaiting()} from outside)")
+          return
+        } else {
+          return
+        }
+      }
+      "answered" | "decoded" | "ready" => {
+        // what it names ended since the step began (an answer: one no earlier line took), and a frame drawn after the
+        // one that saw it
+        let taken = if cmd == "answered" { d.answers_taken.get(arg).unwrap_or(0) } else { 0 }
+        let come = if cmd == "answered" {
+          d.count_answers()
+          d.answers.get(arg).unwrap_or(0) > taken
+        } else {
+          arr_any(runtime().outside_ended_since(d.mark), fn(w) { outside_named(cmd, arg, w) })
+        }
+        if d.seen_frame < 0 && come {
+          d.seen_frame = c.frame_no
+        }
+        if d.seen_frame >= 0 && c.frame_no > d.seen_frame {
+          h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+          if cmd == "answered" {
+            d.answers_taken.set(arg, taken + 1)
+          }
+          next()
+        } else if waited > d.timeout {
+          drive_fail(c, d, "not so after \{d.timeout.to_int()} ms (awaiting \{runtime().awaiting()} from outside)")
+          return
+        } else {
+          return
+        }
+      }
+      "image_ready" => {
+        if arg == "" {
+          drive_fail(c, d, "a picture source is required")
+          return
+        }
+        let (state, named) = named_image_state(arg)
+        if state == 1 {
+          h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+          next()
+        } else if state == -1 {
+          drive_fail(c, d, "picture \{named[0]} could not be decoded")
+          return
+        } else if state == -2 {
+          drive_fail(c, d, "\{arg} names more than one picture: \{named.join("; ")}")
+          return
+        } else if waited > d.timeout {
+          drive_fail(c, d, "picture was not requested or is still decoding after \{d.timeout.to_int()} ms")
+          return
+        } else {
+          return
+        }
+      }
+      "done" | "typedone" => {
+        if !d.watching {
+          drive_fail(c, d, "the host watches no directory of the runner's (MBUI_DONE_DIR or MBUI_SHOT_DIR unset, or the host has " +
+            "none: a Tester's, the web's, iOS's)")
+          return
+        }
+        match d.runner_done.get(arg) {
+          Some(said) =>
+          match mbt_compat::str_to_owned(mbt_compat::str_trim(said, chars=" \n\r\t")) {
+            "" | "ok" if cmd == "done" => {
+              h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+              next()
+            }
+            // (what the runner found, typed: the code another device shows, as a person reads it off and types it)
+            // (what the runner found, typed: the code another device shows, as a person reads it off and types it)
+            words if cmd == "typedone" && mbt_compat::str_has_prefix(words, "ok ") => {
+              let typed = mbt_compat::str_to_owned(mbt_compat::str_exact_view(words, start=3))
+              if h_drive(0, typed) {
+                if c.editors.contains(c.focus) {
+                  d.typed = typed
+                }
+              } else {
+                on_text(0, typed, 0, 0)
+              }
+              acted()
+              return
+            }
+            why if cmd == "done" && mbt_compat::str_has_prefix(why, "ok ") => {
+              h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+              next()
+            }
+            why => {
+              drive_fail(c, d, "the runner did not do it: \{why}")
+              return
+            }
+          }
+          Option::None =>
+          if waited > d.timeout {
+            drive_fail(c, d, "not done after \{d.timeout.to_int()} ms (the runner said nothing of it)")
+            return
+          } else {
+            return
+          }
+        }
+      }
+      "notice" | "noticed" | "nonotice" => {
+        // the host's notifications (@hostapi.drive 6: tapped, 7: looked for, 14: confirmed absent on Android)
+        let ok = match cmd {
+          "notice" => h_drive(6, arg)
+          "noticed" => h_drive(7, arg)
+          _ => if hostapi::platform() == 2 { h_drive(14, arg) } else { !h_drive(7, arg) }
+        }
+        if ok {
+          h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+          if cmd == "notice" { acted() } else { next() }
+          return
+        } else if waited > d.timeout {
+          drive_fail(c, d, "no such notification after \{d.timeout.to_int()} ms")
+          return
+        } else {
+          return
+        }
+      }
+      "tap" | "tap1" => {
+        let at = reachable(c, arg)
+        if at.length() == 0 {
+          if waited > d.timeout {
+            drive_fail(c, d, not_reachable(c, arg, d.timeout))
+          }
+          return
+        }
+        let (x, y) = if cmd == "tap1" { topmost(at) } else { lowest(at) }
+        h_log("DRIVE \{cmd} \{arg} at \{x.to_int()},\{y.to_int()}")
+        press(x, y, true)
+        acted()
+        return
+      }
+      "tapxy" => {
+        let xy = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { number(mbt_compat::str_to_owned(v)) }))
+        let x = if xy[0] < 0.0 { c.width + xy[0] } else { xy[0] }
+        let y = if xy[1] < 0.0 { c.height + xy[1] } else { xy[1] }
+        press(x, y, true)
+        acted()
+        return
+      }
+      "hold" => {
+        let (ms, what) = match mbt_compat::str_find(arg, " ") {
+          Some(i) =>
+          (number(mbt_compat::str_unsafe_substring(arg, start=0, end=i)), mbt_compat::str_unsafe_substring(arg, start=i + 1, end=mbt_compat::utf16_len(arg)))
+          None => (600.0, arg)
+        }
+        let at = reachable(c, what)
+        if at.length() == 0 {
+          if waited > d.timeout {
+            drive_fail(c, d, not_reachable(c, what, d.timeout))
+          }
+          return
+        }
+        let (x, y) = lowest(at)
+        tell_step(d.steps[d.at], StepMoment::Acted)
+        press(x, y, false)
+        d.rx = x
+        d.ry = y
+        d.release_at = now + ms
+        return
+      }
+      "holdon" => {
+        // `holdon MS DX DY MOVE TEXT`: held still on TEXT MS, then dragged DX DY over MOVE ms (a long press slid on)
+        let words = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { mbt_compat::str_to_owned(v) }))
+        if words.length() < 5 {
+          drive_fail(c, d, "holdon MS DX DY MOVE TEXT")
+          return
+        }
+        let what = mbt_compat::array_slice_clamp(words, 4, words.length()).join(" ")
+        // (`@X,Y`: there, words in a field being none of what is on screen to find)
+        let at = if mbt_compat::str_has_prefix(what, "@") { point_said(what) } else { reachable(c, what) }
+        if at.length() == 0 {
+          if waited > d.timeout {
+            drive_fail(c, d, not_reachable(c, what, d.timeout))
+          }
+          return
+        }
+        let (x, y) = lowest(at)
+        d.gx = x
+        d.gy = y
+        d.gdx = number(words[1])
+        d.gdy = number(words[2])
+        d.gms = dmax(number(words[3]), 16.0)
+        d.gt0 = now + number(words[0])
+        d.gfrom = 0.0
+        d.gstay = number(words[0])
+        h_log("DRIVE holdon \{arg} from \{x.to_int()},\{y.to_int()}")
+        tell_step(d.steps[d.at], StepMoment::Acted)
+        on_pointer(0, x, y, 0)
+        return
+      }
+      "drag" | "dragon" => {
+        let words = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { mbt_compat::str_to_owned(v) }))
+        let (x, y, rest) = if cmd == "drag" {
+          if words.length() < 4 {
+            drive_fail(c, d, "drag X Y DX DY [MS]")
+            return
+          }
+          let x = number(words[0])
+          let y = number(words[1])
+          (
+            if x < 0.0 { c.width + x } else { x },
+            if y < 0.0 { c.height + y } else { y },
+            mbt_compat::array_slice_clamp(words, 2, words.length()),
+          )
+        } else {
+          if words.length() < 4 {
+            drive_fail(c, d, "dragon DX DY MS TEXT")
+            return
+          }
+          let what = mbt_compat::array_slice_clamp(words, 3, words.length()).join(" ")
+          let at = reachable(c, what)
+          if at.length() == 0 {
+            if waited > d.timeout {
+              drive_fail(c, d, not_reachable(c, what, d.timeout))
+            }
+            return
+          }
+          let (x, y) = lowest(at)
+          (x, y, mbt_compat::array_slice_clamp(words, 0, 3))
+        }
+        d.gx = x
+        d.gy = y
+        d.gdx = number(rest[0])
+        d.gdy = if rest.length() > 1 { number(rest[1]) } else { 0.0 }
+        d.gms = if rest.length() > 2 { dmax(number(rest[2]), 16.0) } else { 300.0 }
+        d.gt0 = now
+        d.gfrom = 0.0
+        h_log("DRIVE \{cmd} \{arg} from \{x.to_int()},\{y.to_int()}")
+        tell_step(d.steps[d.at], StepMoment::Acted)
+        on_pointer(0, x, y, 0)
+        return
+      }
+      "swipe" => {
+        let words = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { mbt_compat::str_to_owned(v) }))
+        d.sdx = number(words[0])
+        d.sms = if words.length() > 1 { dmax(number(words[1]), 16.0) } else { 300.0 }
+        d.sdone = 0.0
+        d.st0 = now
+        h_log("DRIVE swipe \{arg}")
+        tell_step(d.steps[d.at], StepMoment::Acted)
+        return
+      }
+      "backswipe" => {
+        let words = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { mbt_compat::str_to_owned(v) }))
+        d.bdx = number(words[0])
+        d.bms = 300.0
+        d.bedge = 0
+        d.boff = false
+        for wi = 1; wi < words.length(); wi = wi + 1 {
+          let w = words[wi]
+          match w {
+            "right" => d.bedge = 1
+            "off" => d.boff = true
+            _ => d.bms = dmax(number(w), 16.0)
+          }
+        }
+        d.bt0 = now
+        h_log("DRIVE backswipe \{arg}")
+        tell_step(d.steps[d.at], StepMoment::Acted)
+        on_back(0, if d.bedge == 1 { c.width } else { 0.0 }, 0.0, d.bedge)
+        return
+      }
+      "type" => {
+        if h_drive(0, arg) {
+          // (into a field: what a key catcher takes, a remote screen's, is in none)
+          if c.editors.contains(c.focus) {
+            d.typed = arg
+          }
+        } else {
+          on_text(0, arg, 0, 0)
+        }
+        acted()
+        return
+      }
+      "mark" => {
+        if !h_drive(1, arg) {
+          on_text(1, arg, mbt_compat::utf16_len(arg), 0)
+        }
+        acted()
+        return
+      }
+      "enter" => {
+        if !h_drive(2, "") {
+          on_key(key_enter, 0)
+        }
+        acted()
+        return
+      }
+      "clear" => {
+        on_key(key_select_all, 0)
+        if !h_drive(5, "") {
+          on_key(key_backspace, 0)
+        }
+        acted()
+        return
+      }
+      "backspace" => {
+        if !h_drive(5, "") {
+          on_key(key_backspace, 0)
+        }
+        acted()
+        return
+      }
+      "back" => {
+        on_back(2, 0.0, 0.0, 0)
+        acted()
+        return
+      }
+      "paste" | "pasten" => {
+        let words = if cmd == "paste" {
+          arg
+        } else {
+          match mbt_compat::str_find(arg, " ") {
+            Some(i) => {
+              let n = number(mbt_compat::str_unsafe_substring(arg, start=0, end=i)).to_int()
+              let unit = mbt_compat::str_unsafe_substring(arg, start=i + 1, end=mbt_compat::utf16_len(arg))
+              let sb = StringBuilder()
+              let mut len = 0
+              while len < n && mbt_compat::utf16_len(unit) > 0 {
+                sb.write_string(unit)
+                len = len + mbt_compat::utf16_len(unit)
+              }
+              sb.to_string()
+            }
+            None => arg
+          }
+        }
+        h_clipboard_set(words)
+        if !h_drive(3, "") {
+          on_text(text_paste, words, 0, 0)
+        }
+        acted()
+        return
+      }
+      "wheel" => {
+        // (DY, then what is held with it: cmd, ctrl, alt, shift joined by +, as a key's are said)
+        let (dy, held) = match mbt_compat::str_find(arg, " ") {
+          Some(i) => (mbt_compat::str_to_owned(mbt_compat::str_exact_view(arg, end=i)), mbt_compat::str_to_owned(mbt_compat::str_exact_view(arg, start=i + 1)))
+          None => (arg, "")
+        }
+        let mut mods = 0
+        for m in held.split("+") {
+          match mbt_compat::str_to_owned(m) {
+            "cmd" => mods = mods | wheel_mod_cmd
+            "ctrl" => mods = mods | wheel_mod_ctrl
+            "alt" | "option" => mods = mods | wheel_mod_alt
+            "shift" => mods = mods | wheel_mod_shift
+            "" => ()
+            other => {
+              drive_fail(c, d, "wheel DY [cmd+ctrl+alt+shift]: \{other}")
+              return
+            }
+          }
+        }
+        let (wx, wy) = (c.width / 2.0, c.height / 2.0)
+        // (what is there as it turns, and the words nearest it followed after: wheel_said)
+        let near = tree_words_near(wx, wy)
+        let moving = c.moving_now()
+        on_wheel(wx, wy, 0.0, number(dy), mods * 16)
+        wheel_said(d, wx, wy, dy, near, moving)
+        acted()
+        return
+      }
+      "move" => {
+        let xy = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { number(mbt_compat::str_to_owned(v)) }))
+        if xy.length() < 2 {
+          drive_fail(c, d, "move X Y")
+          return
+        }
+        let x = if xy[0] < 0.0 { c.width + xy[0] } else { xy[0] }
+        let y = if xy[1] < 0.0 { c.height + xy[1] } else { xy[1] }
+        on_pointer(1, x, y, 0)
+        acted()
+        return
+      }
+      "hover" | "rightclick" | "wheelat" | "wheelxat" => {
+        let (dy, what) = if cmd == "wheelat" || cmd == "wheelxat" {
+          match mbt_compat::str_find(arg, " ") {
+            Some(i) =>
+            (number(mbt_compat::str_unsafe_substring(arg, start=0, end=i)), mbt_compat::str_unsafe_substring(arg, start=i + 1, end=mbt_compat::utf16_len(arg)))
+            None => {
+              drive_fail(c, d, cmd + " D TEXT")
+              return
+            }
+          }
+        } else {
+          (0.0, arg)
+        }
+        // (a wheel goes to the list under the words, whatever lies over them; a hover or a click is the finger's)
+        let at = if cmd == "wheelat" || cmd == "wheelxat" { on_screen(c, what) } else { reachable(c, what) }
+        if at.length() == 0 {
+          if waited > d.timeout {
+            drive_fail(c, d, not_reachable(c, what, d.timeout))
+          }
+          return
+        }
+        let (x, y) = lowest(at)
+        h_log("DRIVE \{cmd} \{what} at \{x.to_int()},\{y.to_int()}")
+        match cmd {
+          "hover" => on_pointer(1, x, y, 0)
+          "rightclick" => {
+            on_pointer(0, x, y, 2)
+            on_pointer(2, x, y, 2)
+          }
+          // (at once, as a test's replay gives the same step (src/sfreplay: Flow::wheel_at's t.wheel): a notch's ease
+          // under way when the next step presses would come out as far as the frames drawn meanwhile took it)
+          // (at once, as a test's replay gives the same step (src/sfreplay: Flow::wheel_at's t.wheel): a notch's ease
+          // under way when the next step presses would come out as far as the frames drawn meanwhile took it)
+          "wheelxat" => on_wheel(x, y, dy, 0.0, 0)
+          _ => on_wheel(x, y, 0.0, dy, 0)
+        }
+        acted()
+        return
+      }
+      "latency" => {
+        let (mode, what) = match mbt_compat::str_find(arg, " ") {
+          Some(i) => (mbt_compat::str_unsafe_substring(arg, start=0, end=i), mbt_compat::str_unsafe_substring(arg, start=i + 1, end=mbt_compat::utf16_len(arg)))
+          None => (arg, "")
+        }
+        // (where a wheel or a key goes: what is under the words, whatever lies over them)
+        let at = if what == "" {
+          [(c.width / 2.0, c.height / 2.0)]
+        } else if mbt_compat::str_has_prefix(what, "@") {
+          point_said(what)
+        } else {
+          on_screen(c, what)
+        }
+        if at.length() == 0 {
+          if waited > d.timeout {
+            drive_fail(c, d, not_reachable(c, what, d.timeout))
+          }
+          return
+        }
+        let (x, y) = lowest(at)
+        h_log("DRIVE latency \{mode} at \{x.to_int()},\{y.to_int()}")
+        if !h_drive(12, "\{mode} \{mbt_compat::double_to_string(x)} \{mbt_compat::double_to_string(y)}") {
+          drive_fail(c, d, "latency: this host measures no input latency, or not \{mode} (type, scroll, drag, anim)")
+          return
+        }
+        acted()
+        return
+      }
+      "mods" =>
+      match modifiers_named(arg) {
+        Some(mods) => {
+          h_log("DRIVE mods \{arg} (\{mods})")
+          on_key(0, mods)
+          acted()
+          return
+        }
+        Option::None => {
+          drive_fail(c, d, "mods cmd+ctrl+alt+shift, or none")
+          return
+        }
+      }
+      "key" =>
+      match key_named(arg) {
+        Some((code, mods)) => {
+          h_log("DRIVE key \{arg} (\{code} \{mods})")
+          on_key(code, mods)
+          acted()
+          return
+        }
+        Option::None => {
+          drive_fail(c, d, "no such key")
+          return
+        }
+      }
+      "system" | "viewsaid" | "appsaid" | "ime" | "clip" => {
+        // (what only some hosts take of a script: a Tester's says what its system, its native views' host and its
+        // keyboard do as it is told; a host that takes no such step says why)
+        let failed = hostapi::script_step(cmd, arg)
+        if failed != "" {
+          drive_fail(c, d, failed)
+          return
+        }
+        acted()
+        return
+      }
+      "trackpad" => {
+        // (the keyboard's trackpad: begun at the window's top left, its finger moved to DX DY from there, let go)
+        let words = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { mbt_compat::str_to_owned(v) }))
+        let u = text_float_unit
+        match words {
+          __mbt_ap_13 if (__mbt_ap_13).length() == 1 && (match __mbt_ap_13[0] { "begin" => true, _ => false }) => match __mbt_ap_13[0] { "begin" => on_text(text_float_begin, "", 0, 0), _ => panic("unreachable") }
+          __mbt_ap_14 if (__mbt_ap_14).length() == 1 && (match __mbt_ap_14[0] { "end" => true, _ => false }) => match __mbt_ap_14[0] { "end" => on_text(text_float_end, "", 0, 0), _ => panic("unreachable") }
+          __mbt_ap_15 if (__mbt_ap_15).length() == 2 && (match (__mbt_ap_15[0], __mbt_ap_15[1]) { (dx, dy) => true, _ => false }) => match (__mbt_ap_15[0], __mbt_ap_15[1]) { (dx, dy) => on_text(text_float_move, "", (number(dx) * u).to_int(), (number(dy) * u).to_int()), _ => panic("unreachable") }
+          _ => {
+            drive_fail(c, d, "trackpad begin | DX DY | end")
+            return
+          }
+        }
+        acted()
+        return
+      }
+      "resize" => {
+        let wh = mbt_compat::arr_to_array(mbt_compat::arr_map(arg.split(" "), fn(v) { number(mbt_compat::str_to_owned(v)) }))
+        if wh.length() < 2 {
+          drive_fail(c, d, "resize W H")
+          return
+        }
+        if !h_drive(8, "\{wh[0].to_int()}x\{wh[1].to_int()}") {
+          h_log("DRIVE resize: the host cannot")
+        }
+        acted()
+        return
+      }
+      "shot" =>
+      if d.shot_at < 0.0 {
+        if drive_shot(d, arg) {
+          next()
+        } else {
+          d.shot_at = now
+          return
+        }
+      } else if now >= d.shot_at + shot_taker_ms {
+        next()
+      } else {
+        return
+      }
+      // the app's state as the host says it from here on (what it said last at once): a run about the app put away
+      // the app's state as the host says it from here on (what it said last at once): a run about the app put away
+      "hosted" => {
+        d.takes_state = true
+        h_log("DRIVE ok hosted: the host's word on the app taken (\{d.said_state})")
+        app_state_taken(d.said_state)
+        next()
+      }
+      "log" => {
+        h_log("DRIVE LOG " + arg)
+        next()
+      }
+      "drop" =>
+      // files let go on the window as the host's own drop takes them (@hostapi.drive 13)
+      if h_drive(13, arg) {
+        h_log("DRIVE ok \{line} (\{waited.to_int()} ms)")
+        acted()
+      } else {
+        drive_fail(c, d, "this host lets no script drop files")
+      }
+      "picks" => {
+        // (the pickers' answers a host says as it is told: a Tester's; else its own pickers answer)
+        let failed = hostapi::script_step(cmd, arg)
+        if failed != "" {
+          h_log("DRIVE picks: " + failed)
+        }
+        next()
+      }
+      // what the frame shows squeezed (squeeze.pion), a line each
+      // what the frame shows squeezed (squeeze.pion), a line each
+      "squeeze" => {
+        for f in c.squeeze_faults() {
+          h_log("DRIVE SQUEEZE " + f)
+        }
+        next()
+      }
+      // what the frame shows breaking the corner rule (corners.pion), a line each
+      // what the frame shows breaking the corner rule (corners.pion), a line each
+      "corners" => {
+        for f in c.with_tree_nodes(fn() { c.corner_faults() }) {
+          h_log("DRIVE CORNER " + f)
+        }
+        next()
+      }
+      // what the frame shows too faint on what it lies on (contrast.pion), a line each: a frame drawn with whose each
+      // thing drawn is kept, then said
+      // what the frame shows too faint on what it lies on (contrast.pion), a line each: a frame drawn with whose each
+      // thing drawn is kept, then said
+      "contrast" =>
+      if inst_owners.on {
+        inst_owners.on = false
+        // (drawn as before from the next frame on, built whole: frame_watch.pion)
+        test_stepped()
+        for f in c.contrast_faults_drawn(contrast_mark_least) {
+          h_log("DRIVE CONTRAST " + f)
+        }
+        next()
+      } else {
+        inst_owners.on = true
+        inst_owners_clear()
+        c.owe_next()
+        return
+      }
+      "exit" => {
+        drive_end(0)
+        return
+      }
+      "ends" => {
+        // (the host ends the app, the run with it; nothing here moves on)
+        if waited > d.timeout {
+          drive_fail(c, d, "the app did not end by itself within \{d.timeout.to_int()} ms")
+        }
+        return
+      }
+      "linger" => {
+        h_log("DRIVE PASS")
+        d.steps.clear()
+        d.steps.push("wait " + arg)
+        d.steps.push("quit")
+        d.at = 0
+        d.since = -1.0
+        return
+      }
+      "quit" => {
+        driver.v = None
+        hostapi::exit(0)
+        return
+      }
+      _ => {
+        drive_fail(c, d, "no such step")
+        return
+      }
+    }
+  }
+  // the script's end, as `exit`
+  drive_end(0)
+}
+
+///|
+/// Runs `script` (as MBUI_DRIVE would) over the tester's view, a frame at each of the display's frames, until it ends
+/// (or `max` frames), `each` told after each: what it logged.
+pub fn Tester::drive(self : Tester, script : String, max? : Int, each? : (Tester) -> Unit) -> Array[String] {
+  let max = match max { Some(__mbt_v) => __mbt_v, None => 3000 }
+
+  self.drive_while(script, max=max, each=fn(t) {
+    if each is Some(f) {
+      f(t)
+    }
+    true
+  })
+}
+
+///|
+/// A driven run whose observer can stop it when its own work fails (a film's renderer or writer).
+fn Tester::drive_while(self : Tester, script : String, max~ : Int, each~ : (Tester) -> Bool) -> Array[String] {
+  self.fake.logs.clear()
+  drive_start(script, "")
+  let mut n = 0
+  while driver.v is Some(_) && n < max {
+    self.frame()
+    if !each(self) {
+      if driver.v is Some(_) {
+        drive_end(1)
+      }
+      break
+    }
+    n = n + 1
+  }
+  self.fake.logs.copy()
+}
+
+///|
+/// A size a scripted run asked of the window, for the tester's next frame (a host's window resizes itself).
+// moved to 00_init_order.pion: tester_size
+
+///|
+/// A modifier as a script names it (`key` and `mods`), with cmd following the host's command key.
+fn modifier_named(name : String) -> Option[Int] {
+  match name {
+    "cmd" => Some(if h_keys() == 0 { mod_cmd } else { mod_ctrl })
+    "ctrl" => Some(mod_ctrl)
+    "alt" | "option" => Some(mod_alt)
+    "shift" => Some(mod_shift_key)
+    "meta" => Some(mod_cmd)
+    _ => Option::None
+  }
+}
+
+///|
+fn modifiers_named(names : String) -> Option[Int] {
+  if names == "none" { return Some(0) }
+  if names == "" { return Option::None }
+  let mut mods = 0
+  for name in names.split("+") {
+    match modifier_named(mbt_compat::str_to_owned(name)) {
+      Some(bit) => mods = mods | bit
+      Option::None => return Option::None
+    }
+  }
+  Some(mods)
+}
+
+///|
+/// A key as a script names it (drive's `key`): its code and modifiers.
+fn key_named(name : String) -> Option[(Int, Int)] {
+  let parts = mbt_compat::arr_to_array(mbt_compat::arr_map(name.split("+"), fn(v) { mbt_compat::str_to_owned(v) }))
+  let mut mods = 0
+  for i in 0..<(parts.length() - 1) {
+    match modifier_named(parts[i]) {
+      Some(bit) => mods = mods | bit
+      Option::None => return Option::None
+    }
+  }
+  let last = if parts.length() > 0 { parts[parts.length() - 1] } else { "" }
+  let code = match last {
+    "esc" | "escape" => key_escape
+    "tab" => key_tab
+    "enter" | "return" => key_enter
+    "space" => key_of_char(' ')
+    "up" => key_up
+    "down" => key_down
+    "left" => key_left
+    "right" => key_right
+    "home" => key_home
+    "end" => key_end
+    "pageup" => key_page_up
+    "pagedown" => key_page_down
+    "backspace" => key_backspace
+    "delete" => key_delete
+    s if mbt_compat::utf16_len(s) == 1 => {
+      let mut code = -1
+      { let __mbt_s_2028 = s; let __mbt_sn_2028 = mbt_compat::str_byte_len(__mbt_s_2028); let mut __mbt_sp_2028 = 0; while __mbt_sp_2028 < __mbt_sn_2028 { let (__mbt_ch_2028, __mbt_spn_2028) = mbt_compat::str_cursor_step(__mbt_s_2028, __mbt_sp_2028); __mbt_sp_2028 = __mbt_spn_2028; let ch = __mbt_ch_2028;
+        code = key_of_char(ch)
+      } }
+      code
+    }
+    _ => return Option::None
+  }
+  Some((code, mods))
+}
+
+///|
+/// The core's answers ended since they were last counted, counted by their call's name ("core: NAME (call N)", a
+/// subscription's "core: KEY").
+fn Driver::count_answers(self : Driver) -> Unit {
+  let come = runtime().outside_ended_since(self.counted)
+  // (the conversation heard: each answer as it came, read by the app or not; the waits' ends are of the same answers)
+  if heard_on.v {
+    { let __mbt_mit_2045 = mbt_compat::ordered_map_iter_lazy(heard_answers); while true { match (__mbt_mit_2045.next)() { Some((name, n)) => {
+      self.answers.set(name, n)
+    }, None => break } } }
+    self.counted = self.counted + come.length()
+    return
+  }
+  for w in come {
+    if mbt_compat::str_has_prefix(w, "core: ") {
+      let rest = mbt_compat::str_unsafe_substring(w, start=6, end=mbt_compat::utf16_len(w))
+      let name = match mbt_compat::str_find(rest, " (call ") {
+        Some(i) => mbt_compat::str_unsafe_substring(rest, start=0, end=i)
+        None => rest
+      }
+      self.answers.set(name, self.answers.get(name).unwrap_or(0) + 1)
+    }
+  }
+  self.counted = self.counted + come.length()
+}
+
+///|
+/// Whether `what` (a wait on outside, as Runtime::outside_ended_since says it) is what the step `cmd` (answered,
+/// decoded, ready) names by `arg`.
+fn outside_named(cmd : String, arg : String, what : String) -> Bool {
+  match cmd {
+    // "core: NAME (call N)", a subscription's "core: KEY"
+    // "core: NAME (call N)", a subscription's "core: KEY"
+    "answered" => mbt_compat::str_has_prefix(what, "core: " + arg + " (call ") || what == "core: " + arg
+    // "image N SRC", "image N (B bytes) SRC" (bytes handed over for SRC), "image N (PDF D, page P)"
+    // "image N SRC", "image N (B bytes) SRC" (bytes handed over for SRC), "image N (PDF D, page P)"
+    "decoded" =>
+    mbt_compat::str_has_prefix(what, "image ") &&
+    (mbt_compat::str_has_suffix(what, arg) || what.contains(" " + arg) || (arg == "PDF" && what.contains("(PDF ")))
+    _ =>
+    if arg == "pdf" {
+      mbt_compat::str_has_prefix(what, "image ") && what.contains("(PDF ")
+    } else if mbt_compat::str_has_prefix(arg, "#") {
+      mbt_compat::str_has_prefix(what, "view " + mbt_compat::str_unsafe_substring(arg, start=1, end=mbt_compat::utf16_len(arg)) + " (")
+    } else if mbt_compat::utf16_len(arg) > 0 && mbt_compat::str_iter(arg).all(fn(ch) { ch >= '0' && ch <= '9' }) {
+      mbt_compat::str_has_prefix(what, "view ") && what.contains("(kind " + arg + ",")
+    } else {
+      mbt_compat::str_has_prefix(what, "view ") && mbt_compat::str_has_suffix(what, ", " + arg + ")")
+    }
+  }
+}
+
+///|
+/// What a press at (x, y) goes to, for a failure's report: the hit target there, what kind it is, where it is laid out
+/// and the first words in it (or nothing there).
+fn over_it(c : Ctx, x : Double, y : Double) -> String {
+  // (the window's tree's first: a node of it taking the press there, else, where no old view's does, the one found
+  // there first, lying over what is looked for: a scrim, a page's bar)
+  match view_app.v {
+    Some(tree) => {
+      let said = fn(what : String, id : view::NodeId) {
+        let at = "at \{x.to_int()},\{y.to_int()} \{what}"
+        match arr_search_by(tree.drawn(), fn(d) { d.id == id }) {
+          Some(k) => {
+            let d = tree.drawn()[k]
+            let words = tree_first_words(tree, id)
+            "\{at} \{d.x.to_int()},\{d.y.to_int()} \{d.w.to_int()}x\{d.h.to_int()}" +
+            (if words == "" { "" } else { " holding \"" + words + "\"" })
+          }
+          Option::None => "\{at} not drawn this frame"
+        }
+      }
+      match view_presses_at(x, y) {
+        Some(id) => return said("a tree node taking presses", id)
+        Option::None =>
+        if hit_in(c.hit_ids, c.hit_rects, x, y) == 0 && !old_root_hit(c, x, y, pressed=true) {
+          match tree.drop_at(x, y) {
+            Some(.OnNode(id)) => return said("a tree node lying over it", id)
+            Some(view::DropOn::Shut(id)) => return said("a tree node under a modal layer", id)
+            _ => ()
+          }
+        }
+      }
+    }
+    Option::None => ()
+  }
+  let top = hit_in(c.hit_ids, c.hit_rects, x, y)
+  if top == 0 {
+    return "nothing at \{x.to_int()},\{y.to_int()}"
+  }
+  let what = if drags.contains(top) { "a drag area" } else { "a box taking presses" }
+  for k in 0..<c.count {
+    let n = c.nodes[k]
+    if n.id == top {
+      let words = first_words(c, k)
+      return "at \{x.to_int()},\{y.to_int()} \{what} \{n.x.to_int()},\{n.y.to_int()} \{n.fw.to_int()}x\{n.fh.to_int()}" +
+      (if words == "" { "" } else { " holding \"" + words + "\"" })
+    }
+  }
+  "at \{x.to_int()},\{y.to_int()} \{what} not built this frame"
+}
+
+///|
+/// The first words of node `id` of the window's tree, or of what it holds as drawn in order, else what it is called
+/// (its label): "" when none.
+fn tree_first_words(tree : view::Tree, id : view::NodeId) -> String {
+  for d in tree.drawn() {
+    if tree.holds(id, d.id) {
+      let w = view_words_found(d)
+      if w != "" {
+        return w
+      }
+    }
+  }
+  tree.said_label(id)
+}
+
+///|
+/// The first words under node `i` (itself, then its children in order), "" when none.
+fn first_words(c : Ctx, i : Int) -> String {
+  let n = c.nodes[i]
+  if (n.kind == kind_text || n.kind == kind_rich) && n.text != "" {
+    return n.text
+  }
+  let mut k = n.first
+  while k >= 0 {
+    let w = first_words(c, k)
+    if w != "" {
+      return w
+    }
+    k = c.nodes[k].next
+  }
+  ""
+}
+
+///|
+/// Whether the app's conversation with its core is heard (drive_heard: it is kept, the app's MBUI_CORE_TRACE).
+// kept across runs: once heard, the conversation is kept for the whole process
+// moved to 00_init_order.pion: heard_on
+
+///|
+/// The calls the app made, by the id it gave each, as heard (drive_heard), till an answer for it came.
+// kept across runs: emptied of each as its answer comes
+// moved to 00_init_order.pion: heard_calls
+
+///|
+/// How many answers came for each call by its name since the run began, as heard (drive_heard): what `answered`
+/// counts.
+// kept across runs: emptied as a run begins (drive_start)
+// moved to 00_init_order.pion: heard_answers
+
+///|
+/// A line of the app's conversation with its core as it is kept (src/core/trace.pion's `{"out":…}`, `{"in":…}`), told
+/// to a driven run where it is kept: a call going out, and the core's answer to it (`ok` or `error`) coming in, so
+/// `answered CALL` counts the core's answers as they come, whether the app reads them or not. Only where the
+/// conversation is kept already (the app's MBUI_CORE_TRACE, a scripted run's): nothing waits on it, nothing reads more.
+pub fn drive_heard(line : String) -> Unit {
+  heard_on.v = true
+  let out = mbt_compat::str_has_prefix(line, "{\"out\":")
+  if out && !line.contains("\"call\":") {
+    return
+  }
+  if !out && !(line.contains("\"ok\":") || line.contains("\"error\":")) {
+    return
+  }
+  guard (match mbt_compat::mbt_json_parse(line) { Ok(__mbt_ok_5) => Some(__mbt_ok_5), Err(_) => None }) is Some(.Object(o)) else { return }
+  match (o.get("out"), o.get("in")) {
+    (Some(.Object(m)), _) =>
+    match (m.get("id"), m.get("call")) {
+      (Some(.Number(id, _)), Some(String(name))) => heard_calls.set(id.to_int(), name)
+      _ => ()
+    }
+    (_, Some(.Object(m))) =>
+    match m.get("id") {
+      Option::Some(.Number(id, _)) if m.contains("ok") || m.contains("error") =>
+      match heard_calls.get(id.to_int()) {
+        Some(name) => {
+          heard_calls.remove(id.to_int())
+          heard_answers.set(name, heard_answers.get(name).unwrap_or(0) + 1)
+        }
+        Option::None => ()
+      }
+      _ => ()
+    }
+    _ => ()
+  }
+}

@@ -1,161 +1,373 @@
-// Reactive high-level file picking, streaming file save, gallery reading, and app update bridge.
-// Thin reactive layer over `packages/hostapi` primitives.
-
 import "hostapi"
+import "mbt_compat"
 import "signals"
 
-/// Reactive file/photo/camera picker wrapping `hostapi::Pick`.
-pub struct FilePick {
-  raw : hostapi::Pick
-  files_sig : signals::Signal[Option[Array[hostapi::Picked]]]
+// The system's pickers and the files the app keeps on the device (as @hostapi's pick.pion and keep.pion have them), through
+// the framework. Under a Tester the system is the test's (its fake host's pk_* and kp_*, fake_host.pion): its pickers
+// give what the test said (Tester::picks) and what the app keeps is kept by the test (Tester::kept), each answer at the
+// next frame, as a host's event comes at a frame's boundary.
+
+///|
+/// An ask of the system's pickers under way (@hostapi.Pick): one of the host's, or (photos of the gallery picked
+/// together: pick_photos) one for each, answered as one once all of them are, in their order.
+pub struct Pick {
+  priv hosts : Array[hostapi::Pick]
+  priv got : Array[Option[Array[hostapi::Picked]]]
+  priv said : signals::Signal[Option[Array[hostapi::Picked]]]
 }
 
-/// Start a system file/photo/camera picker; returns `None` when unsupported by the host.
-pub fn FilePick::start(kind : hostapi::PickKind, hold~ : Bool = false) -> Option[FilePick] {
+///|
+/// Asks the system for files of `kind` (@hostapi.pick; `hold`: one too big to be read whole may be held by the host):
+/// None when this host cannot. `on_got`: given what was picked once (empty: called off), in the event that takes the
+/// answer, outside any tracking, to write state where no node waits on `Pick::files`.
+pub fn pick(kind : hostapi::PickKind, hold? : Bool, on_got? : (Array[hostapi::Picked]) -> Unit) -> Option[Pick] {
+  let hold = match hold { Some(__mbt_v) => __mbt_v, None => false }
+
   match hostapi::pick(kind, hold=hold) {
-    Some(raw) => Some(FilePick::{ raw, files_sig: signals::signal_by(None, same=fn(_a, _b) { false }) })
-    None => None
+    Some(h) => Some(Pick::waits([h], "a pick", on_got?=on_got))
+    Option::None => Option::None
   }
 }
 
-/// Read a gallery photo by `src` into a `FilePick`.
-pub fn FilePick::from_photo(src : String) -> Option[FilePick] {
-  match hostapi::pick_photo(src) {
-    Some(raw) => Some(FilePick::{ raw, files_sig: signals::signal_by(None, same=fn(_a, _b) { false }) })
-    None => None
-  }
-}
-
-/// Underlying host pick request id.
-pub fn FilePick::id(self : FilePick) -> Int {
-  self.raw.id()
-}
-
-/// Poll host completion once and publish picked files into the reactive signal.
-pub fn FilePick::poll(self : FilePick) -> Option[Array[hostapi::Picked]] {
-  match self.files_sig.untracked() {
-    Some(done) => Some(done)
-    None => match self.raw.files() {
-      Some(fs) => {
-        self.files_sig.set(Some(fs))
-        Some(fs)
-      }
-      None => None
+///|
+/// An ask of `hosts`, waited on until the system answers each (hostcall.pion's outside, by its id as the host's event
+/// names it: outside_pick), each taken as its event comes (outside_takes).
+fn Pick::waits(hosts : Array[hostapi::Pick], what : String, on_got? : (Array[hostapi::Picked]) -> Unit) -> Pick {
+  let p : Pick = Pick::{ hosts: hosts, got: mbt_compat::arr_map(hosts, fn(_) { None }), said: signals::signal(Option::None) }
+  for i, h in hosts {
+    outside_start(outside_pick, h.id(), what + " \{h.id()}")
+    if !p.take(i, on_got) {
+      outside_takes(outside_pick, h.id(), fn() { p.take(i, on_got) })
     }
   }
+  p
 }
 
-/// Reactive view of picked files (`None` until ready).
-pub fn FilePick::files(self : FilePick) -> Option[Array[hostapi::Picked]] {
-  let _ = self.poll()
-  self.files_sig.get()
+///|
+/// Photos of the gallery (`srcs`) read whole, as one pick of them in that order (@hostapi.pick_photo, each): None
+/// where the host has no gallery. `on_got`: given all of them once in `srcs`'s order, as the last is answered.
+pub fn pick_photos(srcs : Array[String], on_got? : (Array[hostapi::Picked]) -> Unit) -> Option[Pick] {
+  let hosts = []
+  for src in srcs {
+    match hostapi::pick_photo(src) {
+      Some(h) => hosts.push(h)
+      Option::None => ()
+    }
+  }
+  if hosts.is_empty() {
+    Option::None
+  } else {
+    Some(Pick::waits(hosts, "a gallery photo read", on_got?=on_got))
+  }
 }
 
-/// Reactive streaming file export/save handle wrapping `hostapi::Keep`.
-pub struct FileKeep {
-  raw : hostapi::Keep
-  kept_sig : signals::Signal[hostapi::Kept]
+///|
+/// The host's answer for `hosts[i]` taken, as its event says it came (or, a host answering by the frame, as a frame
+/// begins): what it gave kept, the ask's wait over; all of them answered, what was picked said (Pick::files) and given
+/// to `on_got`. Whether it was there to take.
+fn Pick::take(self : Pick, i : Int, on_got : Option[(Array[hostapi::Picked]) -> Unit]) -> Bool {
+  let h = self.hosts[i]
+  guard self.got[i] is Option::None && h.files() is Some(files) else { return false }
+  self.got[i] = Some(files)
+  outside_end(outside_pick, h.id(), wake=false)
+  let out = []
+  for got in self.got {
+    match got {
+      Some(files) => mbt_compat::arr_push_iter(out, mbt_compat::arr_iter(files))
+      Option::None => return true
+    }
+  }
+  self.said.set(Some(out))
+  match on_got {
+    Some(f) => signals::untracked(fn() { f(out) })
+    Option::None => ()
+  }
+  true
 }
 
-/// Begin saving a file named `name` (`mime`) via `way`.
-pub fn FileKeep::begin(name : String, mime : String, way : hostapi::KeepWay) -> Option[FileKeep] {
+///|
+/// What was picked, once the system has answered (empty: called off); None while it asks. A signal's read: what reads
+/// it (a binding, a `reacts`, an old view's build) is told as the answer comes, and reads the same however often.
+pub fn Pick::files(self : Pick) -> Option[Array[hostapi::Picked]] {
+  self.said.get()
+}
+
+///|
+/// What the system's pickers give from now on, whatever is asked (as MBUI_PICK_FILES does a host's), each ask answered
+/// at its moment, told as a host's event (after the event that asked, before the clock moves on): `files` (their names
+/// and bytes); none: the person calls the picker off.
+pub fn Tester::picks(self : Tester, files : Array[(String, Bytes)]) -> Unit {
+  self.fake.picks.clear()
+  for f in files {
+    self.fake.picks.push({ name: f.0, bytes: f.1, held: 0, size: f.1.length().to_double(), src: "" })
+  }
+}
+
+///|
+/// The system's pickers from now on answered as the test says (Tester::pick_answer), as a person takes their while,
+/// not at each ask.
+pub fn Tester::picks_by_hand(self : Tester) -> Unit {
+  self.fake.picks_by_hand = true
+}
+
+///|
+/// The person answers ask `n` (from 1, in the order asked: Tester::pick_asks) now, with what the pickers give
+/// (Tester::picks): told at this moment, as a host's event (after what is going on, before the clock moves on or an
+/// input comes).
+pub fn Tester::pick_answer(self : Tester, n : Int) -> Unit {
+  let f = self.fake
+  f.due(f.time, "a pick answered", fn() { fake_pick_said(f, n) })
+}
+
+///|
+/// What the app asked of the system's pickers, oldest first.
+pub fn Tester::pick_asks(self : Tester) -> Array[hostapi::PickKind] {
+  mbt_compat::arr_map(self.fake.pick_asks, fn(a) { a.kind })
+}
+
+///|
+/// A file being kept on the device (@hostapi.Keep).
+pub struct Keep {
+  priv host : hostapi::Keep
+}
+
+///|
+/// A file named `name` (`mime`, "" when unknown) to keep on the device, its bytes to come (@hostapi.keep_begin): None
+/// when this host keeps none.
+pub fn keep_begin(name : String, mime : String, way? : hostapi::KeepWay) -> Option[Keep] {
+  let way = match way { Some(__mbt_v) => __mbt_v, None => .Downloads }
+
   match hostapi::keep_begin(name, mime, way=way) {
-    Some(raw) => Some(FileKeep::{ raw, kept_sig: signals::signal_by(hostapi::Kept::Keeping, same=fn(_a, _b) { false }) })
-    None => None
+    Some(k) => Some(Keep::{ host: k })
+    Option::None => Option::None
   }
 }
 
-/// Append a chunk of bytes to the outgoing save stream.
-pub fn FileKeep::append(self : FileKeep, data : Bytes) -> Bool {
-  self.raw.append(data)
+///|
+/// The next of its bytes; false when they could not be written.
+pub fn Keep::append(self : Keep, data : Bytes) -> Bool {
+  self.host.append(data)
 }
 
-/// Commit all written bytes to the destination.
-pub fn FileKeep::finish(self : FileKeep) -> Unit {
-  self.raw.finish()
-  let _ = self.kept()
+///|
+/// All of it is here: the host puts it in its place.
+pub fn Keep::finish(self : Keep) -> Unit {
+  self.host.finish()
 }
 
-/// Poll and return the reactive save state.
-pub fn FileKeep::kept(self : FileKeep) -> hostapi::Kept {
-  let cur = self.raw.kept()
-  self.kept_sig.set(cur)
-  self.kept_sig.get()
+///|
+/// How it stands.
+pub fn Keep::kept(self : Keep) -> hostapi::Kept {
+  self.host.kept()
 }
 
-/// Release the underlying host save handle.
-pub fn FileKeep::end(self : FileKeep) -> Unit {
-  self.raw.end()
+///|
+/// Let go of: one not finished is called off.
+pub fn Keep::end(self : Keep) -> Unit {
+  self.host.end()
 }
 
-/// Convenience helper: save `data` in one call as `name` (`mime`) via `way`.
-pub fn keep_bytes(name : String, mime : String, data : Bytes, way : hostapi::KeepWay) -> Option[FileKeep] {
-  match FileKeep::begin(name, mime, way) {
-    Some(fk) => {
-      if fk.append(data) {
-        fk.finish()
+///|
+/// `data`, all here, kept as a file named `name` (@hostapi.keep): None when this host keeps none.
+pub fn keep(name : String, mime : String, data : Bytes, way? : hostapi::KeepWay) -> Option[Keep] {
+  let way = match way { Some(__mbt_v) => __mbt_v, None => .Downloads }
+
+  match keep_begin(name, mime, way=way) {
+    Some(k) => {
+      if k.append(data) {
+        k.finish()
       }
-      Some(fk)
+      Some(k)
     }
-    None => None
+    Option::None => Option::None
   }
 }
 
-/// Reactive photo/video gallery reader wrapping `hostapi::GalleryRead`.
+///|
+/// The files the app kept on the device (finished), oldest first: their names, kinds and bytes.
+pub fn Tester::kept(self : Tester) -> Array[(String, String, Bytes)] {
+  mbt_compat::arr_map(mbt_compat::arr_filter(self.fake.keeps, fn(k) { k.finished >= 0 }), fn(k) { (k.name, k.mime, mbt_compat::bytes_from_array(k.data)) })
+}
+
+///|
+/// The same, their names and how each was kept (where downloads go, where the person chose, the photo album).
+pub fn Tester::kept_ways(self : Tester) -> Array[(String, hostapi::KeepWay)] {
+  mbt_compat::arr_map(mbt_compat::arr_filter(self.fake.keeps, fn(k) { k.finished >= 0 }), fn(k) { (k.name, k.way) })
+}
+
+///|
+/// The device's gallery being read (@hostapi.GalleryRead), waited on until its photos are taken.
 pub struct GalleryRead {
-  raw : hostapi::GalleryRead
-  photos_sig : signals::Signal[Option[Array[hostapi::GalleryPhoto]]]
+  priv host : hostapi::GalleryRead
 }
 
-/// Begin reading the device gallery; returns `None` when no gallery is available.
-pub fn GalleryRead::start() -> Option[GalleryRead] {
+///|
+// kept across runs: counts library changes from the host
+// moved to 00_init_order.pion: gallery_changed
+
+///|
+/// How many library changes the host reported. A view can follow this signal while it shows photos.
+pub fn gallery_changes() -> Int {
+  gallery_changed.get()
+}
+
+///|
+/// How many gallery reads the host has answered, without taking their photos.
+pub fn gallery_reads_told() -> Int {
+  answers_told[outside_gallery].get()
+}
+
+///|
+/// The gallery's photos read (@hostapi.gallery_read): None where there is no gallery. A Tester's is what the test says
+/// it is (Tester::gallery), read as a host reads it, from the next frame.
+pub fn gallery_read() -> Option[GalleryRead] {
   match hostapi::gallery_read() {
-    Some(raw) => Some(GalleryRead::{ raw, photos_sig: signals::signal_by(None, same=fn(_a, _b) { false }) })
-    None => None
-  }
-}
-
-pub fn GalleryRead::id(self : GalleryRead) -> Int {
-  self.raw.id()
-}
-
-pub fn GalleryRead::poll(self : GalleryRead) -> Option[Array[hostapi::GalleryPhoto]] {
-  match self.photos_sig.untracked() {
-    Some(done) => Some(done)
-    None => match self.raw.photos() {
-      Some(ps) => {
-        self.photos_sig.set(Some(ps))
-        Some(ps)
-      }
-      None => None
+    Some(h) => {
+      outside_start(outside_gallery, h.id(), "the gallery read \{h.id()}")
+      Some(GalleryRead::{ host: h })
     }
+    Option::None => Option::None
   }
 }
 
-/// Reactive list of gallery photos once read (`None` while pending).
+///|
+/// A read of a Tester's gallery (its fake host's ga_read): its rows as a host writes them, the frame it was asked in
+/// (read from the next on), whether it was let go of.
+struct FakeGalleryRead {
+  rows : String
+  frame : Int
+  mut ended : Bool
+}
+
+///|
+/// Set the photos the app can read. `limited` restricts access to the chosen photos.
+/// `changed` sends the same library change event as the host.
+pub fn Tester::gallery(self : Tester, photos : Array[hostapi::GalleryPhoto], limited? : Bool, changed? : Bool) -> Unit {
+  let limited = match limited { Some(__mbt_v) => __mbt_v, None => false }
+  let changed = match changed { Some(__mbt_v) => __mbt_v, None => false }
+
+  self.fake.gallery = Some(photos.copy())
+  self.fake.gallery_limited = limited
+  if changed {
+    on_outside(outside_gallery, 0, 1)
+  }
+}
+
+///|
+/// A read of the fake host's gallery begun (its id, from 1; 0 none: no gallery given).
+fn FakeHost::gallery_read(self : FakeHost) -> Int {
+  match self.gallery {
+    Some(photos) => {
+      // (rows as a host writes them: id, src, added, modified, taken, video, a tab between)
+      let rows = StringBuilder()
+      for p in photos {
+        rows.write_string(
+          "\{p.id}\t\{p.src}\t\{p.added}\t\{p.modified}\t\{p.taken}\t\{if p.video { 1 } else { 0 }}\n",
+        )
+      }
+      self.gallery_reads.push(FakeGalleryRead::{ rows: rows.to_string(), frame: self.gallery_frame, ended: false })
+      self.wants = true
+      self.gallery_reads.length()
+    }
+    Option::None => 0
+  }
+}
+
+///|
+/// How read `id` goes, as a host says it: 0 reading (until the frame after it was asked), 1 read, -1 let go of or none.
+fn FakeHost::gallery_read_state(self : FakeHost, id : Int) -> Int {
+  match mbt_compat::arr_get(self.gallery_reads, id - 1) {
+    Some(r) if !r.ended => if self.gallery_frame <= r.frame { 0 } else { 1 }
+    _ => -1
+  }
+}
+
+///|
+fn FakeHost::gallery_read_rows(self : FakeHost, id : Int) -> String {
+  match mbt_compat::arr_get(self.gallery_reads, id - 1) {
+    Some(r) if !r.ended => r.rows
+    _ => ""
+  }
+}
+
+///|
+fn FakeHost::gallery_read_end(self : FakeHost, id : Int) -> Unit {
+  match mbt_compat::arr_get(self.gallery_reads, id - 1) {
+    Some(r) => r.ended = true
+    Option::None => ()
+  }
+}
+
+///|
+/// Its photos once read (empty: none, or not allowed), None while it reads; taken once (@hostapi.GalleryRead::photos).
 pub fn GalleryRead::photos(self : GalleryRead) -> Option[Array[hostapi::GalleryPhoto]] {
-  let _ = self.poll()
-  self.photos_sig.get()
+  if !answer_here(outside_gallery, self.host.id()) {
+    return Option::None
+  }
+  let got = self.host.photos()
+  if got is Some(_) {
+    answer_taken(outside_gallery, self.host.id())
+    outside_end(outside_gallery, self.host.id())
+  }
+  got
 }
 
-/// Request the host updater to fetch an update artifact.
-pub fn update_fetch(
-  url : String,
-  sha256 : String,
-  size : Double,
-  name : String,
-  now_flag~ : Bool = false,
-  delta~ : String = "",
-) -> Unit {
-  hostapi::update_fetch(url, sha256, size, name, now_flag, delta)
+///|
+/// A newer build downloaded and made ready (@hostapi.update_fetch): how it goes, `update_state`, and the host's word as
+/// it changes (hostcall.pion's outside_update). What the host says as it takes it (downloading, waiting) is read at
+/// once, not on its event a frame or more later: until then it said nothing was under way, and what shows how it goes
+/// went from nothing to a frame late (the update dialog's bar gone and back, its sheet shorter and taller
+/// again, 2026-10-28).
+/// `delta`: "" or a delta to make the build of (@hostapi.update_fetch's).
+pub fn update_fetch(url : String, sha256 : String, size : Double, name : String, now : Bool, delta : String) -> Unit {
+  hostapi::update_fetch(url, sha256, size, name, now, delta)
+  update_told.set(hostapi::update_state())
 }
 
-/// Apply a fetched update payload.
+///|
+/// The build made ready put in this app's place now (@hostapi.update_apply), as update_fetch.
 pub fn update_apply(said : String) -> Unit {
   hostapi::update_apply(said)
+  update_told.set(hostapi::update_state())
 }
 
-/// Read the current host updater state string.
-pub fn update_state() -> String {
-  hostapi::update_state()
+///|
+/// What the app asked of the host's updates under a Tester ("fetch <name> <now>", with " delta <json>" where it gave
+/// one; "apply"), in order.
+pub fn Tester::update_asked(self : Tester) -> Array[String] {
+  self.reads_own()
+  ignore(self)
+  update_asked.copy()
 }
+
+///|
+// kept across runs: a Tester's alone, emptied as one begins (update_told's put back with it)
+// moved to 00_init_order.pion: update_asked
+
+///|
+/// How an update goes (@hostapi.update_state's JSON), "" where there is none (a Tester's, a host that does not update
+/// itself, nothing told yet): as the host last told it, a signal (each change the host's event, hostcall.pion's
+/// on_outside, which sets it), so what reads it follows it, a part kept as it was drawn or a computed of it alike.
+pub fn update_state() -> String {
+  update_told.get()
+}
+
+///|
+/// The host tells how an update goes (@hostapi.update_state's JSON, `{"phase","percent","error"}`), as a host's event
+/// does (hostcall.pion's on_outside): what reads it follows it.
+pub fn Tester::tells_update(self : Tester, state : String) -> Unit {
+  ignore(self)
+  update_told.set(state)
+}
+
+///|
+/// How an update goes, said as a host would (@hostapi.update_state's JSON) where there is none to say it: a made-up
+/// run's pictures of it (the app's fixtures).
+pub fn update_told_as(state : String) -> Unit {
+  update_told.set(state)
+}
+
+///|
+/// How an update goes as the host last told it ("" before it has told anything: nothing under way).
+// kept across runs: set by the host's events (a Tester's host tells none: Tester::tells_update), put back by each Tester
+// moved to 00_init_order.pion: update_told

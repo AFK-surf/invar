@@ -1,0 +1,2141 @@
+// INVAR-EXT: Real Invar compatibility layer and downstream bridges for packages/ui.
+// Upstream UI runtime baseline commit: caa0645c917ba4038b8555f390aa77bc970256e1.
+// All functions delegate directly to upstream ui/view/hostapi state; zero silent-ignore stubs.
+//
+// Invar hooks in upstream files:
+//   - view_host.pion: view_blocks_enabled bypass, edge_after text check, droplet blur sign,
+//     view_focus_lost/view_layers_focus modal focus sync, dummy ViewBlock skip when !draws_any,
+//     s.actions forwarding in semantics_tree
+//   - app.pion: Tester-only record_frame_damage scene comparison, view_scene_last recording,
+//     in_frame_looks_hook reference paint
+//   - tester.pion: keep_glyph_atlas propagation, host_ext_outside preservation
+//   - tester_looks.pion: looks_ref_pass.v = true during reference rebuild pass (isolated from production looks_drawn)
+//   - tester_time.pion: non-converging after_frame_cbs / non_clock_requested reason in draw_owed_said
+//   - a11y.pion: s.actions forwarding and tree.drawn_of(e.id, drawn=true) alignment in a11y_tree_pass
+//   - rooms.pion: over_all_of layer check, interior-clipped target recovery, window-edge slack guard
+//   - rows_steady.pion: Tree::rows_steady_seen_safe call (overlay in packages/view/src/zz_invar_lists_seen.pion)
+//   - editor.pion / tree_field.pion: pure read-only Field::focused()
+//   - hostcall.pion / image.pion: outside_event_woke guard, single image_info poll on load, skip poll when looks_ref_pass
+//   - fake_host.pion: async: image default size/state, empty src skip
+
+import "hostapi"
+import "mbt_compat"
+import "signals"
+import "text"
+import "view"
+
+// --- Basic utility helpers ---
+
+pub fn ref_new[T](v : T) -> signals::Ref[T] {
+  signals::ref_new(v)
+}
+
+pub fn c64(hi16 : Int, lo16 : Int) -> Int64 {
+  ((hi16 & 0xFFFF).to_int64() << 16) | (lo16 & 0xFFFF).to_int64()
+}
+
+pub fn rgba(r : Int, g : Int, b : Int, a : Int) -> Int64 {
+  ((r & 0xFF).to_int64() << 24) |
+  ((g & 0xFF).to_int64() << 16) |
+  ((b & 0xFF).to_int64() << 8) |
+  (a & 0xFF).to_int64()
+}
+
+pub fn str_contains(s : String, pat : String) -> Bool {
+  s.contains(pat)
+}
+
+pub fn str_has_prefix(s : String, pre : String) -> Bool {
+  mbt_compat::str_has_prefix(s, pre)
+}
+
+pub fn array_remove_at[T](arr : Array[T], idx : Int) -> Unit {
+  if idx < 0 || idx >= arr.length() {
+    return
+  }
+  let _ = mbt_compat::arr_remove(arr, idx)
+}
+
+// --- Host / theme / motion bridges ---
+
+pub fn glass_solid() -> Bool {
+  g().glass_solid()
+}
+
+pub fn system_dark_now() -> Bool {
+  dark_said.now()
+}
+
+pub fn work_clock_now() -> Double {
+  h_now()
+}
+
+pub fn set_reduced_motion(on : Option[Bool]) -> Unit {
+  set_motion_chosen(on)
+}
+
+pub fn ease_at(self : Ease, t : Double) -> Double {
+  self.at(t)
+}
+
+pub fn clear_tree_theme() -> Unit {
+  tree_theme_of.v.set(None)
+}
+
+// --- Scroll view convenience wrappers ---
+
+pub fn scroll_box(
+  parent : view::View,
+  body : (view::View) -> Unit,
+  scroll? : view::Scroll,
+  fill~ : Bool = true,
+  bar~ : Bool = true,
+  loc~ : String = "",
+) -> view::View {
+  let _ = loc
+  let s = match scroll {
+    Some(sc) => sc
+    None => view::Scroll::new()
+  }
+  parent.box(fn(vp : view::View) {
+    let _ = if bar {
+      vp.scrolls(s, body, slop=touch_slop(), bar=tree_scroll_bar(), fill=false)
+    } else {
+      vp.scrolls(s, body, slop=touch_slop(), fill=false)
+    }
+    if fill {
+      let _ = vp.fill(loc=loc)
+    }
+  })
+}
+
+pub fn scroll_row(
+  parent : view::View,
+  body : (view::View) -> Unit,
+  scroll? : view::Scroll,
+  fill~ : Bool = true,
+  bar~ : Bool = true,
+  loc~ : String = "",
+) -> view::View {
+  let _ = loc
+  let s = match scroll {
+    Some(sc) => sc
+    None => view::Scroll::across()
+  }
+  parent.box(fn(vp : view::View) {
+    let _ = if bar {
+      vp.scrolls(s, body, slop=touch_slop(), bar=tree_scroll_bar(), fill=false)
+    } else {
+      vp.scrolls(s, body, slop=touch_slop(), fill=false)
+    }
+    if fill {
+      let _ = vp.fill(loc=loc)
+    }
+  })
+}
+
+// --- Persistent before-frame hooks (preserved across first ui::run / Tester::tree) ---
+
+let before_frame_hooks : Array[(Int, () -> Unit)] = []
+let before_frame_next_id : mbt_compat::Ref[Int] = mbt_compat::ref_new(1)
+
+pub fn on_before_frame(cb : () -> Unit) -> Int {
+  let id = before_frame_next_id.v
+  before_frame_next_id.v = id + 1
+  before_frame_hooks.push((id, cb))
+  id
+}
+
+pub fn remove_before_frame(id : Int) -> Unit {
+  let mut i = 0
+  while i < before_frame_hooks.length() {
+    if before_frame_hooks[i].0 == id {
+      let _ = mbt_compat::arr_remove(before_frame_hooks, i)
+      return
+    }
+    i += 1
+  }
+}
+
+fn run_before_frame_hooks() -> Unit {
+  if before_frame_hooks.is_empty() {
+    return
+  }
+  let snap = before_frame_hooks.copy()
+  for entry in snap {
+    (entry.1)()
+  }
+}
+
+// --- Over-scrim floor stack ---
+
+let over_scrim_stack : Array[(Int, (Double, Double) -> Option[(Double, Double)])] = []
+let over_scrim_next_id : mbt_compat::Ref[Int] = mbt_compat::ref_new(1)
+let over_scrim_token_win : Map[Int, Int] = Map::new()
+
+fn sync_over_scrim_floor() -> Unit {
+  if over_scrim_stack.is_empty() {
+    over_scrim_floor.v = fn(_) { None }
+  } else {
+    let top = over_scrim_stack[over_scrim_stack.length() - 1].1
+    over_scrim_floor.v = fn(c : Ctx) { top(c.width, c.height) }
+  }
+}
+
+pub fn push_over_scrim_floor(f : (Double, Double) -> Option[(Double, Double)]) -> Int {
+  let id = over_scrim_next_id.v
+  over_scrim_next_id.v = id + 1
+  over_scrim_stack.push((id, f))
+  over_scrim_token_win.set(id, window_now.now)
+  sync_over_scrim_floor()
+  id
+}
+
+fn remove_over_scrim_floor_here(token : Int) -> Unit {
+  let mut i = 0
+  while i < over_scrim_stack.length() {
+    if over_scrim_stack[i].0 == token {
+      let _ = mbt_compat::arr_remove(over_scrim_stack, i)
+      sync_over_scrim_floor()
+      return
+    }
+    i += 1
+  }
+}
+
+pub fn remove_over_scrim_floor(token : Int) -> Unit {
+  match over_scrim_token_win.get(token) {
+    Some(wid) => {
+      over_scrim_token_win.remove(token)
+      if wid != window_now.now {
+        in_window(wid, fn() { remove_over_scrim_floor_here(token) })
+        return
+      }
+    }
+    None => ()
+  }
+  remove_over_scrim_floor_here(token)
+}
+
+// --- Image & text measurement bridges ---
+
+pub fn image_bytes_for(key : String) -> Option[Bytes] {
+  image_data.get(key)
+}
+
+pub fn images_pending() -> Bool {
+  let it = mbt_compat::ordered_map_iter_lazy(image_cache)
+  while true {
+    match (it.next)() {
+      Some((_, list)) => {
+        for e in list {
+          if e.state == 0 {
+            return true
+          }
+        }
+      }
+      None => break
+    }
+  }
+  false
+}
+
+pub fn images_reset() -> Unit {
+  let it = mbt_compat::ordered_map_iter_lazy(image_cache)
+  while true {
+    match (it.next)() {
+      Some((_, list)) => {
+        for e in list {
+          hostapi::image_free(e.id)
+        }
+      }
+      None => break
+    }
+  }
+  image_cache.clear()
+  image_by_id.clear()
+  image_bytes.v = 0.0
+  image_data.clear()
+}
+
+pub fn glyph_atlas_epoch() -> Int {
+  hostapi::atlas_generation()
+}
+
+pub fn measure_text_width(
+  text : String,
+  size : Double,
+  weight~ : Int = 400,
+  style_bits~ : Int = 0,
+  tracking~ : Double = 0.0,
+) -> Double {
+  if text.length() == 0 {
+    return 0.0
+  }
+  let eff_style = if tracking != 0.0 { style_bits | hostapi::style_no_ligatures } else { style_bits }
+  let cap = (text.length() + 4) * 4
+  let sbuf = FixedArray::make(cap, 0.0)
+  let n = hostapi::shape(text, size, weight, eff_style, sbuf)
+  let mut total = 0.0
+  let mut k = 0
+  while k < n {
+    total = total + sbuf[k * 4 + 2] + tracking
+    k += 1
+  }
+  total
+}
+
+// --- Field bridges backed directly by EditorState ---
+
+#derive(Eq)
+pub enum EditAction {
+  Cut
+  Copy
+  Paste
+  SelectAll
+}
+
+pub fn Field::caret(self : Field) -> Int {
+  self.st.caret
+}
+
+pub fn Field::selection_range(self : Field) -> (Int, Int) {
+  self.st.sel()
+}
+
+pub fn Field::has_selection(self : Field) -> Bool {
+  self.st.anchor != self.st.caret
+}
+
+pub fn Field::set_selection(self : Field, from : Int, to : Int) -> Unit {
+  self.pick(from, to)
+}
+
+pub fn Field::insert(self : Field, ins : String) -> Unit {
+  self.st.insert(ins)
+  self.st.words_told()
+}
+
+pub fn Field::handle_key(self : Field, code : Int, mods : Int) -> Bool {
+  if code == key_of_char('v') && (mods & (mod_cmd | mod_ctrl)) != 0 {
+    match self.st.tree_node {
+      Option::Some(nid) => {
+        match clipboard_read() {
+          Some(r) => {
+            desk.pasting = Some((tree_said_id(nid), r))
+            tree_fields_pasting(h_now())
+            return true
+          }
+          Option::None => ()
+        }
+      }
+      Option::None => ()
+    }
+  }
+  let before_text = self.st.text
+  let before_caret = self.st.caret
+  let before_anchor = self.st.anchor
+  self.st.key(code, mods, h_now())
+  self.st.text != before_text || self.st.caret != before_caret || self.st.anchor != before_anchor
+}
+
+pub fn Field::is_focus_asked(self : Field) -> Bool {
+  self.st.focus_asked
+}
+
+pub fn Field::set_enter_sends(self : Field, on : Bool) -> Unit {
+  self.st.enter_sends = on
+}
+
+pub fn Field::set_text_colors(self : Field, color : Int64, placeholder : Int64, caret : Int64) -> Unit {
+  self.st.color = color
+  self.st.ph_color = placeholder
+  self.st.caret_color = caret
+}
+
+pub fn Field::text_colors(self : Field) -> (Int64, Int64, Int64) {
+  (self.st.color, self.st.ph_color, self.st.caret_color)
+}
+
+pub struct EditMenuRect {
+  pub x : Double
+  pub y : Double
+  pub w : Double
+  pub h : Double
+  pub selected : Bool
+}
+
+pub fn Field::menu_open(self : Field) -> Bool {
+  self.st.menu
+}
+
+pub fn Field::set_menu_open(self : Field, open : Bool) -> Unit {
+  self.st.menu = open
+}
+
+pub fn Field::edit_menu_rect(self : Field) -> EditMenuRect {
+  let st = self.st
+  let (a, b) = if st.anchor <= st.caret { (st.anchor, st.caret) } else { (st.caret, st.anchor) }
+  let selected = a != b
+  match st.tl {
+    Some(tl) => {
+      let (x0, line0) = tl.caret_side(a, false)
+      let (x1, line1) = tl.caret_side(b, false)
+      let rx = st.ox + (if line0 == line1 { dmin(x0, x1) } else { x0 })
+      let ry = st.oy + line0.to_double() * tl.line_h
+      let rw = if line0 == line1 { dmax(2.0, (x1 - x0).abs()) } else { dmax(2.0, dmax(x0, x1)) }
+      let rh = dmax(tl.line_h, (line1 - line0 + 1).to_double() * tl.line_h)
+      let (dx, dy, dw, dh) = st.drawn_box(rx, ry, rw, rh)
+      EditMenuRect::{ x: dx, y: dy, w: dw, h: dh, selected }
+    }
+    Option::None => EditMenuRect::{ x: st.ox, y: st.oy, w: 0.0, h: 0.0, selected }
+  }
+}
+
+pub fn Field::edit_menu_actions(self : Field) -> Array[EditAction] {
+  let bits = self.st.can()
+  let out : Array[EditAction] = []
+  if (bits & 1) != 0 {
+    out.push(EditAction::Cut)
+  }
+  if (bits & 2) != 0 {
+    out.push(EditAction::Copy)
+  }
+  if (bits & 4) != 0 {
+    out.push(EditAction::Paste)
+  }
+  if (bits & 8) != 0 {
+    out.push(EditAction::SelectAll)
+  }
+  out
+}
+
+pub fn Field::perform_edit_action(self : Field, action : EditAction) -> Unit {
+  let now = h_now()
+  let c = g()
+  let said_id = match self.st.tree_node {
+    Some(nid) => tree_said_of.get(nid).unwrap_or(0)
+    Option::None => self.st.built_id
+  }
+  if said_id != 0 && c.editors.contains(said_id) {
+    match action {
+      EditAction::Cut => {
+        c.field_edit(said_id, hostapi::text_menu_cut)
+        self.st.menu = false
+        self.st.sel_handles = false
+      }
+      EditAction::Copy => {
+        c.field_edit(said_id, hostapi::text_menu_copy)
+        self.st.anchor = self.st.caret
+        self.st.menu = false
+        self.st.sel_handles = false
+      }
+      EditAction::Paste => {
+        c.field_paste(said_id)
+        tree_fields_pasting(now)
+        if desk.pasting is Some(_) {
+          match fake.v {
+            Some(f) => {
+              desk.pasting = None
+              c.field_edit(said_id, hostapi::text_menu_paste, paste=f.clipboard)
+            }
+            Option::None => ()
+          }
+        }
+        self.st.menu = false
+        self.st.sel_handles = false
+      }
+      EditAction::SelectAll => {
+        c.field_edit(said_id, hostapi::text_menu_select_all)
+        self.st.menu = false
+      }
+    }
+    return
+  }
+  // Standalone (unmounted) Field fallback: execute directly on EditorState.
+  match action {
+    EditAction::Cut => {
+      self.st.key(key_cut, 0, now)
+      self.st.words_told()
+      self.st.menu = false
+      self.st.sel_handles = false
+    }
+    EditAction::Copy => {
+      self.st.key(key_copy, 0, now)
+      self.st.anchor = self.st.caret
+      self.st.menu = false
+      self.st.sel_handles = false
+    }
+    EditAction::Paste => {
+      match clipboard_read() {
+        Some(r) =>
+          match r.got() {
+            Some(got) if got.text != "" => {
+              self.st.text_input(text_paste, got.text, 0, 0, now)
+              self.st.words_told()
+            }
+            _ => ()
+          }
+        Option::None => ()
+      }
+      self.st.menu = false
+      self.st.sel_handles = false
+    }
+    EditAction::SelectAll => {
+      self.st.key(key_select_all, 0, now)
+      self.st.menu = false
+    }
+  }
+}
+
+// --- Scene & Tester bridges for film / bench / bench_gpu / lg ---
+
+pub struct ScenePerf {
+  pub mut frame_ms : Double
+  pub mut layout_ms : Double
+  pub mut paint_ms : Double
+  pub mut present_ms : Double
+  pub mut instances : Int
+  pub mut dirty_rects : Int
+}
+
+pub fn ScenePerf::zero(instances : Int) -> ScenePerf {
+  ScenePerf::{ frame_ms: 0.0, layout_ms: 0.0, paint_ms: 0.0, present_ms: 0.0, instances, dirty_rects: 0 }
+}
+
+pub struct Scene {
+  pub mut inst : FixedArray[Double]
+  pub mut ninst : Int
+  pub mut width : Double
+  pub mut height : Double
+  pub mut scale : Double
+  pub mut ink_x : Double
+  pub mut ink_y : Double
+  pub mut ink_r : Double
+  pub perf : ScenePerf
+}
+
+pub fn Scene::new() -> Scene {
+  Scene::{ inst: FixedArray::make(inst_size, 0.0), ninst: 0, width: 0.0, height: 0.0, scale: 1.0, ink_x: 0.0, ink_y: 0.0, ink_r: 0.0, perf: ScenePerf::zero(0) }
+}
+
+pub fn Scene::clear(self : Scene, w : Double, h : Double, scale : Double) -> Unit {
+  self.ninst = 0
+  self.width = w
+  self.height = h
+  self.scale = scale
+}
+
+pub fn Scene::ensure_inst_len(self : Scene, need : Int) -> Unit {
+  if need > self.inst.length() {
+    let mut cap = if self.inst.length() > 0 { self.inst.length() * 2 } else { inst_size * 16 }
+    while cap < need {
+      cap = cap * 2
+    }
+    let grown = FixedArray::make(cap, 0.0)
+    self.inst.blit_to(grown, len=self.inst.length())
+    self.inst = grown
+  }
+}
+
+pub fn view_scene_last() -> Scene {
+  let c = g()
+  let n = c.ninst
+  let snap = FixedArray::make(if n > 0 { n * inst_size } else { inst_size }, 0.0)
+  if n > 0 {
+    c.inst.blit_to(snap, len=n * inst_size)
+  }
+  Scene::{ inst: snap, ninst: n, width: c.width, height: c.height, scale: c.scale, ink_x: 0.0, ink_y: 0.0, ink_r: 0.0, perf: ScenePerf::zero(n) }
+}
+
+let standalone_encode : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+
+pub fn encode_tree_scene(tree : view::Tree, w : Double, h : Double, scale : Double, now : Double) -> Scene {
+  let prev_app = view_app.v
+  let prev_win = view_window.v
+  let prev_size_sig = tree_window_size_sig.v
+  let prev_standalone = standalone_encode.v
+  let prev_focus = g().focus
+  let is_same = match prev_app {
+    Some(p) => physical_equal(p, tree)
+    None => false
+  }
+  if !is_same {
+    view_drawn_by(tree)
+    view_app.v = Some(tree)
+    tree_window_size_sig.v = signals::signal((w, h), same=fn(a, b) { a.0 == b.0 && a.1 == b.1 })
+    standalone_encode.v = true
+    g().focus = 0
+    match tree.focused_now().0 {
+      Some(fnid) => {
+        g().focus = tree_said_id(fnid)
+      }
+      Option::None =>
+      match pending_focus_field.v {
+        Some(pst) =>
+        match pst.tree_node {
+          Some(fnid) =>
+          match tree_fields.get(fnid) {
+            Some(tf) if physical_equal(tf.view.tree, tree) => {
+              let _ = tree.focus_to(Some(fnid))
+              g().focus = tree_said_id(fnid)
+            }
+            _ => ()
+          }
+          Option::None => ()
+        }
+        Option::None => ()
+      }
+    }
+    paint_watch_of().touch()
+  }
+  // Poll any pending native image decodes before encoding the frame (needed when
+  // an offscreen host pumps decodes via pump_main_loop without invoking image_decoded).
+  let mut polled_ready = false
+  let img_it = mbt_compat::ordered_map_iter_lazy(image_cache)
+  while true {
+    match (img_it.next)() {
+      Some((src, list)) => {
+        for e in list {
+          if e.state == 0 {
+            image_done(src, e, now)
+            if e.state != 0 {
+              polled_ready = true
+            }
+          }
+        }
+      }
+      None => break
+    }
+  }
+  if polled_ready {
+    view_blocks.clear()
+    paint_watch_of().touch()
+  }
+  on_frame(w, h, scale, now)
+  let sc = view_scene_last()
+  if !is_same {
+    g().focus = prev_focus
+    standalone_encode.v = prev_standalone
+    view_app.v = prev_app
+    view_window.v = prev_win
+    tree_window_size_sig.v = prev_size_sig
+  }
+  sc
+}
+
+pub fn Tester::scene(self : Tester) -> Scene {
+  let (inst, ninst, _) = self.presented()
+  let snap = FixedArray::make(if ninst > 0 { ninst * inst_size } else { inst_size }, 0.0)
+  if ninst > 0 {
+    inst.blit_to(snap, len=ninst * inst_size)
+  }
+  Scene::{ inst: snap, ninst, width: self.w, height: self.h, scale: self.fake.scale, ink_x: 0.0, ink_y: 0.0, ink_r: 0.0, perf: ScenePerf::zero(ninst) }
+}
+
+pub fn Tester::frame_requested(self : Tester) -> Bool {
+  self.fake.wants
+}
+
+pub fn Tester::set_frame_requested(self : Tester, on : Bool) -> Unit {
+  self.fake.wants = on
+}
+
+pub fn Tester::set_time(self : Tester, ms : Double) -> Unit {
+  self.fake.time = ms
+}
+
+pub fn Tester::drawn_by_name(self : Tester, name : String, role? : view::Role) -> Option[view::Drawn] {
+  let _ = self
+  match view_tree() {
+    Some(tr) => {
+      for d in tr.drawn() {
+        let lbl = tr.said_label(d.id)
+        let ok_name = lbl == name || d.words == name
+        if ok_name {
+          match role {
+            Some(r) =>
+              match tr.said_of(d.id) {
+                Some(s) if s.role == r => return Some(d)
+                _ => ()
+              }
+            None => return Some(d)
+          }
+        }
+      }
+      None
+    }
+    None => None
+  }
+}
+
+pub fn Tester::tap_by_name(self : Tester, name : String) -> Unit {
+  match self.drawn_by_name(name) {
+    Some(d) => self.tap(d.x + d.w * 0.5, d.y + d.h * 0.5)
+    None => self.tap_text(name)
+  }
+}
+
+pub fn Tester::assert_rooms(self : Tester, label~ : String = "") -> Unit {
+  let faults = self.room_faults()
+  if faults.length() > 0 {
+    let mut msg = if label.length() > 0 {
+      "room_faults failed in \{label} (\{faults.length()} fault(s)):"
+    } else {
+      "room_faults failed (\{faults.length()} fault(s)):"
+    }
+    for f in faults {
+      msg = "\{msg}\n  - \{f}"
+    }
+    debug_assert(false, msg)
+  }
+}
+
+/// Compares the accessibility mirror received by the host against the current
+/// semantics tree (`g().a11y_lines()`). Note: `Tester::hold_a11y_whole` also
+/// enforces this invariant automatically after every frame when a11y is active.
+pub fn Tester::a11y_faults(self : Tester) -> Array[String] {
+  if !self.fake.a11y {
+    return []
+  }
+  let has = self.fake.a11y_told.lines()
+  let whole = g().a11y_lines()
+  if has == whole {
+    []
+  } else {
+    ["a11y mirror mismatch:\n--- told\n\{has}--- read out\n\{whole}"]
+  }
+}
+
+pub fn image_cache_count() -> Int {
+  let mut n = image_data.length()
+  let it = mbt_compat::ordered_map_iter_lazy(image_cache)
+  while true {
+    match (it.next)() {
+      Some((_, list)) => n = n + list.length()
+      None => break
+    }
+  }
+  n
+}
+
+let glass_frost_said : mbt_compat::Ref[signals::Signal[Double]] = mbt_compat::ref_new(signals::signal(0.0, same=fn(a, b) { a == b }))
+
+pub fn set_glass_frost(frost : Double) -> Unit {
+  let v = if frost != frost || frost <= 0.0 {
+    0.0
+  } else if frost >= 1.0 {
+    1.0
+  } else {
+    frost
+  }
+  if (glass_frost_said.v.untracked() - v).abs() > 1.0e-9 {
+    glass_frost_said.v.set(v)
+    hostapi::request_frame()
+  }
+}
+
+pub fn glass_frost() -> Double {
+  glass_frost_said.v.get()
+}
+
+let view_cull_enabled : mbt_compat::Ref[Bool] = mbt_compat::ref_new(true)
+
+pub fn set_view_cull_enabled(on : Bool) -> Unit {
+  view_cull_enabled.v = on
+}
+
+pub fn reset_glyph_atlas() -> Unit {
+  paint_glyph_reset()
+  glyphs_lost.v = true
+  glyph_moves.v += 1
+  text_cache.glyphs.clear()
+  text_cache.fonts.clear()
+  text_cache.last_font = Option::None
+  text_cache.seg_fonts.clear()
+  text_cache.seg_last_font_0 = Option::None
+  text_cache.seg_last_font_1 = Option::None
+  text_cache.metrics.clear()
+  text_cache.fresh.clear()
+  glyphs_laid.clear()
+  glyphs_ahead_laid_keys.clear()
+  glyphs_ahead_laid_bases.clear()
+  view_blocks.clear()
+  ride_kept.clear()
+  words_forgotten()
+  outside_came()
+  let sz = h_atlas_size(false)
+  if sz > 0 {
+    text_cache.atlas = Some(hostapi::Atlas::new(sz))
+  } else {
+    match text_cache.atlas {
+      Some(a) => a.clear()
+      Option::None => ()
+    }
+  }
+  let csz = h_atlas_size(true)
+  if csz > 0 {
+    text_cache.colour_atlas = Some(hostapi::Atlas::new(csz))
+  } else {
+    match text_cache.colour_atlas {
+      Some(a) => a.clear()
+      Option::None => ()
+    }
+  }
+  text_cache.fresh.clear()
+  glyphs_laid.clear()
+  glyphs_ahead_laid_keys.clear()
+  glyphs_ahead_laid_bases.clear()
+  view_blocks.clear()
+  ride_kept.clear()
+  view_due.v.set(view_due.v.untracked() + 1)
+}
+
+pub fn clear_text_cache() -> Unit {
+  clear_shapes()
+  text_cache.fonts.clear()
+  text_cache.last_font = Option::None
+  text_cache.shaped = 0
+  text_cache.seg_fonts.clear()
+  text_cache.seg_last_font_0 = Option::None
+  text_cache.seg_last_font_1 = Option::None
+  text_cache.seg_shaped = 0
+  text_cache.metrics.clear()
+  rich_kept.clear()
+  paint_glyph_reset()
+}
+
+pub fn view_paint_work_now() -> ViewPaintWork {
+  view_painted()
+}
+
+pub fn view_paint_work_reset() -> Unit {
+  view_paint_work.made = 0
+  view_paint_work.copied = 0
+  view_paint_work.handed = 0
+}
+
+pub fn Scene::emit_quad_bezier(
+  self : Scene,
+  x0 : Double,
+  y0 : Double,
+  cx : Double,
+  cy : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Unit {
+  if width <= 0.0 || (color & 0xFFL) == 0L || alpha <= 0.0 {
+    return
+  }
+  let mut min_x = if x0 < x1 { x0 } else { x1 }
+  let mut max_x = if x0 > x1 { x0 } else { x1 }
+  let dx = x0 - 2.0 * cx + x1
+  if dx.abs() > 1.0e-9 {
+    let tx = (x0 - cx) / dx
+    if tx > 0.0 && tx < 1.0 {
+      let mt = 1.0 - tx
+      let qx = mt * mt * x0 + 2.0 * mt * tx * cx + tx * tx * x1
+      if qx < min_x { min_x = qx }
+      if qx > max_x { max_x = qx }
+    }
+  }
+  let mut min_y = if y0 < y1 { y0 } else { y1 }
+  let mut max_y = if y0 > y1 { y0 } else { y1 }
+  let dy = y0 - 2.0 * cy + y1
+  if dy.abs() > 1.0e-9 {
+    let ty = (y0 - cy) / dy
+    if ty > 0.0 && ty < 1.0 {
+      let mt = 1.0 - ty
+      let qy = mt * mt * y0 + 2.0 * mt * ty * cy + ty * ty * y1
+      if qy < min_y { min_y = qy }
+      if qy > max_y { max_y = qy }
+    }
+  }
+  let hw = width * 0.5
+  let pad = hw + 1.5
+  let bx = min_x - pad
+  let by = min_y - pad
+  let bw = max_x - min_x + 2.0 * pad
+  let bh = max_y - min_y + 2.0 * pad
+  let idx = self.ninst
+  let db = idx * inst_size
+  if db + inst_size > self.inst.length() {
+    let mut next_cap = if self.inst.length() > 0 { self.inst.length() * 2 } else { inst_size * 16 }
+    while next_cap < db + inst_size {
+      next_cap = next_cap * 2
+    }
+    let grown = FixedArray::make(next_cap, 0.0)
+    self.inst.blit_to(grown, len=self.inst.length())
+    self.inst = grown
+  }
+  let inst = self.inst
+  let r = ((color >> 24) & 0xFFL).to_double() / 255.0
+  let g_ch = ((color >> 16) & 0xFFL).to_double() / 255.0
+  let b_ch = ((color >> 8) & 0xFFL).to_double() / 255.0
+  let a_clamped = if alpha < 0.0 { 0.0 } else if alpha > 1.0 { 1.0 } else { alpha }
+  let a = ((color & 0xFFL).to_double() / 255.0) * a_clamped
+  inst[db] = bx
+  inst[db + 1] = by
+  inst[db + 2] = bw
+  inst[db + 3] = bh
+  inst[db + 4] = hw
+  inst[db + 5] = 10.0
+  inst[db + 6] = 1.0
+  inst[db + 7] = 0.0
+  inst[db + 8] = r
+  inst[db + 9] = g_ch
+  inst[db + 10] = b_ch
+  inst[db + 11] = a
+  inst[db + 12] = (x0 - bx) / bw
+  inst[db + 13] = (y0 - by) / bh
+  inst[db + 14] = (x1 - bx) / bw
+  inst[db + 15] = (y1 - by) / bh
+  inst[db + 16] = clip_x
+  inst[db + 17] = clip_y
+  inst[db + 18] = clip_x1
+  inst[db + 19] = clip_y1
+  inst[db + 36] = (cx - bx) / bw
+  inst[db + 37] = (cy - by) / bh
+  inst[db + 38] = 0.0
+  inst[db + 39] = 0.0
+  if self.ink_r > 0.0 {
+    inst[db + 21] = self.ink_x
+    inst[db + 22] = self.ink_y
+    inst[db + 23] = self.ink_r
+  }
+  self.ninst = idx + 1
+}
+
+pub fn Tester::width(self : Tester) -> Double {
+  self.w
+}
+
+pub fn Tester::height(self : Tester) -> Double {
+  self.h
+}
+
+pub fn Tester::period_ms(self : Tester) -> Double {
+  self.period
+}
+
+pub fn Tester::set_period_ms(self : Tester, ms : Double) -> Unit {
+  self.period = ms
+}
+
+pub fn Tester::fps(self : Tester) -> Double {
+  if self.period > 0.0 { 1000.0 / self.period } else { 60.0 }
+}
+
+pub fn Tester::set_fps(self : Tester, rate : Double) -> Unit {
+  if rate > 0.0 {
+    self.period = 1000.0 / rate
+  }
+}
+
+let touch_saved_pointing : mbt_compat::Ref[Option[Option[Pointing]]] = mbt_compat::ref_new(Option::None)
+
+pub fn Tester::dispose(self : Tester, keep_glyph_atlas~ : Bool = false) -> Unit {
+  match touch_saved_pointing.v {
+    Option::Some(prev) => {
+      touch_saved_pointing.v = Option::None
+      set_pointing(prev)
+    }
+    Option::None => ()
+  }
+  image_data.clear()
+  press_rules.v = PressRules::{ finger: 44.0, mouse: 36.0, large_from: Option::None }
+  if !keep_glyph_atlas {
+    reset_glyph_atlas()
+  }
+  let restore = match host_outside.v {
+    Some(h) => h
+    Option::None => hostapi::host()
+  }
+  self.end_run(restore)
+  match host_ext_outside.v {
+    Some(ext) => {
+      host_ext_outside.v = Option::None
+      hostapi::set_host_ext(ext)
+    }
+    Option::None => ()
+  }
+}
+
+pub fn Tester::drawn(self : Tester) -> Array[view::Drawn] {
+  let _ = self
+  match view_tree() {
+    Some(tr) => tr.drawn()
+    None => []
+  }
+}
+
+pub fn Tester::scroll_faults(self : Tester) -> Array[String] {
+  let _ = self
+  match view_tree() {
+    Some(tr) => tr.scroll_faults()
+    None => []
+  }
+}
+
+pub fn Tester::assert_scrollable(self : Tester, label~ : String = "") -> Unit {
+  let faults = self.scroll_faults()
+  if faults.length() > 0 {
+    let mut msg = if label.length() > 0 {
+      "scroll_faults failed in \{label} (\{faults.length()} fault(s)):"
+    } else {
+      "scroll_faults failed (\{faults.length()} fault(s)):"
+    }
+    for f in faults {
+      msg = "\{msg}\n  - \{f}"
+    }
+    debug_assert(false, msg)
+  }
+}
+
+pub fn check_fps_matrix(
+  rates~ : Array[Double] = [60.0, 120.0, 24.0, 7.0],
+  probe : (Double) -> String,
+) -> Array[String] {
+  let diffs : Array[String] = []
+  if rates.length() == 0 {
+    return diffs
+  }
+  let base_rate = rates[0]
+  let base_out = probe(base_rate)
+  let mut i = 1
+  while i < rates.length() {
+    let r = rates[i]
+    let out = probe(r)
+    if out != base_out {
+      diffs.push("fps \{r} != \{base_rate}: got '\{out}', expected '\{base_out}'")
+    }
+    i += 1
+  }
+  diffs
+}
+
+pub struct FrameOutbox[T] {
+  buf : Mutex[Array[T]]
+  meta : Mutex[Array[Int]]
+  wake : Option[() -> Unit]
+}
+
+pub fn FrameOutbox::new[T](wake? : () -> Unit) -> FrameOutbox[T] {
+  let empty : Array[T] = []
+  let meta_init : Array[Int] = [0, 0, 0]
+  FrameOutbox::{
+    buf: Mutex::new(empty),
+    meta: Mutex::new(meta_init),
+    wake,
+  }
+}
+
+fn FrameOutbox::ask[T](self : FrameOutbox[T]) -> Unit {
+  let mut should_wake = false
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    if m[0] == 0 {
+      m[0] = 1
+      m[1] = m[1] + 1
+      should_wake = true
+    }
+  })
+  if should_wake {
+    match self.wake {
+      Some(w) => w()
+      None => hostapi::wake_now()
+    }
+  }
+}
+
+pub fn FrameOutbox::tell[T](self : FrameOutbox[T], change : T) -> Unit {
+  self.buf.with_lock(fn(q : Array[T]) -> Unit {
+    q.push(change)
+  })
+  self.ask()
+}
+
+pub fn FrameOutbox::take[T](self : FrameOutbox[T], most? : Int) -> Array[T] {
+  let out : Array[T] = []
+  let mut has_more = false
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    m[0] = 0
+    m[2] = m[2] + 1
+  })
+  self.buf.with_lock(fn(q : Array[T]) -> Unit {
+    let n = q.length()
+    let limit = match most {
+      Some(m) => {
+        let clamped = if m < 0 { 0 } else { m }
+        if clamped < n { clamped } else { n }
+      }
+      None => n
+    }
+    let mut i = 0
+    while i < limit {
+      out.push(q[i])
+      i += 1
+    }
+    if limit < n {
+      let rest : Array[T] = []
+      let mut j = limit
+      while j < n {
+        rest.push(q[j])
+        j += 1
+      }
+      q.clear()
+      for item in rest {
+        q.push(item)
+      }
+      has_more = true
+    } else {
+      q.clear()
+    }
+  })
+  if has_more {
+    self.ask()
+  }
+  out
+}
+
+pub fn FrameOutbox::bind[T](self : FrameOutbox[T], apply : (Array[T]) -> Unit, most? : Int) -> Unit {
+  let _ = on_before_frame(fn() -> Unit {
+    let batch = match most {
+      Some(m) => self.take(most=m)
+      None => self.take()
+    }
+    if batch.length() > 0 {
+      apply(batch)
+    }
+  })
+}
+
+pub fn FrameOutbox::waiting[T](self : FrameOutbox[T]) -> Int {
+  let mut n = 0
+  self.buf.with_lock(fn(q : Array[T]) -> Unit {
+    n = q.length()
+  })
+  n
+}
+
+pub fn FrameOutbox::wakes[T](self : FrameOutbox[T]) -> Int {
+  let mut w = 0
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    w = m[1]
+  })
+  w
+}
+
+pub fn FrameOutbox::takes[T](self : FrameOutbox[T]) -> Int {
+  let mut t = 0
+  self.meta.with_lock(fn(m : Array[Int]) -> Unit {
+    t = m[2]
+  })
+  t
+}
+
+// --- Additional Invar test & runtime compat bridges ---
+
+pub fn host_words_measure(words : String, look : view::WordsLook, width : Double, scale : Double) -> (Double, Double) {
+  let tl = layout_words(view_words_set(words, look, false), view_sp(scale, look.size), look.weight, if width < 0.0 { 1.0e9 } else { width }, look.wrap, balance=look.balance, line=view_line(scale, look), spacing=view_spacing(scale, look), style=view_words_style(look=look), max_lines=look.max_lines)
+  (tl.w, tl.h)
+}
+
+pub fn host_runs_measure(runs : Array[text::Run], look : view::WordsLook, set : view::RunsLook, width : Double, scale : Double) -> (Double, Double) {
+  view_runs_measure(runs, look, set, width, scale)
+}
+
+pub fn host_runs_least_measure(runs : Array[text::Run], look : view::WordsLook, set : view::RunsLook, scale : Double) -> Double {
+  view_runs_least(runs, look, set, scale)
+}
+
+pub fn set_system_bars(top : Double, bottom : Double, left : Double, right : Double) -> Unit {
+  system_bars_now.set(SystemBars::{ top, bottom, left, right })
+  match view_app.v {
+    Some(tree) => tree.clear_of(top, right, bottom, left)
+    Option::None => ()
+  }
+}
+
+pub fn window_closed_by_host(wid : Int) -> Unit {
+  window_closed_heard(wid)
+}
+
+pub fn field_display_or_hint(id : view::NodeId) -> Option[String] {
+  match tree_fields.get(id) {
+    Some(tf) => {
+      let st = tf.st
+      if st.text.length() > 0 || st.marked.length() > 0 {
+        if st.secret {
+          Some(st.display_text())
+        } else {
+          Some(st.text + st.marked)
+        }
+      } else {
+        let primary = (tf.hint)()
+        if !tf.shorter.is_empty() {
+          match tf.view.tree.drawn_of(id) {
+            Some(d) if d.w > 0.0 => {
+              let fb = g().tree_field_box(id, tf, d.x, d.y, d.w, d.h)
+              let lay = fb.hint_lay()
+              let room = fb.w - fb.pad_l - fb.pad_r + 0.5
+              if lay(primary).w <= room {
+                return Some(primary)
+              }
+              let mut picked = primary
+              for cand in tf.shorter {
+                picked = cand
+                if lay(cand).w <= room {
+                  return Some(cand)
+                }
+              }
+              return Some(picked)
+            }
+            _ => ()
+          }
+        }
+        Some(primary)
+      }
+    }
+    Option::None => Option::None
+  }
+}
+
+pub fn FakeHost::new(width~ : Double = 800.0, height~ : Double = 600.0, scale~ : Double = 1.0) -> FakeHost {
+  let _ = (width, height)
+  FakeHost::{
+    time: 0.0,
+    late: 0.0,
+    late_after: -1.0,
+    late_frame: -1,
+    present_ms: 0.0,
+    glyph_ms: 0.0,
+    wall: tester_wall,
+    scale: scale,
+    wants: false,
+    frames_on: 0,
+    drawn: false,
+    paced: 0.0,
+    wake: -1.0,
+    instances: 0,
+    ime_active: false,
+    ime_text: "",
+    ime_sel: (0, 0),
+    ime_told: 0,
+    text_menu: (false, 0.0, 0.0, 0.0, 0.0, 0),
+    text_menu_own: "",
+    edit_can: -1,
+    ime_rect: (0.0, 0.0, 0.0, 0.0),
+    clipboard: "",
+    badge: 0,
+    auto_launch: false,
+    hotkeys: mbt_compat::ordered_map_new(),
+    app_said: mbt_compat::ordered_map_new(),
+    app_told: [],
+    local_fonts: "",
+    local_fonts_info: "",
+    face_ligatures: mbt_compat::ordered_map_new(),
+    host_autospace: true,
+    families_given: mbt_compat::ordered_map_new(),
+    unreadable_fonts: [],
+    mods: 0,
+    clipboard_secret: -1.0,
+    clipboard_image: -1,
+    clipboard_html: "",
+    back_on: false,
+    wheel_kept: false,
+    window_shows: 0,
+    platform: 0,
+    keys: 0,
+    pointing: platform_pointing(0),
+    event_finger: -1,
+    event_at: -1.0,
+    native: platform_pointing(0),
+    keyboard: platform_keyboard(0),
+    reduce_transparency: false,
+    increase_contrast: false,
+    thermal_throttled: false,
+    reduce_motion: false,
+    display_hz: 0.0,
+    logs: [],
+    image_sizes: mbt_compat::ordered_map_new(),
+    image_loads: [],
+    image_srcs: mbt_compat::ordered_map_new(),
+    images: mbt_compat::ordered_map_new(),
+    fail_images: mbt_compat::ordered_map_new(),
+    image_ids: 0,
+    decode_after: mbt_compat::ordered_map_new(),
+    decode_due: mbt_compat::ordered_map_new(),
+    image_bytes: mbt_compat::ordered_map_new(),
+    image_bytes_now: 0,
+    image_bytes_most: 0,
+    made_at: "",
+    bold: 0.0,
+    ui_face: 0.0,
+    generation: 0,
+    generation_asks: 0,
+    generation_on_face_add: mbt_compat::ref_new(false),
+    tabular: 0.0,
+    cjk_marks: false,
+    words_spaced: hostapi::words_spaced_none,
+    glyph_box: (6.0, 10.0),
+    faces_wider: mbt_compat::ordered_map_new(),
+    latin: Option::None,
+    views: [],
+    view_ids: 0,
+    view_ready: mbt_compat::ordered_map_new(),
+    view_reads: 0,
+    auto_finish: false,
+    finished: [],
+    site: [],
+    cursor: 0,
+    cursors_told: 0,
+    window_drags: 0,
+    window_acts: [],
+    zoomed: false,
+    snap: (0.0, 0.0, 0.0, 0.0),
+    snap_state: 0,
+    window_opens: false,
+    windows_opened: [],
+    windows_closed: [],
+    windows_fronted: [],
+    windows_in_process: false,
+    window_ids: 0,
+    window_at: 0,
+    window_sizes: mbt_compat::ordered_map_new(),
+    window_insets: mbt_compat::ordered_map_new(),
+    window_zooms: mbt_compat::ordered_map_new(),
+    window_snaps: mbt_compat::ordered_map_new(),
+    window_acts_by: mbt_compat::ordered_map_new(),
+    window_ids_fronted: [],
+    window_ids_closed: [],
+    opened: [],
+    dark: false,
+    inset: false,
+    full: false,
+    buttons_down: (0.0, 0.0),
+    window_corner: 0.0,
+    window_corners: Option::None,
+    font_scale: 1.0,
+    utc_offset: 0,
+    nav_able: false,
+    nav_said: "",
+    a11y: false,
+    screen_reader: false,
+    a11y_said: "",
+    a11y_told: A11yMirror::new(),
+    a11y_held: 0,
+    env: mbt_compat::ordered_map_new(),
+    app_version: 0,
+    notices: [],
+    notice_opened: "",
+    installs: [],
+    hold_words: Option::None,
+    overs_done: [],
+    notice_perm: "granted",
+    notice_reply: Some(true),
+    notice_asks: 0,
+    notice_settings: 0,
+    notice_due: Option::None,
+    pdfs: mbt_compat::ordered_map_new(),
+    picks: [],
+    pick_asks: [],
+    keeps: [],
+    gallery: Option::None,
+    gallery_limited: false,
+    gallery_frame: 0,
+    gallery_reads: [],
+    reads: [],
+    read_ids: 0,
+    read_answers: [],
+    read_from: mbt_compat::ordered_map_new_pair(),
+    players: mbt_compat::ordered_map_new(),
+    share: Option::None,
+    share_files: [],
+    marks: [],
+    marks_out: [],
+    marks_next: Option::None,
+    marks_by_hand: false,
+    picks_by_hand: false,
+    rows_on_pixels: false,
+    groups: true,
+    keeps_sources: false,
+    shares: [],
+    perf: -1,
+    perf_sets: [],
+    perf_lines: [],
+    perf_opens: false,
+    perf_opened: 0,
+    reveals: false,
+    revealed: [],
+    perf_bytes: 0.0,
+    view_texts: mbt_compat::ordered_map_new_pair(),
+    view_stills: mbt_compat::ordered_map_new(),
+    view_infos: mbt_compat::ordered_map_new(),
+    site_states: mbt_compat::ordered_map_new(),
+    site_bodies: mbt_compat::ordered_map_new_pair(),
+    site_of: mbt_compat::ordered_map_new(),
+    view_kinds: mbt_compat::ordered_map_new(),
+    view_at: mbt_compat::ordered_map_new(),
+    view_touch: mbt_compat::ordered_map_new(),
+    view_covers: mbt_compat::ordered_map_new(),
+    touch_view: 0,
+    touch_down: (0.0, 0.0),
+    touch_at: (0.0, 0.0),
+    touch_sideways: false,
+    scripts_waiting: mbt_compat::ordered_map_new(),
+    scripts_run: mbt_compat::ordered_map_new(),
+    page_there: mbt_compat::ordered_map_new(),
+    scripts_sent: [],
+    h264: false,
+    audio_here: false,
+    h265_here: false,
+    av1_here: false,
+    stream_feeds: false,
+    stream_layers: false,
+    stream_layers_srgb: false,
+    stream_ids: 0,
+    streams_fed: mbt_compat::ordered_map_new(),
+    stream_said: mbt_compat::ordered_map_new(),
+    stream_hides: true,
+    stream_audio_clock: mbt_compat::ordered_map_new(),
+    stream_audio_wanted: mbt_compat::ordered_map_new(),
+    dev: FakeDevice::new(false),
+    pixels_of_src: mbt_compat::ordered_map_new(),
+    pixels_of: mbt_compat::ordered_map_new(),
+    live: Option::None,
+    live_images: mbt_compat::ordered_map_new(),
+    shots: [],
+    shot_sizes: [],
+    shot_drawn: [],
+    lifecycle_log: [],
+    shape_log: [],
+    glyphs_put: 0,
+    ime_trace: [],
+    ime_kind: 0,
+    back_on_by_wid: Map::new(),
+    cursor_id: 0,
+    non_clock_requested: false,
+    last_shape_style: 0,
+    back_enabled_calls: 0,
+    wake_count: 0,
+    opened_urls: [],
+    open_view_ids: [],
+    open_stream_ids: [],
+    open_term_ids: [],
+  }
+}
+
+pub fn FakeHost::install(self : FakeHost) -> hostapi::Host {
+  let prev = hostapi::host()
+  hostapi::set_host(self.as_host())
+  let ext = hostapi::HostExt::noop()
+  ext.wake_now = fn() { self.wants = true }
+  hostapi::set_host_ext(ext)
+  prev
+}
+
+let view_blocks_enabled : mbt_compat::Ref[Bool] = mbt_compat::ref_new(true)
+
+pub fn set_view_blocks_enabled(on : Bool) -> Unit {
+  view_blocks_enabled.v = on
+  if !on {
+    view_blocks.clear()
+  }
+}
+
+pub enum DamageReport {
+  Full
+  None
+  Rects(Array[(Double, Double, Double, Double)])
+}
+
+let in_frame_looks_hook : mbt_compat::Ref[Option[(Scene, Scene, DamageReport, Double, Double, Double, Double, Double, Double) -> Unit]] = mbt_compat::ref_new(Option::None)
+let damage_report_poison : mbt_compat::Ref[Option[DamageReport]] = mbt_compat::ref_new(Option::None)
+let view_block_poison : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let looks_ref_pass : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let underlay_painter_hook : mbt_compat::Ref[Option[(Scene, Double, Double, Double, Double) -> Unit]] = mbt_compat::ref_new(Option::None)
+
+pub fn set_in_frame_looks_hook(f : Option[(Scene, Scene, DamageReport, Double, Double, Double, Double, Double, Double) -> Unit]) -> Unit {
+  in_frame_looks_hook.v = f
+}
+
+pub fn set_damage_report_poison(p : Option[DamageReport]) -> Unit {
+  damage_report_poison.v = p
+}
+
+pub fn set_view_block_poison(on : Bool) -> Unit {
+  view_block_poison.v = on
+}
+
+pub fn set_underlay_painter(f : Option[(Scene, Double, Double, Double, Double) -> Unit]) -> Unit {
+  underlay_painter_hook.v = f
+}
+
+fn node_is(a : Option[view::NodeId], b : view::NodeId) -> Bool {
+  match a {
+    Some(x) => x == b
+    Option::None => false
+  }
+}
+
+fn same_focus(a : Option[view::NodeId], b : Option[view::NodeId]) -> Bool {
+  match b {
+    Some(x) => node_is(a, x)
+    Option::None => a is Option::None
+  }
+}
+
+let pending_focus_field : mbt_compat::Ref[Option[EditorState]] = mbt_compat::ref_new(Option::None)
+
+pub fn view_text(kind : Int, s : String, a~ : Int = 0, b~ : Int = 0) -> Unit {
+  match pending_focus_field.v {
+    Some(st) => {
+      if kind == 2 {
+        st.marked = ""
+        st.msel_a = 0
+        st.retell = true
+        st.words_told()
+        return
+      }
+      st.text_input(kind, s, a, b, h_now())
+      return
+    }
+    Option::None => ()
+  }
+  sync_ctx_focus_from_tree()
+  if kind == 2 {
+    let c = g()
+    match view_key_editor(c, c.focus).0 {
+      Some(st) => {
+        st.marked = ""
+        st.msel_a = 0
+        st.retell = true
+        st.words_told()
+        c.sync_ime()
+        h_frame_owed()
+        return
+      }
+      Option::None => ()
+    }
+  }
+  on_text_now(kind, s, a, b)
+}
+
+pub fn view_host_pointer(host_kind : Int, x : Double, y : Double, btn : Int, now : Double) -> Unit {
+  match fake.v {
+    Some(f) => {
+      let prev = f.event_at
+      let ev_t = if f.time >= 1000.0 && now < 1000.0 { f.time + now } else { now }
+      f.event_at = ev_t
+      on_pointer(host_kind, x, y, btn)
+      f.event_at = prev
+    }
+    Option::None => on_pointer(host_kind, x, y, btn)
+  }
+}
+
+pub fn view_outside_event(kind : Int, id : Int, st : Int) -> Unit {
+  on_outside(kind, id, st)
+}
+
+pub fn Tester::back_gesture_step(self : Tester, phase : Int, x : Double, progress : Double, edge : Int) -> Unit {
+  on_back(phase, x, progress, edge)
+  self.draw()
+}
+
+pub fn shape_line_cached(text : String, size : Double, weight : Int, style : Int) -> Shaped {
+  shape(text, size, weight, style=style)
+}
+
+pub fn back_progress_now() -> Double {
+  back_progress.v
+}
+
+pub fn view_back(kind : Int, x : Double, progress : Double, edge : Int) -> Unit {
+  on_back(kind, x, progress, edge)
+}
+
+pub fn fake_host_dispatch_back(wid : Int, kind : Int, x : Double, progress : Double, edge : Int) -> Bool {
+  let enabled = match fake.v {
+    Some(f) => match f.back_on_by_wid.get(wid) {
+      Some(b) => b
+      Option::None => false
+    }
+    Option::None => false
+  }
+  if !enabled {
+    return false
+  }
+  let prev_at = match fake.v {
+    Some(f) => {
+      let old = f.window_at
+      f.window_at = wid
+      old
+    }
+    Option::None => 0
+  }
+  in_window(wid, fn() {
+    on_back(kind, x, progress, edge)
+  })
+  match fake.v {
+    Some(f) => f.window_at = prev_at
+    Option::None => ()
+  }
+  true
+}
+
+let tester_halt_intercept : signals::Ref[Option[(String) -> Unit]] = ref_new(None)
+
+fn tester_halt(msg : String) -> Unit {
+  match tester_halt_intercept.v {
+    Some(f) => f(msg)
+    Option::None => halt::saying(msg, loc="zz_invar_compat.pion:tester_halt")
+  }
+}
+
+pub fn tester_capture_halts(f : () -> Unit) -> Array[String] {
+  let caught : Array[String] = []
+  let prev = tester_halt_intercept.v
+  tester_halt_intercept.v = Some(fn(msg : String) { caught.push(msg) })
+  f()
+  tester_halt_intercept.v = prev
+  caught
+}
+
+let last_damage_report : mbt_compat::Ref[DamageReport] = mbt_compat::ref_new(DamageReport::Full)
+let prev_damage_ninst : mbt_compat::Ref[Int] = mbt_compat::ref_new(-1)
+let prev_damage_inst : mbt_compat::Ref[FixedArray[Double]] = mbt_compat::ref_new(FixedArray::make(1, 0.0))
+let prev_damage_light : mbt_compat::Ref[Double] = mbt_compat::ref_new(-999.0)
+let prev_damage_atlas : mbt_compat::Ref[Int] = mbt_compat::ref_new(-1)
+let prev_damage_bg : mbt_compat::Ref[Int64] = mbt_compat::ref_new(-1L)
+
+fn rects_cover_bbox(rects : Array[(Double, Double, Double, Double)], bx0 : Double, by0 : Double, bx1 : Double, by1 : Double) -> Bool {
+  if bx1 <= bx0 || by1 <= by0 {
+    return true
+  }
+  // Check resize sentinel (0, 0, -1, -1) -> normalized to Full
+  for r in rects {
+    if r.0 == 0.0 && r.1 == 0.0 && r.2 < 0.0 && r.3 < 0.0 {
+      return true
+    }
+  }
+  // Sample grid + boundary points across [bx0, bx1] x [by0, by1]
+  let steps = 16
+  let mut ix = 0
+  while ix <= steps {
+    let px = bx0 + (bx1 - bx0) * (ix.to_double() / steps.to_double())
+    let mut iy = 0
+    while iy <= steps {
+      let py = by0 + (by1 - by0) * (iy.to_double() / steps.to_double())
+      let mut covered = false
+      for r in rects {
+        if px >= r.0 - 0.5 && px <= r.0 + r.2 + 0.5 && py >= r.1 - 0.5 && py <= r.1 + r.3 + 0.5 {
+          covered = true
+          break
+        }
+      }
+      if !covered {
+        return false
+      }
+      iy += 1
+    }
+    ix += 1
+  }
+  true
+}
+
+fn record_frame_damage(c : Ctx) -> Unit {
+  if looks_ref_pass.v {
+    return
+  }
+  let n = c.ninst
+  let cur_light = glass_light_angle()
+  let cur_atlas = hostapi::atlas_generation()
+  let cur_bg = tree_theme().bg
+  let env_changed = (prev_damage_ninst.v >= 0) && (
+    (cur_light - prev_damage_light.v).abs() > 1.0e-9 ||
+    cur_atlas != prev_damage_atlas.v ||
+    cur_bg != prev_damage_bg.v
+  )
+  let mut same = !env_changed && prev_damage_ninst.v == n && n >= 0
+  let mut bx0 = 1.0e9
+  let mut by0 = 1.0e9
+  let mut bx1 = -1.0e9
+  let mut by1 = -1.0e9
+  let include_inst = fn(arr : FixedArray[Double], idx : Int) {
+    let b = idx * inst_size
+    let x = arr[b]
+    let y = arr[b + 1]
+    let w = arr[b + 2]
+    let h = arr[b + 3]
+    if w > 0.0 && h > 0.0 {
+      if x - 2.0 < bx0 { bx0 = dmax(0.0, x - 2.0) }
+      if y - 2.0 < by0 { by0 = dmax(0.0, y - 2.0) }
+      if x + w + 2.0 > bx1 { bx1 = x + w + 2.0 }
+      if y + h + 2.0 > by1 { by1 = y + h + 2.0 }
+    }
+  }
+  if prev_damage_ninst.v >= 0 {
+    let prev = prev_damage_inst.v
+    let pn = prev_damage_ninst.v
+    let max_n = if n > pn { n } else { pn }
+    let mut k = 0
+    while k < max_n {
+      let mut diff = k >= n || k >= pn
+      if !diff {
+        let b = k * inst_size
+        let mut s = 0
+        while s < inst_size {
+          if (c.inst[b + s] - prev[b + s]).abs() > 1.0e-9 {
+            diff = true
+            break
+          }
+          s += 1
+        }
+      }
+      if diff {
+        same = false
+        if k < n { include_inst(c.inst, k) }
+        if k < pn { include_inst(prev, k) }
+      }
+      k += 1
+    }
+  }
+  last_damage_report.v = if same { DamageReport::None } else { DamageReport::Full }
+  if looks_check.v && in_frame_looks_hook.v is Option::None {
+    if view_block_poison.v {
+      tester_halt("check_looks mismatch: poisoned stale view_block")
+    }
+    match damage_report_poison.v {
+      Some(DamageReport::None) => {
+        if !same || env_changed {
+          tester_halt("check_looks: actual damage is None while scene changed")
+        }
+      }
+      Some(DamageReport::Rects(rects)) => {
+        if env_changed {
+          let mut is_sentinel = false
+          for r in rects {
+            if r.0 == 0.0 && r.1 == 0.0 && r.2 < 0.0 && r.3 < 0.0 {
+              is_sentinel = true
+            }
+          }
+          if !is_sentinel {
+            tester_halt("check_looks: missed expected Full damage on light/atlas/theme change")
+          }
+        } else if !same && !rects_cover_bbox(rects, bx0, by0, bx1, by1) {
+          tester_halt("check_looks: missed expected damage rect")
+        }
+      }
+      _ => ()
+    }
+  }
+  prev_damage_ninst.v = n
+  prev_damage_light.v = cur_light
+  prev_damage_atlas.v = cur_atlas
+  prev_damage_bg.v = cur_bg
+  let len = if n > 0 { n * inst_size } else { 1 }
+  let snap = FixedArray::make(len, 0.0)
+  if n > 0 {
+    c.inst.blit_to(snap, len=n * inst_size)
+  }
+  prev_damage_inst.v = snap
+}
+
+fn reset_frame_damage() -> Unit {
+  last_damage_report.v = DamageReport::Full
+  prev_damage_ninst.v = -1
+  prev_damage_light.v = -999.0
+  prev_damage_atlas.v = -1
+  prev_damage_bg.v = -1L
+}
+
+pub fn view_last_damage_report() -> DamageReport {
+  match damage_report_poison.v {
+    Some(p) => p
+    Option::None => last_damage_report.v
+  }
+}
+
+pub fn Field::caret_pos(self : Field) -> Int {
+  self.st.caret
+}
+
+pub fn Field::caret_line(self : Field) -> Int {
+  let shown = match self.st.look {
+    Some(f) => f(self.st.text).0
+    Option::None => self.st.text
+  }
+  let mut line = 0
+  let mut i = 0
+  let limit = if self.st.caret < shown.length() { self.st.caret } else { shown.length() }
+  while i < limit {
+    if shown[i].to_int() == 10 {
+      line += 1
+    }
+    i += 1
+  }
+  line
+}
+
+pub fn Field::set_handles_shown(self : Field, on : Bool) -> Unit {
+  self.st.sel_handles = on
+}
+
+pub fn Field::compose(self : Field, text : String) -> Unit {
+  self.st.marked = text
+  self.st.said_composed = None
+}
+
+pub fn EditorState::display_text(self : EditorState) -> String {
+  let raw = self.text + self.marked
+  if !self.secret {
+    return raw
+  }
+  let sb = StringBuilder()
+  let mut i = 0
+  let n = raw.length()
+  while i < n {
+    let nxt = text::next_grapheme(raw, i)
+    sb.write_string("•")
+    i = if nxt > i { nxt } else { i + 1 }
+  }
+  sb.to_string()
+}
+
+let host_drop_channel : String = "mbui.drop"
+
+pub fn drop_host_pick(pick : Int, x~ : Double = 0.0, y~ : Double = 0.0, wid~ : Int = 0) -> Bool {
+  let res = mbt_compat::ref_new(false)
+  let run_drop = fn() {
+    match tree_paths_at(g(), x, y, [], pick) {
+      TreeDropped::Took => res.v = true
+      TreeDropped::Shut => res.v = false
+      TreeDropped::Not => {
+        forget_drop(pick)
+        res.v = false
+      }
+    }
+  }
+  if wid == current_window_id() {
+    run_drop()
+  } else {
+    as_window(wid, run_drop)
+  }
+  res.v
+}
+
+pub fn style_centered(st : TextStyle) -> Bool {
+  let dark = signals::untracked(fn() { tree_theme().dark })
+  st.resolve(tree_narrow(), dark).center.unwrap_or(false)
+}
+
+pub fn concentric(outer : Double, inset : Double) -> Double {
+  paint::concentric(outer, inset)
+}
+
+pub fn concentric_out(inner : Double, inset : Double) -> Double {
+  paint::concentric_out(inner, inset)
+}
+
+pub fn capsule_in(corner : Double, height : Double, room~ : Double = 1.0e30) -> Double {
+  paint::capsule_in(corner, height, room=room)
+}
+
+pub fn Scene::push_inst(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  r : Double,
+  kind : Double,
+  p6 : Double,
+  p7 : Double,
+  color : Int64,
+  alpha : Double,
+  p12 : Double,
+  p13 : Double,
+  p14 : Double,
+  p15 : Double,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+  tex_id~ : Double = 0.0,
+) -> Int {
+  self.ensure_inst_len((self.ninst + 1) * inst_size)
+  let base = self.ninst * inst_size
+  self.inst[base + 0] = x
+  self.inst[base + 1] = y
+  self.inst[base + 2] = w
+  self.inst[base + 3] = h
+  self.inst[base + 4] = r
+  self.inst[base + 5] = kind
+  self.inst[base + 6] = p6
+  self.inst[base + 7] = p7
+  self.inst[base + 8] = ((color >> 24) & 0xFFL).to_double() / 255.0
+  self.inst[base + 9] = ((color >> 16) & 0xFFL).to_double() / 255.0
+  self.inst[base + 10] = ((color >> 8) & 0xFFL).to_double() / 255.0
+  self.inst[base + 11] = ((color & 0xFFL).to_double() / 255.0) * alpha
+  self.inst[base + 12] = p12
+  self.inst[base + 13] = p13
+  self.inst[base + 14] = p14
+  self.inst[base + 15] = p15
+  self.inst[base + 16] = clip_x
+  self.inst[base + 17] = clip_y
+  self.inst[base + 18] = clip_x1
+  self.inst[base + 19] = clip_y1
+  self.inst[base + 20] = tex_id
+  let idx = self.ninst
+  self.ninst = self.ninst + 1
+  idx
+}
+
+fn emit_cubic_bezier_rec(
+  scene : Scene,
+  x0 : Double,
+  y0 : Double,
+  c1x : Double,
+  c1y : Double,
+  c2x : Double,
+  c2y : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  eff_tol : Double,
+  alpha : Double,
+  clip_x : Double,
+  clip_y : Double,
+  clip_x1 : Double,
+  clip_y1 : Double,
+  depth : Int,
+) -> Unit {
+  let ex = x1 - 3.0 * c2x + 3.0 * c1x - x0
+  let ey = y1 - 3.0 * c2y + 3.0 * c1y - y0
+  let err = 0.016037507477489605 * (ex * ex + ey * ey).sqrt()
+  if err <= eff_tol || depth >= 5 {
+    let qax = x0 + 0.75 * (c1x - x0)
+    let qay = y0 + 0.75 * (c1y - y0)
+    let qbx = x1 + 0.75 * (c2x - x1)
+    let qby = y1 + 0.75 * (c2y - y1)
+    let mx = 0.5 * (qax + qbx)
+    let my = 0.5 * (qay + qby)
+    scene.emit_quad_bezier(
+      x0, y0, qax, qay, mx, my, width, color,
+      alpha=alpha, clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+    scene.emit_quad_bezier(
+      mx, my, qbx, qby, x1, y1, width, color,
+      alpha=alpha, clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+    )
+  } else {
+    let p01x = 0.5 * (x0 + c1x)
+    let p01y = 0.5 * (y0 + c1y)
+    let p12x = 0.5 * (c1x + c2x)
+    let p12y = 0.5 * (c1y + c2y)
+    let p23x = 0.5 * (c2x + x1)
+    let p23y = 0.5 * (c2y + y1)
+    let p012x = 0.5 * (p01x + p12x)
+    let p012y = 0.5 * (p01y + p12y)
+    let p123x = 0.5 * (p12x + p23x)
+    let p123y = 0.5 * (p12y + p23y)
+    let midx = 0.5 * (p012x + p123x)
+    let midy = 0.5 * (p012y + p123y)
+    emit_cubic_bezier_rec(
+      scene, x0, y0, p01x, p01y, p012x, p012y, midx, midy,
+      width, color, eff_tol, alpha, clip_x, clip_y, clip_x1, clip_y1, depth + 1,
+    )
+    emit_cubic_bezier_rec(
+      scene, midx, midy, p123x, p123y, p23x, p23y, x1, y1,
+      width, color, eff_tol, alpha, clip_x, clip_y, clip_x1, clip_y1, depth + 1,
+    )
+  }
+}
+
+pub fn Scene::emit_cubic_bezier(
+  self : Scene,
+  x0 : Double,
+  y0 : Double,
+  c1x : Double,
+  c1y : Double,
+  c2x : Double,
+  c2y : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  tol~ : Double = 0.15,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Unit {
+  if width <= 0.0 || (color & 0xFFL) == 0L || alpha <= 0.0 {
+    return
+  }
+  let eff_tol = dmax(tol, 0.01)
+  emit_cubic_bezier_rec(
+    self, x0, y0, c1x, c1y, c2x, c2y, x1, y1,
+    width, color, eff_tol, alpha, clip_x, clip_y, clip_x1, clip_y1, 0,
+  )
+}
+
+pub fn Scene::push_blur_layer(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Int {
+  let sigma = if radius > 0.0 { radius } else { 0.0 }
+  self.push_inst(
+    x, y, w, h, 0.0, 14.0, 0.0, sigma, c64(0xFFFF, 0xFFFF), 1.0,
+    0.0, 0.0, 0.0, 0.0,
+    clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+  )
+}
+
+pub fn Scene::pop_blur_layer(
+  self : Scene,
+  x : Double,
+  y : Double,
+  w : Double,
+  h : Double,
+  radius : Double,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Int {
+  let sigma = if radius > 0.0 { radius } else { 0.0 }
+  self.push_inst(
+    x, y, w, h, 0.0, 15.0, 0.0, sigma, c64(0xFFFF, 0xFFFF), alpha,
+    0.0, 0.0, 0.0, 0.0,
+    clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+  )
+}
+
+pub fn Scene::emit_layer(
+  self : Scene,
+  layer_id : Int,
+  phys_x : Int,
+  phys_y : Int,
+  phys_w : Int,
+  phys_h : Int,
+  scale : Double,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Int {
+  let sc = if scale > 0.0 { scale } else { 1.0 }
+  self.push_inst(
+    phys_x.to_double() / sc,
+    phys_y.to_double() / sc,
+    phys_w.to_double() / sc,
+    phys_h.to_double() / sc,
+    0.0,
+    4.0,
+    0.0,
+    0.0,
+    0xFFFFFFFFL,
+    alpha,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    clip_x=clip_x,
+    clip_y=clip_y,
+    clip_x1=clip_x1,
+    clip_y1=clip_y1,
+    tex_id=(hostapi::layer_tex_base + layer_id).to_double(),
+  )
+}
+
+pub fn Scene::emit_line(
+  self : Scene,
+  x0 : Double,
+  y0 : Double,
+  x1 : Double,
+  y1 : Double,
+  width : Double,
+  color : Int64,
+  alpha~ : Double = 1.0,
+  clip_x~ : Double = 0.0,
+  clip_y~ : Double = 0.0,
+  clip_x1~ : Double = 1.0e9,
+  clip_y1~ : Double = 1.0e9,
+) -> Unit {
+  if width <= 0.0 || (color & 0xFFL) == 0L || alpha <= 0.0 {
+    return
+  }
+  let dx = x1 - x0
+  let dy = y1 - y0
+  let len = dmath::sqrt(dx * dx + dy * dy)
+  let mx = (x0 + x1) * 0.5
+  let my = (y0 + y1) * 0.5
+  let w = len + width
+  let h = width
+  let r = width * 0.5
+  let idx = self.push_inst(
+    mx - w * 0.5, my - h * 0.5, w, h, r, 0.0, 0.0, 0.0, color, alpha,
+    0.0, 0.0, 0.0, 0.0,
+    clip_x=clip_x, clip_y=clip_y, clip_x1=clip_x1, clip_y1=clip_y1,
+  )
+  if len > 1.0e-9 {
+    let angle = dmath::atan2(dy, dx)
+    if angle.abs() > 1.0e-9 {
+      let base = idx * inst_size
+      self.inst[base + 32] = angle
+      self.inst[base + 33] = mx
+      self.inst[base + 34] = my
+      self.inst[base + 35] = 1.0
+    }
+  }
+}
+
+pub fn hand_on_message(channel : String, json : String, bytes? : Bytes) -> Unit {
+  hand_on(channel, json, bytes)
+}
+
+let pending_shot_dones : Array[() -> Unit] = []
+
+fn drain_pending_shot_dones() -> Unit {
+  if pending_shot_dones.is_empty() {
+    return
+  }
+  let cbs = pending_shot_dones.copy()
+  pending_shot_dones.clear()
+  for cb in cbs {
+    cb()
+  }
+}
+
+fn finish_shot_done(done : (Option[Bytes]) -> Unit, png : Option[Bytes]) -> Unit {
+  if frame_running.v || in_frame.v {
+    pending_shot_dones.push(fn() { done(png) })
+  } else {
+    done(png)
+  }
+}
+
+pub fn a11y_handle_action(json : String) -> Unit {
+  a11y_took(json)
+}

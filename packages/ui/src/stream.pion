@@ -1,950 +1,1201 @@
-// Decoded host Stream, tree_stream, NativeView, tree_native, and tree_scroll_bar.
-// Ported from libs/mbui/src/ui/stream.mbt, tree_stream.mbt, tree_native.mbt, scroll_bar.mbt.
-
 import "hostapi"
-import "view"
-import "signals"
+import "mbt_compat"
 
-/// Decoded frame-by-frame video/JPEG host stream.
+// A picture the host decodes frame by frame, drawn by the app as an image (the app's remote screens: its Android
+// app's remote/Decoders.kt and ScreenSession.kt): the app hands it a sender's frames, H.264 (`h264`, a config, then
+// `frame`s; H.265's `hevc` and AV1's `av1` the same, where the host decodes them) or JPEG (`jpeg`), and draws it where it likes (`Ctx::stream`), under and over what it paints, faded,
+// frosted, zoomed and panned as any picture. Not a native view: nothing of it is the system's but the decoding.
+//
+// The sender sends a few frames ahead of the last one the app acknowledged, so each frame comes back through `shown`
+// once its fate is known: drawn, or let go. Which frame shows is said by events, never by what the host happens to
+// have decoded: the host says "decoded, W × H" or "let go" of each frame (or that its decoder broke) as it comes, the
+// framework takes those as a frame begins (frame_body, before the view builds) and the stream shows from that frame
+// on the last one said decoded (the host told to latch it: @hostapi.stream_show). So what frame N draws depends only on
+// the events taken by then, and a run's tape (VIEWSAID {"stream":…} lines, the host's words as they were taken)
+// replays it exactly. `shown(ts)` is called once that frame is painted, for each frame taken in it, drawn or not (a
+// page not showing the stream that frame let its frame go all the same); `broken()` as the event is taken, the app
+// asking the sender for a key frame.
+//
+// Each frame handed over is the host's work until its event comes: a ticket of the window's runtime (effect.mb's
+// outside, hostcall.pion's outside_stream), "stream N frame TS", so a run is not at rest while a frame is out (a
+// Tester's until the test says what became of it: Tester::stream_shows, stream_drops). A stream open between frames
+// is at rest: nothing of it moves by the clock.
+//
+// The rules of Android's decoder, kept here where the host would only repeat them: until a key frame
+// after a config or a broken decoder, frames are let go unseen; where nothing decodes H.264 (@hostapi.h264_here false,
+// or no config yet) they are let go too. Those it lets go itself are said at the next frame's start, as a host's are.
+//
+// Under a Tester the host is the test's (Tester::new's `h264`; Tester::stream_fed, stream_shows, stream_drops,
+// stream_broken), its picture a placeholder in the draw list: `image N PX "stream WxH ts=TS"`.
+//
+// Shown by the system (`layer`, where the host has a layer of its own for it: @hostapi.stream_layers, macOS's and
+// iOS's, whose contents are the decoded frame's IOSurface; Windows', a composition swap chain the GPU puts the frame
+// in): an H.264 stream drawn whole and as it is (`Ctx::stream`'s
+// `layer`, stretched to its rect, not faded) is a native view of kind 4 under the canvas, its hole painted where the
+// picture would be (native.pion), each frame shown put on that layer by the host as well. While that view shows, a frame
+// decoded of the picture's size (and one its app says may: Stream::new's `quiet`) changes nothing the app draws: its
+// event is taken as it comes (streams_arrive; between frames, streams_said), the frame shown and said shown at once,
+// nothing built or painted for it, no frame asked, as a video plays under the app's canvas. Its first frame, another
+// size, what the app let go of itself and whatever else comes, as before.
+//
+// Routed (`route`, where the host has routes: @hostapi.stream_direct, macOS's, iOS's, Windows' and Android's): while it
+// shows itself so, the app may have the host take a route's frames and sound straight from the app's engine
+// (the app's shell reading a remote screen), not by way of the app's queue: the host decodes, shows and acknowledges
+// each, nothing of the app's run. What came so is said in one event as the stream's are next taken ("D TS N BYTES":
+// the frame it shows, how many came and their bytes), on the run's tape as any; no ticket is the app's for them. A
+// config of the route stops it (the host's), and a stream that no longer shows itself stops it as the frame begins.
+//
+// A stream on its system video layer is decoded by the host itself even where the host's decoder is otherwise driven
+// from here (Android's: @hostapi.stream_feeds; its layered streams' own MediaCodec decodes onto the layer, as Apple's
+// VideoToolbox does): no feed for it.
+
+///|
+/// A picture decoded frame by frame.
 pub struct Stream {
-  pub phys_id : Int
-  pub mut id : Int
-  pub mut opened : Bool
-  shown_cb : (Double) -> Unit
-  broken_cb : () -> Unit
-  pub mut h264 : Bool
-  pub mut hevc : Bool
-  pub mut av1 : Bool
-  pub mut cw : Int
-  pub mut ch : Int
-  pub mut need_key : Bool
-  pub mut size : Option[(Int, Int)]
-  pub mut at : Option[Double]
-  pub mut closed : Bool
-  pub mut visible : Bool
-  pub layer : Bool
-  pub mut volume : Option[Double]
-  pub out : Array[Double]
-  pub acks : Array[Double]
+  priv mut id : Int
+  priv mut opened : Bool
+  priv shown : (Double) -> Unit
+  priv broken : () -> Unit
+  priv mut h264 : Bool
+  priv mut hevc : Bool
+  priv mut av1 : Bool
+  priv mut cw : Int
+  priv mut ch : Int
+  priv mut need_key : Bool
+  priv mut size : Option[(Int, Int)]
+  priv mut at : Option[Double]
+  priv out : Array[(Double, Int)]
+  priv own : Array[String]
+  priv acks : Array[(Double, Double)]
+  priv mut last_wait_us : Double
+  priv mut taken : Int
+  priv mut closed : Bool
+  priv mut feed : Option[Feed]
+  priv layer : Bool
+  priv mut view : Option[NativeView]
+  priv quiet : Option[(Double) -> Bool]
+  priv latched : Option[(Double) -> Unit]
+  priv mut routed : (Int, Bool, Bool)
+  priv mut direct_frames : Int
+  priv mut direct_bytes : Int
+  priv hidden : Array[Double]
+  priv mut volume : Option[Double]
 }
 
-let open_streams : Array[Stream] = []
+///|
+/// The streams open, their events taken as each frame begins.
+// moved to 00_init_order.pion: open_streams
 
-pub fn Stream::new(
-  shown~ : (Double) -> Unit,
-  broken~ : () -> Unit,
-  layer~ : Bool = false,
-) -> Stream {
+///|
+/// Where streams are drawn, by node, as the last build said: the stream, and the rect it is drawn at (Ctx::stream's
+/// `at`).
+// moved to 00_init_order.pion: stream_nodes
+
+///|
+/// The frames handed over so far (their tickets' numbers).
+// moved to 00_init_order.pion: stream_tickets
+
+///|
+fn streams_reset() -> Unit {
+  open_streams.clear()
+  stream_nodes.clear()
+  stream_tickets.v = 0
+  pointers_told.clear()
+}
+
+///|
+/// A stream: `shown(ts)` once frame `ts` is drawn or let go (the sender's acknowledgement), `broken()` once its
+/// decoder lost its state (the sender asked for a key frame). Nothing shows until a frame decodes. The host is not
+/// asked for anything until the first config or frame (made where a view builds, it does nothing outside it).
+/// `layer`: shown by the host's own video layer where it has one (@hostapi.stream_layers), drawn as it is
+/// (Ctx::stream's `layer`); `quiet(ts)`: whether its frame of `ts` may then be shown as it comes, nothing built for it
+/// (false: what the app draws around it changes with it, as a part of a screen over the whole: the frame built).
+/// `latched(ts)`: the frame it shows from now on, told as the frame that shows it begins, before it is built (`shown`
+/// comes once it is painted): what the app places by the frame shown (a part of a screen over the whole) placed in
+/// that same frame, so a frame is never drawn where the one before it was.
+pub fn Stream::new(shown~ : (Double) -> Unit, broken~ : () -> Unit, layer? : Bool, quiet? : Option[(Double) -> Bool], latched? : Option[(Double) -> Unit]) -> Stream {
+  let layer = match layer { Some(__mbt_v) => __mbt_v, None => false }
+  let quiet = match quiet { Some(__mbt_v) => __mbt_v, None => Option::None }
+  let latched = match latched { Some(__mbt_v) => __mbt_v, None => Option::None }
+
   let s = Stream::{
-    phys_id: next_ui_id(),
     id: 0,
     opened: false,
-    shown_cb: shown,
-    broken_cb: broken,
+    shown: shown,
+    broken: broken,
     h264: false,
     hevc: false,
     av1: false,
     cw: 0,
     ch: 0,
     need_key: true,
-    size: None,
-    at: None,
-    closed: false,
-    visible: false,
-    layer,
-    volume: None,
+    size: Option::None,
+    at: Option::None,
     out: [],
+    own: [],
     acks: [],
+    last_wait_us: 0.0,
+    taken: -1,
+    closed: false,
+    feed: Option::None,
+    layer: layer,
+    view: Option::None,
+    quiet: quiet,
+    latched: latched,
+    routed: (0, false, false),
+    direct_frames: 0,
+    direct_bytes: 0,
+    hidden: [],
+    volume: Option::None,
   }
   open_streams.push(s)
   s
 }
 
-fn register_open_stream(s : Stream) -> Unit {
-  for o in open_streams {
-    if o.phys_id == s.phys_id {
-      return
-    }
-  }
-  open_streams.push(s)
-}
-
-fn Stream::ensure_open(self : Stream) -> Bool {
-  if self.closed {
-    return false
-  }
-  register_open_stream(self)
-  if !self.opened {
-    self.opened = true
-    self.id = hostapi::stream_open()
-    match self.volume {
-      Some(v) if self.id > 0 => hostapi::stream_audio_volume(self.id, v)
-      _ => ()
-    }
-  }
-  self.id > 0
-}
-
+///|
+/// Whether this host decodes H.264 (else the sender is asked for JPEG only). Under a Tester, Tester::new's `h264`; a
+/// run's tape keeps the host's (its ENV line), and a replay gives it again.
 pub fn h264_here() -> Bool {
-  hostapi::h264_here()
+  h_h264_here()
 }
 
-pub fn stream_layers_here() -> Bool {
-  hostapi::stream_layers()
-}
-
-pub fn stream_audio_here() -> Bool {
-  hostapi::stream_audio_here()
-}
-
+///|
+/// A config for H.264 (`avcc`: its AVCDecoderConfigurationRecord; the picture `w` × `h` pixels): the decoder starts
+/// anew, the frames inside it let go, and takes nothing until a key frame.
 pub fn Stream::h264(self : Stream, avcc : Bytes, w : Int, h : Int) -> Unit {
-  if !self.ensure_open() { return }
+  if self.closed {
+    return
+  }
+  self.open()
   self.h264 = true
   self.hevc = false
   self.av1 = false
   self.cw = w
   self.ch = h
   self.need_key = true
-  hostapi::stream_h264(self.id, avcc, w, h)
+  if self.id != 0 {
+    h_stream_h264(self.id, avcc, w, h)
+    // (one on its system video layer is decoded by the host itself, onto that layer: no feed, whatever the host's)
+    if h_stream_feeds() && self.view is Option::None {
+      let f = match self.feed {
+        Some(f) => f
+        Option::None => {
+          // (the host's first surface made as its first config came: @hostapi.stream_h264)
+          let f = Feed::new()
+          f.surface = 1
+          self.feed = Some(f)
+          f
+        }
+      }
+      f.configure(avcc, w, h)
+      self.fed()
+    }
+  }
 }
 
+///|
+/// What its feed said and asks of the host since: its words for the app said as the next frame begins (as the frames
+/// it lets go itself are), its commands given the host now.
+fn Stream::fed(self : Stream) -> Unit {
+  guard self.feed is Some(f) else { return }
+  let said = f.said.copy()
+  f.said.clear()
+  for e in said {
+    self.own.push(e)
+  }
+  if said.length() > 0 {
+    self.owe()
+  }
+  self.feed_host(f)
+}
+
+///|
+/// Its feed's commands given the host, oldest first.
+fn Stream::feed_host(self : Stream, f : Feed) -> Unit {
+  let todo = f.todo.copy()
+  f.todo.clear()
+  for d in todo {
+    h_stream_codec(self.id, d.cmd, d.data)
+  }
+}
+
+///|
+/// An H.264 access unit (AVCC: each NAL after its length), a key frame or not, of time `ts` (a whole number: the
+/// decoders carry it as a frame's presentation time, as the sender's are). `show` false: decoded for the frames after
+/// it (a seek's way to its picture) and never shown: its fate said as one let go ("d", `shown(ts)` called all the
+/// same), the picture shown left as it was, and no frame asked for it (it is taken as the next frame begins, whatever
+/// asks for that one). A host that cannot decode one unseen decodes it as any and says it decoded: taken here as let
+/// go all the same, never shown; where the host does not take it at all (@hostapi.stream_frame_shown) it is let go
+/// here, undecoded.
+pub fn Stream::frame(self : Stream, data : Bytes, key : Bool, ts : Double, show? : Bool) -> Unit {
+  let show = match show { Some(__mbt_v) => __mbt_v, None => true }
+
+  if self.closed {
+    return
+  }
+  self.open()
+  self.hand_over(ts)
+  let decodes = if self.av1 {
+    av1_here()
+  } else if self.hevc {
+    h265_here()
+  } else {
+    h_h264_here()
+  }
+  if self.id == 0 || !self.h264 || !decodes || (self.need_key && !key) {
+    self.let_go(ts, wake=show)
+    return
+  }
+  self.need_key = false
+  match self.feed {
+    Some(f) => {
+      if !show {
+        self.hidden.push(ts)
+      }
+      f.frame(data, key, ts)
+      self.fed()
+    }
+    Option::None if show => h_stream_frame(self.id, data, key, ts)
+    Option::None =>
+    if hostapi::stream_frame_shown(self.id, data, key, ts, false) {
+      self.hidden.push(ts)
+    } else {
+      self.let_go(ts, wake=false)
+    }
+  }
+}
+
+///|
+/// Its decoder emptied, in its place among the frames handed over (a seek): `drain` false, what is in it let go (each
+/// said "d", none shown); true, decoded out first, each as it would have been, then emptied. The picture shown stays;
+/// nothing after it is taken till a key frame (one that is not, let go here). Where the host has nothing for it
+/// (@hostapi.stream_flush: Windows' alone has), the frames in it come out as ever; nor is a decoder driven from here
+/// (stream_feed.pion) emptied.
+pub fn Stream::flush(self : Stream, drain? : Bool) -> Unit {
+  let drain = match drain { Some(__mbt_v) => __mbt_v, None => false }
+
+  if self.closed {
+    return
+  }
+  self.need_key = true
+  if self.id != 0 && self.h264 && self.feed is Option::None {
+    hostapi::stream_flush(self.id, drain)
+  }
+}
+
+///|
+/// Whether frame `ts` was handed over not to be shown: those up to it no longer waited for.
+fn Stream::unhide(self : Stream, ts : Double) -> Bool {
+  let was = self.hidden.contains(ts)
+  if self.hidden.length() > 0 {
+    mbt_compat::arr_retain(self.hidden, fn(h) { h > ts })
+  }
+  was
+}
+
+///|
+/// Whether this host decodes H.265 (the sender is then asked for it first: `hevc`). Under a Tester, false unless
+/// Tester::set_h265; a run's tape keeps the host's (its ENV line says it only when it does).
+pub fn h265_here() -> Bool {
+  hostapi::h265_here()
+}
+
+///|
+/// A config for H.265 (`hvcc`: its HEVCDecoderConfigurationRecord; the picture `w` × `h` pixels), as `h264`'s: its
+/// access units after it go to `frame` (each NAL after its length). Only where `h265_here`: elsewhere its frames are
+/// let go.
 pub fn Stream::hevc(self : Stream, hvcc : Bytes, w : Int, h : Int) -> Unit {
-  if !self.ensure_open() { return }
-  self.h264 = false
+  if self.closed {
+    return
+  }
+  self.open()
+  self.h264 = true
   self.hevc = true
   self.av1 = false
   self.cw = w
   self.ch = h
   self.need_key = true
-  hostapi::stream_hevc(self.id, hvcc, w, h)
+  if self.id != 0 && h265_here() {
+    hostapi::stream_hevc(self.id, hvcc, w, h)
+  }
 }
 
+///|
+/// Whether this host decodes AV1 (8-bit 4:2:0; Windows' with the system's AV1 Video Extension). An app asks it before
+/// it plays AV1 through a stream, and plays it another way where it is false. Under a Tester, false unless
+/// Tester::set_av1; a run's tape keeps the host's (its ENV line says it only when it does).
+pub fn av1_here() -> Bool {
+  hostapi::av1_here()
+}
+
+///|
+/// A config for AV1 (`av1c`: its AV1CodecConfigurationRecord, an MP4's `av1C` box's payload, or its sequence header
+/// OBU alone; the picture `w` × `h` pixels), as `h264`'s: its temporal units after it go to `frame` as an MP4's samples
+/// hold them (OBUs, each with its size). Only where `av1_here`: elsewhere its frames are let go.
 pub fn Stream::av1(self : Stream, av1c : Bytes, w : Int, h : Int) -> Unit {
-  if !self.ensure_open() { return }
-  self.h264 = false
+  if self.closed {
+    return
+  }
+  self.open()
+  self.h264 = true
   self.hevc = false
   self.av1 = true
   self.cw = w
   self.ch = h
   self.need_key = true
-  hostapi::stream_av1(self.id, av1c, w, h)
+  if self.id != 0 && av1_here() {
+    hostapi::stream_av1(self.id, av1c, w, h)
+  }
 }
 
+///|
+/// A JPEG frame of time `ts`.
 pub fn Stream::jpeg(self : Stream, data : Bytes, ts : Double) -> Unit {
-  if !self.ensure_open() { return }
-  self.h264 = false
-  self.hevc = false
-  self.av1 = false
-  self.out.push(ts)
-  hostapi::stream_jpeg(self.id, data, ts)
-}
-
-pub fn Stream::frame(self : Stream, data : Bytes, key : Bool, ts : Double, show~ : Bool = true) -> Unit {
-  if !self.ensure_open() { return }
-  if self.need_key && !key {
-    self.acks.push(ts)
+  if self.closed {
     return
   }
-  if key {
-    self.need_key = false
+  self.open()
+  self.h264 = false
+  self.hand_over(ts)
+  if self.id == 0 {
+    self.let_go(ts)
+    return
   }
-  self.out.push(ts)
-  if show {
-    hostapi::stream_frame(self.id, data, key, ts)
+  h_stream_jpeg(self.id, data, ts)
+}
+
+///|
+/// The picture's size in pixels, once a frame of it shows (H.264's: its config's; JPEG's: the frame's).
+pub fn Stream::size(self : Stream) -> Option[(Int, Int)] {
+  self.size
+}
+
+///|
+/// Whether a frame has shown since it opened (one is kept on screen through a reconnect or an end).
+pub fn Stream::shown_any(self : Stream) -> Bool {
+  self.at is Some(_)
+}
+
+///|
+/// The time of the frame it shows, once one does.
+pub fn Stream::shown_at(self : Stream) -> Option[Double] {
+  self.at
+}
+
+///|
+/// How long (µs) the host held the frame currently being reported to `shown` (0 when none was said).
+pub fn Stream::wait_us(self : Stream) -> Double {
+  self.last_wait_us
+}
+
+///|
+fn Stream::say_shown(self : Stream, ts : Double, wait_us : Double) -> Unit {
+  self.last_wait_us = wait_us
+  (self.shown)(ts)
+  self.last_wait_us = 0.0
+}
+
+///|
+fn stream_wait_us(w : Array[String], at : Int) -> Double {
+  if at < w.length() {
+    match stream_num(w[at]) {
+      Some(v) if v > 0.0 => v
+      _ => 0.0
+    }
   } else {
-    let _ = hostapi::stream_frame_shown(self.id, data, key, ts, false)
+    0.0
   }
 }
 
-pub fn Stream::flush(self : Stream, drain~ : Bool = false) -> Unit {
-  if self.id > 0 && !self.closed {
-    hostapi::stream_flush(self.id, drain)
-  }
+///|
+/// Its host's number for it (what a Tester's stream_fed, stream_shows… take): from the first config or frame handed
+/// over; 0 before, or where the host has none.
+pub fn Stream::id(self : Stream) -> Int {
+  self.id
 }
 
-pub fn Stream::audio(self : Stream, data : Bytes) -> Unit {
-  if self.ensure_open() {
-    hostapi::stream_audio(self.id, data)
-  }
-}
-
-pub fn Stream::audio_volume(self : Stream, v : Double) -> Unit {
-  self.volume = Some(v)
-  if self.id > 0 && !self.closed {
-    hostapi::stream_audio_volume(self.id, v)
-  }
-}
-
-/// Set a named cursor bitmap for this remote/video stream.
-pub fn Stream::pointer(
-  self : Stream,
-  key : String,
-  png : () -> Bytes,
-  w : Double,
-  h : Double,
-  hx : Double,
-  hy : Double,
-) -> Unit {
-  if self.ensure_open() {
-    hostapi::stream_pointer(self.id, key, png, w, h, hx, hy)
-  }
-}
-
-/// Update pointer position and visibility on this stream.
-pub fn Stream::pointer_at(self : Stream, x : Double, y : Double, shown : Bool) -> Unit {
-  if self.id > 0 && !self.closed {
-    hostapi::stream_pointer_at(self.id, x, y, shown)
-  }
-}
-
-pub fn Stream::audio_played(self : Stream) -> Double {
-  if self.id > 0 && !self.closed { hostapi::stream_audio_played(self.id) } else { 0.0 }
-}
-
-pub fn Stream::audio_queued(self : Stream) -> Double {
-  if self.id > 0 && !self.closed { hostapi::stream_audio_queued(self.id) } else { 0.0 }
-}
-
-pub fn Stream::audio_wanted(self : Stream) -> Double {
-  if self.id > 0 && !self.closed { hostapi::stream_audio_wanted(self.id) } else { 0.0 }
-}
-
-pub fn Stream::is_closed(self : Stream) -> Bool {
-  self.closed
-}
-
-pub fn Stream::is_visible(self : Stream) -> Bool {
-  self.visible
-}
-
+///|
+/// Gone: its decoder stopped, its frames let go and not said (nothing more is), nothing of it drawn.
 pub fn Stream::close(self : Stream) -> Unit {
   if self.closed {
     return
   }
   self.closed = true
-  self.visible = false
-  if self.id > 0 {
-    hostapi::stream_close(self.id)
-    self.id = 0
+  for o in self.out {
+    outside_end(outside_stream, o.1)
   }
-}
-
-/// Poll host decoder events for this stream (called at frame start).
-fn Stream::poll(self : Stream) -> Unit {
-  if self.closed || self.id <= 0 {
-    return
-  }
-  let mut guard_steps = 0
-  while guard_steps < 64 {
-    let ev = hostapi::stream_next(self.id)
-    if ev == "" {
-      break
-    }
-    guard_steps += 1
-    if str_has_prefix(ev, "f ") {
-      // Native host format: "f TS W H"
-      let parts = split_spaces(ev)
-      if parts.length() >= 4 {
-        let ts = parse_double_simple(parts[1])
-        let w = parse_int_simple(parts[2])
-        let h = parse_int_simple(parts[3])
-        self.size = Some((w, h))
-        self.at = Some(ts)
-        hostapi::stream_show(self.id, ts)
-        self.acks.push(ts)
-      }
-    } else if str_has_prefix(ev, "ok ") {
-      // Synthetic fake-host format: "ok W H TS"
-      let parts = split_spaces(ev)
-      if parts.length() >= 4 {
-        let w = parse_int_simple(parts[1])
-        let h = parse_int_simple(parts[2])
-        let ts = parse_double_simple(parts[3])
-        self.size = Some((w, h))
-        self.at = Some(ts)
-        hostapi::stream_show(self.id, ts)
-        self.acks.push(ts)
-      }
-    } else if str_has_prefix(ev, "d ") || str_has_prefix(ev, "drop ") {
-      let parts = split_spaces(ev)
-      if parts.length() >= 2 {
-        let ts = parse_double_simple(parts[1])
-        self.acks.push(ts)
-      }
-    } else if ev == "b" || ev == "broken" {
-      self.need_key = true
-      (self.broken_cb)()
-    }
-  }
-}
-
-fn Stream::flush_acks(self : Stream) -> Unit {
-  if self.acks.length() == 0 {
-    return
-  }
-  let pending = self.acks.copy()
+  self.out.clear()
+  self.own.clear()
   self.acks.clear()
-  for ts in pending {
-    (self.shown_cb)(ts)
+  self.hidden.clear()
+  self.feed = Option::None
+  match self.view {
+    Some(v) => v.close()
+    Option::None => ()
   }
+  self.view = Option::None
+  if self.id != 0 {
+    h_stream_close(self.id)
+  }
+  mbt_compat::arr_retain(open_streams, fn(s) { !physical_equal(s, self) })
 }
 
-fn split_spaces(s : String) -> Array[String] {
-  let out : Array[String] = []
-  let sb = StringBuilder::new()
-  let mut i = 0
-  while i < s.length() {
-    let cu = s.code_unit_at(i)
-    if cu == 32 {
-      let cur = sb.to_string()
-      if cur.length() > 0 {
-        out.push(cur)
-        sb.reset()
-      }
-    } else {
-      sb.write_byte(cu as Byte)
+///|
+/// Its host's stream, opened as the first config or frame is handed over.
+fn Stream::open(self : Stream) -> Unit {
+  if !arr_any(open_streams, fn(x) { physical_equal(x, self) }) {
+    open_streams.push(self)
+  }
+  if !self.opened {
+    self.opened = true
+    self.id = h_stream_open()
+    // (the volume asked before it opened)
+    match self.volume {
+      Some(v) if self.id != 0 => hostapi::stream_audio_volume(self.id, v)
+      _ => ()
     }
-    i += 1
-  }
-  let tail = sb.to_string()
-  if tail.length() > 0 {
-    out.push(tail)
-  }
-  out
-}
-
-fn parse_int_simple(s : String) -> Int {
-  let mut n = 0
-  let mut neg = false
-  let mut i = 0
-  if s.length() > 0 && s.code_unit_at(0) == 45 {
-    neg = true
-    i = 1
-  }
-  while i < s.length() {
-    let c = s.code_unit_at(i)
-    if c >= 48 && c <= 57 {
-      n = n * 10 + (c - 48)
-    } else {
-      break
-    }
-    i += 1
-  }
-  if neg { -n } else { n }
-}
-
-fn parse_double_simple(s : String) -> Double {
-  let mut neg = false
-  let mut i = 0
-  if s.length() > 0 && s.code_unit_at(0) == 45 {
-    neg = true
-    i = 1
-  }
-  let mut whole = 0.0
-  while i < s.length() {
-    let c = s.code_unit_at(i)
-    if c >= 48 && c <= 57 {
-      whole = whole * 10.0 + (c - 48).to_double()
-      i += 1
-    } else {
-      break
-    }
-  }
-  let mut frac = 0.0
-  let mut scale = 0.1
-  if i < s.length() && s.code_unit_at(i) == 46 {
-    i += 1
-    while i < s.length() {
-      let c = s.code_unit_at(i)
-      if c >= 48 && c <= 57 {
-        frac = frac + (c - 48).to_double() * scale
-        scale = scale * 0.1
-        i += 1
-      } else {
-        break
+    // its system video layer, where the host has one: a native view of its own (kind 4, the stream's id)
+    if self.layer && self.id != 0 && h_stream_layers() {
+      let v = NativeView::make(4, self.id.to_string(), Option::None)
+      if v.here() {
+        self.view = Some(v)
       }
     }
   }
-  let mut v = whole + frac
-  if i < s.length() && (s.code_unit_at(i) == 101 || s.code_unit_at(i) == 69) {
-    i += 1
-    let mut eneg = false
-    if i < s.length() && s.code_unit_at(i) == 45 {
-      eneg = true
-      i += 1
-    } else if i < s.length() && s.code_unit_at(i) == 43 {
-      i += 1
-    }
-    let mut exp = 0
-    while i < s.length() {
-      let c = s.code_unit_at(i)
-      if c >= 48 && c <= 57 {
-        exp = exp * 10 + (c - 48)
-        i += 1
-      } else {
-        break
+}
+
+///|
+/// Whether its frames are shown by its system video layer now, nothing of the app's drawn for them: its view shown
+/// in the last frame painted, its decoder the host's own.
+fn Stream::shows_itself(self : Stream) -> Bool {
+  match self.view {
+    Some(v) => !v.closed && v.told_shown && self.feed is Option::None
+    Option::None => false
+  }
+}
+
+///|
+/// Route `route`'s frames (`video`) and sound (`audio`) taken by the host straight from the app's engine
+/// (@hostapi.stream_direct), from the record after the `after`th, the last the app took of it: its frames only while it
+/// shows itself (its system video layer, its decoder the host's, a frame shown, past a key frame). Asked again as each
+/// is taken while it is wanted (the host takes it only when nothing of the route is left in the app's queue); said once
+/// when it is not. Nothing of the app's changes by it: what came so is said by the stream's events ("D").
+pub fn Stream::route(self : Stream, route : Int, after : Double, video~ : Bool, audio~ : Bool) -> Unit {
+  if self.closed || self.id == 0 {
+    return
+  }
+  let video = video && self.routable()
+  let want = (if video || audio { route } else { 0 }, video, audio)
+  if !video && !audio && !self.routed.1 && !self.routed.2 {
+    return
+  }
+  self.routed = want
+  hostapi::stream_direct(self.id, route.to_double(), after, video=video, audio=audio)
+}
+
+///|
+/// Whether a route's frames may be shown by the host as they come: it shows itself, a frame of it shown, its H.264 or
+/// H.265 past a key frame.
+fn Stream::routable(self : Stream) -> Bool {
+  self.shows_itself() && self.h264 && self.at is Some(_) && !self.need_key
+}
+
+///|
+/// The frames that came by a route (Stream::route) as its events said, and their bytes.
+pub fn Stream::direct_count(self : Stream) -> (Int, Int) {
+  (self.direct_frames, self.direct_bytes)
+}
+
+///|
+/// A route's "D TS N BYTES": the frames counted; the one shown, if any (`ts` ≥ 0), shown from now, as far as the app is
+/// concerned (the host showed it and said it shown to its sender).
+fn Stream::take_direct(self : Stream, w : Array[String]) -> Unit {
+  if w.length() < 4 {
+    return
+  }
+  let t = w[1]
+  let n = w[2]
+  let b = w[3]
+  match (stream_num(t), stream_num(n), stream_num(b)) {
+    (Some(ts), Some(n), Some(b)) => {
+      self.direct_frames += n.to_int()
+      self.direct_bytes += b.to_int()
+      if ts >= 0.0 {
+        self.at = Some(ts)
       }
     }
-    let mut p = 1.0
-    let mut k = 0
-    while k < exp && k < 308 {
-      p = p * 10.0
-      k += 1
-    }
-    v = if eneg { v / p } else { v * p }
-  }
-  if neg { -v } else { v }
-}
-
-struct TreeStream {
-  node_id : view::NodeId
-  stream : Stream
-  fit : Fit
-  closes : Bool
-  layer : () -> Bool
-  mut drawn_this_frame : Bool
-}
-
-let tree_streams : Array[TreeStream] = []
-
-fn find_tree_stream(id : view::NodeId) -> Option[TreeStream] {
-  if tree_streams.length() == 0 {
-    return None
-  }
-  for ts in tree_streams {
-    if ts.node_id == id {
-      return Some(ts)
-    }
-  }
-  None
-}
-
-fn remove_tree_stream(id : view::NodeId) -> Option[TreeStream] {
-  let mut idx = -1
-  let mut i = 0
-  while i < tree_streams.length() {
-    if tree_streams[i].node_id == id {
-      idx = i
-      break
-    }
-    i += 1
-  }
-  if idx >= 0 {
-    let removed = tree_streams[idx]
-    array_remove_at(tree_streams, idx)
-    Some(removed)
-  } else {
-    None
+    _ => ()
   }
 }
 
-/// Mount decoded host stream `s` as a pure-tree node. Hides while undrawn; closes on unmount unless `closes=false`.
-pub fn stream(
-  parent : view::View,
-  s : Stream,
-  fit~ : Fit = Fit::FitFill,
-  closes~ : Bool = true,
-  layer~ : () -> Bool = fn() { false },
-) -> view::View {
-  parent.box(fn(b : view::View) {
-    let id = b.id()
-    let ts = TreeStream::{ node_id: id, stream: s, fit, closes, layer, drawn_this_frame: false }
-    tree_streams.push(ts)
-    let _ = b.owns(fn() {
-      match remove_tree_stream(id) {
-        Some(removed) => {
-          removed.stream.visible = false
-          if removed.closes {
-            removed.stream.close()
-          }
+///|
+/// A host's event taken as it comes, while the stream shows itself (streams_arrive): a frame decoded of the size it
+/// shows (shown on its layer and said shown at once), one let go (said), its decoder broken. False for one that
+/// changes what the app draws (the first frame, another size): taken as the frame is built, as before.
+fn Stream::take_quietly(self : Stream, e : String) -> Bool {
+  let w = mbt_compat::arr_to_array(mbt_compat::arr_map(e.split(" "), fn(x) { mbt_compat::str_to_owned(x) }))
+  match w {
+    __mbt_ap_146 if (__mbt_ap_146).length() >= 4 && (match (__mbt_ap_146[0], __mbt_ap_146[1], __mbt_ap_146[2], __mbt_ap_146[3]) { ("f", t, pw, ph) => true, _ => false }) => match (__mbt_ap_146[0], __mbt_ap_146[1], __mbt_ap_146[2], __mbt_ap_146[3]) { ("f", t, pw, ph) => {
+      let wait_us = stream_wait_us(w, 4)
+      match (stream_num(t), stream_num(pw), stream_num(ph)) {
+        (Some(ts), _, _) if self.unhide(ts) => {
+          // (one not to be shown: let go, as its host would have said)
+          self.settled_to(ts, wake=false)
+          self.say_shown(ts, wait_us)
+          true
         }
-        None => ()
+        (Some(ts), Some(fw), Some(fh)) => {
+          let size = if self.h264 && self.cw > 0 && self.ch > 0 {
+            Some((self.cw, self.ch))
+          } else {
+            Some((fw.to_int(), fh.to_int()))
+          }
+          if self.at is Option::None || size != self.size {
+            return false
+          }
+          match self.quiet {
+            Some(f) if !f(ts) => return false
+            _ => ()
+          }
+          self.at = Some(ts)
+          self.settled_to(ts, wake=false)
+          h_stream_show(self.id, ts)
+          self.say_shown(ts, wait_us)
+          true
+        }
+        _ => false
       }
-    })
-  })
+    }, _ => panic("unreachable") }
+    __mbt_ap_147 if (__mbt_ap_147).length() >= 2 && (match (__mbt_ap_147[0], __mbt_ap_147[1]) { ("d", t) => true, _ => false }) => match (__mbt_ap_147[0], __mbt_ap_147[1]) { ("d", t) => {
+      let wait_us = stream_wait_us(w, 2)
+      match stream_num(t) {
+        Some(ts) => {
+          self.unhide(ts) |> ignore
+          self.settled_to(ts, wake=false)
+          self.say_shown(ts, wait_us)
+          true
+        }
+        Option::None => false
+      }
+    }, _ => panic("unreachable") }
+    __mbt_ap_148 if (__mbt_ap_148).length() >= 1 && (match __mbt_ap_148[0] { "b" => true, _ => false }) => match __mbt_ap_148[0] { "b" => {
+      self.need_key = true
+      (self.broken)()
+      true
+    }, _ => panic("unreachable") }
+    __mbt_ap_149 if (__mbt_ap_149).length() >= 2 && (match (__mbt_ap_149[0], __mbt_ap_149[1]) { ("D", t) => true, _ => false }) => match (__mbt_ap_149[0], __mbt_ap_149[1]) { ("D", t) => match (stream_num(t), self.quiet) {
+      (Some(ts), Some(f)) if ts >= 0.0 && !f(ts) => false
+      (Some(_), _) => {
+        self.take_direct(w)
+        true
+      }
+      _ => false
+    }, _ => panic("unreachable") }
+    _ => false
+  }
 }
 
-/// Pure-tree hardware-decoded video/remote-screen stream node (`st_open/show/close/frame/pointer`).
-pub fn stream_view_node(
-  parent : view::View,
-  s : Stream,
-  fit~ : Fit = Fit::FitFill,
-  closes~ : Bool = true,
-  layer~ : () -> Bool = fn() { false },
-) -> view::View {
-  let _ = s.ensure_open()
-  stream(parent, s, fit=fit, closes=closes, layer=layer)
+///|
+/// Frame `ts` handed over: the host's (or its own) until its fate is said.
+fn Stream::hand_over(self : Stream, ts : Double) -> Unit {
+  stream_tickets.v += 1
+  let n = stream_tickets.v
+  outside_start(outside_stream, n, "stream \{self.id} frame \{mbt_compat::double_to_string(ts)}")
+  self.out.push((ts, n))
 }
 
-fn streams_frame_begin() -> Unit {
+///|
+/// Frame `ts` let go here (before a key frame, nothing to decode it): said as the next frame begins, the frame that
+/// takes it asked for unless this one is still to take it. One let go in a frame that took its events already waits
+/// for the next frame's start (streams_frame_start): that frame is owed now (Ctx::owe_next). `wake` false (a frame not to
+/// be shown): no frame asked for it, as a host asks none for such a frame.
+fn Stream::let_go(self : Stream, ts : Double, wake? : Bool) -> Unit {
+  let wake = match wake { Some(__mbt_v) => __mbt_v, None => true }
+
+  self.own.push("d \{mbt_compat::double_to_string(ts)}")
+  if wake {
+    self.owe()
+  }
+}
+
+///|
+/// What it said itself is taken as the next frame begins: that frame asked for (owed, when this one took its events).
+fn Stream::owe(self : Stream) -> Unit {
+  let c = g()
+  if in_frame.v && self.taken == c.frame_no {
+    c.owe_next()
+  } else if !in_frame.v {
+    c.read_changed("stream \{self.id} said")
+  }
+}
+
+///|
+/// The frames up to `ts` are no longer the host's (`wake` false: nothing shown changes for it, no frame asked).
+fn Stream::settled_to(self : Stream, ts : Double, wake? : Bool) -> Unit {
+  let wake = match wake { Some(__mbt_v) => __mbt_v, None => true }
+
+  let left = []
+  for o in self.out {
+    if o.0 <= ts {
+      outside_end(outside_stream, o.1, wake=wake)
+    } else {
+      left.push(o)
+    }
+  }
+  self.out.clear()
+  mbt_compat::arr_append(self.out, left)
+}
+
+///|
+/// A number of an event's.
+fn stream_num(s : String) -> Option[Double] {
+  match (match mbt_compat::mbt_json_parse(s) { Ok(__mbt_ok_28) => Some(__mbt_ok_28), Err(_) => None }) {
+    Some(.Number(d, _)) => Some(d)
+    _ => Option::None
+  }
+}
+
+///|
+/// As a frame begins, before it is decided what it does again (frame_watch.pion): what the host said of each stream
+/// since the last, taken after what it said itself; where any came, said come from outside (the frame is built and
+/// takes it: streams_frame_start).
+fn streams_arrive() -> Unit {
+  let mut came = false
   for s in open_streams {
-    s.poll()
+    if s.take_said() {
+      came = true
+    }
   }
-  for ts in tree_streams {
-    ts.drawn_this_frame = false
+  if came {
+    outside_counted()
   }
 }
 
-fn streams_frame_end() -> Unit {
-  for ts in tree_streams {
-    ts.stream.visible = ts.drawn_this_frame && !ts.stream.closed
+///|
+/// What its host said since, taken: while it shows itself (its system video layer), what changes nothing drawn taken
+/// now, in order, till one does; the rest kept for the frame that takes it (streams_frame_start). Whether any was.
+fn Stream::take_said(self : Stream) -> Bool {
+  if self.closed || self.id == 0 {
+    return false
+  }
+  let s = self
+  let quiet = s.shows_itself()
+  let mut came = false
+  // (a bound, so a host that says without end cannot hold the frame)
+  for _ in 0..<256 {
+    let e = h_stream_next(s.id)
+    if e == "" {
+      break
+    }
+    if quiet && s.own.is_empty() && s.take_quietly(e) {
+      continue
+    }
+    s.own.push(e)
+    came = true
+  }
+  came
+}
+
+///|
+/// Between frames, stream `id`'s host said something (hostcall.pion's outside_streamed: a host whose streams show
+/// themselves): taken now; a frame asked for only where something is left for it, none for a frame its layer shows.
+fn streams_said(id : Int) -> Unit {
+  if in_frame.v {
+    // (the frame being drawn takes it, or the next: streams_arrive)
+    outside_counted()
+    return
   }
   for s in open_streams {
-    s.flush_acks()
-  }
-}
-
-/// Native host view handle (e.g., WebView, video surface) mounted directly as a pure-tree node.
-pub struct NativeView {
-  pub phys_id : Int
-  pub mut id : Int
-  pub kind : Int
-  pub mut visible : Bool
-  pub mut closed : Bool
-}
-
-pub fn NativeView::new(kind : Int) -> NativeView {
-  NativeView::open(kind, arg="")
-}
-
-pub fn NativeView::open(kind : Int, arg~ : String = "") -> NativeView {
-  let id = hostapi::view_open(kind, arg)
-  NativeView::{ phys_id: next_ui_id(), id, kind, visible: false, closed: false }
-}
-
-/// Send an opaque message `(what, text)` to this native host view (`hostapi::view_tell`).
-pub fn NativeView::tell(self : NativeView, what : Int, text : String) -> Unit {
-  if !self.closed && self.id > 0 {
-    hostapi::view_tell(self.id, what, text)
-  }
-}
-
-pub fn NativeView::close(self : NativeView) -> Unit {
-  if self.closed {
-    return
-  }
-  self.closed = true
-  self.visible = false
-  if self.id > 0 {
-    hostapi::view_close(self.id)
-    self.id = 0
-  }
-}
-
-struct TreeNative {
-  node_id : view::NodeId
-  view : NativeView
-  kept : Bool
-  mut drawn_this_frame : Bool
-}
-
-let tree_natives : Array[TreeNative] = []
-
-fn find_tree_native(id : view::NodeId) -> Option[TreeNative] {
-  if tree_natives.length() == 0 {
-    return None
-  }
-  for tn in tree_natives {
-    if tn.node_id == id {
-      return Some(tn)
+    if s.id == id {
+      // (what is left: a frame, which takes it)
+      if s.take_said() {
+        outside_left()
+      }
+      return
     }
   }
-  None
 }
 
-fn remove_tree_native(id : view::NodeId) -> Option[TreeNative] {
-  let mut idx = -1
-  let mut i = 0
-  while i < tree_natives.length() {
-    if tree_natives[i].node_id == id {
-      idx = i
-      break
+///|
+/// As the frame is built (frame_body, before the view builds): each stream's events since the last, its own then the
+/// host's (streams_arrive), in the order said; the last frame said decoded is the one it shows from now (the host told
+/// to latch it).
+fn streams_frame_start() -> Unit {
+  let c = g()
+  for s in open_streams.copy() {
+    if s.closed {
+      continue
     }
-    i += 1
-  }
-  if idx >= 0 {
-    let removed = tree_natives[idx]
-    array_remove_at(tree_natives, idx)
-    Some(removed)
-  } else {
-    None
-  }
-}
-
-/// Mount a NativeView as a pure-tree node. Hides while undrawn; closes on unmount unless `kept=true`.
-pub fn native(
-  parent : view::View,
-  nv : NativeView,
-  kept~ : Bool = false,
-) -> view::View {
-  parent.box(fn(b : view::View) {
-    let id = b.id()
-    tree_natives.push(TreeNative::{ node_id: id, view: nv, kept, drawn_this_frame: false })
-    let _ = b.owns(fn() {
-      match remove_tree_native(id) {
-        Some(removed) => {
-          if removed.view.visible && removed.view.id > 0 && !removed.view.closed {
-            hostapi::view_place(
-              removed.view.id, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false,
-            )
+    // (its frames routed to the host while it showed itself: no longer, now it does not; its sound goes on)
+    if s.routed.1 && !s.routable() {
+      s.route(s.routed.0, -1.0, video=false, audio=s.routed.2)
+    }
+    s.taken = c.frame_no
+    // (what the host said of it, taken as the frame began: streams_arrive)
+    let events = s.own.copy()
+    s.own.clear()
+    let latch : mbt_compat::Ref[Option[Double]] = mbt_compat::ref_new(None)
+    let take = fn(e : String) {
+      let w = mbt_compat::arr_to_array(mbt_compat::arr_map(e.split(" "), fn(x) { mbt_compat::str_to_owned(x) }))
+      match w {
+        __mbt_ap_150 if (__mbt_ap_150).length() >= 4 && (match (__mbt_ap_150[0], __mbt_ap_150[1], __mbt_ap_150[2], __mbt_ap_150[3]) { ("f", t, pw, ph) => true, _ => false }) => match (__mbt_ap_150[0], __mbt_ap_150[1], __mbt_ap_150[2], __mbt_ap_150[3]) { ("f", t, pw, ph) => {
+          let wait_us = stream_wait_us(w, 4)
+          match (stream_num(t), stream_num(pw), stream_num(ph)) {
+            // (one not to be shown, said decoded: let go, never latched)
+            // (one not to be shown, said decoded: let go, never latched)
+            (Some(ts), _, _) if s.unhide(ts) => {
+              s.acks.push((ts, wait_us))
+              s.settled_to(ts)
+            }
+            (Some(ts), Some(fw), Some(fh)) => {
+              s.at = Some(ts)
+              s.size = if s.h264 && s.cw > 0 && s.ch > 0 {
+                Some((s.cw, s.ch))
+              } else {
+                Some((fw.to_int(), fh.to_int()))
+              }
+              latch.v = Some(ts)
+              s.acks.push((ts, wait_us))
+              s.settled_to(ts)
+            }
+            _ => ()
           }
-          removed.view.visible = false
-          if !removed.kept {
-            removed.view.close()
+        }, _ => panic("unreachable") }
+        __mbt_ap_151 if (__mbt_ap_151).length() >= 2 && (match (__mbt_ap_151[0], __mbt_ap_151[1]) { ("d", t) => true, _ => false }) => match (__mbt_ap_151[0], __mbt_ap_151[1]) { ("d", t) => {
+          let wait_us = stream_wait_us(w, 2)
+          match stream_num(t) {
+            Some(ts) => {
+              s.unhide(ts) |> ignore
+              s.acks.push((ts, wait_us))
+              s.settled_to(ts)
+            }
+            Option::None => ()
           }
+        }, _ => panic("unreachable") }
+        __mbt_ap_152 if (__mbt_ap_152).length() >= 1 && (match __mbt_ap_152[0] { "b" => true, _ => false }) => match __mbt_ap_152[0] { "b" => {
+          s.need_key = true
+          (s.broken)()
+        }, _ => panic("unreachable") }
+        __mbt_ap_153 if (__mbt_ap_153).length() >= 1 && (match __mbt_ap_153[0] { "D" => true, _ => false }) => match __mbt_ap_153[0] { "D" => s.take_direct(w), _ => panic("unreachable") }
+        _ => ()
+      }
+    }
+    for e in events {
+      match (mbt_compat::str_has_prefix(e, "c "), s.feed) {
+        (true, Some(f)) => {
+          // the host's decoder or surface said something: what the feed makes of it taken now, in its place
+          f.event(({ let __mbt_sl_154 = mbt_compat::arr_to_array(mbt_compat::arr_map(e.split(" "), fn(x) { mbt_compat::str_to_owned(x) })); mbt_compat::array_slice_clamp(__mbt_sl_154, 1, __mbt_sl_154.length()) }))
+          let said = f.said.copy()
+          f.said.clear()
+          for x in said {
+            take(x)
+          }
+          s.feed_host(f)
         }
-        None => ()
+        (true, None) => ()
+        _ => take(e)
       }
-    })
-  })
-}
-
-/// Pure-tree native host view node (WebView, video surface, etc.) managing `view_open/place/close/tell`.
-pub fn native_view_node(
-  parent : view::View,
-  kind : Int,
-  arg~ : String = "",
-  kept~ : Bool = false,
-  on_ready? : (NativeView) -> Unit,
-) -> view::View {
-  let nv = NativeView::open(kind, arg=arg)
-  match on_ready {
-    Some(cb) => cb(nv)
-    None => ()
-  }
-  native(parent, nv, kept=kept)
-}
-
-fn natives_frame_begin() -> Unit {
-  for tn in tree_natives {
-    tn.drawn_this_frame = false
-  }
-}
-
-fn natives_frame_end() -> Unit {
-  for tn in tree_natives {
-    let should_show = tn.drawn_this_frame && !tn.view.closed
-    if tn.view.visible && !should_show && tn.view.id > 0 {
-      hostapi::view_place(tn.view.id, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false)
     }
-    tn.view.visible = should_show
-  }
-}
-
-/// Native host PTY/VT terminal handle mounted directly as a pure-tree node.
-pub struct NativeTerminal {
-  pub phys_id : Int
-  pub mut id : Int
-  mut handle : Option[hostapi::Terminal]
-  pub mut cols : Int
-  pub mut rows : Int
-  pub mut cell_w : Int
-  pub mut cell_h : Int
-  pub mut visible : Bool
-  pub mut closed : Bool
-  pub mut last_frame : Bytes
-}
-
-pub fn NativeTerminal::open(
-  cols~ : Int = 80,
-  rows~ : Int = 24,
-  cell_w~ : Int = 8,
-  cell_h~ : Int = 16,
-) -> NativeTerminal {
-  let c = if cols > 0 { cols } else { 80 }
-  let r = if rows > 0 { rows } else { 24 }
-  let handle = hostapi::Terminal::open(c, r)
-  let id = match handle {
-    Some(t) => t.id
-    None => 0
-  }
-  NativeTerminal::{
-    phys_id: next_ui_id(),
-    id,
-    handle,
-    cols: c,
-    rows: r,
-    cell_w: if cell_w > 0 { cell_w } else { 8 },
-    cell_h: if cell_h > 0 { cell_h } else { 16 },
-    visible: false,
-    closed: id <= 0,
-    last_frame: "".to_bytes(),
-  }
-}
-
-pub fn NativeTerminal::write(self : NativeTerminal, data : Bytes) -> Unit {
-  if !self.closed {
-    match self.handle {
-      Some(t) => t.write(data)
-      None => ()
-    }
-  }
-}
-
-pub fn NativeTerminal::resize(
-  self : NativeTerminal,
-  cols : Int,
-  rows : Int,
-  cell_w : Int,
-  cell_h : Int,
-) -> Unit {
-  if self.closed {
-    return
-  }
-  let c = if cols > 0 { cols } else { 1 }
-  let r = if rows > 0 { rows } else { 1 }
-  let cw = if cell_w > 0 { cell_w } else { 8 }
-  let ch = if cell_h > 0 { cell_h } else { 16 }
-  if c == self.cols && r == self.rows && cw == self.cell_w && ch == self.cell_h {
-    return
-  }
-  self.cols = c
-  self.rows = r
-  self.cell_w = cw
-  self.cell_h = ch
-  match self.handle {
-    Some(t) => t.resize(c, r, cell_w=cw, cell_h=ch)
-    None => ()
-  }
-}
-
-pub fn NativeTerminal::modes(self : NativeTerminal) -> Int {
-  if self.closed {
-    return -1
-  }
-  match self.handle {
-    Some(t) => {
-      let m = t.modes()
-      if m < 0 {
-        // (failed to open: release the host's handle now, not when the view goes)
-        self.close()
-      }
-      m
-    }
-    None => {
-      self.closed = true
-      -1
-    }
-  }
-}
-
-pub fn NativeTerminal::frame(self : NativeTerminal, full~ : Bool = false) -> Bytes {
-  if self.closed {
-    return "".to_bytes()
-  }
-  match self.handle {
-    Some(t) => {
-      if t.modes() < 0 {
-        self.close()
-        return "".to_bytes()
-      }
-      let b = t.frame(full=full)
-      self.last_frame = b
-      b
-    }
-    None => "".to_bytes()
-  }
-}
-
-pub fn NativeTerminal::close(self : NativeTerminal) -> Unit {
-  if self.closed {
-    return
-  }
-  self.closed = true
-  self.visible = false
-  match self.handle {
-    Some(t) => {
-      t.close()
-      self.handle = None
-      self.id = 0
-    }
-    None => ()
-  }
-}
-
-struct TreeTerminal {
-  node_id : view::NodeId
-  term : NativeTerminal
-  cell_w : Double
-  cell_h : Double
-  closes : Bool
-  mut drawn_this_frame : Bool
-}
-
-let tree_terminals : Array[TreeTerminal] = []
-
-fn find_tree_terminal(id : view::NodeId) -> Option[TreeTerminal] {
-  if tree_terminals.length() == 0 {
-    return None
-  }
-  for tt in tree_terminals {
-    if tt.node_id == id {
-      return Some(tt)
-    }
-  }
-  None
-}
-
-fn remove_tree_terminal(id : view::NodeId) -> Option[TreeTerminal] {
-  let mut idx = -1
-  let mut i = 0
-  while i < tree_terminals.length() {
-    if tree_terminals[i].node_id == id {
-      idx = i
-      break
-    }
-    i += 1
-  }
-  if idx >= 0 {
-    let removed = tree_terminals[idx]
-    array_remove_at(tree_terminals, idx)
-    Some(removed)
-  } else {
-    None
-  }
-}
-
-/// Pure-tree native PTY/VT terminal node managing `tm_open/resize/write/frame/close`.
-pub fn native_terminal_node(
-  parent : view::View,
-  term : NativeTerminal,
-  cell_w~ : Double = 8.0,
-  cell_h~ : Double = 16.0,
-  closes~ : Bool = true,
-) -> view::View {
-  let cw = if cell_w > 0.0 { cell_w } else { 8.0 }
-  let ch = if cell_h > 0.0 { cell_h } else { 16.0 }
-  parent.box(fn(b : view::View) {
-    let id = b.id()
-    tree_terminals.push(TreeTerminal::{
-      node_id: id,
-      term,
-      cell_w: cw,
-      cell_h: ch,
-      closes,
-      drawn_this_frame: false,
-    })
-    let _ = b.owns(fn() {
-      match remove_tree_terminal(id) {
-        Some(removed) => {
-          removed.term.visible = false
-          if removed.closes {
-            removed.term.close()
+    match latch.v {
+      Some(ts) if s.id != 0 && !s.closed => {
+        match s.feed {
+          Some(f) => {
+            f.latch(ts)
+            // (what it said meanwhile, the next frame's)
+            s.fed()
           }
+          Option::None => h_stream_show(s.id, ts)
         }
-        None => ()
+        match s.latched {
+          Some(f) => f(ts)
+          Option::None => ()
+        }
       }
-    })
-  })
-}
-
-fn terminals_frame_begin() -> Unit {
-  for tt in tree_terminals {
-    tt.drawn_this_frame = false
-  }
-}
-
-fn terminals_frame_end() -> Unit {
-  for tt in tree_terminals {
-    tt.term.visible = tt.drawn_this_frame && !tt.term.closed
-  }
-}
-
-fn streams_and_natives_reset() -> Unit {
-  open_streams.clear()
-  tree_streams.clear()
-  tree_natives.clear()
-  tree_terminals.clear()
-}
-
-/// Scrollbar constants matching upstream scroll_bar.mbt.
-pub let scroll_bar_size : Double = 3.0
-pub let scroll_bar_inset : Double = 3.0
-pub let scroll_bar_least : Double = 28.0
-pub let scroll_bar_near : Double = 20.0
-pub let scroll_bar_grab : Double = 6.0
-pub let scrollbar_hold_ms : Double = 1000.0
-pub let scrollbar_fade_ms : Double = 200.0
-
-fn bars_drawn() -> Bool {
-  match pointing() {
-    Pointing::Mouse => true
-    Pointing::Finger => false
-  }
-}
-
-/// Standard scrollbar configuration for pure-tree `View::scrolls(..., bar=tree_scroll_bar())`.
-pub fn tree_scroll_bar() -> view::ScrollBar {
-  let at = fn(share : Double) -> () -> Int64 {
-    fn() {
-      let fg = tree_theme().fg
-      (fg & c64(0xFFFF, 0xFF00)) | (((fg & 0xFFL).to_double() * share).round().to_int64() & 0xFFL)
+      _ => ()
     }
   }
-  view::ScrollBar::{
-    drawn: fn() { bars_drawn() },
-    ink: at(0.26),
-    ink_held: at(0.45),
-    ease: fn(t : Double) { ease_at(Ease::Out, t) },
-    size: scroll_bar_size,
-    inset: scroll_bar_inset,
-    least: scroll_bar_least,
-    near: scroll_bar_near,
-    grab: scroll_bar_grab,
-    hold_ms: scrollbar_hold_ms,
-    fade_ms: scrollbar_fade_ms,
+}
+
+///|
+/// Once the frame is painted: the frames taken in it said shown, drawn or not.
+fn streams_after_paint() -> Unit {
+  for s in open_streams.copy() {
+    if s.acks.length() == 0 {
+      continue
+    }
+    let acks = s.acks.copy()
+    s.acks.clear()
+    for ack in acks {
+      s.say_shown(ack.0, ack.1)
+    }
   }
 }
 
-/// Create a new child scrollable column with sane defaults:
-/// - creates its OWN child box (never mutates `parent` or clobbers sibling headers/footers)
-/// - fills remaining flex space safely (`fill=true` -> grow(1) + shrink(1) + basis(0) + min_width(0) + min_height(0))
-/// - attaches `ui::tree_scroll_bar()` and `ui::touch_slop()` automatically
-pub fn scroll_box(
-  parent : view::View,
-  body : (view::View) -> Unit,
-  scroll? : view::Scroll,
-  fill~ : Bool = true,
-  bar~ : Bool = true,
-  loc~ : String = "",
-) -> view::View {
-  let s = match scroll {
-    Some(sc) => sc
-    None => view::Scroll::new()
+///|
+/// Where `s` is drawn: a node of `w` × `h` (filling its parent by default), its picture stretched to it (`fit`: as an
+/// image's), or drawn at `at` (x, y, w, h from the node's top left: zoomed, panned; only what is inside the clip it is
+/// painted in shows). Drawn as an image is, at the box's opacity, in its clip and transforms, under what is painted
+/// after it; nothing until a frame shows. `layer`: a stream shown by its system video layer (Stream::new's `layer`)
+/// shown there, under the canvas, once an H.264 frame of it shows (JPEG's are drawn here; stretched to its rect: `fit` FitFill; whole, not faded:
+/// what is painted over it draws over it, a glass over it frosts the canvas alone); else drawn by the app.
+pub fn Ctx::stream(self : Ctx, s : Stream, w? : Size, h? : Size, fit? : Fit, radius? : Double, at? : Option[(Double, Double, Double, Double)], layer? : Bool) -> Int {
+  let w = match w { Some(__mbt_v) => __mbt_v, None => Size::Fill(1.0) }
+  let h = match h { Some(__mbt_v) => __mbt_v, None => Size::Fill(1.0) }
+  let fit = match fit { Some(__mbt_v) => __mbt_v, None => Fit::FitFill }
+  let radius = match radius { Some(__mbt_v) => __mbt_v, None => 0.0 }
+  let at = match at { Some(__mbt_v) => __mbt_v, None => Option::None }
+  let layer = match layer { Some(__mbt_v) => __mbt_v, None => true }
+
+  match s.view {
+    Some(v) if layer && s.h264 && fit is Fit::FitFill && radius == 0.0 && !s.closed && s.at is Some(_) =>
+    return self.native(v, w=w, h=h, content=at)
+    _ => ()
   }
-  parent.box(fn(vp : view::View) {
-    let _ = if bar {
-      vp.scrolls(s, body, slop=touch_slop(), bar=tree_scroll_bar(), fill=false)
-    } else {
-      vp.scrolls(s, body, slop=touch_slop(), fill=false)
-    }
-    if fill {
-      let _ = vp.fill(loc=loc)
-    }
-  })
+  let i = self.image("", w=w, h=h, fit=fit, radius=radius, bg=0L, fade=false)
+  stream_nodes.set(i, (s, at))
+  // (its frames come as they are decoded: a part kept builds it each frame, kept_part.pion)
+  part_live()
+  i
 }
 
-/// Create a new child horizontally scrollable row (`view::Scroll::across()`) with sane defaults.
-pub fn scroll_row(
-  parent : view::View,
-  body : (view::View) -> Unit,
-  scroll? : view::Scroll,
-  fill~ : Bool = true,
-  bar~ : Bool = true,
-  loc~ : String = "",
-) -> view::View {
-  let s = match scroll {
-    Some(sc) => sc
-    None => view::Scroll::across()
+///|
+/// Node `i`'s stream drawn (paint_image): an instance of kind 4 whose image is the stream's (@hostapi.stream_tex_base +
+/// its id), as an image's is placed.
+fn Ctx::paint_stream(self : Ctx, i : Int, n : Node, alpha : Double) -> Bool {
+  let (s, at) = match stream_nodes.get(i) {
+    Some(x) => x
+    Option::None => return false
   }
-  parent.box(fn(vp : view::View) {
-    let _ = if bar {
-      vp.scrolls(s, body, slop=touch_slop(), bar=tree_scroll_bar(), fill=false)
-    } else {
-      vp.scrolls(s, body, slop=touch_slop(), fill=false)
+  let (pw, ph) = match s.size {
+    Some((pw, ph)) if !s.closed && s.id != 0 && pw > 0 && ph > 0 => (pw.to_double(), ph.to_double())
+    _ => return true
+  }
+  let (bx, by, bw, bh, fit) = match at {
+    Some((x, y, w, h)) => (n.x + x, n.y + y, w, h, Fit::FitFill)
+    None => (n.x, n.y, n.fw, n.fh, n.fit)
+  }
+  if bw <= 0.0 || bh <= 0.0 {
+    return true
+  }
+  let (x, y, w, h, u0, v0, du, dv) = match fit {
+    Fit::FitFill => (bx, by, bw, bh, 0.0, 0.0, 1.0, 1.0)
+    Fit::FitCover | Fit::FitCoverAt(_) | Fit::FitCoverFrom(_, _) => {
+      let k = dmax(bw / pw, bh / ph)
+      let du = bw / k / pw
+      let dv = bh / k / ph
+      let (across, down) = fit.cover_from()
+      (bx, by, bw, bh, (1.0 - du) * across, (1.0 - dv) * down, du, dv)
     }
-    if fill {
-      let _ = vp.fill(loc=loc)
+    Fit::FitContain => {
+      let k = dmin(bw / pw, bh / ph)
+      let w = pw * k
+      let h = ph * k
+      (bx + (bw - w) / 2.0, by + (bh - h) / 2.0, w, h, 0.0, 0.0, 1.0, 1.0)
     }
-  })
+  }
+  self.push_inst(x, y, w, h, n.radius, 4.0, 0.0, 0.0, 0xFFFFFFFFL, alpha, u0, v0, du, dv)
+  self.corners_last(n)
+  self.inst[(self.ninst - 1) * inst_size + 20] = (hostapi::stream_tex_base + s.id).to_double()
+  true
+}
+
+///|
+/// The stream an instance's image is, if it is one's.
+fn stream_of_image(image : Int) -> Option[Stream] {
+  if image <= hostapi::stream_tex_base {
+    return Option::None
+  }
+  let id = image - hostapi::stream_tex_base
+  for s in open_streams {
+    if s.id == id {
+      return Some(s)
+    }
+  }
+  Option::None
+}
+
+///|
+/// What a frame's stream picture is, for its hash and its text (frames.pion): its size and its frame's time; "" for an
+/// image that is no stream's.
+fn stream_drawn(image : Int) -> String {
+  match stream_of_image(image) {
+    Some(s) =>
+    match (s.size, s.at) {
+      (Some((w, h)), Some(ts)) => "stream \{w}x\{h} ts=\{mbt_compat::double_to_string(ts)}"
+      _ => "stream"
+    }
+    Option::None => ""
+  }
+}
+
+// ── the host ───────────────────────────────────────────────────────────
+
+///|
+fn h_stream_open() -> Int {
+  hostapi::stream_open()
+}
+
+///|
+fn h_stream_h264(id : Int, avcc : Bytes, w : Int, h : Int) -> Unit {
+  hostapi::stream_h264(id, avcc, w, h)
+}
+
+///|
+fn h_stream_frame(id : Int, data : Bytes, key : Bool, ts : Double) -> Unit {
+  hostapi::stream_frame(id, data, key, ts)
+}
+
+///|
+fn h_stream_jpeg(id : Int, data : Bytes, ts : Double) -> Unit {
+  hostapi::stream_jpeg(id, data, ts)
+}
+
+///|
+fn h_stream_show(id : Int, ts : Double) -> Unit {
+  hostapi::stream_show(id, ts)
+}
+
+///|
+fn h_stream_codec(id : Int, cmd : String, data : Bytes) -> Unit {
+  hostapi::stream_codec(id, cmd, data)
+}
+
+///|
+/// Whether the host's H.264 decoder is driven from here (stream_feed.pion): Tester::set_stream_feeds, a run's ENV line.
+fn h_stream_feeds() -> Bool {
+  feeds_said.now()
+}
+
+///|
+/// Whether a stream may be shown by the host's own video layer (@hostapi.stream_layers): Tester::set_stream_layers, a
+/// run's ENV line.
+fn h_stream_layers() -> Bool {
+  layers_said.now()
+}
+
+///|
+/// Whether that layer shows the stream's tagged colours (@hostapi.stream_layers_tagged): a Tester's unless it said its
+/// host's are sRGB (Tester::set_stream_layers_srgb), a run's ENV line.
+fn h_stream_layers_tagged() -> Bool {
+  hostapi::stream_layers_tagged()
+}
+
+///|
+fn h_stream_close(id : Int) -> Unit {
+  hostapi::stream_close(id)
+}
+
+///|
+/// The stream's next event: the host's (a Tester's as the test or the run said it), on the run's tape as it is taken
+/// (`{"stream":{"id":N,"e":E}}`, what Tester::view_said says again).
+fn h_stream_next(id : Int) -> String {
+  let e = hostapi::stream_next(id)
+  if e != "" && (views_tracer.v is Some(_) || taping()) {
+    view_say(({ let __mbt_pairs_1008_14 : Array[(String, mbt_compat::MbtJson)] = [("stream", mbt_compat::MbtJson::object(({ let __mbt_pairs_1008_39 = [("id", mbt_compat::MbtJson::number(id.to_double())), ("e", mbt_compat::MbtJson::string(e))]; mbt_compat::ordered_map_from_array(__mbt_pairs_1008_39) })))]; mbt_compat::ordered_map_from_array(__mbt_pairs_1008_14) }))
+  }
+  e
+}
+
+///|
+fn h_h264_here() -> Bool {
+  h264_said.now()
+}
+
+///|
+/// A run's `{"stream":{"id":N,"e":E}}` (Tester::view_said): the event said again, taken at the next frame.
+fn fake_stream_said(f : FakeHost, v : mbt_compat::OrderedMap[String, mbt_compat::MbtJson]) -> Bool {
+  match (v.get("id"), v.get("e")) {
+    (Some(.Number(id, _)), Some(String(e))) => {
+      fake_said(f, id.to_int(), e)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn fake_said(f : FakeHost, id : Int, e : String) -> Unit {
+  match f.stream_said.get(id) {
+    Some(q) => q.push(e)
+    Option::None => f.stream_said.set(id, [e])
+  }
+  f.wants = true
+  f.non_clock_requested = true
+}
+
+///|
+/// What the app handed stream `id`'s host, oldest first, a line each: "h264 WxH avcc=N" a config, "frame key=K ts=T
+/// bytes=N" ("… hidden": one not to be shown), "flush drain=D", "jpeg ts=T bytes=N", "show ts=T" the frame it shows from
+/// then, "audio bytes=N", "volume V", "close". Frames let go before reaching it
+/// (before a key frame, nothing to decode them) are not among them.
+pub fn Tester::stream_fed(self : Tester, id : Int) -> Array[String] {
+  self.fake.streams_fed.get(id).unwrap_or([]).copy()
+}
+
+///|
+/// Stream `id`'s host decoded frame `ts`, `w` × `h` pixels: taken at the next frame, which shows it.
+pub fn Tester::stream_shows(self : Tester, id : Int, ts : Double, w : Int, h : Int) -> Unit {
+  fake_said(self.fake, id, "f \{mbt_compat::double_to_string(ts)} \{w} \{h}")
+}
+
+///|
+/// Shown in window `wid` of the run from now on (window_slots.pion), handed to it by what showed it in another: its
+/// picture's layer that window's to place, the one it leaves taking it not back nor hiding it as what showed it there
+/// goes (NativeView::paint_in, Ctx::sync_views).
+pub fn Stream::given_to_window(self : Stream, wid : Int) -> Unit {
+  match self.view {
+    Some(v) => v.wid = wid
+    Option::None => ()
+  }
+}
+
+///|
+/// The streams open now, by their host's ids, oldest first (what a test says each shows: stream_shows).
+pub fn Tester::stream_ids(self : Tester) -> Array[Int] {
+  ignore(self)
+  mbt_compat::arr_map(mbt_compat::arr_filter(open_streams, fn(s) { !s.closed && s.id != 0 }), fn(s) { s.id })
+}
+
+///|
+/// Stream `id`'s host let its frames up to `ts` go undecoded: taken at the next frame.
+pub fn Tester::stream_drops(self : Tester, id : Int, ts : Double) -> Unit {
+  fake_said(self.fake, id, "d \{mbt_compat::double_to_string(ts)}")
+}
+
+///|
+/// Stream `id`'s decoder lost its state: taken at the next frame (`broken`; frames let go until a key frame).
+pub fn Tester::stream_broken(self : Tester, id : Int) -> Unit {
+  fake_said(self.fake, id, "b")
+}
+
+///|
+/// Whether its host's H.264 decoder is driven from here, as Android's (stream_feed.pion): what it is told shows in
+/// stream_fed ("do CMD", "do queue … bytes=N"), what it says is the test's to give (stream_codec_said).
+pub fn Tester::set_stream_feeds(self : Tester, on : Bool) -> Unit {
+  self.fake.stream_feeds = on
+}
+
+///|
+/// Whether a stream asking for one is shown by a system video layer (@hostapi.stream_layers): a native view of kind 4
+/// opened with it (Tester's views), its frames taken as they come while it shows.
+pub fn Tester::set_stream_layers(self : Tester, on : Bool) -> Unit {
+  self.fake.stream_layers = on
+}
+
+///|
+/// Whether its layers (set_stream_layers) show a frame as sRGB whatever colours it is tagged with (Windows'), not as
+/// tagged (Apple's, the default).
+pub fn Tester::set_stream_layers_srgb(self : Tester, on : Bool) -> Unit {
+  self.fake.stream_layers_srgb = on
+}
+
+///|
+/// Stream `id`'s host's decoder or surface said `e` (stream_feed.pion's words, without "c "): taken at the next frame.
+pub fn Tester::stream_codec_said(self : Tester, id : Int, e : String) -> Unit {
+  fake_said(self.fake, id, "c " + e)
+}
+
+///|
+/// Whether a stream asking for it is shown by the host's own video layer (@hostapi.stream_layers) that shows a
+/// video in the colours it is tagged with (Display P3's wider than sRGB's), not the app's sRGB canvas: false where the
+/// host has none, or one that shows it as sRGB (@hostapi.stream_layers_tagged: Windows').
+pub fn stream_layers_here() -> Bool {
+  h_stream_layers_tagged()
+}
+
+///|
+/// This host plays system audio carried alongside a remote screen; recorded with the run's environment.
+pub fn stream_audio_here() -> Bool {
+  hostapi::stream_audio_here()
+}
+
+///|
+/// PCM16 stereo at 48 kHz, 20 ms per packet; empty stops queued audio immediately.
+pub fn Stream::audio(self : Stream, data : Bytes) -> Unit {
+  if self.closed || (data.length() != 0 && data.length() != 3840) { return }
+  if data.length() == 0 && !self.opened { return }
+  self.open()
+  hostapi::stream_audio(self.id, data)
+}
+
+///|
+/// Samples (48 kHz) of its sound played since its sound began, by the host's clock (@hostapi.stream_audio_played):
+/// counted on across its sound stopped and started again, set back only as the stream closes (the app keeps its own base
+/// where it wants another start). 0 before it opens, once closed, or where the host plays none or counts none.
+pub fn Stream::audio_played(self : Stream) -> Double {
+  if self.closed || self.id == 0 {
+    return 0.0
+  }
+  hostapi::stream_audio_played(self.id)
+}
+
+///|
+/// Milliseconds of its sound queued and not played yet (@hostapi.stream_audio_queued): 0 where none is, or the host
+/// says none.
+pub fn Stream::audio_queued(self : Stream) -> Double {
+  if self.closed || self.id == 0 {
+    return 0.0
+  }
+  hostapi::stream_audio_queued(self.id)
+}
+
+///|
+/// Milliseconds of its sound the host wants queued before it starts (@hostapi.stream_audio_wanted: Windows' reserve,
+/// 100 ms at first, up to 300 ms after late packets, coming back to 100 ms once calm): an app pacing packets by
+/// `audio_played` keeps at least this much ahead (`while sent - played < ahead.max(s.audio_wanted())`). Answered before
+/// the stream opens too; 0 once closed, or where the host plays none or says none.
+pub fn Stream::audio_wanted(self : Stream) -> Double {
+  if self.closed {
+    return 0.0
+  }
+  hostapi::stream_audio_wanted(self.id)
+}
+
+///|
+/// Its sound played at volume `v` (1 as it came, 0 silent), from now on, its sound started later too; asked before it
+/// opens, told the host as it does. Where the host has nothing for it, as it came.
+pub fn Stream::audio_volume(self : Stream, v : Double) -> Unit {
+  if self.closed {
+    return
+  }
+  self.volume = Some(v)
+  if self.opened && self.id != 0 {
+    hostapi::stream_audio_volume(self.id, v)
+  }
+}
+
+///|
+pub fn Tester::set_stream_audio(self : Tester, on : Bool) -> Unit { self.fake.audio_here = on }
+
+///|
+/// What stream `id`'s host says of its sound from now (Stream::audio_played, audio_queued): samples played, and
+/// milliseconds queued.
+pub fn Tester::set_stream_audio_clock(self : Tester, id : Int, played : Double, queued : Double) -> Unit {
+  self.fake.stream_audio_clock.set(id, (played, queued))
+}
+
+///|
+/// Milliseconds stream `id`'s host wants queued before its sound starts (Stream::audio_wanted; `id` 0: before a stream
+/// opens, and the default for opened ones).
+pub fn Tester::set_stream_audio_wanted(self : Tester, id : Int, ms : Double) -> Unit {
+  self.fake.stream_audio_wanted.set(id, ms)
+}
+
+///|
+/// Whether its host takes a frame not to be shown (@hostapi.stream_frame_shown: Windows'; the default), or has nothing
+/// for one (false: the app lets such a frame go itself, as on every other host).
+pub fn Tester::set_stream_hides(self : Tester, on : Bool) -> Unit {
+  self.fake.stream_hides = on
+}
+
+///|
+/// Whether its host decodes H.265 (h265_here; false until set).
+pub fn Tester::set_h265(self : Tester, on : Bool) -> Unit {
+  self.fake.h265_here = on
+}
+
+///|
+/// Whether its host decodes AV1 (av1_here; false until set).
+pub fn Tester::set_av1(self : Tester, on : Bool) -> Unit {
+  self.fake.av1_here = on
 }

@@ -1,0 +1,1017 @@
+// INVAR-EXT: Secondary-window reactive context isolation (`signals::register_reactive_context`),
+// per-window lifecycle guards, eager secondary-window tree build/cancellation, and narrow/size helpers.
+
+import "halt"
+import "hostapi"
+import "mbt_compat"
+import "signals"
+import "view"
+
+struct InvarUiCtxSnap {
+  logical : Option[(Int, Int)]
+  window_size : signals::Signal[(Double, Double)]
+  narrow_below : signals::Signal[Double]
+  narrow_enabled : signals::Signal[Bool]
+  window_corner : signals::Signal[Double]
+  window_zoom : signals::Signal[Double]
+  theme_said : signals::Signal[Option[Theme]]
+  theme_of : signals::Signal[Option[() -> Theme]]
+  inset_said : signals::Signal[Option[Bool]]
+  glass_forced : signals::Signal[Int]
+  glass_material : signals::Signal[GlassMaterial]
+  inset : HostSaid[Bool]
+  zoomed : HostSaid[Bool]
+  snap : HostSaid[Int]
+  detached : Bool
+}
+
+let tree_window_size_sig : mbt_compat::Ref[signals::Signal[(Double, Double)]] = mbt_compat::ref_new(
+  signals::signal((0.0, 0.0), same=fn(a, b) { a.0 == b.0 && a.1 == b.1 }),
+)
+let tree_narrow_below_sig : mbt_compat::Ref[signals::Signal[Double]] = mbt_compat::ref_new(
+  signals::signal(700.0, same=fn(a, b) { a == b }),
+)
+let tree_narrow_enabled_sig : mbt_compat::Ref[signals::Signal[Bool]] = mbt_compat::ref_new(
+  signals::signal(false, same=fn(a, b) { a == b }),
+)
+
+let invar_window_ctx_registered : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let logical_window_now : mbt_compat::Ref[Option[(Int, Int)]] = mbt_compat::ref_new(None)
+let disposing_window_instance : mbt_compat::Ref[Option[(Int, Int)]] = mbt_compat::ref_new(None)
+let disposing_primary_epoch : mbt_compat::Ref[Option[Int]] = mbt_compat::ref_new(None)
+let disposing_primary_prev_live0 : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let window_host_detached : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let host_said_detached : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let window_switching : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let window_open_seq : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+let window_live_gen : Map[Int, Int] = Map::new()
+let window_closing_gen : Map[Int, Int] = Map::new()
+let window_active_gen : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+let disposing_window_slots : Map[Int, Array[() -> Unit]] = Map::new()
+let disposing_window_detached : Map[Int, Bool] = Map::new()
+let window_opening_closed : Map[Int, Array[(Int, mbt_compat::Ref[Bool])]] = Map::new()
+let window_opening_saved_slot : Map[Int, Array[() -> Unit]] = Map::new()
+let primary_building_epochs : Array[Int] = []
+let primary_building_saved_slot : Map[Int, Array[() -> Unit]] = Map::new()
+let replacing_app : mbt_compat::Ref[Bool] = mbt_compat::ref_new(false)
+let ui_ctx_depth : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+let ui_ctx_native_base : mbt_compat::Ref[Option[InvarUiCtxSnap]] = mbt_compat::ref_new(None)
+let ui_ctx_epoch : mbt_compat::Ref[Int] = mbt_compat::ref_new(0)
+
+fn window_gen_is(wid : Int, gen : Int) -> Bool {
+  match window_live_gen.get(wid) {
+    Some(g) => g == gen
+    None => false
+  }
+}
+
+fn invar_ui_ctx_snapshot() -> InvarUiCtxSnap {
+  InvarUiCtxSnap::{
+    logical: logical_window_now.v,
+    window_size: tree_window_size_sig.v,
+    narrow_below: tree_narrow_below_sig.v,
+    narrow_enabled: tree_narrow_enabled_sig.v,
+    window_corner: tree_window_corner.v,
+    window_zoom: tree_window_zoom.v,
+    theme_said: tree_theme_said.v,
+    theme_of: tree_theme_of.v,
+    inset_said: tree_inset_said.v,
+    glass_forced: glass_forced_said.v,
+    glass_material: glass_material_said.v,
+    inset: inset_said.v,
+    zoomed: zoomed_said.v,
+    snap: snap_said.v,
+    detached: host_said_detached.v,
+  }
+}
+
+fn invar_ui_ctx_restore(snap : InvarUiCtxSnap) -> Unit {
+  logical_window_now.v = snap.logical
+  tree_window_size_sig.v = snap.window_size
+  tree_narrow_below_sig.v = snap.narrow_below
+  tree_narrow_enabled_sig.v = snap.narrow_enabled
+  tree_window_corner.v = snap.window_corner
+  tree_window_zoom.v = snap.window_zoom
+  tree_theme_said.v = snap.theme_said
+  tree_theme_of.v = snap.theme_of
+  tree_inset_said.v = snap.inset_said
+  glass_forced_said.v = snap.glass_forced
+  glass_material_said.v = snap.glass_material
+  inset_said.v = snap.inset
+  zoomed_said.v = snap.zoomed
+  snap_said.v = snap.snap
+  host_said_detached.v = snap.detached
+}
+
+fn host_said_detached_clone[T](src : HostSaid[T]) -> HostSaid[T] {
+  HostSaid::{
+    said: signals::signal_ref(src.said.untracked()),
+    ask: src.ask,
+    told: src.told,
+  }
+}
+
+fn ensure_windows_kept_init() -> Unit {
+  register_invar_window_reactive_ctx()
+  if !windows_kept_said.v {
+    windows_kept_said.v = true
+    let own = window_kept_ui()
+    let theirs = windows_kept.copy()
+    windows_kept.clear()
+    mbt_compat::arr_append(windows_kept, own)
+    mbt_compat::arr_append(windows_kept, theirs)
+  }
+}
+
+fn take_all_window_slots() -> Array[() -> Unit] {
+  ensure_windows_kept_init()
+  glyph_moves_seen.v = glyph_moves.v
+  mbt_compat::arr_map(windows_kept, fn(k) { (k.take)() })
+}
+
+fn fresh_all_window_slots() -> Unit {
+  ensure_windows_kept_init()
+  for k in windows_kept {
+    (k.fresh)()
+  }
+}
+
+fn snapshot_all_window_slots_detached() -> Array[() -> Unit] {
+  ensure_windows_kept_init()
+  let base = mbt_compat::arr_map(windows_kept, fn(k) { (k.take)() })
+  let saved_win_size = signals::signal_by(
+    tree_window_size_sig.v.untracked(),
+    same=fn(a, b) { a.0 == b.0 && a.1 == b.1 },
+  )
+  let saved_narrow_below = signals::signal(tree_narrow_below_sig.v.untracked(), same=fn(a, b) { a == b })
+  let saved_narrow_enabled = signals::signal(tree_narrow_enabled_sig.v.untracked(), same=fn(a, b) { a == b })
+  let saved_corner = signals::signal(tree_window_corner.v.untracked(), same=fn(a, b) { a == b })
+  let saved_zoom = signals::signal(tree_window_zoom.v.untracked(), same=fn(a, b) { a == b })
+  let saved_theme_said = signals::signal_ref(tree_theme_said.v.untracked())
+  let saved_theme_of = signals::signal_ref(tree_theme_of.v.untracked())
+  let saved_inset_said = signals::signal(tree_inset_said.v.untracked(), same=fn(a, b) { a == b })
+  let saved_glass = signals::signal(glass_forced_said.v.untracked(), same=fn(a, b) { a == b })
+  let saved_material = signals::signal(glass_material_said.v.untracked(), same=fn(a, b) { a == b })
+  let saved_inset = host_said_detached_clone(inset_said.v)
+  let saved_zoomed = host_said_detached_clone(zoomed_said.v)
+  let saved_snap = host_said_detached_clone(snap_said.v)
+  base.push(fn() {
+    tree_window_size_sig.v = saved_win_size
+    tree_narrow_below_sig.v = saved_narrow_below
+    tree_narrow_enabled_sig.v = saved_narrow_enabled
+    tree_window_corner.v = saved_corner
+    tree_window_zoom.v = saved_zoom
+    tree_theme_said.v = saved_theme_said
+    tree_theme_of.v = saved_theme_of
+    tree_inset_said.v = saved_inset_said
+    glass_forced_said.v = saved_glass
+    glass_material_said.v = saved_material
+    inset_said.v = saved_inset
+    zoomed_said.v = saved_zoomed
+    snap_said.v = saved_snap
+    view_app.v = None
+  })
+  base
+}
+
+fn register_invar_window_reactive_ctx() -> Unit {
+  if invar_window_ctx_registered.v {
+    return
+  }
+  invar_window_ctx_registered.v = true
+  window_kept_ref(tree_window_size_sig, fn() {
+    signals::signal((0.0, 0.0), same=fn(a, b) { a.0 == b.0 && a.1 == b.1 })
+  })
+  window_kept_ref(tree_narrow_below_sig, fn() {
+    signals::signal(700.0, same=fn(a, b) { a == b })
+  })
+  window_kept_ref(tree_narrow_enabled_sig, fn() {
+    signals::signal(false, same=fn(a, b) { a == b })
+  })
+  signals::register_reactive_context(fn() -> (() -> (() -> Unit)) {
+    let (owner_wid, owner_gen) = match logical_window_now.v {
+      Some(pair) => pair
+      None => (window_now.now, window_active_gen.v)
+    }
+    let cap_epoch = ui_ctx_epoch.v
+    let cap_size = tree_window_size_sig.v
+    let cap_narrow_below = tree_narrow_below_sig.v
+    let cap_narrow_enabled = tree_narrow_enabled_sig.v
+    let cap_corner = tree_window_corner.v
+    let cap_zoom = tree_window_zoom.v
+    let cap_theme_said = tree_theme_said.v
+    let cap_theme_of = tree_theme_of.v
+    let cap_inset_said = tree_inset_said.v
+    let cap_glass_forced = glass_forced_said.v
+    let cap_glass_material = glass_material_said.v
+    let cap_inset = inset_said.v
+    let cap_zoomed = zoomed_said.v
+    let cap_snap = snap_said.v
+    fn() -> (() -> Unit) {
+      let entered_epoch = ui_ctx_epoch.v
+      let prev = invar_ui_ctx_snapshot()
+      if ui_ctx_depth.v == 0 {
+        ui_ctx_native_base.v = Some(prev)
+      }
+      ui_ctx_depth.v = ui_ctx_depth.v + 1
+      logical_window_now.v = Some((owner_wid, owner_gen))
+      let keep_detached_primary = match disposing_primary_epoch.v {
+        Some(dep) => owner_wid == 0 && owner_gen == 0 && cap_epoch == dep && window_host_detached.v && window_now.now == 0
+        None => false
+      }
+      if !keep_detached_primary {
+        tree_window_size_sig.v = cap_size
+        tree_narrow_below_sig.v = cap_narrow_below
+        tree_narrow_enabled_sig.v = cap_narrow_enabled
+        tree_window_corner.v = cap_corner
+        tree_window_zoom.v = cap_zoom
+        tree_theme_said.v = cap_theme_said
+        tree_theme_of.v = cap_theme_of
+        tree_inset_said.v = cap_inset_said
+        glass_forced_said.v = cap_glass_forced
+        glass_material_said.v = cap_glass_material
+        inset_said.v = cap_inset
+        zoomed_said.v = cap_zoomed
+        snap_said.v = cap_snap
+      }
+      let live_primary_override = !keep_detached_primary && owner_wid == 0 && owner_gen == 0 && disposing_primary_epoch.v.is_some() && disposing_primary_prev_live0.v
+      host_said_detached.v = if live_primary_override {
+        false
+      } else {
+        window_host_detached.v || owner_wid != window_now.now || owner_gen != window_active_gen.v
+      }
+      fn() -> Unit {
+        if ui_ctx_epoch.v != entered_epoch {
+          return
+        }
+        ui_ctx_depth.v = ui_ctx_depth.v - 1
+        invar_ui_ctx_restore(prev)
+        if ui_ctx_depth.v == 0 {
+          ui_ctx_native_base.v = None
+        }
+      }
+    }
+  })
+}
+
+pub fn window_size_now() -> (Double, Double) {
+  match view::current_tree_room() {
+    Some(sig) => sig.get()
+    None => tree_window_size_sig.v.get()
+  }
+}
+
+pub fn set_narrow_below(width : Double) -> Unit {
+  tree_narrow_below_sig.v.set(width)
+}
+
+pub fn set_narrow_enabled(on : Bool) -> Unit {
+  tree_narrow_enabled_sig.v.set(on)
+}
+
+pub fn tree_narrow() -> Bool {
+  if !tree_narrow_enabled_sig.v.get() {
+    return false
+  }
+  let (w, _) = window_size_now()
+  w > 0.0 && w < tree_narrow_below_sig.v.get()
+}
+
+pub fn window_switch_guard_error(caller : String) -> Option[String] {
+  if window_switching.v {
+    Some("\{caller}: cannot re-enter while switching windows")
+  } else {
+    None
+  }
+}
+
+pub fn window_lifecycle_guard_error(caller : String) -> Option[String] {
+  match window_switch_guard_error(caller) {
+    Some(msg) => Some(msg)
+    None => if view::tree_disposing() {
+      Some("\{caller}: cannot mutate window or app lifecycle during tree teardown")
+    } else {
+      None
+    }
+  }
+}
+
+fn with_room_for(
+  phase_wid : Int,
+  phase_gen : Int,
+  outer_wid : Int,
+  outer_gen : Int,
+  f : () -> Unit,
+) -> Unit {
+  if phase_wid != outer_wid || phase_gen != outer_gen {
+    view::without_tree_room(f)
+  } else {
+    f()
+  }
+}
+
+pub fn in_window(wid : Int, body : () -> Unit) -> Unit {
+  match window_switch_guard_error("in_window") {
+    Some(msg) => {
+      let _ : Unit = halt::saying(msg)
+    }
+    None => ()
+  }
+  ensure_windows_kept_init()
+  let entered_epoch = ui_ctx_epoch.v
+  let prev = window_now.now
+  let prev_gen = window_active_gen.v
+  let target_gen = match window_live_gen.get(wid) {
+    Some(g) => g
+    None => match window_closing_gen.get(wid) {
+      Some(g) => g
+      None => match disposing_window_instance.v {
+        Some((dw, dg)) => if dw == wid && dg > 0 { dg } else { 0 }
+        None => 0
+      }
+    }
+  }
+  let same_instance = prev == wid && prev_gen == target_gen
+  let logical_matches = match logical_window_now.v {
+    Some((w, g)) => w == wid && g == target_gen
+    None => true
+  }
+  if same_instance && logical_matches && host_said_detached.v == window_host_detached.v {
+    body()
+    return
+  }
+  let prev_host_det = window_host_detached.v
+  let prev_host_said_det = host_said_detached.v
+  let (effective_wid, effective_gen) = match logical_window_now.v {
+    Some(pair) => pair
+    None => (prev, prev_gen)
+  }
+  let suspended_depth = ui_ctx_depth.v
+  let suspended_overlay : Option[InvarUiCtxSnap] = if suspended_depth > 0 {
+    let overlay = invar_ui_ctx_snapshot()
+    match ui_ctx_native_base.v {
+      Some(base) => invar_ui_ctx_restore(base)
+      None => ()
+    }
+    logical_window_now.v = None
+    host_said_detached.v = false
+    ui_ctx_depth.v = 0
+    ui_ctx_native_base.v = None
+    Some(overlay)
+  } else {
+    None
+  }
+  window_host_detached.v = prev_host_det
+  host_said_detached.v = prev_host_det
+  if same_instance {
+    with_room_for(wid, target_gen, effective_wid, effective_gen, body)
+    if ui_ctx_epoch.v != entered_epoch {
+      window_switching.v = false
+      return
+    }
+  } else {
+    window_switching.v = true
+    let mut prev_saved : Array[() -> Unit] = []
+    with_room_for(prev, prev_gen, effective_wid, effective_gen, fn() -> Unit {
+      prev_saved = take_all_window_slots()
+    })
+    let prev_is_disposing = prev_gen > 0 && !window_gen_is(prev, prev_gen) && disposing_window_detached.get(prev_gen).is_some()
+    let target_is_disposing = target_gen > 0 && !window_gen_is(wid, target_gen) && disposing_window_detached.get(target_gen).is_some()
+    let target_host_det = if target_is_disposing {
+      match disposing_window_detached.get(target_gen) {
+        Some(b) => b
+        None => false
+      }
+    } else {
+      false
+    }
+    let stored_prev_slot = !prev_is_disposing && prev != wid && (prev == 0 || prev_gen == 0 || window_gen_is(prev, prev_gen))
+    if prev_is_disposing {
+      disposing_window_slots[prev_gen] = prev_saved
+    } else if stored_prev_slot {
+      window_slots.set(prev, prev_saved)
+    }
+    window_now.now = wid
+    window_active_gen.v = target_gen
+    window_host_detached.v = target_host_det
+    host_said_detached.v = target_host_det
+    with_room_for(wid, target_gen, effective_wid, effective_gen, fn() -> Unit {
+      let target_restore_opt = if target_is_disposing {
+        disposing_window_slots.get(target_gen)
+      } else {
+        window_slots.get(wid)
+      }
+      match target_restore_opt {
+        Some(restore_list) => {
+          if target_is_disposing {
+            disposing_window_slots.remove(target_gen)
+          } else {
+            window_slots.remove(wid)
+          }
+          for r in restore_list {
+            r()
+          }
+          glyphs_moved_since()
+        }
+        None => {
+          fresh_all_window_slots()
+        }
+      }
+      window_switching.v = false
+      body()
+      if ui_ctx_epoch.v != entered_epoch {
+        window_switching.v = false
+        return
+      }
+      window_switching.v = true
+      let target_saved = take_all_window_slots()
+      if target_is_disposing {
+        disposing_window_slots[target_gen] = target_saved
+      } else if wid == 0 || target_gen == 0 || window_gen_is(wid, target_gen) {
+        window_slots.set(wid, target_saved)
+      }
+    })
+    if ui_ctx_epoch.v != entered_epoch {
+      window_switching.v = false
+      return
+    }
+    window_now.now = prev
+    window_active_gen.v = prev_gen
+    window_host_detached.v = prev_host_det
+    host_said_detached.v = prev_host_det
+    with_room_for(prev, prev_gen, effective_wid, effective_gen, fn() -> Unit {
+      if prev_is_disposing {
+        let restore_list = match disposing_window_slots.get(prev_gen) {
+          Some(latest) => {
+            disposing_window_slots.remove(prev_gen)
+            latest
+          }
+          None => prev_saved
+        }
+        for r in restore_list {
+          r()
+        }
+        glyphs_moved_since()
+      } else if stored_prev_slot {
+        match window_slots.get(prev) {
+          Some(restore_list) => {
+            window_slots.remove(prev)
+            for r in restore_list {
+              r()
+            }
+            glyphs_moved_since()
+          }
+          None => ()
+        }
+      } else {
+        for r in prev_saved {
+          r()
+        }
+        glyphs_moved_since()
+      }
+    })
+    window_switching.v = false
+  }
+  window_host_detached.v = prev_host_det
+  match suspended_overlay {
+    Some(overlay) => {
+      let refreshed_native = invar_ui_ctx_snapshot()
+      invar_ui_ctx_restore(overlay)
+      ui_ctx_depth.v = suspended_depth
+      ui_ctx_native_base.v = Some(refreshed_native)
+    }
+    None => {
+      host_said_detached.v = prev_host_said_det
+    }
+  }
+}
+
+fn dispose_detached_tree(
+  wid : Int,
+  gen : Int,
+  t : view::Tree,
+  saved_target_slot : Option[Array[() -> Unit]],
+  already_active? : Bool,
+  primary_epoch? : Option[Int],
+) -> Unit {
+  let already_active = match already_active { Some(v) => v, None => false }
+  let primary_epoch = match primary_epoch { Some(v) => v, None => None }
+  let fallback_epoch = ui_ctx_epoch.v
+  let suspended_depth = ui_ctx_depth.v
+  let suspended_overlay : Option[InvarUiCtxSnap] = if suspended_depth > 0 {
+    let overlay = invar_ui_ctx_snapshot()
+    match ui_ctx_native_base.v {
+      Some(base) => invar_ui_ctx_restore(base)
+      None => ()
+    }
+    logical_window_now.v = None
+    host_said_detached.v = false
+    ui_ctx_depth.v = 0
+    ui_ctx_native_base.v = None
+    Some(overlay)
+  } else {
+    None
+  }
+  if already_active && window_now.now == wid && (gen == 0 || window_active_gen.v == gen) {
+    let prev_disp = disposing_window_instance.v
+    let prev_disp_primary_ep = disposing_primary_epoch.v
+    let prev_disp_primary_live0 = disposing_primary_prev_live0.v
+    disposing_window_instance.v = Some((wid, gen))
+    disposing_primary_epoch.v = primary_epoch
+    disposing_primary_prev_live0.v = false
+    if gen > 0 {
+      disposing_window_detached[gen] = window_host_detached.v
+    }
+    view::without_tree_room(fn() -> Unit { t.dispose() })
+    disposing_window_instance.v = prev_disp
+    disposing_primary_epoch.v = prev_disp_primary_ep
+    disposing_primary_prev_live0.v = prev_disp_primary_live0
+    if gen > 0 {
+      disposing_window_detached.remove(gen)
+      disposing_window_slots.remove(gen)
+    }
+    if ui_ctx_epoch.v == fallback_epoch {
+      match suspended_overlay {
+        Some(overlay) => {
+          let refreshed_native = invar_ui_ctx_snapshot()
+          invar_ui_ctx_restore(overlay)
+          ui_ctx_depth.v = suspended_depth
+          ui_ctx_native_base.v = Some(refreshed_native)
+        }
+        None => ()
+      }
+    }
+    return
+  }
+  let prev_w = window_now.now
+  let prev_g = window_active_gen.v
+  let prev_log = logical_window_now.v
+  let prev_det = host_said_detached.v
+  let prev_host_det = window_host_detached.v
+  window_switching.v = true
+  let cur_saved = take_all_window_slots()
+  let stored_prev0 = prev_w == 0
+  if stored_prev0 {
+    window_slots.set(0, cur_saved)
+  }
+  window_now.now = wid
+  window_active_gen.v = gen
+  logical_window_now.v = None
+  window_host_detached.v = true
+  host_said_detached.v = true
+  match saved_target_slot {
+    Some(restore_list) => {
+      for r in restore_list {
+        r()
+      }
+    }
+    None => ()
+  }
+  window_switching.v = false
+  let prev_disp = disposing_window_instance.v
+  let prev_disp_primary_ep = disposing_primary_epoch.v
+  let prev_disp_primary_live0 = disposing_primary_prev_live0.v
+  disposing_window_instance.v = Some((wid, gen))
+  disposing_primary_epoch.v = primary_epoch
+  disposing_primary_prev_live0.v = primary_epoch.is_some() && prev_w == 0 && !prev_host_det
+  if gen > 0 {
+    disposing_window_detached[gen] = true
+  }
+  view::without_tree_room(fn() -> Unit { t.dispose() })
+  disposing_window_instance.v = prev_disp
+  disposing_primary_epoch.v = prev_disp_primary_ep
+  disposing_primary_prev_live0.v = prev_disp_primary_live0
+  if gen > 0 {
+    disposing_window_detached.remove(gen)
+    disposing_window_slots.remove(gen)
+  }
+  if ui_ctx_epoch.v == fallback_epoch {
+    window_switching.v = true
+    let restore_prev = if stored_prev0 {
+      match window_slots.get(0) {
+        Some(latest) => {
+          window_slots.remove(0)
+          latest
+        }
+        None => cur_saved
+      }
+    } else {
+      cur_saved
+    }
+    window_now.now = prev_w
+    window_active_gen.v = prev_g
+    logical_window_now.v = prev_log
+    window_host_detached.v = prev_host_det
+    host_said_detached.v = prev_det
+    for r in restore_prev {
+      r()
+    }
+    window_switching.v = false
+    match suspended_overlay {
+      Some(overlay) => {
+        let refreshed_native = invar_ui_ctx_snapshot()
+        invar_ui_ctx_restore(overlay)
+        ui_ctx_depth.v = suspended_depth
+        ui_ctx_native_base.v = Some(refreshed_native)
+      }
+      None => ()
+    }
+  }
+}
+
+fn dispose_primary_tree(t : view::Tree) -> Unit {
+  let start_epoch = ui_ctx_epoch.v
+  let suspended_depth = ui_ctx_depth.v
+  let suspended_overlay : Option[InvarUiCtxSnap] = if suspended_depth > 0 {
+    let overlay = invar_ui_ctx_snapshot()
+    match ui_ctx_native_base.v {
+      Some(base) => invar_ui_ctx_restore(base)
+      None => ()
+    }
+    logical_window_now.v = None
+    host_said_detached.v = false
+    ui_ctx_depth.v = 0
+    ui_ctx_native_base.v = None
+    Some(overlay)
+  } else {
+    None
+  }
+  if window_now.now == 0 {
+    view::without_tree_room(fn() -> Unit { t.dispose() })
+    if ui_ctx_epoch.v == start_epoch {
+      match suspended_overlay {
+        Some(overlay) => {
+          let refreshed_native = invar_ui_ctx_snapshot()
+          invar_ui_ctx_restore(overlay)
+          ui_ctx_depth.v = suspended_depth
+          ui_ctx_native_base.v = Some(refreshed_native)
+        }
+        None => ()
+      }
+    }
+    return
+  }
+  let prev_w = window_now.now
+  let prev_g = window_active_gen.v
+  let prev_log = logical_window_now.v
+  let prev_det = host_said_detached.v
+  let prev_host_det = window_host_detached.v
+  window_switching.v = true
+  let prev_saved = take_all_window_slots()
+  if prev_w > 0 && window_gen_is(prev_w, prev_g) {
+    window_slots.set(prev_w, prev_saved)
+  }
+  window_now.now = 0
+  window_active_gen.v = 0
+  logical_window_now.v = None
+  window_host_detached.v = false
+  host_said_detached.v = false
+  match window_slots.get(0) {
+    Some(restore0) => {
+      window_slots.remove(0)
+      for r in restore0 {
+        r()
+      }
+    }
+    None => ()
+  }
+  window_switching.v = false
+  view_app.v = None
+  view::without_tree_room(fn() -> Unit { t.dispose() })
+  if ui_ctx_epoch.v == start_epoch {
+    window_switching.v = true
+    let updated0 = take_all_window_slots()
+    window_slots.set(0, updated0)
+    window_now.now = prev_w
+    window_active_gen.v = prev_g
+    logical_window_now.v = prev_log
+    window_host_detached.v = prev_host_det
+    host_said_detached.v = prev_det
+    let restore_prev = match window_slots.get(prev_w) {
+      Some(latest) => {
+        window_slots.remove(prev_w)
+        latest
+      }
+      None => prev_saved
+    }
+    for r in restore_prev {
+      r()
+    }
+    window_switching.v = false
+    match suspended_overlay {
+      Some(overlay) => {
+        let refreshed_native = invar_ui_ctx_snapshot()
+        invar_ui_ctx_restore(overlay)
+        ui_ctx_depth.v = suspended_depth
+        ui_ctx_native_base.v = Some(refreshed_native)
+      }
+      None => ()
+    }
+  }
+}
+
+fn window_close_inner(wid : Int, notify_host : Bool, caller : String) -> Unit {
+  match window_lifecycle_guard_error(caller) {
+    Some(msg) => {
+      let _ : Unit = halt::saying(msg)
+    }
+    None => ()
+  }
+  if wid <= 0 {
+    return
+  }
+  let mut caller_gen : Option[Int] = None
+  match logical_window_now.v {
+    Some((cw, cg)) => if cw == wid && cg > 0 { caller_gen = Some(cg) }
+    None => ()
+  }
+  if caller_gen.is_none() {
+    match disposing_window_instance.v {
+      Some((dw, dg)) => if dw == wid && dg > 0 { caller_gen = Some(dg) }
+      None => ()
+    }
+  }
+  if caller_gen.is_none() && window_now.now == wid && window_active_gen.v > 0 {
+    caller_gen = Some(window_active_gen.v)
+  }
+  match caller_gen {
+    Some(cg) => {
+      if !window_gen_is(wid, cg) {
+        let mut claimed = false
+        match window_opening_closed.get(wid) {
+          Some(arr) => {
+            for entry in arr {
+              if entry.0 == cg && !entry.1.v {
+                entry.1.v = true
+                claimed = true
+                break
+              }
+            }
+          }
+          None => ()
+        }
+        if claimed && notify_host {
+          hostapi::window_close_id(wid)
+        }
+        return
+      }
+    }
+    None => ()
+  }
+  let close_epoch = ui_ctx_epoch.v
+  let live_gen = match window_live_gen.get(wid) {
+    Some(g) => g
+    None => 0
+  }
+  let tree_opt = window_trees.get(wid)
+  window_trees.remove(wid)
+  window_live_gen.remove(wid)
+  if live_gen > 0 {
+    window_closing_gen[wid] = live_gen
+  }
+  windows_beside.remove(wid)
+  match window_opening_closed.get(wid) {
+    Some(arr) => {
+      if live_gen > 0 {
+        for entry in arr {
+          if entry.0 == live_gen && !entry.1.v {
+            entry.1.v = true
+            break
+          }
+        }
+      } else {
+        let mut i = arr.length() - 1
+        while i >= 0 {
+          let entry = arr[i]
+          if !entry.1.v {
+            entry.1.v = true
+            break
+          }
+          i = i - 1
+        }
+      }
+    }
+    None => ()
+  }
+  match tree_opt {
+    Some(t) => {
+      in_window(wid, fn() -> Unit {
+        let prev_disp = disposing_window_instance.v
+        disposing_window_instance.v = Some((wid, live_gen))
+        if live_gen > 0 {
+          disposing_window_detached[live_gen] = window_host_detached.v
+        }
+        t.dispose()
+        view_app.v = None
+        disposing_window_instance.v = prev_disp
+        if live_gen > 0 {
+          disposing_window_detached.remove(live_gen)
+          disposing_window_slots.remove(live_gen)
+        }
+      })
+    }
+    None => ()
+  }
+  match driver.v {
+    Some(d) if d.wid == wid => d.wid = 0
+    _ => ()
+  }
+  if live_gen > 0 {
+    match window_closing_gen.get(wid) {
+      Some(g) => if g == live_gen { window_closing_gen.remove(wid) }
+      None => ()
+    }
+  }
+  if ui_ctx_epoch.v == close_epoch && window_live_gen.get(wid).is_none() {
+    window_slots.remove(wid)
+  }
+  if notify_host {
+    hostapi::window_close_id(wid)
+  }
+  if ui_ctx_epoch.v == close_epoch {
+    let listeners = window_closed_tell.copy()
+    for f in listeners {
+      f(wid)
+    }
+  }
+}
+
+fn windows_reset_checked() -> Bool {
+  let pre_epoch = ui_ctx_epoch.v
+  while true {
+    let keys = mbt_compat::ordered_map_keys_iter(window_trees).collect()
+    if keys.length() == 0 {
+      break
+    }
+    let k = keys[0]
+    let tree_opt = window_trees.get(k)
+    let k_gen = match window_live_gen.get(k) {
+      Some(g) => g
+      None => 0
+    }
+    let k_slot = window_slots.get(k)
+    window_trees.remove(k)
+    window_live_gen.remove(k)
+    window_slots.remove(k)
+    match tree_opt {
+      Some(t) => {
+        dispose_detached_tree(
+          k,
+          k_gen,
+          t,
+          k_slot,
+          already_active=window_now.now == k && (k_gen == 0 || window_active_gen.v == k_gen),
+        )
+        if ui_ctx_epoch.v != pre_epoch {
+          return false
+        }
+      }
+      None => ()
+    }
+  }
+  match ui_ctx_native_base.v {
+    Some(base) => invar_ui_ctx_restore(base)
+    None => ()
+  }
+  let was_secondary = window_now.now != 0
+  if was_secondary && window_active_gen.v > 0 {
+    let active_gen = window_active_gen.v
+    let mut is_opening = false
+    match window_opening_closed.get(window_now.now) {
+      Some(arr) => {
+        for entry in arr {
+          if entry.0 == active_gen {
+            is_opening = true
+            break
+          }
+        }
+      }
+      None => ()
+    }
+    if is_opening && window_opening_saved_slot.get(active_gen).is_none() {
+      window_switching.v = true
+      let snap = take_all_window_slots()
+      window_switching.v = false
+      window_opening_saved_slot[active_gen] = snap
+    }
+  }
+  for ow in window_opening_closed.keys() {
+    match window_live_gen.get(ow) {
+      Some(og) => {
+        if window_opening_saved_slot.get(og).is_none() {
+          match window_slots.get(ow) {
+            Some(slot) => window_opening_saved_slot[og] = slot
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  let restore0 = if was_secondary { window_slots.get(0) } else { None }
+  windows_beside.clear()
+  window_slots.clear()
+  window_live_gen.clear()
+  window_closing_gen.clear()
+  window_now.now = 0
+  window_active_gen.v = 0
+  ui_ctx_epoch.v = ui_ctx_epoch.v + 1
+  let my_epoch = ui_ctx_epoch.v
+  logical_window_now.v = None
+  ui_ctx_depth.v = 0
+  ui_ctx_native_base.v = None
+  window_host_detached.v = false
+  host_said_detached.v = false
+  if was_secondary {
+    window_switching.v = true
+    view::without_tree_room(fn() -> Unit {
+      match restore0 {
+        Some(list) => {
+          for r in list {
+            r()
+          }
+        }
+        None => {
+          fresh_all_window_slots()
+        }
+      }
+    })
+    window_switching.v = false
+  } else {
+    window_switching.v = false
+  }
+  if primary_building_epochs.length() > 0 {
+    window_switching.v = true
+    view::without_tree_room(fn() -> Unit {
+      for ep in primary_building_epochs {
+        if primary_building_saved_slot.get(ep).is_none() {
+          primary_building_saved_slot[ep] = snapshot_all_window_slots_detached()
+        }
+      }
+    })
+    window_switching.v = false
+  }
+  window_title_said.v = ""
+  tree_window_size_sig.v.set((0.0, 0.0))
+  if ui_ctx_epoch.v != my_epoch {
+    return false
+  }
+  true
+}
+
+pub fn window_tree_of(wid : Int) -> Option[view::Tree] {
+  if wid == 0 {
+    window_zero_tree.v
+  } else {
+    window_trees.get(wid)
+  }
+}
+
+pub fn window_frame(wid : Int, w : Double, h : Double, scale : Double, now : Double) -> Bool {
+  if wid < 0 || (wid > 0 && !windows_beside.contains(wid)) {
+    return false
+  }
+  in_window(wid, fn() {
+    tree_window_size_sig.v.set((w, h))
+    on_frame(w, h, scale, now)
+  })
+  true
+}
+
+pub fn window_kept_sref[T](r : signals::Ref[T], fresh : () -> T) -> Unit {
+  window_kept(
+    fn() {
+      let saved = r.v
+      fn() { r.v = saved }
+    },
+    fn() { r.v = fresh() },
+  )
+}
+
+pub fn window_kept_std_map[K, V](m : Map[K, V]) -> Unit {
+  window_kept(
+    fn() {
+      let saved : Array[(K, V)] = []
+      for k in m.keys() {
+        match m.get(k) {
+          Some(v) => saved.push((k, v))
+          None => ()
+        }
+      }
+      fn() {
+        m.clear()
+        for pair in saved {
+          m[pair.0] = pair.1
+        }
+      }
+    },
+    fn() { m.clear() },
+  )
+}
+
+fn init_invar_window_reactive_ctx() -> Bool {
+  register_invar_window_reactive_ctx()
+  true
+}
+
+let _invar_window_reactive_ctx_init : Bool = init_invar_window_reactive_ctx()

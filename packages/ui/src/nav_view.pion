@@ -1,0 +1,855 @@
+import "mbt_compat"
+import "signals"
+import "view"
+
+// A stack of pages (Nav) held by the window's tree (src/view, the way there's 4): the stack a node of
+// its own, each page in it a node made as the page is put on the stack and let go as it leaves it (what the page made
+// for it forgotten then: Nav's on_leave), and in it, while the page shows (the top; the one beside it as one moves),
+// the page itself, an old view (`old`) built the old way. Which pages show and where they are drawn are bindings of
+// those nodes: what shows changes as the stack is told to (its moment the cause's: Nav::go); where a page is drawn is
+// worked out from the time it is drawn at (its slide said once as it sets out: where from, where to, from when, how
+// long), followed by a finger as it holds one. Its slide's end is a moment of the tree's timeline (View::at_moment),
+// whatever frames are drawn: the page that slid away let go there, and the one under a page come to rest no longer
+// shown. A page pushed to show what the core has for it (`ready`) sets out as it has it (the moment that answer came),
+// `most` ms after it was pushed at the latest (Nav::comes_when's wait, said once).
+//
+// What is the old frame's still (the way there): back. The page on top takes it first, then the stack (its swipe from
+// the edge, the system's gesture, as Ctx::nav does); said as the page's old view is built, in the tree's order, by the
+// view itself (NavPage's island, nav_page_built).
+
+///|
+/// What the window's tree gives a stack it holds: its moment now (a change's cause's), how big it is laid out then, and what it is told as a page
+/// sets out (Nav::go: its slide's end, or its wait, said on the tree's timeline).
+struct NavHosted {
+  now : () -> Double
+  room : () -> (Double, Double)
+  went : () -> Unit
+  swap_went : () -> Unit
+  holds : (Int) -> Bool
+  still : (Int) -> Bool
+}
+
+///|
+/// What shows of the stack changed (which pages, how they move): what reads it told.
+fn Nav::shown_told[P](self : Nav[P]) -> Unit {
+  self.shown.set(self.shown.untracked() + 1)
+}
+
+///|
+/// Where the top page is at `now`, in its widths off to its side, as its slide has it (from where it set out, by when
+/// and how), or where it is held (by a finger, waiting, at rest).
+fn Nav::p_at[P](self : Nav[P], now : Double) -> Double {
+  if (self.mode == 1 || self.mode == 2 || self.mode == 4) && self.t0 >= 0.0 {
+    self.slid_at(now)
+  } else {
+    self.p
+  }
+}
+
+///|
+/// The page `serial` (on the stack, leaving it, on its shelf: Nav::replace_kept, or on its kept left: Nav::try_park_left).
+fn Nav::entry[P](self : Nav[P], serial : Int) -> Option[NavPage[P]] {
+  match self.leaving {
+    Some(e) if e.serial == serial => return Some(e)
+    _ => ()
+  }
+  match self.swap_out {
+    Some(e) if e.serial == serial => return Some(e)
+    _ => ()
+  }
+  match mbt_compat::arr_iter(self.pages).find_first(fn(e) { e.serial == serial }) {
+    Some(e) => Some(e)
+    None =>
+    match mbt_compat::arr_iter(self.shelf).find_first(fn(e) { e.serial == serial }) {
+      Some(e) => Some(e)
+      None => mbt_compat::opt_map(mbt_compat::arr_iter(self.kept_left).find_first(fn(x) { x.2.serial == serial }), fn(x) { x.2 })
+    }
+  }
+}
+
+///|
+/// The top page and the one beside it as one moves (the one under it: the page under one pushed, the page left on top
+/// as one goes back), if one does.
+fn Nav::top_beside[P](self : Nav[P]) -> (NavPage[P], Option[NavPage[P]]) {
+  let n = self.pages.length()
+  match self.leaving {
+    Some(e) => (e, Some(self.pages[n - 1]))
+    Option::None => (self.pages[n - 1], if self.mode != 0 && n > 1 { Some(self.pages[n - 2]) } else { Option::None })
+  }
+}
+
+///|
+/// Whether page `serial` shows: the top, or the one beside it as one moves (read: told as it changes).
+pub fn Nav::shows[P](self : Nav[P], serial : Int) -> Bool {
+  self.said.get() |> ignore
+  self.shown.get() |> ignore
+  let (top, beside) = self.top_beside()
+  top.serial == serial ||
+  (beside is Some(b) && b.serial == serial) ||
+  (self.swap_out is Some(s) && s.serial == serial)
+}
+
+///|
+/// Whether the stack's root page shows: the top, or the one beside it as one moves over it or off it (read: told as it
+/// changes, at its slide's end on the tree's timeline).
+pub fn Nav::root_shows[P](self : Nav[P]) -> Bool {
+  self.said.get() |> ignore
+  self.shown.get() |> ignore
+  let root = self.pages[0].serial
+  let (top, beside) = self.top_beside()
+  top.serial == root || (beside is Some(b) && b.serial == root)
+}
+
+///|
+/// Whether page `serial` takes presses: not as it goes back off the stack, nor under a page coming in over it, nor on
+/// the shelf (read: told as that changes).
+pub fn Nav::takes[P](self : Nav[P], serial : Int) -> Bool {
+  self.said.get() |> ignore
+  self.shown.get() |> ignore
+  let n = self.pages.length()
+  let leaving = self.leaving is Some(l) && l.serial == serial
+  let swapping_out = self.swap_out is Some(s) && s.serial == serial
+  let top = !leaving && !swapping_out && self.pages[n - 1].serial == serial
+  let shelved = mbt_compat::arr_iter(self.shelf).any(fn(e) { e.serial == serial }) ||
+  mbt_compat::arr_iter(self.kept_left).any(fn(x) { x.2.serial == serial })
+  !(leaving || swapping_out || shelved || (self.mode == 1 && !top))
+}
+
+///|
+/// How far page `serial` is drawn off its place at `now`, as the stack moves (the top off to its side, the one beside
+/// it edge to edge with it, or scaled by `under_parallax`; one that rose up and down over the one under it, which
+/// stays): read as it is drawn (told as the stack changes; with the clock while it slides, the finger while it is held
+/// by one), in its own widths and heights: as big as the frame drawing it lays it out (View::shift).
+fn Nav::shift_of[P](self : Nav[P], serial : Int, now : () -> Double, under_parallax? : Double) -> (Double, Double) {
+  let under_parallax = match under_parallax { Some(__mbt_v) => __mbt_v, None => 1.0 }
+
+  self.said.get() |> ignore
+  self.shown.get() |> ignore
+  if self.mode == 0 {
+    return (0.0, 0.0)
+  }
+  let p = self.live_p(now)
+  let (top, beside) = self.top_beside()
+  let rising = top.rise
+  let way = if (self.from_left)(top.page, top.under) { -1.0 } else { 1.0 }
+  if top.serial == serial {
+    if rising {
+      (0.0, p)
+    } else {
+      (way * p, 0.0)
+    }
+  } else if beside is Some(b) && b.serial == serial && !rising {
+    (way * (p - 1.0) * under_parallax, 0.0)
+  } else {
+    (0.0, 0.0)
+  }
+}
+
+///|
+/// When page `serial`'s slide on the stack ends (-1 when still, held by a finger, or still waiting at the gate before
+/// setting out): read by Tree::on_way_at so a layout step inside a sliding page is caught as a mid-motion jolt.
+fn Nav::shift_ends_of[P](self : Nav[P], serial : Int) -> Double {
+  if self.mode == 0 || self.mode == 3 || self.t0 < 0.0 {
+    return -1.0
+  }
+  let (top, beside) = self.top_beside()
+  if top.serial == serial || (beside is Some(b) && b.serial == serial && !top.rise) {
+    self.t0 + self.dur
+  } else {
+    -1.0
+  }
+}
+
+///|
+/// The stacks the window's tree holds, each told as every frame ends (nav_views_framed): by a number of
+/// its own.
+// kept across runs: put back as a run begins (view_forget)
+// moved to 00_init_order.pion: nav_views
+
+///|
+// kept across runs: a count
+// moved to 00_init_order.pion: nav_views_made
+
+///|
+/// As every frame ends (built whole, painted alone or of its looks alone): each stack the tree holds says what a
+/// frame says of a stack (Ctx::nav: when it rests, a page held by a finger), for what reads it of the frame (a test's
+/// nav_rest, the corners' checks).
+fn nav_views_framed(c : Ctx) -> Unit {
+  for e in nav_views {
+    (e.1)(c)
+  }
+}
+
+///|
+/// Stack `nav` as a node of `v`'s, filling the room it is given (nav_view.pion above): each page built by `page` (its
+/// old view, built again as `page_key` of it changes besides what it reads), on a ground of `bg`; back taken within
+/// `edge` of its left side. A page pushed slides in once `ready` says it has what it shows, `most` ms after it was
+/// pushed at the latest (none: at once). `made`: a page made once as nodes of the tree's in the place of its old view
+/// (Nav::made): what kind of page it is (one become another of the same kind, in place, the same nodes following what
+/// it is now) and what makes its nodes, in the node given, given what it is as that changes, the page under it (its
+/// own, whatever is on top when what they bind is read: not Nav::under), its time on top (its entry's, as it is put
+/// there again: Ctx::page_stint's) and its entry's number (what the frame keeps of the page by, as long as the entry
+/// is: nav_flat_view's `head`, `gone`); none, its old view. `keeps_made`: a root page made as nodes that another takes
+/// the place of (Nav::replace_kept) put on the shelf, its nodes put by at rest (View::each's `keeps`) and taken in again
+/// as it is put back; the shelf emptied, each on it left for good, as this node is let go. `keeps_left`: a page over the
+/// root made as nodes that leaves the stack (popped, put in place of) kept by the key and kind it says (none: let go as
+/// ever), its nodes put by at rest, and taken in again as a page of that key and kind is put on (Nav::take_kept_left),
+/// nav_kept_left_most at most; each let go for good as this node is.
+pub fn nav_view[P](v : view::View, nav : Nav[P], page : (Ctx, P) -> Unit, bg? : () -> Int64, edge? : Double, ready? : (P) -> Bool, most? : Double, page_key? : (P) -> String, page_for? : (view::View, Int) -> (view::View) -> (Ctx, P) -> Unit, made? : (P) -> Option[(String, (view::View, () -> P, Option[P], () -> Int, Int) -> Unit)], keeps_made? : Bool, keeps_left? : (P) -> Option[(String, String)], transition? : NavTransition, tab_moves_slot? : Bool) -> view::View {
+  let bg = match bg { Some(__mbt_v) => __mbt_v, None => fn() { 0L } }
+  let edge = match edge { Some(__mbt_v) => __mbt_v, None => 20.0 }
+  let most = match most { Some(__mbt_v) => __mbt_v, None => 0.0 }
+  let page_key = match page_key { Some(__mbt_v) => __mbt_v, None => fn(_) { "" } }
+  let made = match made { Some(__mbt_v) => __mbt_v, None => fn(_) { Option::None } }
+  let keeps_made = match keeps_made { Some(__mbt_v) => __mbt_v, None => false }
+  let transition = match transition { Some(__mbt_v) => __mbt_v, None => NavTransition::flat() }
+  let tab_moves_slot = match tab_moves_slot { Some(__mbt_v) => __mbt_v, None => true }
+
+  v.box(fn(s) {
+    s.grow(view::Live::Is(1.0)) |> ignore
+    nav.floor = 0
+    if keeps_left is Some(_) {
+      nav.keeps_left = keeps_left
+      // (its kept left this node's: let go with it, what it put by let go by the each below, each left for good)
+      s.owns(fn() {
+        nav.keeps_left = Option::None
+        nav.kept_left = []
+      })
+      |> ignore
+    }
+    if keeps_made {
+      nav.shelves = Some(fn(p) {
+        match made(p) {
+          Some((kind, _)) => nav_shelf_kind_allows(nav.said, kind)
+          Option::None => false
+        }
+      })
+      // (its shelf this node's: let go with it, what it put by let go by the each below, each left for good)
+      s.owns(fn() {
+        nav.shelves = Option::None
+        nav.shelf = []
+      })
+      |> ignore
+    }
+    nav.held_by(s, fn() { s.laid_size() }, ready, most)
+    let k = nav_views_made.v
+    nav_views_made.v = k + 1
+    nav_views.push((k, fn(c) {
+      if nav.mode == 3 {
+        c.page_in_hand = true
+      }
+      let r = nav.rested_at(c.frame_no)
+      if r > c.nav_rest {
+        c.nav_rest = r
+      }
+    }))
+    s.owns(fn() {
+      match arr_search_by(nav_views, fn(e) { e.0 == k }) {
+        Some(i) => mbt_compat::arr_remove(nav_views, i) |> ignore
+        Option::None => ()
+      }
+    })
+    |> ignore
+    s.each(
+      fn() {
+        nav.said.get() |> ignore
+        nav.shown.get() |> ignore
+        let all : Array[Int] = []
+        match nav.swap_out {
+          Some(e) => all.push(e.serial)
+          Option::None => ()
+        }
+        for e in nav.pages {
+          if nav.shows(e.serial) || made(e.page) is Option::None {
+            all.push(e.serial)
+          }
+        }
+        match nav.leaving {
+          Some(e) if nav.shows(e.serial) || made(e.page) is Option::None => all.push(e.serial)
+          _ => ()
+        }
+        all
+      },
+      fn(k) { k },
+      fn(pv, serial) {
+        let k = serial.untracked()
+        let entry = nav.entry(k)
+        pv
+        .over(view::Live::Is(true))
+        .shift(view::Live::By(fn() { nav.shift_of(k, fn() { pv.drawn_at() }, under_parallax=transition.under_parallax) }), ends=fn() { nav.shift_ends_of(k) })
+        // (going back off the stack, or covered as a page comes in over it: drawn only, from that moment)
+        .presses(view::Live::By(fn() { nav.takes(k) }))
+        |> ignore
+        if transition.rise_under_scale != 1.0 {
+          pv
+          .scale(
+            view::Live::By(fn() { nav.rise_scale_of(k, fn() { nav.slide_moment(pv) }, transition.rise_under_scale) }),
+            about=view::Pivot::At(0.5, 0.5),
+          )
+          |> ignore
+        }
+        if tab_moves_slot && transition.tab_ms > 0.0 && transition.tab_slide != 0.0 {
+          pv
+          .offset(
+            view::Live::By(fn() {
+              let (dx, _) = nav.tab_body_motion(k, fn() { nav.tab_moment(pv) }, slide=transition.tab_slide)
+              (dx, 0.0)
+            }),
+          )
+          .alpha(view::Live::By(fn() { nav.tab_body_motion(k, fn() { nav.tab_moment(pv) }, slide=transition.tab_slide).1 }))
+          .carries_until(fn() { nav.tab_ends_at() })
+          |> ignore
+        }
+        // (let go as it leaves the stack: what it made forgotten, the app told; let go with the stack's node, kept)
+        let pv_id = pv.id()
+        if transition.under_dim > 0.0 || transition.rise_dim > 0.0 || transition.edge_shadow {
+          nav_veils.set(pv_id, fn(x, y, w, h, now) { nav.veil_of(k, transition, x, y, w, h, now) })
+        }
+        if transition.under_parallax < 1.0 {
+          nav_clips.set(pv_id, fn(x, w, now) { nav.clip_of(k, transition, x, w, now) })
+        }
+        pv.owns(fn() {
+          nav_veils.remove(pv_id)
+          nav_clips.remove(pv_id)
+          let here = mbt_compat::arr_iter(nav.pages).any(fn(e) { e.serial == k }) ||
+          (nav.leaving is Some(e) && e.serial == k) ||
+          (nav.swap_out is Some(e) && e.serial == k)
+          if !here {
+            match arr_search_by(nav.gone, fn(e) { e.serial == k }) {
+              Some(i) => mbt_compat::arr_remove(nav.gone, i) |> ignore
+              Option::None => ()
+            }
+            g().forget(k)
+            match entry {
+              Some(e) => nav.entry_left(e)
+              Option::None => ()
+            }
+          }
+        })
+        |> ignore
+        let draw_for = match page_for { Some(make) => make(pv, k); Option::None => fn(_) { page } }
+        // (its old view while it shows, built again as `page_key` of it changes; or, where `made` says so, its nodes made
+        // once, as it first shows, and kept as long as it is on the stack, laid out nowhere while it does not show (what they hold, their
+        // fields' words, how far they scroll, as they were), its data what it becomes in place followed by them; another
+        // kind of page come in its place (Nav::become) the one handed to the other)
+        pv.pick(at_once=true, fn() {
+          nav.said.get() |> ignore
+          match mbt_compat::opt_map(nav.entry(k), fn(e) { made(e.page) }) {
+            Some(Some((kind, _))) => kind
+            _ => ""
+          }
+        }, fn(b, kind) {
+          b.grow(view::Live::Is(1.0)) |> ignore
+          match signals::untracked(fn() { mbt_compat::opt_map(nav.entry(k), fn(e) { (e, made(e.page)) }) }) {
+            Some((e, Some((_, f)))) if kind != "" => {
+              // (made the first time it shows, as its old view would first be built: a page put on under another before
+              // a frame shows it makes nothing; kept from then)
+              let shown = mbt_compat::ref_new(false)
+              b.show(at_once=true, fn() {
+                if nav.shows(k) {
+                  shown.v = true
+                  e.shown_once = true
+                }
+                shown.v
+              }, fn(m) {
+                // (covered made pages are parked at rest via EachKept rather than laid_nowhere, keeping their layout cache)
+                m.grow(view::Live::Is(1.0)) |> ignore
+                nav.made(m, k, e, f, bg, edge)
+              })
+            }
+            _ =>
+            b.show(at_once=true, fn() { nav.shows(k) }, fn(o) {
+              o.grow(view::Live::Is(1.0)) |> ignore
+              let draw_page = draw_for(o)
+              let key = fn() {
+                match nav.entry(k) {
+                  // (as the page is built: what it asks of where it stands, Nav::under, its own)
+                  // (as the page is built: what it asks of where it stands, Nav::under, its own)
+                  Some(e) => {
+                    let said = mbt_compat::ref_new("")
+                    nav.built_by(e, fn() { said.v = page_key(e.page) })
+                    said.v
+                  }
+                  Option::None => ""
+                }
+              }
+              old(o, fn(c) { nav.page_built(c, k, draw_page, bg(), edge) }, key=key, loc="nav_view.pion:393:19").grow(.Is(1.0)) |> ignore
+            })
+          }
+        })
+      },
+      // (covered made pages on the stack, those on the shelf (Nav::replace_kept), and those on the kept left
+      // (Nav::try_park_left): put by at rest so layout cache is kept and bindings rest while not shown)
+      keeps=fn() {
+        nav.said.get() |> ignore
+        nav.shown.get() |> ignore
+        let kept : Array[Int] = []
+        for e in nav.pages {
+          if !nav.shows(e.serial) && made(e.page) is Some(_) && !kept.contains(e.serial) {
+            kept.push(e.serial)
+          }
+        }
+        if keeps_made {
+          for e in nav.shelf {
+            if !kept.contains(e.serial) {
+              kept.push(e.serial)
+            }
+          }
+        }
+        for x in nav.kept_left {
+          if !kept.contains(x.2.serial) {
+            kept.push(x.2.serial)
+          }
+        }
+        kept
+      },
+      keeps_holds=fn(k) { mbt_compat::arr_iter(nav.pages).any(fn(e) { e.serial == k }) },
+    )
+  })
+}
+
+///|
+/// Stack `self` held by node `s` of the window's tree, its slides on the tree's timeline (nav_view's, and a stack an
+/// old view draws whose pages pushed over it the node over that view sets out: Nav::held_over): each told at its
+/// cause's moment (Nav::go: the tree's now), as long as its way across `room` is (as laid out as of then), its end a
+/// moment there (the page that went let go); a page pushed waiting for what it shows (`ready`) set out as it has it
+/// (a reaction, at that answer's moment) or `most` ms after it was pushed (a moment), whichever comes first, whatever
+/// frames are drawn. What is due of a slide or a wait is called off as the stack is told anew (pushed, popped, back
+/// let go or called off: Nav::go) and as the node is let go (the stack no longer this node's then: another's, or the
+/// frames' again).
+fn Nav::held_by[P](self : Nav[P], s : view::View, room : () -> (Double, Double), ready : Option[(P) -> Bool], most : Double) -> Unit {
+  let nav : Nav[P] = self
+  // (what is due of it on the tree's timeline: its slide's end, or the end of its wait)
+  let due : mbt_compat::Ref[() -> Unit] = mbt_compat::ref_new(fn() { })
+  let swap_due : mbt_compat::Ref[() -> Unit] = mbt_compat::ref_new(fn() { })
+  // a slide set out (at its start, said once): over at its end, the page that went let go
+  let sets_out = fn() {
+    (due.v)()
+    let t0 = nav.t0
+    due.v = s.at_moment(nav.t0 + nav.dur, fn() {
+      if nav.t0 == t0 && (nav.mode == 1 || nav.mode == 2 || nav.mode == 4) {
+        nav.settle()
+      }
+    })
+  }
+  let swap_sets_out = fn() {
+    (swap_due.v)()
+    swap_due.v = fn() { }
+    if nav.swap_out is Some(_) && nav.swap_t0 >= 0.0 && nav.swap_dur > 0.0 {
+      let t0 = nav.swap_t0
+      swap_due.v = s.at_moment(nav.swap_t0 + nav.swap_dur, fn() {
+        if nav.swap_t0 == t0 && nav.swap_out is Some(_) {
+          nav.settle_swap()
+        }
+      })
+    }
+  }
+  // the page waited for goes now (it has what it shows, or its wait is over): its slide from now
+  let goes = fn() {
+    if nav.t0 == nav_held {
+      nav.waited = true
+      nav.t0 = s.logic_at()
+      sets_out()
+      g().moving(nav.mover, nav.as_moving(), what="a stack's slide")
+      nav.shown_told()
+    }
+  }
+  let hosted : NavHosted = NavHosted::{
+    now: fn() { s.logic_at() },
+    room: room,
+    swap_went: swap_sets_out,
+    holds: fn(id) {
+      match (view_app.v, focus_node_of(id)) {
+        (Some(t), Some(n)) => t.holds(s.id(), n)
+        _ => false
+      }
+    },
+    still: fn(id) {
+      match tree_said_ids.get(id) {
+        Some(n) =>
+        match view_app.v {
+          Some(t) => t.holds(n, n)
+          Option::None => false
+        }
+        Option::None => true
+      }
+    },
+    went: fn() {
+      (due.v)()
+      due.v = fn() { }
+      // (no frame has given the window yet: how far it goes and so how long, not known; set out once it is)
+      if signals::untracked(fn() { s.window_w() }) <= 0.0 {
+        nav.t0 = -1.0
+        return
+      }
+      match ready {
+        Some(r) if nav.mode == 1 && nav.p0 == 1.0 => {
+          nav.wait_from = nav.t0
+          nav.held_most = most
+          if !r(nav.pages[nav.pages.length() - 1].page) {
+            nav.t0 = nav_held
+            due.v = s.at_moment(nav.wait_from + most, goes)
+            return
+          }
+          nav.waited = true
+        }
+        _ => ()
+      }
+      if nav.mode == 1 || nav.mode == 2 || nav.mode == 4 {
+        sets_out()
+      }
+    },
+  }
+  nav.hosted = Some(hosted)
+  // a page told to come or go before the tree held the stack (pushed as the app began, before any frame; or as the old
+  // view held it, the window laid out otherwise): its slide set out now, at this moment, where it had not; one under
+  // way goes on to its end, said on the timeline
+  if nav.mode == 1 || nav.mode == 2 || nav.mode == 4 {
+    if nav.t0 == -1.0 {
+      nav.go(nav.mode, nav.p1, v=nav.v0)
+    } else if nav.t0 >= 0.0 {
+      sets_out()
+    } else if nav.t0 == nav_held {
+      due.v = s.at_moment(nav.wait_from + nav.held_most, goes)
+    }
+  }
+  // (one told before the window was known sets out as the first frame gives it, at that moment)
+  s.reacts(fn() { s.window_w() > 0.0 }, fn(laid) {
+    if laid && nav.t0 == -1.0 && (nav.mode == 1 || nav.mode == 2 || nav.mode == 4) {
+      nav.go(nav.mode, nav.p1, v=nav.v0)
+    }
+  })
+  // (waiting: it goes as what it shows comes, at that answer's moment)
+  match ready {
+    Some(r) =>
+    s.reacts(fn() {
+      nav.shown.get() |> ignore
+      nav.said.get() |> ignore
+      nav.t0 == nav_held && r(nav.pages[nav.pages.length() - 1].page)
+    }, fn(now) { if now { goes() } })
+    Option::None => ()
+  }
+  if nav.swap_out is Some(_) {
+    if nav.swap_t0 < 0.0 {
+      nav.swap_t0 = s.logic_at()
+    }
+    swap_sets_out()
+  }
+  s.owns(fn() {
+    (due.v)()
+    due.v = fn() { }
+    (swap_due.v)()
+    swap_due.v = fn() { }
+    // (held by another node since, made before this one was let go: that one's still)
+    match nav.hosted {
+      Some(h) if physical_equal(h, hosted) => nav.hosted = Option::None
+      _ => ()
+    }
+  })
+  |> ignore
+}
+
+///|
+/// Stack `self`, drawn by an old view in node `s` (Ctx::nav_flat's `stacks`: a pane's stack, the pages pushed over the
+/// one in place sliding in as on a phone), held by it (Nav::held_by): its slides told at their causes' moments, as
+/// long as its way across the room the view drew it in last (Ctx::nav's, as laid out then); a page pushed over (Nav::
+/// push_over) sliding in once `ready` says it has what it shows, `most` ms after it was pushed at the latest, a page put
+/// in place not waited for here (what shows in place, the view's owner's: Nav::flat_keep).
+pub fn Nav::held_over[P](self : Nav[P], s : view::View, ready : (P) -> Bool, most : Double) -> Unit {
+  self.held_by(s, fn() { (self.room_w, self.room_h) }, Some(fn(p) { !self.top_over() || ready(p) }), most)
+}
+
+///|
+/// Page `serial` of the stack built (its old view): over its whole room, on the stack's back (its gesture, from within
+/// `edge` of its left side) where it is the top and a page is under it or moving, the page's own back taken before it;
+/// one leaving, or under a page coming in, its back none (its presses none: its node's, Nav::takes, as the tree says
+/// where an input finds what: old_hits_place). Not `stack`: the stack's back none of the old view's (a node of the
+/// tree's over the whole page has it: Nav::backs_over), the page's own as above.
+fn Nav::page_built[P](self : Nav[P], c : Ctx, serial : Int, page : (Ctx, P) -> Unit, bg : Int64, edge : Double, stack? : Bool) -> Unit {
+  let stack = match stack { Some(__mbt_v) => __mbt_v, None => true }
+
+  self.said.get() |> ignore
+  self.shown.get() |> ignore
+  let e = match self.entry(serial) {
+    Some(e) => e
+    Option::None => return
+  }
+  let n = self.pages.length()
+  let leaving = self.leaving is Some(l) && l.serial == serial
+  let top = !leaving && self.pages[n - 1].serial == serial
+  let takes = stack && top && (n > self.floor + 1 || self.mode >= 3 || (self.floor == 0 && self.mode != 0))
+  let before = c.back_next
+  let before_node = c.back_node_next
+  let before_edge = c.back_edge_next
+  let before_island = c.back_island_next
+  let before_chain = c.back_chain_next
+  let _ = c.box(style=nav_page_whole.then(style(bg=Data(bg))), fn() {
+    let stack_back = fn() {
+      c.back_next = Some(fn(kind, x, w, t, progress) { self.gesture(kind, x, w, t, progress=progress) })
+      c.back_node_next = c.cur
+      c.back_edge_next = edge
+      c.back_island_next = c.island_said()
+      c.back_says()
+    }
+    // (the page's own back first, then the stack's: a page going back off it takes none of its own)
+    if takes && self.leaving is Option::None {
+      stack_back()
+    }
+    let saved = c.owner
+    let saved_stint = c.stint
+    c.owner = e.serial
+    c.stint = e.stint
+    self.built_by(e, fn() { c.scope_(e.serial, fn() { page(c, e.page) }) })
+    c.owner = saved
+    c.stint = saved_stint
+    if takes && self.leaving is Some(_) {
+      stack_back()
+    }
+  })
+  // (not the top: back as it was before it)
+  if !top {
+    c.back_next = before
+    c.back_node_next = before_node
+    c.back_edge_next = before_edge
+    c.back_island_next = before_island
+    c.back_chain_next = before_chain
+  }
+}
+
+///|
+/// The old view of page `serial` in node `v` of a page made once (nav_view's and nav_flat_view's `made`), while what it
+/// holds is not nodes yet: built as the stack builds a page's old view (Nav::page_built's: what it keeps its own and
+/// forgotten with it, its time on top, the page it was put on from, its widgets' ids its own), as what the page is now
+/// (what it became in place) and as `key` changes (asked as it is built: Nav::under its own); none of the stack's back
+/// (the made page's node has it: Nav::backs_over). One left the stack but kept shown in place (Nav::flat_keep) built
+/// as before. `natural`, `gives`, `over`, `reshaped`: as tall as what it holds, giving way where it is short of room,
+/// drawing past it, told as what it holds comes to another height (old's: the rest of the page under it nodes).
+pub fn Nav::page_island[P](self : Nav[P], v : view::View, serial : Int, build : (Ctx, P) -> Unit, key? : () -> String, natural? : Bool, gives? : Bool, over? : Bool, reshaped? : (Double, Double) -> Unit) -> view::View {
+  let key = match key { Some(__mbt_v) => __mbt_v, None => fn() { "" } }
+  let natural = match natural { Some(__mbt_v) => __mbt_v, None => false }
+  let gives = match gives { Some(__mbt_v) => __mbt_v, None => false }
+  let over = match over { Some(__mbt_v) => __mbt_v, None => false }
+
+  let nav = self
+  old(v, natural=natural, gives=gives, over=over, reshaped?=reshaped, fn(c) {
+    nav.said.get() |> ignore
+    nav.shown.get() |> ignore
+    match nav.flat_entry(serial) {
+      // (none built of one put by on the kept left: at rest, it reads nothing)
+      // (none built of one put by on the kept left: at rest, it reads nothing)
+      Some(e) if !nav.is_kept_left(serial) && !nav.is_parked_shelf(serial) => {
+        let (owner, stint) = (c.owner, c.stint)
+        c.owner = e.serial
+        c.stint = e.stint
+        nav.built_by(e, fn() { c.scope_(e.serial, fn() { build(c, e.page) }) })
+        c.owner = owner
+        c.stint = stint
+      }
+      _ => ()
+    }
+  }, key=fn() {
+    match nav.flat_entry(serial) {
+      Some(e) => {
+        let said = mbt_compat::ref_new("")
+        nav.built_by(e, fn() { said.v = key() })
+        said.v
+      }
+      Option::None => ""
+    }
+  }, loc="nav_view.pion:672:3")
+}
+
+///|
+/// A page of the stack: the whole of its room, on its ground.
+// kept across runs: a value (no field of it changes)
+// moved to 00_init_order.pion: nav_page_whole
+
+///|
+/// Page `serial` of the stack (`e`) made once as nodes of the tree's in node `m` (nav_view's `made`): on a ground of
+/// `bg`, its nodes `f` makes in it, once (as it is put on, the stack's `under` as of it: Nav::under), given what the
+/// page is as that changes; back the stack's as Nav::backs_over has it (from `floor`, where `when` says), the whole of
+/// `m`. With `head`: what the frame puts over it made first in its flow, the page in the room left under it, cut to it.
+fn Nav::made[P](self : Nav[P], m : view::View, serial : Int, e : NavPage[P], f : (view::View, () -> P, Option[P], () -> Int, Int) -> Unit, bg : () -> Int64, edge : Double, floor? : () -> Int, when? : () -> Bool, head? : (view::View) -> Unit) -> Unit {
+  let when = match when { Some(__mbt_v) => __mbt_v, None => fn() { true } }
+
+  let nav = self
+  m
+  .grow(.Is(1.0))
+  // (cut to its room, its ground and all it holds, as the old view of a page is by the island it is built in)
+  .clips(view::Live::Is(true))
+  |> ignore
+  // (its ground, under all it holds; transparent while another root fades out beneath it in replace_tab)
+  m.box(fn(g) {
+    g
+    .over(view::Live::Is(true))
+    .ground(view::Live::By(fn() { if nav.is_swapping_in(serial) { 0L } else { bg() } }))
+    |> ignore
+  })
+  |> ignore
+  // (what it is: as it was put on, then what it becomes in place, Nav::become)
+  let page = fn() {
+    nav.said.get() |> ignore
+    e.page
+  }
+  // (its time on top, as it is put there again: what is put up anew then, a picture that could not be had asked for
+  // again, Ctx::page_stint's)
+  let stint = fn() {
+    nav.said.get() |> ignore
+    e.stint
+  }
+  nav.backs_over(m, serial, edge, floor?=floor, when=when, fn() {
+    match head {
+      Option::None => nav.built_by(e, fn() { f(m, page, e.under, stint, serial) })
+      // (what the frame puts over the page first (a panel's bar), in its flow; the page in what is left under it, cut
+      // to it: what it scrolls never under the bar)
+      // (what the frame puts over the page first (a panel's bar), in its flow; the page in what is left under it, cut
+      // to it: what it scrolls never under the bar)
+      Some(h) => {
+        m.box(h) |> ignore
+        m.box(fn(rest) {
+          rest.grow(view::Live::Is(1.0)).basis(view::Live::Is(Some(0.0))).min_height(view::Live::Is(Some(0.0))).clips(view::Live::Is(true)) |> ignore
+          nav.built_by(e, fn() { f(rest, page, e.under, stint, serial) })
+        })
+        |> ignore
+      }
+    }
+  })
+}
+
+///|
+/// Back the stack's over the whole of node `m`, page `serial`'s (what `build` makes in it its own, the page and what is
+/// over it), while it takes it as the old view says it (Nav::page_built's `takes`, from the stack's `floor`; and where
+/// `when` says so): a node of the tree's following it, before what `build` makes (the page's own back said in it takes
+/// it first), after it while the one over it goes back off (it takes none of its own then); the swipe from its left
+/// edge (within `edge`, a finger's on a platform with none of the system's, a mouse's where it drags) taken over from
+/// whatever of `m` it went down on once it goes across more than up or down, past the old view's slop, as wide as `m`.
+fn Nav::backs_over[P](self : Nav[P], m : view::View, serial : Int, edge : Double, build : () -> Unit, floor? : () -> Int, when? : () -> Bool) -> Unit {
+  let when = match when { Some(__mbt_v) => __mbt_v, None => fn() { true } }
+
+  let nav = self
+  let floor = match floor {
+    Some(f) => f
+    Option::None => fn() { nav.floor }
+  }
+  // (whether back is the stack's, and before or after what the page says takes it: Nav::page_built's `takes`)
+  let backs = fn(leaving : Bool) {
+    nav.said.get() |> ignore
+    nav.shown.get() |> ignore
+    let n = nav.pages.length()
+    let gone = nav.leaving is Some(l) && l.serial == serial
+    let top = !gone && n > 0 && nav.pages[n - 1].serial == serial
+    let fl = floor()
+    when() &&
+    top &&
+    (n > fl + 1 || nav.mode >= 3 || (fl == 0 && nav.mode != 0)) &&
+    (nav.leaving is Some(_)) == leaving
+  }
+  // (each step to the stack as one of the old frame's (Ctx::back_gesture's kinds), x from the page's left, as wide as it
+  // is laid out)
+  let step = fn(s : view::BackStep) {
+    let w = signals::untracked(fn() { m.laid_size() }).0
+    let p = back_progress.v
+    match s {
+      view::BackStep::Began(x, t) => nav.gesture(0, x, w, t, progress=p, floor=floor())
+      view::BackStep::Moved(x, t) => nav.gesture(1, x, w, t, progress=p, floor=floor())
+      .LetGo(x, t) => nav.gesture(2, x, w, t, progress=p, floor=floor())
+      view::BackStep::CalledOff => nav.gesture(3, 0.0, w, m.cause_at(), progress=p, floor=floor())
+      view::BackStep::Back => nav.gesture(4, 0.0, w, m.cause_at(), progress=p, floor=floor())
+    }
+  }
+  let back_node = fn(b : view::View) { b.over(.Is(true)).follows_back(step) |> ignore }
+  // (back not the stack's but another's of the tree's, outside the page (a tape's panel's: what the frame takes it by,
+  // View::follows_back): the swipe from the page's edge is its, as the old frame's edge gives a page's swipe to what
+  // takes back then (Ctx::back_gesture: Tree::back_taker))
+  let elsewhere = fn() -> Option[view::NodeId] {
+    if backs(false) {
+      return None
+    }
+    match m.tree.back_taker() {
+      Some(id) if !m.tree.holds(m.id(), id) => Some(id)
+      _ => Option::None
+    }
+  }
+  // (where a swipe from its edge went down, as it went down: from there it sets out, as the old frame's from press_x;
+  // and, where it is another's, which, and where that is drawn from: x from its left, as it is told by the old frame's)
+  let down_x = mbt_compat::ref_new(0.0)
+  let down_wx = mbt_compat::ref_new(0.0)
+  // (where `m` was in the window as it went down, and how big it was drawn: what the stack's steps are told x from,
+  // as the old frame's are from where the page was as the gesture began, whatever `m` is moved by as it goes)
+  let down_left = mbt_compat::ref_new(0.0)
+  let down_scale = mbt_compat::ref_new(1.0)
+  let from_down = fn(d : view::Drag) { (d.wx - down_left.v) / down_scale.v }
+  let swiped = mbt_compat::ref_new(false)
+  let other : mbt_compat::Ref[Option[(view::NodeId, Double)]] = mbt_compat::ref_new(None)
+  let to_other = fn(id : view::NodeId, step : view::BackStep, at : Double) { m.tree.back_step(id, step, at) |> ignore }
+  m
+  .claims(fn(dx, dy) {
+    swiped.v = dx > 6.0 && dx.abs() > dy.abs()
+    swiped.v
+  }, from=fn(x, _) {
+    down_x.v = x
+    // (where it went down in the window, as `m` is drawn as it goes down: what it sets out from, whatever moves `m`
+    // before it is taken over)
+    match m.tree.drawn_of(m.id()) {
+      Some(o) => {
+        let lw = signals::untracked(fn() { m.laid_size() }).0
+        down_left.v = o.x
+        down_scale.v = if lw > 0.0 { o.w / lw } else { 1.0 }
+      }
+      Option::None => {
+        down_left.v = 0.0
+        down_scale.v = 1.0
+      }
+    }
+    down_wx.v = down_left.v + x * down_scale.v
+    h_platform() != 2 && desk.mouse_drags && x < edge && (backs(false) || elsewhere() is Some(_))
+  })
+  .on_drag(fn(d) {
+    if swiped.v {
+      let w = d.w
+      match d.kind {
+        view::DragIs::Down => {
+          other.v = match elsewhere() {
+            Some(id) => Some((id, mbt_compat::opt_map(m.tree.drawn_of(id), fn(o) { o.x }).unwrap_or(0.0)))
+            Option::None => None
+          }
+          match other.v {
+            Some((id, left)) => {
+              to_other(id, view::BackStep::Began(down_wx.v - left, d.at), d.at)
+              to_other(id, view::BackStep::Moved(d.wx - left, d.at), d.at)
+            }
+            Option::None => {
+              nav.gesture(0, down_x.v, w, d.at, floor=floor())
+              nav.gesture(1, from_down(d), w, d.at, floor=floor())
+            }
+          }
+        }
+        view::DragIs::Moved =>
+        match other.v {
+          Some((id, left)) => to_other(id, view::BackStep::Moved(d.wx - left, d.at), d.at)
+          Option::None => nav.gesture(1, from_down(d), w, d.at, floor=floor())
+        }
+        view::DragIs::Up => {
+          match other.v {
+            Some((id, left)) => to_other(id, view::BackStep::LetGo(d.wx - left, d.at), d.at)
+            Option::None => nav.gesture(2, from_down(d), w, d.at, floor=floor())
+          }
+          swiped.v = false
+          other.v = None
+        }
+        view::DragIs::Off => {
+          match other.v {
+            Some((id, _)) => to_other(id, view::BackStep::CalledOff, d.at)
+            Option::None => nav.gesture(3, from_down(d), w, d.at, floor=floor())
+          }
+          swiped.v = false
+          other.v = None
+        }
+      }
+    }
+  })
+  |> ignore
+  m.show(at_once=true, fn() { backs(false) }, back_node)
+  build()
+  m.show(at_once=true, fn() { backs(true) }, back_node)
+}

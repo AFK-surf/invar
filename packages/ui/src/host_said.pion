@@ -1,160 +1,152 @@
-// Reactive fine-grained host environment signals (`HostSaid[T]`), system bars/size-class/fold
-// state, and host command wrappers (`menu_setup`, `hotkey_set/clear`, `set_badge`, `open_url`).
-
 import "hostapi"
 import "signals"
 
+// What a frame is drawn by that is the host's, one signal each, read where it is used: what read one, and only that, is
+// built, laid out or painted again as it changes (a list's row or a part kept as its own watch follows it too).
+//
+// The host's settings (the system's dark, its size of words, whether something reads the widgets out, reduced motion,
+// solid glass, what decodes a stream, the window's buttons in the top row, the window maximized and how the pointer
+// stands on its maximize button the app draws): each asked of the host as each frame begins
+// (host_settings_arrive), and as it is asked between frames. What the frame is drawn on (the window's size, its pixels,
+// where the old views are laid out): as frame_drawn begins it (frame_settings_arrive); what the host measures words in,
+// before the window's tree is brought (on_frame's text_arrive).
+
+///|
+/// A setting of the host's: its signal (as the frame has it), how it is asked of the host, what else is told as it
+/// changes.
 struct HostSaid[T] {
   said : signals::Signal[T]
   ask : () -> T
-  eq : (T, T) -> Bool
   told : () -> Unit
 }
 
-fn host_said[T](
-  first : T,
-  ask : () -> T,
-  eq : (T, T) -> Bool,
-  told~ : () -> Unit = fn() { () },
-) -> HostSaid[T] {
-  HostSaid::{
-    said: signals::signal_ref(first),
-    ask,
-    eq,
-    told,
-  }
+///|
+fn host_said[T : Eq](first : T, ask : () -> T, told? : () -> Unit) -> HostSaid[T] {
+  let told = match told { Some(__mbt_v) => __mbt_v, None => fn() { () } }
+
+  HostSaid::{ said: signals::signal(first, same=fn(a, b) { a == b }), ask: ask, told: told }
 }
 
-fn HostSaid::arrive[T](self : HostSaid[T]) -> Unit {
+///|
+/// Asked of the host: its signal set where it changed (what read it told), and what else is told so.
+fn HostSaid::arrive[T : Eq](self : HostSaid[T]) -> Unit {
   let now = (self.ask)()
-  if !(self.eq)(self.said.untracked(), now) {
+  if self.said.untracked() != now {
     self.said.set(now)
     (self.told)()
   }
 }
 
-let host_said_detached : signals::Ref[Bool] = ref_new(false)
-
-fn HostSaid::now[T](self : HostSaid[T]) -> T {
+///|
+/// The setting as the frame has it, followed; asked of the host again where no frame is being drawn (between frames,
+/// before the first: a handler's, a Tester's).
+fn HostSaid::now[T : Eq](self : HostSaid[T]) -> T {
   if !frame_running.v && !host_said_detached.v {
     self.arrive()
   }
   self.said.get()
 }
 
-fn bool_eq(a : Bool, b : Bool) -> Bool {
-  a == b
-}
+///|
+/// Whether the window's buttons are in the app's top row (window_inset): each window's own (window_kept.pion), a window
+/// in full screen beside one that is not neither told the other's.
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: inset_said
 
-fn int_eq(a : Int, b : Int) -> Bool {
-  a == b
-}
-
-fn double_eq(a : Double, b : Double) -> Bool {
-  a == b
-}
-
+///|
 fn inset_said_new() -> HostSaid[Bool] {
-  host_said(false, fn() { hostapi::window_inset() }, bool_eq)
+  host_said(false, fn() { hostapi::window_inset() })
 }
 
+///|
+/// Whether the window is maximized (window_zoomed): each window's own, as inset_said.
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: zoomed_said
+
+///|
 fn zoomed_said_new() -> HostSaid[Bool] {
-  host_said(false, fn() { hostapi::window_zoomed() }, bool_eq)
+  host_said(false, fn() { hostapi::window_zoomed() })
 }
 
+///|
+/// How the pointer stands on the window's maximize button the app draws (window_snap_state): each window's own, as
+/// inset_said.
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: snap_said
+
+///|
 fn snap_said_new() -> HostSaid[Int] {
-  host_said(0, fn() { hostapi::window_snap_state() }, int_eq)
+  host_said(0, fn() { hostapi::window_snap_state() })
 }
 
-/// The system settings read where views are built and drawn (`glass_solid`, `reduced_motion`, `more_contrast_now`), each
-/// a system call on some hosts, asked of the host at most once a frame (or once an `encode_tree_scene`): -1 is not asked yet, 0 and 1
-/// what it said. Outside a frame each read asks the host. They are the system's, the same in every window; what a
-/// window overrides (`set_glass_solid`, `set_glass_frost`, `set_reduced_motion`) is never kept here.
-let sampled_transparency : signals::Ref[Int] = ref_new(-1)
-let sampled_motion : signals::Ref[Int] = ref_new(-1)
-let sampled_contrast : signals::Ref[Int] = ref_new(-1)
-let sampled_glass_env : signals::Ref[Int] = ref_new(-1)
+///|
+/// Whether the system is set to dark (system_dark).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: dark_said
 
-/// Whether an `encode_tree_scene` of its own (outside a frame) keeps what it samples.
-let sampled_offscreen : signals::Ref[Bool] = ref_new(false)
+///|
+/// The system's size of words (font_scale), or the program's over it (set_font_scale); the window's tree's words
+/// measured again as it changes.
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: words_size_said
 
-fn host_sampled(kept : signals::Ref[Int], ask : () -> Bool) -> Bool {
-  if kept.v < 0 || !(frame_running.v || sampled_offscreen.v) {
-    kept.v = if ask() { 1 } else { 0 }
-  }
-  kept.v == 1
+///|
+/// Whether something reads the widgets out (reads_out).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: reads_out_said
+
+///|
+/// Whether an actual screen reader is active (screen_reader_on).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: screen_reader_said
+
+///|
+/// Whether an actual screen reader is active now (macOS VoiceOver, iOS VoiceOver/Switch Control, Android screen reader,
+/// Windows SPI_GETSCREENREADER, Linux AT-SPI ScreenReaderEnabled), followed as a signal.
+pub fn screen_reader_on() -> Bool {
+  screen_reader_said.now()
 }
 
-/// What was sampled is of the frame before: the next read of each asks the host.
-fn host_samples_begin() -> Unit {
-  sampled_transparency.v = -1
-  sampled_motion.v = -1
-  sampled_contrast.v = -1
-  sampled_glass_env.v = -1
+///|
+/// Whether motion is reduced (reduced_motion).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: motion_reduced_said
+
+///|
+/// Whether glass is drawn solid as the system says (Ctx::glass_solid): less transparency asked, or the device slowed
+/// for its heat (h_glass_solid).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: glass_solid_said
+
+///|
+/// Whether the system asks for more contrast (more_contrast).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: contrast_said
+
+///|
+/// Whether the system asks for more contrast now (macOS's and iOS's Increase Contrast, Windows' high contrast),
+/// followed: what reads it (an app's theme) is made again as it changes.
+pub fn more_contrast() -> Bool {
+  contrast_said.now()
 }
 
-fn host_reduce_transparency() -> Bool {
-  host_sampled(sampled_transparency, fn() { hostapi::reduce_transparency() })
-}
+///|
+/// Whether the host decodes H.264 (h264_here), drives its decoder from here (stream_feeds), has a video layer
+/// (stream_layers).
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: h264_said
 
-fn host_reduce_motion() -> Bool {
-  host_sampled(sampled_motion, fn() { hostapi::reduce_motion() })
-}
+///|
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: feeds_said
 
-fn host_increase_contrast() -> Bool {
-  host_sampled(sampled_contrast, fn() { hostapi::increase_contrast() })
-}
+///|
+// kept across runs: put back by each Tester (host_settings_arrive as its first frame begins)
+// moved to 00_init_order.pion: layers_said
 
-fn host_glass_env_solid() -> Bool {
-  host_sampled(sampled_glass_env, fn() { hostapi::env("MBUI_GLASS") == "solid" })
-}
-
-let inset_said : signals::Ref[HostSaid[Bool]] = ref_new(inset_said_new())
-let zoomed_said : signals::Ref[HostSaid[Bool]] = ref_new(zoomed_said_new())
-let snap_said : signals::Ref[HostSaid[Int]] = ref_new(snap_said_new())
-let dark_said : HostSaid[Bool] = host_said(false, fn() { hostapi::system_dark() }, bool_eq)
-let said_font_scale : signals::Ref[Option[Double]] = ref_new(None)
-
-fn view_words_rescaled() -> Unit {
-  match view_tree() {
-    Some(tree) => tree.words_again()
-    None => ()
-  }
-}
-
-let words_size_said : HostSaid[Double] = host_said(
-  1.0,
-  fn() {
-    match said_font_scale.v {
-      Some(s) => s
-      None => {
-        let fs = hostapi::font_scale()
-        if fs > 0.0 { fs } else { 1.0 }
-      }
-    }
-  },
-  double_eq,
-  told=view_words_rescaled,
-)
-
-let reads_out_said : HostSaid[Bool] = host_said(false, fn() { hostapi::a11y_on() }, bool_eq)
-let motion_reduced_said : HostSaid[Bool] = host_said(false, fn() { reduced_motion() }, bool_eq)
-let glass_solid_host_said : HostSaid[Bool] = host_said(false, fn() { glass_solid() }, bool_eq)
-let contrast_said : HostSaid[Bool] = host_said(false, fn() { host_increase_contrast() }, bool_eq)
-let full_screen_said : HostSaid[Bool] = host_said(false, fn() { hostapi::full_screen() }, bool_eq)
-let app_visible_override : signals::Ref[Option[Bool]] = ref_new(None)
-let app_visible_said : HostSaid[Bool] = host_said(
-  true,
-  fn() {
-    match app_visible_override.v {
-      Some(v) => v
-      None => hostapi::env("INVAR_APP_VISIBLE") != "0"
-    }
-  },
-  bool_eq,
-)
-
-/// Sync all host environment signals at frame start; only changed signals notify dependents.
+///|
+/// The host's settings, each asked as the frame begins (on_frame, before the window's tree is brought): what read one
+/// that changed is told.
 fn host_settings_arrive() -> Unit {
   inset_said.v.arrive()
   zoomed_said.v.arrive()
@@ -162,277 +154,52 @@ fn host_settings_arrive() -> Unit {
   dark_said.arrive()
   words_size_said.arrive()
   reads_out_said.arrive()
+  screen_reader_said.arrive()
   motion_reduced_said.arrive()
-  glass_solid_host_said.arrive()
+  glass_solid_said.arrive()
   contrast_said.arrive()
-  app_visible_said.arrive()
-  full_screen_said.arrive()
+  h264_said.arrive()
+  feeds_said.arrive()
+  layers_said.arrive()
 }
 
-fn host_settings_arrive_checked(ep : Int) -> Bool {
-  inset_said.v.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  zoomed_said.v.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  snap_said.v.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  dark_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  words_size_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  reads_out_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  motion_reduced_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  glass_solid_host_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  contrast_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  app_visible_said.arrive()
-  if ui_ctx_epoch.v != ep { return false }
-  full_screen_said.arrive()
-  ui_ctx_epoch.v == ep
-}
-
-/// Whether window controls are inset into the top row (per-window reactive signal).
-pub fn window_inset_now() -> Bool {
-  inset_said.v.now()
-}
-
-/// Whether the window is currently maximized/zoomed (per-window reactive signal).
-pub fn window_zoomed_now() -> Bool {
-  zoomed_said.v.now()
-}
-
-/// Reactive alias for `window_zoomed_now()`.
-pub fn window_zoomed() -> Bool {
-  window_zoomed_now()
-}
-
-/// Window maximize snap hover state (per-window reactive signal).
-pub fn window_snap_state_now() -> Int {
-  snap_said.v.now()
-}
-
-/// Reactive alias for `window_snap_state_now()`.
-pub fn window_snap_state() -> Int {
-  window_snap_state_now()
-}
-
-/// Whether the system appearance is dark (reactive signal).
-pub fn system_dark_now() -> Bool {
-  dark_said.now()
-}
-
-/// Current text font scale factor (reactive signal).
-pub fn font_scale_now() -> Double {
-  words_size_said.now()
-}
-
-/// Override the host font scale (`None` restores host default); triggers text re-measurement when changed.
-pub fn set_font_scale(scale : Option[Double]) -> Unit {
-  said_font_scale.v = match scale {
-    Some(s) => Some(if s > 0.0 { s } else { 1.0 })
-    None => None
-  }
-  words_size_said.arrive()
-}
-
-/// Whether a screen reader / accessibility service is active (reactive signal).
-pub fn reads_out_now() -> Bool {
+///|
+/// Whether something reads the widgets out (the system's accessibility, @hostapi.a11y_on), as the frame has it,
+/// followed.
+fn reads_out() -> Bool {
   reads_out_said.now()
 }
 
-/// Whether reduced motion is enabled by system or override (reactive signal).
-pub fn reduced_motion_now() -> Bool {
-  motion_reduced_said.now()
+///|
+/// The window's size the frame is built and laid out in (frame_body), as frame_drawn begins it: what is built for it
+/// (the frame's root) built again as it changes.
+// kept across runs: set as each frame begins
+// moved to 00_init_order.pion: window_size
+
+///|
+/// The grid of the device's pixels the frame is laid out on (its scale; whether the host sets things on whole pixels:
+/// whole_px_layout), as frame_drawn begins it: what is built for it (the frame's root: Ctx::scale, Ctx::whole_px) built
+/// again as it changes; what was laid out on another (a node, a row kept as laid out) laid out again.
+// kept across runs: set as each frame begins
+// moved to 00_init_order.pion: pixel_grid
+
+///|
+/// What the frame is drawn on, as it begins (frame_drawn): the window `w` × `h` at `scale`; where the old views are laid
+/// out (old_laid_arrive). What the host measures words in (its glyphs' generation: text_arrive) was taken as the frame
+/// began, before the window's tree was brought (on_frame), and asked of the host that once.
+fn frame_settings_arrive(w : Double, h : Double, scale : Double) -> Unit {
+  window_size.v.set((w, h))
+  pixel_grid.v.set((scale, whole_px_layout()))
+  old_laid_arrive()
 }
 
-/// Whether glass surfaces should render solid (reactive signal).
-pub fn glass_solid_now() -> Bool {
-  glass_solid_host_said.now()
-}
+///|
+/// The window's frame built and laid out (frame_body) in the window and on the pixels it is drawn on as it began, read
+/// so: built again as the window's size or its pixels change.
+fn frame_body_drawn(c : Ctx, t : Double, tell? : Bool) -> Double {
+  let tell = match tell { Some(__mbt_v) => __mbt_v, None => true }
 
-/// Whether high/increased contrast is requested by the system (reactive signal).
-pub fn more_contrast_now() -> Bool {
-  contrast_said.now()
-}
-
-/// Whether the application is currently visible/foreground (reactive signal).
-pub fn app_visible_now() -> Bool {
-  app_visible_said.now()
-}
-
-/// Update application visibility state (e.g., from host lifecycle events or tests).
-pub fn set_app_visible(visible : Bool) -> Unit {
-  app_visible_override.v = Some(visible)
-  app_visible_said.arrive()
-}
-
-/// Whether the window is currently in full-screen mode (reactive signal).
-pub fn full_screen_now() -> Bool {
-  full_screen_said.now()
-}
-
-/// Request full-screen mode on the host and update the reactive signal.
-pub fn set_full_screen(on : Bool) -> Unit {
-  hostapi::set_full_screen(on)
-  full_screen_said.arrive()
-}
-
-/// Safe-area system bar insets in points.
-#derive(Eq)
-pub struct SystemBars {
-  pub top : Double
-  pub bottom : Double
-  pub left : Double
-  pub right : Double
-}
-
-fn system_bars_eq(a : SystemBars, b : SystemBars) -> Bool {
-  a.top == b.top && a.bottom == b.bottom && a.left == b.left && a.right == b.right
-}
-
-/// Window size classes reported by the system.
-pub struct SystemSizeClass {
-  pub width : hostapi::SizeClass
-  pub height : hostapi::SizeClass
-}
-
-/// Foldable hinge state and division rectangles reported by the system.
-pub struct SystemFold {
-  pub hinge : hostapi::Hinge
-  pub divisions : Array[(Double, Double, Double, Double)]
-}
-
-let system_bars_sig : signals::Signal[SystemBars] = signals::signal_ref(
-  SystemBars::{ top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 },
-)
-let system_size_class_sig : signals::Signal[Option[SystemSizeClass]] = signals::signal_ref(None)
-let system_fold_sig : signals::Signal[SystemFold] = signals::signal_ref(
-  SystemFold::{ hinge: hostapi::Hinge::NoHinge, divisions: [] },
-)
-let system_nav_action_sig : signals::Signal[Option[(Double, Double, Double, Double)]] = signals::signal_ref(None)
-
-fn system_state_reset() -> Unit {
-  said_font_scale.v = None
-  app_visible_override.v = None
-  system_bars_sig.set(SystemBars::{ top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 })
-  system_size_class_sig.set(None)
-  system_fold_sig.set(SystemFold::{ hinge: hostapi::Hinge::NoHinge, divisions: [] })
-  system_nav_action_sig.set(None)
-  host_settings_arrive()
-}
-
-fn system_state_reset_checked(ep : Int) -> Bool {
-  said_font_scale.v = None
-  app_visible_override.v = None
-  system_bars_sig.set(SystemBars::{ top: 0.0, bottom: 0.0, left: 0.0, right: 0.0 })
-  if ui_ctx_epoch.v != ep { return false }
-  system_size_class_sig.set(None)
-  if ui_ctx_epoch.v != ep { return false }
-  system_fold_sig.set(SystemFold::{ hinge: hostapi::Hinge::NoHinge, divisions: [] })
-  if ui_ctx_epoch.v != ep { return false }
-  system_nav_action_sig.set(None)
-  if ui_ctx_epoch.v != ep { return false }
-  host_settings_arrive_checked(ep)
-}
-
-/// Current system bar safe-area insets (reactive signal).
-pub fn system_bars() -> SystemBars {
-  system_bars_sig.get()
-}
-
-/// Update system bar safe-area insets and propagate to `Tree::clear_of`.
-pub fn set_system_bars(top : Double, bottom : Double, left : Double, right : Double) -> Unit {
-  let next = SystemBars::{ top, bottom, left, right }
-  if !system_bars_eq(system_bars_sig.untracked(), next) {
-    system_bars_sig.set(next)
-  }
-  match view_tree() {
-    Some(tree) => tree.clear_of(top, right, bottom, left)
-    None => ()
-  }
-}
-
-/// Current system window size classes (reactive signal).
-pub fn system_size_class() -> Option[SystemSizeClass] {
-  system_size_class_sig.get()
-}
-
-/// Current foldable hinge state and division rectangles (reactive signal).
-pub fn system_fold() -> SystemFold {
-  system_fold_sig.get()
-}
-
-/// Horizontal tabletop fold band `(top_y, bottom_y)` when the device hinge is half-open with a wide division (reactive signal).
-pub fn system_tabletop_now() -> Option[(Double, Double)] {
-  let f = system_fold_sig.get()
-  match f.hinge {
-    hostapi::Hinge::Half => {
-      for d in f.divisions {
-        let (_, y, w, h) = d
-        if w > h {
-          return Some((y, y + h))
-        }
-      }
-      None
-    }
-    _ => None
-  }
-}
-
-/// Current native nav action button rect `(x, y, w, h)` if reported by system (reactive signal).
-pub fn system_nav_action() -> Option[(Double, Double, Double, Double)] {
-  system_nav_action_sig.get()
-}
-
-/// Apply parsed `hostapi::system_channel` events to reactive system signals.
-fn system_took(json : String) -> Unit {
-  for said in hostapi::system_said(json) {
-    match said {
-      hostapi::SystemSaid::Bars(top, bottom, left, right) => {
-        set_system_bars(top, bottom, left, right)
-      }
-      hostapi::SystemSaid::SizeClasses(width, height) => {
-        system_size_class_sig.set(Some(SystemSizeClass::{ width, height }))
-      }
-      hostapi::SystemSaid::Fold(hinge, divisions) => {
-        system_fold_sig.set(SystemFold::{ hinge, divisions })
-      }
-      hostapi::SystemSaid::NavAction(x, y, w, h) => {
-        let next = if w > 0.0 && h > 0.0 { Some((x, y, w, h)) } else { None }
-        system_nav_action_sig.set(next)
-      }
-      hostapi::SystemSaid::Shown(_) => {
-        set_app_visible(true)
-      }
-      _ => ()
-    }
-  }
-}
-
-/// Configure native application menu bar from JSON specification.
-pub fn menu_setup(json : String) -> Unit {
-  hostapi::menu_setup(json)
-}
-
-/// Register a global/window hotkey accelerator `accel` under `id`.
-pub fn hotkey_set(id : String, accel : String) -> Bool {
-  hostapi::hotkey_set(id, accel)
-}
-
-/// Unregister a previously registered hotkey by `id`.
-pub fn hotkey_clear(id : String) -> Unit {
-  hostapi::hotkey_clear(id)
-}
-
-/// Set application dock/taskbar badge count (`0` clears the badge).
-pub fn set_badge(n : Int) -> Unit {
-  hostapi::set_badge(n)
-}
-
-/// Open an external URL using the host's default handler.
-pub fn open_url(url : String) -> Bool {
-  hostapi::open_url(url)
+  let (w, h) = window_size.v.get()
+  let (scale, _) = pixel_grid.v.get()
+  frame_body(c, w, h, scale, t, tell=tell)
 }
