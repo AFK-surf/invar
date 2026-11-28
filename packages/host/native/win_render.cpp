@@ -5728,6 +5728,14 @@ int32_t mb_host_atlas_pages_most(int32_t colour) {
 
 int32_t mb_host_atlas_pages_now(int32_t colour) { return colour ? 1 : atlas_pages_n; }
 
+// How many pages the atlas's texture has (for tests).
+int32_t mb_render_atlas_pages_held(int32_t colour) {
+  if (colour || !atlas) return colour ? 1 : 0;
+  D3D11_TEXTURE2D_DESC d;
+  atlas->GetDesc(&d);
+  return (int32_t)d.ArraySize;
+}
+
 // The atlas made `n` pages, now (uploads and draws are this thread's, in order): a texture array of n made, the pages
 // both have copied into it on the GPU, put in the old one's place. Pages given back are no one's (their texels'
 // occupancy dropped) and every window's next frame is drawn whole, as one may show a glyph that was on them.

@@ -5,6 +5,7 @@
 #include "contained.h"
 #include "bands.h"
 #include "groups.h"
+#include "atlas_pages.h"
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <os/lock.h>
@@ -28,8 +29,9 @@ static id<MTLRenderPipelineState> hpipe;
 static id<MTLRenderPipelineState> fpipe;
 // offscreen physical-pixel tile layers (MB_LAYER_TEX + id)
 static NSMutableDictionary<NSNumber *, id<MTLTexture>> *layer_texs;
-// the words' glyphs (R8) and colour glyphs (RGBA), square (apple.h)
-static id<MTLTexture> atlas, catlas;
+// the words' glyphs (R8) and colour glyphs (RGBA), arrays of square pages (apple.h, atlas_pages.h); what stands in a
+// texture2d slot nothing is bound to (an instance with no picture): 1 texel, clear
+static id<MTLTexture> atlas, catlas, stand_tex;
 static id<MTLBuffer> bufs[3];
 static size_t buf_cap[3];
 static int buf_i;
@@ -268,7 +270,13 @@ typedef struct {
   uint64_t seq;
   int color, x, y, w, h;
   uint8_t *px;
+  // (a PAGES op, px NULL: the atlas, `pages` pages from here on, `tex` made for it (CFBridgingRetain'd))
+  int pages;
+  void *tex;
 } AtlasPut;
+// the PAGES ops kept and not yet done (under present_mu)
+static int atlas_ops_owed;
+static void atlas_ops_kick(void);
 static AtlasPut *atlas_puts;
 static size_t atlas_puts_n, atlas_puts_cap, atlas_puts_head;
 static uint64_t atlas_seq;
@@ -705,8 +713,8 @@ MB_CORNER_SL
 "  return c;\n"
 "}\n"
 "fragment float4 fmain(VOut in [[stage_in]], const device Inst* inst [[buffer(0)]],\n"
-"    constant U& u [[buffer(1)]], constant G& g [[buffer(2)]], texture2d<float> atlas [[texture(0)]],\n"
-"    texture2d<float> img [[texture(1)]], texture2d<float> bd [[texture(2)]], texture2d<float> catlas [[texture(3)]],\n"
+"    constant U& u [[buffer(1)]], constant G& g [[buffer(2)]], texture2d_array<float> atlas [[texture(0)]],\n"
+"    texture2d<float> img [[texture(1)]], texture2d<float> bd [[texture(2)]], texture2d_array<float> catlas [[texture(3)]],\n"
 "    texture2d<float> ad_tex [[texture(4)]]) {\n"
 "  Inst I = inst[in.iid];\n"
 "  float2 at_p = in.pos.xy / u.scale + u.origin;\n"
@@ -742,13 +750,17 @@ MB_CORNER_SL
 "  }\n"
 "  float4 col = I.color;\n"
 "  if (kind == 1 || kind == 3 || kind == 7) {\n"
-"    constexpr sampler s(filter::linear, coord::pixel);\n"
+"    constexpr sampler s(filter::linear);\n"
 "    // within its own cell (c2: where in the atlas, in texels; a colour glyph's MB_ATLAS_COLOR_U across past its place\n"
 "    // in theirs), however its rect is stretched or turned: a sample past the cell's edge texels would blend in what\n"
 "    // lies beside it (another glyph, one left from before the atlas started over). The words' atlas has a glyph's\n"
 "    // cover alone: white, premultiplied, as the colour one would have it.\n"
 "    bool colour = I.c2.x >= 16384.0;\n"
 "    float2 at = float2(I.c2.x - (colour ? 16384.0 : 0.0), I.c2.y);\n"
+"    // (its page, a page's side of its atlas down for each: atlas_pages.h)\n"
+"    float side = colour ? float(catlas.get_height()) : float(atlas.get_height());\n"
+"    float layer = max(floor(at.y / side), 0.0);\n"
+"    at.y -= layer * side;\n"
 "    // One drawn as big as its picture, not turned, its corner on a pixel: each pixel its texel's centre, as\n"
 "    // win_render.cpp takes it (worked out of where it is across the rect, a float's division took a texel's\n"
 "    // neighbour in where its rounding fell, at 3, 2.625 and 1.5 pixels a point and far across)\n"
@@ -757,7 +769,8 @@ MB_CORNER_SL
 "    bool exact = I.rot.x == 0.0 && max(off.x, off.y) <= 0.05 && max(abs(r0.x - r0i.x), abs(r0.y - r0i.y)) <= 0.05;\n"
 "    float2 tex = exact ? floor(p * u.scale - r0i) + 0.5 : (p - I.rect.xy) / I.rect.zw * I.c2.zw;\n"
 "    float2 uv = clamp(at + tex, at + 0.5, at + I.c2.zw - 0.5);\n"
-"    float4 t = colour ? catlas.sample(s, uv) : float4(atlas.sample(s, uv).r);\n"
+"    // (a texel's centre, a power of two over: the same texel as its place in texels)\n"
+"    float4 t = colour ? catlas.sample(s, uv / side, uint(layer)) : float4(atlas.sample(s, uv / side, uint(layer)).r);\n"
 "    if (kind == 1) return (float4(col.rgb, 1.0) * (t.a * col.a)) * cover;\n"
 "    if (kind == 7) {\n"
 "      // inked by how light what is under its glass is, looked at round the glass's middle and locally\n"
@@ -2028,13 +2041,15 @@ static id<MTLRenderPipelineState> kind_pipe(id<MTLRenderPipelineState> p, int ki
   return kinds_ready && kpipe[kind] ? kpipe[kind] : p;
 }
 
-// An atlas `side` texels square: the words' a byte a texel, colour glyphs' four.
-static id<MTLTexture> atlas_texture(int color, int side) {
-  MTLTextureDescriptor *td = [MTLTextureDescriptor
-      texture2DDescriptorWithPixelFormat:color ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR8Unorm
-                                   width:(NSUInteger)side
-                                  height:(NSUInteger)side
-                               mipmapped:NO];
+// An atlas of `pages` pages `side` texels square: the words' a byte a texel, colour glyphs' four. An array however
+// many pages, as the shader takes it.
+static id<MTLTexture> atlas_texture(int color, int side, int pages) {
+  MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+  td.textureType = MTLTextureType2DArray;
+  td.pixelFormat = color ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatR8Unorm;
+  td.width = td.height = (NSUInteger)side;
+  td.arrayLength = (NSUInteger)(pages > 0 ? pages : 1);
+  td.mipmapLevelCount = 1;
   td.usage = MTLTextureUsageShaderRead;
   return [dev newTextureWithDescriptor:td];
 }
@@ -2078,8 +2093,16 @@ static void prepare_gpu(void) {
   ad.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
   adpipe = [dev newRenderPipelineStateWithDescriptor:ad error:&err];
   if (!adpipe) NSLog(@"adaptive pipeline: %@", err);
-  atlas = atlas_texture(0, MB_ATLAS_SIDE);
-  catlas = atlas_texture(1, MB_ATLAS_COLOR_SIDE);
+  atlas = atlas_texture(0, MB_ATLAS_SIDE, 1);
+  catlas = atlas_texture(1, MB_ATLAS_COLOR_SIDE, 1);
+  MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                width:1
+                                                                               height:1
+                                                                            mipmapped:NO];
+  sd.usage = MTLTextureUsageShaderRead;
+  stand_tex = [dev newTextureWithDescriptor:sd];
+  static const uint32_t clear_texel = 0;
+  [stand_tex replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&clear_texel bytesPerRow:4];
   inflight = dispatch_semaphore_create(3);
   dispatch_group_async(kinds_made, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     for (int k = 0; k < MB_KINDS; k++)
@@ -2144,8 +2167,27 @@ void mb_atlas_upload(int color, int x, int y, int w, int h, const void *px) {
       atlas_puts = realloc(atlas_puts, atlas_puts_cap * sizeof *atlas_puts);
     }
   }
-  atlas_puts[atlas_puts_n++] = (AtlasPut){++atlas_seq, color, x, y, w, h, copy};
+  atlas_puts[atlas_puts_n++] = (AtlasPut){++atlas_seq, color, x, y, w, h, copy, 0, NULL};
   os_unfair_lock_unlock(&present_mu);
+}
+
+// The atlas `color` made texture `t`'s pages (a PAGES op, on the thread that draws): the pages both have copied into it
+// on the GPU (the queue's, after what it holds: done before a glyph is put in it on the CPU), put in the old one's
+// place. What the GPU still draws with the old one keeps it till done.
+static void atlas_pages_put(int color, id<MTLTexture> t) {
+  id<MTLTexture> old = color ? catlas : atlas;
+  NSUInteger keep = old ? MIN(old.arrayLength, t.arrayLength) : 0;
+  if (keep > 0) {
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:old sourceSlice:0 sourceLevel:0 toTexture:t destinationSlice:0 destinationLevel:0
+             sliceCount:keep levelCount:1];
+    [bl endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+  }
+  if (color) catlas = t;
+  else atlas = t;
 }
 
 // The glyphs kept put into the atlases, in order, those numbered up to `upto`.
@@ -2157,8 +2199,18 @@ static void atlas_flush(uint64_t upto) {
     if (has) p = atlas_puts[atlas_puts_head++];
     os_unfair_lock_unlock(&present_mu);
     if (!has) return;
-    [(p.color ? catlas : atlas) replaceRegion:MTLRegionMake2D(p.x, p.y, p.w, p.h) mipmapLevel:0 withBytes:p.px
-                                 bytesPerRow:(NSUInteger)p.w * (p.color ? 4 : 1)];
+    if (p.tex) {
+      atlas_pages_put(p.color, (__bridge_transfer id<MTLTexture>)p.tex);
+      os_unfair_lock_lock(&present_mu);
+      atlas_ops_owed--;
+      os_unfair_lock_unlock(&present_mu);
+      continue;
+    }
+    id<MTLTexture> t = p.color ? catlas : atlas;
+    int side = (int)t.height, page = side > 0 ? p.y / side : 0;
+    if (page < (int)t.arrayLength && p.x + p.w <= (int)t.width && p.y - page * side + p.h <= side)
+      [t replaceRegion:MTLRegionMake2D(p.x, p.y - page * side, p.w, p.h) mipmapLevel:0 slice:(NSUInteger)page
+             withBytes:p.px bytesPerRow:(NSUInteger)p.w * (p.color ? 4 : 1) bytesPerImage:0];
     free(p.px);
   }
 }
@@ -3366,8 +3418,8 @@ static id<MTLRenderCommandEncoder> begin_pass_ex(id<MTLCommandBuffer> cb, id<MTL
   [enc setFragmentBytes:&gu length:sizeof(gu) atIndex:2];
   [enc setFragmentTexture:atlas atIndex:0];
   [enc setFragmentTexture:catlas atIndex:3];
-  [enc setFragmentTexture:(gtex ?: atlas) atIndex:2];
-  id<MTLTexture> adt = (at_win && at_win->ad_tex[at_win->ad_cur]) ? at_win->ad_tex[at_win->ad_cur] : atlas;
+  [enc setFragmentTexture:(gtex ?: stand_tex) atIndex:2];
+  id<MTLTexture> adt = (at_win && at_win->ad_tex[at_win->ad_cur]) ? at_win->ad_tex[at_win->ad_cur] : stand_tex;
   [enc setFragmentTexture:adt atIndex:4];
   if (use_sc && sc_on) [enc setScissorRect:sc];
   return enc;
@@ -3792,7 +3844,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
         if (ctid > MB_STREAM_TEX && !ct) { cs = ce; continue; }
         if (ctid > 0 && ctid <= MB_STREAM_TEX && !ct) encode_missing = 1;
         [lenc setRenderPipelineState:(cown ? kind_pipe(p, ck) : p)];
-        [lenc setFragmentTexture:(ct ?: atlas) atIndex:1];
+        [lenc setFragmentTexture:(ct ?: stand_tex) atIndex:1];
         [lenc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6 instanceCount:ce - cs baseInstance:cs];
         cs = ce;
       }
@@ -3895,7 +3947,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
             [enc setVertexBytes:&gu length:sizeof gu atIndex:2];
             [enc setFragmentBytes:&gu length:sizeof gu atIndex:2];
             [enc setFragmentTexture:gtex atIndex:2];
-            id<MTLTexture> adt = (at_win && at_win->ad_tex[at_win->ad_cur]) ? at_win->ad_tex[at_win->ad_cur] : atlas;
+            id<MTLTexture> adt = (at_win && at_win->ad_tex[at_win->ad_cur]) ? at_win->ad_tex[at_win->ad_cur] : stand_tex;
             [enc setFragmentTexture:adt atIndex:4];
           }
         } else if (shows) {
@@ -3935,7 +3987,7 @@ static void encode(id<MTLCommandBuffer> cb, id<MTLTexture> target, id<MTLRenderP
       continue;
     }
     if (!hole && tid > 0 && tid <= MB_STREAM_TEX && !t) encode_missing = 1;
-    [enc setFragmentTexture:(t ?: atlas) atIndex:1];
+    [enc setFragmentTexture:(t ?: stand_tex) atIndex:1];
     if (hole) [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6
                       instanceCount:end - start baseInstance:start];
     else draw_banded(enc, kp, f, start, end, count, tw, th);
@@ -4319,6 +4371,8 @@ void mb_render_present(const double *inst, int32_t count, double r, double g, do
     dirty_told = dirty_whole = dirty_n = 0;
     through_n = 0;
     mb_text_flush_ahead();
+    // (pages given back with no frame drawn after: done on the queue, so their memory goes now)
+    atlas_ops_kick();
     return;
   }
   MBFrame *fr = [MBFrame new];
@@ -5107,18 +5161,75 @@ void mb_host_layer_destroy(int32_t layer_id) {
   if (rw) shown_ok = 0;
 }
 
-// ---- the glyph atlases' pages (atlas_pages.h): one page here as yet ----
+// ---- the glyph atlases' pages (atlas_pages.h) ----
 int mb_atlas_pages_said;
 void mb_render_set_atlas_max_pages(int n) { mb_atlas_pages_said = n > 0 ? n : 0; }
+
+// how many pages each atlas has for what is put and drawn from now on (the main thread's: what the ops kept say)
+static int atlas_pages_n[2] = {1, 1};
+
 int32_t mb_host_atlas_pages_most(int32_t colour) {
-  (void)colour;
-  return 1;
+  // (Metal's arrays take 2048 layers)
+  return colour ? mb_atlas_pages_cap(MB_ATLAS_COLOR_SIDE, 4, 2048) : mb_atlas_pages_cap(MB_ATLAS_SIDE, 1, 2048);
 }
-int32_t mb_host_atlas_pages_now(int32_t colour) {
-  (void)colour;
-  return 1;
+
+int32_t mb_host_atlas_pages_now(int32_t colour) { return atlas_pages_n[colour ? 1 : 0]; }
+
+// How many pages each atlas's texture has, once the queue has done what it holds (for tests).
+int32_t mb_render_atlas_pages_held(int32_t colour) {
+  dispatch_group_wait(prepared, DISPATCH_TIME_FOREVER);
+  __block int32_t n = 0;
+  void (^look)(void) = ^{
+    id<MTLTexture> t = colour ? catlas : atlas;
+    n = t ? (int32_t)t.arrayLength : 0;
+  };
+  if (present_q) dispatch_sync(present_q, look);
+  else look();
+  return n;
 }
+
+// The PAGES ops kept done on the queue though no frame is to be drawn (one given back as the app rests): what it holds
+// first, as any frame's.
+static void atlas_ops_kick(void) {
+  os_unfair_lock_lock(&present_mu);
+  int owed = atlas_ops_owed;
+  uint64_t upto = atlas_seq;
+  os_unfair_lock_unlock(&present_mu);
+  if (owed > 0 && present_q) dispatch_async(present_q, ^{
+    @autoreleasepool {
+      atlas_flush(upto);
+    }
+  });
+}
+
+// The atlas `colour` made `n` pages for what is put and drawn after this: a texture of n made here, put in by the
+// queue in order with the glyphs put before and after it (atlas_flush). Given back, done on the queue at once.
 int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
-  (void)colour;
-  return n == 1;
+  int c = colour ? 1 : 0;
+  if (n == atlas_pages_n[c]) return 1;
+  if (n < 1 || n > mb_host_atlas_pages_most(colour)) return 0;
+  dispatch_group_wait(prepared, DISPATCH_TIME_FOREVER);
+  if (!dev) return 0;
+  id<MTLTexture> t = atlas_texture(c, c ? MB_ATLAS_COLOR_SIDE : MB_ATLAS_SIDE, n);
+  if (!t) return 0;
+  os_unfair_lock_lock(&present_mu);
+  if (atlas_puts_head > 0 && atlas_puts_head == atlas_puts_n) atlas_puts_head = atlas_puts_n = 0;
+  if (atlas_puts_n == atlas_puts_cap) {
+    if (atlas_puts_head > 0) {
+      memmove(atlas_puts, atlas_puts + atlas_puts_head, (atlas_puts_n - atlas_puts_head) * sizeof *atlas_puts);
+      atlas_puts_n -= atlas_puts_head;
+      atlas_puts_head = 0;
+    }
+    if (atlas_puts_n == atlas_puts_cap) {
+      atlas_puts_cap = atlas_puts_cap ? atlas_puts_cap * 2 : 64;
+      atlas_puts = realloc(atlas_puts, atlas_puts_cap * sizeof *atlas_puts);
+    }
+  }
+  atlas_puts[atlas_puts_n++] = (AtlasPut){++atlas_seq, c, 0, 0, 0, 0, NULL, n, (void *)CFBridgingRetain(t)};
+  atlas_ops_owed++;
+  os_unfair_lock_unlock(&present_mu);
+  int fewer = n < atlas_pages_n[c];
+  atlas_pages_n[c] = n;
+  if (fewer) atlas_ops_kick();
+  return 1;
 }

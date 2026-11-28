@@ -2822,3 +2822,7 @@ int32_t mb_host_atlas_pages(int32_t colour, int32_t n) {
   (void)colour;
   return n == 1;
 }
+int32_t mb_render_atlas_pages_held(int32_t colour) {
+  (void)colour;
+  return 1;
+}
