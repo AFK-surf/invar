@@ -98,6 +98,9 @@ void mb_host_request_frame(void);
 @property VTDecompressionSessionRef session;
 @property AVAudioEngine *audioEngine;
 @property AVAudioPlayerNode *audioPlayer;
+// Published under audio_state_lock ONLY while started & not stopping/starting, for main-thread clock queries.
+@property AVAudioEngine *audioActiveEngine;
+@property AVAudioPlayerNode *audioActivePlayer;
 @property NSUInteger audioQueued, audioGeneration, audioBuffersDone;
 @property NSInteger audioPending;
 @property double audioPlayedBefore, audioMaxHeard;
@@ -1107,12 +1110,14 @@ static os_unfair_lock audio_state_lock = OS_UNFAIR_LOCK_INIT;
 
 // (under audio_state_lock) 48 kHz frames heard in the active AVAudioPlayerNode run so far, minus output presentation latency.
 static double active_player_frames(MBStream *s) {
-  if (!s.audioPlayer || !s.audioEngine || !s.audioEngine.running || !s.audioPlayer.playing) return 0;
-  AVAudioTime *rt = s.audioPlayer.lastRenderTime;
+  AVAudioPlayerNode *player = s.audioActivePlayer;
+  AVAudioEngine *engine = s.audioActiveEngine;
+  if (!player || !engine || !engine.running || !player.playing) return 0;
+  AVAudioTime *rt = player.lastRenderTime;
   if (!rt) return 0;
-  AVAudioTime *pt = [s.audioPlayer playerTimeForNodeTime:rt];
+  AVAudioTime *pt = [player playerTimeForNodeTime:rt];
   if (!pt || !pt.sampleTimeValid || pt.sampleTime <= 0) return 0;
-  double latency = s.audioEngine.outputNode.presentationLatency * 48000.0;
+  double latency = engine.outputNode.presentationLatency * 48000.0;
   if (!(latency >= 0 && latency < 48000.0)) latency = 0;
   double heard = (double)pt.sampleTime - latency;
   return heard > 0 ? heard : 0;
@@ -1129,22 +1134,31 @@ static void fold_player_frames_locked(MBStream *s, double floorFrames) {
   s.audioBuffersDone = 0;
 }
 
-// (its audio queue) what is queued let go, the player stopped
+// (its audio queue) what is queued let go, the player stopped.
+// audio_state_lock is never held across CoreAudio start/stop/teardown so the main render thread never blocks.
 static void audio_stop(MBStream *s) {
   os_unfair_lock_lock(&audio_state_lock);
   fold_player_frames_locked(s, 0);
-  [s.audioPlayer stop];
-  [s.audioEngine stop];
+  s.audioActivePlayer = nil;
+  s.audioActiveEngine = nil;
   s.audioGeneration++;
   s.audioQueued = 0;
   s.audioPending = 0;
   os_unfair_lock_unlock(&audio_state_lock);
+  [s.audioPlayer stop];
+  [s.audioEngine stop];
 }
 
 // (its audio queue) the engine and its player let go, what is queued with them: the next packet makes them anew
 static void audio_drop(MBStream *s) {
   os_unfair_lock_lock(&audio_state_lock);
   fold_player_frames_locked(s, 0);
+  s.audioActivePlayer = nil;
+  s.audioActiveEngine = nil;
+  s.audioGeneration++;
+  s.audioQueued = 0;
+  s.audioPending = 0;
+  os_unfair_lock_unlock(&audio_state_lock);
   @try {
     [s.audioPlayer stop];
     [s.audioEngine stop];
@@ -1152,10 +1166,6 @@ static void audio_drop(MBStream *s) {
   }
   s.audioPlayer = nil;
   s.audioEngine = nil;
-  s.audioGeneration++;
-  s.audioQueued = 0;
-  s.audioPending = 0;
-  os_unfair_lock_unlock(&audio_state_lock);
 }
 
 static void audio_packet(MBStream *s, NSData *data, NSUInteger expectedGen, BOOL counted);
@@ -1200,49 +1210,97 @@ static void audio_packet(MBStream *s, NSData *data, NSUInteger expectedGen, BOOL
     os_unfair_lock_unlock(&audio_state_lock);
     return;
   }
+  float vol = s.audioVolume;
+  os_unfair_lock_unlock(&audio_state_lock);
+
   const uint8_t *bytes = data.bytes;
-  AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:48000 channels:2];
+  static AVAudioFormat *format = nil;
+  static dispatch_once_t formatOnce;
+  dispatch_once(&formatOnce, ^{
+    format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:48000 channels:2];
+  });
+
+  // All AVAudioEngine / AVAudioPlayerNode creation and CoreAudio HAL start run exclusively on the serial
+  // audioQueue OUTSIDE audio_state_lock so the main render thread never stalls during HAL cold start (~100 ms).
   if (!s.audioEngine) {
-    s.audioEngine = [AVAudioEngine new];
-    s.audioPlayer = [AVAudioPlayerNode new];
-    [s.audioEngine attachNode:s.audioPlayer];
-    [s.audioEngine connect:s.audioPlayer to:s.audioEngine.mainMixerNode format:format];
-    s.audioPlayer.volume = s.audioVolume;
+    AVAudioEngine *eng = [AVAudioEngine new];
+    AVAudioPlayerNode *pl = [AVAudioPlayerNode new];
+    [eng attachNode:pl];
+    [eng connect:pl to:eng.mainMixerNode format:format];
+    pl.volume = vol;
+    s.audioEngine = eng;
+    s.audioPlayer = pl;
   }
   if (!s.audioEngine.running) {
+    os_unfair_lock_lock(&audio_state_lock);
     fold_player_frames_locked(s, 0);
-    [s.audioPlayer stop];
+    s.audioActivePlayer = nil;
+    s.audioActiveEngine = nil;
     s.audioQueued = 0;
+    os_unfair_lock_unlock(&audio_state_lock);
+
+    [s.audioPlayer stop];
 #if TARGET_OS_IPHONE
     AVAudioSession *session = AVAudioSession.sharedInstance;
     NSError *sessionError = nil;
     if (![session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&sessionError] ||
         ![session setActive:YES error:&sessionError]) {
-      if (counted && s.audioPending > 0) s.audioPending--;
-      os_unfair_lock_unlock(&audio_state_lock);
+      if (counted) {
+        os_unfair_lock_lock(&audio_state_lock);
+        if (s.audioGeneration == expectedGen && s.audioPending > 0) s.audioPending--;
+        os_unfair_lock_unlock(&audio_state_lock);
+      }
       return;
     }
 #endif
     NSError *error = nil;
     if (![s.audioEngine startAndReturnError:&error]) {
-      if (counted && s.audioPending > 0) s.audioPending--;
-      os_unfair_lock_unlock(&audio_state_lock);
+      if (counted) {
+        os_unfair_lock_lock(&audio_state_lock);
+        if (s.audioGeneration == expectedGen && s.audioPending > 0) s.audioPending--;
+        os_unfair_lock_unlock(&audio_state_lock);
+      }
       return;
     }
+  }
+
+  BOOL needFlush = NO;
+  os_unfair_lock_lock(&audio_state_lock);
+  if (s.audioGeneration != expectedGen) {
+    os_unfair_lock_unlock(&audio_state_lock);
+    return;
   }
   // Keep 60 ms of startup jitter reserve, at most 500 ms after a transport stall.
   if (s.audioQueued >= 25) {
     fold_player_frames_locked(s, 0);
-    [s.audioPlayer stop];
+    s.audioActivePlayer = nil;
     s.audioGeneration++;
     s.audioQueued = 0;
     s.audioPending = counted ? 1 : 0;
+    needFlush = YES;
   }
-  s.audioPlayer.volume = s.audioVolume;
+  vol = s.audioVolume;
   NSUInteger generation = s.audioGeneration;
   if (!counted) s.audioPending++;
   s.audioQueued++;
+  NSUInteger queued = s.audioQueued;
+  if (!needFlush) {
+    s.audioActiveEngine = s.audioEngine;
+    s.audioActivePlayer = s.audioPlayer;
+  }
   os_unfair_lock_unlock(&audio_state_lock);
+
+  if (needFlush) {
+    [s.audioPlayer stop];
+    os_unfair_lock_lock(&audio_state_lock);
+    if (s.audioGeneration != generation) {
+      os_unfair_lock_unlock(&audio_state_lock);
+      return;
+    }
+    s.audioActiveEngine = s.audioEngine;
+    s.audioActivePlayer = s.audioPlayer;
+    os_unfair_lock_unlock(&audio_state_lock);
+  }
 
   AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:960];
   if (!buffer) {
@@ -1264,33 +1322,37 @@ static void audio_packet(MBStream *s, NSData *data, NSUInteger expectedGen, BOOL
   __weak MBStream *weak = s;
   dispatch_queue_t queue = s.audioQueue;
   os_unfair_lock_lock(&audio_state_lock);
-  @try {
-    if (s.audioGeneration != generation) {
-      return;
-    }
-    [s.audioPlayer scheduleBuffer:buffer completionCallbackType:AVAudioPlayerNodeCompletionDataPlayedBack completionHandler:^(AVAudioPlayerNodeCompletionCallbackType type) {
-      (void)type;
-      dispatch_async(queue, ^{
-        MBStream *live = weak;
-        if (!live) return;
-        os_unfair_lock_lock(&audio_state_lock);
-        if (live.audioGeneration == generation && live.audioQueued > 0) {
-          live.audioQueued--;
-          if (live.audioPending > 0) live.audioPending--;
-          live.audioBuffersDone++;
-          // An underrun must refill the same reserve before starting again, folding played frames first.
-          if (live.audioQueued == 0) {
-            fold_player_frames_locked(live, (double)live.audioBuffersDone * 960.0);
-            [live.audioPlayer stop];
-          }
-        }
-        os_unfair_lock_unlock(&audio_state_lock);
-      });
-    }];
-    if (!s.audioPlayer.playing && s.audioQueued >= 3) [s.audioPlayer play];
-  } @finally {
+  if (s.audioGeneration != generation) {
     os_unfair_lock_unlock(&audio_state_lock);
+    return;
   }
+  vol = s.audioVolume;
+  os_unfair_lock_unlock(&audio_state_lock);
+
+  s.audioPlayer.volume = vol;
+  [s.audioPlayer scheduleBuffer:buffer completionCallbackType:AVAudioPlayerNodeCompletionDataPlayedBack completionHandler:^(AVAudioPlayerNodeCompletionCallbackType type) {
+    (void)type;
+    dispatch_async(queue, ^{
+      MBStream *live = weak;
+      if (!live) return;
+      BOOL stopPlayer = NO;
+      os_unfair_lock_lock(&audio_state_lock);
+      if (live.audioGeneration == generation && live.audioQueued > 0) {
+        live.audioQueued--;
+        if (live.audioPending > 0) live.audioPending--;
+        live.audioBuffersDone++;
+        // An underrun must refill the same reserve before starting again, folding played frames first.
+        if (live.audioQueued == 0) {
+          fold_player_frames_locked(live, (double)live.audioBuffersDone * 960.0);
+          live.audioActivePlayer = nil;
+          stopPlayer = YES;
+        }
+      }
+      os_unfair_lock_unlock(&audio_state_lock);
+      if (stopPlayer) [live.audioPlayer stop];
+    });
+  }];
+  if (!s.audioPlayer.playing && queued >= 3) [s.audioPlayer play];
 }
 
 void mb_host_stream_audio(int32_t sid, moonbit_bytes_t data) {
@@ -1458,8 +1520,16 @@ void mb_host_stream_audio_volume(int32_t sid, double v) {
   float vol = !(v > 0) ? 0.0f : (v > 2.0 ? 2.0f : (float)v);
   os_unfair_lock_lock(&audio_state_lock);
   s.audioVolume = vol;
-  if (s.audioPlayer) s.audioPlayer.volume = vol;
   os_unfair_lock_unlock(&audio_state_lock);
+  __weak MBStream *weak = s;
+  dispatch_async(s.audioQueue, ^{
+    MBStream *live = weak;
+    if (!live || live.closed || !live.audioPlayer) return;
+    os_unfair_lock_lock(&audio_state_lock);
+    float latest = live.audioVolume;
+    os_unfair_lock_unlock(&audio_state_lock);
+    live.audioPlayer.volume = latest;
+  });
 }
 
 // Reads back the frame currently shown on `sid` as top-down BGRA sRGB on a background queue, without blocking UI.
