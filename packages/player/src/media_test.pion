@@ -1,228 +1,344 @@
-// Unit tests for packages/player: Media state machine, subtitle cues, speed stepping,
-// scrubbing, auto-hide & HUD note timers, and decode timeout + retry.
+// Unit tests for packages/player: Media streaming controller, subtitle cues, speed stepping,
+// scrubbing, volume/mute/fill/sideways, decode timeout + retry, frame grab wait, and play=false open.
 
 import "codec"
+import "ui"
 
-fn sample_track() -> MediaTrack {
+fn video_track(name : String, mime : String) -> MediaTrack {
   MediaTrack::{
-    url: "https://example.invalid/demo.mp4",
-    title: "Demo Clip",
-    duration_ms: 120000.0,
-    has_video: true,
-    has_audio: true,
+    name,
+    mime,
+    audio: false,
+    read: fn(_off : Double, _len : Int, _answer : (Bytes, Double, Bool) -> Unit) -> () -> Unit {
+      fn() -> Unit {}
+    },
+    direct: "",
   }
 }
 
-test "player: open, on_status, play_pause, pause, ended restart, and close" {
-  let m = Media::new()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Idle), "starts Idle")
-  m.open(sample_track(), start=5000.0, play=true)
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Loading), "open enters Loading")
-  debug_assert((m.position_ms() - 5000.0).abs() < 0.01, "start offset applied")
-  debug_assert((m.duration_ms() - 120000.0).abs() < 0.01, "duration initialized")
-
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Playing,
-    position_ms: 6200.0,
-    duration_ms: 120000.0,
-    buffered_ms: 30000.0,
-    muted: false,
-    volume: 0.8,
-    speed: 1.0,
-    error: "",
-  })
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing), "on_status transitions to Playing")
-  debug_assert((m.position_ms() - 6200.0).abs() < 0.01, "position updated")
-  debug_assert((m.buffered_ms() - 30000.0).abs() < 0.01, "buffered updated")
-
-  m.play_pause()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Paused), "play_pause pauses Playing")
-  m.play_pause()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing), "play_pause resumes Paused")
-  m.pause()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Paused), "explicit pause")
-
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Ended,
-    position_ms: 120000.0,
-    duration_ms: 120000.0,
-    buffered_ms: 120000.0,
-    muted: false,
-    volume: 0.8,
-    speed: 1.0,
-    error: "",
-  })
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Ended), "Ended phase")
-  m.play_pause()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing) && m.position_ms().abs() < 0.01, "play_pause from Ended restarts at 0")
-
-  m.close()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Idle) && m.track().is_none(), "close resets to Idle")
+fn views_has(views : Array[String], prefix : String, sub : String) -> Bool {
+  for s in views {
+    if s.starts_with(prefix) && s.contains(sub) {
+      return true
+    }
+  }
+  false
 }
 
-test "player: seek, seek_near, seek_by, step_speed, volume, and toggle_fill" {
-  let m = Media::new()
-  m.open(sample_track(), start=0.0, play=true)
-  m.seek(15000.0)
-  debug_assert((m.position_ms() - 15000.0).abs() < 0.01, "seek sets exact position")
-  m.seek_by(-5000.0)
-  debug_assert((m.position_ms() - 10000.0).abs() < 0.01, "seek_by relative backward")
-  m.seek_by(999999.0)
-  debug_assert((m.position_ms() - 120000.0).abs() < 0.01, "seek clamps to duration")
-  m.seek_near(12340.0)
-  debug_assert((m.position_ms() - 12300.0).abs() < 0.01, "seek_near snaps to 100ms")
+fn views_count(views : Array[String], prefix : String, sub : String) -> Int {
+  let mut n = 0
+  for s in views {
+    if s.starts_with(prefix) && s.contains(sub) {
+      n = n + 1
+    }
+  }
+  n
+}
 
-  // Speed cycles 1.0 -> 1.25 -> 1.5 -> 2.0 -> 0.5 -> 0.75 -> 1.0
-  debug_assert((m.step_speed() - 1.25).abs() < 0.001, "1.0 -> 1.25")
-  debug_assert((m.step_speed() - 1.5).abs() < 0.001, "1.25 -> 1.5")
-  debug_assert((m.step_speed() - 2.0).abs() < 0.001, "1.5 -> 2.0")
-  debug_assert((m.step_speed() - 0.5).abs() < 0.001, "2.0 -> 0.5 wrap")
-  debug_assert((m.step_speed() - 0.75).abs() < 0.001, "0.5 -> 0.75")
-  debug_assert((m.step_speed() - 1.0).abs() < 0.001, "0.75 -> 1.0")
+fn views_index(views : Array[String], prefix : String, sub : String) -> Int {
+  let mut i = 0
+  while i < views.length() {
+    let s = views[i]
+    if s.starts_with(prefix) && s.contains(sub) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+fn decode_waited(m : Media, now : Double) -> Unit {
+  match m.native() {
+    Some(n) => {
+      if n.state() == 2 && n.decode_since() >= 0.0 && n.decode_since() + media_decode_wait_ms <= now {
+        m.decode_given_up()
+      }
+    }
+    None => ()
+  }
+}
+
+test "player: open, take_ready, seek_by, step_speed, scrub_to/scrub_done, and close" {
+  let m = Media::new()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, w=390.0, h=844.0)
+  debug_assert(m.track().is_none(), "starts with no track")
+  debug_assert(m.status().state == 0, "starts opening state 0")
+  m.open(video_track("a.mp4", "video/mp4"))
+  t.draw()
+  debug_assert(m.track().is_some(), "open sets track")
+  debug_assert(m.take_ready(), "take_ready reports ready once")
+  debug_assert(m.started(), "started is true after ready")
+  debug_assert((m.duration() - 10000.0).abs() < 0.01, "fake host duration is 10000ms")
+
+  // 15 s on (the fake is 10 s long: clamped to its end), about there at once (nearest key frame)
+  m.seek_by(m.nudge_ms())
+  debug_assert(views_has(t.views(), "control", " 11 10000"), "seek_by clamps to end via keyframe seek")
+
+  // Speed steps through defaults: 1.0 -> 1.25 -> 1.5 -> 2.0 -> 0.5 -> 0.75 -> 1.0
+  m.step_speed()
+  debug_assert((m.speed() - 1.25).abs() < 0.001, "1.0 -> 1.25")
+  m.step_speed()
+  debug_assert((m.speed() - 1.5).abs() < 0.001, "1.25 -> 1.5")
+  m.step_speed()
+  debug_assert((m.speed() - 2.0).abs() < 0.001, "1.5 -> 2.0")
+  m.step_speed()
+  debug_assert((m.speed() - 0.5).abs() < 0.001, "2.0 -> 0.5 wrap")
+  m.step_speed()
+  debug_assert((m.speed() - 0.75).abs() < 0.001, "0.5 -> 0.75")
+  m.step_speed()
+  debug_assert((m.speed() - 1.0).abs() < 0.001, "0.75 -> 1.0")
+
+  // Dragged to the middle: paused, exact seeks, let go ends scrub without redundant seek
+  m.scrub_to(5000.0)
+  debug_assert(m.scrubbing() == Some(5000.0), "scrubbing holds target 5000")
+  debug_assert(views_has(t.views(), "control", " 2 0"), "scrub pauses playback")
+  debug_assert(views_has(t.views(), "control", " 9 1"), "scrub enters scrub mode")
+  debug_assert(views_has(t.views(), "control", " 3 5000"), "scrub issues exact seek")
+  debug_assert(!views_has(t.views(), "control", " 11 5000"), "scrub does not issue keyframe seek")
+  m.scrub_done()
+  t.draw()
+  debug_assert(m.scrubbing().is_none(), "scrub_done clears scrubbing")
+  debug_assert(views_count(t.views(), "control", " 3 5000") == 1, "no duplicate exact seek on scrub_done")
+  debug_assert(views_has(t.views(), "control", " 9 0"), "scrub_done exits scrub mode")
+
+  m.close()
+  debug_assert(m.native().is_none() && !m.is_sideways(), "close releases native view and resets sideways")
+  t.dispose()
+}
+
+test "player: seek, seek_near, volume, mute, toggle_fill, and sideways" {
+  let m = Media::new()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, w=390.0, h=844.0)
+  m.open(video_track("demo.mp4", "video/mp4"))
+  t.draw()
+
+  m.seek(3500.0)
+  debug_assert(views_has(t.views(), "control", " 3 3500"), "seek sends exact seek")
+  m.seek_near(4200.0)
+  debug_assert(views_has(t.views(), "control", " 11 4200"), "seek_near sends keyframe seek")
 
   m.set_volume(0.0)
-  debug_assert(m.muted() && m.volume().abs() < 0.001, "volume 0 mutes")
+  let (v0, muted0) = m.volume()
+  debug_assert(v0.abs() < 0.001 && muted0, "set_volume(0.0) clamps to 0.0 and mutes")
   m.set_volume(1.5)
-  debug_assert(!m.muted() && (m.volume() - 1.0).abs() < 0.001, "volume clamps to 1.0")
+  let (v1, muted1) = m.volume()
+  debug_assert((v1 - 1.0).abs() < 0.001 && !muted1, "set_volume(1.5) clamps to 1.0")
+  m.toggle_mute()
+  let (_, muted2) = m.volume()
+  debug_assert(muted2, "toggle_mute turns mute on")
+  m.toggle_mute()
+  let (_, muted3) = m.volume()
+  debug_assert(!muted3, "toggle_mute turns mute off")
 
-  debug_assert(!m.fill(), "fill defaults false")
-  debug_assert(m.toggle_fill() && m.fill(), "toggle_fill turns on")
-  debug_assert(!m.toggle_fill() && !m.fill(), "toggle_fill turns off")
+  debug_assert(!m.fills(), "fills defaults false")
+  m.toggle_fill()
+  debug_assert(m.fills(), "toggle_fill turns on")
+  m.toggle_fill()
+  debug_assert(!m.fills(), "toggle_fill turns off")
+
+  debug_assert(!m.is_sideways(), "starts upright")
+  m.toggle_sideways()
+  debug_assert(m.is_sideways(), "toggle_sideways turns sideways")
+  m.upright()
+  debug_assert(!m.is_sideways(), "upright resets sideways")
+
+  let (nudge, dtap, note, wake, sleep) = m.times()
+  debug_assert(nudge > 0.0 && dtap > 0.0 && note > 0.0 && wake > 0.0 && sleep > 0.0, "default timing constants positive")
+  t.dispose()
 }
 
 test "player: subtitle timeline lookup via codec::parse_subtitles and cue_now" {
   let m = Media::new()
-  m.open(sample_track(), start=0.0, play=true)
   let srt = "1\n00:00:01,000 --> 00:00:03,500\nHello world\n\n2\n00:00:05,000 --> 00:00:08,000\nSecond cue\n"
   let cues = codec::parse_subtitles("demo.srt", srt.to_bytes())
   debug_assert(cues.length() == 2, "parsed 2 SRT cues")
   m.set_subtitle(true, cues)
-  debug_assert(m.subtitles_on(), "subtitles enabled")
+  let (has_sub, sub_on) = m.subtitle()
+  debug_assert(has_sub && sub_on, "subtitles loaded and enabled")
 
-  m.seek(500.0)
-  debug_assert(m.cue_now().is_none(), "before first cue -> None")
-  m.seek(2000.0)
-  match m.cue_now() {
-    Some(c) => debug_assert(c.text == "Hello world", "cue 1 matched at 2000ms")
-    None => debug_assert(false, "expected cue 1")
+  let mk = fn(pos : Double) -> MediaStatus {
+    MediaStatus::{
+      state: 1,
+      duration: 10000.0,
+      position: pos,
+      buffered: 10000.0,
+      playing: true,
+      buffering: false,
+      ended: false,
+      width: 640.0,
+      height: 360.0,
+    }
   }
-  m.seek(4000.0)
-  debug_assert(m.cue_now().is_none(), "gap between cues -> None")
-  m.seek(6500.0)
-  match m.cue_now() {
-    Some(c) => debug_assert(c.text == "Second cue", "cue 2 matched at 6500ms")
-    None => debug_assert(false, "expected cue 2")
-  }
+  m.pin(mk(500.0))
+  debug_assert(m.cue_now() == "", "before first cue -> empty")
+  m.pin(mk(2000.0))
+  debug_assert(m.cue_now() == "Hello world", "cue 1 matched at 2000ms")
+  m.pin(mk(4000.0))
+  debug_assert(m.cue_now() == "", "gap between cues -> empty")
+  m.pin(mk(6500.0))
+  debug_assert(m.cue_now() == "Second cue", "cue 2 matched at 6500ms")
 
-  m.set_subtitle(false, cues)
-  debug_assert(m.cue_now().is_none(), "disabled subtitles returns None")
+  m.toggle_subtitle()
+  let (_, sub_off) = m.subtitle()
+  debug_assert(!sub_off, "toggle_subtitle disables subtitles")
+  debug_assert(m.cue_now() == "", "disabled subtitles returns empty")
 }
 
-test "player: scrubbing holds playback, previews position, and resumes on end_scrub" {
+test "player: scrub_done(at=...) seeks to final release point before ending scrub" {
   let m = Media::new()
-  m.open(sample_track(), start=1000.0, play=true)
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Playing,
-    position_ms: 1000.0,
-    duration_ms: 120000.0,
-    buffered_ms: 50000.0,
-    muted: false,
-    volume: 1.0,
-    speed: 1.0,
-    error: "",
-  })
-  m.begin_scrub(1000.0)
-  debug_assert(m.scrubbing() && media_phase_eq(m.phase(), MediaPhase::Paused), "begin_scrub pauses Playing")
-  m.update_scrub(45000.0)
-  debug_assert((m.position_ms() - 45000.0).abs() < 0.01, "position_ms previews scrub target")
-  m.end_scrub()
-  debug_assert(!m.scrubbing() && media_phase_eq(m.phase(), MediaPhase::Playing), "end_scrub resumes Playing")
-  debug_assert((m.position_ms() - 45000.0).abs() < 0.01, "end_scrub commits position")
-}
-
-test "player: controls auto-hide (2500ms), HUD note fade (800ms), decode timeout (10000ms), and retry" {
-  let m = Media::new()
-  m.tick(1000.0)
-  m.open(sample_track(), start=0.0, play=true)
-  // Decode timeout after media_decode_wait_ms (10000ms)
-  m.tick(1000.0 + media_decode_wait_ms)
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Failed("decode timeout")), "decode timeout transitions to Failed")
-
-  // Retry returns to Loading, then Playing
-  m.retry()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Loading), "retry re-enters Loading")
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Playing,
-    position_ms: 500.0,
-    duration_ms: 120000.0,
-    buffered_ms: 20000.0,
-    muted: false,
-    volume: 1.0,
-    speed: 1.0,
-    error: "",
-  })
-  m.touch(20000.0)
-  let _ = m.step_speed()
-  debug_assert(m.note().is_some() && m.controls_shown(), "note and controls visible after action")
-  // After 800ms: HUD note fades, controls remain visible
-  m.tick(20000.0 + media_note_ms)
-  debug_assert(m.note().is_none() && m.controls_shown(), "note clears at 800ms while controls stay shown")
-  // After 2500ms: controls auto-hide while Playing
-  m.tick(20000.0 + media_rest_ms)
-  debug_assert(!m.controls_shown(), "controls auto-hide at 2500ms while Playing")
-}
-
-test "player: buffering state pauses on play_pause and resumes playback after scrub_to/scrub_done (#8122)" {
-  let m = Media::new()
-  m.open(sample_track(), start=2000.0, play=true)
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Buffering,
-    position_ms: 2000.0,
-    duration_ms: 10000.0,
-    buffered_ms: 5000.0,
-    muted: false,
-    volume: 1.0,
-    speed: 1.0,
-    error: "",
-  })
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Buffering), "entered Buffering")
-
-  // Scrubbing while Buffering records scrub_resumes() == true and resumes Playing on scrub_done()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, w=390.0, h=844.0)
+  m.open(video_track("a.mp4", "video/mp4"))
+  t.draw()
   m.scrub_to(4000.0)
-  debug_assert(m.scrubbing() && m.scrub_resumes(), "scrubbing from Buffering sets scrub_resumes() == true")
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Paused), "scrub holds playback in Paused")
-  m.scrub_done()
-  debug_assert(!m.scrubbing() && !m.scrub_resumes(), "scrub_done clears scrubbing & scrub_resumes")
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Playing), "scrub_done resumes Playing after Buffering scrub")
-  debug_assert((m.position_ms() - 4000.0).abs() < 0.01, "scrub_done commits 4000ms")
+  debug_assert(views_has(t.views(), "control", " 3 4000"), "scrub_to seeks to 4000")
+  m.scrub_done(at=6000.0)
+  t.draw()
+  debug_assert(m.scrubbing().is_none(), "scrub_done clears scrubbing")
+  debug_assert(views_has(t.views(), "control", " 3 6000"), "scrub_done seeks to release point 6000")
+  debug_assert(!views_has(t.views(), "control", " 11 4000"), "no keyframe seek at 4000")
+  debug_assert(!views_has(t.views(), "control", " 11 6000"), "no keyframe seek at 6000")
+  let log = t.views()
+  let exact_idx = views_index(log, "control", " 3 6000")
+  let end_idx = views_index(log, "control", " 9 0")
+  debug_assert(exact_idx >= 0 && end_idx >= 0 && exact_idx < end_idx, "exact seek precedes scrub end")
+  t.dispose()
+}
 
-  // play_pause while Buffering pauses playback
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Buffering,
-    position_ms: 4000.0,
-    duration_ms: 10000.0,
-    buffered_ms: 5000.0,
-    muted: false,
-    volume: 1.0,
-    speed: 1.0,
-    error: "",
-  })
+test "player: buffering state pauses on play_pause and resumes playback after scrub_to/scrub_done" {
+  let m = Media::new()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, finish=false)
+  m.open(video_track("a.webm", "video/webm"))
+  let id = match m.native() {
+    Some(n) => n.id()
+    None => { debug_assert(false, "expected native view"); return }
+  }
+  debug_assert(t.view_said("{\"info\":{\"view\":\{id},\"state\":1,\"at\":[10000,2000,0,640,360,100,1,1,5000,0]}}"), "host reports buffering state")
+  t.draw()
+  debug_assert(m.status().buffering, "status reflects buffering")
+
+  m.scrub_to(4000.0)
+  debug_assert(m.scrubbing() == Some(4000.0), "scrubbing active at 4000")
+  debug_assert(m.scrub_resumes(), "scrubbing while buffering records scrub_resumes == true")
+  let before = t.views().length()
+  m.scrub_done()
+  let after = t.views()
+  let mut resumed = false
+  let mut i = before
+  while i < after.length() {
+    if after[i].starts_with("control \{id} 1 ") {
+      resumed = true
+    }
+    i = i + 1
+  }
+  debug_assert(resumed, "scrub_done resumes playback after buffering scrub")
+
+  // play_pause while buffering pauses
+  let before_pause = t.views().length()
   m.play_pause()
-  debug_assert(media_phase_eq(m.phase(), MediaPhase::Paused), "play_pause from Buffering pauses")
+  let after_pause = t.views()
+  let mut paused = false
+  let mut j = before_pause
+  while j < after_pause.length() {
+    if after_pause[j].starts_with("control \{id} 2 ") {
+      paused = true
+    }
+    j = j + 1
+  }
+  debug_assert(paused, "play_pause from buffering sends pause")
+  t.dispose()
+}
 
-  // Ended state does NOT resume after scrub
-  m.on_status(MediaStatus::{
-    phase: MediaPhase::Ended,
-    position_ms: 10000.0,
-    duration_ms: 10000.0,
-    buffered_ms: 10000.0,
-    muted: false,
-    volume: 1.0,
-    speed: 1.0,
-    error: "",
-  })
-  m.scrub_to(3000.0)
-  debug_assert(!m.scrub_resumes(), "scrubbing from Ended does not auto-resume")
-  m.scrub_done()
-  debug_assert(!media_phase_eq(m.phase(), MediaPhase::Playing), "Ended scrub stays paused")
+test "player: decode timeout starts only after all bytes arrive and retry resets wait" {
+  let m = Media::new()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, finish=false)
+  let wait = media_decode_wait_ms
+  let margin = wait / 40.0
+  m.open(video_track("a.webm", "video/webm"))
+  let id = match m.native() {
+    Some(n) => n.id()
+    None => { debug_assert(false, "expected native view"); return }
+  }
+  t.draw()
+  t.run_for(wait * 1.5)
+  decode_waited(m, t.time())
+  debug_assert(m.status().state == 0, "a slow read is not a decoder timeout")
+  debug_assert(t.view_said("{\"info\":{\"view\":\{id},\"state\":2,\"at\":[-1,0,0,0,0,100,0,0,0,0]}}"), "host reports decoding state 2")
+  t.advance(wait - margin)
+  t.frame_at(t.time())
+  decode_waited(m, t.time())
+  debug_assert(m.status().state == 0, "still waiting before decode_wait_ms")
+  t.advance(margin * 2.0)
+  t.frame_at(t.time())
+  decode_waited(m, t.time())
+  debug_assert(m.status().state == -4, "decode_given_up transitions to state -4")
+
+  m.retry()
+  let next = match m.native() {
+    Some(n) => n.id()
+    None => { debug_assert(false, "expected native view after retry"); return }
+  }
+  debug_assert(next != id, "retry creates a fresh native view")
+  debug_assert(t.view_said("{\"info\":{\"view\":\{next},\"state\":2,\"at\":[-1,0,0,0,0,100,0,0,0,0]}}"), "retry host reports state 2")
+  t.advance(wait - margin)
+  t.frame_at(t.time())
+  decode_waited(m, t.time())
+  debug_assert(m.status().state == 0, "retry gets its own decode wait")
+  debug_assert(t.view_said("{\"info\":{\"view\":\{next},\"state\":1,\"at\":[10000,0,0,640,360,100,1,0,0,0]}}"), "retry reaches ready state 1")
+  t.draw()
+  t.run_for(margin * 2.0)
+  decode_waited(m, t.time())
+  debug_assert(m.status().state == 1, "ready state stays 1")
+  t.dispose()
+}
+
+test "player: frame grab wait timeout and give_up_grab allows subsequent grab" {
+  let m = Media::new()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, finish=false)
+  let wait = media_grab_wait_ms
+  let margin = wait / 40.0
+  m.open(video_track("a.mp4", "video/mp4"))
+  let n = match m.native() {
+    Some(v) => v
+    None => { debug_assert(false, "expected native view"); return }
+  }
+  let stalled = fn(now : Double) -> Bool { n.grab_since() >= 0.0 && n.grab_since() + wait <= now }
+  t.draw()
+  n.grab_frame(1000.0)
+  t.draw()
+  t.advance(wait - margin)
+  t.frame_at(t.time())
+  debug_assert(!stalled(t.time()), "grab not stalled before wait")
+  debug_assert(n.grabbing(), "still grabbing before timeout")
+  t.advance(margin * 2.0)
+  t.frame_at(t.time())
+  debug_assert(stalled(t.time()), "grab stalled after wait")
+  n.give_up_grab()
+  debug_assert(!n.grabbing(), "give_up_grab clears grabbing")
+  debug_assert((n.grab_since() - (-1.0)).abs() < 0.001, "give_up_grab resets grab_since")
+  n.grab_frame(2000.0)
+  debug_assert(n.grabbing(), "subsequent grab succeeds")
+  t.dispose()
+}
+
+test "player: open with play=false seeks without auto-play until play_pause" {
+  let m = Media::new()
+  let t = ui::Tester::new(fn(_c : ui::Ctx) -> Unit {}, w=390.0, h=844.0)
+  let track = video_track("a.mp4", "video/mp4")
+  m.open(track, start=4000.0, play=false)
+  t.draw()
+  let id = match m.native() {
+    Some(n) => n.id()
+    None => { debug_assert(false, "expected native view"); return }
+  }
+  debug_assert(views_has(t.views(), "control \{id} 3 4000", ""), "sent to start position 4000")
+  debug_assert(!views_has(t.views(), "control \{id} 1 0", ""), "not played when play=false")
+  m.play_pause()
+  debug_assert(views_has(t.views(), "control \{id} 1 0", ""), "played on play_pause")
+  m.open(track)
+  let next = match m.native() {
+    Some(n) => n.id()
+    None => { debug_assert(false, "expected native view on reopen"); return }
+  }
+  debug_assert(views_has(t.views(), "control \{next} 1 0", ""), "default open auto-plays")
+  t.dispose()
 }
