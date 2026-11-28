@@ -141,6 +141,8 @@ jobs:
 
       - name: Configure pion toolchain env
         id: pion-env
+        env:
+          CAS_HASH: ${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
         run: |
           if [ -d "$GITHUB_WORKSPACE/.pion/release" ]; then
             SEARCH_ROOT="$GITHUB_WORKSPACE/.pion/release"
@@ -169,15 +171,21 @@ jobs:
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-macos}-${CC_FP}" >> "$GITHUB_OUTPUT"
           echo "pion_id=${PION_ID}" >> "$GITHUB_OUTPUT"
+          # Saved CAS keys end in the run, so a save the timeout cuts off can never hold a key a later run needs.
+          CAS_PREFIX="pion-cas-v3-macos-arm64-${ImageOS:-macos}-${CC_FP}-${PION_ID}"
+          echo "cas_prefix=${CAS_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "cas_base=${CAS_PREFIX}-${CAS_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Restore pion CAS cache
         id: cas-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full
           restore-keys: |
-            pion-cas-v3-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-
+            ${{ steps.pion-env.outputs.cas_base }}-full-
+            ${{ steps.pion-env.outputs.cas_base }}-ws-
+            ${{ steps.pion-env.outputs.cas_prefix }}-
 
       - name: Doctor, static audit, workspace type-check, reactive audit, web check & Web/Java/iOS/Apple native checks (parallel)
         run: |
@@ -340,11 +348,11 @@ jobs:
           exit "$FAIL"
 
       - name: Save pion CAS cache
-        if: steps.cas-cache.outputs.cache-hit != 'true'
+        if: ${{ !startsWith(steps.cas-cache.outputs.cache-matched-key, format('{0}-full-', steps.pion-env.outputs.cas_base)) }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-macos-arm64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Timing report
         if: always()
@@ -425,14 +433,16 @@ jobs:
           path: .pion
           persist-credentials: false
 
-      - name: Install Linux dependencies & bootstrap pionc2 (parallel)
+      - name: Start installing Linux dependencies (in the background) & bootstrap pionc2
         run: |
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/ci-logs"
+          source scripts/ci-bg.sh
 
-          (
+          # The packages are needed from the unit tests on (doctor, host & film, MT stress,
+          # Linux host); the static checks before them run while dpkg works.
+          apt_install() {
             set -eu
-            SECONDS=0; trap 'echo "apt ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
             APT_PKGS="libgtk-4-dev libsoup-3.0-dev libepoxy-dev libpango1.0-dev libfontconfig1-dev libgdk-pixbuf-2.0-dev zlib1g-dev pkg-config mesa-utils libgl1-mesa-dri ffmpeg"
             if [ "${{ steps.apt-cache.outputs.cache-hit }}" = "true" ] && ls /tmp/apt-debs/*.deb >/dev/null 2>&1; then
               echo "Installing cached .deb packages from /tmp/apt-debs"
@@ -461,14 +471,13 @@ jobs:
               sudo rm -rf /tmp/apt-debs/lock /tmp/apt-debs/partial
               sudo chmod -R a+rX /tmp/apt-debs
             fi
-          ) > "${{ runner.temp }}/ci-logs/apt.log" 2>&1 &
-          PID_APT=$!
+          }
+          bg_start apt apt_install
 
           PID_BOOT=""
           if [ -z "${PION_RELEASE_URL:-}" ] && [ "${{ steps.pion-cache.outputs.cache-hit }}" != "true" ]; then
             (
               set -eu
-              SECONDS=0; trap 'echo "bootstrap ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
               OUT_DIR="$PWD/.pion/out"
               COMPILER_DIR="$PWD/.pion/compiler"
               TMP_DIR="$(mktemp -d)"
@@ -531,17 +540,20 @@ jobs:
           fi
 
           FAIL=0
-          wait "$PID_APT" || { echo "::error::Linux apt dependency install failed"; FAIL=1; }
           if [ -n "$PID_BOOT" ]; then
             wait "$PID_BOOT" || { echo "::error::Bootstrap pionc2 failed"; FAIL=1; }
           fi
-          echo "=== Linux apt dependencies ==="
-          cat "${{ runner.temp }}/ci-logs/apt.log"
           if [ -f "${{ runner.temp }}/ci-logs/bootstrap.log" ]; then
             echo "=== Bootstrap pionc2 ==="
             cat "${{ runner.temp }}/ci-logs/bootstrap.log"
           fi
           exit "$FAIL"
+
+      - name: Wait for the Linux dependencies (apt cache miss only)
+        if: steps.apt-cache.outputs.cache-hit != 'true'
+        run: |
+          source scripts/ci-bg.sh
+          bg_wait apt || { echo "::error::Linux apt dependency install failed"; exit 1; }
 
       - name: Save Linux apt .deb cache
         if: steps.apt-cache.outputs.cache-hit != 'true'
@@ -563,6 +575,8 @@ jobs:
 
       - name: Configure pion toolchain env
         id: pion-env
+        env:
+          CAS_HASH: ${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
         run: |
           if [ -d "$GITHUB_WORKSPACE/.pion/release" ]; then
             SEARCH_ROOT="$GITHUB_WORKSPACE/.pion/release"
@@ -591,17 +605,23 @@ jobs:
           CC_FP=$(cc --version 2>&1 | head -n 1 | tr -cs 'A-Za-z0-9._' '-' | cut -c1-36)
           echo "env_fp=${ImageOS:-linux}-${CC_FP}" >> "$GITHUB_OUTPUT"
           echo "pion_id=${PION_ID}" >> "$GITHUB_OUTPUT"
+          # Saved CAS keys end in the run, so a save the timeout cuts off can never hold a key a later run needs.
+          CAS_PREFIX="pion-cas-v3-linux-x86_64-${ImageOS:-linux}-${CC_FP}-${PION_ID}"
+          echo "cas_prefix=${CAS_PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "cas_base=${CAS_PREFIX}-${CAS_HASH}" >> "$GITHUB_OUTPUT"
 
       - name: Restore pion CAS cache
         id: cas-cache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full
           restore-keys: |
-            pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-
+            ${{ steps.pion-env.outputs.cas_base }}-full-
+            ${{ steps.pion-env.outputs.cas_base }}-ws-
+            ${{ steps.pion-env.outputs.cas_prefix }}-
 
-      - name: Doctor, static audit, workspace type-check, reactive audit, web check & Web/Java checks (parallel)
+      - name: Static audit, workspace type-check, reactive audit, web check & Web/Java checks (parallel)
         run: |
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/ci-logs" target
@@ -637,7 +657,6 @@ jobs:
           (
             set -euo pipefail
             SECONDS=0; trap 'echo "audit-gen ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
-            python3 scripts/invar doctor --json
             bash scripts/check-generated.sh
             python3 scripts/invar audit --json --require-reactive > "$CI_JSON_DIR/audit.json"
           ) > "${{ runner.temp }}/ci-logs/audit-gen.log" 2>&1 &
@@ -666,7 +685,7 @@ jobs:
 
           FAIL=0
           wait "$PID_AUDIT" || {
-            echo "::error::Doctor / check-generated / static audit failed"
+            echo "::error::check-generated / static audit failed"
             if [ -s "$CI_JSON_DIR/audit.json" ]; then
               echo "=== audit.json ==="
               cat "$CI_JSON_DIR/audit.json"
@@ -692,7 +711,7 @@ jobs:
           }
           wait "$PID_WEB_JAVA" || { echo "::error::Web/Java checks failed"; FAIL=1; }
 
-          echo "=== Doctor, check-generated & static audit ==="
+          echo "=== check-generated & static audit ==="
           cat "${{ runner.temp }}/ci-logs/audit-gen.log"
           echo "=== Workspace type-check ==="
           cat "${{ runner.temp }}/ci-logs/ws-check.log"
@@ -704,35 +723,28 @@ jobs:
           cat "${{ runner.temp }}/ci-logs/web-java.log"
           exit "$FAIL"
 
-      - name: Run unit tests (manifest-discovered, including host & film)
+      - name: Doctor & unit tests (manifest-discovered, including host & film), MT stress & Linux host started beside them
         run: |
           set -euo pipefail
+          source scripts/ci-bg.sh
+          bg_wait apt || { echo "::error::Linux apt dependency install failed"; exit 1; }
+          python3 scripts/invar doctor --json
+          # Neither needs the unit tests; they take the cores the tests leave idle.
+          bg_start mt-stress env RUNS=3 bash examples/worker_app/scripts/verify-mt.sh
+          bg_start linux-host bash scripts/check-linux-host.sh --skip-workspace-pion-tests
           python3 scripts/invar test --json | tee "$CI_JSON_DIR/ws_test.json"
 
       - name: Save pion CAS cache (workspace checkpoint)
-        if: steps.cas-cache.outputs.cache-hit != 'true' && !contains(steps.cas-cache.outputs.cache-matched-key, '-ws')
+        if: ${{ !startsWith(steps.cas-cache.outputs.cache-matched-key, format('{0}-', steps.pion-env.outputs.cas_base)) }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}-ws
+          key: ${{ steps.pion-env.outputs.cas_base }}-ws-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: WebAssembly showcase, invar CLI E2E, MT stress & Linux host (parallel)
+      - name: WebAssembly showcase & invar CLI E2E; MT stress & Linux host results
         run: |
           set -euo pipefail
-          (
-            set -euo pipefail
-            SECONDS=0; trap 'echo "mt-stress ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
-            RUNS=3 bash examples/worker_app/scripts/verify-mt.sh
-          ) > "${{ runner.temp }}/ci-logs/mt-stress.log" 2>&1 &
-          PID_MT=$!
-
-          (
-            set -euo pipefail
-            SECONDS=0; trap 'echo "linux-host ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
-            bash scripts/check-linux-host.sh --skip-workspace-pion-tests
-          ) > "${{ runner.temp }}/ci-logs/linux-host.log" 2>&1 &
-          PID_HOST=$!
-
+          source scripts/ci-bg.sh
           (
             set -euo pipefail
             SECONDS=0; trap 'echo "cli-e2e ${SECONDS}s rc=$?" >> "$RUNNER_TEMP/timings.txt"' EXIT
@@ -747,20 +759,16 @@ jobs:
 
           FAIL=0
           wait "$PID_CLI" || { echo "::error::invar CLI E2E (incl. web check) failed"; FAIL=1; }
-          wait "$PID_MT" || { echo "::error::MT stress failed"; FAIL=1; }
-          wait "$PID_HOST" || { echo "::error::Linux host check failed"; FAIL=1; }
-          echo "=== MT stress ==="
-          cat "${{ runner.temp }}/ci-logs/mt-stress.log"
-          echo "=== Linux host check ==="
-          cat "${{ runner.temp }}/ci-logs/linux-host.log"
+          bg_wait mt-stress || { echo "::error::MT stress failed"; FAIL=1; }
+          bg_wait linux-host || { echo "::error::Linux host check failed"; FAIL=1; }
           exit "$FAIL"
 
       - name: Save pion CAS cache
-        if: steps.cas-cache.outputs.cache-hit != 'true'
+        if: ${{ !startsWith(steps.cas-cache.outputs.cache-matched-key, format('{0}-full-', steps.pion-env.outputs.cas_base)) }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/pion-cas
-          key: pion-cas-v3-linux-x86_64-${{ steps.pion-env.outputs.env_fp }}-${{ steps.pion-env.outputs.pion_id }}-${{ hashFiles('pion.toml', 'packages/**/pion.toml', 'examples/**/pion.toml', 'packages/**/*.c', 'packages/**/*.m', 'packages/**/*.h', 'packages/**/*.pion', 'examples/**/*.pion') }}
+          key: ${{ steps.pion-env.outputs.cas_base }}-full-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Timing report
         if: always()
