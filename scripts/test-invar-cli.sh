@@ -113,6 +113,7 @@ print('OK: zero-match filter')
 # Run independent heavy E2E groups (6: jsx-app, 7-8b: web, 9-12: diff/install/shot/compare) in parallel.
 (
 set -euo pipefail
+SECONDS=0; trap 'rc=$?; [ -z "${RUNNER_TEMP:-}" ] || echo "cli-step6 ${SECONDS}s rc=$rc" >> "$RUNNER_TEMP/timings.txt"' EXIT
 echo "=== 6. invar new jsx-app + check + test + audit + no-overwrite ==="
 JSX_DIR="$TMP/my_jsx_app"
 NEW_JSX="$("$INVAR" new --template jsx-app --json "$JSX_DIR")"
@@ -181,6 +182,7 @@ LG_WASM_OUT="$TMP/lg_web_step8.wasm"
 
 (
   set -euo pipefail
+  SECONDS=0; trap 'rc=$?; [ -z "${RUNNER_TEMP:-}" ] || echo "cli-step7 ${SECONDS}s rc=$rc" >> "$RUNNER_TEMP/timings.txt"' EXIT
   echo "=== 7. invar new web-app + invar web build ==="
   "$INVAR" new --template web-app --json "$WEB_DIR" >/dev/null
   WEB_BLD="$("$INVAR" web build --pkg "$WEB_DIR" --out "$WEB_OUT" --json)"
@@ -200,6 +202,7 @@ PID_S7=$!
 
 (
   set -euo pipefail
+  SECONDS=0; trap 'rc=$?; [ -z "${RUNNER_TEMP:-}" ] || echo "cli-step8 ${SECONDS}s rc=$rc" >> "$RUNNER_TEMP/timings.txt"' EXIT
   echo "=== 8. invar web check --json (packages/lg_web) ==="
   if [ -n "${INVAR_CLI_TEST_WEB_CHECK_JSON:-}" ] && [ -f "$INVAR_CLI_TEST_WEB_CHECK_JSON" ]; then
     WEB_CHK="$(cat "$INVAR_CLI_TEST_WEB_CHECK_JSON")"
@@ -244,6 +247,7 @@ chmod +x "$NO_BROTLI_BIN/brotli"
 
 (
   set -euo pipefail
+  SECONDS=0; trap 'rc=$?; [ -z "${RUNNER_TEMP:-}" ] || echo "cli-step8b ${SECONDS}s rc=$rc" >> "$RUNNER_TEMP/timings.txt"' EXIT
   export PATH="$NO_BROTLI_BIN:$PATH"
   SHARED_OUT="$TMP/shared_web_out"
   MY_WEB_WASM="$WEB_OUT/my_web_app.wasm"
@@ -371,6 +375,7 @@ PID_STEP7_8B=$!
 
 (
 set -euo pipefail
+SECONDS=0; trap 'rc=$?; [ -z "${RUNNER_TEMP:-}" ] || echo "cli-step9-12 ${SECONDS}s rc=$rc" >> "$RUNNER_TEMP/timings.txt"' EXIT
 echo "=== 9. invar diff --json --out --sbs (synthetic PNGs) ==="
 python3 - "$TMP" << 'PYEOF'
 import os, struct, sys, zlib
@@ -465,7 +470,8 @@ assert d['ok'] is False and d['pngs'] == [] and d['mp4s'] == [], f'stale PNG lea
 print('OK: unknown preset rejected cleanly without leaking stale PNG')
 " "$BOGUS_JSON"
 
-SHOT_OK="$("$INVAR" shot --only ios27-parity-light --scale 1 --out "$SHOT_DIR" --prebuilt-bin "$SHOT_BIN" --json)"
+# A quarter of the preset's 390x844 page: the run steps 1 s of frames through llvmpipe on Linux.
+SHOT_OK="$("$INVAR" shot --only ios27-parity-light --scale 1 --w 195 --h 422 --out "$SHOT_DIR" --prebuilt-bin "$SHOT_BIN" --json)"
 assert_py "
 import json, os, sys
 d = json.loads(sys.argv[1])
@@ -473,8 +479,8 @@ assert d['ok'] is True, f'ios27-parity-light shot failed: {d}'
 assert len(d['pngs']) == 1 and d['mp4s'] == [], f'unexpected shot outputs: {d}'
 p = d['pngs'][0]
 assert os.path.basename(p['file']) == 'ios27-parity-light.png', f'wrong file: {p}'
-assert p['width'] == 390 and p['height'] == 844, f'scale=1 override failed: {p}'
-print('OK: invar shot fresh output + scale=1 override (%dx%d, build %d ms, run %d ms)' % (p['width'], p['height'], d['build_ms'], d['run_ms']))
+assert p['width'] == 195 and p['height'] == 422, f'scale=1 / size override failed: {p}'
+print('OK: invar shot fresh output + scale=1 and size override (%dx%d, build %d ms, run %d ms)' % (p['width'], p['height'], d['build_ms'], d['run_ms']))
 " "$SHOT_OK"
 
 # Relative --prebuilt-bin from a different cwd must resolve against caller cwd, and combining --prebuilt-bin + --out-bin must fail.
