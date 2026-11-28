@@ -262,6 +262,20 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
     }
 
     /**
+     * The glyphs put since the last frame handed over, handed to the GL thread with no frame after them (an atlas's
+     * pages given back as the app rests: MBText.atlasPages), in order with what was handed over before. With ONE, put in
+     * at once: the app's frame is the GL thread's, its context current.
+     */
+    static void glyphsOnly() {
+        if (ONE) {
+            MBText.flush();
+            return;
+        }
+        MBView v = Host.view;
+        if (mail.glyphsOnly(MBText.placed) && v != null) v.requestRender();
+    }
+
+    /**
      * {@code r}, which lets go of what a frame draws (a picture's texture, a native view's, a stream's), run on the GL
      * thread once a frame the app's thread hands over after it is drawn on the screen: the frame kept till then is
      * drawn again as a native view's picture changes or the surface asks, and still draws it (FrameMail.retire). With
@@ -712,6 +726,8 @@ public class MBView extends GLSurfaceView implements GLSurfaceView.Renderer {
             MBText.upload(t.glyphs);
             Native.draw();
         } else {
+            // (glyphs handed over alone: an atlas's pages given back, the frame kept drawing none of them)
+            MBText.upload(mail.takeGlyphs());
             Native.redraw();
         }
         boolean settlingNow = Native.adaptiveSettling();

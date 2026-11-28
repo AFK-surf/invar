@@ -162,6 +162,31 @@ final class FrameMail<G> {
         return true;
     }
 
+    /**
+     * Glyphs put in the atlases with no frame after them (an atlas's pages given back as the app rests), handed over as
+     * a frame's are, after what was handed over before ({@code placed}: taken, the list cleared): put in by the GL thread
+     * with the next frame it takes, or alone (takeGlyphs). Whether they were taken: not made for the context now.
+     */
+    synchronized boolean glyphsOnly(List<G> placed) {
+        if (appGen != contextGen) {
+            f.dropped(new ArrayList<>(placed));
+            placed.clear();
+            return false;
+        }
+        pendingGlyphs.addAll(placed);
+        placed.clear();
+        notifyAll();
+        return true;
+    }
+
+    /** (GL thread) The glyphs handed over with no frame waiting to take them, taken (none: empty). */
+    synchronized ArrayList<G> takeGlyphs() {
+        if (pendingSeq >= 0 || pendingGlyphs.isEmpty()) return new ArrayList<>();
+        ArrayList<G> out = pendingGlyphs;
+        pendingGlyphs = new ArrayList<>();
+        return out;
+    }
+
     /** Only a native view's picture changed: the frame kept drawn again, at {@code shows}; whether it is to be. */
     synchronized boolean redrawAsked(long shows) {
         // (the frame kept is of the GL context before: the app's own for this one comes)
@@ -196,6 +221,10 @@ final class FrameMail<G> {
             pendingSeq = -1;
             pendingRef = null;
             // (its latency run's events the next frame's: pendingLat kept; what it was to let go, the next's)
+        } else if (!pendingGlyphs.isEmpty()) {
+            // (glyphs handed over alone, an atlas's pages among them: of the atlas gone)
+            f.dropped(pendingGlyphs);
+            pendingGlyphs = new ArrayList<>();
         }
         redrawOwed = false;
         return ++contextGen;

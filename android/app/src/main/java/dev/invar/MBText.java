@@ -232,6 +232,8 @@ final class MBText {
         generation++;
         dropHeld();
         dropPlaced();
+        // (the new context's atlases one page each, said before anything is put for it)
+        Native.atlasReset();
     }
 
     /** A font's key: its size's bits, its weight and its style. */
@@ -870,14 +872,9 @@ final class MBText {
     static void atlasPages(boolean colour, int n, boolean fewer) {
         Placed op = new Placed(null, null, 0, 0, 0, 0, colour);
         op.pages = n;
-        if (!fewer) {
-            placed.add(op);
-            return;
-        }
-        ArrayList<Placed> now = new ArrayList<>(placed);
-        placed.clear();
-        now.add(op);
-        MBView.toRender(() -> upload(now));
+        placed.add(op);
+        // (given back: handed over now in the same order, though no frame is drawn after it)
+        if (fewer) MBView.glyphsOnly();
     }
 
     /** The glyph drawn last, not put in the atlas, let go. */
@@ -992,18 +989,27 @@ final class MBText {
         int n = placed.size();
         if (n == 0) return;
         int bound = -1;
+        // (how many pages each atlas has: a glyph on a page past them, one there was no memory for, not put)
+        int[] have = {Native.atlasPagesHave(false), Native.atlasPagesHave(true)};
         int i = 0;
         while (i < n) {
             Placed first = placed.get(i);
             if (first.pages > 0) {
-                // (the atlas's texture made anew: bound again for the glyphs after)
+                // (the atlas's texture made anew, or as it was where there was no memory: bound again for the glyphs
+                // after)
                 Native.atlasPages(first.colour, first.pages);
+                have[first.colour ? 1 : 0] = Native.atlasPagesHave(first.colour);
                 bound = -1;
                 i++;
                 continue;
             }
             int side = first.colour ? COLOUR_ATLAS_SIDE : ATLAS_SIDE;
             int page = first.y / side, ly = first.y - page * side;
+            if (page >= have[first.colour ? 1 : 0]) {
+                first.release();
+                i++;
+                continue;
+            }
             int j = i, right = first.x - 1, h = 0;
             while (j < n && placed.get(j).pages == 0 && placed.get(j).colour == first.colour
                     && placed.get(j).y == first.y && placed.get(j).x == right + 1) {

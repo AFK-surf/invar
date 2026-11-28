@@ -65,6 +65,12 @@ final class Native {
 
     /** (GL thread) The atlas (colour glyphs' or the words') made {@code n} pages: false where there was no memory. */
     static native boolean atlasPages(boolean colour, int n);
+
+    /** (GL thread) How many pages the atlas (colour glyphs' or the words') has: a glyph on a page past them not put. */
+    static native int atlasPagesHave(boolean colour);
+
+    /** (The app's thread) A GL context made anew: its atlases one page each, as what is put from now on says. */
+    static native void atlasReset();
     static native boolean snapshot(String path);
     /** Image `id` uploaded as `tex` (0: not decoded), GL thread: whether the app is to be told (imageTold). */
     static native boolean imageDone(int id, int tex);
