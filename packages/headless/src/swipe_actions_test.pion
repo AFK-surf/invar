@@ -1,0 +1,242 @@
+// Tests for headless SwipeActions: horizontal drag open/close, axis locking against vertical & diagonal scroll inside
+// a real `View::scrolls` list, slop subtraction (no jump, FPS-invariant), rubber-band over-drag damping, velocity flick,
+// programmatic open/close, and disabled guard.
+
+import "signals"
+import "view"
+
+fn swipe_make_tree(make : (view::View) -> Unit) -> view::Tree {
+  let t = view::Tree::new(
+    make,
+    measure=view::words_measure,
+    measure_runs=view::runs_measure,
+    measure_runs_least=view::runs_least_measure,
+  )
+  let _ = t.frame(300.0, 200.0, now=0.0)
+  t
+}
+
+/// Drive a pointer drag through `Tree::claimers_at` / `Tree::claimer_of` / `Tree::drag_at`
+/// matching the host claim-and-handover protocol (including velocity track on release).
+fn swipe_drag(
+  t : view::Tree,
+  clock : signals::Ref[Double],
+  x0 : Double,
+  y0 : Double,
+  x1 : Double,
+  y1 : Double,
+  steps : Int,
+) -> Unit {
+  let step_ms = 1000.0 / 60.0
+  let t0 = clock.v
+  let chain = t.claimers_at(x0, y0)
+  let track : Array[(Double, Double, Double)] = [(t0, x0, y0)]
+  let mut claimed : Option[view::NodeId] = None
+  let mut i = 1
+  while i <= steps {
+    clock.v = clock.v + step_ms
+    let f = i.to_double() / steps.to_double()
+    let x = x0 + (x1 - x0) * f
+    let y = y0 + (y1 - y0) * f
+    track.push((clock.v, x, y))
+    match claimed {
+      None => match t.claimer_of(chain, x - x0, y - y0) {
+        Some(id) => {
+          claimed = Some(id)
+          let _ = t.drag_at(id, view::DragIs::Down, x0, y0, t0)
+          let _ = t.drag_at(id, view::DragIs::Moved, x, y, clock.v)
+        }
+        None => ()
+      }
+      Some(id) => {
+        let _ = t.drag_at(id, view::DragIs::Moved, x, y, clock.v)
+      }
+    }
+    let _ = t.frame(300.0, 200.0, now=clock.v)
+    i = i + 1
+  }
+  match claimed {
+    Some(id) => {
+      let _ = t.drag_at(id, view::DragIs::Up, x1, y1, clock.v, track=track)
+      let _ = t.frame(300.0, 200.0, now=clock.v)
+    }
+    None => ()
+  }
+  clock.v = clock.v + step_ms
+}
+
+fn swipe_side_is(got : Option[SwipeSide], exp : Option[SwipeSide]) -> Bool {
+  match (got, exp) {
+    (None, None) => true
+    (Some(SwipeSide::Left), Some(SwipeSide::Left)) => true
+    (Some(SwipeSide::Right), Some(SwipeSide::Right)) => true
+    _ => false
+  }
+}
+
+test "SwipeActions: horizontal drag opens Left/Right past threshold, short drag snaps back, vertical drag ignored" {
+  let events : Array[Option[SwipeSide]] = []
+  let sa = SwipeActions::new(
+    left_width=80.0,
+    right_width=100.0,
+    threshold=0.4,
+    velocity_threshold=400.0,
+    slop=6.0,
+    on_open=fn(side : Option[SwipeSide]) { events.push(side) },
+  )
+  let t = swipe_make_tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+        .width(view::Live::Is(Some(300.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="List Row"))))
+      sa.bind(v)
+    })
+  })
+  let clock = view::ref_new(10.0)
+
+  // Vertical drag (dy=40 > dx=5) does not lock horizontal axis
+  swipe_drag(t, clock, 150.0, 10.0, 155.0, 50.0, 10)
+  debug_assert(sa.offset() == 0.0 && swipe_side_is(sa.open_side(), None) && !sa.dragging(), "vertical drag ignored")
+
+  // Slow short horizontal drag right (+20 -> effective 14 < 80 * 0.4 = 32) snaps back to 0
+  swipe_drag(t, clock, 150.0, 30.0, 170.0, 30.0, 20)
+  debug_assert(sa.offset() == 0.0 && swipe_side_is(sa.open_side(), None), "short drag snaps back")
+
+  // Slow horizontal drag right (+50 -> effective 44 >= 32) snaps open Left (80.0)
+  swipe_drag(t, clock, 150.0, 30.0, 200.0, 30.0, 20)
+  debug_assert(sa.offset() == 80.0 && swipe_side_is(sa.open_side(), Some(SwipeSide::Left)), "drag right snaps open Left")
+
+  // Drag back left to close
+  swipe_drag(t, clock, 200.0, 30.0, 120.0, 30.0, 20)
+  debug_assert(sa.offset() == 0.0 && swipe_side_is(sa.open_side(), None), "drag back left closes")
+
+  // Slow horizontal drag left (-60 -> effective -54 <= -40) snaps open Right (-100.0)
+  swipe_drag(t, clock, 200.0, 30.0, 140.0, 30.0, 20)
+  debug_assert(sa.offset() == -100.0 && swipe_side_is(sa.open_side(), Some(SwipeSide::Right)), "drag left snaps open Right")
+
+  debug_assert(
+    events.length() == 3 &&
+      swipe_side_is(events[0], Some(SwipeSide::Left)) &&
+      swipe_side_is(events[1], None) &&
+      swipe_side_is(events[2], Some(SwipeSide::Right)),
+    "on_open events match [Some(Left), None, Some(Right)]",
+  )
+  t.dispose()
+}
+
+test "SwipeActions: rubber-band damping past width, fast velocity flick, and programmatic open/close" {
+  let sa = SwipeActions::new(left_width=80.0, right_width=80.0, threshold=0.5, velocity_threshold=400.0)
+  let t = swipe_make_tree(fn(root : view::View) {
+    let _ = root.box(fn(v : view::View) {
+      let _ = v
+        .width(view::Live::Is(Some(300.0)))
+        .height(view::Live::Is(Some(60.0)))
+        .says(view::Live::Is(Some(view::said(view::Role::Group, label="Swipe Row"))))
+      sa.bind(v)
+    })
+  })
+  let clock = view::ref_new(10.0)
+
+  // Hold-drag right 160px past left_width=80 -> rubber-band damped (80 < offset < 160)
+  let chain = t.claimers_at(50.0, 30.0)
+  let cid = match t.claimer_of(chain, 160.0, 0.0) { Some(id) => id; None => panic("expected claimer") }
+  let _ = t.drag_at(cid, view::DragIs::Down, 50.0, 30.0, clock.v)
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(cid, view::DragIs::Moved, 210.0, 30.0, clock.v)
+  let mid_offset = sa.offset()
+  let mid_drag = sa.dragging()
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(cid, view::DragIs::Up, 210.0, 30.0, clock.v)
+  debug_assert(mid_drag, "dragging true during hold-drag")
+  debug_assert(mid_offset > 80.0 && mid_offset < 160.0, "rubber-band damped past left_width")
+  debug_assert(sa.offset() == 80.0 && swipe_side_is(sa.open_side(), Some(SwipeSide::Left)) && !sa.dragging(), "snapped to Left on release")
+
+  // Programmatic close
+  sa.close()
+  debug_assert(sa.offset() == 0.0 && swipe_side_is(sa.open_side(), None), "programmatic close")
+
+  // Fast short flick left (25px over 2 steps ~= 750 pt/s > 400) snaps open Right even though 25 - 6 < 40
+  swipe_drag(t, clock, 150.0, 30.0, 125.0, 30.0, 2)
+  debug_assert(sa.offset() == -80.0 && swipe_side_is(sa.open_side(), Some(SwipeSide::Right)), "fast flick opens Right")
+
+  // Programmatic open(Left) switches side
+  sa.open(SwipeSide::Left)
+  debug_assert(sa.offset() == 80.0 && swipe_side_is(sa.open_side(), Some(SwipeSide::Left)), "programmatic open Left")
+  t.dispose()
+}
+
+test "SwipeActions: inside View::scrolls, vertical/diagonal drags scroll the list; crossing slop starts smoothly from 0; dead side ignored" {
+  let scroll = view::Scroll::new()
+  let sa = SwipeActions::new(left_width=0.0, right_width=100.0, threshold=0.4, slop=6.0)
+  let t = swipe_make_tree(fn(root : view::View) {
+    let _ = root.box(fn(sc : view::View) {
+      let _ = sc
+        .width(view::Live::Is(Some(300.0)))
+        .height(view::Live::Is(Some(180.0)))
+        .scrolls(scroll, slop=6.0, fn(held : view::View) {
+          let _ = held.box(fn(v : view::View) {
+            let _ = v
+              .width(view::Live::Is(Some(300.0)))
+              .height(view::Live::Is(Some(60.0)))
+              .says(view::Live::Is(Some(view::said(view::Role::Group, label="Gesture Row"))))
+            sa.bind(v)
+          })
+          let _ = held.box(fn(pad : view::View) {
+            let _ = pad.width(view::Live::Is(Some(300.0))).height(view::Live::Is(Some(600.0)))
+          })
+        })
+    })
+  })
+  let clock = view::ref_new(10.0)
+
+  // Vertical-leaning drag (|dy|=24 >= |dx|=8) must yield to outer View::scrolls and scroll the list
+  swipe_drag(t, clock, 150.0, 50.0, 142.0, 26.0, 10)
+  debug_assert(
+    sa.offset() == 0.0 && swipe_side_is(sa.open_side(), None) && !sa.dragging() && scroll.at(t) > 0.0,
+    "vertical-leaning drag yields to outer View::scrolls",
+  )
+
+  // Reset scroll back to top
+  scroll.put(0.0)
+  let _ = t.frame(300.0, 200.0, now=clock.v)
+
+  // Shallow diagonal drag (|dx|=20 > |dy|=12, but |dx| <= 2*|dy|) must NOT falsely lock horizontal swipe
+  swipe_drag(t, clock, 150.0, 40.0, 130.0, 28.0, 10)
+  debug_assert(
+    sa.offset() == 0.0 && swipe_side_is(sa.open_side(), None) && !sa.dragging(),
+    "shallow diagonal drag does not falsely lock horizontal swipe",
+  )
+
+  // Dragging right when closed and left_width == 0.0 must not claim dragging
+  let dead_chain = t.claimers_at(150.0, 30.0)
+  let dead_claimed = t.claimer_of(dead_chain, 30.0, 0.0)
+  debug_assert(dead_claimed is None && sa.offset() == 0.0 && !sa.dragging(), "dead side does not claim")
+
+  // Crossing slop leftward subtracts slop so offset starts smoothly from 0 with no jump
+  let c1 = t.claimers_at(200.0, 30.0)
+  // At exact slop (-6.0): not claimed yet
+  debug_assert(t.claimer_of(c1, -6.0, 0.0) is None && sa.offset() == 0.0 && !sa.dragging(), "at exact slop not claimed")
+  // Just past slop (-6.5): claims and starts at -0.5
+  let id1 = match t.claimer_of(c1, -6.5, 0.0) { Some(id) => id; None => panic("expected claim at -6.5") }
+  let _ = t.drag_at(id1, view::DragIs::Down, 200.0, 30.0, clock.v)
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(id1, view::DragIs::Moved, 193.5, 30.0, clock.v)
+  debug_assert((sa.offset() - (-0.5)).abs() < 0.001 && sa.dragging(), "just past slop starts smoothly at -0.5")
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(id1, view::DragIs::Moved, 190.0, 30.0, clock.v)
+  debug_assert((sa.offset() - (-4.0)).abs() < 0.001 && sa.dragging(), "past slop reaches -4.0")
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(id1, view::DragIs::Up, 190.0, 30.0, clock.v)
+
+  // Single-step jump to the same final point yields the exact same offset (FPS-invariant)
+  let c2 = t.claimers_at(200.0, 30.0)
+  let id2 = match t.claimer_of(c2, -10.0, 0.0) { Some(id) => id; None => panic("expected claim at -10.0") }
+  let _ = t.drag_at(id2, view::DragIs::Down, 200.0, 30.0, clock.v)
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(id2, view::DragIs::Moved, 190.0, 30.0, clock.v)
+  debug_assert((sa.offset() - (-4.0)).abs() < 0.001 && sa.dragging(), "single-step jump is FPS-invariant (-4.0)")
+  clock.v = clock.v + 16.0
+  let _ = t.drag_at(id2, view::DragIs::Up, 190.0, 30.0, clock.v)
+  t.dispose()
+}

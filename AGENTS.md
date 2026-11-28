@@ -143,7 +143,7 @@ pub fn build_page(root : view::View, field : ui::Field, on_send : () -> Unit) ->
   - `zz_invar_*.pion` or `invar_ext.pion` (Invar-specific extensions/overlays), and
   - `00_init_order.pion` (topological module init order).
 - Keep pure-Pion Layer-0/1 primitives (`packages/redacted`, `packages/causal`, `packages/machine`, `packages/signals`, `packages/headless_core`) in small standalone micro-packages so they remain isolated from generated-package refreshes and maximize `pionc` CAS cache hits.
-- Audit generated provenance and overlay boundaries with `bash scripts/check-generated.sh [--strict] [--report-only] [--require-single-commit] [--json]`. Default ratchet mode tracks existing legacy items (`packages/headless` pending next publish) so counts may only shrink; use `--strict` for zero-exemption enforcement.
+- Audit generated provenance and overlay boundaries with `bash scripts/check-generated.sh [--strict] [--report-only] [--require-single-commit] [--json]`. Default ratchet mode and `--strict` both enforce zero-exemption provenance and overlay boundaries.
 
 ---
 
