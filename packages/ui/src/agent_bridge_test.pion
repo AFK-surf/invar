@@ -10,20 +10,34 @@ fn ab_assert(cond : Bool, msg : String) -> Unit {
   }
 }
 
+fn ab_is_ok(r : Result[AgentEntry, AgentActError]) -> Bool {
+  match r {
+    Ok(_) => true
+    Err(_) => false
+  }
+}
+
+fn ab_is_err(r : Result[AgentEntry, AgentActError]) -> Bool {
+  match r {
+    Ok(_) => false
+    Err(_) => true
+  }
+}
+
 test "agent_bridge 01 secret redaction, side-channel protection, and hidden subtree" {
   let t = Tester::tree(fn(root : view::View) {
     let _ = root.box(fn(v : view::View) {
-      let _ = agent_secret(v)
-        .says(view::Live::Is(Some(view::said(
-          view::Role::TextField,
-          label="API Token",
-          description="Secret key value",
-          value="sk-live-998877",
-        ))))
+      agent_secret(v)
+      let _ = v.says(view::Live::Is(Some(view::said(
+        view::Role::TextField,
+        label="API Token",
+        description="Secret key value",
+        value="sk-live-998877",
+      ))))
     })
     let _ = root.box(fn(sec : view::View) {
-      let _ = agent_hidden(sec)
-        .says(view::Live::Is(Some(view::said(view::Role::Region, label="Internal Debug"))))
+      agent_hidden(sec)
+      let _ = sec.says(view::Live::Is(Some(view::said(view::Role::Region, label="Internal Debug"))))
       let _ = sec.box(fn(btn : view::View) {
         let _ = btn
           .presses(view::Live::Is(true))
@@ -56,13 +70,10 @@ test "agent_bridge 01 secret redaction, side-channel protection, and hidden subt
 
   // Hidden subtree nodes are completely unreachable.
   ab_assert(t.agent_query(text="Secret Reset").length() == 0, "hidden child invisible to query")
-  let hidden_act = t.agent_act(AgentStep::by_query(AgentAction::Press, text="Secret Reset"))
-  ab_assert(agent_act_is_err(hidden_act), "cannot act on hidden child")
+  let hidden_act = t.agent_act(AgentStep::{ target: "Secret Reset", action: AgentAction::Press })
+  ab_assert(ab_is_err(hidden_act), "cannot act on hidden child")
 
-  let json = match view_tree() {
-    Some(tr) => agent_snapshot_json(tr)
-    None => panic("missing tree")
-  }
+  let json = agent_snapshot_json(snap)
   ab_assert(str_contains(json, "\"value\":\"[redacted]\""), "JSON contains redacted placeholder")
   ab_assert(!str_contains(json, "998877"), "JSON never leaks secret value")
   ab_assert(!str_contains(json, "Secret Reset"), "JSON never leaks hidden subtree")
@@ -71,10 +82,10 @@ test "agent_bridge 01 secret redaction, side-channel protection, and hidden subt
 
 test "agent_bridge 02 modal blocking, confirm gate, ambiguity protection, and within scoping" {
   let modal_open = signals::signal(false)
-  let deleted = view::ref_new(0)
-  let saved_a = view::ref_new(0)
-  let saved_b = view::ref_new(0)
-  let modal_ok = view::ref_new(0)
+  let deleted = ref_new(0)
+  let saved_a = ref_new(0)
+  let saved_b = ref_new(0)
+  let modal_ok = ref_new(0)
 
   let t = Tester::tree(fn(root : view::View) {
     let _ = root.box(fn(sec_a : view::View) {
@@ -96,7 +107,8 @@ test "agent_bridge 02 modal blocking, confirm gate, ambiguity protection, and wi
       })
     })
     let _ = root.box(fn(del : view::View) {
-      let _ = agent_confirm(del, "Permanently delete account")
+      agent_confirm(del, "Permanently delete account")
+      let _ = del
         .presses(view::Live::Is(true))
         .says(view::Live::Is(Some(view::said(view::Role::Button, label="Delete Account"))))
         .on_press(fn() { deleted.v = deleted.v + 1 })
@@ -114,42 +126,39 @@ test "agent_bridge 02 modal blocking, confirm gate, ambiguity protection, and wi
     }, at_once=true)
   })
 
-  // Ambiguous "Save" rejected without `within` or `ref_id`.
-  match t.agent_act(AgentStep::by_query(AgentAction::Press, text="Save", role=view::Role::Button)) {
+  // Ambiguous "Save" rejected without ref_id disambiguation.
+  match t.agent_act(AgentStep::{ target: "Save", action: AgentAction::Press }) {
     Err(AgentActError::Ambiguous(refs)) => ab_assert(refs.length() == 2, "two Save buttons reported")
     _ => panic("expected Ambiguous error for duplicate Save")
   }
   ab_assert(saved_a.v == 0 && saved_b.v == 0, "ambiguous press did not fire")
 
-  // Scoped with `within="Billing Form"` succeeds unambiguously.
-  let r_bill = t.agent_act(AgentStep::by_query(
-    AgentAction::Press,
-    text="Save",
-    role=view::Role::Button,
-    within="Billing Form",
-  ))
-  ab_assert(agent_act_is_ok(r_bill) && saved_b.v == 1 && saved_a.v == 0, "within disambiguates Billing Save")
+  // Scoped query with `within="Billing Form"` disambiguates via ref_id.
+  let bill_hits = t.agent_query(text="Save", role=view::Role::Button, within="Billing Form")
+  ab_assert(bill_hits.length() == 1, "within disambiguates Billing Save")
+  let r_bill = t.agent_act(AgentStep::{ target: bill_hits[0].ref_id, action: AgentAction::Press })
+  ab_assert(ab_is_ok(r_bill) && saved_b.v == 1 && saved_a.v == 0, "within disambiguated press fired Billing Save")
 
-  // Confirm gate: denied by default, allowed with matching approval.
-  match t.agent_act(AgentStep::by_query(AgentAction::Press, text="Delete Account")) {
+  // Confirm gate: denied by default, allowed with matching approval callback.
+  match t.agent_act(AgentStep::{ target: "Delete Account", action: AgentAction::Press }) {
     Err(AgentActError::NeedsConfirm(reason)) => ab_assert(reason == "Permanently delete account", "confirm reason")
     _ => panic("expected NeedsConfirm")
   }
   ab_assert(deleted.v == 0, "unapproved delete blocked")
 
   let r_del = t.agent_act(
-    AgentStep::by_query(AgentAction::Press, text="Delete Account"),
-    allow=AgentApproval::AllowReason("Permanently delete account"),
+    AgentStep::{ target: "Delete Account", action: AgentAction::Press },
+    allow=fn(ap : AgentApproval) { ap.reason == "Permanently delete account" },
   )
-  ab_assert(agent_act_is_ok(r_del) && deleted.v == 1, "approved delete succeeded")
+  ab_assert(ab_is_ok(r_del) && deleted.v == 1, "approved delete succeeded")
 
   // Modal layer blocks all underlying nodes from snapshot & actions.
   modal_open.set(true)
   t.frame(ms=16.0)
   ab_assert(t.agent_query(text="Delete Account").length() == 0, "underlying node blocked by modal")
-  ab_assert(agent_act_is_err(t.agent_act(AgentStep::by_query(AgentAction::Press, text="Save", within="Profile Form"))), "modal blocks underlying press")
-  let r_modal = t.agent_act(AgentStep::by_query(AgentAction::Press, text="Confirm", role=view::Role::Button))
-  ab_assert(agent_act_is_ok(r_modal) && modal_ok.v == 1, "modal button remains actionable")
+  ab_assert(ab_is_err(t.agent_act(AgentStep::{ target: bill_hits[0].ref_id, action: AgentAction::Press })), "modal blocks underlying press")
+  let r_modal = t.agent_act(AgentStep::{ target: "Confirm", action: AgentAction::Press })
+  ab_assert(ab_is_ok(r_modal) && modal_ok.v == 1, "modal button remains actionable")
   t.dispose()
 }
 
@@ -157,12 +166,13 @@ test "agent_bridge 03 all actions (Press, Focus, Increment, Decrement, SetValue)
   let vol = signals::signal(50)
   let name = signals::signal("Alice")
   let disabled_btn = signals::signal(true)
-  let field_focused = view::ref_new(false)
-  let btn_clicks = view::ref_new(0)
+  let field_focused = ref_new(false)
+  let btn_clicks = ref_new(0)
 
   let t = Tester::tree(fn(root : view::View) {
     let _ = root.box(fn(fld : view::View) {
-      let _ = agent_value_writer(fld, fn(s : String) { name.set(s) })
+      agent_value_writer(fld, fn(s : String) { name.set(s) })
+      let _ = fld
         .presses(view::Live::Is(true))
         .focusable(view::Live::Is(true), keys=0)
         .says(view::Live::By(fn() -> Option[view::Said] {
@@ -194,14 +204,14 @@ test "agent_bridge 03 all actions (Press, Focus, Increment, Decrement, SetValue)
     })
   })
 
-  // Empty query must always return Err(NotFound) rather than accidentally hitting a lone control.
-  match t.agent_act(AgentStep::by_query(AgentAction::Press)) {
+  // Empty target must always return Err(NotFound) rather than accidentally hitting a lone control.
+  match t.agent_act(AgentStep::{ target: "", action: AgentAction::Press }) {
     Err(AgentActError::NotFound(_)) => ()
-    _ => panic("expected NotFound for empty query")
+    _ => panic("expected NotFound for empty target")
   }
 
   // Disabled button returns Disabled error.
-  match t.agent_act(AgentStep::by_query(AgentAction::Press, text="Submit")) {
+  match t.agent_act(AgentStep::{ target: "Submit", action: AgentAction::Press }) {
     Err(AgentActError::Disabled(_)) => ()
     _ => panic("expected Disabled error")
   }
@@ -209,7 +219,7 @@ test "agent_bridge 03 all actions (Press, Focus, Increment, Decrement, SetValue)
   t.frame(ms=16.0)
 
   // UnsupportedAction: SetValue on a button without agent_value_writer.
-  match t.agent_act(AgentStep::by_query(AgentAction::SetValue("x"), text="Submit")) {
+  match t.agent_act(AgentStep::{ target: "Submit", action: AgentAction::SetValue("x") }) {
     Err(AgentActError::UnsupportedAction(_)) => ()
     _ => panic("expected UnsupportedAction for SetValue on button")
   }
@@ -220,18 +230,18 @@ test "agent_bridge 03 all actions (Press, Focus, Increment, Decrement, SetValue)
     None => panic("missing tree")
   }
   let results = agent_act_all(tr, [
-    AgentStep::by_query(AgentAction::Focus, text="Display Name"),
-    AgentStep::by_query(AgentAction::SetValue("Bob"), text="Display Name"),
-    AgentStep::by_query(AgentAction::Increment, text="Volume"),
-    AgentStep::by_query(AgentAction::Increment, text="Volume"),
-    AgentStep::by_query(AgentAction::Decrement, text="Volume"),
-    AgentStep::by_query(AgentAction::Press, text="Submit"),
-  ], at=32.0)
+    AgentStep::{ target: "Display Name", action: AgentAction::Focus },
+    AgentStep::{ target: "Display Name", action: AgentAction::SetValue("Bob") },
+    AgentStep::{ target: "Volume", action: AgentAction::Increment },
+    AgentStep::{ target: "Volume", action: AgentAction::Increment },
+    AgentStep::{ target: "Volume", action: AgentAction::Decrement },
+    AgentStep::{ target: "Submit", action: AgentAction::Press },
+  ])
   t.frame(ms=16.0)
 
   ab_assert(results.length() == 6, "all 6 steps ran")
   for r in results {
-    ab_assert(agent_act_is_ok(r), "every step succeeded")
+    ab_assert(ab_is_ok(r), "every step succeeded")
   }
   match results[1] {
     Ok(updated) => ab_assert(updated.value == "Bob", "agent_act returns refreshed AgentEntry after SetValue")
@@ -267,10 +277,7 @@ test "agent_bridge 04 ui::field secret=true auto-redaction and side-channel defe
   let pub_matches = t.agent_query(text="Username")
   ab_assert(pub_matches.length() == 1 && !pub_matches[0].redacted && pub_matches[0].value == "public-user-name", "plain field not redacted")
 
-  let json = match view_tree() {
-    Some(tr) => agent_snapshot_json(tr)
-    None => panic("missing tree")
-  }
+  let json = agent_snapshot_json(t.agent_snapshot())
   ab_assert(str_contains(json, "\"value\":\"[redacted]\""), "JSON has redacted placeholder")
   ab_assert(!str_contains(json, "s3cr3t-token-42"), "JSON never leaks ui::field secret text")
   t.dispose()

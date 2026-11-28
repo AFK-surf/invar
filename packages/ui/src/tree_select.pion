@@ -1,272 +1,828 @@
-// Read-only rich/plain text drag selection, double-tap word selection, multi-line highlight,
-// and Cmd/Ctrl+C clipboard copy (`SelectableText` + `selectable_words`).
-
-import "dmath"
-import "editor"
-import "hostapi"
-import "paint"
+import "mbt_compat"
 import "signals"
 import "view"
 
-/// Read-only selectable text state backed by `packages/editor` layout and grapheme/word boundaries.
-pub struct SelectableText {
-  pub editor : editor::EditorState
-  layout_sig : signals::Signal[Int]
-  dragging_sig : signals::Signal[Bool]
-  pub mut sel_color : Int64
-  pub mut last_font_size : Double
-  pub mut last_line_h : Double
-  pub mut last_max_w : Double
-  mut drag_anchor : Int
-  mut last_tap_at : Double
-  mut last_tap_x : Double
-  mut last_tap_y : Double
-}
+// Words of the window's tree picked with the pointer, by the same selection as an old view's paragraphs (desktop.pion):
+// a node's words in pieces (View::words_runs) where what holds it says its words are picked so (words_picked: a page's,
+// as an old view's page in Ctx::selectable), each a paragraph of it (SelKey's `Words`: the tree's number, the row of a
+// list made by its key it is in and its place in that row: View::row_place), found where the tree lays it out and shows
+// it now (tree_sels: what holds it cutting it, as big as it is drawn), never as the frame before painted it; what of it
+// is picked drawn under its words (View::runs_picked, as each is made and as what is picked changes: picked_told). Its
+// plain words are picked by none, as an old view's plain words are not (Ctx::text). A finger's press is what it
+// presses; a finger held still on them a long press's time is the selection's (tree_finger_down, finger_select.pion).
 
-pub fn SelectableText::new(text~ : String = "") -> SelectableText {
-  let cfg = editor::EditorConfig::default()
-  let ed = editor::EditorState::new(text=text, config=cfg)
-  ed.set_selection(0, 0)
-  SelectableText::{
-    editor: ed,
-    layout_sig: signals::signal(0),
-    dragging_sig: signals::signal(false),
-    sel_color: c64(0x0A84, 0xFF40),
-    last_font_size: 15.0,
-    last_line_h: 22.0,
-    last_max_w: 0.0,
-    drag_anchor: 0,
-    last_tap_at: -10000.0,
-    last_tap_x: 0.0,
-    last_tap_y: 0.0,
-  }
-}
+///|
+/// How many window's trees were made (set_view_app): the one now's number, what its paragraphs are known by.
+// kept across runs: counted on, never put back (a number given again would be another tree's)
+// moved to 00_init_order.pion: view_tree_made
 
-pub fn SelectableText::set_text(self : SelectableText, s : String) -> Unit {
-  self.editor.set(s, caret=0)
-  self.layout_sig.set(self.layout_sig.untracked() + 1)
-}
+///|
+/// What a node lends what it holds: the root node of the selection scope its words belong to (words_picked).
+// kept across runs: what each node lends (View::lends), let go with it
+// moved to 00_init_order.pion: words_picks
 
-pub fn SelectableText::text(self : SelectableText) -> String {
-  self.editor.text_signal().get()
-}
+///|
+/// What a node lends what it holds: the hit-test container box for pointer selection (words_hit_box, e.g. a table cell).
+// kept across runs: what each node lends (View::lends), let go with it
+// moved to 00_init_order.pion: words_hit_boxes
 
-pub fn SelectableText::has_selection(self : SelectableText) -> Bool {
-  let a = self.editor.anchor_signal().get()
-  let c = self.editor.caret_signal().get()
-  a != c
-}
+///|
+/// The words in pieces node `v` holds, now or later, picked with the pointer, a mouse's (a page's, as an old view's
+/// page's in Ctx::selectable): pressed and dragged over, picked; ⌘C (Ctrl+C) copies them; a press elsewhere lets them
+/// go. By default (`apart=false`), inherits an enclosing `words_picked` scope if one exists; pass `apart=true` to start
+/// an independent selection scope inside an existing one.
+pub fn words_picked(v : view::View, apart? : Bool) -> Unit {
+  let apart = match apart { Some(__mbt_v) => __mbt_v, None => false }
 
-pub fn SelectableText::selection(self : SelectableText) -> (Int, Int) {
-  let a = self.editor.anchor_signal().get()
-  let c = self.editor.caret_signal().get()
-  if a <= c { (a, c) } else { (c, a) }
-}
-
-pub fn SelectableText::selected_text(self : SelectableText) -> String {
-  let _ = self.selection()
-  self.editor.selected_text()
-}
-
-pub fn SelectableText::clear_selection(self : SelectableText) -> Unit {
-  self.editor.set_selection(0, 0)
-  self.dragging_sig.set(false)
-}
-
-pub fn SelectableText::select_all(self : SelectableText) -> Unit {
-  self.editor.select_all()
-}
-
-pub fn SelectableText::select_range(self : SelectableText, from : Int, to : Int) -> Unit {
-  self.editor.set_selection(from, to)
-}
-
-/// Lay out visual lines for `max_w` using real font shaping via `measure_text_width`.
-pub fn SelectableText::layout_for(
-  self : SelectableText,
-  max_w : Double,
-  font_size~ : Double = 0.0,
-  line_h~ : Double = 0.0,
-) -> Array[editor::VisualLine] {
-  let sz = if font_size > 0.0 { font_size } else { self.last_font_size }
-  let lh = if line_h > 0.0 { line_h } else if self.last_line_h > 0.0 { self.last_line_h } else { sz * 1.4 }
-  self.last_font_size = sz
-  self.last_line_h = lh
-  self.last_max_w = max_w
-  let lines = self.editor.layout_lines(max_w, fn(s : String) { measure_text_width(s, sz) }, lh)
-  self.layout_sig.set(self.layout_sig.untracked() + 1)
-  lines
-}
-
-pub fn SelectableText::selection_rects(self : SelectableText) -> Array[paint::Rect] {
-  self.editor.selection_rects(color=self.sel_color)
-}
-
-/// Select the word at local coordinates `(x, y)`.
-pub fn SelectableText::select_word_at_point(self : SelectableText, x : Double, y : Double) -> (Int, Int) {
-  let off = self.editor.hit_test(x, y)
-  self.editor.select_word_at(off)
-}
-
-/// Copy the current selection to the system clipboard and return it.
-pub fn SelectableText::copy_selection(self : SelectableText) -> String {
-  let s = self.editor.copy()
-  if s.length() > 0 {
-    clipboard_set(s)
-  }
-  s
-}
-
-/// Begin pointer selection at local `(x, y)` (double-tap within 400ms & 12pt selects the word).
-pub fn SelectableText::pointer_down(self : SelectableText, x : Double, y : Double, now~ : Double = 0.0) -> Unit {
-  let dx = x - self.last_tap_x
-  let dy = y - self.last_tap_y
-  let dist = dmath::sqrt(dx * dx + dy * dy)
-  if now > 0.0 && now - self.last_tap_at <= 400.0 && dist <= 12.0 {
-    let _ = self.select_word_at_point(x, y)
-    self.dragging_sig.set(false)
-    self.last_tap_at = -10000.0
-    return
-  }
-  self.last_tap_at = now
-  self.last_tap_x = x
-  self.last_tap_y = y
-  let off = self.editor.hit_test(x, y)
-  self.drag_anchor = off
-  self.editor.set_selection(off, off)
-  self.dragging_sig.set(true)
-}
-
-/// Extend drag selection to local `(x, y)`.
-pub fn SelectableText::pointer_move(self : SelectableText, x : Double, y : Double) -> Unit {
-  if !self.dragging_sig.untracked() {
-    return
-  }
-  let off = self.editor.hit_test(x, y)
-  self.editor.set_selection(self.drag_anchor, off)
-}
-
-/// End pointer drag selection.
-pub fn SelectableText::pointer_up(self : SelectableText) -> Unit {
-  self.dragging_sig.set(false)
-}
-
-/// Handle read-only selection keyboard shortcuts: Cmd/Ctrl+C (copy), Cmd/Ctrl+A (select all), Escape (clear).
-pub fn SelectableText::handle_key(self : SelectableText, code : Int, mods : Int) -> Bool {
-  let platform = hostapi::keys_platform()
-  let is_apple = platform == editor::platform_macos || platform == editor::platform_ios
-  let primary = if is_apple { (mods & mod_cmd) != 0 } else { (mods & mod_ctrl) != 0 }
-  let shift = (mods & mod_shift_key) != 0
-  let alt = (mods & mod_alt) != 0
-  if code == key_code_copy || (primary && !alt && !shift && code == key_of_char('c')) {
-    let _ = self.copy_selection()
-    return true
-  }
-  if code == key_code_select_all || (primary && !alt && !shift && code == key_of_char('a')) {
-    self.select_all()
-    return true
-  }
-  if code == key_escape {
-    self.clear_selection()
-    return true
-  }
-  false
-}
-
-/// Pure-tree read-only selectable paragraph node with I-beam cursor, multi-line selection highlight,
-/// drag/double-click selection, and Cmd/Ctrl+C copy.
-pub fn selectable_words(
-  parent : view::View,
-  sel : SelectableText,
-  font_size~ : Double = 15.0,
-  line~ : Double = 0.0,
-  color~ : Int64 = c64(0x1D1D, 0x1FFF),
-  sel_color~ : Int64 = c64(0x0A84, 0xFF40),
-  label~ : String = "",
-) -> view::View {
-  let line_h = if line > 0.0 { line } else { font_size * 1.4 }
-  sel.sel_color = sel_color
-  sel.last_font_size = font_size
-  sel.last_line_h = line_h
-  let look = view::WordsLook::of(font_size, line=line_h, wrap=true)
-
-  parent.box(fn(v : view::View) {
-    let _ = v
-    .cursor(view::Live::Is(Some(view::Cursor::IBeam)))
-    .focusable(view::Live::Is(true), keys=0)
-    .words(view::Live::By(fn() { sel.text() }), ink=color, look=look)
-    .on_drag(fn(d : view::Drag) {
-      let (_, _, w, _) = v.rect()
-      if w > 0.0 && ((sel.last_max_w - w).abs() > 0.5 || sel.editor.lines.length() == 0) {
-        let _ = sel.layout_for(w, font_size=font_size, line_h=line_h)
-      }
-      match d.kind {
-        view::DragIs::Down => sel.pointer_down(d.x, d.y, now=work_clock_now())
-        view::DragIs::Moved => sel.pointer_move(d.x, d.y)
-        view::DragIs::Up | view::DragIs::Off => sel.pointer_up()
-      }
-    })
-    .on_key(fn(k : view::Key) -> Bool {
-      sel.handle_key(k.code, k.mods)
-    })
-    if label.length() > 0 {
-      let _ = v.says(view::Live::By(fn() { Some(view::said(view::Role::Text, label=label, value=sel.text())) }))
-    }
-    // Pure-tree multi-line selection highlight overlay.
-    let _ = v.box(fn(sel_layer : view::View) {
-      let _ = sel_layer.over(view::Live::Is(true)).presses(view::Live::Is(false))
-      sel_layer.each_of(
-        fn() {
-          let _ = sel.text()
-          let _ = sel.selection()
-          let _ = sel.layout_sig.get()
-          let rects = sel.selection_rects()
-          let idxs : Array[Int] = []
-          for i in 0..<rects.length() {
-            idxs.push(i)
+  let existing = if !apart { v.lent(words_picks) } else { None }
+  let scope_id = mbt_compat::opt_unwrap_or_else(existing, fn() { v.id() })
+  v.lends(words_picks, scope_id).lends(view::runs_picker, words_picker) |> ignore
+  if existing is Option::None {
+    v.owns(fn() {
+      match picked.layer {
+        .TreeScope(_, id) if id == scope_id => {
+          if picked.dragging {
+            picked.dragging = false
+            tree_edge_stop()
           }
-          idxs
-        },
-        fn(row : view::View, idx : Int) {
-          let _ = row
-          .over_at(
-            view::Live::By(fn() {
-              let _ = sel.text()
-              let _ = sel.selection()
-              let _ = sel.layout_sig.get()
-              let rects = sel.selection_rects()
-              if idx < rects.length() {
-                let r = rects[idx]
-                (Some(r.x), Some(r.y), None, None)
-              } else {
-                (Some(0.0), Some(0.0), None, None)
-              }
-            }),
-          )
-          .width(
-            view::Live::By(fn() {
-              let _ = sel.text()
-              let _ = sel.selection()
-              let _ = sel.layout_sig.get()
-              let rects = sel.selection_rects()
-              if idx < rects.length() { Some(rects[idx].w) } else { Some(0.0) }
-            }),
-          )
-          .height(
-            view::Live::By(fn() {
-              let _ = sel.text()
-              let _ = sel.selection()
-              let _ = sel.layout_sig.get()
-              let rects = sel.selection_rects()
-              if idx < rects.length() { Some(rects[idx].h) } else { Some(0.0) }
-            }),
-          )
-          .ground(view::Live::Is(sel.sel_color))
-          .radius(view::Live::Is(3.0))
-          .presses(view::Live::Is(false))
-        },
-        at_once=true,
-      )
+          if picked_now_said.v.untracked() is Some(_) {
+            picked_now_tell()
+          }
+        }
+        _ => ()
+      }
     })
+    |> ignore
+  }
+}
+
+///|
+/// Mark `v` as the selection hit-test box for words inside it (e.g. a table cell whose words are vertically centered
+/// in a taller row): pointer hits anywhere inside `v`'s visible box clamp to the words' first or last line instead of
+/// falling through to neighboring columns.
+pub fn words_hit_box(v : view::View) -> Unit {
+  v.lends(words_hit_boxes, v.id()) |> ignore
+}
+
+///|
+/// Whether selection scope `scope_id` is still alive and visible in the current window's tree.
+fn tree_scope_live(scope_id : view::NodeId) -> Bool {
+  match view_app.v {
+    Some(tree) =>
+    match tree.view_of(scope_id) {
+      Some(v) => !v.shown_nowhere()
+      Option::None => false
+    }
+    Option::None => false
+  }
+}
+
+///|
+/// If the current tree selection belongs to a scope that was destroyed or hidden (`shown_nowhere`), stop any active
+/// drag and drop `picked_now` while keeping the released selection snapshot for ⌘C copy until a press elsewhere. The
+/// scope alive, sync `picked_now` whenever the words what is picked ends in (`ends_in`) leave or return to view (a
+/// virtualized row scrolled out, parked, recycled, or scrolled back; a step folded or unfolded). Returns whether
+/// `picked_now` changed.
+fn sync_picked_scope_live() -> Bool {
+  let before = picked_now_said.v.untracked()
+  match picked.layer {
+    .TreeScope(_, scope_id) if !tree_scope_live(scope_id) => {
+      if picked.dragging {
+        picked.dragging = false
+        tree_edge_stop()
+      }
+      if before is Some(_) {
+        picked_now_tell()
+      }
+    }
+    .TreeScope(_, scope_id) if !picked.dragging =>
+    match before {
+      Some(p) =>
+      match picked_in_order() {
+        Some((_, end)) if picked_end_live(p.ends_in, end, scope_id) => ()
+        _ => picked_now_tell()
+      }
+      None if !picked.spans.is_empty() =>
+      match picked_in_order() {
+        Some((_, end)) =>
+        match picked_shown.get(end) {
+          Some((ends_in, _, end_scope)) if end_scope == scope_id && picked_end_live(ends_in, end, scope_id) => picked_now_tell()
+          _ => ()
+        }
+        Option::None => ()
+      }
+      _ => ()
+    }
+    _ => ()
+  }
+  picked_now_said.v.untracked() != before
+}
+
+///|
+/// The picker words_picked lends (words_picked_span), one value: a block in what has its words picked that is lent
+/// another (one that picks none: a quote's card in a message, whose words were never of what is picked) holds words
+/// none of what is picked, nor copied with it (tree_sels).
+// kept across runs: a function, the same for every run
+// moved to 00_init_order.pion: words_picker
+
+///|
+/// What of each paragraph's words is picked with the pointer (from, to; (0, 0) none), by its key, as a signal of its
+/// own made as it is first read (words_picked_span): told as what is picked changes (picked_told), each only as its
+/// own span does.
+// kept across runs: said again from what is picked as that changes
+// moved to 00_init_order.pion: picked_spans_said
+
+///|
+/// Whether a `scrolls_window` row `(tree_id, list, row_num)` currently holds any non-empty picked span, as a signal
+/// read by that row's shared memo (`row_picked_reader`, fanout <= 1).
+// kept across runs: said again from what is picked as that changes
+// moved to 00_init_order.pion: picked_row_said
+
+///|
+/// Per-row memo (`View::memo`) shared by all `words_runs` inside a mounted `rows_named` row: returns the row's
+/// number when that row holds any picked span, or `0` otherwise so reusing an unselected row cuts off downstream
+/// `RunsPicked` bindings.
+// kept across runs: removed by `View::owns` when the row node is disposed
+// moved to 00_init_order.pion: row_picked_memos
+
+///|
+/// Whether what is picked with the pointer was picked by a finger, as a signal (Ctx::selection_by_finger).
+// kept across runs: said again from what is picked as that changes
+// moved to 00_init_order.pion: picked_finger_said
+
+///|
+/// What of paragraph `k`'s words is picked now ((0, 0): none).
+fn picked_span_of(k : SelKey) -> (Int, Int) {
+  match picked.spans.get(k) {
+    Some(s) if s.a < s.b => (s.a, s.b)
+    _ => (0, 0)
+  }
+}
+
+///|
+/// Whether `picked.spans` currently has any non-empty span in `(tree_id, list, row_num)`.
+fn picked_row_has_any(tree_id : Int, list : view::NodeId, row_num : Int) -> Bool {
+  let found = mbt_compat::ref_new(false)
+  picked.spans.each(fn(k, s) {
+    if !found.v && s.a < s.b {
+      match k {
+        SelKey::Words(t, r_at, r_gen, Some(first_row), _) if t == tree_id && r_at == list.at && r_gen == list.gen && first_row == row_num => found.v = true
+        _ => ()
+      }
+    }
   })
+  found.v
+}
+
+///|
+/// Shared per-row memo reading `number()` and gating on `picked_row_said[(tree_id, list, n)]`: returns `n` when
+/// that row has an active selection, or `0` otherwise.
+fn row_picked_reader(row_v : view::View, list : view::NodeId, number : () -> Int) -> () -> Int {
+  let tree_id = view_tree_made.v
+  let mk = (tree_id, row_v.id())
+  match row_picked_memos.get(mk) {
+    Some(m) => m
+    Option::None => {
+      let m = row_v.memo(fn() {
+        let n = number()
+        let rk = (tree_id, list, n)
+        let s = match picked_row_said.get(rk) {
+          Some(s) => s
+          Option::None => {
+            if picked_row_said.length() >= 64 {
+              let gone : Array[(Int, view::NodeId, Int)] = []
+              picked_row_said.each(fn(k, rs) {
+                if !rs.watched() && !picked_row_has_any(k.0, k.1, k.2) {
+                  gone.push(k)
+                }
+              })
+              for k in gone {
+                picked_row_said.remove(k)
+              }
+            }
+            let s = signals::signal(picked_row_has_any(tree_id, list, n), same=fn(a, b) { a == b })
+            picked_row_said.set(rk, s)
+            s
+          }
+        }
+        if s.get() { n } else { 0 }
+      })
+      row_picked_memos.set(mk, m)
+      row_v.owns(fn() { row_picked_memos.remove(mk) }) |> ignore
+      m
+    }
+  }
+}
+
+///|
+/// What is picked with the pointer changed: told what follows it (each node's words of the window's tree: what of them
+/// is picked, words_picked_span), each paragraph whose span changed alone, at once.
+fn picked_told() -> Unit {
+  let active_rows : mbt_compat::OrderedSet[(Int, view::NodeId, Int)] = mbt_compat::ordered_set_from_array_triple([])
+  picked.spans.each(fn(k, s) {
+    if s.a < s.b {
+      match k {
+        SelKey::Words(t, r_at, r_gen, Some(first_row), _) =>
+        active_rows.insert((t, view::NodeId::{ at: r_at, gen: r_gen }, first_row))
+        _ => ()
+      }
+    }
+  })
+  signals::start_batch()
+  let unread : Array[SelKey] = []
+  picked_spans_said.each(fn(k, s) {
+    s.set(picked_span_of(k))
+    if !s.watched() {
+      unread.push(k)
+    }
+  })
+  let unread_rows : Array[(Int, view::NodeId, Int)] = []
+  picked_row_said.each(fn(rk, s) {
+    s.set(active_rows.contains(rk))
+    if !s.watched() {
+      unread_rows.push(rk)
+    }
+  })
+  picked_finger_said.v.set(picked.finger)
+  picked_now_tell()
+  cmd_sel_underline_update()
+  signals::end_batch()
+  // (what no node reads any more let go)
+  if picked_spans_said.length() > 64 {
+    for k in unread {
+      picked_spans_said.remove(k)
+    }
+  }
+  if picked_row_said.length() > 64 {
+    for rk in unread_rows {
+      picked_row_said.remove(rk)
+    }
+  }
+}
+
+///|
+/// Which paragraph node `v`'s words are, as its words picked are known (tree_key).
+fn tree_key(v : view::View) -> SelKey {
+  let (row, place) = v.row_place()
+  sel_words_key(view_tree_made.v, row, place)
+}
+
+///|
+/// What of node `v`'s words is picked with the pointer, followed as that changes (picked_told): View::runs_picker's.
+fn words_picked_span(v : view::View) -> view::Live[(Int, Int)] {
+  let row_read = mbt_compat::opt_map(v.row_named(), fn(t) { (t.1, row_picked_reader(t.0, t.1, t.2)) })
+  .By(fn() {
+    let k = match row_read {
+      Some((list, read)) => {
+        let row_num = read()
+        if row_num == 0 {
+          return (0, 0)
+        }
+        let (row, place) = v.row_place_with(list, row_num)
+        sel_words_key(view_tree_made.v, row, place)
+      }
+      None => tree_key(v)
+    }
+    let s = match picked_spans_said.get(k) {
+      Some(s) => s
+      Option::None => {
+        let s = signals::signal(picked_span_of(k), same=fn(a, b) { a == b })
+        picked_spans_said.set(k, s)
+        s
+      }
+    }
+    let span = s.get()
+    if span.0 < span.1 {
+      picked_shown_node(k, v)
+    }
+    span
+  })
+}
+
+///|
+/// The paragraphs of the window's tree that can be picked as it is laid out and shown now (what an event finds: the
+/// tree laid out as of its moment), in the order they are drawn: a node's words in pieces where what holds it says so
+/// (words_picked), drawn (not clear, not laid out nowhere), taking input (none under a modal layer over it), each with
+/// the part of it seen (what holds it cutting it: Tree::seen_bounds), laid out in its own terms as it draws them
+/// (view_runs_laid), as big as it is drawn; none with a finger's pointing.
+fn tree_sels(finger? : Bool) -> Array[SelTarget] {
+  let finger = match finger { Some(__mbt_v) => __mbt_v, None => false }
+
+  tree_sels_made.v = tree_sels_made.v + 1
+  let out : Array[SelTarget] = []
+  guard pointing() is Pointing::Mouse || picked.finger || finger else { return out }
+  match view_app.v {
+    Some(tree) => {
+      // (laid out as of the moment it is asked: what an event finds)
+      tree.laid_as_now()
+      tree.each_drawn_scaled(fn(c, x, y, a, s) {
+        if c.runs.is_empty() || a <= 0.0 || !tree.allows(c.id) {
+          return
+        }
+        match tree.view_of(c.id) {
+          // (where its words are picked, by the picker that picks them: not where a block in it was lent another)
+          // (where its words are picked, by the picker that picks them: not where a block in it was lent another)
+          Some(v) if v.lent(words_picks) is Some(scope_id) && mbt_compat::opt_map(v.lent(view::runs_picker), fn(f) { physical_equal(f, words_picker) }) == Some(true) => {
+            let (bx0, by0, bx1, by1) = tree.seen_bounds(c.id)
+            let x0 = dmax(x, bx0)
+            let y0 = dmax(y, by0)
+            let x1 = dmin(x + c.w * s, bx1)
+            let y1 = dmin(y + c.h * s, by1)
+            let (hx0, hy0, hx1, hy1) = match mbt_compat::opt_bind(v.lent(words_hit_boxes), fn(bid) { tree.view_of(bid) }) {
+              Some(box_v) => {
+                let (rx, ry, rw, rh) = box_v.rect()
+                let (hbx0, hby0, hbx1, hby1) = tree.seen_bounds(box_v.id())
+                (dmax(rx, hbx0), dmax(ry, hby0), dmin(rx + rw, hbx1), dmin(ry + rh, hby1))
+              }
+              None => (x0, y0, x1, y1)
+            }
+            if (hx1 <= hx0 || hy1 <= hy0) && (x1 <= x0 || y1 <= y0) {
+              return
+            }
+            let (r, lay, _) = view_runs_laid(c.runs, c.words_look, c.runs_look, c.w, tree.words_scale_of(c.id), kept=c.words_breaks, tabular=c.words_tabular)
+            let (place, row_depth) = tree_place_with_row(v)
+            let base = tree_key(v)
+            let of = v.lent(picked_ofs)
+            let shape = mbt_compat::opt_map(v.lent(words_shapes), fn(f) { f() })
+            // (who shows it, what it is of: what is picked of it told by them, picked_now)
+            picked_shown_by(base, v, scope_id)
+            out.push(SelTarget::{
+              base: base,
+              layer: .TreeScope(tree.stack_of(c.id), scope_id),
+              island: Option::None,
+              at: place,
+              row_depth: row_depth,
+              lay: lay,
+              text: lay.text,
+              ox: x,
+              oy: y,
+              x0: x0,
+              y0: y0,
+              x1: x1,
+              y1: y1,
+              hx0: hx0,
+              hy0: hy0,
+              hx1: hx1,
+              hy1: hy1,
+              sc: s,
+              center: if c.words_center { c.w } else { -1.0 },
+              node: Some(c.id),
+              of: of,
+              shape: shape,
+              runs: c.runs,
+            })
+            ignore(r)
+          }
+          _ => ()
+        }
+      })
+    }
+    Option::None => ()
+  }
+  out
+}
+
+///|
+/// How many times the window's tree's paragraphs that can be picked were found (tree_sels), for a test: as a press, a
+/// drag and what reads where they are ask, never as frames are drawn.
+// kept across runs: counted on, read as differences
+// moved to 00_init_order.pion: tree_sels_made
+
+///|
+/// Where node `v` stands in the window's tree: from the root down, each node's place among what holds it (a page's
+/// list's row's as its key's among the list's keys, whichever of its rows are made: View::row_order), and the index in
+/// that path where a `scrolls_window` row order was recorded (-1 if none).
+fn tree_place_with_row(v : view::View) -> (Array[Int], Int) {
+  let up : Array[Int] = []
+  let mut row_from_bottom = -1
+  let mut at = v
+  while at.parent() is Some(p) {
+    let i = match at.row_order() {
+      Some(i) => {
+        if row_from_bottom < 0 {
+          row_from_bottom = up.length()
+        }
+        i
+      }
+      Option::None => arr_search_by(p.kids(), fn(k) { k.id() == at.id() }).unwrap_or(0)
+    }
+    up.push(i)
+    at = p
+  }
+  let row_depth = if row_from_bottom >= 0 { up.length() - 1 - row_from_bottom } else { -1 }
+  (mbt_compat::arr_rev(up), row_depth)
+}
+
+///|
+/// The paragraphs that can be picked as they are shown now: an old view's as its last frame painted them, the window's
+/// tree's as it is laid out now (tree_sels).
+fn sels_shown() -> Array[SelTarget] {
+  mbt_compat::arr_concat(desk.sels, tree_sels())
+}
+
+///|
+/// The paragraph of the window's tree that can be picked under (x, y), the topmost (tree_sels), if one is.
+fn tree_sel_at(x : Double, y : Double, finger? : Bool) -> Option[SelTarget] {
+  let finger = match finger { Some(__mbt_v) => __mbt_v, None => false }
+
+  let sels = tree_sels(finger=finger)
+  let mut k = sels.length() - 1
+  while k >= 0 {
+    let t = sels[k]
+    if x >= t.hx0 && x < t.hx1 && y >= t.hy0 && y < t.hy1 {
+      return Some(t)
+    }
+    k = k - 1
+  }
+  Option::None
+}
+
+///|
+/// Whether window point `(x, y)` lies inside live, input-allowed `words_picked` scope `within` and is not owned by a
+/// different `words_picked` scope (a sibling pane or an `apart=true` sub-scope).
+fn tree_in_scope(tree : view::Tree, within : view::NodeId, x : Double, y : Double) -> Bool {
+  guard tree.view_of(within) is Some(v) && !v.shown_nowhere() && tree.allows(within) else { return false }
+  match tree.drop_at(x, y) {
+    Some(.OnNode(hit_id)) =>
+    match mbt_compat::opt_bind(tree.view_of(hit_id), fn(hv) { hv.lent(words_picks) }) {
+      Some(hit_scope) => return hit_scope == within
+      None => ()
+    }
+    _ => ()
+  }
+  let (rx, ry, rw, rh) = v.rect()
+  let (bx0, by0, bx1, by1) = tree.seen_bounds(within)
+  let x0 = dmax(rx, bx0)
+  let y0 = dmax(ry, by0)
+  let x1 = dmin(rx + rw, bx1)
+  let y1 = dmin(ry + rh, by1)
+  x >= x0 && x < x1 && y >= y0 && y < y1
+}
+
+///|
+/// Whether a primary mouse press at `(x, y)` with `mods` extends the current tree selection anchor (`picked.from`) via
+/// Shift+click within the same `words_picked` scope instead of clearing it.
+fn tree_shift_picks(tree : view::Tree, x : Double, y : Double, mods : Int) -> Bool {
+  guard pointing() is Pointing::Mouse &&
+  (mods & mod_shift_key) != 0 &&
+  !cmd_pick_held(mods=Some(mods)) &&
+  picked.from.base != .NoSel &&
+  !picked.finger else {
+    return false
+  }
+  guard picked.layer is .TreeScope(_, within) else { return false }
+  guard tree.target_at(x, y) is .Nothing else { return false }
+  guard !g().selection_blocked(x, y) else { return false }
+  match tree_sel_at(x, y) {
+    Some(t) => t.layer == picked.layer
+    Option::None => tree_in_scope(tree, within, x, y)
+  }
+}
+
+///|
+/// Whether a mouse at (x, y) is over a paragraph of the window's tree that can be picked (tree_sel_at's, where a press
+/// there picks), found by where each is drawn and cut alone, none laid out for it: what the pointer's shape is over
+/// (view_over_words), worked out as often as the pointer moves.
+fn tree_words_under(x : Double, y : Double, laid? : Bool) -> Bool {
+  let laid = match laid { Some(__mbt_v) => __mbt_v, None => true }
+
+  guard pointing() is Pointing::Mouse && view_app.v is Some(tree) else { return false }
+  if laid {
+    tree.laid_as_now()
+  }
+  let found = mbt_compat::ref_new(false)
+  tree.each_drawn_scaled(fn(c, cx, cy, a, s) {
+    if found.v || c.runs.is_empty() || a <= 0.0 || !tree.allows(c.id) {
+      return
+    }
+    if x < cx || y < cy || x >= cx + c.w * s || y >= cy + c.h * s {
+      return
+    }
+    let (bx0, by0, bx1, by1) = tree.seen_bounds(c.id)
+    if x < bx0 || y < by0 || x >= bx1 || y >= by1 {
+      return
+    }
+    match tree.view_of(c.id) {
+      Some(v) if v.lent(words_picks) is Some(_) && mbt_compat::opt_map(v.lent(view::runs_picker), fn(f) { physical_equal(f, words_picker) }) == Some(true) => found.v = true
+      _ => ()
+    }
+  })
+  found.v
+}
+
+///|
+/// Whether what is picked with the pointer is of the window's tree's words (a scope of its: SelLayer's TreeScope).
+fn tree_picking() -> Bool {
+  picked.layer is .TreeScope(_, _)
+}
+
+///|
+/// What words of the window's tree are being picked in scrolls: the nearest column scrolling up and down that holds the
+/// paragraph the press went down in, and the nearest row scrolling across (a code block's, a wide table's), each
+/// View::scroll_holding (known by what scrolls, not by that paragraph, whose node may scroll away and be made anew
+/// while picking goes on), and how fast each was last said to go toward the pointer (Scroll::edge_toward: px a ms, 0
+/// still).
+struct TreeEdge {
+  scroll : Option[view::Scroll]
+  mut speed : Double
+  mut across : Option[view::Scroll]
+  mut speed_across : Double
+}
+
+///|
+// kept across runs: said as a press picks the window's tree's words, let go as they are let go or the column goes
+// (tree_edge_stop)
+// moved to 00_init_order.pion: tree_edge
+
+///|
+/// Start edge auto-scrolling for the scroll containers holding tree node `id`.
+fn tree_edge_from_node(id : view::NodeId) -> Unit {
+  tree_edge_stop()
+  match view_app.v {
+    Some(tree) =>
+    match tree.view_of(id) {
+      Some(v) => {
+        let scroll = v.scroll_holding()
+        let across = v.scroll_holding(across=true)
+        if scroll is Some(_) || across is Some(_) {
+          { let __mbt_r = tree_edge; __mbt_r.v = (Some(TreeEdge::{ scroll: scroll, speed: 0.0, across: across, speed_across: 0.0 })) }
+        }
+      }
+      Option::None => ()
+    }
+    Option::None => ()
+  }
+}
+
+///|
+/// Words of the window's tree being picked from paragraph `t` (a press on it, the pointer held): the column it is in
+/// scrolls toward the pointer held past its top or its foot, the row it is in past its start or its end (tree_edge_to),
+/// as an old view's list does (select_edge) and a browser's overflowing box does.
+fn tree_edge_from(t : SelTarget) -> Unit {
+  match t.node {
+    Some(id) => tree_edge_from_node(id)
+    Option::None => tree_edge_stop()
+  }
+}
+
+///|
+/// How fast what scrolls (`s`) is to go toward the pointer at `at` (the Ctx's py down a column, px across a row) while
+/// `held`: past where it shows (its two ends, as it is laid out and cut by what holds it now: as the window or the page
+/// changes, those then), as fast as select_edge has an old view's list go that far past (select_edge_rate, from
+/// select_edge_least); within it, or let go, still. None: shown nowhere (its page covered by another, or left).
+fn tree_edge_speed(tree : view::Tree, s : view::Scroll, across : Bool, at : Double, held : Bool) -> Option[Double] {
+  let shows = match s.shown_by() {
+    Some(v) if !v.shown_nowhere() => Some(v)
+    _ => None
+  }
+  guard shows is Some(col) else { return Option::None }
+  let (x, y, w, h) = col.rect()
+  let (bx0, by0, bx1, by1) = tree.seen_bounds(col.id())
+  let (top, foot) = if across {
+    (dmax(x, bx0), dmin(x + w, bx1))
+  } else {
+    (dmax(y, by0), dmin(y + h, by1))
+  }
+  Some(if !held || foot <= top {
+    0.0
+  } else if at < top {
+    -(top - at + select_edge_least) * select_edge_rate
+  } else if at > foot {
+    (at - foot + select_edge_least) * select_edge_rate
+  } else {
+    0.0
+  },)
+}
+
+///|
+/// Horizontal edge-scroll speed for a horizontal scroll group (`Scroll::beside` peers): only scrolls while `py` is
+/// within at least one alive, visible peer's vertical visible band, returning the active peer's `Scroll` so edge
+/// scrolling continues even after the slice where selection started scrolls out of view.
+fn tree_edge_across_speed(tree : view::Tree, s : view::Scroll, px : Double, py : Double, held : Bool) -> (Double, Option[view::Scroll]) {
+  guard held else { return (0.0, Option::None) }
+  for pair in s.shown_peers() {
+    let (peer, peer_scroll) = pair
+    let (x, y, w, h) = peer.rect()
+    let (bx0, by0, bx1, by1) = tree.seen_bounds(peer.id())
+    let vtop = dmax(y, by0)
+    let vbot = dmin(y + h, by1)
+    if vbot <= vtop || py < vtop || py > vbot {
+      continue
+    }
+    let left = dmax(x, bx0)
+    let right = dmin(x + w, bx1)
+    if right <= left {
+      continue
+    }
+    let v = if px < left {
+      -(left - px + select_edge_least) * select_edge_rate
+    } else if px > right {
+      (px - right + select_edge_least) * select_edge_rate
+    } else {
+      0.0
+    }
+    return (v, Some(peer_scroll))
+  }
+  (0.0, Option::None)
+}
+
+///|
+/// What words of the window's tree are being picked in toward the pointer (the Ctx's px, py) while `held`
+/// (tree_edge_speed): said to each only as how fast changes (Scroll::edge_toward goes on as it is said, its place a
+/// function of time), never again for the same. The column shown nowhere: all of it still, and known no more, at once;
+/// the row alone shown nowhere, it alone still.
+fn tree_edge_to(c : Ctx, held : Bool) -> Unit {
+  guard tree_edge.v is Some(e) else { return }
+  guard view_app.v is Some(tree) else { return }
+  // (laid out and placed as of the moment it is asked: what changed since the last frame (the column moved, made
+  // shorter, laid out nowhere) as it is then)
+  tree.laid_as_now()
+  match e.scroll {
+    Some(s) =>
+    match tree_edge_speed(tree, s, false, c.py, held) {
+      Some(v) =>
+      if v != e.speed {
+        e.speed = v
+        s.edge_toward(v)
+      }
+      Option::None => {
+        tree_edge_stop()
+        return
+      }
+    }
+    Option::None => ()
+  }
+  match e.across {
+    Some(s) => {
+      let (v, active) = tree_edge_across_speed(tree, s, c.px, c.py, held)
+      match active {
+        Some(peer_s) => {
+          let switched = peer_s.serial() != s.serial()
+          if switched {
+            e.across = Some(peer_s)
+          }
+          if v != e.speed_across || switched {
+            e.speed_across = v
+            peer_s.edge_toward(v)
+          }
+        }
+        Option::None =>
+        if e.speed_across != 0.0 {
+          e.speed_across = 0.0
+          s.edge_toward(0.0)
+        }
+      }
+    }
+    Option::None => ()
+  }
+}
+
+///|
+/// What words of the window's tree were picked in still, and known no more (they are let go, the pointer let them be,
+/// or the column went).
+fn tree_edge_stop() -> Unit {
+  match tree_edge.v {
+    Some(e) => {
+      match e.scroll {
+        Some(s) if e.speed != 0.0 => s.edge_toward(0.0)
+        _ => ()
+      }
+      match e.across {
+        Some(s) if e.speed_across != 0.0 => s.edge_toward(0.0)
+        _ => ()
+      }
+      tree_edge.v = None
+    }
+    Option::None => ()
+  }
+}
+
+///|
+/// A finger held on words of the window's tree that are picked with the pointer (words_picked): what is set going for
+/// its hold's moment (called off as the finger moves past the slop, is let go or called off, or another goes down).
+// kept across runs: let go as a run begins (view_forget's tree_finger_off)
+// moved to 00_init_order.pion: tree_finger_hold
+
+///|
+/// A finger down at (x, y) at `at` on the window's tree: where words of its that are picked with the pointer are
+/// there, at a long press's moment after (the tree's timeline: whatever frames are drawn), held still on them all the
+/// while and nothing of the tree's having taken it for its own hold, what held it lets go of it (a column scrolled by
+/// it, an old view under the words that took the press: called off) and it is the old frame's from then, the word
+/// there picked (Ctx::finger_pick), slid on from and let go as an old view's words a finger held are
+/// (finger_select.pion).
+fn tree_finger_down(tree : view::Tree, x : Double, y : Double, at : Double) -> Unit {
+  tree_finger_off()
+  // (what is under it looked for at the hold's moment alone, as the tree is then: nothing laid out for it as it goes
+  // down)
+  guard pointing() is Pointing::Finger else { return }
+  // (this press's: downs_made counts it once the tree has routed it, pointer_in_now)
+  let down = downs_made.v + 1
+  tree_finger_hold.v = Some(
+    tree
+    .root()
+    .at_moment(at + long_press_ms, fn() {
+      tree_finger_hold.v = None
+      if downs_made.v != down {
+        return
+      }
+      let words = tree_sel_at(x, y, finger=true)
+      if tree_finger_menu(tree, x, y, words) {
+        return
+      }
+      match view_held.v {
+        // (a column it scrolls held it: called off, as a hold handed on calls its cover's off)
+        // (a column it scrolls held it: called off, as a hold handed on calls its cover's off)
+        Some(.Dragging(id)) if tree.claims_scroll(id) =>
+        tree.drag_at(id, view::DragIs::Off, x, y, view_moment(), finger=view_fingers[0]) |> ignore
+        Some(.Nowhere) => ()
+        // (an old view under them held it, the words of the tree's that take no press drawn over it there (a page's
+ // messages over 's shell): its press called off, as a hold of the old frame's own on words it drew is its)
+        // (an old view under them held it, the words of the tree's that take no press drawn over it there (a page's
+ // messages over 's shell): its press called off, as a hold of the old frame's own on words it drew is its)
+        Some(ViewHeld::Old(_, _)) if words is Some(t) && tree_words_over(tree, t, x, y) => g().press_called_off(x, y, at)
+        // (a cover held over them whose still hold goes through to what lies under it (View::gesture's `through`: the
+ // page beside 's sidebar), which nothing of the tree's under it took: its hold ended, as one handed through
+        // is, the words under it the hold's)
+        // (a cover held over them whose still hold goes through to what lies under it (View::gesture's `through`: the
+ // page beside 's sidebar), which nothing of the tree's under it took: its hold ended, as one handed through
+        // is, the words under it the hold's)
+        Some(.Dragging(id)) if words is Some(_) && tree.hold_goes_through(id) =>
+        tree.drag_at(id, view::DragIs::Off, x, y, view_moment(), finger=view_fingers[0]) |> ignore
+ // under words picked
+        // with the pointer: the hold the words', the ground's press called off, no tap as it is let go)
+ // under words picked
+        // with the pointer: the hold the words', the ground's press called off, no tap as it is let go)
+        Some(ViewHeld::Node(id)) if words is Some(_) && tree.is_ground(id) => tree.hold_lost_in(id.at)
+        // (a node's own press, its own hold: its)
+        // (a node's own press, its own hold: its)
+        _ => return
+      }
+      guard words is Some(t) else { return }
+      view_down.v = None
+      view_held.v = Some(ViewHeld::Old(-1, Option::None))
+      view_input_went(-1)
+      old_pointer_now(0, x, y, 0, 0, at)
+      g().finger_pick(t, x, y)
+    }),
+  )
+}
+
+///|
+/// A finger held still as long as a long press at (x, y), on what asks for a menu there (View::on_menu, Tree::menu_at):
+/// its menu, as the secondary button's press asks it, and the rest of the press nobody's (a node's press let go
+/// unpressed, no tap as it is let go; a column it was to scroll told Off), felt. Not where what takes the hold is
+/// another's: a node's own gesture (a hold of its own, @headless.Hold), a gesture answering a hold alone there
+/// (Tree::hold_at, its hold due at the same moment), a field the press went down on (view_down let go by it), an old
+/// view, a cover whose hold goes through, words a finger picks there (their hold picks them, as ever). Whether it did.
+fn tree_finger_menu(tree : view::Tree, x : Double, y : Double, words : Option[SelTarget]) -> Bool {
+  guard view_down.v is Some(_) else { return false }
+  let call_off : () -> Unit = match view_held.v {
+    // (a field of the tree's on Android has its own long press (tree_field_held) that picks the word there; never
+    // stolen by its secondary-button context menu, nor by an I-beam backdrop area wired with field_menu_on)
+    // (a field of the tree's on Android has its own long press (tree_field_held) that picks the word there; never
+    // stolen by its secondary-button context menu, nor by an I-beam backdrop area wired with field_menu_on)
+    Some(ViewHeld::Node(id)) if tree_fields.contains(id) || tree_field_menu_areas.contains(id) => return false
+    Some(ViewHeld::Node(id)) => fn() { tree.hold_lost_in(id.at) }
+    Some(.Dragging(id)) if tree.claims_scroll(id) && words is Option::None =>
+    fn() { tree.drag_at(id, .Off, x, y, view_moment(), finger=view_fingers[0]) |> ignore }
+    Some(.Nowhere) if words is Option::None => fn() { }
+    _ => return false
+  }
+  if tree.hold_at(x, y) is Some(_) {
+    return false
+  }
+  // (even after a field's press was cancelled by the window going behind or a second finger, a touch hold over a tree
+  // field or its field_menu_on backdrop must never trigger its desktop secondary-button context menu)
+  match tree.target_at(x, y) {
+    .Pressed(id) if tree_fields.contains(id) || tree_field_menu_areas.contains(id) => return false
+    _ => ()
+  }
+  guard tree.menu_at(x, y, view_moment()) else { return false }
+  call_off()
+  view_down.v = None
+  view_nothing_down.v = None
+  view_held.v = Some(Nowhere)
+  haptic(Haptic::LongPress)
+  h_frame_owed()
+  true
+}
+
+///|
+/// Whether paragraph `t` of the window's tree (its node's words) is what is drawn topmost at (x, y): over what else is
+/// there (an old view hosted under it, which a press there reaches as its words take none: Tree::drop_at).
+fn tree_words_over(tree : view::Tree, t : SelTarget, x : Double, y : Double) -> Bool {
+  match (tree.drop_at(x, y), t.node) {
+    (Some(.OnNode(id)), Some(n)) => id == n
+    _ => false
+  }
+}
+
+///|
+/// What a finger's hold on words of the window's tree set going called off (tree_finger_down).
+fn tree_finger_off() -> Unit {
+  match tree_finger_hold.v {
+    Some(stop) => stop()
+    Option::None => ()
+  }
+  tree_finger_hold.v = None
 }

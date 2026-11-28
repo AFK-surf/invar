@@ -1,0 +1,1124 @@
+import "dmath"
+import "mbt_compat"
+import "paint"
+import "view"
+
+// Contrast, measured: what a frame draws to be seen stands off what it is drawn on far enough to be seen (the app's
+// ui ui/contrast.pion). Words as WCAG 2's AA asks: 4.5:1, 3:1 where they are large (24 and up, or 18.66 and up in
+// bold); an icon (Ctx::shapes) 3:1, as its non-text contrast asks of what is understood by its shape. What is drawn
+// with nothing in it, its ground or (where that does not show) its edge alone saying what it is: a gauge's cell, a
+// bar's track, a line (Ctx::lines too), a sheet's grip, each bar and shape of a page's bones (bones.pion): at least
+// `contrast_mark_least`, WCAG 2's ratio. A ground under words, a picture or an icon is not asked: what is in it carries
+// it (and under bones, as under the words they stand for), as a shape (Ctx::shapes) with words drawn over it after it
+// is too (a highlighter's scribble behind a word found). Each is measured where it is drawn, against what the
+// frame drew under it there (its instances before it, as the renderers lay them: fills, and glass's tint over what it
+// frosts); what lies on a picture, a video or another app's view, or is covered by what is drawn after it (a dialog's
+// scrim, a bar's glass over a list), is not asked, nor a picture drawn of something else (Role Image: another system's
+// screen, a code to scan), nor what is in a widget said disabled (WCAG asks nothing of what cannot be used).
+
+///|
+/// Which node drew each instance of a frame, kept only while a test asks (Tester::contrast_faults): `owner[k]`
+/// instance k's (-1 none known), `painting` the node being painted; `own_colours` the nodes said to draw in their own
+/// colours (Ctx::own_colours). `track`: the owners kept on every frame a Tester draws, and nothing else of `on`'s (its
+/// frame drawn as measured, each loop at its start, no row kept): what words lie over whose (words_over.pion).
+struct InstOwners {
+  mut on : Bool
+  mut track : Bool
+  mut painting : Int
+  owner : Array[Int]
+  cell : Array[(Double, Double)]
+  tree : Array[Option[view::NodeId]]
+  mut tree_painting : Option[view::NodeId]
+  tree_words : mbt_compat::OrderedMap[view::NodeId, String]
+  mark : Array[Int]
+  own_colours : mbt_compat::OrderedSet[Int]
+}
+
+///|
+// moved to 00_init_order.pion: inst_owners
+
+///|
+/// The frame's contrast asked again from nothing: no instance's owner known, no node said in its own colours.
+fn inst_owners_clear() -> Unit {
+  inst_owners.painting = -1
+  inst_owners.owner.clear()
+  inst_owners.cell.clear()
+  inst_owners.tree.clear()
+  inst_owners.mark.clear()
+  inst_owners.tree_painting = None
+  inst_owners.own_colours.clear()
+  bone_insts.clear()
+}
+
+///|
+/// Node `node` (as Ctx::box or Ctx::shapes returns it) draws a picture in its own colours, a maker's mark, a logo, an
+/// illustration: its colours are its owner's, as a picture's are, and the contrast rule asks nothing of them (WCAG asks
+/// nothing of a logo).
+pub fn Ctx::own_colours(self : Ctx, node : Int) -> Unit {
+  ignore(self)
+  if inst_owners.on {
+    inst_owners.own_colours.insert(node)
+  }
+}
+
+///|
+/// Whether each instance's owner is kept (`on` or `track`).
+fn inst_owners_kept() -> Bool {
+  inst_owners.on || inst_owners.track
+}
+
+///|
+/// Instance `k` drawn by the node being painted.
+fn inst_owned(k : Int) -> Unit {
+  let o = inst_owners.owner
+  let cl = inst_owners.cell
+  let tr = inst_owners.tree
+  while o.length() <= k {
+    o.push(-1)
+  }
+  while inst_owners.mark.length() <= k {
+    inst_owners.mark.push(0)
+  }
+  while cl.length() <= k {
+    cl.push((0.0, 1.0))
+  }
+  while tr.length() <= k {
+    tr.push(Option::None)
+  }
+  o[k] = inst_owners.painting
+  cl[k] = (0.0, 1.0)
+  tr[k] = inst_owners.tree_painting
+  inst_owners.mark[k] = 0
+}
+
+///|
+/// Who drew an instance (contrast.pion's inst_owners): a node of the old view's (its index in the frame's nodes), a node
+/// of the window's tree's, or nothing known. What reads who drew what asks this, whichever drew it.
+
+#derive(Eq)
+enum InstBy {
+  Nobody
+  Old(Int)
+  Node(view::NodeId)
+}
+
+///|
+/// Who drew instance `k`.
+fn inst_by(k : Int) -> InstBy {
+  match inst_tree_owner(k) {
+    Some(id) => InstBy::Node(id)
+    Option::None => {
+      let o = inst_owner(k)
+      if o < 0 {
+        .Nobody
+      } else {
+        InstBy::Old(o)
+      }
+    }
+  }
+}
+
+///|
+/// Whether what `by` names is `own`'s or in it: an old view's node in one of its, a node of the tree's held by one of its.
+fn Ctx::by_in(self : Ctx, by : InstBy, own : InstBy) -> Bool {
+  match (by, own) {
+    (InstBy::Old(i), InstBy::Old(o)) => i < self.count && o < self.count && self.node_in(i, o)
+    (InstBy::Node(i), InstBy::Node(o)) =>
+    match view_app.v {
+      Some(t) => t.holds(o, i)
+      Option::None => i == o
+    }
+    _ => false
+  }
+}
+
+///|
+/// The words `by` draws (its whole text: what a test names words by), "" none known.
+fn Ctx::by_text(self : Ctx, by : InstBy) -> String {
+  match by {
+    InstBy::Old(o) if o < self.count => self.nodes[o].text
+    InstBy::Node(id) => inst_owners.tree_words.get(id).unwrap_or("")
+    _ => ""
+  }
+}
+
+///|
+/// The words `by` draws, or the first of what it holds, cut short to be said ("?" none known).
+fn Ctx::by_said(self : Ctx, by : InstBy) -> String {
+  match by {
+    InstBy::Old(o) if o < self.count => self.words_over_words(o)
+    InstBy::Node(_) => {
+      let t = self.by_text(by).replace("\n", " ")
+      if mbt_compat::utf16_len(t) > 40 {
+        mbt_compat::str_unsafe_substring(t, start=0, end=40) + "…"
+      } else {
+        t
+      }
+    }
+    _ => "?"
+  }
+}
+
+///|
+/// The node of the window's tree that drew instance `k`, None not one of its.
+fn inst_tree_owner(k : Int) -> Option[view::NodeId] {
+  if k < inst_owners.tree.length() {
+    inst_owners.tree[k]
+  } else {
+    Option::None
+  }
+}
+
+///|
+/// Glyph `k`'s cell across, from `x0` to `x1` where its picture is `gx` across `gw` wide (inst_owners' `cell`).
+fn inst_cell(k : Int, gx : Double, gw : Double, x0 : Double, x1 : Double) -> Unit {
+  if k < inst_owners.cell.length() && gw > 0.0 {
+    inst_owners.cell[k] = ((x0 - gx) / gw, (x1 - gx) / gw)
+  }
+}
+
+///|
+/// Instance `k`'s cell (inst_owners' `cell`).
+fn inst_cell_of(k : Int) -> (Double, Double) {
+  if k < inst_owners.cell.length() {
+    inst_owners.cell[k]
+  } else {
+    (0.0, 1.0)
+  }
+}
+
+///|
+/// The node that drew instance `k`, -1 none known.
+fn inst_owner(k : Int) -> Int {
+  if k < inst_owners.owner.length() {
+    inst_owners.owner[k]
+  } else {
+    -1
+  }
+}
+
+///|
+/// The owners moved as Ctx::raise_tops moves the instances, `tops` (from, to) after the rest of the `count` painted.
+fn inst_owners_raised(tops : Array[(Int, Int)], count : Int) -> Unit {
+  // (all that is kept of who drew each, moved with it: its owner, its glyph's cell, its node of the tree's, what it is
+  // checked as)
+  let raised : Array[(Int, (Double, Double), Option[view::NodeId], Int)] = []
+  for r in tops {
+    for q in r.0..<r.1 {
+      raised.push((inst_owner(q), inst_cell_of(q), inst_tree_owner(q), inst_mark_of(q)))
+    }
+  }
+  let moved : Array[(Int, (Double, Double), Option[view::NodeId], Int)] = []
+  for k, r in tops {
+    let end = if k + 1 < tops.length() { tops[k + 1].0 } else { count }
+    for q in r.1..<end {
+      moved.push((inst_owner(q), inst_cell_of(q), inst_tree_owner(q), inst_mark_of(q)))
+    }
+  }
+  let was = inst_owners.painting
+  let was_tree = inst_owners.tree_painting
+  let mut to = tops[0].0
+  for o in mbt_compat::arr_concat(moved, raised) {
+    inst_owners.painting = o.0
+    inst_owners.tree_painting = o.2
+    inst_owned(to)
+    inst_owners.cell[to] = o.1
+    inst_owners.mark[to] = o.3
+    to = to + 1
+  }
+  inst_owners.painting = was
+  inst_owners.tree_painting = was_tree
+}
+
+///|
+/// The least what is drawn with nothing in it stands off what it lies on (see the head): WCAG 2's contrast ratio. A
+/// line (the theme's `line` on its page) is the faintest the design draws on purpose, about 1.2; a block the size of
+/// a gauge's cell below that is not seen in a lit room (1.03: a station's cells in dark on its card, 2026-10-26).
+// moved to 00_init_order.pion: contrast_mark_least
+
+///|
+/// The least words stand off their ground: WCAG 2's AA, 3:1 large (24 and up, 18.66 and up bold), 4.5:1 else.
+pub fn contrast_words_least(size : Double, weight : Int) -> Double {
+  if size >= 24.0 || (size >= 18.66 && weight >= 700) {
+    3.0
+  } else {
+    4.5
+  }
+}
+
+///|
+/// The least an icon stands off its ground: WCAG 2's non-text contrast.
+// moved to 00_init_order.pion: contrast_icon_least
+
+///|
+/// The most an icon is across: a shape drawn larger is a drawing or an outline (a card's dashed edge), held as a line.
+// moved to 00_init_order.pion: icon_most
+
+///|
+/// A colour's red, green and blue, 0 to 1.
+struct Rgb {
+  r : Double
+  g : Double
+  b : Double
+}
+
+///|
+/// `top` laid over `under` at opacity `a` (as the renderers blend: in the colours as they are written).
+fn Rgb::laid(under : Rgb, top : Rgb, a : Double) -> Rgb {
+  Rgb::{ r: under.r + (top.r - under.r) * a, g: under.g + (top.g - under.g) * a, b: under.b + (top.b - under.b) * a }
+}
+
+///|
+/// WCAG 2's relative luminance.
+fn Rgb::luminance(self : Rgb) -> Double {
+  let lin = fn(v : Double) {
+    if v <= 0.04045 {
+      v / 12.92
+    } else {
+      dmath::pow((v + 0.055) / 1.055, 2.4)
+    }
+  }
+  0.2126 * lin(self.r) + 0.7152 * lin(self.g) + 0.0722 * lin(self.b)
+}
+
+///|
+/// WCAG 2's contrast ratio of two colours (1 to 21).
+fn contrast_of(a : Rgb, b : Rgb) -> Double {
+  let la = a.luminance()
+  let lb = b.luminance()
+  (dmax(la, lb) + 0.05) / (dmin(la, lb) + 0.05)
+}
+
+///|
+/// A colour as the theme writes it (0xRRGGBBAA), its red, green and blue.
+fn rgb_of(v : Int64) -> Rgb {
+  Rgb::{
+    r: ((v >> 24) & 0xFFL).to_double() / 255.0,
+    g: ((v >> 16) & 0xFFL).to_double() / 255.0,
+    b: ((v >> 8) & 0xFFL).to_double() / 255.0,
+  }
+}
+
+///|
+/// WCAG 2's contrast ratio of two opaque colours as the theme writes them (0xRRGGBBAA), 1 to 21.
+pub fn contrast_ratio(a : Int64, b : Int64) -> Double {
+  contrast_of(rgb_of(a), rgb_of(b))
+}
+
+///|
+/// Of `inks`, the one that stands furthest off `ground` (opaque, 0xRRGGBBAA): what is said on a colour a person chose
+/// (an app's picture's ground) reads on whatever they chose.
+pub fn ink_on(ground : Int64, inks : Array[Int64]) -> Int64 {
+  let mut best = inks[0]
+  for i in inks {
+    if contrast_ratio(i, ground) > contrast_ratio(best, ground) {
+      best = i
+    }
+  }
+  best
+}
+
+///|
+/// Whether two colours are the same as drawn (within a step of 8 bits).
+fn same_rgb(a : Rgb, b : Rgb) -> Bool {
+  (a.r - b.r).abs() < 0.5 / 255.0 && (a.g - b.g).abs() < 0.5 / 255.0 && (a.b - b.b).abs() < 0.5 / 255.0
+}
+
+///|
+/// `#rrggbb`.
+fn Rgb::hex(self : Rgb) -> String {
+  let two = fn(v : Double) {
+    let n = (dmin(dmax(v, 0.0), 1.0) * 255.0).round().to_int()
+    let s = n.to_string(radix=16)
+    if mbt_compat::utf16_len(s) < 2 {
+      "0" + s
+    } else {
+      s
+    }
+  }
+  "#" + two(self.r) + two(self.g) + two(self.b)
+}
+
+///|
+/// A ratio as said: two decimals.
+fn ratio_said(r : Double) -> String {
+  let h = (r * 100.0).round().to_int()
+  let f = h % 100
+  "\{h / 100}.\{if f < 10 { "0" } else { "" }}\{f}"
+}
+
+///|
+/// Instance `b`'s colour (8-10) and its opacity (11).
+fn inst_rgb(a : FixedArray[Double], b : Int) -> Rgb {
+  Rgb::{ r: a[b + 8], g: a[b + 9], b: a[b + 10] }
+}
+
+///|
+/// Whether (`px`, `py`) is inside what cuts instance `b` as the renderers cut it (smooth.pion sd_clip): its clip, a
+/// rounded rect (16-19, its corners 24-27, their smoothness 28-31), and the rounded clip outside it that it cuts through
+/// (40-51), where it has one. A point in a clip's rect but past its rounded corner is not cut to: a picture flying in a
+/// frame rounded round it covers nothing there.
+fn in_inst_clip(a : FixedArray[Double], b : Int, px : Double, py : Double) -> Bool {
+  let outer = a[b + 44] > 0.0 || a[b + 45] > 0.0 || a[b + 46] > 0.0 || a[b + 47] > 0.0
+  px >= a[b + 16] &&
+  px <= a[b + 18] &&
+  py >= a[b + 17] &&
+  py <= a[b + 19] &&
+  inst_in_round(a, b + 16, b + 24, px, py) &&
+  (!outer || inst_in_round(a, b + 40, b + 44, px, py))
+}
+
+///|
+/// Whether (`px`, `py`) is within the rounded rect x0 y0 x1 y1 at `at` of instance numbers `a`, its corners' radii at
+/// `radii` and their smoothness the four after them, as the renderers cut it (sd_clip).
+fn inst_in_round(a : FixedArray[Double], at : Int, radii : Int, px : Double, py : Double) -> Bool {
+  let r = (a[radii], a[radii + 1], a[radii + 2], a[radii + 3])
+  if r.0 <= 0.0 && r.1 <= 0.0 && r.2 <= 0.0 && r.3 <= 0.0 {
+    return true
+  }
+  paint::sd_clip(px, py, a[at], a[at + 1], a[at + 2], a[at + 3], r, (a[radii + 4], a[radii + 5], a[radii + 6], a[radii + 7])) <=
+  0.0
+}
+
+///|
+/// Whether (`px`, `py`) is inside instance `b`'s drawn box and its clips. The renderer uses the radius of the
+/// point's quarter (36-39) and smooths that corner as far as the box has room for.
+fn in_inst(a : FixedArray[Double], b : Int, px : Double, py : Double) -> Bool {
+  let x = a[b]
+  let y = a[b + 1]
+  let w = a[b + 2]
+  let h = a[b + 3]
+  if px < x || py < y || px > x + w || py > y + h || !in_inst_clip(a, b, px, py) {
+    return false
+  }
+  let hw = w / 2.0
+  let hh = h / 2.0
+  let dx = px - (x + hw)
+  let dy = py - (y + hh)
+  let r = if dy < 0.0 {
+    if dx < 0.0 { a[b + 36] } else { a[b + 37] }
+  } else {
+    if dx < 0.0 { a[b + 39] } else { a[b + 38] }
+  }
+  r <= 0.0 || paint::sd_box(dx, dy, hw, hh, r) <= 0.0
+}
+
+///|
+/// How instance `j` lies over (`px`, `py`) as a ground: 0 not, 1 a colour (its fill, glass's tint, a shape's filled
+/// band: a badge's disc under its glyph, not `own`'s own) at an opacity, 2 a picture, a video or another app's view, its
+/// colours not known here.
+fn ground_kind(a : FixedArray[Double], j : Int, px : Double, py : Double, own? : Int) -> (Int, Double) {
+  let own = match own { Some(__mbt_v) => __mbt_v, None => -1 }
+
+  let b = j * inst_size
+  let kind = a[b + 5]
+  if kind == 11.0 {
+    if a[b + 4] == 0.0 && a[b + 11] > 0.002 && in_inst(a, b, px, py) && inst_owner(j) != own {
+      (1, a[b + 11])
+    } else {
+      (0, 0.0)
+    }
+  } else if kind == 0.0 {
+    let o = a[b + 11]
+    if o > 0.002 && in_inst(a, b, px, py) {
+      (1, o)
+    } else {
+      (0, 0.0)
+    }
+  } else if kind == 5.0 || kind == 6.0 {
+    if in_inst(a, b, px, py) {
+      (1, a[b + 11] * a[b + 15])
+    } else {
+      (0, 0.0)
+    }
+  } else if kind == 4.0 || kind == 9.0 {
+    if in_inst(a, b, px, py) {
+      (2, 1.0)
+    } else {
+      (0, 0.0)
+    }
+  } else {
+    (0, 0.0)
+  }
+}
+
+///|
+fn contrast_max(a : Double, b : Double) -> Double {
+  if a > b { a } else { b }
+}
+
+///|
+fn contrast_min(a : Double, b : Double) -> Double {
+  if a < b { a } else { b }
+}
+
+///|
+fn contrast_smoothstep(e0 : Double, e1 : Double, x : Double) -> Double {
+  let t = mbt_compat::double_clamp(((x - e0) / (e1 - e0)), min=0.0, max=1.0)
+  t * t * (3.0 - 2.0 * t)
+}
+
+///|
+/// Exact optical transfer of non-adaptive Regular Liquid Glass overlays (`kind == 6`, neutral tint, `col_a >= 0.46`)
+/// matching all four GPU renderers (Metal / GLES3 / D3D11 / WebGL2), including the symmetric `p=4` hard-knee floor/ceiling.
+/// Leaves `0x67` (`col_a = 0.404`) bar/pill controls on the existing linear model so untouched controls keep baseline parity.
+fn liquid_glass_ground(bg : Rgb, tint : Rgb, col_a : Double, vis_a : Double, sat : Double) -> Rgb {
+  let col_ch = contrast_max(tint.r, contrast_max(tint.g, tint.b)) -
+  contrast_min(tint.r, contrast_min(tint.g, tint.b))
+  if col_a < 0.46 || col_ch > 0.08 {
+    return Rgb::laid(bg, tint, col_a * vis_a)
+  }
+  let y = 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b
+  let tint_y = 0.2126 * tint.r + 0.7152 * tint.g + 0.0722 * tint.b
+  let is_dark = tint_y < 0.35
+  let base_dens = 0.404 + (col_a - 0.404) * contrast_smoothstep(0.405, 0.46, col_a)
+  let extra = mbt_compat::double_clamp(((base_dens - 0.404) / (1.0 - 0.404)), min=0.0, max=1.0)
+  let overlay_knee = contrast_smoothstep(0.09, 0.16, extra)
+  let (em_r, em_g, em_b, trans, lift, chroma_gain, proj_mix) = if is_dark {
+    let dark_bump = 3.5 *
+    contrast_smoothstep(0.0, 0.16, extra) *
+    (1.0 - contrast_smoothstep(0.22, 0.38, extra))
+    let em0 = (34.0 + dark_bump) / 255.0
+    let ep = dmath::pow(extra, 1.5)
+    let er = contrast_max(em0 + (tint.r - em0) * ep, 0.0)
+    let eg = contrast_max(em0 + (tint.g - em0) * ep, 0.0)
+    let eb = contrast_max(em0 + (tint.b - em0) * ep, 0.0)
+    let tr = 0.59 * (1.0 - extra)
+    let lf = 0.55 * (1.0 - extra)
+    let cg = 1.05 * (1.0 - dmath::pow(extra, 1.05))
+    let pm = 0.25 + (0.35 - 0.25) * contrast_smoothstep(0.0, 0.18, extra)
+    (er, eg, eb, tr, lf, cg, pm)
+  } else {
+    let lp = dmath::pow(extra, 1.35)
+    let ld = 0.525 + (1.0 - 0.525) * lp
+    let er = (253.0 / 255.0 + (tint.r - 253.0 / 255.0) * extra) * ld
+    let eg = (252.0 / 255.0 + (tint.g - 252.0 / 255.0) * extra) * ld
+    let eb = (253.0 / 255.0 + (tint.b - 253.0 / 255.0) * extra) * ld
+    let tr = 1.0 - ld
+    let lf = (0.04 + 0.10 * contrast_smoothstep(0.0, 0.16, extra)) *
+    (1.0 - contrast_smoothstep(0.40, 0.95, extra))
+    let cg = 1.0 - lp
+    let pm = 0.25 + (0.48 - 0.25) * contrast_smoothstep(0.0, 0.18, extra)
+    (er, eg, eb, tr, lf, cg, pm)
+  }
+  let trans_lum = mbt_compat::double_clamp((y * (1.0 + lift * (1.0 - y))), min=0.0, max=1.0)
+  let lt = mbt_compat::double_clamp((trans_lum * trans), min=0.0, max=1.0)
+  let (base_lum, knee_scale) = if is_dark {
+    let kt = trans_lum * 2.0
+    let kt2 = kt * kt
+    let k_denom = 1.0 + kt2 * kt2
+    let lc = lt * dmath::pow(k_denom, -0.25)
+    let bl = lt + (lc - lt) * overlay_knee
+    let ks = 1.0 + (dmath::pow(k_denom, -0.075) - 1.0) * overlay_knee
+    (bl, ks)
+  } else {
+    let d = contrast_max(trans - lt, 0.0)
+    let dt = d / 0.205
+    let dt2 = dt * dt
+    let d_inv = dmath::pow(1.0 + dt2 * dt2, -0.25)
+    let dc = d * d_inv
+    let bl = lt + (contrast_max(trans - dc, 0.0) - lt) * overlay_knee
+    let ks = 1.0 + (d_inv - 1.0) * overlay_knee
+    (bl, ks)
+  }
+  let cs = chroma_gain * sat * knee_scale
+  let raw_r = em_r + base_lum + (bg.r - y) * cs
+  let raw_g = em_g + base_lum + (bg.g - y) * cs
+  let raw_b = em_b + base_lum + (bg.b - y) * cs
+  let em_y = 0.2126 * em_r + 0.7152 * em_g + 0.0722 * em_b
+  let lum_r = mbt_compat::double_clamp((em_y + base_lum), min=0.001, max=0.999)
+  let dr = raw_r - lum_r
+  let dg = raw_g - lum_r
+  let db = raw_b - lum_r
+  let mut s = 1.0
+  if dr > 0.0001 { s = contrast_min(s, (1.0 - lum_r) / dr) } else if dr < -0.0001 { s = contrast_min(s, lum_r / -dr) }
+  if dg > 0.0001 { s = contrast_min(s, (1.0 - lum_r) / dg) } else if dg < -0.0001 { s = contrast_min(s, lum_r / -dg) }
+  if db > 0.0001 { s = contrast_min(s, (1.0 - lum_r) / db) } else if db < -0.0001 { s = contrast_min(s, lum_r / -db) }
+  let sc = mbt_compat::double_clamp(s, min=0.0, max=1.0)
+  let pr = mbt_compat::double_clamp((lum_r + dr * sc), min=0.0, max=1.0)
+  let pg = mbt_compat::double_clamp((lum_r + dg * sc), min=0.0, max=1.0)
+  let pb = mbt_compat::double_clamp((lum_r + db * sc), min=0.0, max=1.0)
+  let cl_r = mbt_compat::double_clamp(raw_r, min=0.0, max=1.0)
+  let cl_g = mbt_compat::double_clamp(raw_g, min=0.0, max=1.0)
+  let cl_b = mbt_compat::double_clamp(raw_b, min=0.0, max=1.0)
+  let glass : Rgb = Rgb::{
+    r: cl_r + (pr - cl_r) * proj_mix,
+    g: cl_g + (pg - cl_g) * proj_mix,
+    b: cl_b + (pb - cl_b) * proj_mix,
+  }
+  Rgb::laid(bg, glass, vis_a)
+}
+
+///|
+/// How much of instance `j` (a fill) is seen at a point of it under glass blurring by `blur` (CSS blur()'s deviation): all
+/// of it where it is wider and taller than the blur's reach (2.5 deviations), else as much as the blur leaves of it
+/// spread across that reach (a split's 5 pt grip under a panel's 14 pt blur: a seventh). Something that narrow under
+/// frosted or liquid glass shows as a faint smear, not as the ground of words drawn over the glass.
+fn blurred_under(a : FixedArray[Double], j : Int, blur : Double) -> Double {
+  let b = j * inst_size
+  let side = contrast_min(a[b + 2], a[b + 3])
+  let reach = blur * 2.5
+  if side >= reach { 1.0 } else { contrast_max(side, 0.0) / reach }
+}
+
+///|
+/// What the frame drew at (`px`, `py`) before instance `k`: the colour there, and each colour it was on the way up
+/// (the last whole one first: a sidebar's, a row's on it); None where that is a picture's, a video's or another app's
+/// (or on one, with nothing whole over it).
+fn Ctx::ground_under(self : Ctx, k : Int, px : Double, py : Double) -> Option[(Rgb, Array[Rgb])] {
+  let a = self.inst
+  let own = inst_owner(k)
+  // the topmost glass under it there that blurs what it lies over, and how far (blurred_under): what is drawn under that
+  // glass narrower than its blur is spread out under it, not seen whole at this one point
+  let mut blur_at = -1
+  let mut blur = 0.0
+  let mut g = k - 1
+  while g >= 0 {
+    let gb = g * inst_size
+    let gk = a[gb + 5]
+    if (gk == 5.0 || gk == 6.0) && in_inst(a, gb, px, py) {
+      // (kind 5's blur said negative when contained, kind 6's negative a droplet's or a lens's, which blur nothing)
+      let v = if gk == 5.0 { a[gb + 7].abs() } else { a[gb + 7] }
+      if v > 0.0 {
+        blur_at = g
+        blur = v
+      }
+      break
+    }
+    g = g - 1
+  }
+  let seen = fn(j : Int) -> (Int, Double) {
+    let (kind, o) = ground_kind(a, j, px, py, own=own)
+    if kind == 1 && j < blur_at { (kind, o * blurred_under(a, j, blur)) } else { (kind, o) }
+  }
+  // the last whole colour under it there, then what is laid over that
+  let mut from = -1
+  let mut j = k - 1
+  while j >= 0 {
+    let (kind, o) = seen(j)
+    if kind == 2 {
+      return Option::None
+    }
+    if kind == 1 && o >= 0.999 {
+      from = j
+      break
+    }
+    j = j - 1
+  }
+  let t = if self.narrow { self.theme_narrow.unwrap_or(self.theme_wide) } else { self.theme_wide }
+  let mut out = if from >= 0 {
+    inst_rgb(a, from * inst_size)
+  } else {
+    let v = t.bg
+    Rgb::{
+      r: ((v >> 24) & 0xFFL).to_double() / 255.0,
+      g: ((v >> 16) & 0xFFL).to_double() / 255.0,
+      b: ((v >> 8) & 0xFFL).to_double() / 255.0,
+    }
+  }
+  let beneath = [out]
+  for q in (from + 1)..<k {
+    let (kind, o) = seen(q)
+    if kind == 1 {
+      let qb = q * inst_size
+      out = if a[qb + 5] == 6.0 && a[qb + 14] >= -0.5 {
+        liquid_glass_ground(out, inst_rgb(a, qb), a[qb + 11], a[qb + 15], a[qb + 6])
+      } else {
+        Rgb::laid(out, inst_rgb(a, qb), o)
+      }
+      beneath.push(out)
+    }
+  }
+  Some((out, beneath))
+}
+
+///|
+/// Whether instance `k` (a filled shape) is in the colour of a ground drawn whole by a node holding something (words, a
+/// picture), touching it: a piece of that ground (a popover's arrow, a bubble's tail), not a mark of its own.
+fn Ctx::ground_piece(self : Ctx, k : Int, holding : Array[Bool]) -> Bool {
+  let a = self.inst
+  let b = k * inst_size
+  let ink = inst_rgb(a, b)
+  for j in 0..<self.ninst {
+    let q = j * inst_size
+    let o = inst_owner(j)
+    if j == k || a[q + 5] != 0.0 || a[q + 11] < 0.999 || o < 0 || o >= self.count || !holding[o] {
+      continue
+    }
+    if !same_rgb(inst_rgb(a, q), ink) {
+      continue
+    }
+    // (their rects within a pixel of each other)
+    if a[b] <= a[q] + a[q + 2] + 1.0 &&
+    a[q] <= a[b] + a[b + 2] + 1.0 &&
+    a[b + 1] <= a[q + 1] + a[q + 3] + 1.0 &&
+    a[q + 1] <= a[b + 1] + a[b + 3] + 1.0 {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Whether words are drawn after instance `k` over the box (`x`, `y`, `w`, `h`) its shape fills (the node's: a shape
+/// goes to the renderers as bands 8 tall, its last perhaps under its words' glyphs, the whole shape their ground): a
+/// glyph meeting it by more than a point each way.
+fn Ctx::words_on(self : Ctx, k : Int, x : Double, y : Double, w : Double, h : Double) -> Bool {
+  let a = self.inst
+  for j in (k + 1)..<self.ninst {
+    let q = j * inst_size
+    if a[q + 5] == 1.0 &&
+    a[q] + 1.0 < x + w &&
+    x + 1.0 < a[q] + a[q + 2] &&
+    a[q + 1] + 1.0 < y + h &&
+    y + 1.0 < a[q + 1] + a[q + 3] {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Whether node `i` is `own` or in it.
+fn Ctx::node_in(self : Ctx, i : Int, own : Int) -> Bool {
+  let mut q = i
+  while q >= 0 {
+    if q == own {
+      return true
+    }
+    q = self.nodes[q].parent
+  }
+  false
+}
+
+///|
+/// Whether something drawn after instance `k`, not by `own` nor what is in it, lies over (`px`, `py`): what `k`
+/// draws there is covered (a dialog's scrim over the page, a bar's glass over a list).
+fn Ctx::covered_after(self : Ctx, k : Int, px : Double, py : Double, own : InstBy) -> Bool {
+  let a = self.inst
+  for j in (k + 1)..<self.ninst {
+    let (kind, _) = ground_kind(a, j, px, py)
+    if kind != 0 && !self.by_in(inst_by(j), own) {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// For each node, whether it draws words, a picture, an icon or another app's view, or holds something that does: a
+/// ground with something in it, which carries it.
+fn Ctx::holding(self : Ctx) -> Array[Bool] {
+  let out = Array::make(self.count, false)
+  for i in 0..<self.count {
+    let n = self.nodes[i]
+    let shows = n.kind == kind_text ||
+    n.kind == kind_rich ||
+    n.kind == kind_editor ||
+    n.kind == kind_image ||
+    n.kind == kind_native ||
+    n.kind == kind_page ||
+    n.shapes.length() > 0
+    if shows {
+      let mut q = i
+      while q >= 0 && !out[q] {
+        out[q] = true
+        q = self.nodes[q].parent
+      }
+    }
+  }
+  out
+}
+
+///|
+/// Whether instance `k` (node `own`'s) is a ground for what is drawn over it after it: words, an icon, a picture or
+/// another app's view with its middle inside it (a choice's thumb under its words), or a ground or a line of what is in
+/// `own` over its own middle (`px`, `py`: a ring round a dot, cut out of what lies under it; a spinner in a place kept).
+fn Ctx::drawn_over(self : Ctx, k : Int, own : Int, px : Double, py : Double) -> Bool {
+  let a = self.inst
+  let b = k * inst_size
+  for j in (k + 1)..<self.ninst {
+    let q = j * inst_size
+    let kind = a[q + 5]
+    // (a bone stands for the words or the picture it is drawn in place of: over it as they would be)
+    if kind == 1.0 || kind == 3.0 || kind == 7.0 || kind == 4.0 || kind == 9.0 || kind == 11.0 || bone_insts.contains(j) {
+      let cx = a[q] + a[q + 2] / 2.0
+      let cy = a[q + 1] + a[q + 3] / 2.0
+      if cx >= a[b] && cx <= a[b] + a[b + 2] && cy >= a[b + 1] && cy <= a[b + 1] + a[b + 3] {
+        return true
+      }
+    } else if kind == 0.0 && a[q + 11] > 0.002 {
+      let o = inst_owner(j)
+      if o != own && self.node_in(o, own) && in_inst(a, q, px, py) {
+        return true
+      }
+    } else if kind == 10.0 {
+      // (a line of what is in it over its middle: a spinner turning in a placeholder)
+      let o = inst_owner(j)
+      if o != own && self.node_in(o, own) && in_inst(a, q, px, py) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+///|
+/// Where node `i` is (and where the old view it is in was made: Ctx::old_source_said), and the words nearest it (its
+/// own, or the first of what holds it), to find it by: ` at x,y w×h (in an old view made at …) by "…"`.
+fn Ctx::contrast_where(self : Ctx, i : Int) -> String {
+  let n = self.nodes[i]
+  let src = self.old_source_said(i)
+  let at = " at \{mbt_compat::double_to_string(n.x.round())},\{mbt_compat::double_to_string(n.y.round())} \{mbt_compat::double_to_string(n.fw.round())}×\{mbt_compat::double_to_string(n.fh.round())}" +
+  (if src == "" { "" } else { " (" + src + ")" })
+  // (the first words in it, depth first, or in what holds it, up to four boxes out)
+  let words_in = fn(r : Int) -> String {
+    let todo = [r]
+    while todo.pop() is Some(q) {
+      let m = self.nodes[q]
+      if m.text != "" && (m.kind == kind_text || m.kind == kind_rich || m.kind == kind_editor) {
+        return m.text
+      }
+      if m.label != "" {
+        return m.label
+      }
+      let kids = []
+      let mut ch = m.first
+      while ch >= 0 {
+        kids.push(ch)
+        ch = self.nodes[ch].next
+      }
+      for x = kids.length() - 1; x >= 0; x = x - 1 {
+        todo.push(kids[x])
+      }
+    }
+    ""
+  }
+  let mut q = i
+  for _ in 0..<5 {
+    if q < 0 {
+      break
+    }
+    let w = words_in(q)
+    if w != "" {
+      let w = if mbt_compat::utf16_len(w) > 16 { mbt_compat::str_unsafe_substring(w, start=0, end=16) + "…" } else { w }
+      return at + " by \"" + w.replace("\n", " ") + "\""
+    }
+    q = self.nodes[q].parent
+  }
+  at
+}
+
+///|
+/// Where the frame Tester::contrast_faults drew stands too faint off what it lies on (see the file's head), each once:
+/// what it is and where, its colour as drawn on its ground, the ratio and the least. `marks`: the least for what has
+/// nothing in it. Words are measured at their faintest letter; a line (Ctx::lines) or an icon at its strongest piece,
+/// as it is seen by that (a spinner's spokes fading behind the one it is at). What is drawn in the colour of a ground
+/// under it, deeper than the one it lies on, is a cut through to that ground (round a dot over a picture, in the
+/// sidebar's colour), not a mark of its own.
+fn Ctx::contrast_faults_drawn(self : Ctx, marks : Double) -> Array[String] {
+  self.flat_from(0)
+  let a = self.inst
+  let pictures = self.pictures()
+  { let __mbt_sit_821 = (inst_owners.own_colours).iter(); while true { match (__mbt_sit_821.next)() { Some(n) => {
+    pictures.insert(n)
+  }, None => break } } }
+  let disabled : mbt_compat::OrderedSet[Int] = mbt_compat::ordered_set_from_array([])
+  for s in self.sems {
+    if s.disabled {
+      disabled.insert(s.node)
+    }
+  }
+  let holding = self.holding()
+  // each node's words at their faintest letter, a line's or an icon's pieces at their strongest: (ratio, what is said
+  // where it is under the least)
+  let lines : mbt_compat::OrderedMap[Int, (Double, String)] = mbt_compat::ordered_map_new()
+  let order : Array[Int] = []
+  let out : Array[String] = []
+  let seen : mbt_compat::OrderedSet[String] = mbt_compat::ordered_set_from_array([])
+  let say = fn(s : String) {
+    out.push(s)
+  }
+  // (what a node of the window's tree draws, by node and by what it is checked as, each its own whatever else the node
+  // draws: its words at their faintest letter, as an old view's are (their size and weight the tree's words',
+  // view_host.pion); its shapes at their strongest piece, as an old view's icon or line)
+  let tree_lines : mbt_compat::OrderedMap[(view::NodeId, Int), (Double, String)] = mbt_compat::ordered_map_new_pair()
+  let tree_order : Array[(view::NodeId, Int)] = []
+  // (what a node of the window's tree said disabled holds, as an old view's in a widget said disabled: asked nothing;
+  // its own presses off, under a modal layer as well (a send with nothing to send behind a menu opened over it), not
+  // what is only a modal layer's taking them from it)
+  let tree_off : Array[view::NodeId] = match view_app.v {
+    Some(tree) => mbt_compat::arr_map(mbt_compat::arr_filter(tree.said_order(), fn(s) { tree.node_pressless_own(s.id) }), fn(s) { s.id })
+    Option::None => []
+  }
+  let tree_off_holds = fn(id : view::NodeId) {
+    match view_app.v {
+      Some(tree) => arr_any(tree_off, fn(o) { tree.holds(o, id) })
+      Option::None => false
+    }
+  }
+  // (what a node of the window's tree said to be a picture holds (Role Image: a drawing of something else, its inks its
+  // own), as an old view's in a box said so: asked nothing)
+  let tree_pictured : Array[view::NodeId] = match view_app.v {
+    Some(tree) => mbt_compat::arr_map(mbt_compat::arr_filter(tree.said_order(), fn(s) { (match s.said { Some(__mbt_sp_6) if ((match __mbt_sp_6.role { .Image => true, _ => false })) => true, _ => false }) }), fn(s) { s.id })
+    Option::None => []
+  }
+  let tree_in_picture = fn(id : view::NodeId) {
+    match view_app.v {
+      Some(tree) => arr_any(tree_pictured, fn(o) { o == id || tree.holds(o, id) })
+      Option::None => false
+    }
+  }
+  for k in 0..<self.ninst {
+    let b = k * inst_size
+    match inst_by(k) {
+      InstBy::Node(id) => {
+        let kind = a[b + 5]
+        let is_words = kind == 1.0 || (kind == 7.0 && {
+          let ink = inst_rgb(a, b)
+          dmax(dmax(ink.r, ink.g), ink.b) - dmin(dmin(ink.r, ink.g), ink.b) > 0.08
+        })
+        // (a shape's piece: checked as the whole shape it is of is, an icon or a line, as made: inst_owners' `mark`)
+        let mark = if !is_words && kind == 11.0 { inst_mark_of(k) } else { 0 }
+        if !is_words && mark == 0 {
+          continue
+        }
+        if tree_off_holds(id) || tree_in_picture(id) {
+          continue
+        }
+        // (a picture in its own colours (View::picture: a maker's mark, a logo), its owner's, as an old view's own_colours
+        // are: asked nothing)
+        if !is_words &&
+        (match view_app.v {
+          Some(tree) => mbt_compat::opt_map(tree.drawn_of(id), fn(d) { d.picture is Some(_) }).unwrap_or(false)
+          Option::None => false
+        }) {
+          continue
+        }
+        let px = a[b] + a[b + 2] / 2.0
+        let py = a[b + 1] + a[b + 3] / 2.0
+        if px < 0.0 || py < 0.0 || px > self.window_w || py > self.window_h || !in_inst_clip(a, b, px, py) {
+          continue
+        }
+        let (ground, beneath) = match self.ground_under(k, px, py) {
+          Some(g) => g
+          Option::None => continue
+        }
+        if self.covered_after(k, px, py, InstBy::Node(id)) {
+          continue
+        }
+        let ink = inst_rgb(a, b)
+        // Adaptive-ink icons/glyphs (slot 23 > 0 on glyph/shape instances) invert dynamically against backdrop luminance in the GPU shader.
+        if (kind == 1.0 || kind == 11.0) && b + 23 < a.length() && a[b + 23] > 0.0 {
+          continue
+        }
+        let shown = Rgb::laid(ground, ink, a[b + 11])
+        // (a cut through to a ground under it, or that ground's own colour; words are never that)
+        if !is_words &&
+        (same_rgb(shown, ground) || (a[b + 11] >= 0.999 && mbt_compat::arr_iter(beneath).any(fn(u) { same_rgb(u, ink) }))) {
+          continue
+        }
+        let r = contrast_of(shown, ground)
+        let (what, least) = if is_words {
+          // (as its words are set: how big, how heavy)
+          let k = match view_app.v {
+            Some(tree) =>
+            match tree.drawn_of(id) {
+              Some(d) => d.words_look
+              Option::None => view::words_plain
+            }
+            Option::None => view::words_plain
+          }
+          ("words \"\{self.by_said(InstBy::Node(id))}\" \{mbt_compat::double_to_string(k.size)}/\{k.weight}", contrast_words_least(k.size, k.weight))
+        } else if mark == 1 {
+          ("icon", contrast_icon_least)
+        } else {
+          ("line", marks)
+        }
+        let said = if r < least - 0.005 {
+          "\{what} (a node of the window's tree's)" +
+          tree_source_said(id, paren=true) +
+          ": " +
+          "\{shown.hex()} on \{ground.hex()} \{ratio_said(r)}:1, under \{mbt_compat::double_to_string(least)}"
+        } else {
+          ""
+        }
+        // (words at their faintest letter, an icon or a line at its strongest piece)
+        let key = (id, mark)
+        match tree_lines.get(key) {
+          Some((had, _)) if (is_words && had <= r) || (!is_words && had >= r) => ()
+          Some(_) => tree_lines.set(key, (r, said))
+          Option::None => {
+            tree_lines.set(key, (r, said))
+            tree_order.push(key)
+          }
+        }
+        continue
+      }
+      _ => ()
+    }
+    let o = inst_owner(k)
+    if o < 0 || o >= self.count {
+      continue
+    }
+    let n = self.nodes[o]
+    let kind = a[b + 5]
+    let is_words = (kind == 1.0 || (kind == 7.0 && {
+      let ink = inst_rgb(a, b)
+      dmax(dmax(ink.r, ink.g), ink.b) - dmin(dmin(ink.r, ink.g), ink.b) > 0.08
+    })) &&
+    (n.kind == kind_text || n.kind == kind_rich || n.kind == kind_editor)
+    let is_line = kind == 10.0 || kind == 11.0 || is_words
+    // (a page's bones: each is what has nothing in it, whatever drew it, bones.pion)
+    let bone = bone_insts.contains(k)
+    if !(is_line || bone || (kind == 0.0 && n.kind == kind_box && !n.blocks)) {
+      continue
+    }
+    let px = a[b] + a[b + 2] / 2.0
+    let py = a[b + 1] + a[b + 3] / 2.0
+    if px < 0.0 ||
+    py < 0.0 ||
+    px > self.window_w ||
+    py > self.window_h ||
+    !in_inst_clip(a, b, px, py) ||
+    self.in_picture(o, pictures) ||
+    (kind != 0.0 && self.in_picture(o, disabled)) {
+      continue
+    }
+    // (a filled shape in the colour of a ground with words in it, touching it: that ground's piece, as a popover's arrow
+    // is the popover's)
+    if kind == 11.0 && a[b + 4] == 0.0 && self.ground_piece(k, holding) {
+      continue
+    }
+    // (a shape words are drawn over after it: their ground, as a box's is, a highlighter's scribble behind a word)
+    if kind == 11.0 && self.words_on(k, n.x, n.y, n.fw, n.fh) {
+      continue
+    }
+    if is_line {
+      let (ground, beneath) = match self.ground_under(k, px, py) {
+        Some(g) => g
+        Option::None => continue
+      }
+      if self.covered_after(k, px, py, InstBy::Old(o)) {
+        continue
+      }
+      let ink = inst_rgb(a, b)
+      let shown = Rgb::laid(ground, ink, a[b + 11])
+      // (a cut through to a ground under it, or that ground's own colour; words are never that)
+      if !is_words &&
+      (same_rgb(shown, ground) || (a[b + 11] >= 0.999 && mbt_compat::arr_iter(beneath).any(fn(u) { same_rgb(u, ink) }))) {
+        continue
+      }
+      let r = contrast_of(shown, ground)
+      let (what, least) = if is_words {
+        let text = if mbt_compat::utf16_len(n.text) > 24 { mbt_compat::str_unsafe_substring(n.text, start=0, end=24) + "…" } else { n.text }
+        (
+          "words \"\{text.replace("\n", " ")}\" \{mbt_compat::double_to_string(n.font_size)}/\{n.weight}",
+          contrast_words_least(n.font_size, n.weight),
+        )
+      } else if kind == 11.0 && n.fw <= icon_most && n.fh <= icon_most {
+        ("icon", contrast_icon_least)
+      } else {
+        ("line", marks)
+      }
+      let said = if r < least - 0.005 {
+        "\{what}\{self.contrast_where(o)}: \{shown.hex()} on \{ground.hex()} \{ratio_said(r)}:1, under \{mbt_compat::double_to_string(least)}"
+      } else {
+        ""
+      }
+      match lines.get(o) {
+        Some((had, _)) if (is_words && had <= r) || (!is_words && had >= r) => ()
+        Some(_) => lines.set(o, (r, said))
+        Option::None => {
+          lines.set(o, (r, said))
+          order.push(o)
+        }
+      }
+      continue
+    }
+    // a box with nothing in it (nothing drawn in it, nor over it after: a choice's thumb under its words holds them; a
+    // ring round a dot is the dot's ground), seen by its ground or by its edge (a box to tick, white with a line round
+    // it): the one that stands further off what it lies on
+    if !bone && (holding[o] || self.drawn_over(k, o, px, py)) {
+      continue
+    }
+    // (ratio, what is said): its ground's, its edge's (at the middle of its left side), each that shows and is not cut
+    // through to a ground under it
+    let mut seen : Option[(Double, String)] = Option::None
+    let look = fn(what : String, x : Double, ink : Rgb, o2 : Double) {
+      match self.ground_under(k, x, py) {
+        Some((ground, beneath)) if !self.covered_after(k, x, py, InstBy::Old(o)) => {
+          let shown = Rgb::laid(ground, ink, o2)
+          let cut = o2 >= 0.999 && mbt_compat::arr_iter(beneath).any(fn(u) { same_rgb(u, ink) })
+          if !cut && !same_rgb(shown, ground) {
+            let r = contrast_of(shown, ground)
+            match seen {
+              Some((had, _)) if had >= r => ()
+              _ =>
+              seen = Some(
+                (r, "\{what}\{self.contrast_where(o)}: \{shown.hex()} on \{ground.hex()} \{ratio_said(r)}:1, under \{mbt_compat::double_to_string(marks)}"),
+              )
+            }
+          }
+        }
+        _ => ()
+      }
+    }
+    if a[b + 11] > 0.002 {
+      look("mark", px, inst_rgb(a, b), a[b + 11])
+    }
+    let ex = a[b] + a[b + 6] / 2.0
+    if a[b + 6] > 0.0 && a[b + 15] > 0.002 && ex >= 0.0 && in_inst_clip(a, b, ex, py) {
+      look("edge", ex, Rgb::{ r: a[b + 12], g: a[b + 13], b: a[b + 14] }, a[b + 15])
+    }
+    match seen {
+      Some((r, said)) if r < marks - 0.005 => say(said)
+      _ => ()
+    }
+  }
+  for o in order {
+    match lines.get(o) {
+      Some((_, said)) if said != "" => say(said)
+      _ => ()
+    }
+  }
+  for key in tree_order {
+    match tree_lines.get(key) {
+      Some((_, said)) if said != "" => say(said)
+      _ => ()
+    }
+  }
+  out
+}
+
+///|
+/// Where the screen as it is now draws something too faint to be seen on what it lies on (see the file's head): a
+/// frame drawn, each fault once. `marks`: the least for what has nothing in it (contrast_mark_least). Its frame and
+/// the one that draws the screen back after it are both at the last frame's moment (Tester::frame_again): what is
+/// read after it, and the clock, are as before.
+pub fn Tester::contrast_faults(self : Tester, marks? : Double) -> Array[String] {
+  let marks = match marks { Some(__mbt_v) => __mbt_v, None => contrast_mark_least }
+
+  self.reads_own()
+  let c = g()
+  inst_owners.on = true
+  inst_owners_clear()
+  test_stepped()
+  self.frame_again()
+  inst_owners.on = false
+  let faults = c.contrast_faults_drawn(marks)
+  // (drawn back as it was, built whole: frame_watch.pion; each loop where the clock has it again, not at its start)
+  test_stepped()
+  self.frame_again()
+  faults
+}
+
+///|
+/// What instance `k` is checked as (inst_owners' `mark`), 0 where none is said.
+fn inst_mark_of(k : Int) -> Int {
+  if k < inst_owners.mark.length() {
+    inst_owners.mark[k]
+  } else {
+    0
+  }
+}

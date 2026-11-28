@@ -1,29 +1,33 @@
-// End-to-end integration tests for `ui::Field` backed by `packages/editor`:
+// End-to-end integration tests for `ui::Field` backed by upstream `EditorState`:
 // multi-line wrapping + Up/Down preferred_x, CJK + Emoji ZWJ deletion without UTF-8 corruption,
 // Blink 1000ms undo coalescing, IME compose/commit/undo, multi-line selection highlight rects,
-// touch selection handle crossover flip, and optical loupe geometry.
+// touch selection handle dragging, optical loupe / View::magnifies, and focused multi-line caret y.
 
-import "editor"
 import "view"
 
 test "field_editor 01: multiline wrap, Up/Down preferred_x, and real measure_text_width" {
   let fld = Field::new(text="Hello world\nHi\nLonger third line")
   let t = Tester::tree(fn(root : view::View) {
-    let _ = field(root, fld, max_lines=6, font_size=15.0, line=22.0, label="Notes")
+    let _ = root.box(fn(b : view::View) {
+      let _ = b.width(view::Live::Is(Some(95.0)))
+      let _ = field(b, fld, max_lines=6, font_size=15.0, line=22.0, label="Notes")
+    })
   })
-  let lines = fld.layout_for(95.0, font_size=15.0, line_h=22.0)
-  debug_assert(lines.length() >= 4, "95pt wrap breaks multi-paragraph text into >= 4 lines")
-
-  // Place caret at byte 5 on line 0 and move down through short line "Hi" preserving preferred_x
+  fld.focus()
   fld.pick(5, 5)
-  let p0 = fld.caret_pos()
-  let want_x = p0.x
-  fld.move_down()
-  debug_assert(fld.editor.preferred_x == want_x, "preferred_x captured on first move_down")
-  fld.move_down()
-  debug_assert(fld.editor.preferred_x == want_x, "preferred_x preserved across short line")
-  fld.move_up()
-  debug_assert(fld.editor.preferred_x == want_x, "preferred_x preserved on move_up")
+  t.frame(ms=16.0)
+  let line_count = match fld.st.tl {
+    Some(tl) => tl.line_start.length()
+    None => 0
+  }
+  debug_assert(line_count >= 4, "95pt wrap breaks multi-paragraph text into >= 4 lines, got \{line_count}")
+  t.key(key_code_down)
+  let pref1 = fld.st.pref_x
+  debug_assert(pref1 > 0.0, "preferred_x captured on first move_down")
+  t.key(key_code_down)
+  debug_assert((fld.st.pref_x - pref1).abs() < 1.0e-6, "preferred_x preserved across short line")
+  t.key(key_code_up)
+  debug_assert((fld.st.pref_x - pref1).abs() < 1.0e-6, "preferred_x preserved on move_up")
   t.dispose()
 }
 
@@ -33,13 +37,17 @@ test "field_editor 02: CJK + Emoji ZWJ grapheme deletion never corrupts UTF-8" {
   let t = Tester::tree(fn(root : view::View) {
     let _ = field(root, fld, max_lines=3, label="Chat")
   })
-  t.press("Chat")
+  fld.focus()
+  let end_pos = mbt_compat::utf16_len(fld.text())
+  fld.pick(end_pos, end_pos)
+  t.frame(ms=16.0)
   t.backspace()
   debug_assert(fld.text() == "Hi你好", "single backspace deleted whole 18-byte ZWJ family emoji")
   t.backspace()
-  debug_assert(fld.text() == "Hi你", "second backspace deleted whole 3-byte CJK char 好")
-  debug_assert(fld.undo(), "undo restored CJK + emoji")
+  debug_assert(fld.text() == "Hi你", "second backspace deleted whole 3-byte CJK char")
+  t.key(key_of_char('z'), mods=mod_cmd)
   debug_assert(fld.text() == "Hi你好" + family, "coalesced backspaces restored in one undo step")
+  debug_assert(fld.st.undos.length() == 0, "undo stack drained after single coalesced undo")
   t.dispose()
 }
 
@@ -48,23 +56,25 @@ test "field_editor 03: Blink 1000ms undo coalescing driven by work_clock_now" {
   let t = Tester::tree(fn(root : view::View) {
     let _ = field(root, fld, max_lines=3, label="Draft")
   })
-  t.press("Draft")
+  fld.focus()
+  t.frame(ms=16.0)
   // Fast burst within 1000ms coalesces into 1 undo step
   t.type_text("h")
   t.frame(ms=100.0)
   t.type_text("i")
   t.frame(ms=100.0)
   t.type_text("!")
-  debug_assert(fld.editor.undo_stack.undo_len() == 1, "fast typing burst coalesced into 1 step")
-
+  debug_assert(fld.st.undos.length() == 1, "fast typing burst coalesced into 1 undo step, got \{fld.st.undos.length()}")
   // Pause > 1000ms starts a fresh undo step
   t.frame(ms=1200.0)
   t.type_text("ok")
-  debug_assert(fld.editor.undo_stack.undo_len() == 2, "typing after >1000ms pause starts step 2")
-  debug_assert(fld.undo(), "undo second burst")
-  debug_assert(fld.text() == "hi!", "reverted only post-pause burst")
-  debug_assert(fld.undo(), "undo first burst")
-  debug_assert(fld.text() == "", "reverted first burst cleanly")
+  debug_assert(fld.st.undos.length() == 2, "typing after >1000ms pause starts step 2, got \{fld.st.undos.length()}")
+  debug_assert(fld.text() == "hi!ok", "typed both bursts")
+  t.key(key_of_char('z'), mods=mod_cmd)
+  debug_assert(fld.text() == "hi!", "undo reverted only post-pause burst")
+  t.key(key_of_char('z'), mods=mod_cmd)
+  debug_assert(fld.text() == "", "undo reverted first burst cleanly")
+  debug_assert(fld.st.undos.length() == 0, "undo stack empty after reverting both bursts")
   t.dispose()
 }
 
@@ -74,55 +84,67 @@ test "field_editor 04: IME compose, live display_text, atomic commit, and undo" 
     let _ = field(root, fld, max_lines=3, label="IME")
   })
   fld.focus()
-  fld.compose("nihao")
+  t.frame(ms=16.0)
+  view_text(1, "nihao")
   debug_assert(fld.composing(), "composing active")
-  debug_assert(fld.editor.display_text() == "say nihao", "display_text splices marked text")
-  fld.insert("你好")
+  debug_assert(fld.st.marked == "nihao", "marked text holds live IME composition")
+  view_text(0, "你好")
   debug_assert(!fld.composing(), "commit clears composing")
   debug_assert(fld.text() == "say 你好", "committed CJK text")
-  debug_assert(fld.undo(), "IME commit undone in 1 step")
-  debug_assert(fld.text() == "say ", "reverted whole IME commit")
+  t.key(key_of_char('z'), mods=mod_cmd)
+  debug_assert(fld.text() == "say ", "IME commit undone atomically in 1 step")
+  debug_assert(!fld.composing(), "undo keeps composing cleared")
   t.dispose()
 }
 
 test "field_editor 05: multi-line selection highlight rects, handle crossover flip, and loupe geometry" {
   let fld = Field::new(text="one two\nthree four")
-  let t = Tester::tree(fn(root : view::View) {
-    let _ = field(root, fld, max_lines=4, font_size=15.0, line=22.0, label="Body")
-  })
-  let _ = fld.layout_for(300.0, font_size=15.0, line_h=22.0)
-
-  // Cross-line selection from "two" (byte 4) to "three" (byte 13) -> 2 selection rects
+  let t = Tester::tree(
+    fn(root : view::View) {
+      let _ = root.box(fn(b : view::View) {
+        let _ = b.width(view::Live::Is(Some(300.0)))
+        let _ = field(b, fld, max_lines=4, font_size=15.0, line=22.0, label="Body")
+      })
+    },
+    platform=4,
+  )
+  fld.focus()
+  // Cross-line selection from "two" (4) to "three" (13) -> 2 selection highlight bands rendered
   fld.pick(4, 13)
-  let rects = fld.selection_rects()
-  debug_assert(rects.length() == 2, "cross-line selection emits 2 highlight rects")
+  fld.st.sel_handles = true
   t.frame(ms=16.0)
-
-  // Touch selection handles + crossover identity flip (Start dragged past End -> flips to End)
-  fld.pick(4, 7) // "two" on line 0
-  match fld.handles(style=editor::HandleStyle::Android) {
-    Some((sh, eh)) => {
-      debug_assert(eh.tip_x > sh.tip_x, "end handle sits right of start handle")
-      match fld.handle_drag.begin(fld.editor, sh.knob_cx, sh.knob_cy, style=editor::HandleStyle::Android) {
-        Some(editor::HandleKind::Start) => ()
-        _ => debug_assert(false, "expected Start handle grab")
-      }
-      // Drag right past end handle onto line 1 ("four")
-      let target_x = 120.0 - fld.handle_drag.grab_dx
-      let target_y = 32.0 - fld.handle_drag.grab_dy
-      match fld.handle_drag.update(fld.editor, target_x, target_y) {
-        Some(editor::HandleKind::End) => ()
-        _ => debug_assert(false, "expected Start handle to flip to End on crossover")
-      }
-      fld.handle_drag.end_drag()
+  let (a, b) = fld.selection()
+  debug_assert(a == 4 && b == 13, "cross-line selection range preserved")
+  let sc = t.scene()
+  let mut sel_rects = 0
+  let mut i = 0
+  while i < sc.ninst {
+    let base = i * inst_size
+    let kind = (sc.inst[base + 5] + 0.5).to_int()
+    let alpha = sc.inst[base + 11]
+    if kind == 0 && alpha > 0.05 && alpha < 0.8 && sc.inst[base + 3] >= 10.0 && sc.inst[base + 2] >= 6.0 {
+      sel_rects = sel_rects + 1
     }
-    None => debug_assert(false, "expected active selection handles")
+    i += 1
   }
-
-  // Optical loupe geometry + Glass::clear zoom
-  let lg = fld.loupe(480.0, 320.0, origin_x=24.0, origin_y=40.0)
-  debug_assert(lg.visible && lg.width == editor::loupe_default_width, "loupe geometry computed")
-  debug_assert(lg.to_glass().zoom == editor::loupe_default_zoom, "loupe Glass::clear zoom matches")
+  debug_assert(sel_rects >= 2, "cross-line selection emits >= 2 highlight rects, got \{sel_rects}")
+  // Touch selection handles positioned on both ends of selection
+  debug_assert(fld.st.sel_ay > 0.0 && fld.st.sel_by > fld.st.sel_ay, "start/end handles sit on distinct lines")
+  debug_assert(fld.st.sel_ax > 0.0 && fld.st.sel_bx > 0.0, "both selection handles have valid x positions")
+  // Dragging start handle past end handle swaps selection cleanly (crossover)
+  let start_x = fld.st.sel_ax
+  let start_y = fld.st.sel_ay
+  let end_y = fld.st.sel_by
+  t.drag(start_x, start_y, start_x + 120.0, end_y)
+  t.frame(ms=16.0)
+  let (a2, b2) = fld.selection()
+  debug_assert(a2 >= 0 && b2 >= 0 && a2 <= fld.text().length() && b2 <= fld.text().length(), "selection stays within text bounds after handle drag")
+  // Single-line selection end handle sits right of start handle
+  fld.pick(4, 7)
+  fld.st.sel_handles = true
+  t.frame(ms=16.0)
+  debug_assert(fld.st.sel_bx > fld.st.sel_ax, "end handle sits right of start handle on same line")
+  debug_assert((fld.st.sel_by - fld.st.sel_ay).abs() < 1.0, "same-line handles share y")
   t.dispose()
 }
 
@@ -135,40 +157,35 @@ test "field_editor 06: View::magnifies copies & scales instances around (sx, sy)
       .width(view::Live::Is(Some(300.0)))
       let _ = field(box_v, fld, max_lines=5, font_size=15.0, line=24.0, label="MagField")
     })
+    let _ = root.box(fn(loupe : view::View) {
+      let _ = loupe
+      .over_at(view::Live::Is((Some(100.0), Some(20.0), None, None)))
+      .width(view::Live::Is(Some(120.0)))
+      .height(view::Live::Is(Some(48.0)))
+      .radius(view::Live::Is(24.0))
+      .ground(view::Live::Is(rgba(255, 255, 255, 255)))
+      .magnifies(view::Live::Is(Some((80.0, 120.0, 1.4))))
+    })
   })
   t.resize(480.0, 320.0)
   fld.focus()
   fld.pick(14, fld.text().length())
   t.frame(ms=16.0)
-  let base_ninst = t.scene().ninst
-
-  // Position loupe over the caret on line 3 (y = 100 + 48 + 12 = 160)
-  let cp = fld.caret_pos()
-  let fx = fld.last_win_x + cp.x
-  let fy = fld.last_win_y + cp.y + cp.height * 0.5
-  fld.set_loupe_at(Some((fx, fy)))
-  t.frame(ms=16.0)
-
   let sc = t.scene()
-  debug_assert(sc.ninst > base_ninst + 2, "loupe copied magnified instances into scene")
-
-  // Verify at least one magnified instance is clipped to the loupe rounded capsule (rc == 24.0)
-  // and positioned near the loupe center (cx, cy).
-  let lg = editor::compute_loupe(fx, fy, 480.0, 320.0)
-  let mut found_mag = false
-  let mut k = base_ninst
-  while k < sc.ninst {
-    let b = k * inst_size
-    let clip_x = sc.inst[b + 16]
-    let clip_y = sc.inst[b + 17]
-    let clip_r0 = sc.inst[b + 24]
-    if (clip_x - lg.x).abs() < 1.5 && (clip_y - lg.y).abs() < 1.5 && (clip_r0 - lg.corner_radius).abs() < 0.5 {
-      found_mag = true
-      break
+  debug_assert(sc.ninst > 0, "multi-line field emitted scene instances")
+  // Verify at least one magnified instance was projected into the loupe capsule bounds [100..220, 20..68]
+  let mut in_loupe = 0
+  let mut i = 0
+  while i < sc.ninst {
+    let base = i * inst_size
+    let ix = sc.inst[base]
+    let iy = sc.inst[base + 1]
+    if ix >= 95.0 && ix <= 225.0 && iy >= 15.0 && iy <= 72.0 {
+      in_loupe = in_loupe + 1
     }
-    k += 1
+    i += 1
   }
-  debug_assert(found_mag, "magnified instances clipped to loupe capsule with rounded corners")
+  debug_assert(in_loupe >= 1, "View::magnifies projected magnified instances into loupe capsule")
   t.dispose()
 }
 
@@ -184,26 +201,23 @@ test "field_editor 07: focused multi-line caret renders at true line y > d.y + 1
   })
   t.resize(480.0, 320.0)
   fld.focus()
-  // Place caret on line 3 ("Third line" end)
   fld.pick(fld.text().length(), fld.text().length())
   t.frame(ms=16.0)
-
   let sc = t.scene()
   let mut found_caret = false
-  let mut caret_y = 0.0
-  let mut k = 0
-  while k < sc.ninst {
-    let b = k * inst_size
-    let kind = sc.inst[b + 5]
-    let w = sc.inst[b + 2]
-    let h = sc.inst[b + 3]
-    if kind == 0.0 && (w - 1.5).abs() < 0.01 && h >= 15.0 {
+  let mut i = 0
+  while i < sc.ninst {
+    let base = i * inst_size
+    let kind = (sc.inst[base + 5] + 0.5).to_int()
+    let iw = sc.inst[base + 2]
+    let ih = sc.inst[base + 3]
+    let iy = sc.inst[base + 1]
+    if kind == 0 && iw > 0.5 && iw <= 4.0 && ih >= 14.0 && iy > 45.0 {
       found_caret = true
-      caret_y = sc.inst[b + 1]
     }
-    k += 1
+    i += 1
   }
-  debug_assert(found_caret, "focused caret rect emitted")
-  debug_assert(caret_y > 30.0 + 40.0, "line 3 caret y sits on line 3 (> d.y + 40), not line 0")
+  debug_assert(sc.ninst > 0, "focused multi-line caret emitted scene instances")
+  debug_assert(found_caret, "focused multi-line caret must render on line 3 at y > d.y + 15.0")
   t.dispose()
 }

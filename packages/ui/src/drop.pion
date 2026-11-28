@@ -1,691 +1,681 @@
-// Pure-node drag-and-drop receivers for text, filesystem paths, and picked files,
-// plus deterministic Tester driving helpers.
-
 import "hostapi"
-import "signals"
+import "mbt_compat"
 import "view"
 
-/// A filesystem path dropped onto a view node.
+// Files dragged in from outside the app (Finder, Explorer, a file manager) and let go on its window: the host says where
+// they are held as they move and, once let go, the pick their reading is (macOS's MBView, Windows' drop target in
+// win_files.h, Linux's GTK drop target in linux_app.c: their
+// `ui.drop` messages, {"type":"over","x","y"},
+// {"type":"left"}, {"type":"drop","x","y","pick"}; each with "wid", the window of the run it is over where it is one
+// beside the first: window_slots.pion). A box follows them as the host says them, outside any build
+// (Ctx::on_files): told where they are held over it, and taking them as they are let go on it, their files read as a
+// pick's are (Pick::files: a folder's by their way down, each folder itself named with a "/" at its end). Under a
+// Tester: Tester::hold_files, Tester::drop_files.
+//
+// Words dragged in from outside (another app's text, a browser page's) are said only as they are let go, with what they
+// say ({"type":"words","x","y","text"}: macOS's MBView, Linux's): on a field (what a press there reaches) they go into it where
+// they were let go, as a paste's words do, the field taking the focus; let go beside one on a box that is its field's
+// (a composer's capsule), the view puts them in that field (Ctx::words_into); elsewhere nothing takes them. Under a
+// Tester: Tester::drop_words.
+//
+// Files from the Finder or a file manager (a host that knows where they are says so, macOS's and Linux's:
+// {"type":"drop",…,"paths":[{"path","dir","size"}]})
+// may be taken as where they are instead of read: by a box that takes them so (Ctx::paths_into: a chat's composer,
+// naming them by the station they are on); let go on a field no such box holds, as their paths, a line each, as a
+// Mac's text fields take files from the Finder (on a box that takes words for its field, Ctx::words_into, into that
+// field). Either way they are not read. A drop of files is read only as a box takes it (Ctx::on_files); one that
+// nothing takes as it comes is let go, unread: at once, or, let go with its paths, as the frame that could take them so
+// ends (drops_frame_end).
+
+///|
+/// Whether files can be dragged in from outside and let go on the window here: the hosts that say so (macOS's,
+/// Windows' and Linux's: `ui.drop`), what a setting of how they are taken is shown for.
+pub fn takes_drops() -> Bool {
+  let p = platform()
+  p == 0 || p == 3 || p == 5
+}
+
+///|
+/// A file or folder let go on the window from outside, where its host says where it is (the Finder's): its path,
+/// whether it is a folder, how many bytes it has (a folder: 0).
+
+#derive(Eq)
 pub struct DroppedPath {
   pub path : String
-  pub name : String
-  pub is_dir : Bool
+  pub dir : Bool
+  pub size : Double
 }
 
-/// Reactive hover/active state for a drop target node.
-pub struct DropZoneState {
-  pub active : signals::Signal[Bool]
-  pub hovered : signals::Signal[Bool]
+///|
+/// Files from outside let go where they are said by their paths (DroppedPath), the frame they came in: what holds where
+/// they were let go (the hit target and what holds it), the target itself (a field, if one), where, the paths, the
+/// frame's number, the pick their reading would be.
+struct PathsLetGo {
+  within : Array[Int]
+  target : Int
+  x : Double
+  y : Double
+  paths : Array[DroppedPath]
+  frame : Int
+  pick : Int
 }
 
-struct DropWordsTarget {
-  id : view::NodeId
-  field : Field
-  state : DropZoneState
+///|
+/// Words from outside let go on no field, the frame they came in (the hit target and what holds it, what they say, the
+/// frame's number); files let go with their paths that no box took as files: that frame's build may take them
+/// (Ctx::words_into, Ctx::paths_into), none after it.
+struct Dropping {
+  mut words : Option[(Array[Int], String, Int)]
+  mut paths : Option[PathsLetGo]
 }
 
-struct DropPathsTarget {
-  id : view::NodeId
-  on_paths : (Array[DroppedPath]) -> Unit
-  state : DropZoneState
+///|
+// moved to 00_init_order.pion: dropping
+
+///|
+fn drop_reset() -> Unit {
+  tree_drops.clear()
+  files_on.clear()
+  files_on_held.v = 0
+  files_on_tree_held.v = None
+  dropping.words = None
+  dropping.paths = None
 }
 
-struct DropFilesTarget {
-  wid : Int
-  id : view::NodeId
-  gen : Int
-  on_files : (Array[hostapi::Picked]) -> Unit
-  state : DropZoneState
-}
-
-struct DropRegistry {
-  words : Array[DropWordsTarget]
-  paths : Array[DropPathsTarget]
-  files : Array[DropFilesTarget]
-}
-
-fn DropRegistry::new() -> DropRegistry {
-  DropRegistry::{ words: [], paths: [], files: [] }
-}
-
-let drop_registry_ref : signals::Ref[DropRegistry] = ref_new(DropRegistry::new())
-let drop_registry_kept_registered : signals::Ref[Bool] = ref_new(false)
-let host_drop_channel : String = "mb" + "ui.drop"
-
-fn ensure_drop_registry_kept() -> Unit {
-  if !drop_registry_kept_registered.v {
-    drop_registry_kept_registered.v = true
-    window_kept_ref(drop_registry_ref, fn() { DropRegistry::new() })
-    on_message_said(host_drop_channel, fn(json : String, _b : Option[Bytes]) -> Bool {
-      handle_host_drop_message(json)
-      true
-    })
+///|
+/// What was shown at (`x`, `y`), and what holds it: not a page merely underneath a dialog or popover. Boxes only
+/// pointed at too (a chat's page): they can take what is let go there without taking a press from their contents.
+fn drop_within(c : Ctx, x : Double, y : Double) -> Array[Int] {
+  let k = hit_at(c.hit_ids, c.hit_rects, c.hit_clips, x, y)
+  let within : Array[Int] = []
+  c.holders(k, within)
+  if k >= 0 {
+    within.push(c.hit_ids[k])
   }
+  within
 }
 
-struct PendingDropPick {
-  wid : Int
-  tree_id : Int
-  node_id : view::NodeId
-  gen : Int
-  pick : hostapi::Pick
+///|
+/// What of the window's tree did with what was let go from outside at a point (tree_words_at, tree_paths_at).
+enum TreeDropped {
+  Took
+  Shut
+  Not
 }
 
-let pending_drop_picks : Map[Int, PendingDropPick] = Map::new()
-
-fn drops_reset() -> Unit {
-  ensure_drop_registry_kept()
-  drop_registry_ref.v = DropRegistry::new()
-  let ids = pending_drop_picks.keys()
-  for pid in ids {
-    match pending_drop_picks.get(pid) {
-      Some(p) => hostapi::forget_dropped(p.pick.id())
-      None => ()
+///|
+/// Words from outside let go at (`x`, `y`) on the window's tree: on a field of it, in where they were let go; beside one
+/// on a node of it, or what holds that, that takes them for it (words_into), there at once at that field's caret.
+fn tree_words_at(c : Ctx, x : Double, y : Double, words : String) -> TreeDropped {
+  match tree_drop_at(x, y) {
+    Some((Some(st), _)) => {
+      place_caret_at(st, x, y, h_now())
+      tree_words_into(c, st, words)
+      .Took
     }
-  }
-  pending_drop_picks.clear()
-}
-
-/// Whether the current host supports receiving external drops (desktop & web).
-pub fn takes_drops() -> Bool {
-  let p = hostapi::platform()
-  p == 0 || p == 3 || p == 4 || p == 5
-}
-
-fn new_drop_zone_state() -> DropZoneState {
-  DropZoneState::{ active: signals::signal(false), hovered: signals::signal(false) }
-}
-
-fn drop_point_hits(id : view::NodeId, x : Double, y : Double) -> Bool {
-  if x == 0.0 && y == 0.0 {
-    return true
-  }
-  match view_tree() {
-    Some(tr) => match tr.drawn_of(id) {
-      Some(d) => x >= d.x && x <= d.x + d.w && y >= d.y && y <= d.y + d.h
-      None => false
+    Some((None, Some(at))) =>
+    match tree_drops_on(at, fn(d) { d.words is Some(_) }) {
+      Option::Some(__mbt_sp_16) if (match __mbt_sp_16.words { Some(f) => true, _ => false }) => match __mbt_sp_16.words { Some(f) => {
+        tree_words_into(c, f.st, words)
+        .Took
+      }, _ => panic("unreachable") }
+      _ => TreeDropped::Not
     }
-    None => true
+    Some((_, None)) => TreeDropped::Shut
+    Option::None => TreeDropped::Not
   }
 }
 
-/// Bind `v` as a text-drop receiver that inserts dropped text into `fld`.
-pub fn words_into(v : view::View, fld : Field) -> view::View {
-  ensure_drop_registry_kept()
-  let id = v.id()
-  let st = new_drop_zone_state()
-  drop_registry_ref.v.words.push(DropWordsTarget::{ id, field: fld, state: st })
-  let _ = v.owns(fn() {
-    let reg = drop_registry_ref.v
-    let keep : Array[DropWordsTarget] = []
-    for item in reg.words {
-      if item.id != id {
-        keep.push(item)
-      }
+///|
+/// Files of drop `pick` let go at (`x`, `y`) on the window's tree, with their paths where the host says them (the
+/// Finder's; Windows' says none): taken at once, not read, by the innermost of the node there and what holds it that
+/// takes them by their paths (paths_into: on its field, or beside any); else read, by the innermost that takes them as
+/// files for its field (files_into: on it, or beside any), as the reading comes; else, beside any field, by one that
+/// takes them as files there (files_onto); else, with their paths, on a field their paths in where they were let go,
+/// beside any on one that takes words for its field (words_into) their paths there at its caret. Taken by their paths
+/// or as words, or shut, the drop let go unread; read, it is the reading's.
+fn tree_paths_at(c : Ctx, x : Double, y : Double, paths : Array[DroppedPath], pick : Int) -> TreeDropped {
+  match tree_drop_at(x, y) {
+    Some((_, None)) => {
+      forget_drop(pick)
+      TreeDropped::Shut
     }
-    reg.words.clear()
-    for item in keep {
-      reg.words.push(item)
-    }
-  })
-  v
-}
-
-/// Bind `v` as a filesystem-path drop receiver invoking `on_paths`.
-pub fn paths_into(v : view::View, on_paths : (Array[DroppedPath]) -> Unit) -> view::View {
-  ensure_drop_registry_kept()
-  let id = v.id()
-  let st = new_drop_zone_state()
-  drop_registry_ref.v.paths.push(DropPathsTarget::{ id, on_paths, state: st })
-  let _ = v.owns(fn() {
-    let reg = drop_registry_ref.v
-    let keep : Array[DropPathsTarget] = []
-    for item in reg.paths {
-      if item.id != id {
-        keep.push(item)
-      }
-    }
-    reg.paths.clear()
-    for item in keep {
-      reg.paths.push(item)
-    }
-  })
-  v
-}
-
-/// Bind `v` as a picked-file drop receiver invoking `on_files`.
-pub fn files_into(v : view::View, on_files : (Array[hostapi::Picked]) -> Unit) -> view::View {
-  ensure_drop_registry_kept()
-  let wid = current_window_id()
-  let id = v.id()
-  let gen = id.gen
-  let st = new_drop_zone_state()
-  drop_registry_ref.v.files.push(DropFilesTarget::{ wid, id, gen, on_files, state: st })
-  let _ = v.owns(fn() {
-    let reg = drop_registry_ref.v
-    let keep : Array[DropFilesTarget] = []
-    for item in reg.files {
-      if !(item.id == id && item.gen == gen) {
-        keep.push(item)
-      }
-    }
-    reg.files.clear()
-    for item in keep {
-      reg.files.push(item)
-    }
-  })
-  v
-}
-
-/// Inspect the reactive `DropZoneState` attached to `v`, if any.
-pub fn drop_zone_state(v : view::View) -> Option[DropZoneState] {
-  ensure_drop_registry_kept()
-  let reg = drop_registry_ref.v
-  let id = v.id()
-  for t in reg.files {
-    if t.id == id {
-      return Some(t.state)
-    }
-  }
-  for t in reg.paths {
-    if t.id == id {
-      return Some(t.state)
-    }
-  }
-  for t in reg.words {
-    if t.id == id {
-      return Some(t.state)
-    }
-  }
-  None
-}
-
-fn drop_target_alive(id : view::NodeId) -> Bool {
-  match view_tree() {
-    Some(tr) => tr.lives(id)
-    None => true
-  }
-}
-
-fn find_drop_files_target_here(id : view::NodeId, gen : Int) -> Option[DropFilesTarget] {
-  let reg = drop_registry_ref.v
-  let mut i = reg.files.length() - 1
-  while i >= 0 {
-    let t = reg.files[i]
-    if t.id == id && t.gen == gen && drop_target_alive(t.id) {
-      return Some(t)
-    }
-    i -= 1
-  }
-  None
-}
-
-fn match_drop_files_target_here(x : Double, y : Double) -> Option[DropFilesTarget] {
-  let reg = drop_registry_ref.v
-  let mut i = reg.files.length() - 1
-  while i >= 0 {
-    let t = reg.files[i]
-    if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
-      return Some(t)
-    }
-    i -= 1
-  }
-  None
-}
-
-fn deliver_files_to_target(t : DropFilesTarget, files : Array[hostapi::Picked]) -> Unit {
-  t.state.active.set(true)
-  t.state.hovered.set(true)
-  (t.on_files)(files)
-  t.state.hovered.set(false)
-  t.state.active.set(false)
-}
-
-/// Route a dropped `hostapi::Pick` to the topmost matching `files_into` receiver in window `wid`
-/// keyed by `(wid, NodeId, gen)`.
-/// - On miss (no receiver or closed window): invokes `hostapi::forget_dropped(pick.id())` exactly once.
-/// - On immediate hit: consumes via `pick.files()` (which invokes `pk_end` internally; never double-forgets).
-/// - On async pending hit (`pick.files()` is `None`): stores `(wid, NodeId, gen)` until `drop_pick_ready(pick.id())`.
-pub fn drop_pick_at(
-  pick : hostapi::Pick,
-  x~ : Double = 0.0,
-  y~ : Double = 0.0,
-  wid~ : Int = current_window_id(),
-) -> Bool {
-  ensure_drop_registry_kept()
-  if wid > 0 && window_tree_of(wid).is_none() {
-    hostapi::forget_dropped(pick.id())
-    return false
-  }
-  let delivered = ref_new(false)
-  let run_in = fn() -> Unit {
-    match match_drop_files_target_here(x, y) {
-      None => {
-        hostapi::forget_dropped(pick.id())
-        delivered.v = false
-      }
-      Some(t) =>
-      match pick.files() {
-        Some(files) => {
-          deliver_files_to_target(t, files)
-          delivered.v = true
-        }
-        None => {
-          let tid = match view_tree() {
-            Some(tr) => tr.phys_id()
-            None => -1
-          }
-          pending_drop_picks[pick.id()] = PendingDropPick::{
-            wid,
-            tree_id: tid,
-            node_id: t.id,
-            gen: t.gen,
-            pick,
-          }
-          delivered.v = true
-        }
-      }
-    }
-  }
-  if wid == current_window_id() {
-    run_in()
-  } else {
-    in_window(wid, run_in)
-  }
-  delivered.v
-}
-
-/// Complete a pending asynchronous dropped `Pick` (`set_outside` kind 3) routed by `(wid, tree_id, NodeId, gen)`.
-/// - If the target receiver is still mounted in `wid` with matching `(tree_id, NodeId, gen)`: consumes via `pick.files()`
-///   (which executes `pk_end` once internally; never double-forgets) and delivers to `on_files`.
-/// - If the target was unmounted, its window closed/reopened, or its slot was reused with a new `gen`:
-///   invokes `hostapi::forget_dropped(pick.id())` exactly once and discards delivery.
-pub fn drop_pick_ready(pick_id : Int) -> Bool {
-  let pend = match pending_drop_picks.get(pick_id) {
-    Some(p) => p
-    None => return false
-  }
-  if pend.wid > 0 && window_tree_of(pend.wid).is_none() {
-    pending_drop_picks.remove(pick_id)
-    hostapi::forget_dropped(pend.pick.id())
-    return false
-  }
-  let result = ref_new(false)
-  let run_in = fn() -> Unit {
-    let same_tree = match view_tree() {
-      Some(tr) => tr.phys_id() == pend.tree_id
-      None => false
-    }
-    if !same_tree {
-      pending_drop_picks.remove(pick_id)
-      hostapi::forget_dropped(pend.pick.id())
-      result.v = false
-      return
-    }
-    match find_drop_files_target_here(pend.node_id, pend.gen) {
-      None => {
-        pending_drop_picks.remove(pick_id)
-        hostapi::forget_dropped(pend.pick.id())
-        result.v = false
-      }
-      Some(t) =>
-      match pend.pick.files() {
-        Some(files) => {
-          pending_drop_picks.remove(pick_id)
-          deliver_files_to_target(t, files)
-          result.v = true
-        }
-        None => result.v = false
-      }
-    }
-  }
-  if pend.wid == current_window_id() {
-    run_in()
-  } else {
-    in_window(pend.wid, run_in)
-  }
-  result.v
-}
-
-/// Wrap a raw host drop `pick_id` via `hostapi::dropped_pick` and route it through `drop_pick_at`.
-pub fn drop_host_pick(
-  pick_id : Int,
-  x~ : Double = 0.0,
-  y~ : Double = 0.0,
-  wid~ : Int = current_window_id(),
-) -> Bool {
-  drop_pick_at(hostapi::dropped_pick(pick_id), x=x, y=y, wid=wid)
-}
-
-fn drop_set_hover_here(at : Option[(Double, Double)]) -> Unit {
-  let reg = drop_registry_ref.v
-  for t in reg.files {
-    match at {
-      Some((x, y)) => {
-        t.state.active.set(true)
-        t.state.hovered.set(drop_target_alive(t.id) && drop_point_hits(t.id, x, y))
-      }
-      None => {
-        t.state.hovered.set(false)
-        t.state.active.set(false)
-      }
-    }
-  }
-  for t in reg.paths {
-    match at {
-      Some((x, y)) => {
-        t.state.active.set(true)
-        t.state.hovered.set(drop_target_alive(t.id) && drop_point_hits(t.id, x, y))
-      }
-      None => {
-        t.state.hovered.set(false)
-        t.state.active.set(false)
-      }
-    }
-  }
-  for t in reg.words {
-    match at {
-      Some((x, y)) => {
-        t.state.active.set(true)
-        t.state.hovered.set(drop_target_alive(t.id) && drop_point_hits(t.id, x, y))
-      }
-      None => {
-        t.state.hovered.set(false)
-        t.state.active.set(false)
-      }
-    }
-  }
-}
-
-fn drop_json_num(m : Map[String, hostapi::JsonValue], key : String, def : Double) -> Double {
-  match m.get(key) {
-    Some(hostapi::JsonValue::JNumber(v)) => v
-    _ => def
-  }
-}
-
-fn drop_json_str(m : Map[String, hostapi::JsonValue], key : String) -> String {
-  match m.get(key) {
-    Some(hostapi::JsonValue::JString(s)) => s
-    _ => ""
-  }
-}
-
-fn drop_path_basename(p : String) -> String {
-  let n = p.length()
-  let mut end = n
-  while end > 0 && (p.code_unit_at(end - 1) == 47 || p.code_unit_at(end - 1) == 92) {
-    end -= 1
-  }
-  let mut start = end
-  while start > 0 && p.code_unit_at(start - 1) != 47 && p.code_unit_at(start - 1) != 92 {
-    start -= 1
-  }
-  let sb = StringBuilder::new()
-  let mut i = start
-  while i < end {
-    sb.write_byte(p.code_unit_at(i) as Byte)
-    i += 1
-  }
-  sb.to_string()
-}
-
-fn drop_parse_paths(m : Map[String, hostapi::JsonValue]) -> Array[DroppedPath] {
-  let out : Array[DroppedPath] = []
-  match m.get("paths") {
-    Some(hostapi::JsonValue::JArray(arr)) => {
-      for item in arr {
-        match item {
-          hostapi::JsonValue::JObject(pm) => {
-            let path = drop_json_str(pm, "path")
-            if path.length() > 0 {
-              let is_dir = match pm.get("dir") {
-                Some(hostapi::JsonValue::JBool(b)) => b
-                _ => false
-              }
-              out.push(DroppedPath::{ path, name: drop_path_basename(path), is_dir })
-            }
-          }
-          hostapi::JsonValue::JString(path) => {
-            if path.length() > 0 {
-              out.push(DroppedPath::{ path, name: drop_path_basename(path), is_dir: false })
-            }
-          }
+    Some((on, Some(at))) => {
+      let on_field = fn(f : Field) { match on { Some(st) => physical_equal(st, f.st); None => true } }
+      if !paths.is_empty() {
+        match tree_drops_on(at, fn(d) { d.paths is Some((f, _, takes)) && on_field(f) && takes() }) {
+          Option::Some(__mbt_sp_17) if (match __mbt_sp_17.paths { Some((_, take, _)) => true, _ => false }) => match __mbt_sp_17.paths { Some((_, take, _)) => {
+            take(paths)
+            forget_drop(pick)
+            return .Took
+          }, _ => panic("unreachable") }
           _ => ()
         }
       }
+      let picked_drop = match tree_drops_on(at, fn(d) { d.picked is Some((f, _, takes)) && on_field(f) && takes() }) {
+        Option::Some(d) => Option::Some(d)
+        Option::None =>
+        if paths.is_empty() {
+          tree_drops_on(at, fn(d) { d.picked is Some((_, _, takes)) && takes() })
+        } else {
+          Option::None
+        }
+      }
+      match picked_drop {
+        Option::Some(__mbt_sp_18) if (match __mbt_sp_18.picked { Some((_, take, _)) => true, _ => false }) => match __mbt_sp_18.picked { Some((_, take, _)) => {
+          let wid_at = current_window_id()
+          let expected_tree = view_app.v
+          let safe_take = fn(fs : Array[hostapi::Picked]) -> Unit {
+            let alive = match (expected_tree, if wid_at == 0 { view_app.v } else { window_tree_of(wid_at) }) {
+              (Some(et), Some(ct)) => physical_equal(et, ct) && ct.holds(at, at)
+              _ => false
+            }
+            if alive {
+              if wid_at == current_window_id() {
+                take(fs)
+              } else {
+                as_window(wid_at, fn() { take(fs) })
+              }
+            }
+          }
+          Pick::waits([hostapi::dropped_pick(pick)], "files dropped", on_got=safe_take) |> ignore
+          return .Took
+        }, _ => panic("unreachable") }
+        _ => ()
+      }
+      if on is None {
+        match tree_drops_on(at, fn(d) { d.files is Some(_) }) {
+          Option::Some(__mbt_sp_19) if (match __mbt_sp_19.files { Some(f) => true, _ => false }) => match __mbt_sp_19.files { Some(f) => match (f.take)(x, y) {
+            Some(take) => {
+              take(Pick::waits([hostapi::dropped_pick(pick)], "files dropped"))
+              return .Took
+            }
+            None => ()
+          }, _ => panic("unreachable") }
+          _ => ()
+        }
+      }
+      guard !paths.is_empty() else { return TreeDropped::Not }
+      match on {
+        Some(st) => {
+          place_caret_at(st, x, y, h_now())
+          tree_words_into(c, st, paths_words(paths))
+          forget_drop(pick)
+          .Took
+        }
+        None =>
+        match tree_drops_on(at, fn(d) { d.words is Some(_) }) {
+          Option::Some(__mbt_sp_20) if (match __mbt_sp_20.words { Some(f) => true, _ => false }) => match __mbt_sp_20.words { Some(f) => {
+            tree_words_into(c, f.st, paths_words(paths))
+            forget_drop(pick)
+            .Took
+          }, _ => panic("unreachable") }
+          _ => TreeDropped::Not
+        }
+      }
     }
-    _ => ()
+    Option::None => TreeDropped::Not
+  }
+}
+
+///|
+/// Words from outside let go at (`x`, `y`): the window's tree's first (tree_words_at); where none of it took them, on an
+/// old view's field (what a press there reaches), put in where they were let go as a paste's are (a step of their own
+/// to undo; as many as its paste_limit or more handed to the app as a paste's are, EditorResult::pasted), the field
+/// taking the focus; elsewhere left for this frame's build (Ctx::words_into).
+fn words_let_go(x : Double, y : Double, words : String) -> Unit {
+  // (the window's tree as of when they are let go: what is there then, view_host.pion)
+  old_input_brought()
+  let c = g()
+  dropping.words = None
+  if tree_words_at(c, x, y, words) is TreeDropped::Not {
+    let target = hit_in(c.hit_ids, c.hit_rects, x, y)
+    match c.editors.get(target) {
+      Some(st) => {
+        c.focus_visible = false
+        c.focus_moved(target)
+        place_caret_at(st, x, y, h_now())
+        st.text_input(text_paste, words, 0, 0, h_now())
+      }
+      Option::None => dropping.words = Some((drop_within(c, x, y), words, c.frame_no))
+    }
+  }
+  // (taken as the frame begins: what reads what the hand did is built again in it, the field's words, a box that takes
+  // them for its field)
+  hand_event()
+}
+
+///|
+/// Files of drop `pick` let go at (`x`, `y`) with their paths, none of the window's tree taking them and no old view's
+/// box taking them as files (Ctx::on_files): left for this frame's build, a box that takes them by their paths
+/// (Ctx::paths_into) or as words for its field (Ctx::words_into); taken by none, the field they were let go on puts
+/// their paths in as it ends (drops_frame_end).
+fn paths_let_go(x : Double, y : Double, paths : Array[DroppedPath], pick : Int) -> Unit {
+  let c = g()
+  let target = hit_in(c.hit_ids, c.hit_rects, x, y)
+  dropping.paths = Some(PathsLetGo::{ within: drop_within(c, x, y), target: target, x: x, y: y, paths: paths, frame: c.frame_no, pick: pick })
+  hand_event()
+}
+
+///|
+/// What a node of the window's tree takes of what is let go on it from outside beside any field in it: words for field
+/// `words` (words_into), files with their paths for `paths`' field and its taker (paths_into), files read for
+/// `picked`'s field and its taker (files_into).
+struct TreeDrops {
+  mut words : Option[Field]
+  mut paths : Option[(Field, (Array[DroppedPath]) -> Unit, () -> Bool)]
+  mut picked : Option[(Field, (Array[hostapi::Picked]) -> Unit, () -> Bool)]
+  mut files : Option[FilesOn]
+}
+
+///|
+/// What each node of the tree's takes of what is let go on it (TreeDrops), by its node.
+// kept across runs: each let go with its node; a run's start clears it (drop_reset)
+// moved to 00_init_order.pion: tree_drops
+
+///|
+/// What node `v` takes, made as it is first said, let go with it.
+fn tree_drops_of(v : view::View) -> TreeDrops {
+  let id = v.id()
+  match tree_drops.get(id) {
+    Some(d) => d
+    Option::None => {
+      let d : TreeDrops = TreeDrops::{ words: Option::None, paths: Option::None, picked: Option::None, files: Option::None }
+      tree_drops.set(id, d)
+      v.owns(fn() { tree_drops.remove(id) }) |> ignore
+      d
+    }
+  }
+}
+
+///|
+/// What of the window's tree something let go at (`x`, `y`) in the window lands on (@view.Tree::drop_at): the node drawn
+/// there, whether or not it takes a press (a page's words: what holds them asked after them, tree_drops_on), not one
+/// hosting an old view; the field's state where it is a field, and the node. Some with no node: the tree's, taking
+/// nothing there now (under a modal layer it is not in). None: not the tree's (an old view's, where nothing of
+/// the tree's is over it, or nothing's).
+fn tree_drop_at(x : Double, y : Double) -> Option[(Option[EditorState], Option[view::NodeId])] {
+  guard view_app.v is Some(tree) else { return Option::None }
+  match tree.drop_at(x, y) {
+    Some(.OnNode(id)) => Some((mbt_compat::opt_map(tree_fields.get(id), fn(tf) { tf.st }), Some(id)))
+    Some(view::DropOn::Shut(_)) => Some((Option::None, Option::None))
+    Some(.OnOld(_)) => Option::None
+    Option::None => {
+      // Fallback for transparent / non-drawing drop-target boxes registered via words_into / paths_into / files_into
+      let mut hit : Option[view::NodeId] = Option::None
+      for d in tree.drawn() {
+        if d.w > 0.0 && d.h > 0.0 && x >= d.x && y >= d.y && x < d.x + d.w && y < d.y + d.h {
+          if tree_drops.contains(d.id) {
+            hit = Some(d.id)
+          }
+        }
+      }
+      match hit {
+        Some(id) => Some((mbt_compat::opt_map(tree_fields.get(id), fn(tf) { tf.st }), Some(id)))
+        Option::None => Option::None
+      }
+    }
+  }
+}
+
+///|
+/// The innermost of node `at` of the window's tree and what holds it whose drops `takes` says take what is let go
+/// there; None: none of them.
+fn tree_drops_on(at : view::NodeId, takes : (TreeDrops) -> Bool) -> Option[TreeDrops] {
+  guard view_app.v is Some(tree) else { return Option::None }
+  let mut v = tree.view_of(at)
+  while v is Some(n) {
+    match tree_drops.get(n.id()) {
+      Some(d) if takes(d) => return Some(d)
+      _ => ()
+    }
+    v = n.parent()
+  }
+  Option::None
+}
+
+///|
+/// Words let go in the field of the window's tree `st` holds (beside it, on what takes them for it: at its caret; on it,
+/// where they were let go): put in there as a paste's, the field taking the focus (Ctx::words_into's).
+fn tree_words_into(c : Ctx, st : EditorState, words : String) -> Unit {
+  st.text_input(text_paste, words, 0, 0, h_now())
+  c.focus_visible = false
+  c.focus_field(Field::{ st, })
+  tree_field_redraw()
+}
+
+///|
+/// Words from outside let go on node `v` or what it holds beside any field (one let go on a field the field took, where
+/// it was let go): put in `field` at its caret, as a paste's, at the moment they are let go, the field taking the focus,
+/// as a press on `v` is its field's (a composer's capsule: its padding, its buttons); files let go there with their paths
+/// that nothing takes by their paths (paths_into), their paths so, a line each, not read. What holds a node of the tree's
+/// takes what it holds does not (the innermost first); an old view's box, Ctx::words_into. `v`.
+pub fn words_into(v : view::View, field : Field) -> view::View {
+  tree_drops_of(v).words = Some(field)
+  v
+}
+
+///|
+/// Files from outside let go with their paths (the Finder's) on node `v` or what it holds, on `field` or beside any field
+/// (one let go on another field is that field's): given to `take` at the moment they are let go, as where they are,
+/// not read (a chat's composer naming them by the station they are on). The innermost of what takes them first; an old
+/// view's box, Ctx::paths_into. Only while `takes` says so, asked as they are let go (a chat's page takes them by where
+/// they are only where this machine is a station): where it does not, they are what holds it's, or its words
+/// (words_into: their paths, a line each), as were this not said. `v`.
+pub fn paths_into(v : view::View, field : Field, take : (Array[DroppedPath]) -> Unit, takes? : () -> Bool) -> view::View {
+  let takes = match takes { Some(__mbt_v) => __mbt_v, None => fn() { true } }
+
+  tree_drops_of(v).paths = Some((field, take, takes))
+  v
+}
+
+///|
+/// Files from outside let go on node `v` or what it holds, on `field` or beside any field (one let go on another field
+/// is that field's, their paths in it where the host says them), that nothing takes by their paths (paths_into: where
+/// it does not take them so, or the host says none, as Windows' does): read, and given to `take` as their reading
+/// comes (a folder's by their way down, each folder itself named with a "/" at its end; none: called off). The
+/// innermost of what takes them first; an old view's box, Ctx::files_into. Only while `takes` says so, asked as they
+/// are let go. `v`.
+pub fn files_into(v : view::View, field : Field, take : (Array[hostapi::Picked]) -> Unit, takes? : () -> Bool) -> view::View {
+  let takes = match takes { Some(__mbt_v) => __mbt_v, None => fn() { true } }
+
+  tree_drops_of(v).picked = Some((field, take, takes))
+  v
+}
+
+///|
+/// Files from outside over node `v` or what it holds (the innermost of what says so first), as the host says them, in
+/// its message, outside any build (Ctx::on_files' for the window's tree): `held` told where they are held over it, in
+/// the window (None: gone from over it: taken away, let go, or over another), `take` asked as they are let go on it (not
+/// on a field with their paths: those are the field's) whether it takes them there: `Some(f)` takes them, `f` given the
+/// pick their reading is, begun now; None leaves them to what holds it, then to an old view's. `v`.
+pub fn files_onto(v : view::View, held~ : (Option[(Double, Double)]) -> Unit, take~ : (Double, Double) -> Option[(Pick) -> Unit]) -> view::View {
+  tree_drops_of(v).files = Some(FilesOn::{ held: held, take: take })
+  v
+}
+
+///|
+/// The node of the window's tree that takes files from outside (files_onto) they are held over now: told as they leave
+/// it.
+// kept across runs: as the host says where they are held; a run's start clears it (drop_reset)
+// moved to 00_init_order.pion: files_on_tree_held
+
+///|
+/// What of the window's tree takes files from outside at (x, y) (files_onto): the innermost of what is drawn there and
+/// what holds it that says so; None where none does, or the tree's there takes nothing now, or none of it is there.
+fn tree_files_at(x : Double, y : Double) -> (Option[FilesOn], Bool) {
+  match tree_drop_at(x, y) {
+    Some((_, Some(at))) =>
+    match tree_drops_on(at, fn(d) { d.files is Some(_) }) {
+      Option::Some(__mbt_sp_21) if (match __mbt_sp_21.files { Some(f) => true, _ => false }) => match __mbt_sp_21.files { Some(f) => (Some(f), true), _ => panic("unreachable") }
+      _ => (Option::None, true)
+    }
+    Some((_, None)) => (Option::None, true)
+    Option::None => (Option::None, false)
+  }
+}
+
+///|
+/// The paths let go this frame on box `id` (beside field `field`, or on it: one let go on another field is that field's),
+/// not taken yet.
+fn paths_on(c : Ctx, id : Int, field : Int) -> Option[PathsLetGo] {
+  match dropping.paths {
+    Some(d) if d.frame == c.frame_no && d.within.contains(id) && (d.target == field || !c.editors.contains(d.target)) => Some(d)
+    _ => Option::None
+  }
+}
+
+///|
+/// Paths as words: a line each.
+fn paths_words(paths : Array[DroppedPath]) -> String {
+  mbt_compat::arr_map(paths, fn(p) { p.path }).join("\n")
+}
+
+///|
+/// Words dragged in from outside and let go on box `id` this frame beside any field in it (one let go on a field the
+/// field took, where it was let go): put in the field of editor `key` (built in this scope) at its caret, as a paste's,
+/// the field taking the focus. For a box that is its field's, as a press on it is (a composer's capsule: its padding,
+/// its buttons). A layer over the box takes the drop itself; the box underneath never sees it. Each is taken once.
+/// Files let go there with their paths (one a box took by their paths not), their paths, a line each, where they were
+/// let go on the field, else at its caret; then they are not read.
+pub fn Ctx::words_into(self : Ctx, id : Int, key : String) -> Unit {
+  hand_events_read()
+  let field = self.id(key)
+  guard self.editors.get(field) is Some(st) else { return }
+  match dropping.words {
+    Some((within, words, frame)) if frame == self.frame_no && within.contains(id) => {
+      dropping.words = None
+      st.text_input(text_paste, words, 0, 0, self.clock)
+      self.focus_on(field)
+    }
+    _ =>
+    match paths_on(self, id, field) {
+      Some(d) if !d.paths.is_empty() => {
+        dropping.paths = None
+        forget_drop(d.pick)
+        if d.target == field {
+          place_caret_at(st, d.x, d.y, self.clock)
+        }
+        st.text_input(text_paste, paths_words(d.paths), 0, 0, self.clock)
+        self.focus_on(field)
+      }
+      _ => ()
+    }
+  }
+}
+
+///|
+/// Files from outside let go this frame on box `id` (on it beside field `key`, its own, or on that field: one let go on
+/// another field is that one's) with their paths, taken by their paths: then not read. A box that names them by where
+/// they are (a chat's composer), asked before it takes words (Ctx::words_into). Each is taken once.
+pub fn Ctx::paths_into(self : Ctx, id : Int, key : String) -> Option[Array[DroppedPath]] {
+  hand_events_read()
+  guard paths_on(self, id, self.id(key)) is Some(d) && !d.paths.is_empty() else { return Option::None }
+  dropping.paths = Option::None
+  forget_drop(d.pick)
+  Some(d.paths)
+}
+
+///|
+/// Files from outside let go this frame on box `id` (on it beside field `key`, its own, or on that field: one let go on
+/// another field is that one's), none taking them by their paths (Ctx::paths_into, asked first) or the host saying none
+/// (Windows'): read, and given to `take` as their reading comes (a folder's by their way down, each folder itself named
+/// with a "/" at its end; none: called off). Asked before the box takes words (Ctx::words_into). Each is taken once.
+pub fn Ctx::files_into(self : Ctx, id : Int, key : String, take : (Array[hostapi::Picked]) -> Unit) -> Unit {
+  hand_events_read()
+  guard paths_on(self, id, self.id(key)) is Some(d) && d.pick > 0 else { return }
+  dropping.paths = None
+  Pick::waits([hostapi::dropped_pick(d.pick)], "files dropped", on_got=take) |> ignore
+}
+
+///|
+/// As the frame ends (its builds over): files let go with their paths that no box took, put in as their paths on the
+/// field they were let go on, as a paste's words, the field taking the focus (shown by the frame after); either way
+/// let go, unread.
+fn drops_frame_end(c : Ctx) -> Unit {
+  if dropping.paths is Some(d) {
+    dropping.paths = None
+    forget_drop(d.pick)
+    match c.editors.get(d.target) {
+      Some(st) if d.frame == c.frame_no && !d.paths.is_empty() => {
+        c.focus_visible = false
+        c.focus_moved(d.target)
+        place_caret_at(st, d.x, d.y, c.clock)
+        st.text_input(text_paste, paths_words(d.paths), 0, 0, c.clock)
+        hand_event()
+        c.owe_next()
+      }
+      _ => ()
+    }
+  }
+}
+
+///|
+/// A drop of files no box took: its reading never begun, or let go.
+fn forget_drop(id : Int) -> Unit {
+  hostapi::forget_dropped(id)
+}
+
+///|
+// moved to 00_init_order.pion: __mbt_init_drop_mbt_1
+
+///|
+/// What takes files from outside over a box (Ctx::on_files): told where they are held over it, asked as they are let
+/// go on it.
+struct FilesOn {
+  held : (Option[(Double, Double)]) -> Unit
+  take : (Double, Double) -> Option[(Pick) -> Unit]
+}
+
+///|
+/// What takes files from outside over each box (Ctx::on_files), by its id: what its last build said.
+// kept across runs: said as each box is built, let go with its page (Ctx::forget); a run's start clears it (drop_reset)
+// moved to 00_init_order.pion: files_on
+
+///|
+/// The box that takes them that files from outside are held over now (Ctx::on_files; 0 none): told as they leave it.
+// kept across runs: as the host says where they are held; a run's start clears it (drop_reset)
+// moved to 00_init_order.pion: files_on_held
+
+///|
+/// Files from outside over box `id` (on it or on what it holds; the innermost of those that say so), followed as the
+/// host says them, in its message, outside any build, as the last frame drew what is there: `held` told where they are
+/// held over it (None: gone from over it: taken away, let go, or over another), `take` asked as they are let go on it
+/// (not on a field, with their paths: those are the field's) whether it takes them there. `Some(f)` takes them: `f`
+/// given the pick their reading is, begun now, and no build sees the drop (Ctx::paths_into); None leaves
+/// them to what is further out, then to the frame's build as ever. Said as the box is built (what takes them is what
+/// the last build said).
+pub fn Ctx::on_files(self : Ctx, id : Int, held~ : (Option[(Double, Double)]) -> Unit, take~ : (Double, Double) -> Option[(Pick) -> Unit]) -> Unit {
+  if id == 0 {
+    return
+  }
+  files_on.set(id, FilesOn::{ held: held, take: take })
+  self.own(id)
+}
+
+///|
+/// What is drawn at (x, y) that takes files from outside (Ctx::on_files), the innermost first.
+fn files_on_at(x : Double, y : Double) -> Array[Int] {
+  let within = drop_within(g(), x, y)
+  let out = []
+  for i = within.length() - 1; i >= 0; i = i - 1 {
+    if files_on.contains(within[i]) {
+      out.push(within[i])
+    }
   }
   out
 }
 
-fn handle_host_drop_message(json : String) -> Unit {
-  ensure_drop_registry_kept()
-  let obj = match hostapi::json_parse(json) {
-    Some(hostapi::JsonValue::JObject(m)) => m
-    _ => return
+///|
+/// Files from outside held over the window at `at` (None: taken away or let go): told to the box that takes them they
+/// are over (Ctx::on_files), and to the one they left.
+fn files_held_at(at : Option[(Double, Double)]) -> Unit {
+  // (the window's tree's first: a node of it that takes them, where it is drawn over an old view's)
+  let (tree_on, tree_there) = match at {
+    Some((x, y)) => tree_files_at(x, y)
+    Option::None => (Option::None, false)
   }
-  let kind = drop_json_str(obj, "type")
-  let x = drop_json_num(obj, "x", 0.0)
-  let y = drop_json_num(obj, "y", 0.0)
-  let wid = drop_json_num(obj, "wid", current_window_id().to_double()).to_int()
-  let run_in_wid = fn(f : () -> Unit) -> Unit {
-    if wid == current_window_id() {
-      f()
-    } else if wid == 0 || window_tree_of(wid).is_some() {
-      in_window(wid, f)
+  match files_on_tree_held.v {
+    Some(was) if !(tree_on is Some(now) && physical_equal(now, was)) => (was.held)(None)
+    _ => ()
+  }
+  files_on_tree_held.v = tree_on
+  match (tree_on, at) {
+    (Some(f), Some(p)) => (f.held)(Some(p))
+    _ => ()
+  }
+  let id = match at {
+    Some((x, y)) if !tree_there => mbt_compat::arr_get(files_on_at(x, y), 0).unwrap_or(0)
+    _ => 0
+  }
+  let was = files_on_held.v
+  files_on_held.v = id
+  if was != 0 && was != id {
+    match files_on.get(was) {
+      Some(f) => (f.held)(None)
+      Option::None => ()
     }
   }
-  if kind == "over" {
-    run_in_wid(fn() { drop_set_hover_here(Some((x, y))) })
-    hostapi::request_frame()
-  } else if kind == "left" {
-    run_in_wid(fn() { drop_set_hover_here(None) })
-    hostapi::request_frame()
-  } else if kind == "words" {
-    run_in_wid(fn() { drop_set_hover_here(None) })
-    let txt = {
-      let s = drop_json_str(obj, "text")
-      if s.length() > 0 { s } else { drop_json_str(obj, "words") }
-    }
-    if txt.length() > 0 {
-      run_in_wid(fn() {
-        let reg = drop_registry_ref.v
-        let mut i = reg.words.length() - 1
-        while i >= 0 {
-          let t = reg.words[i]
-          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
-            t.field.insert(txt)
-            break
-          }
-          i -= 1
-        }
-      })
-      hostapi::request_frame()
-    }
-  } else if kind == "drop" {
-    run_in_wid(fn() { drop_set_hover_here(None) })
-    let pick_id = drop_json_num(obj, "pick", -1.0).to_int()
-    let paths = drop_parse_paths(obj)
-    if paths.length() > 0 {
-      let hit_paths = ref_new(false)
-      run_in_wid(fn() {
-        let reg = drop_registry_ref.v
-        let mut i = reg.paths.length() - 1
-        while i >= 0 {
-          let t = reg.paths[i]
-          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
-            (t.on_paths)(paths)
-            hit_paths.v = true
-            break
-          }
-          i -= 1
-        }
-      })
-      if hit_paths.v {
-        if pick_id >= 0 {
-          hostapi::forget_dropped(pick_id)
-        }
-        hostapi::request_frame()
-        return
-      }
-    }
-    if pick_id >= 0 {
-      let has_files_target = ref_new(false)
-      run_in_wid(fn() {
-        match match_drop_files_target_here(x, y) {
-          Some(_) => has_files_target.v = true
-          None => ()
-        }
-      })
-      if has_files_target.v {
-        let _ = drop_host_pick(pick_id, x=x, y=y, wid=wid)
-        hostapi::request_frame()
-        return
-      }
-    }
-    if paths.length() > 0 {
-      let sb = StringBuilder::new()
-      let mut pi = 0
-      while pi < paths.length() {
-        if pi > 0 {
-          sb.write_string("\n")
-        }
-        sb.write_string(paths[pi].path)
-        pi += 1
-      }
-      let joined = sb.to_string()
-      run_in_wid(fn() {
-        let reg = drop_registry_ref.v
-        let mut i = reg.words.length() - 1
-        while i >= 0 {
-          let t = reg.words[i]
-          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
-            t.field.insert(joined)
-            break
-          }
-          i -= 1
-        }
-      })
-      if pick_id >= 0 {
-        hostapi::forget_dropped(pick_id)
-      }
-      hostapi::request_frame()
-      return
-    }
-    if pick_id >= 0 {
-      hostapi::forget_dropped(pick_id)
-      hostapi::request_frame()
-      return
-    }
-    let txt = {
-      let s = drop_json_str(obj, "words")
-      if s.length() > 0 { s } else { drop_json_str(obj, "text") }
-    }
-    if txt.length() > 0 {
-      run_in_wid(fn() {
-        let reg = drop_registry_ref.v
-        let mut i = reg.words.length() - 1
-        while i >= 0 {
-          let t = reg.words[i]
-          if drop_target_alive(t.id) && drop_point_hits(t.id, x, y) {
-            t.field.insert(txt)
-            break
-          }
-          i -= 1
-        }
-      })
-      hostapi::request_frame()
-    }
+  match (files_on.get(id), at) {
+    (Some(f), Some(p)) => (f.held)(Some(p))
+    _ => ()
   }
 }
 
-/// Test driver helper: deliver `files` to the topmost matching `files_into` target at `(x, y)`.
-pub fn Tester::hold_files(
-  self : Tester,
-  files : Array[hostapi::Picked],
-  x~ : Double = 0.0,
-  y~ : Double = 0.0,
-) -> Bool {
-  ensure_drop_registry_kept()
-  match match_drop_files_target_here(x, y) {
-    Some(t) => {
-      deliver_files_to_target(t, files)
-      self.fake.frame_requested = true
-      self.frame()
-      true
+///|
+/// Files from outside let go at (x, y): what takes them there (Ctx::on_files), the innermost that does; None: none.
+fn files_take_at(x : Double, y : Double) -> Option[(Pick) -> Unit] {
+  for id in files_on_at(x, y) {
+    match files_on.get(id) {
+      Some(f) =>
+      match (f.take)(x, y) {
+        Some(take) => return Some(take)
+        Option::None => ()
+      }
+      Option::None => ()
     }
-    None => false
+  }
+  Option::None
+}
+
+///|
+/// Files from outside held over the window at (x, y), as a host says while they are dragged (None: taken away); over
+/// window `wid` of the run where it says one beside the first.
+pub fn Tester::hold_files(self : Tester, at : Option[(Double, Double)], wid? : Int) -> Unit {
+  let wid = match wid { Some(__mbt_v) => __mbt_v, None => 0 }
+
+  let on = if wid != 0 { ",\"wid\":\{wid}" } else { "" }
+  match at {
+    Some((x, y)) => self.post("mbui.drop", "{\"type\":\"over\",\"x\":\{mbt_compat::double_to_string(x)},\"y\":\{mbt_compat::double_to_string(y)}\{on}}")
+    Option::None => self.post("mbui.drop", "{\"type\":\"left\"\{on}}")
   }
 }
 
-/// Test driver helper: route a `hostapi::Pick` drop to `(x, y)` in window `wid` through `drop_pick_at`.
-pub fn Tester::drop_pick(
-  self : Tester,
-  pick : hostapi::Pick,
-  x~ : Double = 0.0,
-  y~ : Double = 0.0,
-  wid~ : Int = current_window_id(),
-) -> Bool {
-  let ok = drop_pick_at(pick, x=x, y=y, wid=wid)
-  if ok && wid == current_window_id() {
-    self.fake.frame_requested = true
-    self.frame()
+///|
+/// `files` (their names, a folder's by their way down and a folder itself with a "/" at its end, and bytes) let go on
+/// the window at (x, y), as a host says, with their `paths` where it says them (the Finder's: one for each of `files`,
+/// a folder as that file says, its size that file's bytes), on window `wid` of the run where it says one beside the
+/// first (the host says which; one closed by then lets them go); taken as the frame that takes the message begins
+/// (Ctx::on_files), what they hold told by the host's event after the message, at its moment (FakeHost::due), as a
+/// pick's is.
+pub fn Tester::drop_files(self : Tester, x : Double, y : Double, files : Array[(String, Bytes)], paths? : Array[String], wid? : Int) -> Unit {
+  let paths = match paths { Some(__mbt_v) => __mbt_v, None => [] }
+  let wid = match wid { Some(__mbt_v) => __mbt_v, None => 0 }
+
+  self.picks(files)
+  self.fake.pick_asks.push(FakePick::{ kind: .Files, said: false, taken: false })
+  let id = self.fake.pick_asks.length()
+  // (what they hold told after the message, at its moment; where the test answers the pickers itself, as it says:
+  // Tester::pick_answer, the host's reading of them taking a while)
+  let f = self.fake
+  if !f.picks_by_hand {
+    f.due(f.time, "files dropped", fn() { fake_pick_said(f, id) })
   }
-  ok
+  let m : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("type", mbt_compat::MbtJson::string("drop")), ("x", mbt_compat::MbtJson::number(x)), ("y", mbt_compat::MbtJson::number(y)), ("pick", mbt_compat::MbtJson::number(id.to_double()))])
+  if wid != 0 {
+    m.set("wid", mbt_compat::MbtJson::number(wid.to_double()))
+  }
+  if !paths.is_empty() {
+    m.set("paths", mbt_compat::MbtJson::array(
+      mbt_compat::arr_mapi(paths, fn(i, p) {
+        let (name, bytes) = if i < files.length() { files[i] } else { ("", "".to_bytes()) }
+        let o : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("path", mbt_compat::MbtJson::string(p)), ("dir", mbt_compat::MbtJson::boolean(mbt_compat::str_has_suffix(name, "/"))), ("size", mbt_compat::MbtJson::number(bytes.length().to_double()))])
+        mbt_compat::MbtJson::object(o)
+      }),
+    ))
+  }
+  self.post("mbui.drop", mbt_compat::MbtJson::object(m).stringify())
 }
 
-/// Test driver helper: drop `words` onto the topmost matching `words_into` target at `(x, y)`.
-pub fn Tester::drop_words(
-  self : Tester,
-  words : String,
-  x~ : Double = 0.0,
-  y~ : Double = 0.0,
-) -> Bool {
-  ensure_drop_registry_kept()
-  let reg = drop_registry_ref.v
-  let mut i = reg.words.length() - 1
-  while i >= 0 {
-    let t = reg.words[i]
-    if drop_point_hits(t.id, x, y) {
-      t.state.active.set(true)
-      t.state.hovered.set(true)
-      t.field.insert(words)
-      t.state.hovered.set(false)
-      t.state.active.set(false)
-      self.fake.frame_requested = true
-      self.frame()
-      return true
-    }
-    i -= 1
-  }
-  false
-}
+///|
+/// Words from outside (another app's text) let go on the window at (`x`, `y`), as a host says (on window `wid` of the
+/// run where it says one beside the first); taken by the frame that takes the message.
+pub fn Tester::drop_words(self : Tester, x : Double, y : Double, words : String, wid? : Int) -> Unit {
+  let wid = match wid { Some(__mbt_v) => __mbt_v, None => 0 }
 
-/// Test driver helper: drop filesystem `paths` onto the topmost matching `paths_into` target at `(x, y)`.
-pub fn Tester::drop_paths(
-  self : Tester,
-  paths : Array[DroppedPath],
-  x~ : Double = 0.0,
-  y~ : Double = 0.0,
-) -> Bool {
-  ensure_drop_registry_kept()
-  let reg = drop_registry_ref.v
-  let mut i = reg.paths.length() - 1
-  while i >= 0 {
-    let t = reg.paths[i]
-    if drop_point_hits(t.id, x, y) {
-      t.state.active.set(true)
-      t.state.hovered.set(true)
-      (t.on_paths)(paths)
-      t.state.hovered.set(false)
-      t.state.active.set(false)
-      self.fake.frame_requested = true
-      self.frame()
-      return true
-    }
-    i -= 1
+  let m : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("type", mbt_compat::MbtJson::string("words")), ("x", mbt_compat::MbtJson::number(x)), ("y", mbt_compat::MbtJson::number(y)), ("text", mbt_compat::MbtJson::string(words))])
+  if wid != 0 {
+    m.set("wid", mbt_compat::MbtJson::number(wid.to_double()))
   }
-  false
+  self.post("mbui.drop", mbt_compat::MbtJson::object(m).stringify())
 }

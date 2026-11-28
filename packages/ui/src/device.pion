@@ -1,0 +1,867 @@
+import "codec"
+import "hostapi"
+import "mbt_compat"
+import "signals"
+import "view"
+
+// What an app asks of the device beyond its window (as @hostapi's device.pion has it), through the framework, so that under
+// a Tester the device is the test's: a key catcher (an unseen focus that takes the keyboard, the soft one or one
+// plugged in, and keeps no text: what is typed comes to the app as keys and text, as the app's Android KeyCatcher
+// sends a remote screen), the soft keyboard's height, the clipboard read (an outside ticket, answered at a frame's
+// boundary; a real host's answer kept on the run's tape, CLIPSAID, and given again to a Tester replaying it) and
+// written, the screen kept awake, a haptic.
+//
+// A key catcher's input comes as any input does (app.pion's on_key and on_text, kept on the tape as INPUT lines), and
+// is worked into what the app reads as its frame builds (Ctx::key_catcher's `keys`):
+//   text committed            Text of each line, an Enter tapped between lines
+//   text composed             nothing yet: sent once committed, or as the composition is finished
+//   delete around the caret   while composing, the composition shortened; else that many Backspace, then Delete taps
+//   a named key               its tap (down, up): Enter, Backspace, Delete, Tab, Escape, the arrows, Home, End,
+//                             Page Up, Page Down, Space
+//   a character with Ctrl, Alt or ⌘ held   its key's tap (a shortcut: Ctrl+C is "c", KeyC, ctrl)
+// Keys and codes are named as the DOM's KeyboardEvent names them (`key`, `code`); `mods` are a remote screen's bits
+// (key_in_alt, key_in_ctrl, key_in_meta, key_in_shift). The framework's keys are presses: a key comes as its tap.
+//
+//   CLIPSAID {"text":T,"picture":"none"|"png"|"too_large"|"unreadable","png":HEX}   the clipboard as the app took it
+
+///|
+/// A haptic (@ui.haptic), as the app's Android app has them: Android's constant for each (Compose's
+/// HapticFeedbackType.LongPress is LONG_PRESS, TextHandleMove TEXT_HANDLE_MOVE), the nearest elsewhere.
+
+#derive(Eq)
+pub enum Haptic {
+  LongPress
+  ContextClick
+  TextHandleMove
+  Confirm
+  Reject
+  KeyboardTap
+}
+
+///|
+fn Haptic::code(self : Haptic) -> Int {
+  match self {
+    Haptic::LongPress => hostapi::haptic_long_press
+    Haptic::ContextClick => hostapi::haptic_context_click
+    Haptic::TextHandleMove => hostapi::haptic_text_handle_move
+    Haptic::Confirm => hostapi::haptic_confirm
+    Haptic::Reject => hostapi::haptic_reject
+    Haptic::KeyboardTap => hostapi::haptic_keyboard_tap
+  }
+}
+
+///|
+/// A haptic of `kind` (@hostapi.haptic). None while the app has them off (set_haptics).
+pub fn haptic(kind : Haptic) -> Unit {
+  if !haptics_on.v {
+    return
+  }
+  hostapi::haptic(kind.code())
+}
+
+///|
+/// Haptics on (the default) or off, as the app's person chose: off, `haptic` does nothing.
+pub fn set_haptics(on : Bool) -> Unit {
+  haptics_on.v = on
+}
+
+///|
+// kept across runs: the app sets it each frame from its settings (set_haptics)
+// moved to 00_init_order.pion: haptics_on
+
+///|
+/// The screen kept on while the app is in front (`on`), or let sleep again (@hostapi.keep_awake).
+pub fn keep_awake(on : Bool) -> Unit {
+  hostapi::keep_awake(on)
+}
+
+///|
+/// Words put on the clipboard, `label` what the system shows of where they came from (a screen's title).
+pub fn clipboard_set(text : String, label? : String) -> Unit {
+  let label = match label { Some(__mbt_v) => __mbt_v, None => "" }
+
+  hostapi::clip_set_text(text, label)
+}
+
+///|
+/// A picture (PNG's bytes) put on the clipboard (@hostapi.clip_set_png), in place of what it held.
+pub fn clipboard_set_png(png : Bytes, label? : String) -> Unit {
+  let label = match label { Some(__mbt_v) => __mbt_v, None => "" }
+
+  hostapi::clip_set_png(png, label)
+}
+
+///|
+/// Whether the system says itself that something was put on the clipboard (Android 13 and later show it, with a
+/// preview): then the app does not say it again. Kept on the run's tape (ENV's `copy`).
+pub fn copy_shown() -> Bool {
+  hostapi::copy_shown()
+}
+
+///|
+/// A picture on the clipboard, as the app takes it.
+
+pub enum ClipPicture {
+  NoPicture
+  Png(Bytes)
+  TooLarge
+  Unreadable
+}
+pub impl Eq for ClipPicture {
+  fn equal(self : ClipPicture, other : ClipPicture) -> Bool {
+    match (self, other) {
+      (.NoPicture, .NoPicture) => true
+      (.Png(__a0), .Png(__b0)) => ({ let __ba_0 = __a0; let __bb_0 = __b0; let __bl_0 = __ba_0.length(); let mut __beq_0 = __bl_0 == __bb_0.length(); if __beq_0 { let mut __bi_0 = 0; while __bi_0 < __bl_0 { if __ba_0[__bi_0] != __bb_0[__bi_0] { __beq_0 = false; break }; __bi_0 = __bi_0 + 1 } }; __beq_0 })
+      (.TooLarge, .TooLarge) => true
+      (.Unreadable, .Unreadable) => true
+      _ => false
+    }
+  }
+}
+
+///|
+/// What the clipboard held: its words ("" none), its picture, its files (copied in macOS's Finder, or by an app that
+/// copies a picture as its file: each its name and bytes, @hostapi.ClipGot's).
+
+pub struct Clipboard {
+  pub text : String
+  pub picture : ClipPicture
+  pub files : Array[(String, Bytes)]
+}
+pub impl Eq for Clipboard {
+  fn equal(self : Clipboard, other : Clipboard) -> Bool {
+    (self.text == other.text) && (self.picture == other.picture) && ({ let __aa_2 = self.files; let __ab_2 = other.files; let __al_2 = __aa_2.length(); let mut __aeq_2 = __al_2 == __ab_2.length(); if __aeq_2 { let mut __ai_2 = 0; while __ai_2 < __al_2 { if !({ let __ta_3 = __aa_2[__ai_2]; let __tb_3 = __ab_2[__ai_2]; (__ta_3.0 == __tb_3.0) && ({ let __ba_32 = __ta_3.1; let __bb_32 = __tb_3.1; let __bl_32 = __ba_32.length(); let mut __beq_32 = __bl_32 == __bb_32.length(); if __beq_32 { let mut __bi_32 = 0; while __bi_32 < __bl_32 { if __ba_32[__bi_32] != __bb_32[__bi_32] { __beq_32 = false; break }; __bi_32 = __bi_32 + 1 } }; __beq_32 }) }) { __aeq_2 = false; break }; __ai_2 = __ai_2 + 1 } }; __aeq_2 })
+  }
+}
+
+///|
+/// A read of the clipboard under way (clipboard_read), waited on (an outside ticket) until it is taken.
+pub struct ClipboardRead {
+  priv host : hostapi::ClipRead
+  priv taken : mbt_compat::Ref[Bool]
+}
+
+///|
+struct FakeClipRead {
+  mut answer : Option[(Clipboard, Int)]
+}
+
+///|
+/// What a Tester's host has of the device: the screen kept awake, the haptics fired, the picture on the clipboard and
+/// the label of what was put there, whether the system says a copy itself, the soft keyboard's height, whether the
+/// focus is a key catcher's, the clipboard's reads asked and the answers given before an ask.
+struct FakeDevice {
+  mut awake : Bool
+  haptics : Array[Haptic]
+  mut clip_png : Option[Bytes]
+  mut clip_label : String
+  mut copy_shown : Bool
+  mut ime_inset : Double
+  mut key_catch : Bool
+  mut ime_action : Int
+  mut ime_let_go : Int
+  reads : Array[FakeClipRead]
+  held : Array[Clipboard]
+  natives : Array[FakeNative]
+  native_held : Array[(String, Result[mbt_compat::MbtJson, String])]
+  native_auto : mbt_compat::OrderedMap[String, (mbt_compat::MbtJson) -> Result[mbt_compat::MbtJson, String]]
+}
+
+///|
+fn FakeDevice::new(copy_shown : Bool) -> FakeDevice {
+  // (a test's own: on, as an app starts, whatever one before it set)
+  haptics_on.v = true
+  FakeDevice::{
+    awake: false,
+    haptics: [],
+    clip_png: Option::None,
+    clip_label: "",
+    copy_shown: copy_shown,
+    ime_inset: 0.0,
+    key_catch: false,
+    ime_action: 0,
+    ime_let_go: 0,
+    reads: [],
+    held: [],
+    natives: [],
+    native_held: [],
+    native_auto: mbt_compat::ordered_map_new(),
+  }
+}
+
+///|
+/// The clipboard read (@hostapi.clip_read): its words and its picture, from the frame after the host has read it
+/// (ClipboardRead::got). None where the host cannot. Under a Tester, what the test gives (Tester::clipboard_gives…):
+/// until it does, the read is waited on (the app is not at rest).
+pub fn clipboard_read() -> Option[ClipboardRead] {
+  match hostapi::clip_read() {
+    Some(h) => {
+      let r : ClipboardRead = ClipboardRead::{ host: h, taken: mbt_compat::ref_new(false) }
+      outside_start(outside_clip, r.outside_id(), "the clipboard read \{r.outside_id()}")
+      Some(r)
+    }
+    Option::None => Option::None
+  }
+}
+
+///|
+/// Its id as the host's event names it (outside_clip; a Tester's its ask's place, from 1).
+fn ClipboardRead::outside_id(self : ClipboardRead) -> Int {
+  self.host.id()
+}
+
+///|
+/// What the clipboard held, once read: None while it is read, and once taken (taken once: keep it).
+pub fn ClipboardRead::got(self : ClipboardRead) -> Option[Clipboard] {
+  if self.taken.v || !answer_here(outside_clip, self.outside_id()) {
+    return Option::None
+  }
+  let got = mbt_compat::opt_map(self.host.got(), clipboard_of)
+  if got is Some(c) {
+    self.taken.v = true
+    answer_taken(outside_clip, self.outside_id())
+    outside_end(outside_clip, self.outside_id())
+    clip_said(c)
+  }
+  got
+}
+
+///|
+fn clipboard_of(h : hostapi::ClipGot) -> Clipboard {
+  let picture = if h.picture == hostapi::clip_png {
+    Png(h.png)
+  } else if h.picture == hostapi::clip_too_large {
+    TooLarge
+  } else if h.picture == hostapi::clip_unreadable {
+    Unreadable
+  } else {
+    NoPicture
+  }
+  Clipboard::{ text: h.text, picture: picture, files: h.files }
+}
+
+///|
+/// The clipboard as the app took it, on the run's tape (CLIPSAID), for a Tester replaying it to give again.
+fn clip_said(c : Clipboard) -> Unit {
+  if !taping() {
+    return
+  }
+  let (kind, png) = match c.picture {
+    ClipPicture::NoPicture => ("none", "")
+    ClipPicture::Png(b) => ("png", codec::hex(b))
+    ClipPicture::TooLarge => ("too_large", "")
+    ClipPicture::Unreadable => ("unreadable", "")
+  }
+  let m : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("text", mbt_compat::MbtJson::string(c.text)), ("picture", mbt_compat::MbtJson::string(kind)), ("png", mbt_compat::MbtJson::string(png))])
+  if c.files.length() > 0 {
+    m.set("files", mbt_compat::MbtJson::array(
+      mbt_compat::arr_map(c.files, fn(f) { mbt_compat::MbtJson::object(({ let __mbt_pairs_250_40 = [("name", mbt_compat::MbtJson::string(f.0)), ("bytes", mbt_compat::MbtJson::string(codec::hex(f.1)))]; mbt_compat::ordered_map_from_array(__mbt_pairs_250_40) })) }),
+    ))
+  }
+  tape_line("CLIPSAID " + mbt_compat::MbtJson::object(m).stringify())
+}
+
+///|
+/// A CLIPSAID line's clipboard (None: not one).
+fn clip_of_line(line : String) -> Option[Clipboard] {
+  guard mbt_compat::str_find(line, "CLIPSAID ") is Some(i) else { return Option::None }
+  let j = match mbt_compat::mbt_json_parse(mbt_compat::str_to_owned(mbt_compat::str_exact_view(line, start=i + 9))) { Ok(__mbt_ok_1) => __mbt_ok_1, Err(_) => return Option::None }
+  guard j is .Object(m) else { return Option::None }
+  let str = fn(k : String) -> String {
+    match m.get(k) {
+      Option::Some(String(s)) => s
+      _ => ""
+    }
+  }
+  let picture = match str("picture") {
+    "png" => Png(codec::from_hex(str("png")))
+    "too_large" => TooLarge
+    "unreadable" => Unreadable
+    _ => NoPicture
+  }
+  let files = match m.get("files") {
+    Option::Some(Array(fs)) =>
+    mbt_compat::arr_filter_map(fs, fn(f) {
+      guard f is .Object(fm) else { return Option::None }
+      match (fm.get("name"), fm.get("bytes")) {
+        (Some(String(name)), Some(String(hex))) => Some((name, codec::from_hex(hex)))
+        _ => None
+      }
+    })
+    _ => []
+  }
+  Some(Clipboard::{ text: str("text"), picture: picture, files: files })
+}
+
+///|
+/// The clipboard holds `clip` for the app's read asked first and not answered yet (else for its next read): taken
+/// from the next frame.
+fn fake_clip_give(f : FakeHost, clip : Clipboard) -> Unit {
+  for a in f.dev.reads {
+    if a.answer is Option::None {
+      a.answer = Some((clip, g().frame_no))
+      f.wants = true
+      return
+    }
+  }
+  f.dev.held.push(clip)
+}
+
+///|
+/// The app's read of the clipboard answered with `text` (its read asked first and not yet answered; else its next):
+/// taken from the next frame, as a host's answer comes at a frame's boundary. Until a read is answered, the app is not
+/// at rest.
+pub fn Tester::clipboard_gives(self : Tester, text : String) -> Unit {
+  fake_clip_give(self.fake, Clipboard::{ text: text, picture: ClipPicture::NoPicture, files: [] })
+}
+
+///|
+/// The same, the clipboard holding a picture (`png`, as the host gives it: PNG's bytes), and `text` beside it.
+pub fn Tester::clipboard_gives_png(self : Tester, png : Bytes, text? : String) -> Unit {
+  let text = match text { Some(__mbt_v) => __mbt_v, None => "" }
+
+  fake_clip_give(self.fake, Clipboard::{ text: text, picture: ClipPicture::Png(png), files: [] })
+}
+
+///|
+/// The same, the clipboard holding files (their names and bytes, as Finder copies them), and `text` beside them (what
+/// Finder puts there too: their names).
+pub fn Tester::clipboard_gives_files(self : Tester, files : Array[(String, Bytes)], text? : String) -> Unit {
+  let text = match text { Some(__mbt_v) => __mbt_v, None => "" }
+
+  fake_clip_give(self.fake, Clipboard::{ text: text, picture: ClipPicture::NoPicture, files: files })
+}
+
+///|
+/// The same, with all that the host may say of it (an empty clipboard, a picture too large or unreadable).
+pub fn Tester::clipboard_gives_clip(self : Tester, clip : Clipboard) -> Unit {
+  fake_clip_give(self.fake, clip)
+}
+
+///|
+/// How many times the app asked to read the clipboard.
+pub fn Tester::clipboard_reads(self : Tester) -> Int {
+  self.fake.dev.reads.length()
+}
+
+///|
+/// The picture the app last put on the clipboard (None: it holds none, words put there after it).
+pub fn Tester::clipboard_png(self : Tester) -> Option[Bytes] {
+  self.fake.dev.clip_png
+}
+
+///|
+/// The label of what the app last put on the clipboard.
+pub fn Tester::clipboard_label(self : Tester) -> String {
+  self.fake.dev.clip_label
+}
+
+///|
+/// Whether the app last asked for the screen to be kept awake.
+pub fn Tester::awake(self : Tester) -> Bool {
+  self.fake.dev.awake
+}
+
+///|
+/// The haptics the app fired, oldest first.
+pub fn Tester::haptics(self : Tester) -> Array[Haptic] {
+  self.fake.dev.haptics.copy()
+}
+
+///|
+/// The soft keyboard reaching `h` points over the window's foot (0: down), from the next frame on, as a host says it
+/// while it moves (the window's own size is the test's: a host lays the app out above the keyboard).
+pub fn Tester::set_ime_inset(self : Tester, h : Double) -> Unit {
+  self.fake.dev.ime_inset = h
+  self.fake.wants = true
+}
+
+///|
+/// Whether the host was last told the focus is a key catcher's (its keyboard the app's, keys and all).
+pub fn Tester::key_catching(self : Tester) -> Bool {
+  self.fake.dev.key_catch
+}
+
+///|
+/// The field as Android's input method left it (its edits made on the host's copy of the words): words `s`, the
+/// selection from `a` to `b`, the composing region from `ca` to `cb` (-1: none); the frames it causes drawn.
+pub fn Tester::ime_state(self : Tester, s : String, a : Int, b : Int, ca? : Int, cb? : Int) -> Unit {
+  let ca = match ca { Some(__mbt_v) => __mbt_v, None => -1 }
+  let cb = match cb { Some(__mbt_v) => __mbt_v, None => -1 }
+
+  on_text(text_composing, "", ca, cb)
+  on_text(text_state, s, a, b)
+  self.draw()
+}
+
+///|
+/// The soft keyboard put away by the person (its own key, Back); the frames it causes drawn.
+pub fn Tester::keyboard_gone(self : Tester) -> Unit {
+  on_text(text_keyboard_gone, "", 0, 0)
+  self.draw()
+}
+
+///|
+/// The keyboard's trackpad (iOS's floating cursor) begins at (`x`, `y`), moves to (`x1`, `y1`) and is let go; the
+/// frames it causes drawn.
+pub fn Tester::ime_trackpad(self : Tester, x : Int, y : Int, x1 : Int, y1 : Int) -> Unit {
+  let u = text_float_unit.to_int()
+  on_text(text_float_begin, "", x * u, y * u)
+  self.draw()
+  on_text(text_float_move, "", x1 * u, y1 * u)
+  self.draw()
+  on_text(text_float_end, "", 0, 0)
+  self.draw()
+}
+
+///|
+/// The input method deletes `before` UTF-16 units before the caret and `after` after it (Android's
+/// deleteSurroundingText); the frames it causes drawn.
+pub fn Tester::ime_delete(self : Tester, before : Int, after : Int) -> Unit {
+  on_text(text_delete_around, "", before, after)
+  self.draw()
+}
+
+///|
+/// The input method finishes its composition: what it composed is committed as it is (Android's
+/// finishComposingText); the frames it causes drawn.
+pub fn Tester::ime_finish(self : Tester) -> Unit {
+  on_text(2, "", 0, 0)
+  self.draw()
+}
+
+///|
+/// The input method's text event deleting around the caret (`a` before it, `b` after: on_text's kind).
+// moved to 00_init_order.pion: text_delete_around
+
+///|
+/// The input method's text event saying the composing region (`a` to `b`, -1 none) of the state it sends next.
+// moved to 00_init_order.pion: text_composing
+
+///|
+/// The input method's text event giving the field's whole state: its words, the selection from `a` to `b`.
+// moved to 00_init_order.pion: text_state
+
+///|
+/// The host's event saying the soft keyboard was put away by the person: the field lets go of the focus.
+// moved to 00_init_order.pion: text_keyboard_gone
+
+///|
+/// The host's text event putting in the clipboard's words (a paste: ⌘V, the edit menu's): as kind 0 puts in what is
+/// typed, but a step of its own to undo, not one with the typing about it (editor_undo.pion).
+// moved to 00_init_order.pion: text_paste
+
+///|
+/// The host's text event saying the keyboard's trackpad (iOS's floating cursor: a long press on the space bar) begins,
+/// at (`a`, `b`) in the window, in text_float_unit of a point.
+// moved to 00_init_order.pion: text_float_begin
+
+///|
+/// The host's text event saying the keyboard's trackpad moved to (`a`, `b`) in the window, in text_float_unit of a
+/// point: the caret goes as far from where it was when it began as that is from where it began.
+// moved to 00_init_order.pion: text_float_move
+
+///|
+/// The host's text event saying the keyboard's trackpad was let go: the caret stays where it went.
+// moved to 00_init_order.pion: text_float_end
+
+///|
+/// What the keyboard's trackpad's points are counted in (text_float_begin, text_float_move): a 64th of a point, the
+/// finger's way as finely as the host has it (whole points would step the caret it draws 3 pixels at a time).
+// moved to 00_init_order.pion: text_float_unit
+
+///|
+fn h_ime_action(kind : Int) -> Unit {
+  hostapi::ime_action(kind)
+}
+
+///|
+fn h_ime_let_go() -> Unit {
+  hostapi::ime_let_go()
+}
+
+///|
+fn h_key_catch_mode(mode : Int) -> Unit {
+  hostapi::key_catch_mode(mode)
+}
+
+///|
+fn h_ime_inset() -> Double {
+  hostapi::ime_inset()
+}
+
+///|
+/// What a key catcher has typed into it, as the app reads it (see the file's head).
+
+#derive(Eq)
+pub enum KeyIn {
+  Text(String)
+  Key(Bool, String, String, Int)
+}
+
+///|
+/// A KeyIn's modifiers: Alt (Option), Ctrl, Meta (⌘, the Windows key), Shift.
+// moved to 00_init_order.pion: key_in_alt
+
+///|
+// moved to 00_init_order.pion: key_in_ctrl
+
+///|
+// moved to 00_init_order.pion: key_in_meta
+
+///|
+// moved to 00_init_order.pion: key_in_shift
+
+///|
+/// A key catcher as this frame builds it: its id (what Ctx::focus_on gives the keyboard to), whether it has the focus
+/// (the keyboard is the app's), and what was typed into it since the last frame.
+pub struct KeyCatch {
+  id : Int
+  focused : Bool
+  keys : Array[KeyIn]
+}
+
+///|
+/// The device's state a window keeps: its key catchers by id, the soft keyboard's height as this frame began.
+pub struct DeviceState {
+  priv catchers : mbt_compat::OrderedMap[Int, Catcher]
+  priv mut ime_inset : Double
+}
+
+///|
+fn DeviceState::new() -> DeviceState {
+  DeviceState::{ catchers: mbt_compat::ordered_map_new(), ime_inset: 0.0 }
+}
+
+///|
+/// A key catcher's state: what the input method composes (not sent until committed), what came since the frame that
+/// last read it, what this frame reads, and which frame that is.
+struct Catcher {
+  mut composing : String
+  composing_sig : signals::Signal[String]
+  came : Array[KeyIn]
+  mut keys : Array[KeyIn]
+  mut frame : Int
+  mut island : Option[view::NodeId]
+  mut place : Option[(Double, Double, Double)]
+  mut node : Option[view::NodeId]
+  mut told : Option[(KeyIn) -> Unit]
+  mut paste_told : Option[(String) -> Unit]
+  mut catch_close : Bool
+}
+
+///|
+fn Catcher::set_composing(self : Catcher, s : String) -> Unit {
+  if self.composing != s {
+    self.composing = s
+    self.composing_sig.set(s)
+  }
+}
+
+///|
+fn Ctx::catcher_of(self : Ctx, id : Int) -> Catcher {
+  match self.dev.catchers.get(id) {
+    Option::Some(st) => st
+    Option::None => {
+      let st = Catcher::{
+        composing: "",
+        composing_sig: signals::signal("", same=fn(a, b) { a == b }),
+        came: [],
+        keys: [],
+        frame: -1,
+        island: Option::None,
+        place: Option::None,
+        node: Option::None,
+        told: Option::None,
+        paste_told: Option::None,
+        catch_close: false,
+      }
+      self.dev.catchers.set(id, st)
+      st
+    }
+  }
+}
+
+///|
+/// A key catcher (see the file's head): unseen, it takes the keyboard while it has the focus (Ctx::catch_keys raises
+/// the soft keyboard, or puts it away) and keeps no text of its own; what was typed since the last frame is `keys`,
+/// the same in every build of this frame. A press elsewhere leaves it the focus, as a field's.
+pub fn Ctx::key_catcher(self : Ctx, key : String) -> KeyCatch {
+  let id = self.id(key)
+  let st = self.catcher_of(id)
+  self.editor_layer.set(id, self.layer_cur)
+  st.island = if self.layer_cur == 0 { island_building.v } else { Option::None }
+  if st.frame != self.frame_no {
+    st.frame = self.frame_no
+    st.keys = st.came.copy()
+    st.came.clear()
+  }
+  KeyCatch::{ id: id, focused: self.has_focus(id), keys: st.keys }
+}
+
+///|
+/// The key catcher `key` given the focus (`on`: the soft keyboard raised, the keyboard the app's), or, if it has it,
+/// none (the soft keyboard put away).
+pub fn Ctx::catch_keys(self : Ctx, key : String, on : Bool) -> Unit {
+  let id = self.id(key)
+  if on {
+    ignore(self.catcher_of(id))
+    if self.focus != id {
+      self.focus_on(id)
+    }
+  } else if self.focus == id {
+    self.focus_on(0)
+  }
+}
+
+///|
+/// Where key catcher `key` says its input goes on the window: a caret at x, y, h points tall, the input method's own
+/// windows put by it (the keys go on elsewhere; what the catcher knows of the caret there is the app's).
+pub fn Ctx::key_catcher_place(self : Ctx, key : String, x : Double, y : Double, h : Double) -> Unit {
+  self.catcher_of(self.id(key)).place = Some((x, y, h))
+}
+
+///|
+/// How far the soft keyboard reaches over the window's foot as this frame began, in points (0: down); the window is
+/// laid out above it.
+pub fn Ctx::ime_inset(self : Ctx) -> Double {
+  ignore(self)
+  ime_said.get()
+}
+
+///|
+/// Whether the soft keyboard is up as this frame began: what reads it changes as it comes up or goes down, not as it
+/// moves.
+pub fn Ctx::keyboard_up(self : Ctx) -> Bool {
+  ignore(self)
+  ime_up.get()
+}
+
+///|
+/// The soft keyboard's height as this frame began, and whether it is up: signals of their own, read where they are
+/// read (what reads neither is not built again as it moves), not among the host's settings the whole frame reads.
+// kept across runs: set as each frame begins
+// moved to 00_init_order.pion: ime_said
+
+///|
+// kept across runs: worked out of ime_said as it changes
+// moved to 00_init_order.pion: ime_up
+
+///|
+/// As a frame begins: the soft keyboard's height, as the host has it now (kept on the tape: envrec.pion).
+fn Ctx::device_frame_start(self : Ctx) -> Unit {
+  self.dev.ime_inset = h_ime_inset()
+  ime_said.set(self.dev.ime_inset)
+}
+
+///|
+/// The modifiers of a key (mod_shift_key, mod_ctrl, mod_alt, mod_cmd) as a KeyIn's.
+fn key_in_mods(mods : Int) -> Int {
+  (if (mods & mod_alt) != 0 { key_in_alt } else { 0 }) |
+  (if (mods & mod_ctrl) != 0 { key_in_ctrl } else { 0 }) |
+  (if (mods & mod_cmd) != 0 { key_in_meta } else { 0 }) |
+  (if (mods & mod_shift_key) != 0 { key_in_shift } else { 0 })
+}
+
+///|
+/// Whether a key catcher holds the window's keyboard focus now (and is not blocked by a modal layer).
+pub fn key_catching() -> Bool {
+  let c = g()
+  c.dev.catchers.contains(c.focus_allowed())
+}
+
+///|
+/// Whether the focused key catcher also captures macOS ⌘W (e.g. a remote screen, not a terminal).
+pub fn key_catching_close() -> Bool {
+  let c = g()
+  match c.dev.catchers.get(c.focus_allowed()) {
+    Option::Some(st) => st.catch_close
+    Option::None => false
+  }
+}
+
+///|
+/// The keys that are not text, by the framework's code: the DOM's `key` and `code`.
+fn named_key(code : Int) -> Option[(String, String)] {
+  match code {
+    1 => Some(("Backspace", "Backspace"))
+    2 => Some(("Delete", "Delete"))
+    3 => Some(("ArrowLeft", "ArrowLeft"))
+    4 => Some(("ArrowRight", "ArrowRight"))
+    5 => Some(("ArrowUp", "ArrowUp"))
+    6 => Some(("ArrowDown", "ArrowDown"))
+    7 => Some(("Enter", "Enter"))
+    8 => Some(("Home", "Home"))
+    9 => Some(("End", "End"))
+    15 => Some(("PageUp", "PageUp"))
+    16 => Some(("PageDown", "PageDown"))
+    17 => Some(("Escape", "Escape"))
+    18 => Some(("Tab", "Tab"))
+    41 => Some(("Insert", "Insert"))
+    42 => Some(("F1", "F1"))
+    43 => Some(("F2", "F2"))
+    44 => Some(("F3", "F3"))
+    45 => Some(("F4", "F4"))
+    46 => Some(("F5", "F5"))
+    47 => Some(("F6", "F6"))
+    48 => Some(("F7", "F7"))
+    49 => Some(("F8", "F8"))
+    50 => Some(("F9", "F9"))
+    51 => Some(("F10", "F10"))
+    52 => Some(("F11", "F11"))
+    53 => Some(("F12", "F12"))
+    1032 => Some((" ", "Space"))
+    _ => Option::None
+  }
+}
+
+///|
+/// The DOM's `code` of a character typed with a modifier held (c: KeyC); "" for one with no key of its own.
+fn code_of_char(ch : Int) -> String {
+  if ch >= 'a'.to_int() && ch <= 'z'.to_int() {
+    "Key" + (ch - 32).unsafe_to_char().to_string()
+  } else if ch >= 'A'.to_int() && ch <= 'Z'.to_int() {
+    "Key" + ch.unsafe_to_char().to_string()
+  } else if ch >= '0'.to_int() && ch <= '9'.to_int() {
+    "Digit" + ch.unsafe_to_char().to_string()
+  } else {
+    match ch.unsafe_to_char() {
+      ' ' => "Space"
+      '-' => "Minus"
+      '=' => "Equal"
+      '[' => "BracketLeft"
+      ']' => "BracketRight"
+      '\\' => "Backslash"
+      ';' => "Semicolon"
+      '\'' => "Quote"
+      ',' => "Comma"
+      '.' => "Period"
+      '/' => "Slash"
+      '`' => "Backquote"
+      _ => ""
+    }
+  }
+}
+
+///|
+/// What came: told at once to a node's (key_catcher_node), else kept for the frame that reads it (Ctx::key_catcher).
+fn Catcher::put(self : Catcher, k : KeyIn) -> Unit {
+  match self.told {
+    Some(f) => f(k)
+    Option::None => self.came.push(k)
+  }
+}
+
+///|
+/// A key pressed and let go.
+fn Catcher::tap(self : Catcher, key : String, code : String, mods : Int) -> Unit {
+  self.put(KeyIn::Key(true, key, code, mods))
+  self.put(KeyIn::Key(false, key, code, mods))
+}
+
+///|
+/// Words typed: each line as text, Enter tapped between them.
+fn Catcher::type_words(self : Catcher, s : String) -> Unit {
+  let mut first = true
+  for line in s.split("\n") {
+    if !first {
+      self.tap("Enter", "Enter", 0)
+    }
+    first = false
+    let l = mbt_compat::str_to_owned(line)
+    if l != "" {
+      self.put(KeyIn::Text(l))
+    }
+  }
+}
+
+///|
+/// A key with the focus a key catcher's: the catcher's (and seen by Ctx::key_pressed's `in_field` only). False when
+/// the focus is not one's, or is where a modal layer of the window's tree keeps it from input (Ctx::focus_allowed).
+fn catcher_key(c : Ctx, code : Int, mods : Int) -> Bool {
+  guard c.dev.catchers.get(c.focus_allowed()) is Option::Some(st) else { return false }
+  desk_key(code, mods, true)
+  let m = key_in_mods(mods)
+  match named_key(code) {
+    Some((k, kc)) => st.tap(k, kc, m)
+    Option::None =>
+    if code > 1000 {
+      let ch = code - 1000
+      if (mods & (mod_ctrl | mod_alt | mod_cmd)) != 0 {
+        // a shortcut: a letter as its key (upper case with Shift), a digit, another character by itself
+        let lower = if ch >= 'A'.to_int() && ch <= 'Z'.to_int() { ch + 32 } else { ch }
+        let key = if lower >= 'a'.to_int() && lower <= 'z'.to_int() && (mods & mod_shift_key) != 0 {
+          (lower - 32).unsafe_to_char().to_string()
+        } else {
+          lower.unsafe_to_char().to_string()
+        }
+        st.tap(key, code_of_char(lower), m)
+      } else {
+        st.put(KeyIn::Text(ch.unsafe_to_char().to_string()))
+      }
+    }
+  }
+  true
+}
+
+///|
+/// The input method's text with the focus a key catcher's (see the file's head). False when the focus is not one's
+/// (or is kept from input: Ctx::focus_allowed).
+fn catcher_text(c : Ctx, kind : Int, s : String, a : Int, b : Int) -> Bool {
+  guard c.dev.catchers.get(c.focus_allowed()) is Option::Some(st) else { return false }
+  match kind {
+    0 => {
+      st.set_composing("")
+      st.type_words(s)
+    }
+    1 => st.set_composing(s)
+    2 => {
+      let had = st.composing
+      st.set_composing("")
+      if had != "" {
+        st.type_words(had)
+      }
+    }
+    4 =>
+    if st.composing != "" {
+      let n = mbt_compat::utf16_len(st.composing) - a
+      st.set_composing(if n <= 0 {
+        ""
+      } else {
+        mbt_compat::str_unsafe_substring(st.composing, start=0, end=n)
+      })
+    } else {
+      for _ in 0..<a {
+        st.tap("Backspace", "Backspace", 0)
+      }
+      for _ in 0..<b {
+        st.tap("Delete", "Delete", 0)
+      }
+    }
+    8 => {
+      st.set_composing("")
+      if s != "" {
+        match st.paste_told {
+          Some(f) => f(s)
+          None => st.type_words(s)
+        }
+      }
+    }
+    _ => ()
+  }
+  true
+}
+
+///|
+/// The input method's action the app last told its host (@hostapi.ime_action_*: a search field's, when one has the
+/// focus).
+pub fn Tester::ime_action(self : Tester) -> Int {
+  self.fake.dev.ime_action
+}
+
+///|
+/// How many times the app has told its host the input method's composition was let go by the field
+/// (@hostapi.ime_let_go).
+pub fn Tester::ime_let_go(self : Tester) -> Int {
+  self.fake.dev.ime_let_go
+}

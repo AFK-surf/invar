@@ -1,0 +1,1337 @@
+import "hostapi"
+import "mbt_compat"
+import "signals"
+import "view"
+
+// What the window's thread did, piece by piece, and the hangs found in it after (GPUI's foreground journal and hang
+// detection: zed's crates/gpui/src/profiler/journal.rs, hang.rs). Each event from outside (view_event_said), each
+// frame's work, its presenting and what follows it (on_frame) is put into a ring of the last `journal_cap` as it ends;
+// pieces shorter than `journal_floor_ms` folded into one, their count and work kept. What is between two boundaries is
+// an interval, and the boundaries are what happened, never how long it was: a frame presented, the thread idle with
+// no frame asked for, the app hidden. As an interval is closed it is looked over: one piece of work at least
+// `hang_stall_ms` long, the work a presented frame waited on at least the frame's budget (`probe_slow_ms`), or, closed
+// with no frame, one piece at least the budget long, is a hang (Hang), said on the log, into the device's performance
+// record, and to whoever the app has listen (hangs_told).
+//
+// Recorded, never judged: nothing here is read by what the app does, asks for a frame or reads a signal. It is timed
+// by the work's clock (work_now): a Tester's is its own and still within a frame, so what it runs takes no time and
+// finds no hang unless a test gives it a clock (set_work_clock). What it keeps of a piece is its kind, never what it
+// carried (no key, no words, no message of the core's), and of a frame's why the code it names alone (journal_places).
+// What the app shows it is told as that changes (journal_shows), a name it does not read: a hang says the one shown as
+// its interval was sealed, the summary its counts by the name shown as each was counted.
+
+///|
+/// One piece of the window's thread's work.
+
+#derive(Eq)
+pub enum Done {
+  Event(String)
+  Frame(FrameDone)
+  Present
+  FrameEnd
+  Small(Int, Double)
+}
+
+///|
+/// A frame's work up to presenting it, by part (ms on the work clock): the window's tree brought, the messages from
+/// outside handed on, its builds, its layout, its paint; the nodes built and instances drawn; what it was drawn for
+/// (built, painted or looks, and the code that asked: journal_places), said only of a frame at least the budget long.
+
+#derive(Eq)
+pub struct FrameDone {
+  pub tree : Double
+  pub messages : Double
+  pub build : Double
+  pub layout : Double
+  pub paint : Double
+  pub nodes : Int
+  pub insts : Int
+  pub made : Int
+  pub let_go : Int
+  pub laid : Int
+  pub measured : Int
+  pub passes : Int
+  pub again : String
+  pub bindings : Int
+  pub why : String
+}
+
+///|
+/// A piece of work and when it began and ended (ms on the work clock); of folded pieces, the first one's beginning and
+/// the last one's end.
+
+#derive(Eq)
+pub struct Worked {
+  pub what : Done
+  pub start : Double
+  pub end : Double
+  pub notes : Array[(String, Double)]
+}
+
+///|
+pub fn Worked::ms(self : Worked) -> Double {
+  match self.what {
+    Done::Small(_, ms) => ms
+    _ => self.end - self.start
+  }
+}
+
+///|
+/// What closed an interval.
+
+#derive(Eq)
+pub enum Seal {
+  Presented
+  Idle
+  Hidden
+}
+
+///|
+/// What the journal keeps, oldest first (journal).
+
+#derive(Eq)
+pub enum Entry {
+  Work(Worked)
+  Boundary(Seal, Double)
+}
+
+///|
+/// Which rule found a hang.
+
+#derive(Eq)
+pub enum HangTrigger {
+  Stall
+  LateFrame
+  Blocking
+}
+
+///|
+/// An interval with a hang in it: the rule, what closed it, whether no frame had been presented before it (the app
+/// starting); from what it waited on to its end (ms on the work clock: from the frame's asking, or the first piece that
+/// made it one); its longest piece, its work in all, its pieces (folded ones apart), the journal's lost under it (its
+/// beginning overwritten before it closed: no budget is judged then), what made it a hang, the longest first, at most
+/// `hang_contributors_kept`, and how many more there were; what the app said it showed as the interval was sealed
+/// (journal_shows: "" none said yet).
+
+#derive(Eq)
+pub struct Hang {
+  pub trigger : HangTrigger
+  pub page : String
+  pub arranged : String
+  pub window_w : Double
+  pub window_h : Double
+  pub sealed_by : Seal
+  pub startup : Bool
+  pub start : Double
+  pub end : Double
+  pub stall_ms : Double
+  pub work_ms : Double
+  pub pieces : Int
+  pub small : Int
+  pub small_ms : Double
+  pub lost : Int
+  pub contributors : Array[Worked]
+  pub elided : Int
+}
+
+///|
+/// What the app did while it was shown, said as it is hidden (hang_summary_told): from its first work after it was
+/// last hidden to now (ms on the work clock), its work in all, its frames presented, its hangs by rule; its frames
+/// counted by how long each waited (journal_seal's `waited`, a hang's measure, so those under the budget too): in
+/// the bands `frame_band_ms` bounds (below 4 ms, 4 to 8, ... , 24 and over: one more than the bounds), four times
+/// over, by whether a finger's move was handled since the frame before and whether the window's tree laid anything
+/// out for it (`still`, `still_laid`, `moved`, `moved_laid`, each frame in one). Frames whose interval the journal
+/// lost the beginning of are in none. `by_page`: of the frames presented, stalls, late frames and blocking, those
+/// counted while each name the app said it showed was (journal_shows; "" before it said one), in the order the names
+/// were said: they add up to the four counts above. `gpu`: what the drawing side did with the frames meanwhile
+/// (frame_watch.pion's GpuFrames: their GPU time past each budget, those never drawn), which the app's own work does not
+/// show.
+
+#derive(Eq)
+pub struct HangSummary {
+  pub shown_ms : Double
+  pub work_ms : Double
+  pub frames : Int
+  pub stalls : Int
+  pub late : Int
+  pub blocking : Int
+  pub still : Array[Int]
+  pub still_laid : Array[Int]
+  pub moved : Array[Int]
+  pub moved_laid : Array[Int]
+  pub by_page : Array[(String, Int, Int, Int, Int)]
+  pub gpu : GpuFrames
+}
+
+///|
+/// The bounds (ms) of the bands a presented frame is counted in by what it waited on (HangSummary): 120, 90 and 60
+/// frames a second's budgets fall in the second, third and fifth.
+// moved to 00_init_order.pion: frame_band_ms
+
+///|
+/// Which of frame_band_ms's bands a wait of `w` ms is in, its bounds written out: every frame is counted, and reads
+/// no array for it (unit tests holds the two to each other).
+fn frame_band(w : Double) -> Int {
+  if w < 4.0 {
+    0
+  } else if w < 8.0 {
+    1
+  } else if w < 12.0 {
+    2
+  } else if w < 16.0 {
+    3
+  } else if w < 24.0 {
+    4
+  } else {
+    5
+  }
+}
+
+///|
+/// End-to-end vsync lateness bands (ms) for `late_to_screen` in HangSummary.
+// moved to 00_init_order.pion: late_band_ms
+
+///|
+fn late_band(late : Double) -> Int {
+  if late < 4.0 {
+    0
+  } else if late < 8.0 {
+    1
+  } else if late < 16.0 {
+    2
+  } else if late < 24.0 {
+    3
+  } else {
+    4
+  }
+}
+
+///|
+/// Rolling flush interval for `ui_hang_summary` on long-lived sessions (10 minutes).
+// moved to 00_init_order.pion: journal_summary_roll_ms
+
+///|
+/// Frames whose end-to-end lateness (`@hostapi.frame_late`) was > 0, bucketed by `late_band_ms`.
+// kept across runs: put back as a run begins (journal_reset) and as a summary is said (journal_said_shown)
+// moved to 00_init_order.pion: journal_late_bands
+
+///|
+/// Worst end-to-end frame lateness (ms, [0]) and peak process memory (MB, [1]) since the last summary.
+// kept across runs: put back as a run begins (journal_reset) and as a summary is said (journal_said_shown)
+// moved to 00_init_order.pion: journal_extra_ms
+
+///|
+/// Optional test override for process memory sampling (MB).
+// kept across runs: reset by tests that set it
+// moved to 00_init_order.pion: mem_mb_clock
+
+///|
+struct SummaryExtra {
+  late_counts : Array[Int]
+  late_worst : Double
+  mem_peak_mb : Double
+  gpu_by_page : Array[(String, Int, Int, Int, Int, Double, Int)]
+}
+
+///|
+/// Extra summary telemetry kept alongside recent `HangSummary` instances (matched by `physical_equal` in
+/// `HangSummary::json`) so `pub(all) struct HangSummary` stays ABI-stable.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: summary_extras
+
+///|
+fn journal_sample_mem() -> Unit {
+  let mb = match mem_mb_clock.v {
+    Some(f) => f()
+    Option::None => h_mem_mb()
+  }
+  if mb > journal_extra_ms[1] {
+    journal_extra_ms[1] = mb
+  }
+}
+
+///|
+fn journal_is_away() -> Bool {
+  (journal_away.v && !journal_hidden.v) || hostapi::frame_hidden()
+}
+
+///|
+fn journal_maybe_roll_summary(seal : Seal, at : Double, away? : Bool) -> Unit {
+  let away = match away { Some(__mbt_v) => __mbt_v, None => false }
+
+  if !away &&
+  !journal_away.v &&
+  !hostapi::frame_hidden() &&
+  seal != Seal::Hidden &&
+  journal_counts[5] >= 0.0 &&
+  at - journal_counts[5] >= journal_summary_roll_ms &&
+  journal_counts[0] > 0.0 {
+    journal_said_shown(at)
+  }
+}
+
+///|
+// moved to 00_init_order.pion: journal_cap
+
+///|
+/// Work shorter than this is folded (Done::Small).
+// moved to 00_init_order.pion: journal_floor_ms
+
+///|
+/// One piece of work this long is a hang whatever it was.
+// moved to 00_init_order.pion: hang_stall_ms
+
+///|
+// moved to 00_init_order.pion: hang_contributors_kept
+
+///|
+// moved to 00_init_order.pion: hangs_kept_most
+
+///|
+/// How many of what a piece went on are kept with it (Worked's `notes`).
+// moved to 00_init_order.pion: journal_notes_kept
+
+///|
+/// What the piece being done went on so far (@hostapi.work_part), by where it was made: its ms summed.
+// kept across runs: emptied as each piece is kept (journal_work) and as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_notes
+
+///|
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_ring
+
+///|
+/// How many entries were ever put into the ring, and the first of the interval still open.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_at
+
+///|
+/// The pieces folded since the last kept: how many, their work, the first's beginning, the last's end.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_small
+
+///|
+/// When the frame the open interval waits on was first asked for (-1: none asked).
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_dirty_at
+
+///|
+/// A frame asked for as the frame now running was drawn: the next one is waited on from its presenting.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_asked
+
+///|
+/// The app hidden by the event being handled: the interval closed as it ends.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_hidden
+
+///|
+/// Whether the app is currently not shown (background/hidden/minimized).
+// kept across runs: put back as a run begins (journal_reset) and updated by app_state_taken
+// moved to 00_init_order.pion: journal_away
+
+///|
+/// Whether a frame has been presented (a hang before it is the app starting).
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: journal_presented
+
+///|
+/// The last hangs found, oldest first.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: hangs_found
+
+///|
+/// The summary's counts since the app was last hidden: frames, stalls, late frames, blocking; its work; its first
+/// work's beginning (-1: none yet).
+// kept across runs: put back as a run begins (journal_reset)
+// (its first work none yet as the program starts too: a device's first summary counted from 0 on its clock before)
+// moved to 00_init_order.pion: journal_counts
+
+///|
+/// The frames presented since the app was last hidden, by band (frame_band_ms's, and one over), four times over:
+/// still, still and laid out, moved, moved and laid out (HangSummary).
+// kept across runs: put back as a run begins (journal_reset), emptied as the app is hidden (journal_said_shown)
+// moved to 00_init_order.pion: journal_bands
+
+///|
+/// A finger's move was handled in the interval still open.
+// kept across runs: put back as a run begins (journal_reset) and as each interval closes (journal_seal)
+// moved to 00_init_order.pion: journal_moved
+
+///|
+/// The window's tree laid something out for the frame of the interval still open.
+// kept across runs: put back as a run begins (journal_reset) and as each interval closes (journal_seal)
+// moved to 00_init_order.pion: journal_laid
+
+///|
+/// How many names of what the app shows the journal tells apart (journal_shows): one past them is `other`.
+// moved to 00_init_order.pion: shown_names_most
+
+///|
+/// The names the app said it showed since the summary was last said (the one shown now kept), in the order said: a
+/// name's slot is its place here and one (0: none said yet; shown_names_most + 1: `other`).
+// kept across runs: put back as a run begins (journal_reset), begun again as the summary is said (journal_said_shown)
+// moved to 00_init_order.pion: shown_names
+
+///|
+/// The slot of the name shown now (shown_names'), and the name as the app said it.
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: shown_slot
+
+///|
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: shown_said
+
+///|
+/// How the app lays out what it shows and the window's size in points, as it last said (journal_arranged).
+// kept across runs: put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: arranged_said
+
+///|
+/// The summary's counts by the name shown as each was counted, four a slot (shown_slot's): frames, stalls, late
+/// frames, blocking. A frame presented costs one rise of one of them.
+// kept across runs: put back as a run begins (journal_reset), emptied as the app is hidden (journal_said_shown)
+// moved to 00_init_order.pion: shown_counts
+
+///|
+/// What the app shows now told, by `name` (a kind, never which: the app's sfbase shown_kind), as it changes, never
+/// asked each frame: a hang says the one shown as its interval is sealed, the summary counts by it. Past
+/// `shown_names_most` names since the summary was last said, `other`.
+pub fn journal_shows(name : String) -> Unit {
+  shown_said.v = name
+  shown_slot.v = shown_slot_of(name)
+}
+
+///|
+/// How the app lays out what it shows and the window's
+/// size in points (`w`, `h`), told as either changes, never asked each frame: a hang says them as its interval is
+/// sealed, so one can be made again in a Tester's window of that size (the hang reports' `why` alone did not say
+/// which, 2026-11-14).
+pub fn journal_arranged(name : String, w : Double, h : Double) -> Unit {
+  arranged_said.v = (name, w, h)
+}
+
+///|
+fn shown_slot_of(name : String) -> Int {
+  if name == "" {
+    return 0
+  }
+  for i, n in shown_names {
+    if n == name {
+      return i + 1
+    }
+  }
+  if shown_names.length() >= shown_names_most {
+    return shown_names_most + 1
+  }
+  shown_names.push(name)
+  shown_names.length()
+}
+
+///|
+/// The name of what the app shows now as the journal keeps it (journal_shows; `other` past its most; "" none said):
+/// what its hangs and summary say, the device's performance record too.
+pub fn journal_shown() -> String {
+  shown_name(shown_slot.v)
+}
+
+///|
+/// The layout class and window size (points) the app last told the journal (journal_arranged; `("", 0, 0)` before any).
+pub fn journal_arranged_now() -> (String, Double, Double) {
+  arranged_said.v
+}
+
+///|
+fn shown_name(slot : Int) -> String {
+  if slot == 0 {
+    ""
+  } else if slot > shown_names_most {
+    "other"
+  } else {
+    shown_names[slot - 1]
+  }
+}
+
+///|
+/// The summary's counts by name (HangSummary's `by_page`): each slot counted, in their order ("" first, `other` last).
+fn shown_by_page() -> Array[(String, Int, Int, Int, Int)] {
+  let out = []
+  for slot in 0..<(shown_names_most + 2) {
+    let at = slot * 4
+    let (f, s, l, b) = (shown_counts[at], shown_counts[at + 1], shown_counts[at + 2], shown_counts[at + 3])
+    if f + s + l + b > 0 {
+      out.push((shown_name(slot), f, s, l, b))
+    }
+  }
+  out
+}
+
+///|
+// kept across runs: an app's main sets it once; put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: hang_tell
+
+///|
+// kept across runs: an app's main sets it once; put back as a run begins (journal_reset)
+// moved to 00_init_order.pion: hang_summary_tell
+
+///|
+/// `f` told each hang as it is found (None: no one), after the work it was found in, outside any build: what an app
+/// sends where it sends its reports (the app's src/the app/reports.pion).
+pub fn hangs_told(f : Option[(Hang) -> Unit]) -> Unit {
+  hang_tell.v = f
+  journal_listens()
+}
+
+///|
+/// `f` told what the app did while it was shown as it is hidden (HangSummary): hangs per hour shown.
+pub fn hang_summary_told(f : Option[(HangSummary) -> Unit]) -> Unit {
+  hang_summary_tell.v = f
+}
+
+///|
+fn journal_reset() -> Unit {
+  journal_ring.fill(Boundary(Seal::Idle, 0.0))
+  journal_at.fill(0)
+  journal_small.fill(0.0)
+  journal_dirty_at.v = -1.0
+  journal_asked.v = false
+  journal_hidden.v = false
+  journal_away.v = false
+  journal_presented.v = false
+  hangs_found.clear()
+  journal_counts.fill(0.0)
+  journal_counts[5] = -1.0
+  journal_bands.fill(0)
+  journal_moved.v = false
+  journal_laid.v = false
+  hang_tell.v = None
+  hang_summary_tell.v = None
+  journal_notes.clear()
+  journal_tree_work.v = (0, 0, 0, 0)
+  journal_passes.v = 0
+  journal_bindings.v = 0
+  journal_again.v = FixedArray::make(8, 0)
+  shown_names.clear()
+  shown_slot.v = 0
+  shown_said.v = ""
+  arranged_said.v = ("", 0.0, 0.0)
+  shown_counts.fill(0)
+  journal_late_bands.fill(0)
+  journal_extra_ms.fill(0.0)
+  summary_extras.v = []
+  gpu_frames_reset()
+  paint_glyph_reset()
+  journal_listens()
+}
+
+///|
+/// What a piece goes on told the journal by what runs it (@hostapi.work_part), on its clock: as a run begins and as an
+/// app listens for its hangs.
+fn journal_listens() -> Unit {
+  hostapi::work_noted_by(Some((work_now, fn(what, ms) { journal_notes.set(what, journal_notes.get(what).unwrap_or(0.0) + ms) })))
+}
+
+///|
+/// What the journal holds, oldest first: the last `journal_cap` entries.
+pub fn journal() -> Array[Entry] {
+  let n = journal_at[0]
+  let from = if n > journal_cap { n - journal_cap } else { 0 }
+  mbt_compat::arr_makei(n - from, fn(i) { journal_ring[mbt_compat::mod_checked_i32((from + i), journal_cap)] })
+}
+
+///|
+/// The last hangs found, oldest first (at most `hangs_kept_most`).
+pub fn hangs() -> Array[Hang] {
+  hangs_found.copy()
+}
+
+///|
+fn journal_put(e : Entry) -> Unit {
+  journal_ring[mbt_compat::mod_checked_i32(journal_at[0], journal_cap)] = e
+  journal_at[0] += 1
+}
+
+///|
+fn journal_flush_small() -> Unit {
+  if journal_small[0] > 0.0 {
+    journal_put(Entry::Work(Worked::{
+      what: Done::Small(journal_small[0].to_int(), journal_small[1]),
+      start: journal_small[2],
+      end: journal_small[3],
+      notes: [],
+    }))
+    journal_small.fill(0.0)
+  }
+}
+
+///|
+/// Drains accumulated `@hostapi.work_part` notes for the piece just finished, keeping the longest `journal_notes_kept`
+/// parts that took at least `journal_floor_ms`.
+fn journal_take_notes() -> Array[(String, Double)] {
+  if journal_notes.is_empty() {
+    []
+  } else {
+    let all = mbt_compat::arr_filter(journal_notes.to_array(), fn(n) { n.1 >= journal_floor_ms })
+    journal_notes.clear()
+    mbt_compat::arr_sort_by(all, fn(a, b) { b.1.compare(a.1) })
+    if all.length() > journal_notes_kept {
+      mbt_compat::array_slice_clamp(all, 0, journal_notes_kept)
+    } else {
+      all
+    }
+  }
+}
+
+///|
+/// A piece of work done from `start` to `end`: kept, or folded where it is short and of a kind that comes often (an
+/// event, what follows a frame). When `wall >= 4.0ms` and `cpu_ms >= 0.0`, attaches `("cpu", round_tenth(cpu_ms))`
+/// to `Worked.notes` (bypassing `journal_floor_ms` so OS preemption like wall=53.7ms, cpu=0.3ms is preserved).
+fn journal_work(what : Done, start : Double, end : Double, cpu_ms? : Double, late_ms? : Double, gpu_ms? : Double, gpu_dropped? : Int, taken_notes? : Option[Array[(String, Double)]]) -> Unit {
+  let cpu_ms = match cpu_ms { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let late_ms = match late_ms { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let gpu_ms = match gpu_ms { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let gpu_dropped = match gpu_dropped { Some(__mbt_v) => __mbt_v, None => 0 }
+  let taken_notes = match taken_notes { Some(__mbt_v) => __mbt_v, None => Option::None }
+
+  let wall_ms = end - start
+  if !journal_is_away() {
+    if journal_counts[5] < 0.0 {
+      journal_counts[5] = start
+    }
+    journal_counts[4] += wall_ms
+  }
+  // (what it went on, the longest first)
+  // (a part 1 ms in all at least: its pieces summed by where it was made, each as short as work_part tells)
+  let notes : Array[(String, Double)] = match taken_notes {
+    Some(ns) => ns
+    Option::None => journal_take_notes()
+  }
+  if wall_ms >= 4.0 && cpu_ms >= 0.0 {
+    notes.push(("cpu", journal_ms(cpu_ms)))
+  }
+  if late_ms > 0.0 {
+    notes.push(("late_ms", journal_ms(late_ms)))
+  }
+  if gpu_ms >= 0.0 {
+    notes.push(("gpu_ms", journal_ms(gpu_ms)))
+  }
+  if gpu_dropped > 0 {
+    notes.push(("gpu_dropped", gpu_dropped.to_double()))
+  }
+  let foldable = match what {
+    Done::Event(_) | Done::FrameEnd => true
+    _ => false
+  }
+  if foldable && end < start + journal_floor_ms {
+    if journal_small[0] == 0.0 {
+      journal_small[2] = start
+    }
+    journal_small[0] += 1.0
+    journal_small[1] += wall_ms
+    journal_small[3] = end
+    return
+  }
+  journal_flush_small()
+  journal_put(Entry::Work(Worked::{ what: what, start: start, end: end, notes: notes }))
+}
+
+///|
+/// A frame asked of the host (h_request_frame, h_frame_owed, h_request_frame_on): the open interval waits on it.
+fn journal_wants() -> Unit {
+  if journal_away.v || hostapi::frame_hidden() {
+    return
+  }
+  if frame_running.v {
+    journal_asked.v = true
+  } else if journal_dirty_at.v < 0.0 {
+    journal_dirty_at.v = work_now()
+  }
+}
+
+///|
+fn journal_cpu_delta(c0 : Double, c1 : Double) -> Double {
+  if c0 >= 0.0 && c1 >= c0 {
+    c1 - c0
+  } else {
+    -1.0
+  }
+}
+
+///|
+/// Reports a single slow piece from an off-screen/hidden window frame while another window of the process is visible,
+/// without mutating the shared foreground open interval (`journal_at[1]`, `journal_dirty_at`, `journal_counts`, `shown_counts`).
+fn journal_report_offscreen_piece(what : Done, start : Double, end : Double, cpu_ms? : Double, gpu_ms? : Double, gpu_dropped? : Int, taken_notes? : Option[Array[(String, Double)]]) -> Unit {
+  let cpu_ms = match cpu_ms { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let gpu_ms = match gpu_ms { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let gpu_dropped = match gpu_dropped { Some(__mbt_v) => __mbt_v, None => 0 }
+  let taken_notes = match taken_notes { Some(__mbt_v) => __mbt_v, None => Option::None }
+
+  let wall_ms = end - start
+  let notes : Array[(String, Double)] = match taken_notes {
+    Some(ns) => ns
+    Option::None => journal_take_notes()
+  }
+  let trigger = if wall_ms >= hang_stall_ms {
+    Stall
+  } else if wall_ms >= probe_slow_ms {
+    Blocking
+  } else {
+    return
+  }
+  if wall_ms >= 4.0 && cpu_ms >= 0.0 {
+    notes.push(("cpu", journal_ms(cpu_ms)))
+  }
+  if gpu_ms >= 0.0 {
+    notes.push(("gpu_ms", journal_ms(gpu_ms)))
+  }
+  if gpu_dropped > 0 {
+    notes.push(("gpu_dropped", gpu_dropped.to_double()))
+  }
+  let hang = Hang::{
+    trigger: trigger,
+    page: journal_shown(),
+    arranged: arranged_said.v.0,
+    window_w: arranged_said.v.1,
+    window_h: arranged_said.v.2,
+    sealed_by: Seal::Hidden,
+    startup: !journal_presented.v,
+    start: start,
+    end: end,
+    stall_ms: wall_ms,
+    work_ms: wall_ms,
+    pieces: 1,
+    small: 0,
+    small_ms: 0.0,
+    lost: 0,
+    contributors: [Worked::{ what: what, start: start, end: end, notes: notes }],
+    elided: 0,
+  }
+  if hangs_found.length() >= hangs_kept_most {
+    mbt_compat::arr_remove(hangs_found, 0) |> ignore
+  }
+  hangs_found.push(hang)
+  let line = hang.said()
+  h_log("HANG " + line)
+  hostapi::perf_line("hang: " + line)
+  if hang_tell.v is Some(f) {
+    signals::untracked(fn() { f(hang) })
+  }
+}
+
+///|
+/// An event from outside, the outermost, handled from `start` to now: kept, and where it left no frame asked for, the
+/// interval closed (idle; hidden where it hid the app).
+fn journal_event(what : String, start : Double, c0? : Double) -> Unit {
+  let c0 = match c0 { Some(__mbt_v) => __mbt_v, None => -1.0 }
+
+  let end = work_now()
+  let c1 = work_thread_cpu()
+  if hostapi::frame_hidden() && !journal_away.v && !journal_hidden.v {
+    journal_report_offscreen_piece(Done::Event(what), start, end, cpu_ms=journal_cpu_delta(c0, c1))
+    return
+  }
+  if what == "touch-move" {
+    journal_moved.v = true
+  }
+  journal_work(Done::Event(what), start, end, cpu_ms=journal_cpu_delta(c0, c1))
+  if journal_hidden.v {
+    journal_hidden.v = false
+    journal_dirty_at.v = -1.0
+    journal_asked.v = false
+    journal_seal(Seal::Hidden, end, away=false)
+    journal_said_shown(end)
+  } else if journal_away.v {
+    journal_dirty_at.v = -1.0
+    journal_asked.v = false
+    journal_seal(Seal::Hidden, end, away=true)
+  } else if journal_dirty_at.v < 0.0 {
+    journal_seal(Seal::Idle, end, away=false)
+  }
+}
+
+///|
+/// A frame's work from `tw` (its tree brought) and its own from `t0`, presented from `t3` to `t4`: kept, and the
+/// interval closed by it.
+fn journal_frame(c : Ctx, tw : Double, t0 : Double, t3 : Double, t4 : Double, cw? : Double, c3? : Double, c4? : Double, frame_notes? : Option[Array[(String, Double)]]) -> Unit {
+  let cw = match cw { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let c3 = match c3 { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let c4 = match c4 { Some(__mbt_v) => __mbt_v, None => -1.0 }
+  let frame_notes = match frame_notes { Some(__mbt_v) => __mbt_v, None => Option::None }
+
+  let why = if t3 - tw < probe_slow_ms {
+    ""
+  } else if built_why.v != "" {
+    "built" + journal_places(built_why.v)
+  } else if painted_why.v != "" {
+    "painted" + journal_places(painted_why.v)
+  } else {
+    "looks" + journal_places(looks_why())
+  }
+  let msgs = probe_msgs_ms.v
+  // (what the window's tree did since the frame before: its counts now less those kept then)
+  let (now, passes, again, bindings) = match view_app.v {
+    Some(tree) => {
+      let w = tree.work()
+      ((w.made, w.let_go, w.laid, w.measured), w.passes, w.again, w.bindings_run)
+    }
+    Option::None => ((0, 0, 0, 0), 0, FixedArray::make(8, 0), 0)
+  }
+  let bindings_was = journal_bindings.v
+  journal_bindings.v = bindings
+  let was = journal_tree_work.v
+  journal_tree_work.v = now
+  let passes_was = journal_passes.v
+  journal_passes.v = passes
+  let again_said : Array[String] = []
+  for i, n in again {
+    let d = journal_since(n, journal_again.v[i])
+    if d > 0 && i < view::again_names.length() {
+      again_said.push("\{view::again_names[i]}=\{d}")
+    }
+    journal_again.v[i] = n
+  }
+  let offscreen = hostapi::frame_hidden() && !journal_away.v && !journal_hidden.v
+  if !offscreen {
+    journal_laid.v = journal_since(now.2, was.2) > 0
+  }
+  let away = journal_is_away()
+  let late = hostapi::frame_late()
+  if !away && late > 0.0 {
+    journal_late_bands[late_band(late)] += 1
+    if late > journal_extra_ms[0] {
+      journal_extra_ms[0] = late
+    }
+  }
+  let (gms, gdrop, gslow) = gpu_frame_consume()
+  let frame_done = Frame(FrameDone::{
+    tree: t0 - tw,
+    messages: msgs,
+    build: c.t_build - msgs,
+    layout: c.t_layout,
+    paint: c.t_paint,
+    nodes: c.count,
+    insts: c.ninst,
+    made: journal_since(now.0, was.0),
+    let_go: journal_since(now.1, was.1),
+    laid: journal_since(now.2, was.2),
+    measured: journal_since(now.3, was.3),
+    passes: journal_since(passes, passes_was),
+    again: again_said.join(" "),
+    bindings: journal_since(bindings, bindings_was),
+    why: why,
+  })
+  if offscreen {
+    journal_report_offscreen_piece(frame_done, tw, t3, cpu_ms=journal_cpu_delta(cw, c3), gpu_ms=gms, gpu_dropped=gdrop, taken_notes=frame_notes)
+    journal_report_offscreen_piece(Done::Present, t3, t4, cpu_ms=journal_cpu_delta(c3, c4))
+    return
+  }
+  journal_work(frame_done, tw, t3, cpu_ms=journal_cpu_delta(cw, c3), late_ms=if away { -1.0 } else { late }, gpu_ms=gms, gpu_dropped=gdrop, taken_notes=frame_notes)
+  journal_work(Done::Present, t3, t4, cpu_ms=journal_cpu_delta(c3, c4))
+  if away {
+    journal_seal(Seal::Hidden, t4, away=true)
+  } else {
+    journal_counts[0] += 1.0
+    if journal_counts[0].to_int() % 60 == 1 {
+      journal_sample_mem()
+    }
+    shown_counts[shown_slot.v * 4] += 1
+    journal_seal(Seal::Presented, t4, gpu_slow=gslow, away=false)
+    journal_presented.v = true
+  }
+  journal_dirty_at.v = -1.0
+}
+
+///|
+/// The window's tree's counts as the last frame was kept (journal_frame): nodes made, let go, laid out, words measured.
+// kept across runs: put back as a run begins (journal_reset), written as each frame is kept
+// moved to 00_init_order.pion: journal_tree_work
+
+///|
+/// The window's tree's layout passes, and those run again inside one by cause, as the last frame was kept.
+// kept across runs: put back as a run begins (journal_reset), written as each frame is kept
+// moved to 00_init_order.pion: journal_passes
+
+///|
+/// The window's tree's bindings run, as the last frame was kept.
+// kept across runs: put back as a run begins (journal_reset), written as each frame is kept
+// moved to 00_init_order.pion: journal_bindings
+
+///|
+// kept across runs: put back as a run begins (journal_reset), written as each frame is kept
+// moved to 00_init_order.pion: journal_again
+
+///|
+/// A count's rise since it was `was`: all of it where it is below (another tree in the first's place counts from 0).
+fn journal_since(now : Int, was : Int) -> Int {
+  if now >= was { now - was } else { now }
+}
+
+///|
+/// The frame presented at `t4` ended now: what it did after kept; a frame asked for as it ran waited on from its
+/// presenting, else the thread idle.
+fn journal_frame_ended(t4 : Double, c4? : Double) -> Unit {
+  let c4 = match c4 { Some(__mbt_v) => __mbt_v, None => -1.0 }
+
+  let end = work_now()
+  let cend = work_thread_cpu()
+  if hostapi::frame_hidden() && !journal_away.v && !journal_hidden.v {
+    journal_report_offscreen_piece(Done::FrameEnd, t4, end, cpu_ms=journal_cpu_delta(c4, cend))
+    return
+  }
+  journal_work(Done::FrameEnd, t4, end, cpu_ms=journal_cpu_delta(c4, cend))
+  if journal_hidden.v {
+    journal_hidden.v = false
+    journal_asked.v = false
+    journal_dirty_at.v = -1.0
+    journal_seal(Seal::Hidden, end, away=false)
+    journal_said_shown(end)
+  } else if journal_away.v {
+    journal_asked.v = false
+    journal_dirty_at.v = -1.0
+    journal_seal(Seal::Hidden, end, away=true)
+  } else if journal_asked.v {
+    journal_asked.v = false
+    if journal_dirty_at.v < 0.0 {
+      journal_dirty_at.v = t4
+    }
+  } else if journal_dirty_at.v < 0.0 {
+    journal_seal(Seal::Idle, end, away=false)
+  }
+}
+
+///|
+/// The open interval closed by `seal` at `at`, looked over for a hang.
+fn journal_seal(seal : Seal, at : Double, gpu_slow? : Bool, away? : Bool) -> Unit {
+  let gpu_slow = match gpu_slow { Some(__mbt_v) => __mbt_v, None => false }
+  let away = match away { Some(__mbt_v) => __mbt_v, None => journal_away.v }
+
+  journal_flush_small()
+  let from = journal_at[1]
+  let to = journal_at[0]
+  // (the ring keeps the last journal_cap: what of the interval is older is lost)
+  let first = if to - from > journal_cap { to - journal_cap } else { from }
+  let lost = first - from
+  let dirty = journal_dirty_at.v
+  let startup = !journal_presented.v
+  let moved = journal_moved.v
+  let laid = journal_laid.v
+  journal_moved.v = false
+  journal_laid.v = false
+  journal_put(Entry::Boundary(seal, at))
+  journal_at[1] = journal_at[0]
+  if to == from {
+    journal_maybe_roll_summary(seal, at, away=away)
+    return
+  }
+  // (summed first with nothing made, as every frame closes one: what is kept of it only where it is a hang)
+  let mut pieces = 0
+  let mut small = 0
+  let mut small_ms = 0.0
+  let mut work = 0.0
+  let mut longest = 0.0
+  // (what the frame waited on: all since it was asked for, what asked for it too; a frame the host drew of its own,
+  // all of the interval)
+  let mut waited = 0.0
+  let waits = fn(w : Worked) { dirty < 0.0 || w.end >= dirty }
+  for i in first..<to {
+    match journal_ring[mbt_compat::mod_checked_i32(i, journal_cap)] {
+      Entry::Work(__mbt_sp_95) if (match __mbt_sp_95.what { Small(k, ms) => true, _ => false }) => match __mbt_sp_95.what { Small(k, ms) => {
+        small += k
+        small_ms += ms
+        work += ms
+      }, _ => panic("unreachable") }
+      Entry::Work(w) => {
+        pieces += 1
+        work += w.ms()
+        longest = dmax(longest, w.ms())
+        if waits(w) {
+          waited += w.ms()
+        }
+      }
+      Entry::Boundary(_, _) => ()
+    }
+  }
+  // (a frame presented, counted by what it waited on: every one, a hang or not)
+  if seal == Seal::Presented && lost == 0 && !away {
+    let kind = (if moved { 2 } else { 0 }) + (if laid { 1 } else { 0 })
+    journal_bands[kind * 6 + frame_band(waited + small_ms)] += 1
+  }
+  let trigger = if longest >= hang_stall_ms {
+    Stall
+  } else if seal == Seal::Presented {
+    if lost > 0 || (waited + small_ms < probe_slow_ms && !gpu_slow) {
+      journal_maybe_roll_summary(seal, at, away=away)
+      return
+    }
+    LateFrame
+  } else if longest >= probe_slow_ms {
+    Blocking
+  } else {
+    journal_maybe_roll_summary(seal, at, away=away)
+    return
+  }
+  let mut contributors : Array[Worked] = []
+  for i in first..<to {
+    if journal_ring[mbt_compat::mod_checked_i32(i, journal_cap)] is Entry::Work(w) && !(w.what is Small(_, _)) {
+      let made = match trigger {
+        Stall => w.ms() >= hang_stall_ms
+        LateFrame => waits(w)
+        Blocking => w.ms() >= probe_slow_ms
+      }
+      if made {
+        contributors.push(w)
+      }
+    }
+  }
+  let mut start = at
+  for w in contributors {
+    start = dmin(start, w.start)
+  }
+  if seal == Seal::Presented && dirty >= 0.0 {
+    start = dmin(start, dirty)
+  }
+  mbt_compat::arr_sort_by(contributors, fn(a, b) { b.ms().compare(a.ms()) })
+  let elided = if contributors.length() > hang_contributors_kept {
+    contributors.length() - hang_contributors_kept
+  } else {
+    0
+  }
+  if elided > 0 {
+    contributors = mbt_compat::array_slice_clamp(contributors, 0, hang_contributors_kept)
+  }
+  let hang = Hang::{
+    trigger: trigger,
+    page: journal_shown(),
+    arranged: arranged_said.v.0,
+    window_w: arranged_said.v.1,
+    window_h: arranged_said.v.2,
+    sealed_by: seal,
+    startup: startup,
+    start: start,
+    end: at,
+    stall_ms: longest,
+    work_ms: work,
+    pieces: pieces,
+    small: small,
+    small_ms: small_ms,
+    lost: lost,
+    contributors: contributors,
+    elided: elided,
+  }
+  let count = match trigger {
+    Stall => 1
+    LateFrame => 2
+    Blocking => 3
+  }
+  if !away {
+    journal_counts[count] += 1.0
+    shown_counts[shown_slot.v * 4 + count] += 1
+  }
+  if hangs_found.length() >= hangs_kept_most {
+    mbt_compat::arr_remove(hangs_found, 0) |> ignore
+  }
+  hangs_found.push(hang)
+  let line = hang.said()
+  h_log("HANG " + line)
+  hostapi::perf_line("hang: " + line)
+  if hang_tell.v is Some(f) {
+    signals::untracked(fn() { f(hang) })
+  }
+  journal_maybe_roll_summary(seal, at, away=away)
+}
+
+///|
+/// The app hidden (or rolled after 10 minutes) at `at`: what it did while shown said (hang_summary_told), its counts
+/// begun again.
+fn journal_said_shown(at : Double) -> Unit {
+  journal_sample_mem()
+  let since = journal_counts[5]
+  let n = frame_band_ms.length() + 1
+  let bands = fn(kind : Int) { mbt_compat::arr_makei(n, fn(i) { journal_bands[kind * n + i] }) }
+  let gpu_by_page = gpu_by_page_take()
+  let late_n = late_band_ms.length() + 1
+  let extra : SummaryExtra = SummaryExtra::{
+    late_counts: mbt_compat::arr_makei(late_n, fn(i) { journal_late_bands[i] }),
+    late_worst: journal_extra_ms[0],
+    mem_peak_mb: journal_extra_ms[1],
+    gpu_by_page: gpu_by_page,
+  }
+  let summary = HangSummary::{
+    shown_ms: if since < 0.0 { 0.0 } else { at - since },
+    work_ms: journal_counts[4],
+    frames: journal_counts[0].to_int(),
+    stalls: journal_counts[1].to_int(),
+    late: journal_counts[2].to_int(),
+    blocking: journal_counts[3].to_int(),
+    still: bands(0),
+    still_laid: bands(1),
+    moved: bands(2),
+    moved_laid: bands(3),
+    by_page: shown_by_page(),
+    gpu: gpu_frames_take(),
+  }
+  if summary_extras.v.length() >= hangs_kept_most {
+    mbt_compat::arr_remove(summary_extras.v, 0) |> ignore
+  }
+  summary_extras.v.push((summary, extra))
+  journal_counts.fill(0.0)
+  journal_counts[5] = -1.0
+  journal_bands.fill(0)
+  journal_late_bands.fill(0)
+  journal_extra_ms.fill(0.0)
+  shown_counts.fill(0)
+  // (the names begun again, the one shown now first: a long run's names past the most are told apart again)
+  shown_names.clear()
+  shown_slot.v = shown_slot_of(shown_said.v)
+  if hang_summary_tell.v is Some(f) {
+    signals::untracked(fn() { f(summary) })
+  }
+}
+
+///|
+/// Of what a frame's why says (frame_watch.pion's built_why, painted_why, looks_why), the code it names alone
+/// (`….pion:line…`, at most 4, each once), each after a space: no key of a motion, a row or a page, which may carry an
+/// id of what is shown.
+fn journal_places(why : String) -> String {
+  let out : Array[String] = []
+  let word = StringBuilder()
+  let take = fn(w : String) {
+    if w.contains(".pion:") && !out.contains(w) && out.length() < 4 {
+      out.push(w)
+    }
+  }
+  { let __mbt_s_1136 = why; let __mbt_sn_1136 = mbt_compat::str_byte_len(__mbt_s_1136); let mut __mbt_sp_1136 = 0; while __mbt_sp_1136 < __mbt_sn_1136 { let (__mbt_ch_1136, __mbt_spn_1136) = mbt_compat::str_cursor_step(__mbt_s_1136, __mbt_sp_1136); __mbt_sp_1136 = __mbt_spn_1136; let ch = __mbt_ch_1136;
+    if mbt_compat::char_is_ascii_alphabetic(ch) || mbt_compat::char_is_ascii_digit(ch) || ch == '_' || ch == '.' || ch == '/' || ch == ':' || ch == '-' || ch == '@' {
+      word.write_char(ch)
+    } else {
+      take(word.to_string())
+      word.reset()
+    }
+  } }
+  take(word.to_string())
+  mbt_compat::arr_map(out, fn(w) { " " + w }).join("")
+}
+
+///|
+fn journal_ms(x : Double) -> Double {
+  (x * 10.0).round() / 10.0
+}
+
+///|
+fn Seal::name(self : Seal) -> String {
+  match self {
+    Seal::Presented => "presented"
+    Seal::Idle => "idle"
+    Seal::Hidden => "hidden"
+  }
+}
+
+///|
+fn HangTrigger::name(self : HangTrigger) -> String {
+  match self {
+    HangTrigger::Stall => "stall"
+    HangTrigger::LateFrame => "late_frame"
+    HangTrigger::Blocking => "blocking"
+  }
+}
+
+///|
+fn Done::name(self : Done) -> String {
+  match self {
+    Done::Event(what) => what
+    Done::Frame(_) => "frame"
+    Done::Present => "present"
+    Done::FrameEnd => "frame-end"
+    Done::Small(_, _) => "small"
+  }
+}
+
+///|
+/// A piece of work in a few words: its kind and ms, a frame's parts and why.
+fn Worked::said(self : Worked) -> String {
+  let head = "\{Done::name(self.what)} \{mbt_compat::double_to_string(journal_ms(self.ms()))}ms"
+  match self.what {
+    Done::Frame(f) =>
+    head +
+    " (tree=\{mbt_compat::double_to_string(journal_ms(f.tree))} msgs=\{mbt_compat::double_to_string(journal_ms(f.messages))} build=\{mbt_compat::double_to_string(journal_ms(f.build))} layout=\{mbt_compat::double_to_string(journal_ms(f.layout))} paint=\{mbt_compat::double_to_string(journal_ms(f.paint))} nodes=\{f.nodes} insts=\{f.insts}" +
+    (if f.passes > 1 { " passes=\{f.passes}" } else { "" }) +
+    (if f.again != "" { " again: " + f.again } else { "" }) +
+    (if f.why != "" { " " + f.why } else { "" }) +
+    ")" +
+    self.notes_said()
+    _ => head + self.notes_said()
+  }
+}
+
+///|
+/// What it went on, in a few words (" on part 12ms, …"); "" none.
+fn Worked::notes_said(self : Worked) -> String {
+  if self.notes.is_empty() {
+    ""
+  } else {
+    " on " +
+    mbt_compat::arr_map(self.notes, fn(n) {
+      if n.0 == "gpu_dropped" {
+        "gpu_dropped=\{n.1.round().to_int()}"
+      } else {
+        "\{n.0} \{mbt_compat::double_to_string(journal_ms(n.1))}ms"
+      }
+    })
+    .join(", ")
+  }
+}
+
+///|
+/// The hang in a line (the log's `HANG`, the performance record's `hang:`): its rule, what closed it, what the app
+/// showed (none said: not said), its times, what made it one, the longest first.
+pub fn Hang::said(self : Hang) -> String {
+  let active = self.end - self.start
+  let busy = if active > 0.0 { (dmin(self.work_ms / active, 1.0) * 100.0).round() } else { 100.0 }
+  "trigger=\{HangTrigger::name(self.trigger)} sealed=\{Seal::name(self.sealed_by)} phase=\{if self.startup { "startup" } else { "steady" }} " +
+  (if self.page != "" { "page=\{self.page} " } else { "" }) +
+  (if self.arranged != "" { "arranged=\{self.arranged} " } else { "" }) +
+  (if self.window_w > 0.0 { "window=\{mbt_compat::double_to_string(self.window_w.round())}x\{mbt_compat::double_to_string(self.window_h.round())} " } else { "" }) +
+  "active=\{mbt_compat::double_to_string(journal_ms(active))}ms stall=\{mbt_compat::double_to_string(journal_ms(self.stall_ms))}ms work=\{mbt_compat::double_to_string(journal_ms(self.work_ms))}ms busy=\{mbt_compat::double_to_string(busy)}% " +
+  "pieces=\{self.pieces} small=\{self.small}/\{mbt_compat::double_to_string(journal_ms(self.small_ms))}ms lost=\{self.lost} by: " +
+  mbt_compat::arr_map(self.contributors, fn(w) { w.said() }).join(" | ") +
+  (if self.elided > 0 { " | +\{self.elided}" } else { "" })
+}
+
+///|
+/// The hang as JSON (what an app sends of it: the app's reports.pion): its times from its start (ms), each
+/// contributor its kind, start, ms, and a frame's parts; what the app showed as `page`, how it laid it out as
+/// `arranged` and the window's size as `window_w`, `window_h` (none said: no field).
+pub fn Hang::json(self : Hang) -> mbt_compat::MbtJson {
+  let active = self.end - self.start
+  let mut has_gpu_slow = false
+  let contributors = mbt_compat::arr_map(self.contributors, fn(w) {
+    let o : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("kind", mbt_compat::MbtJson::string(Done::name(w.what))), ("start_ms", mbt_compat::MbtJson::number(journal_ms(w.start - self.start))), ("ms", mbt_compat::MbtJson::number(journal_ms(w.ms())))])
+    if w.notes.length() > 0 {
+      let parts : Array[mbt_compat::MbtJson] = []
+      for n in w.notes {
+        if n.0 == "cpu" {
+          o.set("cpu", mbt_compat::MbtJson::number(journal_ms(n.1)))
+        } else if n.0 == "late_ms" {
+          o.set("late_ms", mbt_compat::MbtJson::number(journal_ms(n.1)))
+        } else if n.0 == "gpu_ms" {
+          let v = journal_ms(n.1)
+          o.set("gpu_ms", mbt_compat::MbtJson::number(v))
+          if v >= gpu_budget_hang_ms {
+            has_gpu_slow = true
+          }
+        } else if n.0 == "gpu_dropped" {
+          let v = n.1.round()
+          o.set("gpu_dropped", mbt_compat::MbtJson::number(v))
+          if v > 0.0 {
+            has_gpu_slow = true
+          }
+        } else {
+          parts.push(mbt_compat::MbtJson::object(({ let __mbt_pairs_1264_35 = [("part", mbt_compat::MbtJson::string(n.0)), ("ms", mbt_compat::MbtJson::number(journal_ms(n.1)))]; mbt_compat::ordered_map_from_array(__mbt_pairs_1264_35) })))
+        }
+      }
+      if parts.length() > 0 {
+        o.set("parts", mbt_compat::MbtJson::array(parts))
+      }
+    }
+    if w.what is Done::Frame(f) {
+      o.set("tree_ms", mbt_compat::MbtJson::number(journal_ms(f.tree)))
+      o.set("messages_ms", mbt_compat::MbtJson::number(journal_ms(f.messages)))
+      o.set("build_ms", mbt_compat::MbtJson::number(journal_ms(f.build)))
+      o.set("layout_ms", mbt_compat::MbtJson::number(journal_ms(f.layout)))
+      o.set("paint_ms", mbt_compat::MbtJson::number(journal_ms(f.paint)))
+      o.set("nodes", mbt_compat::MbtJson::number(f.nodes.to_double()))
+      o.set("insts", mbt_compat::MbtJson::number(f.insts.to_double()))
+      o.set("made", mbt_compat::MbtJson::number(f.made.to_double()))
+      o.set("let_go", mbt_compat::MbtJson::number(f.let_go.to_double()))
+      o.set("laid", mbt_compat::MbtJson::number(f.laid.to_double()))
+      o.set("measured", mbt_compat::MbtJson::number(f.measured.to_double()))
+      o.set("passes", mbt_compat::MbtJson::number(f.passes.to_double()))
+      o.set("bindings", mbt_compat::MbtJson::number(f.bindings.to_double()))
+      if f.again != "" {
+        o.set("again", mbt_compat::MbtJson::string(f.again))
+      }
+      o.set("why", mbt_compat::MbtJson::string(f.why))
+    }
+    mbt_compat::MbtJson::object(o)
+  })
+  let o : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("trigger", mbt_compat::MbtJson::string(HangTrigger::name(self.trigger))), ("sealed_by", mbt_compat::MbtJson::string(Seal::name(self.sealed_by))), ("phase", mbt_compat::MbtJson::string(if self.startup { "startup" } else { "steady" })), ("active_ms", mbt_compat::MbtJson::number(journal_ms(active))), ("stall_ms", mbt_compat::MbtJson::number(journal_ms(self.stall_ms))), ("work_ms", mbt_compat::MbtJson::number(journal_ms(self.work_ms))), ("busy_fraction", mbt_compat::MbtJson::number(
+    if active > 0.0 { (dmin(self.work_ms / active, 1.0) * 100.0).round() / 100.0 } else { 1.0 },
+  )), ("pieces", mbt_compat::MbtJson::number(self.pieces.to_double())), ("small_count", mbt_compat::MbtJson::number(self.small.to_double())), ("small_ms", mbt_compat::MbtJson::number(journal_ms(self.small_ms))), ("lost", mbt_compat::MbtJson::number(self.lost.to_double())), ("contributors", mbt_compat::MbtJson::array(contributors)), ("contributors_elided", mbt_compat::MbtJson::number(self.elided.to_double()))])
+  if self.trigger is HangTrigger::LateFrame && self.work_ms < probe_slow_ms && has_gpu_slow {
+    o.set("gpu_only", mbt_compat::MbtJson::boolean(true))
+  }
+  if self.page != "" {
+    o.set("page", mbt_compat::MbtJson::string(self.page))
+  }
+  if self.arranged != "" {
+    o.set("arranged", mbt_compat::MbtJson::string(self.arranged))
+  }
+  if self.window_w > 0.0 {
+    o.set("window_w", mbt_compat::MbtJson::number(self.window_w.round()))
+    o.set("window_h", mbt_compat::MbtJson::number(self.window_h.round()))
+  }
+  let hz = hostapi::display_hz()
+  if hz > 0.0 {
+    o.set("display_hz", mbt_compat::MbtJson::number(hz.round()))
+  }
+  mbt_compat::MbtJson::object(o)
+}
+
+///|
+fn summary_extra_of(s : HangSummary) -> Option[SummaryExtra] {
+  for i = summary_extras.v.length() - 1; i >= 0; i = i - 1 {
+    if physical_equal(s, summary_extras.v[i].0) {
+      return Some(summary_extras.v[i].1)
+    }
+  }
+  Option::None
+}
+
+///|
+/// The summary as JSON (reports.pion's): its counts by what was shown as `by_page`, each name's [frames, stalls, late
+/// frames, blocking] (none said yet: under ""); what the drawing side did as `gpu`, where its host said any (a GPU
+/// time known, a frame never drawn).
+pub fn HangSummary::json(self : HangSummary) -> mbt_compat::MbtJson {
+  let by_page : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_new()
+  for p in self.by_page {
+    by_page.set(p.0, journal_counts_json([p.1, p.2, p.3, p.4]))
+  }
+  let o : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("shown_ms", mbt_compat::MbtJson::number(journal_ms(self.shown_ms))), ("work_ms", mbt_compat::MbtJson::number(journal_ms(self.work_ms))), ("frames", mbt_compat::MbtJson::number(self.frames.to_double())), ("stalls", mbt_compat::MbtJson::number(self.stalls.to_double())), ("late_frames", mbt_compat::MbtJson::number(self.late.to_double())), ("blocking", mbt_compat::MbtJson::number(self.blocking.to_double())), ("frames_by_ms", mbt_compat::MbtJson::Object(mbt_compat::ordered_map_from_array([("bounds", mbt_compat::MbtJson::array(mbt_compat::arr_makei(frame_band_ms.length(), fn(i) { mbt_compat::MbtJson::number(frame_band_ms[i]) }))), ("still", journal_counts_json(self.still)), ("still_laid", journal_counts_json(self.still_laid)), ("moved", journal_counts_json(self.moved)), ("moved_laid", journal_counts_json(self.moved_laid))]))), ("by_page", mbt_compat::MbtJson::object(by_page))])
+  let extra = summary_extra_of(self)
+  match extra {
+    Some(e) => {
+      if e.late_worst > 0.0 {
+        o.set("late_to_screen", mbt_compat::MbtJson::Object(mbt_compat::ordered_map_from_array([("bounds", mbt_compat::MbtJson::array(mbt_compat::arr_makei(late_band_ms.length(), fn(i) { mbt_compat::MbtJson::number(late_band_ms[i]) }))), ("counts", journal_counts_json(e.late_counts)), ("worst_ms", mbt_compat::MbtJson::number(journal_ms(e.late_worst)))])))
+      }
+      if e.mem_peak_mb > 0.0 {
+        o.set("mem_peak_mb", mbt_compat::MbtJson::number(journal_ms(e.mem_peak_mb)))
+      }
+    }
+    Option::None => ()
+  }
+  let g = self.gpu
+  if g.timed > 0 || g.dropped > 0 {
+    let gpu_obj : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_from_array([("frames", mbt_compat::MbtJson::number(g.timed.to_double())), ("over_8ms", mbt_compat::MbtJson::number(g.over_120.to_double())), ("over_16ms", mbt_compat::MbtJson::number(g.over_60.to_double())), ("over_24ms", mbt_compat::MbtJson::number(g.over_hang.to_double())), ("worst_ms", mbt_compat::MbtJson::number(journal_ms(g.worst_ms))), ("dropped", mbt_compat::MbtJson::number(g.dropped.to_double()))])
+    match extra {
+      Some(e) if !e.gpu_by_page.is_empty() => {
+        let gbp : mbt_compat::OrderedMap[String, mbt_compat::MbtJson] = mbt_compat::ordered_map_new()
+        for p in e.gpu_by_page {
+          gbp.set(p.0, mbt_compat::MbtJson::array([mbt_compat::MbtJson::number(p.1.to_double()), mbt_compat::MbtJson::number(p.2.to_double()), mbt_compat::MbtJson::number(p.3.to_double()), mbt_compat::MbtJson::number(p.4.to_double()), mbt_compat::MbtJson::number(journal_ms(p.5)), mbt_compat::MbtJson::number(p.6.to_double())]))
+        }
+        gpu_obj.set("by_page", mbt_compat::MbtJson::object(gbp))
+      }
+      _ => ()
+    }
+    o.set("gpu", mbt_compat::MbtJson::object(gpu_obj))
+  }
+  let hz = hostapi::display_hz()
+  if hz > 0.0 {
+    o.set("display_hz", mbt_compat::MbtJson::number(hz.round()))
+  }
+  mbt_compat::MbtJson::object(o)
+}
+
+///|
+fn journal_counts_json(counts : Array[Int]) -> mbt_compat::MbtJson {
+  mbt_compat::MbtJson::array(mbt_compat::arr_map(counts, fn(k) { mbt_compat::MbtJson::number(k.to_double()) }))
+}
