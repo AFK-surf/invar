@@ -2171,21 +2171,22 @@ void mb_atlas_upload(int color, int x, int y, int w, int h, const void *px) {
   os_unfair_lock_unlock(&present_mu);
 }
 
-// The atlas `color` made texture `t`'s pages (a PAGES op, on the thread that draws): the pages both have copied into it
-// on the GPU (the queue's, after what it holds: done before a glyph is put in it on the CPU), put in the old one's
-// place. What the GPU still draws with the old one keeps it till done.
+// The atlas `color` made texture `t`'s pages (a PAGES op, on the thread that draws): the pages both have copied into it,
+// put in the old one's place. Copied on the CPU, as every glyph is put in (replaceRegion): the CPU's is what the atlas
+// holds on any Mac, a blit's slices on the GPU were lost on a paravirtual one (GitHub's macOS runners), and nothing waits
+// for the GPU. What the GPU still draws with the old one keeps it till done.
 static void atlas_pages_put(int color, id<MTLTexture> t) {
   id<MTLTexture> old = color ? catlas : atlas;
   NSUInteger keep = old ? MIN(old.arrayLength, t.arrayLength) : 0;
-  if (keep > 0) {
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-    [bl copyFromTexture:old sourceSlice:0 sourceLevel:0 toTexture:t destinationSlice:0 destinationLevel:0
-             sliceCount:keep levelCount:1];
-    [bl endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
+  NSUInteger side = MIN(old ? old.width : 0, t.width), row = side * (color ? 4 : 1);
+  uint8_t *page = keep > 0 && side > 0 ? malloc(row * side) : NULL;
+  for (NSUInteger i = 0; page && i < keep; i++) {
+    [old getBytes:page bytesPerRow:row bytesPerImage:0 fromRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0
+              slice:i];
+    [t replaceRegion:MTLRegionMake2D(0, 0, side, side) mipmapLevel:0 slice:i withBytes:page bytesPerRow:row
+         bytesPerImage:0];
   }
+  free(page);
   if (color) catlas = t;
   else atlas = t;
 }
