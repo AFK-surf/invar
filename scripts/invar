@@ -255,24 +255,33 @@ def _read_u32_leb(data, pos):
 def parse_wasm_imports(wasm_path):
     with open(wasm_path, "rb") as f:
         data = f.read()
-    if len(data) < 8 or data[:4] != b"\x00asm":
-        raise ValueError("Invalid WASM magic header")
+    if len(data) < 8 or data[:4] != b"\x00asm" or data[4:8] != b"\x01\x00\x00\x00":
+        raise ValueError("Invalid WASM magic header or version")
     pos = 8
+    n = len(data)
     imports = []
-    while pos < len(data):
+    while pos < n:
         sec_id = data[pos]
         pos += 1
         sec_len, pos = _read_u32_leb(data, pos)
         sec_end = pos + sec_len
+        if sec_end > n:
+            raise ValueError(f"Truncated WASM section {sec_id}: {sec_end} > {n}")
         if sec_id == 2:  # Import section
             count, pos = _read_u32_leb(data, pos)
             for _ in range(count):
                 mlen, pos = _read_u32_leb(data, pos)
+                if pos + mlen > sec_end:
+                    raise ValueError("Truncated WASM import module name")
                 mod = data[pos:pos + mlen].decode("utf-8", errors="replace")
                 pos += mlen
                 nlen, pos = _read_u32_leb(data, pos)
+                if pos + nlen > sec_end:
+                    raise ValueError("Truncated WASM import field name")
                 name = data[pos:pos + nlen].decode("utf-8", errors="replace")
                 pos += nlen
+                if pos >= sec_end:
+                    raise ValueError("Truncated WASM import descriptor")
                 kind = data[pos]
                 pos += 1
                 if kind == 0x00:  # func
@@ -293,10 +302,76 @@ def parse_wasm_imports(wasm_path):
                 elif kind == 0x04:  # tag
                     pos += 1
                     _, pos = _read_u32_leb(data, pos)
+                else:
+                    raise ValueError(f"Unknown WASM import kind {kind}")
+                if pos > sec_end:
+                    raise ValueError("Truncated WASM import section")
                 imports.append((mod, name, kind))
-            break
+            if pos != sec_end:
+                raise ValueError("Malformed WASM import section length")
         pos = sec_end
+    if pos != n:
+        raise ValueError("Truncated WASM binary")
     return imports
+
+
+def _validate_wasm_binary(wasm_path):
+    try:
+        parse_wasm_imports(wasm_path)
+    except (OSError, ValueError) as e:
+        return False, f"Invalid prebuilt wasm binary ({wasm_path}): {e}"
+    node = shutil.which("node")
+    if not node:
+        return False, "node is required to validate --prebuilt-wasm"
+    rc, out, err, _ = run_cmd([
+        node,
+        "-e",
+        "const fs=require('fs'); process.exit(WebAssembly.validate(fs.readFileSync(process.argv[1])) ? 0 : 1);",
+        wasm_path,
+    ])
+    if rc != 0:
+        detail = (out + err).strip()
+        msg = f"WebAssembly.validate failed for {wasm_path}"
+        if detail:
+            msg += f": {detail}"
+        return False, msg
+    return True, ""
+
+
+def _validate_export_dst(dst, forbidden_paths=()):
+    dst_abs = os.path.abspath(dst)
+    if os.path.isdir(dst_abs):
+        return False, f"Export destination is an existing directory: {dst_abs}"
+    dst_real = os.path.realpath(dst_abs)
+    for fp in forbidden_paths:
+        fp_abs = os.path.abspath(fp)
+        if dst_real == os.path.realpath(fp_abs):
+            return False, f"Export destination conflicts with managed output file: {dst_abs}"
+        if os.path.exists(dst_abs) and os.path.exists(fp_abs):
+            try:
+                if os.path.samefile(dst_abs, fp_abs):
+                    return False, f"Export destination conflicts with managed output file: {dst_abs}"
+            except OSError:
+                pass
+    return True, dst_abs
+
+
+def _export_artifact_file(src, dst, forbidden_paths=()):
+    ok, res = _validate_export_dst(dst, forbidden_paths=forbidden_paths)
+    if not ok:
+        return False, res
+    dst_abs = res
+    if os.path.exists(dst_abs):
+        try:
+            if os.path.samefile(src, dst_abs):
+                return True, ""
+        except OSError:
+            pass
+    parent = os.path.dirname(dst_abs)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy2(src, dst_abs)
+    return True, ""
 
 
 def extract_web_provided_pion_rt():
@@ -3191,46 +3266,104 @@ def _web_dist_reconcile(out_dir, managed):
     return sorted(removed)
 
 
-def _web_build_impl(pkg_dir, out_dir, title, release, do_opt, track_dist=True):
-    pionc = resolve_pionc()
-    if not pionc["found"]:
-        return {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
-    env = build_pion_env(pionc)
+def _web_managed_non_wasm_relpaths(pkg_dir, pkg_name):
+    """Single source of truth for all non-wasm files/dirs packaged into a web dist dir."""
+    rels = ["index.html"]
+    rels.extend(WEB_DIST_RUNTIME_FILES)
+    rels.extend(WEB_STATIC_ASSETS)
+    if pkg_name == "lg_web":
+        rels.extend(["_headers", "_redirects"])
+    else:
+        for cf in ("_headers", "_redirects"):
+            if os.path.isfile(os.path.join(pkg_dir, cf)):
+                rels.append(cf)
+    if os.path.isfile(os.path.join(INVAR_ROOT, "web", "ghostty-vt.wasm")):
+        rels.append("ghostty-vt.wasm")
+    for lf in ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"):
+        if os.path.isfile(os.path.join(INVAR_ROOT, lf)):
+            rels.append(lf)
+    lic_dir_src = os.path.join(INVAR_ROOT, "LICENSES")
+    if os.path.isdir(lic_dir_src):
+        rels.append("LICENSES")
+        for fn in sorted(os.listdir(lic_dir_src)):
+            if os.path.isfile(os.path.join(lic_dir_src, fn)):
+                rels.append(os.path.join("LICENSES", fn))
+    return rels
+
+
+def _web_managed_non_wasm_paths(pkg_dir, out_dir, pkg_name):
+    return [os.path.join(out_dir, rel) for rel in _web_managed_non_wasm_relpaths(pkg_dir, pkg_name)]
+
+
+def _web_build_impl(pkg_dir, out_dir, title, release, do_opt, track_dist=True, prebuilt_wasm=""):
     pkg_name = _pkg_name_from_toml(pkg_dir)
-    os.makedirs(out_dir, exist_ok=True)
     wasm_name = f"{pkg_name}.wasm"
     wasm_file = os.path.join(out_dir, wasm_name)
 
-    cmd = [pionc["path"], "build"]
-    if release:
-        cmd.append("--release")
-    cmd += ["--target", "wasm32", pkg_dir, "-o", wasm_file]
-    rc, out, err, build_ms = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
-    if rc != 0:
-        return {"ok": False, "error": (out + err).strip(), "elapsed_ms": build_ms}
-
     wasm_opt_ran = False
     wasm_opt_skipped = None
-    if do_opt:
-        wasm_opt = shutil.which("wasm-opt")
-        if wasm_opt:
-            rc2, out2, err2, _ = run_cmd([
-                wasm_opt, "-Oz",
-                # pionc wasm32 output uses bulk-memory and trunc_sat ops.
-                "--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-nontrapping-float-to-int",
-                wasm_file, "-o", wasm_file,
-            ])
-            if rc2 != 0 and "bulk-memory-opt" in (out2 + err2):
+    if prebuilt_wasm:
+        prebuilt_abs = os.path.abspath(prebuilt_wasm)
+        if not os.path.isfile(prebuilt_abs):
+            return {"ok": False, "error": f"Prebuilt wasm file not found: {prebuilt_abs}"}
+        valid_ok, valid_err = _validate_wasm_binary(prebuilt_abs)
+        if not valid_ok:
+            return {"ok": False, "error": valid_err}
+        pre_imp = verify_wasm_imports(prebuilt_abs)
+        if not pre_imp["ok"]:
+            return {
+                "ok": False,
+                "error": (
+                    f"Prebuilt wasm has unsupported host imports "
+                    f"(missing={pre_imp['missing']}, other_modules={pre_imp['other_modules']})"
+                ),
+                "imports_total": pre_imp["total"],
+                "imports_missing": pre_imp["missing"],
+            }
+        os.makedirs(out_dir, exist_ok=True)
+        same_target = False
+        if os.path.exists(wasm_file):
+            try:
+                same_target = os.path.samefile(prebuilt_abs, wasm_file)
+            except OSError:
+                same_target = False
+        if not same_target:
+            shutil.copy2(prebuilt_abs, wasm_file)
+        build_ms = 0
+    else:
+        os.makedirs(out_dir, exist_ok=True)
+        pionc = resolve_pionc()
+        if not pionc["found"]:
+            return {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+        env = build_pion_env(pionc)
+        cmd = [pionc["path"], "build"]
+        if release:
+            cmd.append("--release")
+        cmd += ["--target", "wasm32", pkg_dir, "-o", wasm_file]
+        rc, out, err, build_ms = run_cmd(cmd, cwd=INVAR_ROOT, env=env)
+        if rc != 0:
+            return {"ok": False, "error": (out + err).strip(), "elapsed_ms": build_ms}
+
+        if do_opt:
+            wasm_opt = shutil.which("wasm-opt")
+            if wasm_opt:
                 rc2, out2, err2, _ = run_cmd([
                     wasm_opt, "-Oz",
-                    "--enable-bulk-memory", "--enable-nontrapping-float-to-int",
+                    # pionc wasm32 output uses bulk-memory and trunc_sat ops.
+                    "--enable-bulk-memory", "--enable-bulk-memory-opt", "--enable-nontrapping-float-to-int",
                     wasm_file, "-o", wasm_file,
                 ])
-            if rc2 != 0:
-                return {"ok": False, "error": f"wasm-opt failed: {(out2 + err2).strip()}", "wasm_opt_ran": False}
-            wasm_opt_ran = True
-        else:
-            wasm_opt_skipped = "wasm-opt not found"
+                if rc2 != 0 and "bulk-memory-opt" in (out2 + err2):
+                    rc2, out2, err2, _ = run_cmd([
+                        wasm_opt, "-Oz",
+                        "--enable-bulk-memory", "--enable-nontrapping-float-to-int",
+                        wasm_file, "-o", wasm_file,
+                    ])
+                if rc2 != 0:
+                    return {"ok": False, "error": f"wasm-opt failed: {(out2 + err2).strip()}", "wasm_opt_ran": False}
+                wasm_opt_ran = True
+            else:
+                wasm_opt_skipped = "wasm-opt not found"
 
     managed = {wasm_name, "index.html"}
     required_files = list(WEB_DIST_RUNTIME_FILES) + list(WEB_STATIC_ASSETS)
@@ -3285,15 +3418,31 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt, track_dist=True):
     raw_bytes = os.path.getsize(wasm_file)
     with open(wasm_file, "rb") as f:
         raw_data = f.read()
-    gzip_bytes = len(gzip.compress(raw_data, compresslevel=9))
 
     brotli_bytes = None
     brotli_bin = shutil.which("brotli")
     if brotli_bin:
-        rc_b, _, _, _ = run_cmd([brotli_bin, "-f", "-q", "11", wasm_file, "-o", wasm_file + ".br"])
-        if rc_b == 0 and os.path.isfile(wasm_file + ".br"):
-            brotli_bytes = os.path.getsize(wasm_file + ".br")
-            os.unlink(wasm_file + ".br")
+        def _run_brotli():
+            with tempfile.NamedTemporaryFile(prefix="invar_br_", suffix=".br", delete=False) as tf:
+                tmp_br = tf.name
+            try:
+                rc_b, _, _, _ = run_cmd([brotli_bin, "-f", "-q", "11", wasm_file, "-o", tmp_br])
+                if rc_b == 0 and os.path.isfile(tmp_br):
+                    return os.path.getsize(tmp_br)
+                return None
+            finally:
+                try:
+                    os.unlink(tmp_br)
+                except OSError:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_gz = ex.submit(lambda: len(gzip.compress(raw_data, compresslevel=9)))
+            f_br = ex.submit(_run_brotli)
+            gzip_bytes = f_gz.result()
+            brotli_bytes = f_br.result()
+    else:
+        gzip_bytes = len(gzip.compress(raw_data, compresslevel=9))
 
     result = {
         "ok": imp_res["ok"],
@@ -3315,11 +3464,34 @@ def _web_build_impl(pkg_dir, out_dir, title, release, do_opt, track_dist=True):
 
 def cmd_web(args):
     pkg_dir = resolve_pkg_dir(args.pkg) if args.pkg else os.path.join(INVAR_ROOT, "packages", "lg_web")
-    title = args.title or f"Invar · {_pkg_name_from_toml(pkg_dir)} (Pion WASM)"
+    pkg_name = _pkg_name_from_toml(pkg_dir)
+    title = args.title or f"Invar · {pkg_name} (Pion WASM)"
+    prebuilt_wasm = getattr(args, "prebuilt_wasm", "") or ""
+    out_wasm = getattr(args, "out_wasm", "") or ""
 
     if args.web_action == "build":
         out_dir = os.path.abspath(args.out) if args.out else os.path.join(INVAR_ROOT, "target", "web-dist")
-        res = _web_build_impl(pkg_dir, out_dir, title, True if args.release or not args.debug else False, args.opt)
+        forbidden = _web_managed_non_wasm_paths(pkg_dir, out_dir, pkg_name)
+        if out_wasm:
+            exp_ok, exp_err = _validate_export_dst(out_wasm, forbidden_paths=forbidden)
+            if not exp_ok:
+                res = {"ok": False, "error": exp_err}
+                emit_json(res) if args.json else print(f"invar web build FAILED: {exp_err}", file=sys.stderr)
+                return 1
+        res = _web_build_impl(
+            pkg_dir,
+            out_dir,
+            title,
+            True if args.release or not args.debug else False,
+            args.opt,
+            prebuilt_wasm=prebuilt_wasm,
+        )
+        if res.get("ok") and out_wasm and os.path.isfile(res["wasm_file"]):
+            forbidden_post = _web_managed_non_wasm_paths(pkg_dir, out_dir, pkg_name)
+            exp_ok, exp_err = _export_artifact_file(res["wasm_file"], out_wasm, forbidden_paths=forbidden_post)
+            if not exp_ok:
+                res["ok"] = False
+                res["error"] = exp_err
         if args.json:
             emit_json(res)
         else:
@@ -3330,6 +3502,12 @@ def cmd_web(args):
         return 0 if res["ok"] else 1
 
     if args.web_action == "check":
+        if out_wasm:
+            exp_ok, exp_err = _validate_export_dst(out_wasm)
+            if not exp_ok:
+                res = {"ok": False, "error": exp_err}
+                emit_json(res) if args.json else print(f"invar web check FAILED: {exp_err}", file=sys.stderr)
+                return 1
         tmp_dir = tempfile.mkdtemp(prefix="invar_web_check_")
         try:
             node = shutil.which("node")
@@ -3339,10 +3517,23 @@ def cmd_web(args):
                     rc, out, err, _ = run_cmd([node, "--check", os.path.join(INVAR_ROOT, "web", wf)])
                     if rc != 0:
                         js_errors.append(f"web/{wf}: {(out + err).strip()}")
-            res = _web_build_impl(pkg_dir, tmp_dir, title, True, args.opt, track_dist=False)
+            res = _web_build_impl(
+                pkg_dir,
+                tmp_dir,
+                title,
+                True,
+                args.opt,
+                track_dist=False,
+                prebuilt_wasm=prebuilt_wasm,
+            )
             res["js_errors"] = js_errors
             if js_errors:
                 res["ok"] = False
+            if res.get("ok") and out_wasm and os.path.isfile(res["wasm_file"]):
+                exp_ok, exp_err = _export_artifact_file(res["wasm_file"], out_wasm)
+                if not exp_ok:
+                    res["ok"] = False
+                    res["error"] = exp_err
             if args.json:
                 emit_json(res)
             else:
@@ -3355,6 +3546,10 @@ def cmd_web(args):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # dev server
+    if prebuilt_wasm or out_wasm:
+        err = {"ok": False, "error": "--prebuilt-wasm and --out-wasm are not supported with `invar web dev`"}
+        emit_json(err) if args.json else print(err["error"], file=sys.stderr)
+        return 1
     out_dir = os.path.abspath(args.out) if args.out else os.path.join(INVAR_ROOT, "target", "web-dev")
     res = _web_build_impl(pkg_dir, out_dir, title, True, args.opt)
     if not res["ok"]:
@@ -3403,15 +3598,47 @@ def _snapshot_media_dir(out_dir):
 
 
 def cmd_shot(args):
-    pionc = resolve_pionc()
-    if not pionc["found"]:
-        err = {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+    prebuilt_bin = getattr(args, "prebuilt_bin", "") or ""
+    out_bin = getattr(args, "out_bin", "") or ""
+    if prebuilt_bin and out_bin:
+        err = {"ok": False, "error": "--prebuilt-bin and --out-bin cannot be used together", "build_ms": 0}
         emit_json(err) if args.json else print(err["error"], file=sys.stderr)
         return 1
-    env = build_pion_env(pionc)
+
+    if prebuilt_bin:
+        prebuilt_abs = os.path.abspath(prebuilt_bin)
+        if not (os.path.isfile(prebuilt_abs) and os.access(prebuilt_abs, os.X_OK)):
+            res = {"ok": False, "error": f"Prebuilt shot binary not found or not executable: {prebuilt_abs}", "build_ms": 0}
+            emit_json(res) if args.json else print(res["error"], file=sys.stderr)
+            return 1
+        pionc = None
+        env = os.environ.copy()
+        bin_path = prebuilt_abs
+        owns_bin = False
+    else:
+        if out_bin:
+            exp_ok, exp_err = _validate_export_dst(out_bin)
+            if not exp_ok:
+                res = {"ok": False, "error": exp_err, "build_ms": 0}
+                emit_json(res) if args.json else print(res["error"], file=sys.stderr)
+                return 1
+        pionc = resolve_pionc()
+        if not pionc["found"]:
+            err = {"ok": False, "error": "pionc not found (set PIONC or add to PATH)"}
+            emit_json(err) if args.json else print(err["error"], file=sys.stderr)
+            return 1
+        env = build_pion_env(pionc)
+        bin_path = None
+        owns_bin = True
+
     pkg_dir = resolve_pkg_dir(args.pkg) if args.pkg else os.path.join(INVAR_ROOT, "packages", "lg_shots")
     out_dir = os.path.abspath(args.out) if args.out else os.path.join(INVAR_ROOT, "target", "shots")
-    os.makedirs(out_dir, exist_ok=True)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        err = {"ok": False, "error": f"Cannot create output directory {out_dir}: {e}", "build_ms": 0}
+        emit_json(err) if args.json else print(err["error"], file=sys.stderr)
+        return 1
 
     env["MBUI_LG_OUT"] = out_dir
     if getattr(args, "list", False):
@@ -3428,18 +3655,27 @@ def cmd_shot(args):
         env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
         env.setdefault("GALLIUM_DRIVER", "llvmpipe")
 
-    fd, bin_path = tempfile.mkstemp(prefix="invar_shot_")
-    os.close(fd)
     try:
-        build_cmd = [pionc["path"], "build"]
-        if getattr(args, "release", False):
-            build_cmd.append("--release")
-        build_cmd += [pkg_dir, "-o", bin_path]
-        rc, out, err, build_ms = run_cmd(build_cmd, cwd=INVAR_ROOT, env=env)
-        if rc != 0:
-            res = {"ok": False, "error": f"build failed: {(out + err).strip()}", "build_ms": build_ms}
-            emit_json(res) if args.json else print(res["error"], file=sys.stderr)
-            return 1
+        if prebuilt_bin:
+            build_ms = 0
+        else:
+            fd, bin_path = tempfile.mkstemp(prefix="invar_shot_")
+            os.close(fd)
+            build_cmd = [pionc["path"], "build"]
+            if getattr(args, "release", False):
+                build_cmd.append("--release")
+            build_cmd += [pkg_dir, "-o", bin_path]
+            rc, out, err, build_ms = run_cmd(build_cmd, cwd=INVAR_ROOT, env=env)
+            if rc != 0:
+                res = {"ok": False, "error": f"build failed: {(out + err).strip()}", "build_ms": build_ms}
+                emit_json(res) if args.json else print(res["error"], file=sys.stderr)
+                return 1
+            if out_bin:
+                exp_ok, exp_err = _export_artifact_file(bin_path, out_bin)
+                if not exp_ok:
+                    res = {"ok": False, "error": exp_err, "build_ms": build_ms}
+                    emit_json(res) if args.json else print(res["error"], file=sys.stderr)
+                    return 1
         before_snap = _snapshot_media_dir(out_dir)
         t_run_ns = time.time_ns()
         rc2, out2, err2, run_ms = run_cmd([bin_path], cwd=INVAR_ROOT, env=env)
@@ -3510,7 +3746,7 @@ def cmd_shot(args):
             print(f"invar shot: {'OK' if ok else 'FAILED'} ({len(pngs)} PNGs, {len(mp4s)} MP4s, build {build_ms} ms, run {run_ms} ms)")
         return 0 if ok else 1
     finally:
-        if os.path.exists(bin_path):
+        if owns_bin and bin_path and os.path.exists(bin_path):
             os.unlink(bin_path)
 
 
@@ -4425,6 +4661,8 @@ def build_parser():
     sp.add_argument("web_action", choices=["build", "dev", "check"])
     sp.add_argument("--pkg", default="", help="Package directory (default: packages/lg_web)")
     sp.add_argument("--out", default="", help="Output directory")
+    sp.add_argument("--out-wasm", default="", help="Copy the resulting .wasm binary to this path")
+    sp.add_argument("--prebuilt-wasm", default="", help="Reuse a prebuilt .wasm file (skip pionc build and wasm-opt)")
     sp.add_argument("--port", type=int, default=8080, help="Dev server port (default: 8080)")
     sp.add_argument("--title", default="", help="HTML document title")
     sp.add_argument("--release", action="store_true", help="Build in release mode (default)")
@@ -4442,6 +4680,8 @@ def build_parser():
     sp.add_argument("--h", default="", help="Override height in pt")
     sp.add_argument("--scale", default="", help="Override display scale")
     sp.add_argument("--release", action="store_true", help="Compile shot binary with --release (default: fast debug CAS build)")
+    sp.add_argument("--out-bin", default="", help="Copy the compiled shot binary to this path for reuse")
+    sp.add_argument("--prebuilt-bin", default="", help="Reuse a prebuilt shot binary (skip pionc build)")
     sp.add_argument("--list", action="store_true", help="List available shot presets and exit")
     sp.add_argument("--json", action="store_true", help="Output structured JSON")
     sp.set_defaults(func=cmd_shot)
