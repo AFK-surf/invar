@@ -192,6 +192,8 @@ d = json.loads(sys.argv[1])
 assert d['ok'] is True, f'web-app build failed: {d}'
 assert d['raw_bytes'] > 0 and d['gzip_bytes'] > 0
 assert d['imports_missing'] == [], f'missing imports: {d}'
+if os.environ.get('INVAR_WEB_BROTLI') == '0':
+    assert d['brotli_bytes'] is None and d.get('brotli_skipped') == 'INVAR_WEB_BROTLI=0', f'brotli not skipped: {d}'
 assert os.path.isfile(os.path.join(d['out_dir'], 'index.html'))
 for lf in ('LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'LICENSES/Apache-2.0.txt', 'LICENSES/OFL-1.1.txt', 'LICENSES/Unicode-3.0.txt'):
     assert os.path.isfile(os.path.join(d['out_dir'], lf)), f'missing license file in web dist: {lf}'
@@ -237,8 +239,8 @@ if [ "$W78_FAIL" -ne 0 ]; then
 fi
 
 echo "=== 8b. invar web build cleans stale _headers/_redirects/wasm across packages ==="
-# Steps 7 and 8 already exercise full wasm32 compilation + brotli -q 11 compression on both
-# my_web_app and lg_web; step 8b only verifies _web_dist_reconcile stale-file cleanup across
+# Steps 7 and 8 already exercise full wasm32 compilation and the size report (brotli -q 11 unless
+# INVAR_WEB_BROTLI=0) on both my_web_app and lg_web; step 8b only verifies _web_dist_reconcile stale-file cleanup across
 # 6 rebuilds by reusing those freshly compiled .wasm binaries via --prebuilt-wasm.
 NO_BROTLI_BIN="$TMP/no_brotli_bin"
 mkdir -p "$NO_BROTLI_BIN"
